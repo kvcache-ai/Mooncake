@@ -105,6 +105,24 @@ class ReplicaSelectionTest : public ::testing::Test {
     std::optional<std::string> original_env_;
 };
 
+TEST_F(ReplicaSelectionTest, SharedKvPrecedesFileFallbacksRegardlessOfOrder) {
+    Replica::Descriptor shared;
+    shared.descriptor_variant = SharedKvDescriptor{1024, 7};
+    shared.status = ReplicaStatus::COMPLETE;
+    for (bool shared_first : {false, true}) {
+        std::vector<Replica::Descriptor> replicas = {
+            MakeDisk("/disk"), MakeDfs("/dfs"), MakeLocalDisk("local")};
+        if (shared_first)
+            replicas.insert(replicas.begin(), shared);
+        else
+            replicas.push_back(shared);
+        const auto* selected = SelectBestReplica(replicas, {});
+        ASSERT_NE(selected, nullptr);
+        EXPECT_TRUE(selected->is_shared_kv_replica());
+        EXPECT_EQ(selected->get_shared_kv_descriptor().allocation_id, 7);
+    }
+}
+
 // --- Base policy (scoring off): behaviour must be unchanged --------------
 
 TEST_F(ReplicaSelectionTest, LocalMemoryAlwaysWins) {

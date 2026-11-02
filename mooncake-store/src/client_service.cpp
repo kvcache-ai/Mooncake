@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #if defined(__linux__)
@@ -25,6 +26,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <sched.h>
 #include <thread>
 #include <set>
@@ -53,6 +55,8 @@
 #endif
 #include "crc_checksum.h"
 #include "config/client_numa_config.h"
+#include "config/shared_nvme_kv_config.h"
+#include "shared_nvme_kv_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
@@ -109,53 +113,6 @@ std::function<std::shared_ptr<NVMeoFInitiator>()>&
 DefaultNofInitiatorFactoryForTestingSlot() {
     static std::function<std::shared_ptr<NVMeoFInitiator>()> factory;
     return factory;
-}
-
-struct ContiguousSliceRange {
-    void* ptr = nullptr;
-    size_t size = 0;
-};
-
-std::optional<ContiguousSliceRange> GetContiguousSliceRange(
-    std::span<const Slice> slices) {
-    if (slices.empty()) {
-        return std::nullopt;
-    }
-
-    uintptr_t expected_ptr = 0;
-    uintptr_t start_ptr = 0;
-    size_t total_size = 0;
-    for (size_t i = 0; i < slices.size(); ++i) {
-        const auto& slice = slices[i];
-        if (slice.ptr == nullptr) {
-            return std::nullopt;
-        }
-
-        const auto current_ptr = reinterpret_cast<uintptr_t>(slice.ptr);
-        if (i == 0) {
-            start_ptr = current_ptr;
-            expected_ptr = current_ptr;
-        } else if (current_ptr != expected_ptr) {
-            return std::nullopt;
-        }
-
-        if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
-            return std::nullopt;
-        }
-        if (slice.size > std::numeric_limits<uintptr_t>::max() - current_ptr) {
-            return std::nullopt;
-        }
-
-        total_size += slice.size;
-        expected_ptr = current_ptr + slice.size;
-    }
-
-    if (total_size == 0) {
-        return std::nullopt;
-    }
-
-    return ContiguousSliceRange{.ptr = reinterpret_cast<void*>(start_ptr),
-                                .size = total_size};
 }
 
 ErrorCode ScatterFragmentError(const Status& status) {
@@ -276,12 +233,15 @@ struct ReplicaTransferSummary {
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     size_t allocated_dfs_replicas = 0;
+    size_t allocated_shared_replicas = 0;
     size_t successful_memory_transfers = 0;
     size_t successful_nof_transfers = 0;
     size_t successful_dfs_transfers = 0;
+    size_t successful_shared_transfers = 0;
     size_t failed_memory_transfers = 0;
     size_t failed_nof_transfers = 0;
     size_t failed_dfs_transfers = 0;
+    size_t failed_shared_transfers = 0;
     ErrorCode first_error = ErrorCode::OK;
 
     void RecordAllocatedReplica(const Replica::Descriptor& replica) {
@@ -291,6 +251,8 @@ struct ReplicaTransferSummary {
             ++allocated_nof_replicas;
         } else if (replica.is_dfs_replica()) {
             ++allocated_dfs_replicas;
+        } else if (replica.is_shared_kv_replica()) {
+            ++allocated_shared_replicas;
         }
     }
 
@@ -301,6 +263,8 @@ struct ReplicaTransferSummary {
             ++successful_nof_transfers;
         } else if (replica_type == ReplicaType::DFS) {
             ++successful_dfs_transfers;
+        } else if (replica_type == ReplicaType::SHARED_NVME_KV) {
+            ++successful_shared_transfers;
         }
     }
 
@@ -311,6 +275,8 @@ struct ReplicaTransferSummary {
             ++failed_nof_transfers;
         } else if (replica_type == ReplicaType::DFS) {
             ++failed_dfs_transfers;
+        } else if (replica_type == ReplicaType::SHARED_NVME_KV) {
+            ++failed_shared_transfers;
         }
         if (first_error == ErrorCode::OK) {
             first_error = error;
@@ -323,7 +289,10 @@ bool NonDfsTransfersSucceeded(const ReplicaTransferSummary& summary) {
                summary.allocated_memory_replicas &&
            summary.successful_nof_transfers == summary.allocated_nof_replicas &&
            summary.failed_memory_transfers == 0 &&
-           summary.failed_nof_transfers == 0;
+           summary.failed_nof_transfers == 0 &&
+           summary.successful_shared_transfers ==
+               summary.allocated_shared_replicas &&
+           summary.failed_shared_transfers == 0;
 }
 
 bool AllAllocatedTransfersSucceeded(const ReplicaTransferSummary& summary) {
@@ -334,25 +303,29 @@ bool AllAllocatedTransfersSucceeded(const ReplicaTransferSummary& summary) {
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary) {
-    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
+    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0 &&
+        config.shared_nvme_kv_replica_num == 0) {
         return summary.allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
         ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
         return summary.allocated_memory_replicas +
-                   summary.allocated_nof_replicas >
+                   summary.allocated_nof_replicas +
+                   summary.allocated_shared_replicas >
                0;
     }
     return summary.allocated_memory_replicas == config.replica_num &&
            summary.allocated_nof_replicas == config.nof_replica_num &&
-           summary.allocated_dfs_replicas == config.dfs_replica_num;
+           summary.allocated_dfs_replicas == config.dfs_replica_num &&
+           summary.allocated_shared_replicas ==
+               config.shared_nvme_kv_replica_num;
 }
 
 std::optional<ErrorCode> ValidatePreferSameNodeWriteConfig(
     const ReplicateConfig& config) {
-    if (config.nof_replica_num > 0) {
+    if (config.nof_replica_num > 0 || config.shared_nvme_kv_replica_num > 0) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
-                      "NoF replicas";
+                      "NoF or shared KV replicas";
         return ErrorCode::INVALID_PARAMS;
     }
     if (config.replica_num != 1) {
@@ -401,23 +374,37 @@ FinalizeDecision DetermineFinalizeDecision(
     }
 
     const bool memory_succeeded = summary.successful_memory_transfers > 0;
-    const bool nof_succeeded = summary.successful_nof_transfers > 0;
 
-    if (memory_succeeded && nof_succeeded) {
+    const bool shared = config.shared_nvme_kv_replica_num > 0;
+    const auto secondary_type =
+        shared ? ReplicaType::SHARED_NVME_KV : ReplicaType::NOF_SSD;
+    const bool secondary_succeeded =
+        shared ? summary.successful_shared_transfers > 0
+               : summary.successful_nof_transfers > 0;
+
+    if (memory_succeeded && secondary_succeeded) {
         return {.end_type = ReplicaType::ALL,
                 .revoke_type = std::nullopt,
                 .success = true,
                 .error = ErrorCode::OK};
     }
+
     if (memory_succeeded) {
+        const auto secondary_allocated = shared
+                                             ? summary.allocated_shared_replicas
+                                             : summary.allocated_nof_replicas;
         return {.end_type = ReplicaType::MEMORY,
-                .revoke_type = ReplicaType::NOF_SSD,
+                .revoke_type = secondary_allocated > 0
+                                   ? std::optional{secondary_type}
+                                   : std::nullopt,
                 .success = true,
                 .error = ErrorCode::OK};
     }
-    if (nof_succeeded) {
-        return {.end_type = ReplicaType::NOF_SSD,
-                .revoke_type = ReplicaType::MEMORY,
+    if (secondary_succeeded) {
+        return {.end_type = secondary_type,
+                .revoke_type = summary.allocated_memory_replicas > 0
+                                   ? std::optional{ReplicaType::MEMORY}
+                                   : std::nullopt,
                 .success = true,
                 .error = ErrorCode::OK};
     }
@@ -1177,6 +1164,53 @@ std::shared_ptr<NVMeoFInitiator> Client::GetNofInitiatorForTesting() const {
     return nof_initiator_;
 }
 
+tl::expected<void, ErrorCode> Client::InitSharedNvmeKv() {
+    const char* path = std::getenv("MOONCAKE_SHARED_NVME_KV_CONFIG");
+    if (!path || !*path) {
+        return {};
+    }
+    if (tenant_id() != TenantId::kDefaultValue) {
+        return tl::unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    std::ifstream input(path);
+    if (!input) {
+        LOG(ERROR) << "Cannot open shared NVMe KV config: " << path;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto config = SharedNvmeKvConfig::Parse(input);
+    if (!config) {
+        LOG(ERROR) << "Invalid shared NVMe KV config: " << config.error();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<std::shared_ptr<NvmeKvObjectStore>> backends;
+    for (const auto& options : config->namespaces) {
+        auto connector = std::make_unique<NvmeKvConnector>();
+        auto result = connector->Init(options);
+        if (!result) {
+            return tl::unexpected(result.error());
+        }
+        backends.push_back(
+            SharedNvmeKvBackend::CreateObjectStore(std::move(connector)));
+    }
+
+    SetSharedKvBackends(std::move(backends));
+    return {};
+}
+
+void Client::SetSharedKvBackends(
+    std::vector<std::shared_ptr<NvmeKvObjectStore>> backends) {
+    if (shared_kv_backend_) {
+        throw std::invalid_argument(
+            "shared KV namespaces must be configured once");
+    }
+
+    shared_kv_backend_ =
+        std::make_shared<SharedNvmeKvBackend>(std::move(backends));
+}
+
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
@@ -1275,6 +1309,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         }
     }
 
+    auto shared_kv = client->InitSharedNvmeKv();
+    if (!shared_kv) {
+        LOG(ERROR) << "Failed to initialize shared NVMe KV: "
+                   << shared_kv.error();
+        return std::nullopt;
+    }
     client->EnterHaRuntimeMode();
 
     // this only performs RPC calls
@@ -1598,6 +1638,10 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     auto t0_get = std::chrono::steady_clock::now();
     if (replica.is_dfs_replica()) {
         err = ReadDfsReplica(object_key, replica, slices);
+    } else if (replica.is_shared_kv_replica()) {
+        auto results = ReadSharedKvReplicas(
+            {{object_key, replica.get_shared_kv_descriptor(), &slices}});
+        err = results[0] ? ErrorCode::OK : results[0].error();
     } else {
         err = TransferRead(replica, slices);
     }
@@ -1757,6 +1801,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::unordered_map<std::string, TargetReadGroup> target_groups;
     std::vector<DfsReadRequest> dfs_read_requests;
     std::vector<size_t> dfs_read_indices;
+    std::vector<SharedKvIORequest> shared_read_requests;
+    std::vector<size_t> shared_read_indices;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1813,6 +1859,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             dfs_read_requests.push_back(
                 DfsReadRequest{key, desc, slices_it->second});
             dfs_read_indices.push_back(i);
+            continue;
+        } else if (replica.is_shared_kv_replica()) {
+            shared_read_requests.push_back(
+                {key, replica.get_shared_kv_descriptor(), &slices_it->second});
+            shared_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
@@ -1952,6 +2003,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 << ", succeeded=" << dfs_success_keys
                 << ", bytes=" << dfs_success_bytes
                 << ", latency_us=" << dfs_read_latency_us;
+    }
+
+    if (!shared_read_requests.empty()) {
+        auto reads = ReadSharedKvReplicas(shared_read_requests);
+        for (size_t i = 0; i < shared_read_indices.size(); ++i) {
+            const size_t index = shared_read_indices[i];
+            const auto& request = shared_read_requests[i];
+            results[index] = reads[i];
+            if (results[index]) {
+                results[index] =
+                    VerifyObjectChecksum(request.key, *request.slice_lists,
+                                         request.descriptor.object_size,
+                                         query_results[index].object_checksum);
+            }
+        }
     }
 
     // Wait for all transfers to complete
@@ -2102,9 +2168,14 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    uint64_t shared_kv_allocation_id = 0;
     ReplicaTransferSummary transfer_summary;
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
+        if (replica.is_shared_kv_replica()) {
+            shared_kv_allocation_id =
+                replica.get_shared_kv_descriptor().allocation_id;
+        }
     }
 
     // Record Put transfer latency (all replicas)
@@ -2137,6 +2208,23 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                 continue;
             }
             transfer_summary.RecordSuccess(replica_type);
+        }
+    }
+
+    if (transfer_summary.allocated_shared_replicas > 0) {
+        for (const auto& replica : start_result.value()) {
+            if (!replica.is_shared_kv_replica()) {
+                continue;
+            }
+
+            auto result = WriteSharedKvReplicas(
+                {{key, replica.get_shared_kv_descriptor(), &slices}})[0];
+            if (result) {
+                transfer_summary.RecordSuccess(ReplicaType::SHARED_NVME_KV);
+            } else {
+                transfer_summary.RecordFailure(ReplicaType::SHARED_NVME_KV,
+                                               result.error());
+            }
         }
     }
 
@@ -2185,7 +2273,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            ObjectMeta{key, object_checksum, shared_kv_allocation_id},
+            *finalize_decision.end_type);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -2194,8 +2283,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.PutRevoke(
+            key, *finalize_decision.revoke_type, shared_kv_allocation_id);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
             return tl::unexpected(revoke_result.error());
@@ -2461,6 +2550,8 @@ class PutOperation {
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
     size_t requested_dfs_replicas = 0;
+    size_t requested_shared_replicas = 0;
+    uint64_t shared_kv_allocation_id = 0;
     ReplicaTransferSummary transfer_summary;
 
     // Error context for debugging
@@ -2514,6 +2605,7 @@ class PutOperation {
         requested_memory_replicas = config.replica_num;
         requested_nof_replicas = config.nof_replica_num;
         requested_dfs_replicas = config.dfs_replica_num;
+        requested_shared_replicas = config.shared_nvme_kv_replica_num;
     }
 
     ReplicateConfig ToReplicateConfig() const {
@@ -2521,6 +2613,7 @@ class PutOperation {
         config.replica_num = requested_memory_replicas;
         config.nof_replica_num = requested_nof_replicas;
         config.dfs_replica_num = requested_dfs_replicas;
+        config.shared_nvme_kv_replica_num = requested_shared_replicas;
         return config;
     }
 
@@ -2528,6 +2621,10 @@ class PutOperation {
         transfer_summary = ReplicaTransferSummary{};
         for (const auto& replica : replicas) {
             transfer_summary.RecordAllocatedReplica(replica);
+            if (replica.is_shared_kv_replica()) {
+                shared_kv_allocation_id =
+                    replica.get_shared_kv_descriptor().allocation_id;
+            }
         }
     }
 
@@ -3198,6 +3295,16 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     return results;
 }
 
+std::vector<tl::expected<void, ErrorCode>> Client::WriteSharedKvReplicas(
+    const std::vector<SharedKvIORequest>& requests) {
+    if (!shared_kv_backend_ || tenant_id() != TenantId::kDefaultValue) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    }
+
+    return shared_kv_backend_->BatchWrite(requests);
+}
+
 void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
     std::vector<std::string> keys;
     std::vector<const std::vector<Slice>*> slice_lists;
@@ -3258,6 +3365,63 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
     }
 }
 
+void Client::SubmitSharedKvWrites(std::vector<PutOperation>& ops) {
+    std::vector<SharedKvIORequest> requests;
+    std::vector<size_t> op_indices;
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const auto& op = ops[i];
+        if (op.IsResolved()) {
+            continue;
+        }
+
+        for (const auto& replica : op.replicas) {
+            if (!replica.is_shared_kv_replica()) {
+                continue;
+            }
+
+            requests.push_back(
+                {op.key, replica.get_shared_kv_descriptor(), &op.slices});
+            op_indices.push_back(i);
+        }
+    }
+
+    auto results = WriteSharedKvReplicas(requests);
+    for (size_t i = 0; i < results.size(); ++i) {
+        auto& op = ops[op_indices[i]];
+        if (results[i]) {
+            op.transfer_summary.RecordSuccess(ReplicaType::SHARED_NVME_KV);
+        } else {
+            op.transfer_summary.RecordFailure(ReplicaType::SHARED_NVME_KV,
+                                              results[i].error());
+            op.AppendFailureContext("Shared KV write failed: " +
+                                    toString(results[i].error()));
+        }
+    }
+}
+
+namespace {
+
+std::vector<uint64_t> CollectSharedKvAllocationIds(
+    const std::vector<PutOperation>& ops, const std::vector<size_t>& indices) {
+    std::vector<uint64_t> allocation_ids;
+    allocation_ids.reserve(indices.size());
+    bool has_shared = false;
+
+    for (const auto index : indices) {
+        const auto id = ops[index].shared_kv_allocation_id;
+        allocation_ids.push_back(id);
+        has_shared |= id != 0;
+    }
+
+    if (!has_shared) {
+        allocation_ids.clear();
+    }
+    return allocation_ids;
+}
+
+}  // namespace
+
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
@@ -3267,9 +3431,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     BatchFinalizeGroup end_all_group;
     BatchFinalizeGroup end_memory_group;
     BatchFinalizeGroup end_nof_group;
+    BatchFinalizeGroup end_shared_group;
     BatchFinalizeGroup revoke_all_group;
     BatchFinalizeGroup revoke_memory_group;
     BatchFinalizeGroup revoke_nof_group;
+    BatchFinalizeGroup revoke_shared_group;
 
     std::vector<size_t> pending_finalize_actions(ops.size(), 0);
     std::vector<bool> should_succeed(ops.size(), false);
@@ -3303,6 +3469,12 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                 case ReplicaType::NOF_SSD:
                     add_group_entry(is_end ? end_nof_group : revoke_nof_group,
                                     key, index);
+                    ++pending_finalize_actions[index];
+                    break;
+                case ReplicaType::SHARED_NVME_KV:
+                    add_group_entry(
+                        is_end ? end_shared_group : revoke_shared_group, key,
+                        index);
                     ++pending_finalize_actions[index];
                     break;
                 default:
@@ -3353,8 +3525,9 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         std::vector<ObjectMeta> object_metas;
         object_metas.reserve(group.indices.size());
         for (size_t i = 0; i < group.indices.size(); ++i) {
-            object_metas.emplace_back(ObjectMeta{
-                group.keys[i], ops[group.indices[i]].object_checksum});
+            object_metas.emplace_back(
+                ObjectMeta{group.keys[i], ops[group.indices[i]].object_checksum,
+                           ops[group.indices[i]].shared_kv_allocation_id});
         }
         auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
         if (responses.size() != group.keys.size()) {
@@ -3382,8 +3555,9 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         if (group.keys.empty()) {
             return;
         }
-        auto responses =
-            master_client_.BatchPutRevoke(group.keys, replica_type);
+        auto responses = master_client_.BatchPutRevoke(
+            group.keys, replica_type,
+            CollectSharedKvAllocationIds(ops, group.indices));
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -3407,9 +3581,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_end_group(end_all_group, ReplicaType::ALL);
     process_end_group(end_memory_group, ReplicaType::MEMORY);
     process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    process_end_group(end_shared_group, ReplicaType::SHARED_NVME_KV);
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+    process_revoke_group(revoke_shared_group, ReplicaType::SHARED_NVME_KV);
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -3682,6 +3858,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     SubmitTransfers(ops,
                     group_by_target || client_cfg.prefer_alloc_in_same_node);
     WaitForTransfers(ops);
+    SubmitSharedKvWrites(ops);
     SubmitDfsWrites(ops);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
@@ -3713,6 +3890,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    if (config.shared_nvme_kv_replica_num > 0) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+    }
+
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -5240,6 +5422,55 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
             << ", offset=" << desc.offset << ", size=" << desc.object_size
             << ", latency_us=" << read_latency_us;
     return ErrorCode::OK;
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::ReadSharedKvReplicas(
+    const std::vector<SharedKvIORequest>& requests) {
+    if (!shared_kv_backend_) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(
+        requests.size(), tl::unexpected(ErrorCode::NOT_SUPPORTED));
+    std::vector<std::vector<Slice>> output_slices(requests.size());
+    std::vector<SharedKvIORequest> reads;
+    std::vector<size_t> indices;
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        if (!request.slice_lists) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        auto range = GetContiguousSliceRange(*request.slice_lists);
+        if (!range) {
+            continue;
+        }
+
+        if (range->size < request.descriptor.object_size) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+
+        output_slices[i].push_back(
+            {range->ptr, request.descriptor.object_size});
+        reads.push_back({request.key, request.descriptor, &output_slices[i]});
+        indices.push_back(i);
+    }
+
+    auto read_results = shared_kv_backend_->BatchRead(reads);
+    for (size_t i = 0; i < reads.size(); ++i) {
+        results[indices[i]] = read_results[i];
+        if (!read_results[i] &&
+            read_results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+            auto ignored = master_client_.InvalidateSharedKv(
+                reads[i].key, reads[i].descriptor.allocation_id);
+            (void)ignored;
+        }
+    }
+    return results;
 }
 
 ErrorCode Client::TransferReadRange(

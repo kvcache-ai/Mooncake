@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <vector>
 #include <sys/mman.h>  // For shm_open, mmap, munmap
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
@@ -121,6 +122,48 @@ size_t BufferHandle::size() const {
     return view_ptr_ ? view_size_ : handle_.size();
 }
 
+std::optional<ContiguousSliceRange> GetContiguousSliceRange(
+    std::span<const Slice> slices) {
+    if (slices.empty()) {
+        return std::nullopt;
+    }
+
+    uintptr_t expected_ptr = 0;
+    uintptr_t start_ptr = 0;
+    size_t total_size = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto& slice = slices[i];
+        if (slice.ptr == nullptr) {
+            return std::nullopt;
+        }
+
+        const auto current_ptr = reinterpret_cast<uintptr_t>(slice.ptr);
+        if (i == 0) {
+            start_ptr = current_ptr;
+            expected_ptr = current_ptr;
+        } else if (current_ptr != expected_ptr) {
+            return std::nullopt;
+        }
+
+        if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
+            return std::nullopt;
+        }
+        if (slice.size > std::numeric_limits<uintptr_t>::max() - current_ptr) {
+            return std::nullopt;
+        }
+
+        total_size += slice.size;
+        expected_ptr = current_ptr + slice.size;
+    }
+
+    if (total_size == 0) {
+        return std::nullopt;
+    }
+
+    return ContiguousSliceRange{.ptr = reinterpret_cast<void*>(start_ptr),
+                                .size = total_size};
+}
+
 // Utility functions for buffer and slice management
 std::vector<Slice> split_into_slices(BufferHandle& handle) {
     auto base = static_cast<uint8_t*>(handle.ptr());
@@ -150,6 +193,8 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         total_length = replica.get_local_disk_descriptor().object_size;
     } else if (replica.is_dfs_replica()) {
         total_length = replica.get_dfs_descriptor().object_size;
+    } else if (replica.is_shared_kv_replica()) {
+        total_length = replica.get_shared_kv_descriptor().object_size;
     } else if (replica.is_nof_replica()) {
         total_length = replica.get_nof_descriptor().buffer_descriptor.size_;
     } else {
@@ -176,6 +221,9 @@ int allocateSlices(std::vector<Slice>& slices,
     } else if (replica.is_dfs_replica()) {
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_dfs_descriptor().object_size});
+    } else if (replica.is_shared_kv_replica()) {
+        slices.emplace_back(
+            Slice{buffer_ptr, replica.get_shared_kv_descriptor().object_size});
     } else if (replica.is_nof_replica()) {
         auto& handle = replica.get_nof_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;

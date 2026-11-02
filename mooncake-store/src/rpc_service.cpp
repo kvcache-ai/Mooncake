@@ -1406,6 +1406,52 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
         [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchRevokeSharedKv(
+    const UUID& client_id, const std::vector<SharedKvObjectRef>& objects,
+    ReplicaType replica_type, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchRevokeSharedKv");
+    MasterMetricManager::instance().inc_batch_put_revoke_requests(
+        objects.size());
+    timer.LogRequest("client_id=", client_id,
+                     ", objects_count=", objects.size());
+    auto results = WithRequestTenantBatch(
+        tenant_id, objects.size(), [&](const TenantId& tenant) {
+            std::vector<tl::expected<void, ErrorCode>> results;
+            results.reserve(objects.size());
+            for (const auto& object : objects) {
+                results.push_back(master_service_.PutRevoke(
+                    client_id, object.key, tenant, replica_type,
+                    object.allocation_id));
+                if (!results.back())
+                    MasterMetricManager::instance()
+                        .inc_batch_put_revoke_failures(1);
+            }
+            return results;
+        });
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::InvalidateSharedKv(
+    const std::string& key, const std::string& tenant_id,
+    uint64_t expected_allocation_id) {
+    return execute_rpc(
+        "InvalidateSharedKv",
+        [&] {
+            return WithRequestTenant(tenant_id, [&](const TenantId& resolved) {
+                return master_service_.InvalidateSharedKv(
+                    key, resolved, expected_allocation_id);
+            });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                             ", allocation_id=", expected_allocation_id);
+        },
+        // TODO: add request and failure counters for InvalidateSharedKv.
+        [] {}, [] {});
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     ReplicaType replica_type) {
@@ -2122,6 +2168,8 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::DynamicReplicaCopyRevoke,
         &WrappedMasterService::MoveStart, &WrappedMasterService::MoveEnd,
         &WrappedMasterService::MoveRevoke,
+        &WrappedMasterService::BatchRevokeSharedKv,
+        &WrappedMasterService::InvalidateSharedKv,
         &WrappedMasterService::EvictDiskReplica,
         &WrappedMasterService::EvictDiskReplicaIfCurrent,
         &WrappedMasterService::BatchEvictDiskReplica,

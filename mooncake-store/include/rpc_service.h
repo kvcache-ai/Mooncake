@@ -412,6 +412,14 @@ class WrappedMasterService {
                                              const std::string& key,
                                              const std::string& tenant_id);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchRevokeSharedKv(
+        const UUID& client_id, const std::vector<SharedKvObjectRef>& objects,
+        ReplicaType replica_type, const std::string& tenant_id);
+
+    tl::expected<void, ErrorCode> InvalidateSharedKv(
+        const std::string& key, const std::string& tenant_id,
+        uint64_t expected_allocation_id);
+
     tl::expected<void, ErrorCode> EvictDiskReplica(const UUID& client_id,
                                                    const std::string& key,
                                                    const std::string& tenant_id,

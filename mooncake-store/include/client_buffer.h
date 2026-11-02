@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <optional>
+#include <span>
 #include <vector>
 #include <string>
 
@@ -11,6 +12,14 @@
 #include "nof/dma_buffer_allocator.h"
 
 namespace mooncake {
+
+struct ContiguousSliceRange {
+    void* ptr = nullptr;
+    size_t size = 0;
+};
+
+std::optional<ContiguousSliceRange> GetContiguousSliceRange(
+    std::span<const Slice> slices);
 
 class BufferHandle;
 

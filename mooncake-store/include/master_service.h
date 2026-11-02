@@ -52,6 +52,7 @@
 #include "promotion_candidate_tracker.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "shared_nvme_kv_id_allocator.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
 #include "task_manager.h"
@@ -457,7 +458,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   uint64_t expected_shared_allocation_id = 0)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -533,6 +535,10 @@ class MasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         const TenantId& tenant_id);
+
+    tl::expected<void, ErrorCode> InvalidateSharedKv(
+        const std::string& key, const TenantId& tenant_id,
+        uint64_t expected_allocation_id);
 
     /**
      * @brief Evict a disk replica for a key (triggered by client-side disk
@@ -1643,6 +1649,8 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+
+    SharedNvmeKvIdAllocator shared_kv_id_allocator_;
 
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
