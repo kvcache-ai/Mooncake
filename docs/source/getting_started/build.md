@@ -57,6 +57,21 @@ make -j
 sudo make install
 ```
 
+(build-with-mlu-store)=
+### Build with MLU Store Support
+
+Install the Cambricon Neuware SDK. If it is installed outside
+`/usr/local/neuware`, set `NEUWARE_HOME` to its root directory.
+
+Follow the Default Build steps above, adding
+`-DWITH_STORE=ON -DUSE_MLU=ON -DUSE_CUDA=OFF` to the `cmake ..` command.
+
+For the Python Tensor API, install `torch_mlu` along with the `torch` and
+Neuware SDK versions supported by that release.
+
+For Tensor offload and reload examples, see
+{ref}`MLU Tensor Offload and Reload <mlu-tensor-offload-and-reload>`.
+
 (build-with-intel-xpu)=
 ### Build with Intel XPU
 

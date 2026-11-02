@@ -98,11 +98,12 @@ MC_MS_AUTO_DISC=1 MC_MS_FILTERS="mlx5_1,mlx5_2" python3 mooncake-store/tests/str
 
 The absence of errors indicates successful data transfer.
 
+(mlu-tensor-offload-and-reload)=
 ### MLU Tensor Offload and Reload
 
-Build Mooncake with `-DWITH_STORE=ON -DUSE_MLU=ON -DUSE_CUDA=OFF`
-and a compatible Neuware SDK (see [build configuration](../getting_started/build.md)).
-Install matching `torch` and `torch_mlu` packages for the Python Tensor API.
+Follow the {ref}`MLU Store build instructions <build-with-mlu-store>`
+before running this example.
+
 Store uses CNRT for MLU pointer detection, device selection, synchronous copies,
 and pinned host buffers. Both Classic TE and TENT can use this Store backend.
 
