@@ -58,6 +58,11 @@ class TransferEngineImplTestPeer {
     static bool hasActiveRuntimeQueue(tent::TransferEngineImpl& engine) {
         return engine.hasActiveRuntimeQueue();
     }
+    static bool hasTransportBandwidthProvider(
+        tent::TransferEngineImpl& engine) {
+        return static_cast<bool>(
+            engine.runtime_queue_->transport_bandwidth_provider_);
+    }
     // What the RDMA transport would install at construction; the tests swap
     // in a fake RDMA transport afterwards, so they install the provider here.
     static void setBandwidthProvider(tent::TransferEngineImpl& engine,
@@ -539,6 +544,31 @@ class MeteredFakeTransport : public FakeTransport {
         return bandwidth_bps.load();
     }
 };
+
+TEST(RuntimeQueueDispatch,
+     InstallsBandwidthProviderOnlyForFinitePositiveThreshold) {
+    for (auto transport : {RDMA, UB}) {
+        for (double theta :
+             {0.0, -1.0, std::nan(""), std::numeric_limits<double>::infinity(),
+              -std::numeric_limits<double>::infinity(), 0.5, 1.25}) {
+            SCOPED_TRACE(testing::Message()
+                         << "transport=" << transport << " theta=" << theta);
+            auto cfg = makeRuntimeQueueConfig(4, 1UL << 20);
+            cfg->set("runtime_queue/deadline_aware", true);
+            cfg->set("runtime_queue/mlu_local_threshold", theta);
+            TransferEngineImpl engine(cfg);
+            ASSERT_TRUE(engine.available());
+            EXPECT_FALSE(
+                TransferEngineImplTestPeer::hasTransportBandwidthProvider(
+                    engine));
+            engine.swapTransportForTest(
+                transport, std::make_shared<MeteredFakeTransport>(transport));
+            EXPECT_EQ(TransferEngineImplTestPeer::hasTransportBandwidthProvider(
+                          engine),
+                      theta > 0.0 && std::isfinite(theta));
+        }
+    }
+}
 
 TEST(RuntimeQueueDispatch, DropReadsBandwidthFromTheRdmaTransport) {
     auto cfg = makeRuntimeQueueConfig(4, 1UL << 20);

@@ -33,6 +33,15 @@ namespace tent {
 // Counted separately; never mixed into latency or bandwidth.
 inline constexpr double kTransferDropped = -2.0;
 
+struct TransferResult {
+    double duration_us = -1.0;
+    uint64_t transferred_bytes = 0;
+    uint64_t completed = 0;
+    uint64_t dropped = 0;
+    // Populated only for mixed completed/canceled batches, for data checks.
+    std::vector<size_t> completed_indices;
+};
+
 enum class IntentType : int;
 
 class BenchRunner {
@@ -42,6 +51,23 @@ class BenchRunner {
 
     BenchRunner(const BenchRunner&) = delete;
     BenchRunner& operator=(const BenchRunner&) = delete;
+
+    virtual double deadlineDropThreshold() const { return 0.0; }
+
+    virtual TransferResult runTransfer(uint64_t local_addr, uint64_t target_id,
+                                       uint64_t target_addr,
+                                       uint64_t block_size, uint64_t batch_size,
+                                       OpCode opcode, uint64_t deadline_ns,
+                                       IntentType intent_type) {
+        const double duration =
+            runSingleTransfer(local_addr, target_id, target_addr, block_size,
+                              batch_size, opcode, deadline_ns, intent_type);
+        return {duration,
+                duration >= 0 ? block_size * batch_size : 0,
+                duration >= 0 ? batch_size : 0,
+                0,
+                {}};
+    }
 
     virtual void pinThread(int thread_id) = 0;
 

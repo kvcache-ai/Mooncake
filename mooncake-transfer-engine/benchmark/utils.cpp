@@ -168,6 +168,16 @@ DEFINE_string(tent_intent_type, "unspec",
 
 namespace mooncake {
 namespace tent {
+
+void printDeadlineDropStats(double theta, const XferBenchStats& stats) {
+    // printStats leaves cout in fixed/precision(1); use independent formatting.
+    std::ostringstream line;
+    line << "  [deadline-drop] mlu_local_threshold="
+         << std::setprecision(std::numeric_limits<double>::max_digits10)
+         << theta << " completed=" << stats.completed_tasks
+         << " dropped=" << stats.dropped;
+    std::cout << line.str() << std::endl;
+}
 std::string XferBenchConfig::seg_name;
 std::string XferBenchConfig::seg_type;
 std::string XferBenchConfig::seg_type_mix;
@@ -351,8 +361,9 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
     double avg_latency = 0, throughput_gb = 0;
     auto num_ops = stats.transfer_duration.count();
     double total_duration = stats.total_duration.avg();
-    total_data_transferred = ((block_size * batch_size) * num_ops);
-    avg_latency = (total_duration * num_threads / num_ops);
+    total_data_transferred =
+        stats.transferred_bytes.value_or((block_size * batch_size) * num_ops);
+    avg_latency = num_ops == 0 ? 0.0 : (total_duration * num_threads / num_ops);
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6));  // In GB/Sec
     const double avg_instant_gbps = stats.instant_bandwidth.avg();
@@ -375,19 +386,19 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
 
 void printDeadlineGroupStats(const char* group, size_t block_size,
                              size_t batch_size, XferBenchStats& stats,
-                             int num_threads, uint64_t deadline_us) {
+                             int num_threads, uint64_t deadline_us,
+                             bool show_drops) {
     if (num_threads <= 0 ||
         (stats.transfer_duration.count() == 0 && stats.dropped == 0))
         return;
     const double duration_s = stats.total_duration.avg() / 1e6;
-    const double bytes = static_cast<double>(block_size) * batch_size *
-                         stats.transfer_duration.count();
+    const double bytes = stats.transferred_bytes.value_or(
+        block_size * batch_size * stats.transfer_duration.count());
     const double throughput_gbs = bytes / 1e9 / duration_s;
     std::cout << "  [deadline-" << group << "] threads=" << num_threads;
     if (deadline_us != 0) std::cout << " deadline_us=" << deadline_us;
     std::cout << " operations=" << stats.transfer_duration.count();
-    if (XferBenchConfig::mlu_local_threshold > 0.0)
-        std::cout << " dropped=" << stats.dropped;
+    if (show_drops) std::cout << " dropped=" << stats.dropped;
     std::cout << " throughput=" << std::fixed << std::setprecision(6)
               << throughput_gbs << " GB/s" << std::endl;
 }

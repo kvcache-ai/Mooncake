@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -105,6 +106,10 @@ struct PreservedTentConfigOverrides {
     std::optional<bool> ascend_agent_mode;
     std::optional<bool> ascend_store_te_init;
     std::optional<bool> ascend_fabric_mem;
+    std::optional<bool> enable_runtime_queue;
+    std::optional<bool> deadline_aware;
+    std::optional<double> mlu_local_threshold;
+    std::optional<bool> deadline_bw_arbitration;
     std::optional<bool> memfabric_store_te_init;
 };
 
@@ -238,6 +243,14 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "transports/ascend_direct/store_te_init", false);
     preserved.ascend_fabric_mem = captureExplicitConfigValue(
         config, "transports/ascend_direct/fabric_mem", false);
+    preserved.enable_runtime_queue =
+        captureExplicitConfigValue(config, "enable_runtime_queue", false);
+    preserved.deadline_aware = captureExplicitConfigValue(
+        config, "runtime_queue/deadline_aware", false);
+    preserved.mlu_local_threshold = captureExplicitConfigValue(
+        config, "runtime_queue/mlu_local_threshold", 0.0);
+    preserved.deadline_bw_arbitration = captureExplicitConfigValue(
+        config, "transports/rdma/deadline_bw_arbitration", false);
     preserved.memfabric_store_te_init = captureExplicitConfigValue(
         config, "transports/memfabric/store_te_init", false);
     return preserved;
@@ -274,6 +287,15 @@ void restoreExplicitTransferEngineConfig(
                                preserved.ascend_store_te_init);
     restoreExplicitConfigValue(config, "transports/ascend_direct/fabric_mem",
                                preserved.ascend_fabric_mem);
+    restoreExplicitConfigValue(config, "enable_runtime_queue",
+                               preserved.enable_runtime_queue);
+    restoreExplicitConfigValue(config, "runtime_queue/deadline_aware",
+                               preserved.deadline_aware);
+    restoreExplicitConfigValue(config, "runtime_queue/mlu_local_threshold",
+                               preserved.mlu_local_threshold);
+    restoreExplicitConfigValue(config,
+                               "transports/rdma/deadline_bw_arbitration",
+                               preserved.deadline_bw_arbitration);
     restoreExplicitConfigValue(config, "transports/memfabric/store_te_init",
                                preserved.memfabric_store_te_init);
 }
@@ -2743,7 +2765,8 @@ Status TransferEngineImpl::cancelQueuedOwner(QueueOwnerId owner_id) {
 
 void TransferEngineImpl::installDegradationPolicy() {
     if (!runtime_queue_ || !runtime_queue_config_.limits.deadline_aware ||
-        runtime_queue_config_.limits.mlu_local_threshold <= 0.0) {
+        !(runtime_queue_config_.limits.mlu_local_threshold > 0.0) ||
+        !std::isfinite(runtime_queue_config_.limits.mlu_local_threshold)) {
         return;
     }
     std::array<std::weak_ptr<Transport>, kSupportedTransportTypes>

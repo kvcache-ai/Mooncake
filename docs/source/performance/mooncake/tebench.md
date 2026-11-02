@@ -586,17 +586,24 @@ gpu_id + thread_id
   Requires `--deadline_aware`. The drop reads the bandwidth estimate of the
   RDMA or UB transport that carries the transfer and only acts on transfers
   routed over those two; on a TCP-only host it does nothing.
-  A dropped transfer is counted, not treated as a failure: it is left out of
-  the latency and bandwidth columns, the case ends with a
+  A dropped task is counted, not treated as a failure. Partially completed
+  batches retain their completed tasks' bytes and one batch latency sample;
+  fully dropped batches contribute neither bytes nor latency samples.
+  The case ends with a
   `[deadline-drop] ... completed=<N> dropped=<M>` line, and the
   `[deadline-tight]` / `[deadline-loose]` lines gain a `dropped=` field.
-  `Avg Lat` divides wall time by completed operations, so it also absorbs the
+  These two counts are tasks, rather than batches. Split JSONL records for
+  canceled batches also include `completed` and `dropped` task counts.
+  `Avg Lat` divides wall time by batches with completed tasks, so it also absorbs the
   time spent on dropped attempts; read transfer latency from `Avg Tx`.
 * `--deadline_bw_arbitration` : order slices most-urgent-first before posting
   on a NIC (`transports/rdma/deadline_bw_arbitration`).
 
-These flags only add keys to the engine config; a `MC_TENT_CONF` file keeps
-its own `runtime_queue` settings when they are left at their defaults. See the
+Explicit deadline flags override the corresponding leaves in `MC_TENT_CONF`;
+other queue settings remain intact. With flags left at their defaults, the
+file controls deadline scheduling and the benchmark uses the effective engine
+configuration to report drops. With `--deadline_aware`, an explicit
+`--mlu_local_threshold=0` disables a threshold set in the file. See the
 [deadline scheduling design](../../design/tent/deadline-scheduling.md).
 
 **Metadata service**

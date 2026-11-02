@@ -16,6 +16,7 @@
 #define XFER_UTILS_H
 
 #include <string>
+#include <optional>
 #include <unordered_map>
 #include <cmath>
 #include <sstream>
@@ -166,9 +167,12 @@ struct XferBenchStats {
     XferMetricStats total_duration;
     XferMetricStats transfer_duration;
     XferMetricStats instant_bandwidth;
-    // Operations the admission queue dropped (--mlu_local_threshold); they
-    // are not in transfer_duration or instant_bandwidth.
-    uint64_t dropped = 0;
+    // Canceled tasks contribute no payload bytes. A partially completed batch
+    // contributes one latency sample and only its completed tasks' bytes.
+    uint64_t dropped = 0;  // tasks, not batches
+    uint64_t completed_tasks = 0;
+    // Set by the runner when partial batches can complete.
+    std::optional<uint64_t> transferred_bytes;
 };
 
 class XferBenchTimer {
@@ -196,12 +200,15 @@ class XferBenchTimer {
 
 void printStatsHeader();
 
+void printDeadlineDropStats(double theta, const XferBenchStats& stats);
+
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
 
 void printDeadlineGroupStats(const char* group, size_t block_size,
                              size_t batch_size, XferBenchStats& stats,
-                             int num_threads, uint64_t deadline_us);
+                             int num_threads, uint64_t deadline_us,
+                             bool show_drops = false);
 
 std::vector<std::string> splitCommaSeparated(const std::string& value);
 
