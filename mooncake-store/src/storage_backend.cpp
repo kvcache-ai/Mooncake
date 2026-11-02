@@ -15,6 +15,7 @@
 #include <cctype>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <regex>
 #include <set>
@@ -2496,18 +2497,56 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         const bool eviction_enabled = bucket_backend_config_.eviction_policy !=
                                       BucketEvictionPolicy::NONE;
         if (eviction_enabled) {
+            // Roots that live on the same filesystem share its capacity, so
+            // giving each its own 90% would let one device promise several
+            // times the bytes it actually holds. Count every configured root
+            // on a device and split that device's 90% between them. Explicit
+            // quotas are the operator's numbers and are left untouched.
+            std::map<dev_t, std::vector<size_t>> roots_by_device;
+            std::vector<size_t> unstatable;
             for (size_t i = 0; i < disks_.size(); ++i) {
-                if (disks_[i].max_total_size > 0) {
+                struct stat stat_buf;
+                if (::stat(disk_paths_[i].c_str(), &stat_buf) != 0) {
+                    // Cannot tell whether this root shares a device; fall
+                    // back to sizing it on its own.
+                    LOG(WARNING) << "Failed to stat storage root "
+                                 << disk_paths_[i] << " (errno=" << errno
+                                 << "); sizing its default quota on its own";
+                    unstatable.push_back(i);
                     continue;
                 }
-                const auto space_info = fs::space(disk_paths_[i]);
-                disks_[i].max_total_size = static_cast<int64_t>(
-                    space_info.capacity * kDefaultQuotaPercentage);
-                LOG(INFO) << "Bucket backend max_total_size not set for "
-                          << disk_paths_[i] << "; using "
-                          << kDefaultQuotaPercentage * 100
-                          << "% of disk capacity: " << disks_[i].max_total_size
-                          << " bytes";
+                roots_by_device[stat_buf.st_dev].push_back(i);
+            }
+            auto assign_default = [&](const std::vector<size_t>& roots) {
+                const auto space_info = fs::space(disk_paths_[roots.front()]);
+                const int64_t share = static_cast<int64_t>(
+                    static_cast<double>(space_info.capacity) *
+                    kDefaultQuotaPercentage /
+                    static_cast<double>(roots.size()));
+                for (const size_t i : roots) {
+                    if (disks_[i].max_total_size > 0) {
+                        continue;
+                    }
+                    disks_[i].max_total_size = share;
+                    LOG(INFO)
+                        << "Bucket backend max_total_size not set for "
+                        << disk_paths_[i] << "; using "
+                        << kDefaultQuotaPercentage * 100
+                        << "% of disk capacity"
+                        << (roots.size() > 1 ? " shared with " +
+                                                   std::to_string(roots.size() -
+                                                                  1) +
+                                                   " other root(s) on the "
+                                                   "same filesystem"
+                                             : std::string())
+                        << ": " << disks_[i].max_total_size << " bytes";
+                }
+            };
+            for (const auto& entry : roots_by_device) {
+                assign_default(entry.second);
+            }
+            for (const size_t i : unstatable) {
+                assign_default({i});
             }
         }
         // Keep the scalar config in sync for the code that still consults it

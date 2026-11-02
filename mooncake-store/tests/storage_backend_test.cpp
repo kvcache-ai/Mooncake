@@ -6258,6 +6258,44 @@ TEST_F(StorageBackendTest, MultiDiskManifestAddDiskSucceeds) {
     }
 }
 
+// Roots on one filesystem share a single device's capacity: defaulting each
+// of them to 90% of the whole device would count the same bytes twice.
+TEST_F(StorageBackendTest, MultiDiskDefaultsSplitCapacityOnSharedFilesystem) {
+    const std::string disk0 = data_path + "/disk0";
+    const std::string disk1 = data_path + "/disk1";
+    fs::create_directories(disk0);
+    fs::create_directories(disk1);
+    struct stat stat0;
+    struct stat stat1;
+    ASSERT_EQ(::stat(disk0.c_str(), &stat0), 0);
+    ASSERT_EQ(::stat(disk1.c_str(), &stat1), 0);
+    if (stat0.st_dev != stat1.st_dev) {
+        GTEST_SKIP() << "the test roots landed on different filesystems";
+    }
+    std::error_code ec;
+    const auto capacity = fs::space(disk0, ec).capacity;
+    ASSERT_FALSE(ec);
+
+    FileStorageConfig config;
+    config.storage_filepath = disk0 + "," + disk1;
+    BucketBackendConfig bucket_config;
+    // No quota configured and eviction on, so both roots get a default.
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    const auto quotas = backend.DiskQuotasForTest();
+    ASSERT_EQ(quotas.size(), 2u);
+    for (const auto quota : quotas) {
+        EXPECT_GT(quota, 0);
+        EXPECT_LE(static_cast<uint64_t>(quota), capacity / 2)
+            << "a root on a shared device must get at most its share";
+    }
+    EXPECT_LE(static_cast<uint64_t>(quotas[0] + quotas[1]), capacity)
+        << "the shared device must not be promised more than it holds";
+}
+
 //-----------------------------------------------------------------------------
 
 }  // namespace mooncake::test
