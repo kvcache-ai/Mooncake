@@ -302,26 +302,32 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
 
     std::unordered_map<std::string, StorageValueSpan> spans;
     spans.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto it = allocated_batch->slices.find(keys[i]);
-        if (it == allocated_batch->slices.end()) {
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    for (size_t begin = 0; begin < keys.size();) {
+        spans.clear();
+        size_t end = begin;
+        // The backend accepts one window per key. Flush before a duplicate,
+        // retaining each input's allocation and position in the RPC result.
+        for (; end < keys.size(); ++end) {
+            auto [it, inserted] = spans.emplace(
+                keys[end],
+                StorageValueSpan{
+                    static_cast<uint64_t>(offsets[end]),
+                    static_cast<uint64_t>(object_sizes[end]),
+                    {reinterpret_cast<void*>(allocated_batch->pointers[end]),
+                     static_cast<size_t>(lengths[end])}});
+            if (!inserted) break;
         }
-        spans.emplace(keys[i],
-                      StorageValueSpan{static_cast<uint64_t>(offsets[i]),
-                                       static_cast<uint64_t>(object_sizes[i]),
-                                       it->second});
-    }
-    auto result = BatchLoadSpans(spans);
-    if (!result) {
-        LOG(ERROR) << "Batch load span failed, err_code = " << result.error();
-        return tl::make_unexpected(result.error());
-    }
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const auto& span = spans.at(keys[i]);
-        allocated_batch->slices[keys[i]].ptr = span.slice.ptr;
-        allocated_batch->pointers[i] =
-            reinterpret_cast<uintptr_t>(span.slice.ptr);
+        auto result = BatchLoadSpans(spans);
+        if (!result) {
+            LOG(ERROR) << "Batch load span failed, err_code = "
+                       << result.error();
+            return tl::make_unexpected(result.error());
+        }
+        for (size_t i = begin; i < end; ++i) {
+            allocated_batch->pointers[i] =
+                reinterpret_cast<uintptr_t>(spans.at(keys[i]).slice.ptr);
+        }
+        begin = end;
     }
     return allocated_batch;
 }

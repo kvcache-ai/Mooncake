@@ -33,6 +33,7 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
+class RealClient;
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -994,6 +995,11 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    // Internal range orchestration needs the DFS storage-mode query.
+    friend class RealClient;
+
+    bool UsesObjectStorageDfs() const;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

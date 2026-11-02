@@ -5241,6 +5241,10 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
                         intent);
 }
 
+bool Client::UsesObjectStorageDfs() const {
+    return dfs_storage_backend_ && dfs_storage_backend_->UsesObjectStorage();
+}
+
 ErrorCode Client::ReadDfsReplica(const std::string& key,
                                  const Replica::Descriptor& replica_descriptor,
                                  std::vector<Slice>& slices) {
