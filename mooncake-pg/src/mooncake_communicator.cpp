@@ -16,6 +16,7 @@
 #include "error_types.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
+#include "pg_host_ip_resolve.h"
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 #include "device_comm/device_collective/device_collective.h"
 #include "device_comm/device_collective/device_collective_workspace.h"
@@ -28,6 +29,16 @@ namespace {
 // A non-zero operation size is required to ensure that the worker creates a
 // task for the barrier.
 constexpr size_t kBarrierDummySize = 1;
+
+PGResult<void> ApplyResolvedHostIp(std::string& host_ip) {
+    auto resolved = MaybeResolveRoutableHostIpFromEnv(host_ip);
+    if (resolved.outcome == HostIpResolveOutcome::FailFast) {
+        return makePGError(PGErrorCode::InvalidArgument,
+                           std::move(resolved.error_message));
+    }
+    host_ip = std::move(resolved.host_ip);
+    return {};
+}
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 constexpr size_t kDefaultDeviceCollectiveBufferSize =
     32ull * 1024 * 1024;  // 32 MiB
@@ -217,6 +228,11 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
         PG_VALIDATE_ARG(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
                         "MACA PG requires MC_MACA_HOST_TRANSPORT=1");
 #endif
+        // P2PHANDSHAKE publishes host_ip:<rpc_port> as the segment name. The
+        // default host_ip is 127.0.0.1, which hangs multi-node jobs that forget
+        // set_host_ip(); resolve a routable address when MASTER_ADDR indicates
+        // multi-node (#4981).
+        PG_TRY(ApplyResolvedHostIp(host_ip));
         PG_TRY_TE(engine->init(P2PHANDSHAKE, host_ip));
         engine_initialized = true;
     }
@@ -1810,23 +1826,15 @@ void MooncakeCommunicator::applyGroupState(
             }
             break;
         case CollectiveExtensionState::Normal:
-            // Build the new mask before publishing it. Clearing the shared
-            // array first creates a window in which a rank that remains active
-            // can observe its own slot as inactive and reject a collective.
-            // Write each slot's final value once instead.
-            {
-                std::vector<bool> next_active_ranks(meta_->maxGroupSize, false);
-                for (size_t local_rank = 0; local_rank < view.rank_order.size();
-                     ++local_rank) {
-                    const auto global_rank = view.rank_order[local_rank];
-                    next_active_ranks[local_rank] =
-                        view.members[global_rank].isActive();
-                }
-                for (int local_rank = 0; local_rank < meta_->maxGroupSize;
-                     ++local_rank) {
-                    meta_->activeRanks[local_rank] =
-                        next_active_ranks[local_rank];
-                }
+            for (int local_rank = 0; local_rank < meta_->maxGroupSize;
+                 ++local_rank) {
+                meta_->activeRanks[local_rank] = false;
+            }
+            for (size_t local_rank = 0; local_rank < view.rank_order.size();
+                 ++local_rank) {
+                const auto global_rank = view.rank_order[local_rank];
+                meta_->activeRanks[local_rank] =
+                    view.members[global_rank].isActive();
             }
             break;
     }
