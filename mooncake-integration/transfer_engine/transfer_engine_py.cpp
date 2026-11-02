@@ -959,6 +959,41 @@ batch_id_t TransferEnginePy::batchTransferAsyncReadArrays(
                               TransferOpcode::READ, transport_hint, nic_hint);
 }
 
+// Block until the batch signals completion or the deadline passes.
+//
+// The classic transport publishes BatchDesc::completion_cv when a batch reaches
+// a terminal state (transport.h), and Mooncake Store's transfer_task.cpp
+// already waits on it. The sync wrappers used to spin on getTransferStatus with
+// no sleep or yield, which kept a core busy for every in-flight transfer; this
+// parks the caller instead and leaves the timeout and retry policy above
+// untouched.
+//
+// TENT batches do not use the classic BatchDesc layout, so they keep the
+// polling behaviour. With USE_EVENT_DRIVEN_COMPLETION off nothing is published
+// and the call is a no-op for the same reason.
+static void waitForBatchCompletion(
+    const std::shared_ptr<TransferEngine>& engine, BatchID batch_id,
+    int64_t deadline_nsec) {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    if (engine->isUsingTent()) return;
+    auto& batch_desc = Transport::toBatchDesc(batch_id);
+    if (batch_desc.is_finished.load(std::memory_order_acquire)) return;
+    const int64_t remaining = deadline_nsec - getCurrentTimeInNano();
+    if (remaining <= 0) return;
+    // The same mutex the notifier takes when it updates the predicate, so a
+    // notify cannot land between the check above and the wait here.
+    std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+    batch_desc.completion_cv.wait_for(
+        lock, std::chrono::nanoseconds(remaining), [&batch_desc] {
+            return batch_desc.is_finished.load(std::memory_order_relaxed);
+        });
+#else
+    (void)engine;
+    (void)batch_id;
+    (void)deadline_nsec;
+#endif
+}
+
 int TransferEnginePy::transferSync(const char* target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
@@ -1037,7 +1072,10 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         bool completed = false;
         bool release_scheduled = false;
         TransferStatus status;
+        const int64_t deadline_nsec =
+            start_ts + transfer_timeout_nsec_ + length;  // 1GiB per second
         while (!completed) {
+            waitForBatchCompletion(engine_, batch_id, deadline_nsec);
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -1165,7 +1203,10 @@ int TransferEnginePy::batchTransferSync(
         bool completed = false;
         bool release_scheduled = false;
         TransferStatus status;
+        const int64_t deadline_nsec = start_ts + transfer_timeout_nsec_ +
+                                      total_length;  // 1GiB per second
         while (!completed) {
+            waitForBatchCompletion(engine_, batch_id, deadline_nsec);
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
