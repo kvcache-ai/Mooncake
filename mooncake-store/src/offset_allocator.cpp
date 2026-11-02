@@ -635,8 +635,8 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     // allocator state and should not extend the serialized critical section.
     // The handle keeps only a weak reference; weak_from_this() avoids taking
     // and dropping a strong one.
-    return OffsetAllocationHandle(weak_from_this(), allocation, real_base,
-                                  size, reserved_size);
+    return OffsetAllocationHandle(weak_from_this(), allocation, real_base, size,
+                                  reserved_size);
 }
 
 uint64_t OffsetAllocator::normalizedAllocationSize(size_t size) const {
