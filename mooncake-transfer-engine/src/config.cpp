@@ -294,26 +294,6 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_SLICE_SIZE";
     }
 
-    const char* nvlink_async_memcpy_threshold_env =
-        std::getenv("MC_NVLINK_ASYNC_MEMCPY_THRESHOLD");
-    if (nvlink_async_memcpy_threshold_env) {
-        // Strict parse (not atoi): a typo keeps the default instead of
-        // silently enabling or disabling the sync fast path. 0 disables it.
-        uint64_t val = 0;
-        const char* end = nvlink_async_memcpy_threshold_env +
-                          strlen(nvlink_async_memcpy_threshold_env);
-        auto [ptr, ec] =
-            std::from_chars(nvlink_async_memcpy_threshold_env, end, val);
-        if (ec == std::errc() && ptr == end && val <= (1ull << 30)) {
-            config.nvlink_async_memcpy_threshold = static_cast<size_t>(val);
-        } else {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_NVLINK_ASYNC_MEMCPY_THRESHOLD: "
-                         << nvlink_async_memcpy_threshold_env
-                         << ". Expected an integer in range 0-1073741824 (KiB)";
-        }
-    }
-
     const char* min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");
     if (min_reg_size_env) {
         size_t val = atoll(min_reg_size_env);
@@ -982,8 +962,6 @@ void dumpGlobalConfig() {
               << config.rdma_notify_max_pending_sends;
     LOG(INFO) << "rdma_notify_oob_fallback = "
               << (config.rdma_notify_oob_fallback ? "true" : "false");
-    LOG(INFO) << "nvlink_async_memcpy_threshold = "
-              << config.nvlink_async_memcpy_threshold;
 }
 
 GlobalConfig& globalConfig() {

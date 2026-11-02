@@ -555,70 +555,6 @@ static bool submitBatchMemcpyByDevice(
     return true;
 }
 
-// A single small copy completes faster with a blocking cudaMemcpy than with
-// the async stream + stream-query pipeline: the sync call returns with the
-// copy already done and saves the fixed per-copy event/poll overhead, while
-// the copy itself runs at the same speed. Only single-entry batches take
-// this path: batched submissions amortize the per-copy submit cost across
-// entries, and blocking copies serialize inside the driver under
-// concurrency, so multi-entry batches and sizes at/above the threshold keep
-// the async pipeline. Mirrors TENT's transports/nvlink/async_memcpy_threshold
-// (see also MC_NVLINK_ASYNC_MEMCPY_THRESHOLD, in KiB; 0 disables).
-//
-// Returns true when the batch was handled through this path (the slice is
-// terminally marked via the Slice::SUCCESS / FAILED semantics). On a
-// structural failure `error` is set so the caller reports it like
-// submitBatchMemcpyByDevice does; a failed copy only marks the slice.
-static bool trySubmitSingleSyncMemcpy(
-    const std::shared_ptr<GpuIpcTransportPolicy> &policy,
-    const std::vector<Slice *> &slices, const std::vector<void *> &srcs,
-    const std::vector<void *> &dsts, const std::vector<size_t> &sizes,
-    std::string &error) {
-    const uint64_t threshold =
-        globalConfig().nvlink_async_memcpy_threshold * 1024;
-    if (threshold == 0 || slices.size() != 1 || sizes.front() >= threshold)
-        return false;
-
-    Slice *slice = slices.front();
-    // Keep the policy's device discipline: MUSA issues its memcpy against
-    // the current device context, so guard around the copy. CUDA's legacy
-    // path already runs with the caller's active device.
-    const int device = policy->selectStreamDevice(slice->source_addr,
-                                                  srcs.front(), dsts.front());
-    if (device < 0) {
-        error = std::string(policy->displayName()) +
-                ": policy returned an invalid stream device";
-        slice->markFailed();
-        return true;
-    }
-
-    cudaError_t err = cudaSuccess;
-    if (policy->requiresStreamDeviceGuard()) {
-        ScopedCudaDevice guard(device);
-        if (!guard.ok()) {
-            error = std::string(policy->displayName()) +
-                    ": failed to select transfer device " +
-                    std::to_string(device);
-            slice->markFailed();
-            return true;
-        }
-        err = cudaMemcpy(dsts.front(), srcs.front(), sizes.front(),
-                         cudaMemcpyDefault);
-    } else {
-        err = cudaMemcpy(dsts.front(), srcs.front(), sizes.front(),
-                         cudaMemcpyDefault);
-    }
-
-    if (err == cudaSuccess) {
-        slice->markSuccess();
-    } else {
-        LOG(ERROR) << "NvlinkTransport: synchronous cudaMemcpy failed: "
-                   << cudaGetErrorString(err);
-        slice->markFailed();
-    }
-    return true;
-}
-
 static int getNumDevices() {
     static int cached_num_devices = -1;
     if (cached_num_devices == -1) {
@@ -898,11 +834,6 @@ Status NvlinkTransport::submitTransfer(
     // Phase 2: Let the backend choose the submission device after IPC address
     // relocation, grouping a mixed-target batch by the selected device.
     std::string submit_error;
-    if (trySubmitSingleSyncMemcpy(policy_, slices, srcs, dsts, sizes,
-                                  submit_error)) {
-        if (!submit_error.empty()) return Status::Context(submit_error);
-        return Status::OK();
-    }
     if (!submitBatchMemcpyByDevice(policy_, slices, srcs, dsts, sizes,
                                    submit_error)) {
         return Status::Context(submit_error);
@@ -1038,11 +969,6 @@ Status NvlinkTransport::submitTransferTask(
 
     // Phase 2: See submitTransfer() for backend-specific stream grouping.
     std::string submit_error;
-    if (trySubmitSingleSyncMemcpy(policy_, slices, srcs, dsts, sizes,
-                                  submit_error)) {
-        if (!submit_error.empty()) return Status::Context(submit_error);
-        return Status::OK();
-    }
     if (!submitBatchMemcpyByDevice(policy_, slices, srcs, dsts, sizes,
                                    submit_error)) {
         return Status::Context(submit_error);
