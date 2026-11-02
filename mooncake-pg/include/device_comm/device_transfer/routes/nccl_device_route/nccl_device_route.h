@@ -33,9 +33,10 @@ class NcclDeviceRoute : public RouteProvider {
                                     size_t size) override;
     std::optional<RouteEndpoint> localEndpoint() override;
     // Each coordinated installation prepares a new nccl communicator.
-    PGResult<void> installEndpoints(const DeviceTransferSnapshot& snapshot,
-                                    uint64_t reclaim_before_version) override;
-    PGResult<std::vector<DeviceTransferRoute>> updateRoutes() override;
+    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> installEndpoints(
+        const DeviceTransferSnapshot& snapshot,
+        uint64_t reclaim_before_version) override;
+    PGResult<void> updateRoutes() override;
     void fillDeviceContext(DeviceRouteContext& context) const noexcept override;
     PGResult<void> shutdown() override;
 

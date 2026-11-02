@@ -73,8 +73,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         int max_world_size,
         std::chrono::microseconds fault_reconciliation_window =
             std::chrono::microseconds(50000),
-        std::optional<DeviceAllReduceAlgorithm> all_reduce_algorithm =
-            std::nullopt);
+        std::optional<std::vector<DeviceCollectiveAlgorithmChoice>>
+            collective_algorithm_choices_override = std::nullopt);
 
     void setFaultReconciliationWindow(
         std::chrono::microseconds fault_reconciliation_window);
@@ -162,6 +162,11 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     struct PendingTransferEndpointInstallation {
         // Fixed endpoint snapshot sent to the participating agents.
         DeviceTransferSnapshot snapshot;
+        // Reachability and capabilities reported by each rank after installing
+        // this snapshot. Indexed by [source][destination], both GlobalRanks.
+        // Each accepted ACK fills one source row. Used for algorithm selection
+        // once the installation completes.
+        std::vector<std::vector<DeviceTransferRouteInfo>> routes;
         std::unordered_set<GlobalRank> waiting_acks;
         std::chrono::steady_clock::time_point deadline;
     };
@@ -181,6 +186,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // bottleneck.
     bool transfer_endpoint_updates_started_ = false;
     std::optional<DeviceTransferSnapshot> installed_transfer_endpoints_;
+    // Route capabilities for installed_transfer_endpoints_, indexed by
+    // [source][destination] GlobalRank.
+    std::vector<std::vector<DeviceTransferRouteInfo>>
+        installed_transfer_routes_;
     std::optional<PendingTransferEndpointInstallation>
         pending_transfer_endpoint_installation_;
     uint64_t next_transfer_snapshot_version_ = 1;
@@ -244,8 +253,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     FaultReconciliationContext reconciliation_ctx_;
     std::chrono::microseconds fault_reconciliation_window_;
 
-    // Unset uses size-based selection.
-    const std::optional<DeviceAllReduceAlgorithm> all_reduce_algorithm_;
+    // When unset, derive the policy from group capabilities. Otherwise use the
+    // supplied policy.
+    const std::optional<std::vector<DeviceCollectiveAlgorithmChoice>>
+        collective_algorithm_choices_override_;
 
     // requestShutdown() freezes the ranks whose current Agent sessions must
     // end before the state machine asks the Host to stop serving RPCs. New
@@ -306,9 +317,8 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Called after every state-changing operation.
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
 
-    // Resolve actives members' preferences into the backend published in the
-    // next GroupView. Called before bootstrap and membership ViewUpdates.
-    void resolveGpuCollectiveBackend(GroupView& view);
+    // Select the backend and algorithms published in the next GroupView.
+    void updateCollectiveSelection(GroupView& view);
 
     void processGroupRegistration(const RegisterGroupRequest& request,
                                   const GroupId& group_id,
