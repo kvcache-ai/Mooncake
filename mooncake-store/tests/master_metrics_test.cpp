@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -308,7 +309,7 @@ TEST_F(MasterMetricsTest, UnevictableMemGaugesTrackPutsAndLeases) {
     auto& metrics = MasterMetricManager::instance();
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
-    WrappedMasterService service_(service_config);
+    auto service = std::make_unique<WrappedMasterService>(service_config);
 
     Segment segment;
     segment.id = generate_uuid();
@@ -316,7 +317,7 @@ TEST_F(MasterMetricsTest, UnevictableMemGaugesTrackPutsAndLeases) {
     segment.base = 0x300000000;
     segment.size = 1024 * 1024 * 16;
     UUID client_id = generate_uuid();
-    ASSERT_TRUE(service_.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
 
     // The gauges are refreshed by the eviction thread about once a second.
     auto wait_for = [&](int64_t processing, int64_t leased) {
@@ -338,17 +339,17 @@ TEST_F(MasterMetricsTest, UnevictableMemGaugesTrackPutsAndLeases) {
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_.PutStart(client_id, key, value_length, config).has_value());
+        service->PutStart(client_id, key, value_length, config).has_value());
     EXPECT_TRUE(wait_for(value_length, 0));
 
-    ASSERT_TRUE(service_
-                    .PutEnd(client_id, ObjectMeta{key, std::nullopt},
-                            ReplicaType::MEMORY)
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                             ReplicaType::MEMORY)
                     .has_value());
     EXPECT_TRUE(wait_for(0, 0));
 
     // A read grants a lease, which pins the complete replica until it expires.
-    ASSERT_TRUE(service_.GetReplicaList(key, "default").has_value());
+    ASSERT_TRUE(service->GetReplicaList(key, "default").has_value());
     EXPECT_TRUE(wait_for(0, value_length));
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
@@ -358,6 +359,15 @@ TEST_F(MasterMetricsTest, UnevictableMemGaugesTrackPutsAndLeases) {
     EXPECT_NE(serialized.find("master_mem_processing_bytes"),
               std::string::npos);
     EXPECT_NE(serialized.find("master_mem_leased_bytes"), std::string::npos);
+
+    // A master that steps down must not keep reporting its last sample.
+    ASSERT_TRUE(
+        service->PutStart(client_id, "unevictable_key_2", value_length, config)
+            .has_value());
+    EXPECT_TRUE(wait_for(value_length, 0));
+    service.reset();
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), 0);
+    EXPECT_EQ(metrics.get_mem_leased_bytes(), 0);
 }
 
 TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {

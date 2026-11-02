@@ -9715,6 +9715,11 @@ void MasterService::EvictionThreadFunc() {
             std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
 
+    // This thread is the only updater of the unevictable gauges; zero them so
+    // a master that stepped down does not keep reporting its last sample.
+    MasterMetricManager::instance().set_mem_processing_bytes(0);
+    MasterMetricManager::instance().set_mem_leased_bytes(0);
+
     VLOG(1) << "action=eviction_thread_stopped";
 }
 

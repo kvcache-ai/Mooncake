@@ -186,7 +186,14 @@ once a second.
 Divided by `master_total_capacity_bytes`, these give the write, read and total
 (sum) usage that clients such as vLLM's Mooncake store connector report. Read
 usage includes the whole lease TTL (`default_kv_lease_ttl`), not only the time
-a read transfer takes.
+a read transfer takes. Both gauges read `0` once the master stops serving, for
+example after an HA step-down.
+
+Replicas displaced by an overwrite, a preempted put or a timed-out put leave
+the object metadata, so the walk does not count them, but their memory stays
+allocated until deferred release. `master_put_start_discarded_staging_size`
+reports those bytes. The memory eviction cannot reclaim is the sum of all three
+gauges.
 
 ### Process and Allocator Memory Metrics
 
