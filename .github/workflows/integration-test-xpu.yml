@@ -171,6 +171,12 @@ jobs:
               || fail "Not a GPU render character device: $device"
             device_args+=(--device "$device" --group-add "$(stat -c %g "$device")")
           done
+
+          # Cap container CPU visibility: affinity-sized native pools (oneTBB,
+          # SYCL, glibc nproc) across the master and both PD vLLM processes
+          # otherwise exhaust the 1024-PID budget on many-core hosts.
+          cpuset=$(python3 -c 'import os; print(",".join(str(cpu) for cpu in sorted(os.sched_getaffinity(0))[:32]))')
+          [[ "$cpuset" =~ ^[0-9]+(,[0-9]+)*$ ]] || fail "Cannot derive a bounded container CPU set"
           python3 "$control_directory/e2e/python/verify_xpu_wheel.py" seccomp "$run_directory/output/seccomp.json"
 
           container_id=
@@ -197,7 +203,7 @@ jobs:
             --security-opt no-new-privileges \
             --security-opt "seccomp=$run_directory/output/seccomp.json" \
             --network none --ipc private --shm-size 2g \
-            --pids-limit 1024 --ulimit core=0 \
+            --pids-limit 1024 --ulimit core=0 --cpuset-cpus "$cpuset" \
             "${device_args[@]}" \
             --mount "type=bind,src=$run_directory/bundle,dst=/bundle,readonly" \
             --mount "type=bind,src=$source_directory,dst=/source,readonly" \

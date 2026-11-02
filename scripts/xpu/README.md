@@ -155,6 +155,14 @@ thread budget on large CPU hosts. Tokenizer parallelism remains enabled,
 the container's 1024-PID limit and the core profile remain unchanged.
 `cpu-resources.json` retains CPU visibility and the enforced thread settings.
 
+The hardware container is additionally pinned to at most 32 of the runner's
+CPUs via `--cpuset-cpus`. Native pools sized from CPU affinity (oneTBB, SYCL,
+glibc `nproc`) are not covered by the thread environment above; on many-core
+hosts the master plus both PD vLLM processes otherwise exceed the 1024-PID
+budget, aborting the decode side's first KV pull with
+`std::system_error: Resource temporarily unavailable`. The PID limit itself
+stays at 1024, and `cpu-resources.json` records the resulting affinity.
+
 Nightly Gate requires the builder and both selected hardware jobs to succeed.
 Missing results, unexpected skips, cancellation, test errors, absent completion
 records, invalid JSON results, or cleanup failures cannot pass. Hardware jobs

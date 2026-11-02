@@ -1874,6 +1874,32 @@ class ApplicationTest(unittest.TestCase):
         launch = hardware_step("Execute isolated two-B60 core")
         self.assertIn("--pids-limit 1024", launch)
 
+    def test_container_cpu_set_is_bounded_validated_and_applied(self):
+        launch = hardware_step("Execute isolated two-B60 core")
+        self.assertIn('--cpuset-cpus "$cpuset"', launch)
+        self.assertIn("--pids-limit 1024", launch)
+        self.assertIn(
+            '[[ "$cpuset" =~ ^[0-9]+(,[0-9]+)*$ ]] '
+            '|| fail "Cannot derive a bounded container CPU set"',
+            launch,
+        )
+        derivation = next(
+            line for line in launch.splitlines() if line.lstrip().startswith("cpuset=$(")
+        )
+        match = re.search(r"python3 -c '([^']+)'", derivation)
+        self.assertIsNotNone(match, derivation)
+        result = subprocess.run(
+            [sys.executable, "-c", match.group(1)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cpus = [int(cpu) for cpu in result.stdout.strip().split(",")]
+        self.assertTrue(cpus, "Derived CPU set must not be empty")
+        self.assertLessEqual(len(cpus), 32)
+        self.assertLessEqual(set(cpus), os.sched_getaffinity(0))
+
     def test_artifact_install_dispatches_only_the_selected_suite(self):
         for selected, mode in (
             ("core", "suite"),
