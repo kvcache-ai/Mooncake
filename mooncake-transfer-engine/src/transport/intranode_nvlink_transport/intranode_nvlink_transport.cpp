@@ -202,8 +202,9 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
             LOG(INFO) << "IntraNodeNvlinkTransport: using cudaMemcpyBatchAsync "
                       << "(CUDA >= 12.8 path)";
         } else {
-            LOG(INFO) << "IntraNodeNvlinkTransport: using per-slice cudaMemcpyAsync "
-                      << "(libcudart.so.12 older than 12.8)";
+            LOG(INFO)
+                << "IntraNodeNvlinkTransport: using per-slice cudaMemcpyAsync "
+                << "(libcudart.so.12 older than 12.8)";
         }
 #else
         LOG(INFO)

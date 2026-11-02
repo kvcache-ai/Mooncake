@@ -13,8 +13,7 @@
 // Include this after the CUDA runtime header (cuda_runtime.h, or
 // cuda_alike.h). It is empty for non-CUDA builds and for CUDA < 12.8.
 
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080 && \
-    CUDART_VERSION < 13000
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080 && CUDART_VERSION < 13000
 
 #include <dlfcn.h>
 
@@ -50,13 +49,15 @@ inline CudaMemcpyBatchAsyncFn loadCudaMemcpyBatchAsync() {
 // Same contract as the CUDA 12.8 cudaMemcpyBatchAsync. Without it, each copy
 // is submitted with cudaMemcpyAsync on `stream`; on an error, *failIdx is the
 // index of the first copy that was not submitted.
-inline cudaError_t cudaMemcpyBatchAsyncCompat(
-    void **dsts, void **srcs, size_t *sizes, size_t count,
-    cudaMemcpyAttributes *attrs, size_t *attrsIdxs, size_t numAttrs,
-    size_t *failIdx, cudaStream_t stream) {
+inline cudaError_t cudaMemcpyBatchAsyncCompat(void **dsts, void **srcs,
+                                              size_t *sizes, size_t count,
+                                              cudaMemcpyAttributes *attrs,
+                                              size_t *attrsIdxs,
+                                              size_t numAttrs, size_t *failIdx,
+                                              cudaStream_t stream) {
     if (CudaMemcpyBatchAsyncFn fn = loadCudaMemcpyBatchAsync()) {
-        return fn(dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs,
-                  failIdx, stream);
+        return fn(dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, failIdx,
+                  stream);
     }
     for (size_t i = 0; i < count; ++i) {
         cudaError_t err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i],
