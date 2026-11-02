@@ -45,6 +45,16 @@ __device__ __forceinline__ int mc_atomic_add_release(const int* ptr, int val) {
     return atomicAdd(const_cast<int*>(ptr), val);
 }
 
+// Keep the platform's existing ordering until a narrower scope is validated.
+__device__ __forceinline__ int mc_ld_acquire_gpu(const int* ptr) {
+    return mc_ld_acquire(ptr);
+}
+
+__device__ __forceinline__ int mc_atomic_add_release_gpu(const int* ptr,
+                                                       int val) {
+    return mc_atomic_add_release(ptr, val);
+}
+
 __device__ __forceinline__ int4 mc_ld_nc(const int4* ptr) { return __ldg(ptr); }
 
 __device__ __forceinline__ int mc_ld_nc_s32(const int* ptr) {

@@ -13,10 +13,11 @@ namespace mooncake {
 
 using mooncake::device::CommCtx;
 using mooncake::device::make_comm_ctx;
-using mooncake::device::mc_atomic_add_release;
+using mooncake::device::mc_atomic_add_release_gpu;
 using mooncake::device::mc_bar_sync;
 using mooncake::device::mc_grid_sync;
 using mooncake::device::mc_ld_acquire;
+using mooncake::device::mc_ld_acquire_gpu;
 using mooncake::device::mc_ld_nc;
 using mooncake::device::mc_ld_nc_f32;
 using mooncake::device::mc_ld_nc_s32;
@@ -318,7 +319,7 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                         atomic_finish_counter_per_expert + dst_expert_idx, 1)
                     : 0;
 #else
-                    mc_atomic_add_release(
+                    mc_atomic_add_release_gpu(
                         atomic_finish_counter_per_expert + dst_expert_idx, 1)
                     : 0;
 #endif
@@ -356,8 +357,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 mc_atomic_add_relaxed(atomic_finish_counter_per_expert + i,
                                       FINISHED_SUM_TAG);
 #else
-                mc_atomic_add_release(atomic_finish_counter_per_expert + i,
-                                      FINISHED_SUM_TAG);
+                mc_atomic_add_release_gpu(atomic_finish_counter_per_expert + i,
+                                          FINISHED_SUM_TAG);
 #endif
         }
 
@@ -389,8 +390,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                 mc_atomic_add_relaxed(atomic_finish_counter_per_expert + i,
                                       FINISHED_SUM_TAG - sum);
 #else
-                mc_atomic_add_release(atomic_finish_counter_per_expert + i,
-                                      FINISHED_SUM_TAG - sum);
+                mc_atomic_add_release_gpu(atomic_finish_counter_per_expert + i,
+                                          FINISHED_SUM_TAG - sum);
 #endif
             }
         }
@@ -418,8 +419,8 @@ __device__ __forceinline__ void dispatch_kernel_impl(
                       0) != FINISHED_SUM_TAG * 2) {
         }
 #else
-        while (mc_ld_acquire(atomic_finish_counter_per_expert +
-                             responsible_expert_idx) != FINISHED_SUM_TAG * 2) {
+        while (mc_ld_acquire_gpu(atomic_finish_counter_per_expert +
+                                 responsible_expert_idx) != FINISHED_SUM_TAG * 2) {
         }
 #endif
         if (active_ranks[dst_rank]) {

@@ -70,6 +70,16 @@ __device__ __forceinline__ int mc_atomic_add_release(const int* ptr, int val) {
     return ret;
 }
 
+// Keep the platform's existing ordering until a narrower scope is validated.
+__device__ __forceinline__ int mc_ld_acquire_gpu(const int* ptr) {
+    return mc_ld_acquire(ptr);
+}
+
+__device__ __forceinline__ int mc_atomic_add_release_gpu(const int* ptr,
+                                                       int val) {
+    return mc_atomic_add_release(ptr, val);
+}
+
 // Finish counters are consumed by local CTA/count workers. Cross-GPU
 // publication is fenced once before the final per-expert signal.
 __device__ __forceinline__ int mc_atomic_add_relaxed(const int* ptr, int val) {

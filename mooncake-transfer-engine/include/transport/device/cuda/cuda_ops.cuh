@@ -69,6 +69,23 @@ __device__ __forceinline__ int mc_atomic_add_release(const int* ptr, int val) {
     return ret;
 }
 
+// Local EP counters synchronize CTAs on this GPU. Remote completion signals
+// must continue to use the system-scope operations above.
+__device__ __forceinline__ int mc_ld_acquire_gpu(const int* ptr) {
+    int ret;
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];"
+                 : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ int mc_atomic_add_release_gpu(const int* ptr,
+                                                       int val) {
+    int ret;
+    asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;"
+                 : "=r"(ret) : "l"(ptr), "r"(val));
+    return ret;
+}
+
 // ---------------------------------------------------------------------------
 // Non-coherent loads (read-only cache, no L1 alloc) — for bulk data reads
 // ---------------------------------------------------------------------------

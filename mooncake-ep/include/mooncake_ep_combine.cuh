@@ -13,10 +13,11 @@ namespace mooncake {
 
 using mooncake::device::CommCtx;
 using mooncake::device::make_comm_ctx;
-using mooncake::device::mc_atomic_add_release;
+using mooncake::device::mc_atomic_add_release_gpu;
 using mooncake::device::mc_bar_sync;
 using mooncake::device::mc_grid_sync;
 using mooncake::device::mc_ld_acquire;
+using mooncake::device::mc_ld_acquire_gpu;
 using mooncake::device::mc_ld_nc;
 using mooncake::device::mc_rdma_put;
 using mooncake::device::mc_route_put;
@@ -143,7 +144,7 @@ __device__ __forceinline__ void combine_kernel_impl(
         __syncwarp();
         if (lane_id == 0) mc_atomic_add_relaxed(atomic_clean_flag, num_experts);
 #else
-        if (lane_id == 0) mc_atomic_add_release(atomic_clean_flag, num_experts);
+        if (lane_id == 0) mc_atomic_add_release_gpu(atomic_clean_flag, num_experts);
 #endif
     }
 
@@ -245,7 +246,7 @@ __device__ __forceinline__ void combine_kernel_impl(
 #ifdef MOONCAKE_EP_USE_MUSA
             while (atomicAdd(atomic_clean_flag, 0) == 0);
 #else
-            while (mc_ld_acquire(atomic_clean_flag) == 0);
+            while (mc_ld_acquire_gpu(atomic_clean_flag) == 0);
 #endif
             if (active_ranks[dst_rank]) {
                 if (dst_rank != rank) {
@@ -265,7 +266,7 @@ __device__ __forceinline__ void combine_kernel_impl(
             // is reused after the current kernel completes on the same stream.
             mc_atomic_add_relaxed(atomic_clean_flag, -1);
 #else
-            mc_atomic_add_release(atomic_clean_flag, -1);
+            mc_atomic_add_release_gpu(atomic_clean_flag, -1);
 #endif
         }
         __syncwarp();
