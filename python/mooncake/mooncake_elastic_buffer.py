@@ -412,6 +412,7 @@ class ElasticBuffer:
 
         self.backend = group
         self._generation: Optional[Tuple[int, ...]] = None
+        self._rdma_connection_disabled = False
 
         # Native Mooncake transport/runtime.  This keeps the legacy Buffer ABI
         # untouched while giving ElasticBuffer users a dedicated native entrypoint.
@@ -537,7 +538,26 @@ class ElasticBuffer:
         if self.transport == "nccl":
             return
 
-        if not bool(self.runtime.ibgda_disabled()):
+        if is_update:
+            if (
+                not bool(self.runtime.ibgda_disabled())
+                and not self._rdma_connection_disabled
+            ):
+                self.runtime.update_local_qpns()
+            ibgda_failed = torch.tensor(
+                [int(self.runtime.ibgda_disabled())],
+                dtype=torch.int32,
+                device="cuda",
+            )
+            dist.all_reduce(ibgda_failed, op=dist.ReduceOp.MAX, group=self.group)
+            if bool(ibgda_failed.item()):
+                self._rdma_connection_disabled = True
+                return self._connect_native(False)
+
+        if (
+            not bool(self.runtime.ibgda_disabled())
+            and not self._rdma_connection_disabled
+        ):
             raddr, rkey = self.runtime.get_mr_info()
             raddr_tensor = torch.tensor([raddr], dtype=torch.int64, device="cuda")
             raddrs = [
@@ -556,9 +576,6 @@ class ElasticBuffer:
             rkeys_list = torch.cat(rkeys).tolist()
 
             all_to_all_size = ep.MAX_QP_COUNT // self.num_ranks
-            if is_update:
-                self.runtime.update_local_qpns()
-
             local_qpns = torch.tensor(
                 self.runtime.get_local_qpns(), dtype=torch.int32, device="cuda"
             ).view(-1, all_to_all_size)

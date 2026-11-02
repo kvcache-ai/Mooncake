@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "cuda_alike.h"
+#include "ibgda_cuda_error_handling.h"
 #include "transport/device/ibgda/memheap.h"
 #include "transport/device/ibgda/mlx5_ifc.h"
 #include "transport/device/ibgda/mlx5gda.h"
@@ -359,18 +360,40 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
                 if (retryControlBuffer(qp_errno))
                     return createQueuePairs(stream_ptr);
+                destroyQueuePairs();
                 return -1;
             }
             if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
                 LOG(ERROR) << "[EP IBGDA] rst2init failed at " << i;
                 mlx5gda_destroy_qp(qp);
+                destroyQueuePairs();
                 return -1;
             }
-            cudaStreamSynchronize(stream);
-            const auto devctx = initialQueuePairDeviceContext(qp);
-            cudaMemcpy(
-                static_cast<char*>(qp_devctxs_) + i * sizeof(mlx5gda_qp_devctx),
-                &devctx, sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
+            size_t failed_operation = 0;
+            const auto cuda_status = initializeQueuePairDeviceContext(
+                cudaSuccess,
+                [&] {
+                    mlx5gda_destroy_qp(qp);
+                    destroyQueuePairs();
+                },
+                &failed_operation,
+                [&] { return cudaStreamSynchronize(stream); },
+                [&] {
+                    const auto devctx = initialQueuePairDeviceContext(qp);
+                    return cudaMemcpy(static_cast<char*>(qp_devctxs_) +
+                                          i * sizeof(mlx5gda_qp_devctx),
+                                      &devctx, sizeof(mlx5gda_qp_devctx),
+                                      cudaMemcpyHostToDevice);
+                });
+            if (cuda_status != cudaSuccess) {
+                LOG(ERROR)
+                    << "[EP IBGDA] Failed to "
+                    << (failed_operation == 0
+                            ? "synchronize stream before initializing QP "
+                            : "copy device context for QP ")
+                    << i << ": " << cudaGetErrorString(cuda_status);
+                return -1;
+            }
             if (i == 0 && ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf) {
                 LOG(INFO) << "[EP IBGDA] QP 0 DMA-BUF regions: cq_umem="
                           << qp->send_cq->cq_region.umem->umem_id
@@ -562,10 +585,12 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                            << " udp_sport=" << ah_attr.dlid
                            << " hop_limit=" << (int)ah_attr.grh.hop_limit
                            << ")";
+                destroyQueuePairs();
                 return -1;
             }
             if (mlx5gda_modify_rc_qp_rtr2rts(qps_[i])) {
                 LOG(ERROR) << "[EP IBGDA] rtr2rts failed for QP " << i;
+                destroyQueuePairs();
                 return -1;
             }
         }
@@ -577,10 +602,26 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             uint32_t rkey = (i == local_rank)
                                 ? local_lkey
                                 : static_cast<uint32_t>(remote_keys[i]);
-            cudaMemcpy(static_cast<char*>(raddrs_) + i * sizeof(uint64_t),
-                       &raddr, sizeof(uint64_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(static_cast<char*>(rkeys_) + i * sizeof(uint32_t), &rkey,
-                       sizeof(uint32_t), cudaMemcpyHostToDevice);
+            size_t failed_operation = 0;
+            const auto cuda_status = initializePeerAddressTable(
+                cudaSuccess, [this] { destroyQueuePairs(); }, &failed_operation,
+                [&] {
+                    return cudaMemcpy(
+                        static_cast<char*>(raddrs_) + i * sizeof(uint64_t),
+                        &raddr, sizeof(uint64_t), cudaMemcpyHostToDevice);
+                },
+                [&] {
+                    return cudaMemcpy(
+                        static_cast<char*>(rkeys_) + i * sizeof(uint32_t),
+                        &rkey, sizeof(uint32_t), cudaMemcpyHostToDevice);
+                });
+            if (cuda_status != cudaSuccess) {
+                LOG(ERROR) << "[EP IBGDA] Failed to copy remote "
+                           << (failed_operation == 0 ? "address" : "key")
+                           << " for rank " << i << ": "
+                           << cudaGetErrorString(cuda_status);
+                return -1;
+            }
         }
         return 0;
     }
