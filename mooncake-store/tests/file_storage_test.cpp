@@ -1144,6 +1144,12 @@ TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     ASSERT_TRUE(enable_offloading);
     EXPECT_TRUE(*enable_offloading);
 #endif
+
+    SetEnv("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+    {
+        FileStorage file_storage(config, nullptr, "localhost:9003");
+        EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+    }
 }
 
 TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
