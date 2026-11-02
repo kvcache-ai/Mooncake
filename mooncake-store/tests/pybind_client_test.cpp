@@ -3,13 +3,18 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <barrier>
 #include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -18,6 +23,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
@@ -451,6 +457,110 @@ TEST_F(RealClientTest, PosixDfsHostReadsSkipStagingBuffer) {
         {key}, {pieces}, {piece_sizes}, true);
     EXPECT_EQ(many, std::vector<int>{static_cast<int>(kObjectSize)});
     EXPECT_EQ(scattered, source);
+}
+
+TEST_F(RealClientTest, GetIntoRangesKeepsMixedReplicaLeasesIndependent) {
+    ScopedEnvVar rpc_timeout("MC_RPC_TIMEOUT_MS", "5000");
+    std::string path = (std::filesystem::temp_directory_path() /
+                        "mooncake_range_leases_XXXXXX")
+                           .string();
+    ASSERT_NE(mkdtemp(path.data()), nullptr);
+    ssd_path_ = path;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_root_fs_dir(ssd_path_)
+                                  .set_enable_disk_eviction(false)
+                                  .set_default_kv_lease_ttl(1000)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_),
+        0);
+    struct StalledOffloadPeer {
+        int listener = -1;
+        std::thread worker;
+        std::atomic<bool> accepted{false};
+        ~StalledOffloadPeer() {
+            if (listener >= 0) shutdown(listener, SHUT_RDWR);
+            if (worker.joinable()) worker.join();
+            if (listener >= 0) close(listener);
+        }
+    } peer;
+    peer.listener =
+        socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    ASSERT_GE(peer.listener, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(peer.listener, reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)),
+              0);
+    ASSERT_EQ(listen(peer.listener, 1), 0);
+    socklen_t address_size = sizeof(address);
+    ASSERT_EQ(getsockname(peer.listener, reinterpret_cast<sockaddr*>(&address),
+                          &address_size),
+              0);
+    const std::string endpoint =
+        "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+    const std::string memory_key = "memory_range_lease";
+    const std::string memory_value = "memory range bytes";
+    ASSERT_EQ(py_client_->put(memory_key, memory_value), 0);
+    auto memory_query = py_client_->client_->Query(memory_key);
+    ASSERT_TRUE(memory_query);
+    PyClient::QueryResultCache queries;
+    queries.emplace(memory_key, std::move(memory_query));
+    const std::string disk_value = "disk range bytes";
+    const std::string disk_path = ssd_path_ + "/fast_range.bin";
+    {
+        std::ofstream file(disk_path, std::ios::binary);
+        ASSERT_TRUE(file);
+        file << disk_value;
+        ASSERT_TRUE(file);
+    }
+    Replica::Descriptor disk;
+    disk.status = ReplicaStatus::COMPLETE;
+    disk.descriptor_variant = DiskDescriptor{disk_path, disk_value.size()};
+    queries.emplace("disk_range_lease",
+                    QueryResult(std::vector<Replica::Descriptor>{disk},
+                                std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(1)));
+    Replica::Descriptor slow;
+    slow.status = ReplicaStatus::COMPLETE;
+    slow.descriptor_variant =
+        LocalDiskDescriptor{generate_uuid(), disk_value.size(), endpoint};
+    queries.emplace(
+        "stalled_offload",
+        QueryResult(std::vector<Replica::Descriptor>{slow},
+                    std::chrono::steady_clock::now() + std::chrono::hours(1)));
+    std::string destination(32, '.');
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+    // Withhold one owner response past the one-second master lease. Earlier
+    // file reads must finish first; MEMORY must be renewed/submitted afterward.
+    peer.worker = std::thread([&peer] {
+        pollfd ready{peer.listener, POLLIN, 0};
+        if (poll(&ready, 1, 5000) <= 0 || !(ready.revents & POLLIN)) return;
+        const int socket = accept(peer.listener, nullptr, nullptr);
+        if (socket < 0) return;
+        peer.accepted.store(true);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        shutdown(socket, SHUT_RDWR);
+        close(socket);
+    });
+    auto results = py_client_->get_into_ranges(
+        {destination.data()},
+        {{memory_key, "disk_range_lease", "stalled_offload"}},
+        {{{0}, {8}, {16}}}, {{{1}, {2}, {0}}}, {{{5}, {5}, {5}}}, &queries);
+    EXPECT_TRUE(peer.accepted.load());
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_EQ(results[0].size(), 3);
+    EXPECT_EQ(results[0][0], (std::vector<int64_t>{5}));
+    EXPECT_EQ(results[0][1], (std::vector<int64_t>{5}));
+    ASSERT_EQ(results[0][2].size(), 1);
+    EXPECT_LT(results[0][2][0], 0);
+    EXPECT_EQ(destination.substr(0, 5), memory_value.substr(1, 5));
+    EXPECT_EQ(destination.substr(8, 5), disk_value.substr(2, 5));
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
 }
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
@@ -1998,8 +2108,58 @@ TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
         ASSERT_EQ(replicas.size(), 1u);
         ASSERT_TRUE(replicas.front().is_local_disk_replica());
     }
-    ASSERT_EQ(reader->batch_get_session_start(keys), std::vector<int>(3, 0));
+    // The public scatter API uses the same indexed restore core without a
+    // reader staging arena. Repeated keys and invalid fragments keep their
+    // individual results; only the two valid keys require an owner RPC.
+    const auto scatter_before = reader->get_offload_rpc_read_count();
+    const int64_t invalid_range = toInt(ErrorCode::INVALID_PARAMS);
+    auto scatter = reader->get_into_ranges(
+        {dst.data()}, {{keys[0], keys[0], keys[1]}},
+        {{{7, 80, 300}, {220}, {160}}}, {{{3, 111, kObjectSize}, {33}, {17}}},
+        {{{16, 20, 1}, {17}, {24}}});
+    EXPECT_EQ(scatter, (std::vector<std::vector<std::vector<int64_t>>>{
+                           {{16, 20, invalid_range}, {17}, {24}}}));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), scatter_before + 2);
+    EXPECT_EQ(dst.substr(7, 16), src.substr(3, 16));
+    EXPECT_EQ(dst.substr(80, 20), src.substr(111, 20));
+    EXPECT_EQ(dst.substr(160, 24), src.substr(kObjectSize + 17, 24));
+    EXPECT_EQ(dst.substr(220, 17), src.substr(33, 17));
+    EXPECT_EQ(dst[300], 'Z');
 
+    auto snapshot = reader->prepare_get_into_ranges_snapshot(ssd_keys);
+    scatter = reader->get_into_ranges_from_snapshot(
+        {dst.data()}, {{keys[0]}}, {{{320, 360}}}, {{{5, 129}}}, {{{16, 16}}},
+        snapshot.query_result_cache);
+    EXPECT_EQ(scatter,
+              (std::vector<std::vector<std::vector<int64_t>>>{{{16, 16}}}));
+    EXPECT_EQ(dst.substr(320, 16), src.substr(5, 16));
+    EXPECT_EQ(dst.substr(360, 16), src.substr(129, 16));
+
+    // Cached interleaved keys still follow caller order for overlapping dst.
+    scatter = reader->get_into_ranges(
+        {dst.data()}, {{keys[0], keys[1], keys[0], keys[1]}},
+        {{{400}, {400}, {400}, {400}}}, {{{0}, {0}, {5}, {7}}},
+        {{{8}, {8}, {8}, {8}}});
+    EXPECT_EQ(
+        scatter,
+        (std::vector<std::vector<std::vector<int64_t>>>{{{8}, {8}, {8}, {8}}}));
+    EXPECT_EQ(dst.substr(400, 8), src.substr(kObjectSize + 7, 8));
+
+    for (const size_t overlap : {size_t{0}, size_t{8}}) {
+        std::string expected(dst);
+        expected.replace(400, 16, src, 7, 16);
+        expected.replace(400 + overlap, 16, src, 99, 16);
+        const auto before = reader->get_offload_rpc_read_count();
+        scatter = reader->get_into_ranges({dst.data()}, {{keys[0]}},
+                                          {{{400, 400 + overlap}}}, {{{7, 99}}},
+                                          {{{16, 16}}});
+        EXPECT_EQ(scatter,
+                  (std::vector<std::vector<std::vector<int64_t>>>{{{16, 16}}}));
+        EXPECT_EQ(dst, expected);
+        EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 2);
+    }
+
+    ASSERT_EQ(reader->batch_get_session_start(keys), std::vector<int>(3, 0));
     auto read_ranges = [&](const std::vector<size_t>& offsets,
                            const std::vector<size_t>& sizes) {
         std::fill(dst.begin(), dst.end(), 'Z');
@@ -2027,6 +2187,7 @@ TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
                 {kPageSize, kPageSize, kPageSize, kPageSize});
     read_ranges({kPageSize}, {kPageSize});            // Non-tail partial read.
     read_ranges({2 * kPageSize, 7, 9}, {16, 16, 8});  // Unordered, overlapping.
+    read_ranges({7, 7, 9}, {16, 16, 8});  // Identical and overlapping windows.
 
     // Repeated SSD keys must fill each destination without duplicate reads.
     const auto before_duplicate = reader->get_offload_rpc_read_count();
@@ -2062,6 +2223,41 @@ TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
     EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
                   {keys[1]}, {{dst.data()}}, {{1}}, {{0}}),
               (std::vector<int>{invalid}));
+    std::filesystem::path truncated_bucket;
+    size_t value_start = 0;
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(ssd_path_)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".bucket")
+            continue;
+        std::ifstream file(entry.path(), std::ios::binary);
+        const std::string content((std::istreambuf_iterator<char>(file)), {});
+        const auto key_start = content.find(keys[0]);
+        if (key_start == std::string::npos) continue;
+        truncated_bucket = entry.path();
+        value_start = key_start + keys[0].size();
+        break;
+    }
+    ASSERT_FALSE(truncated_bucket.empty());
+    // Truncate only this fixture's bucket to check per-window partial success.
+    std::filesystem::resize_file(truncated_bucket, value_start + 128);
+    const int64_t read_error = toInt(ErrorCode::FILE_READ_FAIL);
+    std::fill(dst.begin(), dst.end(), 'Z');
+    ASSERT_EQ(reader->get_into_ranges({dst.data()}, {{keys[0]}}, {{{0}}},
+                                      {{{7}}}, {{{16}}}),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{16}}}));
+    EXPECT_EQ(dst.substr(0, 16), src.substr(7, 16));
+    std::fill(dst.begin(), dst.end(), 'Z');
+    ASSERT_EQ(reader->get_into_ranges({dst.data()}, {{keys[0]}}, {{{32}}},
+                                      {{{200}}}, {{{16}}}),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{read_error}}}));
+    EXPECT_EQ(dst, std::string(dst.size(), 'Z'));
+    std::string expected_partial(dst);
+    expected_partial.replace(0, 16, src, 7, 16);
+    EXPECT_EQ(
+        reader->get_into_ranges({dst.data()}, {{keys[0]}}, {{{0, 32}}},
+                                {{{7, 200}}}, {{{16, 16}}}),
+        (std::vector<std::vector<std::vector<int64_t>>>{{{16, read_error}}}));
+    EXPECT_EQ(dst, expected_partial);
     ASSERT_EQ(reader->unregister_buffer(dst.data()), 0);
     EXPECT_EQ(reader->tearDownAll(), 0);
 }
