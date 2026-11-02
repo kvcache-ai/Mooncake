@@ -968,16 +968,25 @@ class XpuSyclBackend {
                 proto = queues_[device_index];
             }
         }
-        try {
-            if (!q)
+        if (!q) {
+            try {
                 q.emplace(proto->get_context(), proto->get_device(),
                           sycl::property::queue::in_order());
-            q->memcpy(dst, src, len).wait();
+            } catch (...) {
+                // No new queue: run this copy on the device's shared queue,
+                // as all copies did before they had queues of their own.
+            }
+        }
+        try {
+            (q ? *q : *proto).memcpy(dst, src, len).wait();
         } catch (...) {
             // Callers expect a status, not an exception. A queue that saw an
-            // error is not reused.
+            // error does not go back to the idle list.
             return 1;
         }
+        // The shared queue is still used by copyD2D() and the other
+        // operations, so it never goes into the idle list.
+        if (!q) return 0;
         try {
             std::lock_guard<std::mutex> lock(mu_);
             idle_copy_queues_[device_index].push_back(std::move(*q));
