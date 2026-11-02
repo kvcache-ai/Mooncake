@@ -944,14 +944,13 @@ void TransferEngineOperationState::wait_for_completion() {
                 << batch_id_;
         // Wait directly on BatchDesc's condition variable.
         auto& batch_desc = Transport::toBatchDesc(batch_id_);
-        bool completed;
         bool timed_out = false;
 
         // Fast path: if already finished, avoid taking the mutex and waiting.
         // Use acquire here to pair with the writer's release-store, because
         // this path may skip taking the mutex. It ensures all prior updates are
         // visible.
-        completed = batch_desc.is_finished.load(std::memory_order_acquire);
+        bool completed = batch_desc.is_finished.load(std::memory_order_acquire);
         if (!completed) {
             // Use the same mutex as the notifier when updating the predicate to
             // avoid missed notifications. The predicate is re-checked under the
