@@ -2,6 +2,14 @@
 # Platform-specific lifecycle; test helpers are shared.
 source "${E2E_DIR:?E2E_DIR must point to the shared E2E directory}/scripts/common.sh"
 
+# TENT runtime toggle for the mooncake transfer engine. The CI wheel
+# (build-wheel-cu13 with use-tent: true) carries both engines: without
+# MC_USE_TENT the facade runs classic, with it the TENT runtime activates.
+# The e2e pipeline runs TWO T-One jobs — classic (this unset/false) and TENT
+# (USE_TENT=true passed via env_info) — so classic regression coverage is
+# preserved while TENT is validated in parallel.
+USE_TENT=${USE_TENT:-false}
+
 docker_launch(){
     local registry_addr=$1
     local extra_args=$2
@@ -57,19 +65,22 @@ docker_launch(){
     # Check if sglang-router is needed and missing
     if [[ "$registry_addr" == *"sglang"* ]]; then
         echo "=== Detected sglang image, checking sglang-router ==="
+        # Tone hosts often cannot reach pypi.org. Set the Aliyun mirror before
+        # any extra pip installs: sglang-router may already be in the image, but
+        # sgl-eval==0.1.0 still needs pillow<12, and the remote node typically
+        # has no warm pip cache.
+        pip_cmd=$(append_str "${pip_cmd}" \
+            "pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/")
         if ! ${docker_exec} "python -c 'import sglang_router' 2>/dev/null"; then
             echo "sglang-router not found, will install it"
-            pip_cmd=$(append_str "${pip_cmd}" \
-                "pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/")
             pip_cmd=$(append_str "${pip_cmd}" \
                 "pip install sglang-router")
         else
             echo "sglang-router already installed, skipping"
         fi
-        # Reuse SGLang CI's single source of truth for the git-only evaluator
-        # pin instead of duplicating the commit here.
+        # Install the evaluator version required by tone tests.
         pip_cmd=$(append_str "${pip_cmd}" \
-            'source /sgl-workspace/sglang/scripts/ci/utils/sgl_eval_ref.sh && pip install "$SGL_EVAL_SPEC"')
+            'pip install sgl-eval==0.1.0')
     fi
 
     echo "Installing ERDMA drivers"
@@ -99,6 +110,23 @@ docker_launch(){
         return 1
     fi
 
+    # Fail fast if TENT was requested but the installed engine cannot provide
+    # it: MC_USE_TENT=1 against a classic-only engine.so silently falls back
+    # to classic, which would make the test pass without testing TENT at all.
+    if [ "${USE_TENT}" = "true" ]; then
+        echo "=== Verifying TENT runtime in installed mooncake ==="
+        # python3, not python: the vllm/vllm-openai image ships pip for
+        # python3 without a `python` alias, and the check must run there too.
+        if ! ${docker_exec} "p=\$(python3 -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))'); \
+            strings \$p/engine.so | grep -q MC_USE_TENT && \
+            python3 -c 'import mooncake.engine'"; then
+            echo "ERROR: USE_TENT=true but the installed mooncake wheel lacks the TENT runtime." >&2
+            echo "       The CI wheel must be built with -DUSE_TENT=ON (_build-wheel.yaml use-tent: true)." >&2
+            return 1
+        fi
+        echo "TENT runtime verified."
+    fi
+
     return 0
 }
 
@@ -118,21 +146,51 @@ stop_container(){
 
     echo "Stopping ${location} Docker container: ${container_name}"
 
-    if [ "$location" == "remote" ]; then
+    if [ "$location" = "remote" ]; then
         local ssh_target=$remote_host
         ${SSH_CMD:-ssh -o StrictHostKeyChecking=no} "$ssh_target" \
-            "docker stop ${container_name} >/dev/null 2>&1"
+            "if docker container inspect ${container_name} >/dev/null 2>&1; then docker stop ${container_name} >/dev/null; fi"
     else
-        docker stop ${container_name} >/dev/null 2>&1
+        if docker container inspect "$container_name" >/dev/null 2>&1; then
+            docker stop "$container_name" >/dev/null
+        fi
     fi
 
     if [ $? -eq 0 ]; then
         echo "Successfully stopped ${location} container: ${container_name}"
         return 0
-    else
-        echo "Failed to stop ${location} container: ${container_name} (may not exist)"
+    fi
+
+    echo "Failed to stop ${location} container: ${container_name}" >&2
+    return 1
+}
+
+restart_container(){
+    local container_name=${1:-$CONTAINER_NAME}
+    local remote_host=${2:-}
+    local location="local"
+
+    if [ -z "$container_name" ]; then
+        echo "ERROR: No container name provided" >&2
         return 1
     fi
+
+    if [ -n "$remote_host" ]; then
+        location="remote"
+        ${SSH_CMD:-ssh -o StrictHostKeyChecking=no} "$remote_host" \
+            "docker container inspect ${container_name} >/dev/null 2>&1 && docker restart ${container_name} >/dev/null"
+    else
+        docker container inspect "$container_name" >/dev/null 2>&1 && \
+            docker restart "$container_name" >/dev/null
+    fi
+
+    if [ $? -eq 0 ]; then
+        echo "Successfully restarted ${location} container: ${container_name}"
+        return 0
+    fi
+
+    echo "ERROR: Failed to restart ${location} container: ${container_name}" >&2
+    return 1
 }
 
 cleanup_test_env() {
@@ -160,8 +218,20 @@ cleanup_test_env() {
     return 0
 }
 
-# TONE retains its existing between-case lifecycle.
+# Restarting preserves the container writable layer while stopping all test
+# services and releasing their GPU allocations before the next case.
 drain_gpu_between_tests() {
+    echo "===== Resetting shared test environment between cases ====="
+
+    if ! restart_container "${CONTAINER_NAME}"; then
+        return 1
+    fi
+
+    if [ -n "${REMOTE_IP:-}" ] && ! restart_container "${CONTAINER_NAME}" "$REMOTE_IP"; then
+        return 1
+    fi
+
+    sleep 5
     return 0
 }
 
@@ -182,6 +252,15 @@ setup_node_env() {
     local extra_args=""
     extra_args="$extra_args -e NCCL_GIN_TYPE=0 "
     extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
+    if [ "${USE_TENT}" = "true" ]; then
+        # Container-level env: every sglang server (and pytest-spawned server)
+        # inside inherits the TENT runtime. Metrics disabled: all ranks in
+        # this single-container topology inherit one TENT_METRICS_HTTP_PORT,
+        # so only one rank (nondeterministic) would ever expose an endpoint
+        # while the rest degrade to log-only. Re-enable together with the
+        # per-rank port assignment (base + gpu_id) in the sglang integration.
+        extra_args="$extra_args -e MC_USE_TENT=1 -e TENT_METRICS_ENABLED=false"
+    fi
     if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
         extra_args="$extra_args -e HF_ENDPOINT=${HUGGINGFACE_MIRROR} -e HF_HUB_ENABLE_HF_TRANSFER=1"
     fi

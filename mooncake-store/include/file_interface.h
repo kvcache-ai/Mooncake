@@ -257,7 +257,3 @@ class UringFile : public StorageFile {
 #endif  // USE_URING
 
 }  // namespace mooncake
-
-#ifdef USE_3FS
-#include <hf3fs/hf3fs.h>
-#endif

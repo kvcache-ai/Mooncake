@@ -14,7 +14,6 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
-#include "local_ssd/persisted_state.h"
 #include "rpc_types.h"
 #include "segment/status.h"
 #include "segment/usage.h"
@@ -336,47 +335,6 @@ class ScopedAllocatorAccess {
     std::shared_lock<std::shared_mutex> lock_;
 };
 
-/**
- * @brief Lock-free data view of SegmentManager for safely accessing inherited
- * data in forked child processes This class provides read-only access to
- * SegmentManager private members without any lock operations
- */
-class SegmentView {
-   public:
-    /**
-     * @brief Constructor
-     * @param segment_manager Reference to SegmentManager
-     */
-    explicit SegmentView(const SegmentManager* segment_manager)
-        : segment_manager_(segment_manager) {}
-
-    ErrorCode GetSegment(const std::shared_ptr<BufferAllocatorBase>& allocator,
-                         Segment& segment) const;
-
-    ErrorCode GetMountedSegment(const UUID& segment_id,
-                                MountedSegment& mountedSegment) const;
-
-   private:
-    const SegmentManager* segment_manager_;
-};
-
-class SegmentSerializer {
-   public:
-    explicit SegmentSerializer(SegmentManager* segment_manager)
-        : segment_manager_(segment_manager) {}
-
-    tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
-        const LocalSsdPersistedState& local_ssd_state);
-
-    tl::expected<LocalSsdPersistedState, SerializationError> Deserialize(
-        const std::vector<uint8_t>& data);
-
-    void Reset();
-
-   private:
-    SegmentManager* segment_manager_;
-};
-
 class SegmentManager {
    public:
     /**
@@ -416,8 +374,6 @@ class SegmentManager {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
                                      client_by_name_, segment_mutex_);
     }
-
-    SegmentView getView() const { return SegmentView(this); }
 
     /**
      * @brief Return current DRAM usage derived from mounted allocators.
@@ -473,9 +429,7 @@ class SegmentManager {
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
     friend class ScopedSegmentAccess;
-    friend class SegmentTest;        // for unit tests
-    friend class SegmentView;        // for fork serialize
-    friend class SegmentSerializer;  // for fork serialize
+    friend class SegmentTest;  // for unit tests
 };
 
 class NoFSegmentManager {

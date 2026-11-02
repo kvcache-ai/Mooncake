@@ -75,6 +75,10 @@ struct QueueOwnerInput {
     std::vector<size_t> derived_task_ids;
     Request request{};
     QueueOwnerKind kind{QueueOwnerKind::User};
+    // Transport selected before admission. This lets degradation consult the
+    // bandwidth of the path that will actually carry this owner instead of a
+    // process-wide aggregate across unrelated transports.
+    TransportType transport{UNSPEC};
     // True only when the caller has established that this owner's transfer
     // time is governed by the installed bandwidth provider -- for the RDMA
     // wiring, the aggregate transmit estimate over the local NICs. Default
@@ -107,6 +111,11 @@ struct DegradationHooks {
 // NICs' transmit estimates. Injected by the owner so the admission queue does
 // not depend on the device-selection layer directly.
 using BandwidthProvider = std::function<double()>;
+
+// Transport-aware variant used when more than one network transport can be
+// selected. Kept separate from BandwidthProvider so existing callers retain
+// their source-compatible no-argument callback.
+using TransportBandwidthProvider = std::function<double(TransportType)>;
 
 // Returns "now" as a steady-clock timestamp in nanoseconds, matching the units
 // of Request.deadline_ns. Injectable so tests are deterministic.
@@ -144,6 +153,10 @@ class LocalTransferAdmissionQueue {
                               DegradationHooks hooks,
                               NowProvider now_provider = nullptr);
 
+    void setTransportDegradationPolicy(
+        TransportBandwidthProvider bandwidth_provider, DegradationHooks hooks,
+        NowProvider now_provider = nullptr);
+
     Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
 
     // Cancel an owner that has not entered the dispatch window. Idempotent for
@@ -177,6 +190,7 @@ class LocalTransferAdmissionQueue {
         uint64_t batch_token{0};
         Request request{};
         QueueOwnerKind kind{QueueOwnerKind::User};
+        TransportType transport{UNSPEC};
         bool degradation_eligible{false};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
@@ -199,6 +213,7 @@ class LocalTransferAdmissionQueue {
 
     // RFC #2519 step 3 degradation policy (all optional / opt-in).
     BandwidthProvider bandwidth_provider_;
+    TransportBandwidthProvider transport_bandwidth_provider_;
     DegradationHooks degradation_hooks_;
     NowProvider now_provider_;
 };

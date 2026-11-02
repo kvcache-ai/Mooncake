@@ -128,7 +128,10 @@ jobs:
           source /usr/local/Ascend/cann/set_env.sh
           export PATH="/usr/local/go/bin:${PATH}"
           cd build
-          cmake --build . -j"$(nproc)"
+          # Cap parallelism: the mooncake-store TUs (~3-4GB each with Ascend
+          # headers) at -j$(nproc)=4 peak at 12-16GB and get the 16GB runner
+          # killed mid-compile. -j2 peaks at ~7GB and builds in ~2x the time.
+          cmake --build . -j2
           sudo cmake --install .
 
       - name: Generate Python version tag

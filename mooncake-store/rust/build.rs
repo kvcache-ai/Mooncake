@@ -270,7 +270,7 @@ fn main() {
     // Dependencies of mooncake_store that must be satisfied at link time.
     // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
     println!("cargo:rustc-link-lib=transfer_engine");
-    println!("cargo:rustc-link-lib=mooncake_common"); // Environ::Get() and other common utilities
+    println!("cargo:rustc-link-lib=mooncake_common"); // Environ and other common utilities
     println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
     println!("cargo:rustc-link-lib=asio"); // shared library built by mooncake-common
     println!("cargo:rustc-link-lib=jsoncpp"); // transfer_engine dependency

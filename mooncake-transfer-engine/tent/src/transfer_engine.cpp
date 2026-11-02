@@ -28,9 +28,10 @@ TransferEngine::TransferEngine(const std::string config_path) {
     auto conf = std::make_shared<Config>();
     auto status = conf->loadFile(config_path);
     if (!status.ok()) {
-        LOG(WARNING) << "Failed to read config file " << config_path;
+        LOG(ERROR) << "Failed to read config file " << config_path << ": "
+                   << status.ToString();
     }
-    impl_ = std::make_unique<TransferEngineImpl>(conf);
+    impl_ = std::make_unique<TransferEngineImpl>(conf, status.ok());
 }
 
 TransferEngine::TransferEngine(std::shared_ptr<Config> conf)

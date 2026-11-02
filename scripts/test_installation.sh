@@ -41,12 +41,15 @@ cp -r mooncake-wheel/tests test_env/
 cp -r python/tests/services test_env/service_tests
 cp -r python/tests/unit test_env/unit_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
+cp python/tests/store/test_fast_copy.py test_env/tests/
 cp -r python/tests/ssd test_env/ssd_tests
 cd test_env
 pip install torch numpy
 python -c "import mooncake._fast_copy"
+python -c "import mooncake.structured_object_store"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
+python tests/test_transfer_engine_gil.py
 
 echo "Running HTTP metadata server test..."
 python -m unittest service_tests/test_http_metadata_server.py

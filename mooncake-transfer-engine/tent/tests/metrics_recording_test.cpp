@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -35,8 +36,11 @@
 #include <cstdlib>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -49,6 +53,24 @@
 
 namespace mooncake {
 namespace tent {
+
+#if TENT_METRICS_ENABLED
+
+class TentMetricsTestPeer {
+   public:
+    static bool failPrometheusSerialization(TentMetrics& metrics,
+                                            std::string& result) {
+        return metrics.serializeWithAccounting(
+            TentMetrics::kPrometheusFormat, result,
+            [](std::string& output, uint64_t) {
+                output = "partial response";
+                throw std::runtime_error("injected serialization failure");
+            });
+    }
+};
+
+#endif
+
 namespace {
 
 #if TENT_METRICS_ENABLED
@@ -372,6 +394,144 @@ class MetricsRecordingTest : public ::testing::Test {
     void TearDown() override { TentMetrics::instance().shutdown(); }
 };
 
+// Lock the public Prometheus contract: every documented family has a stable
+// name and type, and every self-observability family is emitted even before a
+// transfer records traffic. Representative samples instantiate ylt's dynamic
+// business metrics, which intentionally omit never-observed label series.
+TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
+    auto& metrics = TentMetrics::instance();
+    ASSERT_TRUE(TentMetrics::isCompiledIn());
+
+    const std::string initial_body = metrics.getPrometheusMetrics();
+    for (std::string_view name : {
+             "tent_metrics_build_info",
+             "tent_metrics_runtime_enabled",
+             "tent_metrics_http_server_up",
+             "tent_metrics_http_start_failures_total",
+             "tent_metrics_serialization_attempts_total",
+             "tent_metrics_serialization_failures_total",
+             "tent_metrics_last_success_timestamp_seconds",
+         }) {
+        EXPECT_NE(initial_body.find("# TYPE " + std::string(name) + " "),
+                  std::string::npos)
+            << "self-observability family must not depend on transfer samples: "
+            << name;
+    }
+
+    metrics.recordReadCompleted(RDMA, 1024, 0.001);
+    metrics.recordWriteCompleted(TCP, 2048, 0.002);
+    metrics.recordReadFailed(RDMA);
+    metrics.recordWriteFailed(TCP);
+    metrics.recordTransportFailover(RDMA, TCP);
+    metrics.recordTransportAttemptStarted(RDMA, Request::READ);
+    metrics.recordTransportAttemptFinished(RDMA, Request::READ, FAILED, 42.0);
+    metrics.recordDeadlineMLU(RDMA, 0.8);
+    metrics.recordDeadlineInfeasible(TCP);
+    metrics.recordBatchQuarantined();
+    metrics.recordTaskFailure(RDMA, TentMetrics::TaskFailureReason::Timeout);
+    metrics.recordInflightAttemptStarted(RDMA);
+    metrics.recordInflightAttemptFinished(RDMA);
+    metrics.recordRegisteredBufferBytes(RDMA, 4096);
+    metrics.recordRegisteredBufferBytes(RDMA, -4096);
+    metrics.recordStageLatency(TentMetrics::Stage::QueueWait, RDMA, 10.0);
+    metrics.recordStageLatency(TentMetrics::Stage::Dispatch, RDMA, 20.0);
+    metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
+
+    const std::string body = metrics.getPrometheusMetrics();
+    const std::array<std::pair<std::string_view, std::string_view>, 30>
+        expected_types{{
+            {"tent_read_bytes_total", "counter"},
+            {"tent_write_bytes_total", "counter"},
+            {"tent_read_requests_total", "counter"},
+            {"tent_write_requests_total", "counter"},
+            {"tent_read_failures_total", "counter"},
+            {"tent_write_failures_total", "counter"},
+            {"tent_transport_failover_total", "counter"},
+            {"tent_transport_attempts_total", "counter"},
+            {"tent_transport_attempt_failures_total", "counter"},
+            {"tent_task_failures_total", "counter"},
+            {"tent_deadline_infeasible_total", "counter"},
+            {"tent_quarantined_batches_total", "counter"},
+            {"tent_inflight_attempts", "gauge"},
+            {"tent_registered_buffer_bytes", "gauge"},
+            {"tent_read_latency_us", "histogram"},
+            {"tent_write_latency_us", "histogram"},
+            {"tent_read_size_bytes", "histogram"},
+            {"tent_write_size_bytes", "histogram"},
+            {"tent_deadline_mlu_permille", "histogram"},
+            {"tent_stage_queue_wait_us", "histogram"},
+            {"tent_stage_dispatch_us", "histogram"},
+            {"tent_stage_transport_us", "histogram"},
+            {"tent_transport_attempt_latency_us", "histogram"},
+            {"tent_metrics_build_info", "gauge"},
+            {"tent_metrics_runtime_enabled", "gauge"},
+            {"tent_metrics_http_server_up", "gauge"},
+            {"tent_metrics_http_start_failures_total", "counter"},
+            {"tent_metrics_serialization_attempts_total", "counter"},
+            {"tent_metrics_serialization_failures_total", "counter"},
+            {"tent_metrics_last_success_timestamp_seconds", "gauge"},
+        }};
+
+    for (const auto& [name, type] : expected_types) {
+        EXPECT_NE(body.find("# TYPE " + std::string(name) + " " +
+                            std::string(type) + "\n"),
+                  std::string::npos)
+            << "missing or changed Prometheus contract for " << name;
+    }
+    EXPECT_NE(body.find("tent_metrics_build_info{version=\""),
+              std::string::npos);
+    EXPECT_EQ(body.find("compile_time_enabled"), std::string::npos);
+    EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
+                        "prometheus\"}"),
+              std::string::npos);
+    EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
+                        "json\"}"),
+              std::string::npos);
+}
+
+TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {
+    auto& metrics = TentMetrics::instance();
+    TentMetrics::setEnabled(false);
+
+    const auto before = MetricsSnapshot(metrics);
+    metrics.recordReadCompleted(RDMA, 4096, 0.001);
+    const auto after = MetricsSnapshot(metrics);
+
+    EXPECT_EQ(after.counter("tent_read_bytes_total") -
+                  before.counter("tent_read_bytes_total"),
+              0);
+    EXPECT_EQ(after.series("tent_metrics_runtime_enabled"), 0);
+    EXPECT_EQ(after.series("tent_metrics_http_server_up"),
+              metrics.httpPort() == 0 ? 0 : 1);
+    EXPECT_GE(after.series("tent_metrics_serialization_attempts_total{format="
+                           "\"prometheus\"}"),
+              1);
+    EXPECT_GT(after.series("tent_metrics_last_success_timestamp_seconds{"
+                           "format=\"prometheus\"}"),
+              0);
+
+    TentMetrics::setEnabled(true);
+}
+
+TEST_F(MetricsRecordingTest,
+       FailedSerializationIsVisibleOnTheNextSuccessfulScrape) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    std::string failed_output;
+    EXPECT_FALSE(TentMetricsTestPeer::failPrometheusSerialization(
+        metrics, failed_output));
+    EXPECT_TRUE(failed_output.empty());
+
+    const auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_metrics_serialization_failures_total{format=\""
+                     "prometheus\"}") -
+            before.series("tent_metrics_serialization_failures_total{format=\""
+                          "prometheus\"}"),
+        1);
+}
+
 // ---------------------------------------------------------------------------
 // Completed transfer records bytes, requests, latency. Drives the real
 // recordTaskCompletionMetrics path via FakeTransport.
@@ -601,6 +761,11 @@ TEST_F(MetricsRecordingTest, FailoverResubmitSyncFailureRecordsBothAttempts) {
     ASSERT_TRUE(
         engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
     ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    for (int poll = 0; poll < 3; ++poll) {
+        TransferStatus status{TransferStatusEnum::PENDING, 0};
+        EXPECT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+        EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    }
     auto after = MetricsSnapshot(TentMetrics::instance());
 
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
@@ -622,6 +787,13 @@ TEST_F(MetricsRecordingTest, FailoverResubmitSyncFailureRecordsBothAttempts) {
         "\"write\"}";
     EXPECT_EQ(after.series(rdma_failures) - before.series(rdma_failures), 1);
     EXPECT_EQ(after.series(tcp_failures) - before.series(tcp_failures), 1);
+
+    EXPECT_EQ(after.counter("tent_write_failures_total") -
+                  before.counter("tent_write_failures_total"),
+              1);
+    const std::string poll_failures =
+        "tent_task_failures_total{transport=\"tcp\",reason=\"poll\"}";
+    EXPECT_EQ(after.series(poll_failures) - before.series(poll_failures), 1);
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
@@ -988,6 +1160,10 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordedOnFailedTransfer) {
     // Infeasible counter must increment even though the transfer failed.
     EXPECT_EQ(after.counter("tent_deadline_infeasible_total") -
                   before.counter("tent_deadline_infeasible_total"),
+              1);
+    const std::string rdma_infeasible =
+        "tent_deadline_infeasible_total{transport=\"rdma\"}";
+    EXPECT_EQ(after.series(rdma_infeasible) - before.series(rdma_infeasible),
               1);
     // MLU histogram must not receive a sample (no completion, no latency).
     EXPECT_EQ(after.histogramCount("tent_deadline_mlu_permille") -
@@ -1405,6 +1581,16 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_read_bytes_total"));
     EXPECT_TRUE(json.contains("tent_deadline_infeasible_total"));
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
+    EXPECT_TRUE(json.contains("tent_task_failures_total"));
+    EXPECT_TRUE(json.contains("tent_metrics_build_info"));
+    EXPECT_FALSE(
+        json["tent_metrics_build_info"].contains("compile_time_enabled"));
+    EXPECT_EQ(json["tent_metrics_runtime_enabled"], 1);
+    EXPECT_EQ(json["tent_metrics_http_server_up"], 1);
+    EXPECT_TRUE(
+        json["tent_metrics_serialization_attempts_total"].contains("json"));
+    EXPECT_TRUE(
+        json["tent_metrics_last_success_timestamp_seconds"].contains("json"));
 }
 
 // Regression guard for the silent-drop bug: ylt's
@@ -1554,6 +1740,7 @@ TEST_F(MetricsHttpTest, HealthEndpointOk) {
 // and there is nothing to assert on. This test confirms the stub initializes.
 TEST(MetricsRecording, DisabledAtCompileTime) {
     MetricsConfig config;
+    EXPECT_FALSE(TentMetrics::isCompiledIn());
     EXPECT_TRUE(TentMetrics::instance().initialize(config).ok());
     TentMetrics::instance().shutdown();
 }

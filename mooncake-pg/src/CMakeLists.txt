@@ -1,17 +1,21 @@
 set(_pg_device_source "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_worker.cu")
 if(USE_CUDA)
-  # Preserve the existing sm_80/sm_90 coverage on CUDA 12 unless the caller
-  # selects architectures through CMake's standard variable or CUDAARCHS
-  # environment.
+  # Unless the caller selects architectures through CMake's standard variable or
+  # CUDAARCHS environment, build the same list as mooncake-ep: SASS plus PTX for
+  # each entry. Without PTX, GPUs outside the list (sm_100, sm_120, ...) cannot
+  # load any PG kernel ("no kernel image is available").
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
     if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
-      set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real 103-real)
+      set(CMAKE_CUDA_ARCHITECTURES 80 90 103)
     else()
-      set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real)
+      set(CMAKE_CUDA_ARCHITECTURES 80 90)
     endif()
   endif()
   enable_language(CUDA)
-  set(_pg_device_input "${_pg_device_source}")
+  set(_pg_device_input
+      "${_pg_device_source}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/algorithms/ring/ring_all_reduce.cu"
+  )
 elseif(USE_MUSA OR USE_MACA)
   set(_pg_device_object "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.o")
   set(_pg_device_depfile "${CMAKE_CURRENT_BINARY_DIR}/mooncake_worker_device.d")
@@ -60,15 +64,16 @@ elseif(USE_MUSA OR USE_MACA)
                                   --cuda-gpu-arch=mp_31)
   elseif(USE_MACA)
     set(_pg_platform_name MACA)
-    set(_pg_device_compiler_name mxcc)
-    set(_pg_device_compiler_hint "${MACA_ROOT}/bin")
-    set(_pg_platform_device_flags --compiler-options=-fPIC)
+    set(_pg_device_compiler_name nvcc)
+    set(_pg_device_compiler_hint "${MACA_ROOT}/tools/cu-bridge/bin")
+    set(_pg_platform_device_flags -Xcompiler=-fPIC -include cuda_bf16.h)
+    list(APPEND _pg_device_flags "-I${MACA_ROOT}/tools/cu-bridge/include")
   endif()
 
   find_program(
     _pg_device_compiler
     NAMES "${_pg_device_compiler_name}"
-    HINTS "${_pg_device_compiler_hint}")
+    HINTS ${_pg_device_compiler_hint})
   if(NOT _pg_device_compiler)
     message(
       FATAL_ERROR "USE_${_pg_platform_name}=ON requires the "
@@ -144,12 +149,38 @@ add_library(
   mooncake_pg.cpp
   mooncake_worker_host.cpp
   mooncake_worker_thread.cpp
+  pg_host_ip_resolve.cpp
   p2p_proxy.cpp)
+
+# The initial collective v2 runtime implementation is CUDA-only.
+if(USE_CUDA)
+  target_sources(
+    mooncake_pg
+    PRIVATE
+      device_comm/device_primitives/payload_writer.cpp
+      device_comm/device_transfer/transfer_region.cpp
+      device_comm/device_transfer/transfer_service.cpp
+      device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cpp
+      device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.cpp
+      device_comm/device_transfer/routes/p2p_route/p2p_route.cpp
+      device_comm/device_transfer/routes/rdma_route/rdma_route.cpp
+      device_comm/device_collective/device_collective.cpp
+      device_comm/device_collective/device_collective_workspace.cpp
+      device_comm/device_collective/device_collective_recovery.cpp
+      device_comm/device_collective/device_control_update.cpp
+      device_comm/device_collective/algorithms/ring/ring_all_reduce.cpp
+      device_comm/device_collective/strong_stream.cpp)
+endif()
 
 target_compile_features(mooncake_pg PRIVATE cxx_std_20)
 target_include_directories(
   mooncake_pg PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
                      $<INSTALL_INTERFACE:include>)
+if(USE_MACA)
+  target_include_directories(
+    mooncake_pg PRIVATE "${MACA_ROOT}/tools/cu-bridge/include"
+                        "${MACA_ROOT}/include/mcr")
+endif()
 target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
 
 set_target_properties(
