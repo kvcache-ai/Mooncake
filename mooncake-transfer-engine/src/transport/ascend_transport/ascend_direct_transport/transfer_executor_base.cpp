@@ -212,6 +212,12 @@ int TransferExecutorBase::initEngines() {
         LOG(ERROR) << "Buffer pool mode does not support async transfer.";
         return -1;
     }
+    if (params_.use_buffer_pool && params_.client_server_mode) {
+        LOG(ERROR) << "Client-Server mode only supports BufferPool=0:0, got "
+                   << "a nonzero ASCEND_BUFFER_POOL. Unset ASCEND_BUFFER_POOL "
+                   << "or disable Client-Server mode.";
+        return -1;
+    }
     local_copy_engine_ = std::make_unique<LocalCopyEngine>();
     if (!local_copy_engine_) {
         return ERR_MEMORY;
