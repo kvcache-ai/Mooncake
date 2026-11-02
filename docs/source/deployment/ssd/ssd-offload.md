@@ -114,13 +114,17 @@ These flags control when the master asks clients to persist objects to SSD, whet
 | `--offload_on_evict` | `false` | Defer SSD persistence until memory eviction selects an object. When `false`, successful `Put` completion queues eager SSD persistence |
 | `--offload_force_evict` | `false` | If offload-on-evict exceeds the per-cycle offload cap, force-evict excess objects instead of leaving them in DRAM |
 | `--offloading_queue_limit` | `50000` | Maximum pending offload objects per local disk segment. Must be greater than `0` and at most `100000000` |
-| `--offload_cap_ratio` | `0.5` | Per-eviction-cycle cap as a fraction of `offloading_queue_limit`; range `[0.0, 1.0]`. Default cap is `25000` objects per cycle |
+| `--offloading_queue_use_bytes` | `false` | Use the byte limit instead of the object-count limit for pending offloads |
+| `--offloading_queue_limit_bytes` | `100000000000` | Maximum pending offload payload bytes per local disk segment when byte mode is enabled |
+| `--offload_cap_ratio` | `0.5` | Per-eviction-cycle cap as a fraction of the active queue limit; range `[0.0, 1.0]`. The default count-mode cap is `25000` objects per cycle |
 | `--promotion_on_hit` | `false` | Promote SSD-resident objects back to DRAM after read hits |
 | `--promotion_admission_threshold` | `2` | Minimum CountMinSketch count before promotion is admitted. Set `1` to disable second-touch gating |
 | `--promotion_max_per_heartbeat` | `1` | Maximum promotion tasks returned to one client per heartbeat. Keep conservative for large objects because each task does SSD read plus memory write |
 | `--promotion_queue_limit` | `50000` | Maximum in-flight promotion tasks tracked by the master |
 
 Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_evict=true` when SSD writes should happen only under memory pressure. For SSD-heavy workloads where offload-on-evict is dropping too many objects, raise both `--offloading_queue_limit` and `--offload_cap_ratio`; for example, `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` allows up to `400000` objects to be queued in one eviction cycle.
+
+Alternatively, set `--offloading_queue_use_bytes=true` on the master to limit pending work by payload size. In this mode, `--offloading_queue_limit_bytes` replaces the object-count limit, and `--offload_cap_ratio` applies to bytes. The default byte limit is 100 GB (decimal), giving a 50 GB per-cycle cap at the default ratio when force eviction is enabled. The store requires no matching configuration.
 
 ---
 
