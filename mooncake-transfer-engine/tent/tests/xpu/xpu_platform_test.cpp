@@ -153,10 +153,12 @@ TEST_F(XpuPlatformTest, DeviceAllocCopyFreeRoundTrip) {
 // Host<->device copies from many threads at once. Every copy draws an
 // in-order queue from a per-device idle pool and returns it afterwards. Each
 // thread writes its own slice, then reads back its neighbour's slice, so the
-// read usually runs on a different queue than the write did, and a copy that
-// returns before it has finished leaves stale or partial bytes. The pattern
-// changes every iteration, so leftovers from an earlier iteration are caught
-// too.
+// read usually runs on a different queue than the write did. Staging reuses
+// its host buffer as soon as copy() returns, and so does this test: it
+// overwrites the source right after a host-to-device copy returns and checks
+// the destination right after a device-to-host copy returns, so a copy that
+// returns before it has finished leaves wrong bytes. The pattern changes
+// every iteration, so leftovers from an earlier iteration are caught too.
 TEST_F(XpuPlatformTest, ConcurrentHostDeviceCopiesKeepTheirData) {
     const int kThreads = 16;
     const int kIterations = 16;
@@ -189,28 +191,26 @@ TEST_F(XpuPlatformTest, ConcurrentHostDeviceCopiesKeepTheirData) {
                 Status h2d = errors[t].empty()
                                  ? platform_->copy(slice(t), src.data(), kSlice)
                                  : Status::OK();
+                for (auto &b : src) b = static_cast<uint8_t>(~b);
                 sync.arrive_and_wait();  // every slice written
                 Status d2h =
                     errors[t].empty()
                         ? platform_->copy(dst.data(), slice(peer), kSlice)
                         : Status::OK();
-                sync.arrive_and_wait();  // every slice read before rewriting
-                if (!errors[t].empty()) continue;  // keep the barrier count
-                if (!h2d.ok() || !d2h.ok()) {
+                if (errors[t].empty() && (!h2d.ok() || !d2h.ok())) {
                     errors[t] = "copy failed at iteration " +
                                 std::to_string(it) + ": " +
                                 (h2d.ok() ? d2h.ToString() : h2d.ToString());
-                    continue;
                 }
-                for (size_t i = 0; i < kSlice; ++i) {
+                for (size_t i = 0; errors[t].empty() && i < kSlice; ++i) {
                     if (dst[i] != pattern(peer, it, i)) {
                         errors[t] = "slice " + std::to_string(peer) +
                                     " wrong at iteration " +
                                     std::to_string(it) + ", byte " +
                                     std::to_string(i);
-                        break;
                     }
                 }
+                sync.arrive_and_wait();  // every slice read before rewriting
             }
         });
     }
