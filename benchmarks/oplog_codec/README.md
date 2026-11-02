@@ -111,3 +111,10 @@ raw sample passes, summaries, build metadata, and the eight-case E2E report.
 It was measured on this branch rebased onto `main` at `5d77d344`; the build
 metadata records the exact source commit. The earlier 2026-09-16 report used
 the pre-merge W02 branch and is superseded.
+
+CI does not build this project: `check-paths` skips `benchmarks/`, and the
+CMake project compiles production translation units by path. A change to those
+sources can therefore break this build without any CI signal. Treat the numbers
+as pinned to the recorded tree. Before citing them again, rebuild on the current
+`main`, rerun both passes and the E2E, and refresh the source SHA256 values in
+the build metadata.
