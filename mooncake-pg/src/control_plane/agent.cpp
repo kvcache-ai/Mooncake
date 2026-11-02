@@ -126,15 +126,8 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .agent_addr = "",
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
-        .transfer_service_endpoint = push.transfer_service_endpoint,
         .collective_workspace_endpoint = push.collective_workspace_endpoint,
     };
-    if (push.transfer_service_endpoint) {
-        effects.push_back(InstallDeviceTransferEndpoint{
-            .rank = push.rank,
-            .endpoint = *push.transfer_service_endpoint,
-        });
-    }
     if (push.collective_workspace_endpoint) {
         effects.push_back(InstallDeviceCollectiveWorkspaceEndpoint{
             .rank = push.rank,
@@ -279,6 +272,25 @@ PGResult<AgentApplyResult> AgentStateMachine::handleViewUpdate(
     return applyGroupView(push.view);
 }
 
+PGResult<AgentApplyResult> AgentStateMachine::handleTransferEndpointUpdate(
+    uint64_t request_id, const TransferEndpointUpdatePush& push) const {
+    const auto& snapshot = push.snapshot;
+    const uint64_t rank_epoch =
+        snapshot.rank_epochs.size() == static_cast<size_t>(max_world_size_)
+            ? snapshot.rank_epochs[rank_]
+            : 0;
+    PG_VALIDATE_STATE(
+        snapshot.endpoints.size() == static_cast<size_t>(max_world_size_) &&
+            snapshot.endpoints[rank_] &&
+            std::find(snapshot.participants.begin(),
+                      snapshot.participants.end(),
+                      rank_) != snapshot.participants.end(),
+        "invalid device endpoint installation");
+
+    return AgentApplyResult{InstallTransferEndpoints{
+        request_id, snapshot, push.reclaim_before_version}};
+}
+
 HeartbeatRequest AgentStateMachine::buildHeartbeat() const {
     HeartbeatRequest req;
     req.rank = rank_;
@@ -334,12 +346,6 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
         rank_connections_[connection.rank] = connection;
         // Install rank-scoped endpoints before applying any restored group
         // state that may reference them.
-        if (connection.transfer_service_endpoint) {
-            effects.push_back(InstallDeviceTransferEndpoint{
-                .rank = connection.rank,
-                .endpoint = *connection.transfer_service_endpoint,
-            });
-        }
         if (connection.collective_workspace_endpoint) {
             effects.push_back(InstallDeviceCollectiveWorkspaceEndpoint{
                 .rank = connection.rank,
