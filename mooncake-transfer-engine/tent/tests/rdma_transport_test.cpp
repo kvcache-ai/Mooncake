@@ -3859,6 +3859,73 @@ TEST_F(RdmaWorkersSharedQpTest,
 }
 
 TEST_F(RdmaWorkersSharedQpTest,
+       RefusedBootstrapFailsTheSliceButLeavesRailAndEndpointAlone) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto target_topology = std::make_shared<Topology>();
+    ASSERT_TRUE(target_topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                    .ok());
+    // The peer serves its segment, but its bootstrap address is a closed
+    // port: the endpoint lookup fails on the control plane, not the NIC.
+    auto peer = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t peer_port = 0;
+    ASSERT_TRUE(peer->start(peer_port).ok());
+    ASSERT_TRUE(peer->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.type = SegmentType::Memory;
+                        segment.name = "refused-bootstrap";
+                        segment.machine_id = "refused-bootstrap";
+                        segment.rpc_server_addr = "127.0.0.1:1";
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.topology = *target_topology;
+                        return Status::OK();
+                    })
+                    .ok());
+    SegmentID target_id = 0;
+    ASSERT_TRUE(
+        metadata->segmentManager()
+            .openRemote(target_id, "127.0.0.1:" + std::to_string(peer_port))
+            .ok());
+
+    RdmaTransportTestPeer::params(transport_)->workers.max_retry_count = 1;
+
+    auto rail = std::make_shared<RailMonitor>();
+    loadRailMonitor(*rail, /*cooldown_secs=*/30, /*error_threshold=*/1);
+    uint64_t probe_token = 0;
+    ASSERT_TRUE(rail->admit(kDev, kDev, probe_token));
+    ASSERT_EQ(probe_token, 0u);
+
+    // The slice was last posted on endpoint_, as a retried slice would be.
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    auto* slice = makeSlice();
+    slice->source_dev_id = kDev;
+    slice->target_dev_id = kDev;
+    slice->task->request.target_id = target_id;
+    slice->rail_monitor = rail;
+    slice->rail_probe_token.store(0, std::memory_order_release);
+    slice->ep_weak_ptr = endpoint_;
+    RdmaTransportTestPeer::queuePostPath(*workers_, /*worker_id=*/0,
+                                         /*local_device_id=*/kDev,
+                                         /*remote_segment_id=*/target_id,
+                                         /*remote_device_id=*/kDev, slice);
+
+    RdmaTransportTestPeer::postSend(*workers_, /*worker_id=*/0);
+
+    EXPECT_EQ(slice->word, FAILED);
+    uint64_t retry_token = 0;
+    EXPECT_TRUE(rail->admit(kDev, kDev, retry_token))
+        << "A refused control-plane dial is no fault of the NIC pair: the "
+           "rail must stay closed, not be paused as a failed transfer";
+    EXPECT_EQ(retry_token, 0u) << "The rail must not have to probe itself";
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_READY)
+        << "The endpoint the slice last used must not be reset";
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
        SelectiveSignalingMarksPeriodicWrAndPostedChainTail) {
     params_->endpoint.signal_interval = 3;
     RdmaEndPointTestPeer::markReady(endpoint_);
