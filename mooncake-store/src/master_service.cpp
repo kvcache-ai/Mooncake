@@ -2092,9 +2092,6 @@ MasterService::BuildStaleHandleCleanupPlan(
             plan.removed_ids.push_back(replica.id());
             continue;
         }
-        if (replica.status() == ReplicaStatus::COMPLETE) {
-            plan.remaining.push_back(replica.get_descriptor());
-        }
         if (!replica.is_memory_replica() || !replica.has_invalid_mem_handle()) {
             has_valid_after_cleanup = true;
         }
@@ -2111,19 +2108,27 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
         return {};
     }
 
+    const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
+                                            plan.removed_ids.end());
     const auto op_type =
         plan.would_invalidate ? OpType::REMOVE : OpType::PUT_END;
-    const std::string payload =
-        plan.would_invalidate ? std::string{}
-                              : SerializeMetadataForOpLogFromReplicaDescriptors(
-                                    metadata, plan.remaining);
+    std::string payload;
+    if (!plan.would_invalidate) {
+        std::vector<Replica::Descriptor> remaining;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (!ids.contains(replica.id()) &&
+                replica.status() == ReplicaStatus::COMPLETE) {
+                remaining.push_back(replica.get_descriptor());
+            }
+        }
+        payload = SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                  remaining);
+    }
 
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
     }
-    const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
-                                            plan.removed_ids.end());
     metadata.VisitReplicas(
         [&ids](const Replica& replica) { return ids.contains(replica.id()); },
         [](Replica& replica) { replica.mark_removed(); });

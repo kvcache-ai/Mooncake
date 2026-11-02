@@ -1369,7 +1369,6 @@ class MasterService {
         const std::chrono::system_clock::time_point& ttl);
     struct StaleHandleCleanupPlan {
         std::vector<ReplicaID> removed_ids;
-        std::vector<Replica::Descriptor> remaining;
         bool would_invalidate{false};
     };
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
