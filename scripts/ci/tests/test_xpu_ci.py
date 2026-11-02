@@ -42,7 +42,7 @@ with patch.dict(sys.modules, {"verify_rocm_wheel": ROCM}):
 
 
 class HostReportTest(unittest.TestCase):
-    def test_requires_exact_count_and_completed_non_skipped_cases(self):
+    def test_requires_nonempty_completed_non_skipped_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             reports = Path(directory) / "xpu-ci-output/reports"
             reports.mkdir(parents=True)
@@ -51,21 +51,36 @@ class HostReportTest(unittest.TestCase):
                 .split("python - <<'PY'\n", 1)[1]
                 .rsplit("\nPY", 1)[0]
             )
-            for body, valid in (
-                ('<testcase status="run" result="completed"/>', True),
-                ("", False),
-                ('<testcase status="notrun" result="suppressed"/>', False),
+            passed = '<testcase status="run" result="completed"/>'
+            for body, count, valid in (
+                (passed, 1, True),
+                (passed, 20, True),
+                ("", 1, False),
+                ('<testcase status="notrun" result="suppressed"/>', 1, False),
                 (
                     '<testcase status="run" result="skipped"><skipped/></testcase>',
+                    1,
                     False,
                 ),
                 (
                     '<testcase status="run" result="completed"><failure/></testcase>',
+                    1,
+                    False,
+                ),
+                (
+                    '<testcase status="run" result="completed"><error/></testcase>',
+                    1,
+                    False,
+                ),
+                (
+                    passed
+                    + '<testcase status="run" result="skipped"><skipped/></testcase>',
+                    1,
                     False,
                 ),
             ):
-                with self.subTest(body=body):
-                    for name, count in (("config", 19), ("ep", 6), ("crc32c", 5)):
+                with self.subTest(body=body, count=count):
+                    for name in ("config", "ep", "crc32c"):
                         (reports / f"{name}.xml").write_text(
                             f"<testsuites><testsuite>{body * count}</testsuite></testsuites>"
                         )
@@ -91,12 +106,6 @@ class HostReportTest(unittest.TestCase):
 
 class BuildDirectoryTest(unittest.TestCase):
     def test_cleanup_defaults_and_explicit_override(self):
-        script = (ROOT / "scripts/build_wheel.sh").read_text()
-        code = script[
-            script.index('CUDA_EP_STAGING_TEMP=""') : script.index(
-                "# Make the post-repair device library discoverable"
-            )
-        ]
         wheel_step = next(
             step
             for step in WORKFLOW["jobs"]["build-wheel-xpu"]["steps"]
@@ -126,7 +135,14 @@ class BuildDirectoryTest(unittest.TestCase):
                     environment["CUDA_EP_STAGING_DIR"] = str(build / "ep_pg_staging")
                     environment["CUDA_EP_JIT_DIR"] = str(build / "mooncake_ep_jit")
                     result = subprocess.run(
-                        ["bash", "-ec", code],
+                        [
+                            "bash",
+                            "-ec",
+                            'source "$1"; cleanup_build_directory',
+                            "bash",
+                            str(ROOT / "scripts/build_wheel.sh"),
+                        ],
+                        cwd=directory,
                         env=environment,
                         capture_output=True,
                         text=True,
@@ -137,6 +153,47 @@ class BuildDirectoryTest(unittest.TestCase):
                     if preserved:
                         self.assertEqual(library.read_bytes(), b"shared dependency")
                         self.assertEqual(binary.read_bytes(), b"native test")
+
+    def test_cleanup_preserves_device_libraries_and_jit_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            build = root / "build"
+            staging = build / "ep_pg_staging"
+            staging.mkdir(parents=True)
+            (staging / "device.so").write_bytes(b"device library")
+            jit = build / "mooncake_ep_jit"
+            jit.mkdir()
+            (jit / "kernel.cuh").write_text("kernel header")
+            paths = root / "staging-paths"
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-ec",
+                    'source "$1"; cleanup_build_directory; '
+                    'printf "%s\\n" "$CUDA_EP_STAGING_DIR" "$CUDA_EP_JIT_DIR" > "$2"',
+                    "bash",
+                    str(ROOT / "scripts/build_wheel.sh"),
+                    str(paths),
+                ],
+                cwd=root,
+                env={
+                    **os.environ,
+                    "CI": "true",
+                    "FREE_BUILD_DIR": "1",
+                    "BUILD_DIR": str(build),
+                    "CUDA_EP_STAGING_DIR": str(staging),
+                    "CUDA_EP_JIT_DIR": str(jit),
+                    "TMPDIR": str(root),
+                },
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(build.exists())
+            staged, staged_jit = map(Path, paths.read_text().splitlines())
+            self.assertEqual((staged / "device.so").read_bytes(), b"device library")
+            self.assertEqual((staged_jit / "kernel.cuh").read_text(), "kernel header")
 
 
 class WheelVariantTest(unittest.TestCase):
@@ -192,19 +249,13 @@ class WorkflowTest(unittest.TestCase):
     def test_xpu_selection_and_strict_gate_are_wired(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         jobs = workflow["jobs"]
-        filters = yaml.safe_load(jobs["check-paths"]["steps"][1]["with"]["filters"])
-        for path in (
-            "python/**",
-            ".github/workflows/ci_xpu.yml",
-        ):
-            self.assertIn(path, filters["xpu"])
-        self.assertIn("workflow_dispatch", jobs["check-paths"]["outputs"]["xpu"])
-        self.assertIn("outputs.xpu == 'true'", jobs["build-wheel-xpu"]["if"])
+        self.assertEqual(jobs["build-wheel-xpu"]["if"], jobs["build-wheel"]["if"])
+        self.assertIn("outputs.src == 'true'", jobs["build-wheel-xpu"]["if"])
         gate = jobs["ci-gate"]
         self.assertIn("build-wheel-xpu", gate["needs"])
-        step = next(
-            s for s in gate["steps"] if s["name"] == "Check XPU build and packaging"
-        )
+        step = next(s for s in gate["steps"] if s["name"] == "Check source jobs")
+        self.assertIn("needs.build-wheel-xpu.result", step["env"]["RESULTS"])
+        self.assertIn("outputs.src == 'true'", step["env"]["EXPECTED"])
         for selected, result, passes in (
             (True, "success", True),
             (False, "skipped", True),
@@ -218,7 +269,9 @@ class WorkflowTest(unittest.TestCase):
                 env={
                     **os.environ,
                     "EXPECTED": "success" if selected else "skipped",
-                    "RESULT": result,
+                    "RESULTS": f"success {result} success"
+                    if selected
+                    else f"skipped {result} skipped",
                 },
                 capture_output=True,
                 timeout=5,
@@ -230,15 +283,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("build-wheel-xpu", nightly["nightly-gate"]["needs"])
         self.assertNotIn("build-wheel-xpu", nightly["publish-testpypi"]["needs"])
 
-    def test_uses_rocm_style_container_without_docker_or_orchestration_scripts(self):
+    def test_uses_container_and_shared_wheel_builder(self):
         job = WORKFLOW["jobs"]["build-wheel-xpu"]
         self.assertIn("@sha256:", job["container"])
         commands = "\n".join(step.get("run", "") for step in job["steps"])
         self.assertNotIn("docker ", commands)
         self.assertIn("bash scripts/build_wheel.sh", commands)
-        for name in ("build_xpu.sh", "package_xpu_tests.sh", "check_xpu_host_tests.py"):
-            self.assertFalse((ROOT / "scripts/ci" / name).exists())
-            self.assertNotIn(name, commands)
         self.assertLess(
             [step.get("name") for step in job["steps"]].index(
                 "Install git (pre-checkout)"

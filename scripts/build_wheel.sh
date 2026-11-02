@@ -3,6 +3,33 @@
 # Usage: ./scripts/build_wheel.sh [python_version] [output_dir]
 # Example: ./scripts/build_wheel.sh 3.10 dist-3.10
 
+cleanup_build_directory() {
+    CUDA_EP_STAGING_TEMP=""
+    if [ "$FREE_BUILD_DIR" != "0" ] && { [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; }; then
+        if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+            CUDA_EP_STAGING_TEMP=$(mktemp -d)
+            cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
+            echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+            if [ -d "$CUDA_EP_JIT_DIR" ]; then
+                cp -r "$CUDA_EP_JIT_DIR" "$CUDA_EP_STAGING_TEMP/"
+                CUDA_EP_JIT_DIR="${CUDA_EP_STAGING_TEMP}/mooncake_ep_jit"
+                echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
+            fi
+        fi
+        echo "Freeing disk space: removing build directory (artifacts already copied)"
+        rm -rf "${BUILD_DIR}/"
+        # Point the injection step to the preserved copy (if any).
+        if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
+            CUDA_EP_STAGING_DIR="$CUDA_EP_STAGING_TEMP"
+        fi
+    fi
+}
+
+# Sourcing exposes the cleanup function without starting a wheel build.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
@@ -162,25 +189,7 @@ CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
 # FREE_BUILD_DIR=1 enables local cleanup; 0 preserves build dependencies and tests.
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
-CUDA_EP_STAGING_TEMP=""
-if [ "$FREE_BUILD_DIR" != "0" ] && { [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; }; then
-    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
-        CUDA_EP_STAGING_TEMP=$(mktemp -d)
-        cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
-        echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
-        if [ -d "$CUDA_EP_JIT_DIR" ]; then
-            cp -r "$CUDA_EP_JIT_DIR" "$CUDA_EP_STAGING_TEMP/"
-            CUDA_EP_JIT_DIR="${CUDA_EP_STAGING_TEMP}/mooncake_ep_jit"
-            echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
-        fi
-    fi
-    echo "Freeing disk space: removing build directory (artifacts already copied)"
-    rm -rf "${BUILD_DIR}/"
-    # Point the injection step to the preserved copy (if any).
-    if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
-        CUDA_EP_STAGING_DIR="$CUDA_EP_STAGING_TEMP"
-    fi
-fi
+cleanup_build_directory
 
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
