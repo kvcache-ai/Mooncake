@@ -29,11 +29,24 @@ optional_engine: TransferEngine | None = None
 def exercise_transfer_engine(engine: TransferEngine) -> None:
     assert_type(engine.initialize("127.0.0.1", "P2PHANDSHAKE", "tcp", ""), int)
     assert_type(engine.get_rpc_port(), int)
+    assert_type(engine.get_endpoint(), str)
+    assert_type(engine.refresh_remote("peer:1"), None)
 
     buffer = engine.allocate_managed_buffer(4096)
     assert_type(buffer, int)
     assert_type(engine.register_memory(buffer, 4096), int)
     assert_type(engine.batch_register_memory([buffer], [4096]), int)
+
+    managed_ticket = engine.submit_transfer(
+        target_hostname="peer:1",
+        buffer=buffer,
+        peer_buffer_address=0,
+        length=4096,
+        opcode=TransferOpcode.Write,
+    )
+    assert_type(managed_ticket, ScatterTransferTicket)
+    assert_type(managed_ticket.poll(), tuple[bool, str])
+    engine.submit_transfer("peer:1", buffer, 0, 4096, 1)  # type: ignore[arg-type]
 
     assert_type(engine.transfer_sync_write("peer:1", buffer, 0, 4096), int)
     assert_type(engine.transfer_sync_read("peer:1", buffer, 0, 4096), int)

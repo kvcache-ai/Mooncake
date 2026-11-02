@@ -91,6 +91,9 @@ if(WITH_TE)
         REQUIRED)
       add_executable(on_cuda_transport_guard_test
                      tests/on_cuda_transport_guard_test.cpp)
+      target_include_directories(
+        on_cuda_transport_guard_test
+        PRIVATE "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/include")
       target_link_libraries(on_cuda_transport_guard_test
                             PRIVATE pybind11::headers Python3::Python)
       add_test(NAME on_cuda_transport_guard_test
