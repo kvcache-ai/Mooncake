@@ -5,16 +5,19 @@
 #include <asio.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
 #include "tent/common/status.h"
+#include "tent/common/types.h"
 
 namespace mooncake::tent {
 
@@ -56,11 +59,17 @@ class HighPerformanceTcpWorkers {
         size_t worker_count{16};
     };
 
-    using Task = std::function<void(size_t)>;
+    using QueueTime = std::chrono::steady_clock::time_point;
+    enum class QueueDisposition { Settled, Transferred };
+    using Task = std::function<QueueDisposition(size_t, QueueTime)>;
     struct Command {
         size_t worker_id{0};
         Task run;
         std::function<void()> cancel;
+#if TENT_METRICS_ENABLED
+        std::optional<Request::OpCode> metrics_operation;
+        QueueTime enqueue_time{};
+#endif
     };
 
     HighPerformanceTcpWorkers();

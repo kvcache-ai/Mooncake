@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -56,7 +57,7 @@ struct TcpTask {
     bool non_replayable_failure{false};  // Published by status_word.
     uint64_t target_addr = 0;
 #if TENT_METRICS_ENABLED
-    uint64_t enqueue_ts_ns{0};
+    std::chrono::steady_clock::time_point enqueue_time{};
 #endif
 
     TcpTask() = default;
@@ -70,7 +71,7 @@ struct TcpTask {
 #if TENT_METRICS_ENABLED
           non_replayable_failure(other.non_replayable_failure),
           target_addr(other.target_addr),
-          enqueue_ts_ns(other.enqueue_ts_ns) {
+          enqueue_time(other.enqueue_time) {
     }
 #else
           non_replayable_failure(other.non_replayable_failure),

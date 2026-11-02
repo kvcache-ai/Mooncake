@@ -26,9 +26,16 @@ bool WaitUntil(Predicate predicate) {
 }
 
 Status SubmitToWorker(HighPerformanceTcpWorkers& workers, size_t owner,
-                      HighPerformanceTcpWorkers::Task task) {
-    std::vector<HighPerformanceTcpWorkers::Command> commands{
-        {.worker_id = owner, .run = std::move(task), .cancel = {}}};
+                      std::function<void(size_t)> task) {
+    HighPerformanceTcpWorkers::Command command;
+    command.worker_id = owner;
+    command.run = [task = std::move(task)](
+                      size_t actual, HighPerformanceTcpWorkers::QueueTime) {
+        task(actual);
+        return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
+    };
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    commands.push_back(std::move(command));
     return workers.tryCommitBatch(commands, nullptr, 0, 0, [] {});
 }
 
@@ -52,8 +59,14 @@ TEST(HighPerformanceTcpWorkersTest, BatchAdmissionHasNoPartialCommit) {
     HighPerformanceTcpAdmissionController admission(1, 512);
     ASSERT_TRUE(admission.tryReserve(1, 512).ok());
     bool committed = false;
-    std::vector<HighPerformanceTcpWorkers::Command> commands{
-        {.worker_id = 0, .run = [](size_t) {}, .cancel = [] {}}};
+    HighPerformanceTcpWorkers::Command command;
+    command.worker_id = 0;
+    command.run = [](size_t, HighPerformanceTcpWorkers::QueueTime) {
+        return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
+    };
+    command.cancel = [] {};
+    std::vector<HighPerformanceTcpWorkers::Command> commands;
+    commands.push_back(std::move(command));
     EXPECT_TRUE(workers
                     .tryCommitBatch(commands, &admission, 1, 512,
                                     [&] { committed = true; })

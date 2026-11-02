@@ -27,13 +27,22 @@
 #include <thread>
 
 #include "tent/common/status.h"
-#include "tent/common/utils/os.h"
 #include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/slab.h"
 
 namespace mooncake {
 namespace tent {
+#if TENT_METRICS_ENABLED
+namespace {
+double ElapsedMicroseconds(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+}  // namespace
+#endif
+
 static std::string ExtractHost(const std::string &endpoint) {
     if (!endpoint.empty() && endpoint.front() == '[') {
         auto end = endpoint.find(']');
@@ -181,7 +190,7 @@ Status TcpTransport::submitTransferTasks(
         task.progress_batch_id = batch->progress_batch_id;
         task.notify_progress = batch->notify_progress;
 #if TENT_METRICS_ENABLED
-        task.enqueue_ts_ns = getCurrentTimeInNano();
+        task.enqueue_time = std::chrono::steady_clock::now();
 #endif
         task.status_word.store(TransferStatusEnum::PENDING,
                                std::memory_order_release);
@@ -245,10 +254,10 @@ void TcpTransport::startTransfer(TcpTask *task) {
 #if TENT_METRICS_ENABLED
     TentMetrics::instance().recordStreamQueueDepth(TransportType::TCP, -1);
     TentMetrics::instance().recordStreamBusyWorkers(TransportType::TCP, 1);
-    if (task->enqueue_ts_ns != 0) {
+    if (task->enqueue_time != std::chrono::steady_clock::time_point{}) {
         TentMetrics::instance().recordStreamQueueWait(
             TransportType::TCP, task->request.opcode,
-            (getCurrentTimeInNano() - task->enqueue_ts_ns) / 1000.0);
+            ElapsedMicroseconds(task->enqueue_time));
     }
 #endif
     try {
@@ -333,7 +342,7 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         }
 
 #if TENT_METRICS_ENABLED
-        const uint64_t attempt_start_ns = getCurrentTimeInNano();
+        const auto attempt_start = std::chrono::steady_clock::now();
         TentMetrics::instance().recordStreamEvent(
             TransportType::TCP, task->request.opcode,
             TentMetrics::StreamEvent::AttemptStarted);
@@ -360,7 +369,7 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         }
         TentMetrics::instance().recordStreamAttempt(
             TransportType::TCP, task->request.opcode, outcome,
-            (getCurrentTimeInNano() - attempt_start_ns) / 1000.0);
+            ElapsedMicroseconds(attempt_start));
 #endif
         if (status.ok()) return Status::OK();
 

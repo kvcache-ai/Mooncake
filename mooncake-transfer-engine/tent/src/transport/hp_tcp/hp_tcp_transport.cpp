@@ -703,7 +703,10 @@ Status HighPerformanceTcpTransport::planTask(
         command.worker_id = owner_worker;
         command.run = [this, task, slice_count, slot,
                        operation =
-                           std::move(operation)](size_t worker_id) mutable {
+                           std::move(operation)](
+                          size_t worker_id,
+                          HighPerformanceTcpWorkers::QueueTime enqueue_time)
+            mutable {
             if (task->cancelRequested() ||
                 stopping_.load(std::memory_order_acquire)) {
                 if (slice_count == 1) {
@@ -712,9 +715,15 @@ Status HighPerformanceTcpTransport::planTask(
                 } else {
                     (void)task->completeSlice(CANCELED);
                 }
-                return;
+                return HighPerformanceTcpWorkers::QueueDisposition::Settled;
             }
+#if TENT_METRICS_ENABLED
+            operation.enqueue_time = enqueue_time;
+#else
+            (void)enqueue_time;
+#endif
             client_->enqueueOnOwner(worker_id, std::move(operation));
+            return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
         };
         command.cancel = [task, slice_count, slot] {
             if (slice_count == 1) {
@@ -724,6 +733,9 @@ Status HighPerformanceTcpTransport::planTask(
                 (void)task->completeSlice(CANCELED);
             }
         };
+#if TENT_METRICS_ENABLED
+        command.metrics_operation = request.opcode;
+#endif
         commands.push_back(std::move(command));
         slice_offset += slice_length;
     }

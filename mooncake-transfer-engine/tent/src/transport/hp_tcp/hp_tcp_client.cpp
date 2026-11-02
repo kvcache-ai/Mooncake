@@ -11,7 +11,6 @@
 
 #include <glog/logging.h>
 
-#include "tent/common/utils/os.h"
 #include "tent/metrics/tent_metrics.h"
 #include "tent/transport/hp_tcp/hp_tcp_socket_observability.h"
 
@@ -21,6 +20,30 @@ namespace {
 Request::OpCode streamOperation(HighPerformanceTcpOpcode opcode) {
     return opcode == HighPerformanceTcpOpcode::kRead ? Request::READ
                                                      : Request::WRITE;
+}
+
+double elapsedMicroseconds(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+}
+
+void finishQueuedOperation(
+    HighPerformanceTcpClient::Operation& operation,
+    std::optional<TentMetrics::StreamEvent> terminal_event = std::nullopt) {
+    if (operation.enqueue_time == std::chrono::steady_clock::time_point{}) {
+        return;
+    }
+    TentMetrics::instance().recordStreamQueueDepth(TransportType::HP_TCP, -1);
+    TentMetrics::instance().recordStreamQueueWait(
+        TransportType::HP_TCP, streamOperation(operation.opcode),
+        elapsedMicroseconds(operation.enqueue_time));
+    if (terminal_event.has_value()) {
+        TentMetrics::instance().recordStreamEvent(
+            TransportType::HP_TCP, streamOperation(operation.opcode),
+            *terminal_event);
+    }
+    operation.enqueue_time = {};
 }
 
 bool isPeerClosedError(const std::error_code& error) {
@@ -67,37 +90,25 @@ class HighPerformanceTcpClient::Lane
           timer_(io) {}
 
     void enqueue(Operation operation) {
-#if TENT_METRICS_ENABLED
-        operation.enqueue_ts_ns = getCurrentTimeInNano();
-        TentMetrics::instance().recordStreamEvent(
-            TransportType::HP_TCP, streamOperation(operation.opcode),
-            TentMetrics::StreamEvent::Queued);
-#endif
         try {
             queue_.push_back(std::move(operation));
         } catch (const std::exception& error) {
 #if TENT_METRICS_ENABLED
-            TentMetrics::instance().recordStreamEvent(
-                TransportType::HP_TCP, streamOperation(operation.opcode),
-                TentMetrics::StreamEvent::IoError);
+            finishQueuedOperation(operation,
+                                  TentMetrics::StreamEvent::IoError);
 #endif
             LOG(ERROR) << "HP TCP lane enqueue failed: " << error.what();
             completeStandalone(std::move(operation), FAILED, 0);
             return;
         } catch (...) {
 #if TENT_METRICS_ENABLED
-            TentMetrics::instance().recordStreamEvent(
-                TransportType::HP_TCP, streamOperation(operation.opcode),
-                TentMetrics::StreamEvent::IoError);
+            finishQueuedOperation(operation,
+                                  TentMetrics::StreamEvent::IoError);
 #endif
             LOG(ERROR) << "HP TCP lane enqueue failed";
             completeStandalone(std::move(operation), FAILED, 0);
             return;
         }
-#if TENT_METRICS_ENABLED
-        TentMetrics::instance().recordStreamQueueDepth(TransportType::HP_TCP,
-                                                       1);
-#endif
         if (!current_) startNext();
     }
 
@@ -107,12 +118,10 @@ class HighPerformanceTcpClient::Lane
             Operation operation = std::move(queue_.front());
             queue_.pop_front();
 #if TENT_METRICS_ENABLED
-            TentMetrics::instance().recordStreamQueueDepth(
-                TransportType::HP_TCP, -1);
-            TentMetrics::instance().recordStreamEvent(
-                TransportType::HP_TCP, streamOperation(operation.opcode),
-                terminal == TIMEOUT ? TentMetrics::StreamEvent::Timeout
-                                    : TentMetrics::StreamEvent::Canceled);
+            finishQueuedOperation(
+                operation, terminal == TIMEOUT
+                               ? TentMetrics::StreamEvent::Timeout
+                               : TentMetrics::StreamEvent::Canceled);
 #endif
             completeStandalone(std::move(operation), terminal, 0);
         }
@@ -134,11 +143,8 @@ class HighPerformanceTcpClient::Lane
             Operation operation = std::move(*it);
             queue_.erase(it);
 #if TENT_METRICS_ENABLED
-            TentMetrics::instance().recordStreamQueueDepth(
-                TransportType::HP_TCP, -1);
-            TentMetrics::instance().recordStreamEvent(
-                TransportType::HP_TCP, streamOperation(operation.opcode),
-                TentMetrics::StreamEvent::Canceled);
+            finishQueuedOperation(operation,
+                                  TentMetrics::StreamEvent::Canceled);
 #endif
             completeStandalone(std::move(operation), CANCELED, 0);
             return true;
@@ -180,20 +186,14 @@ class HighPerformanceTcpClient::Lane
         body_offset_ = 0;
         remote_write_outcome_unknown_ = false;
 #if TENT_METRICS_ENABLED
-        TentMetrics::instance().recordStreamQueueDepth(TransportType::HP_TCP,
-                                                       -1);
+        finishQueuedOperation(*current_);
         TentMetrics::instance().recordStreamBusyWorkers(TransportType::HP_TCP,
                                                         1);
-        const uint64_t attempt_start_ns = getCurrentTimeInNano();
-        if (current_->enqueue_ts_ns != 0) {
-            TentMetrics::instance().recordStreamQueueWait(
-                TransportType::HP_TCP, streamOperation(current_->opcode),
-                (attempt_start_ns - current_->enqueue_ts_ns) / 1000.0);
-        }
+        const auto attempt_start = std::chrono::steady_clock::now();
         TentMetrics::instance().recordStreamEvent(
             TransportType::HP_TCP, streamOperation(current_->opcode),
             TentMetrics::StreamEvent::AttemptStarted);
-        attempt_start_ts_ns_ = attempt_start_ns;
+        attempt_start_time_ = attempt_start;
         attempt_outcome_ = TentMetrics::StreamOutcome::IoError;
 #endif
         request_bytes_ = EncodeHighPerformanceTcpRequest(
@@ -620,9 +620,10 @@ class HighPerformanceTcpClient::Lane
         TentMetrics::instance().recordStreamAttempt(
             TransportType::HP_TCP, streamOperation(current_->opcode),
             attempt_outcome_,
-            attempt_start_ts_ns_ == 0
+            attempt_start_time_ == std::chrono::steady_clock::time_point{}
                 ? -1.0
-                : (getCurrentTimeInNano() - attempt_start_ts_ns_) / 1000.0);
+                : elapsedMicroseconds(attempt_start_time_));
+        attempt_start_time_ = {};
 #endif
         Operation operation = std::move(*current_);
         if (terminal == FAILED && remote_write_outcome_unknown_ &&
@@ -695,7 +696,7 @@ class HighPerformanceTcpClient::Lane
     bool remote_write_outcome_unknown_{false};
     std::optional<TransferStatusEnum> forced_terminal_;
 #if TENT_METRICS_ENABLED
-    uint64_t attempt_start_ts_ns_{0};
+    std::chrono::steady_clock::time_point attempt_start_time_{};
     TentMetrics::StreamOutcome attempt_outcome_{
         TentMetrics::StreamOutcome::IoError};
     bool connection_counted_{false};
@@ -756,6 +757,9 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
                                               Operation operation) {
     if (workers_ == nullptr || owner_worker >= worker_states_.size() ||
         !operation.complete) {
+#if TENT_METRICS_ENABLED
+        finishQueuedOperation(operation, TentMetrics::StreamEvent::IoError);
+#endif
         if (operation.complete) {
             try {
                 operation.complete(FAILED, 0, std::nullopt);
@@ -773,6 +777,10 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
             operation.length > config_.max_transfer_bytes ||
             operation.host.empty() || operation.port == 0 ||
             operation.lane_id >= config_.connections_per_peer) {
+#if TENT_METRICS_ENABLED
+            finishQueuedOperation(operation,
+                                  TentMetrics::StreamEvent::Canceled);
+#endif
             try {
                 operation.complete(CANCELED, 0, std::nullopt);
             } catch (...) {
@@ -806,6 +814,9 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
         it->second->enqueue(std::move(operation));
     } catch (const std::exception& error) {
         LOG(ERROR) << "HP TCP lane setup failed: " << error.what();
+#if TENT_METRICS_ENABLED
+        finishQueuedOperation(operation, TentMetrics::StreamEvent::IoError);
+#endif
         try {
             operation.complete(FAILED, 0, std::nullopt);
         } catch (...) {
@@ -814,6 +825,9 @@ void HighPerformanceTcpClient::enqueueOnOwner(size_t owner_worker,
         operationFinished();
     } catch (...) {
         LOG(ERROR) << "HP TCP lane setup failed";
+#if TENT_METRICS_ENABLED
+        finishQueuedOperation(operation, TentMetrics::StreamEvent::IoError);
+#endif
         try {
             operation.complete(FAILED, 0, std::nullopt);
         } catch (...) {

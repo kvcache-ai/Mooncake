@@ -11,6 +11,44 @@
 
 namespace mooncake::tent {
 
+#if TENT_METRICS_ENABLED
+namespace {
+void RecordCommandQueued(HighPerformanceTcpWorkers::Command& command) {
+    if (!command.metrics_operation.has_value()) return;
+    command.enqueue_time = std::chrono::steady_clock::now();
+    TentMetrics::instance().recordStreamEvent(
+        TransportType::HP_TCP, *command.metrics_operation,
+        TentMetrics::StreamEvent::Queued);
+    TentMetrics::instance().recordStreamQueueDepth(TransportType::HP_TCP, 1);
+}
+
+void FinishQueueAccounting(
+    const std::optional<Request::OpCode>& operation,
+    HighPerformanceTcpWorkers::QueueTime enqueue_time,
+    TentMetrics::StreamEvent terminal_event) {
+    if (!operation.has_value() ||
+        enqueue_time == HighPerformanceTcpWorkers::QueueTime{}) {
+        return;
+    }
+    TentMetrics::instance().recordStreamQueueDepth(TransportType::HP_TCP, -1);
+    TentMetrics::instance().recordStreamQueueWait(
+        TransportType::HP_TCP, *operation,
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - enqueue_time)
+            .count());
+    TentMetrics::instance().recordStreamEvent(
+        TransportType::HP_TCP, *operation, terminal_event);
+}
+
+void FinishCommandQueue(HighPerformanceTcpWorkers::Command& command,
+                        TentMetrics::StreamEvent terminal_event) {
+    FinishQueueAccounting(command.metrics_operation, command.enqueue_time,
+                          terminal_event);
+    command.enqueue_time = {};
+}
+}  // namespace
+#endif
+
 Status HighPerformanceTcpAdmissionController::tryReserve(uint64_t tasks,
                                                          uint64_t bytes) {
     if (tasks == 0 || bytes == 0) {
@@ -237,19 +275,35 @@ Status HighPerformanceTcpWorkers::tryCommitBatch(
         return Status::InternalError("HP TCP ownership commit failed" LOC_MARK);
     }
 
+#if TENT_METRICS_ENABLED
+    for (auto& command : commands) RecordCommandQueued(command);
+#endif
+
     for (size_t i = 0; i < commands.size(); ++i) {
         Command command = std::move(commands[i]);
         const size_t owner = command.worker_id;
         const auto cancel = command.cancel;
+#if TENT_METRICS_ENABLED
+        const auto metrics_operation = command.metrics_operation;
+        const auto enqueue_time = command.enqueue_time;
+#endif
         try {
             asio::post(workers_[owner]->io,
                        [this, command = std::move(command)]() mutable {
                            runCommand(std::move(command));
                        });
         } catch (...) {
+#if TENT_METRICS_ENABLED
+            FinishQueueAccounting(metrics_operation, enqueue_time,
+                                  TentMetrics::StreamEvent::IoError);
+#endif
             if (cancel) cancel();
             for (++i; i < commands.size(); ++i) {
                 auto& pending = commands[i];
+#if TENT_METRICS_ENABLED
+                FinishCommandQueue(pending,
+                                   TentMetrics::StreamEvent::Canceled);
+#endif
                 if (pending.cancel) pending.cancel();
             }
             return Status::OK();
@@ -262,15 +316,33 @@ void HighPerformanceTcpWorkers::runCommand(Command command) {
     const size_t owner = command.worker_id;
     try {
         if (running()) {
-            command.run(owner);
-        } else if (command.cancel) {
-            command.cancel();
+#if TENT_METRICS_ENABLED
+            const QueueDisposition disposition =
+                command.run(owner, command.enqueue_time);
+            if (disposition == QueueDisposition::Settled) {
+                FinishCommandQueue(command,
+                                   TentMetrics::StreamEvent::Canceled);
+            }
+#else
+            (void)command.run(owner, QueueTime{});
+#endif
+        } else {
+#if TENT_METRICS_ENABLED
+            FinishCommandQueue(command, TentMetrics::StreamEvent::Canceled);
+#endif
+            if (command.cancel) command.cancel();
         }
     } catch (const std::exception& error) {
         LOG(ERROR) << "HP TCP worker command failed: " << error.what();
+#if TENT_METRICS_ENABLED
+        FinishCommandQueue(command, TentMetrics::StreamEvent::IoError);
+#endif
         if (command.cancel) command.cancel();
     } catch (...) {
         LOG(ERROR) << "HP TCP worker command failed";
+#if TENT_METRICS_ENABLED
+        FinishCommandQueue(command, TentMetrics::StreamEvent::IoError);
+#endif
         if (command.cancel) command.cancel();
     }
 }

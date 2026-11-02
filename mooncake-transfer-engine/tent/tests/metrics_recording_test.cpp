@@ -51,6 +51,8 @@
 #include "tent/runtime/transport.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
+#include "metrics_test_utils.h"
+
 namespace mooncake {
 namespace tent {
 
@@ -137,18 +139,7 @@ class MetricsSnapshot {
     // label set, for example:
     // tent_transport_attempts_total{transport="rdma",operation="write"}
     double series(const std::string& series) const {
-        std::istringstream input(prometheus_);
-        std::string line;
-        const std::string prefix = series + " ";
-        while (std::getline(input, line)) {
-            if (line.rfind(prefix, 0) != 0) continue;
-            try {
-                return std::stod(line.substr(prefix.size()));
-            } catch (...) {
-                return 0.0;
-            }
-        }
-        return 0.0;
+        return test::PrometheusSeriesValue(prometheus_, series);
     }
 
     // Counter value (0 if absent).
