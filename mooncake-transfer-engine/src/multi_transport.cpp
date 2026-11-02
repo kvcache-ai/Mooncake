@@ -134,10 +134,8 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     batch_desc->batch_size = batch_size;
     batch_desc->task_list.reserve(batch_size);
     batch_desc->context = NULL;
-    if (completion_fd_ >= 0) {
-        batch_desc->terminal_notify = &MultiTransport::onTerminal;
-        batch_desc->terminal_notify_ctx = this;
-    }
+    // terminal_notify is installed in syncTerminalNotify after submit, once
+    // counter_eligible is known. Non-counter batches must not hook the wake.
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_lock_.lock();
     batch_desc_set_[batch_desc->id] = batch_desc;
@@ -261,6 +259,28 @@ void MultiTransport::discardQueuedCompletion(BatchID batch_id) {
                  ready_.end());
 }
 
+void MultiTransport::resetTerminalWave(BatchID batch_id) {
+    std::lock_guard<std::mutex> lock(completion_mu_);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    if (batch.terminal_suppressed) return;
+    batch.terminal_enqueued = false;
+    ready_.erase(std::remove_if(ready_.begin(), ready_.end(),
+                                [batch_id](const BatchCompletion& item) {
+                                    return item.batch_id == batch_id;
+                                }),
+                 ready_.end());
+}
+
+void MultiTransport::syncTerminalNotify(BatchDesc& batch_desc) {
+    if (batch_desc.counter_eligible && completion_fd_ >= 0) {
+        batch_desc.terminal_notify = &MultiTransport::onTerminal;
+        batch_desc.terminal_notify_ctx = this;
+    } else {
+        batch_desc.terminal_notify = nullptr;
+        batch_desc.terminal_notify_ctx = nullptr;
+    }
+}
+
 void MultiTransport::onTerminal(void* ctx, BatchID batch_id,
                                 TransferStatus status) {
     static_cast<MultiTransport*>(ctx)->enqueueTerminal(batch_id, status);
@@ -268,6 +288,8 @@ void MultiTransport::onTerminal(void* ctx, BatchID batch_id,
 
 void MultiTransport::enqueueTerminal(BatchID batch_id, TransferStatus status) {
     bool wake = false;
+    bool invoke_hook = false;
+    TransferStatusEnum outcome = status.s;
     {
         std::lock_guard<std::mutex> lock(completion_mu_);
         auto& batch = Transport::toBatchDesc(batch_id);
@@ -275,7 +297,9 @@ void MultiTransport::enqueueTerminal(BatchID batch_id, TransferStatus status) {
         batch.terminal_enqueued = true;
         ready_.push_back(BatchCompletion{batch_id, status});
         wake = completion_fd_ >= 0;
+        invoke_hook = static_cast<bool>(on_batch_terminal_);
     }
+    if (invoke_hook) on_batch_terminal_(batch_id, outcome);
 #ifdef __linux__
     if (!wake) return;
     const uint64_t one = 1;
@@ -473,6 +497,7 @@ Status MultiTransport::submitTransfer(
 
     if (entries.empty()) return Status::OK();
     auto& task_list = batch_desc.task_list;
+    const bool append = !task_list.empty();
     batch_desc.counter_eligible =
         (task_list.empty() || batch_desc.counter_eligible) &&
         std::all_of(transports.begin(), transports.end(), [](Transport* t) {
@@ -481,6 +506,13 @@ Status MultiTransport::submitTransfer(
     batch_desc.status_cached.store(false, std::memory_order_relaxed);
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
+    // A second submit starts a new terminal wave: drop a stale ready entry
+    // and allow publishTerminalIfDone to enqueue again when the new size
+    // is reached.
+    if (append) resetTerminalWave(batch_id);
+    // Install before transport work so a seal-time publish (empty task) can
+    // wake. syncTerminalNotify at the end clears the hook if demoted.
+    syncTerminalNotify(batch_desc);
 
     task_list.reserve(task_list.size() + entries.size());
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
@@ -532,6 +564,8 @@ Status MultiTransport::submitTransfer(
             overall_status = status;
         }
     }
+    syncTerminalNotify(batch_desc);
+    if (!batch_desc.counter_eligible) resetTerminalWave(batch_id);
     return overall_status;
 }
 
@@ -560,10 +594,13 @@ Status MultiTransport::mp_submitTransfer(
 
     if (entries.empty()) return Status::OK();
     // Explicit-protocol dispatch retains transport-specific polling.
+    const bool append = !batch_desc.task_list.empty();
     batch_desc.counter_eligible = false;
     batch_desc.status_cached.store(false, std::memory_order_relaxed);
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
+    if (append) resetTerminalWave(batch_id);
+    syncTerminalNotify(batch_desc);
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
@@ -602,6 +639,8 @@ Status MultiTransport::mp_submitTransfer(
             overall_status = status;
         }
     }
+    syncTerminalNotify(batch_desc);
+    if (!batch_desc.counter_eligible) resetTerminalWave(batch_id);
     return overall_status;
 }
 #endif

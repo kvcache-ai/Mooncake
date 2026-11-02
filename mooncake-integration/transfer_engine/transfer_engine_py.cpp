@@ -2036,7 +2036,10 @@ PYBIND11_MODULE(engine, m) {
                 auto engine = self.getEngine();
                 return engine ? engine->completionFd() : -1;
             },
-            "Engine-owned completion eventfd. -1 when the wake is unavailable.")
+            "Engine-owned completion eventfd. -1 when the wake is unavailable. "
+            "Wakes only for counter-eligible batches (every submitted task "
+            "publishes completion without foreground polling). Mixed or "
+            "legacy batches never write the fd.")
         .def(
             "drain_completions",
             [](TransferEnginePy& self) {

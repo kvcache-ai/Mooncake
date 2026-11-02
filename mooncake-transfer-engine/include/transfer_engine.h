@@ -293,6 +293,12 @@ class TransferEngine {
     // non-Linux, when eventfd() failed, or when this engine is the TENT
     // runtime (classic BatchDesc completion is not on that path). The
     // caller may dup the fd. Destroying the engine closes the original.
+    //
+    // The fd wakes only for counter-eligible batches: every submitted task
+    // uses a transport that publishes completion without foreground
+    // polling. Mixed or legacy batches never write the fd; keep polling
+    // getBatchTransferStatus for those. A second submit on the same
+    // BatchID starts a new terminal wave after the prior one.
     int completionFd() const;
 
     // Non-blocking drain of terminal batches. See BatchCompletion.

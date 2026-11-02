@@ -382,8 +382,10 @@ class Transport {
 
             auto prev = batch_desc.finished_task_count.fetch_add(
                 1, std::memory_order_acq_rel);
-            if (prev + 1 == batch_desc.batch_size) {
-                // Last task in the batch: wake up waiting thread directly.
+            // Same boundary as publishTerminalIfDone and
+            // getBatchTransferStatus: submitted tasks, not capacity.
+            if (prev + 1 == batch_desc.task_list.size()) {
+                // Last submitted task: wake up waiting thread directly.
                 // Publish completion under the same mutex used by the waiter
                 // to avoid lost notifications.
                 //
@@ -589,11 +591,13 @@ class Transport {
         bool terminal_enqueued = false;
 
         // Called when this completion made finished_task_count reach the
-        // allocated batch capacity, the same boundary as completion_cv.
-        // The notify target drops the event if freeBatchID already
+        // number of submitted tasks (task_list.size()), matching
+        // getBatchTransferStatus and completion_cv. batch_size is capacity
+        // only. The notify target drops the event if freeBatchID already
         // suppressed it.
         void publishTerminalIfDone(uint64_t prev) {
-            if (terminal_notify == nullptr || prev + 1 != batch_size) return;
+            if (terminal_notify == nullptr || prev + 1 != task_list.size())
+                return;
             TransferStatus status;
             status.s = has_failure.load(std::memory_order_acquire)
                            ? TransferStatusEnum::FAILED

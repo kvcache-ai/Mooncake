@@ -231,6 +231,14 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
 #endif
+    // Counter-eligible batches wake the eventfd without a status poll.
+    // Flush WithNotify from that path so waiters do not need a second walk.
+    multi_transports_->setOnBatchTerminal(
+        [this](BatchID batch_id, TransferStatusEnum status) {
+            if (status == TransferStatusEnum::COMPLETED) {
+                flushPendingNotify(batch_id);
+            }
+        });
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 

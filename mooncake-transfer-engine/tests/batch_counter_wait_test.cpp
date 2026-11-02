@@ -30,6 +30,9 @@ class ProbeTransport : public Transport {
     bool supportsBatchCompletionCounter() const override { return counter_; }
     int polls = 0;
     bool complete_while_submitting = false;
+    // Create this many unfinished slices per task (ignored when
+    // complete_while_submitting or empty_task).
+    size_t slices_per_task = 1;
     uint64_t published_before_seal = 0;
     bool reject_submit = false;
     bool empty_task = false;
@@ -43,14 +46,14 @@ class ProbeTransport : public Transport {
         for (auto* t : incoming) {
             tasks.push_back(t);
             if (empty_task) continue;
-            auto* s = new Slice{};
-            s->task = t;
-            s->length = 17;
-            s->ts = 0;
-            t->slice_list.push_back(s);
-            t->slice_count = 1;
-            t->total_bytes = 17;
             if (complete_while_submitting) {
+                auto* s = new Slice{};
+                s->task = t;
+                s->length = 17;
+                s->ts = 0;
+                t->slice_list.push_back(s);
+                t->slice_count = 1;
+                t->total_bytes = 17;
                 s->markSuccess();
                 published_before_seal =
                     toBatchDesc(t->batch_id).finished_task_count.load();
@@ -61,7 +64,19 @@ class ProbeTransport : public Transport {
                 t->slice_list.push_back(tail);
                 t->slice_count = 2;
                 t->total_bytes = 40;
+                continue;
             }
+            const size_t n = slices_per_task == 0 ? 1 : slices_per_task;
+            t->total_bytes = 0;
+            for (size_t i = 0; i < n; ++i) {
+                auto* s = new Slice{};
+                s->task = t;
+                s->length = 17;
+                s->ts = 0;
+                t->slice_list.push_back(s);
+                t->total_bytes += 17;
+            }
+            t->slice_count = n;
         }
         return reject_submit ? Status::InvalidArgument("test submit failure")
                              : Status::OK();
@@ -79,6 +94,13 @@ class ProbeTransport : public Transport {
             t->success_slice_count = t->slice_count;
             t->is_finished = true;
         }
+    }
+    void finishSlice(size_t task_i, size_t slice_i, bool failed = false) {
+        auto* s = tasks.at(task_i)->slice_list.at(slice_i);
+        if (failed)
+            s->markFailed();
+        else
+            s->markSuccess();
     }
     Status getTransferStatus(BatchID b, size_t i, TransferStatus& s) override {
         ++polls;
@@ -414,6 +436,109 @@ TEST_F(BatchCounterWait, FailedSliceWakesWithFailedStatus) {
     ASSERT_EQ(done.size(), 1u);
     EXPECT_EQ(done[0].batch_id, b);
     EXPECT_EQ(done[0].status.s, Transport::FAILED);
+#endif
+}
+
+TEST_F(BatchCounterWait, ShortSubmitWakesWhenSubmittedTasksFinish) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    // Capacity 4, submit 1: wake on the submitted count, not capacity.
+    auto b = batch(4);
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(0);
+    ASSERT_TRUE(fdReadable(multi.completionFd()));
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, b);
+    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
+    EXPECT_EQ(done[0].status.transferred_bytes, 17u);
+#endif
+}
+
+TEST_F(BatchCounterWait, SecondSubmitStartsNewTerminalWave) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(4);
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(0);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].status.transferred_bytes, 17u);
+    done.clear();
+    ASSERT_TRUE(submit(b, {1}).ok());
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    rdma->finish(1);
+    ASSERT_TRUE(fdReadable(multi.completionFd()));
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, b);
+    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
+    EXPECT_EQ(done[0].status.transferred_bytes, 34u);
+#endif
+}
+
+TEST_F(BatchCounterWait, AppendBeforeDrainReplacesStaleTerminal) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(4);
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(0);
+    ASSERT_TRUE(fdReadable(multi.completionFd()));
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(1);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, b);
+    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
+    EXPECT_EQ(done[0].status.transferred_bytes, 34u);
+#endif
+}
+
+TEST_F(BatchCounterWait, PartialSliceFailureDoesNotWakeUntilTaskDone) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    rdma->slices_per_task = 2;
+    auto b = batch(1);
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finishSlice(0, 0, true);
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    rdma->finishSlice(0, 1);
+    ASSERT_TRUE(fdReadable(multi.completionFd()));
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].status.s, Transport::FAILED);
+#endif
+}
+
+TEST_F(BatchCounterWait, NonCounterTransportDoesNotWakeFd) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(submit(b, {2}).ok());
+    tcp->finish(0);
+    EXPECT_EQ(query(b).s, Transport::COMPLETED);
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    EXPECT_TRUE(done.empty());
 #endif
 }
 

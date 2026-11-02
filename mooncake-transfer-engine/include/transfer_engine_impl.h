@@ -325,19 +325,7 @@ class TransferEngineImpl {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
-            {
-                RWSpinlock::WriteGuard guard(send_notifies_lock_);
-                auto notify = notifies_to_send_.find(batch_id);
-                if (notify == notifies_to_send_.end()) return result;
-                value = std::move(notify->second);
-                notifies_to_send_.erase(notify);
-            }
-            auto rc = sendNotifyByID(value.first, std::move(value.second));
-            if (rc) {
-                LOG(ERROR) << "Failed to send notify message, error code: "
-                           << rc;
-            }
+            flushPendingNotify(batch_id);
         }
         return result;
     }
@@ -457,6 +445,24 @@ class TransferEngineImpl {
     void insertMemoryRegionLocked(const MemoryRegion& region);
 
     void eraseMemoryRegionLocked(void* addr);
+
+    // Posts a pending submitTransferWithNotify message once. Safe from the
+    // terminal eventfd path and from getBatchTransferStatus; the map erase
+    // makes a second call a no-op.
+    void flushPendingNotify(BatchID batch_id) {
+        std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
+        {
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            auto notify = notifies_to_send_.find(batch_id);
+            if (notify == notifies_to_send_.end()) return;
+            value = std::move(notify->second);
+            notifies_to_send_.erase(notify);
+        }
+        auto rc = sendNotifyByID(value.first, std::move(value.second));
+        if (rc) {
+            LOG(ERROR) << "Failed to send notify message, error code: " << rc;
+        }
+    }
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;

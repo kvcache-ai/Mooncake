@@ -92,6 +92,13 @@ class MultiTransport {
     // Engine-owned counter-mode eventfd. -1 when this platform has no
     // eventfd, or eventfd() failed. The caller may dup it; this object
     // closes the original in its destructor.
+    //
+    // The fd wakes only for batches that stay counter_eligible after
+    // submit: every submitted task uses a transport that publishes
+    // completion without foreground polling (RDMA and peers that report
+    // supportsBatchCompletionCounter). Mixed or legacy batches (TCP,
+    // NVLink-style polling paths, rejected submit) never write the fd;
+    // those callers keep getBatchTransferStatus.
     int completionFd() const { return completion_fd_; }
 
     // Non-blocking. Swaps out every completion freeBatchID has not removed.
@@ -99,6 +106,15 @@ class MultiTransport {
     // stale counter is discarded. A non-empty queue is returned even when
     // that read is EAGAIN.
     Status drainCompletions(std::vector<BatchCompletion> &out);
+
+    // Optional hook run after a terminal batch is queued for the eventfd
+    // path. Used by TransferEngineImpl to flush submitTransferWithNotify
+    // without a status poll. Must not call getBatchTransferStatus or
+    // freeBatchID. Installed once after construction.
+    void setOnBatchTerminal(
+        std::function<void(BatchID, TransferStatusEnum)> fn) {
+        on_batch_terminal_ = std::move(fn);
+    }
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
@@ -164,6 +180,16 @@ class MultiTransport {
     // to invalidating the handle.
     void discardQueuedCompletion(BatchID batch_id);
 
+    // Clears a prior terminal wave so a later submit on the same BatchID
+    // can wake again. Drops a still-queued ready entry for this id.
+    // No-op when freeBatchID already suppressed the batch.
+    void resetTerminalWave(BatchID batch_id);
+
+    // Install or clear terminal_notify from the current counter_eligible
+    // flag and completion_fd_. Called at the end of each successful submit
+    // path so non-counter batches never hook the wake.
+    void syncTerminalNotify(BatchDesc &batch_desc);
+
     void enqueueTerminal(BatchID batch_id, TransferStatus status);
 
     static void onTerminal(void *ctx, BatchID batch_id, TransferStatus status);
@@ -193,6 +219,7 @@ class MultiTransport {
     std::mutex completion_mu_;
     std::vector<BatchCompletion> ready_;
     int completion_fd_ = -1;
+    std::function<void(BatchID, TransferStatusEnum)> on_batch_terminal_;
 };
 }  // namespace mooncake
 
