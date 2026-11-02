@@ -59,6 +59,9 @@ PGResult<void> launchOneShotAllReduceKernel(const AllReduceRequest& request,
 PGResult<void> launchOneShotAllGatherKernel(const AllGatherRequest& request,
                                             OneShotDeviceState* state,
                                             cudaStream_t stream);
+PGResult<void> launchOneShotReduceScatterKernel(
+    const ReduceScatterRequest& request, OneShotDeviceState* state,
+    cudaStream_t stream);
 
 }  // namespace mooncake
 

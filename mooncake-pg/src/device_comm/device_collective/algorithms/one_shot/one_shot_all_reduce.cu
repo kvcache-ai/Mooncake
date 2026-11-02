@@ -28,7 +28,7 @@ runOneShotChunks(CollectiveChunk<T> values, OneShotExchange<T>& exchange,
                          ? remaining
                          : exchange.chunkElementCapacity(),
         };
-        exchange.sendAll(chunk, block);
+        exchange.sendAll(chunk.source, chunk.count, 0, block);
         const auto failed = exchange.template reducePeers<Op>(chunk, block);
         PG_COLL_TRY(exchange.finish(failed, block));
         offset += chunk.count;
@@ -84,80 +84,19 @@ PGResult<void> launchKernel(const AllReduceRequest& request,
     return {};
 }
 
-template <typename T>
-PGResult<void> launchForType(const AllReduceRequest& request,
-                             OneShotDeviceState* state, int threads,
-                             uint32_t channels, cudaStream_t stream) {
-    switch (request.op) {
-        case ReduceOp::Sum:
-            return launchKernel<T, ReduceOp::Sum>(request, state, threads,
-                                                  channels, stream);
-        case ReduceOp::Product:
-            return launchKernel<T, ReduceOp::Product>(request, state, threads,
-                                                      channels, stream);
-        case ReduceOp::Min:
-            return launchKernel<T, ReduceOp::Min>(request, state, threads,
-                                                  channels, stream);
-        case ReduceOp::Max:
-            return launchKernel<T, ReduceOp::Max>(request, state, threads,
-                                                  channels, stream);
-        default:
-            return makePGError(
-                PGErrorCode::NotSupported,
-                "OneShot AllReduce reduction operation is not supported");
-    }
-}
-
 }  // namespace
 
 PGResult<void> launchOneShotAllReduceKernel(const AllReduceRequest& request,
                                             OneShotDeviceState* state,
                                             cudaStream_t stream) {
-    if (!isDeviceReductionCombinationSupported(request.datatype, request.op))
-        return makePGError(PGErrorCode::NotSupported,
-                           "OneShot AllReduce datatype/reduction combination "
-                           "is not supported");
     const uint64_t bytes = request.count * elementSize(request.datatype);
     // Size is fixed in a captured call; smaller blocks suit tiny messages.
     const int threads = bytes <= 64    ? 128
                         : bytes <= 128 ? 256
                                        : kOneShotMaxThreads;
     const uint32_t channels = bytes <= 2048 ? 1 : kOneShotMaxChannels;
-    switch (request.datatype) {
-        case DataType::Float16:
-            return launchForType<__half>(request, state, threads, channels,
-                                         stream);
-        case DataType::Uint8:
-            return launchForType<uint8_t>(request, state, threads, channels,
-                                          stream);
-        case DataType::Int8:
-            return launchForType<int8_t>(request, state, threads, channels,
-                                         stream);
-        case DataType::Int16:
-            return launchForType<int16_t>(request, state, threads, channels,
-                                          stream);
-        case DataType::Int64:
-            return launchForType<int64_t>(request, state, threads, channels,
-                                          stream);
-        case DataType::Bfloat16:
-            return launchForType<__nv_bfloat16>(request, state, threads,
-                                                channels, stream);
-        case DataType::Float32:
-            return launchForType<float>(request, state, threads, channels,
-                                        stream);
-        case DataType::Float64:
-            return launchForType<double>(request, state, threads, channels,
-                                         stream);
-        case DataType::Int32:
-            return launchForType<int32_t>(request, state, threads, channels,
-                                          stream);
-        case DataType::Bool:
-            return launchForType<bool>(request, state, threads, channels,
-                                       stream);
-        default:
-            return makePGError(PGErrorCode::NotSupported,
-                               "OneShot AllReduce datatype is not supported");
-    }
+    PG_DISPATCH_REDUCTION(launchKernel, request, state, threads, channels,
+                          stream);
 }
 
 }  // namespace mooncake
