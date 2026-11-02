@@ -1524,6 +1524,8 @@ class MasterService {
     void RunBucketDfsEviction();
     void InitKvcsDfsEviction();
     void RefreshKvcsDfsUsage();
+    tl::expected<void, ErrorCode> DeleteKvcsObject(
+        const std::string& key, const ObjectMetadata& metadata);
     void RunKvcsDfsEviction(const DfsUsageSnapshot& usage);
     bool RunBucketDfsEvictionInternal(bool force_one);
     bool TryRecoverDfsSpaceAfterAllocationFailure();

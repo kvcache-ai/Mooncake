@@ -18,10 +18,19 @@ KvcsCapacityProvider::KvcsCapacityProvider(uint32_t mountpoint_index,
 
 KvcsCapacityProvider::~KvcsCapacityProvider() = default;
 
+tl::expected<void, ErrorCode> KvcsCapacityProvider::EnsureDriverInitialized() {
+    std::lock_guard lock(driver_init_mutex_);
+    if (driver_initialized_) return {};
+    if (!driver_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto initialized = driver_->Init();
+    if (initialized) driver_initialized_ = true;
+    return initialized;
+}
+
 tl::expected<DfsUsageSnapshot, ErrorCode> KvcsCapacityProvider::GetCapacity() {
     if (!driver_ || mountpoint_index_ == 0 || mountpoint_id_.empty())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    auto initialized = driver_->Init();
+    auto initialized = EnsureDriverInitialized();
     if (!initialized) return tl::make_unexpected(initialized.error());
     auto stats = driver_->GetMountpointStats();
     if (!stats) return tl::make_unexpected(stats.error());
@@ -46,7 +55,7 @@ tl::expected<DfsUsageSnapshot, ErrorCode> KvcsCapacityProvider::GetCapacity() {
 tl::expected<void, ErrorCode> KvcsCapacityProvider::DeleteObject(
     const std::string& logical_key) {
     if (!driver_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    auto initialized = driver_->Init();
+    auto initialized = EnsureDriverInitialized();
     if (!initialized) return tl::make_unexpected(initialized.error());
     auto encoded = EncodeKvcsKey(logical_key);
     if (!IsKvcsKeyStringSafe(encoded, driver_->MaxKeySize()))
