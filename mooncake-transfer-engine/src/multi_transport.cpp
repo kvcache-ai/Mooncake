@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <sstream>
 #include <string>
+#include <thread>
 #ifdef __linux__
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -219,14 +220,21 @@ Status MultiTransport::tryFreeBatchID(
         return Status::BatchBusy(
             "BatchID cannot be freed until all tasks are done");
     }
-    // A terminal status only means the task published completion; the
-    // completion callback may still be unwinding while holding a pin on
-    // this BatchDesc and its TransferTask objects. Keep the batch alive
-    // until the pin count reaches zero.
-    if (batch_desc.active_completion_callbacks.load(
-            std::memory_order_acquire) != 0) {
-        return Status::BatchBusy(
-            "BatchID cannot be freed until completion callbacks are quiescent");
+    // A terminal status is visible to pollers before CompletionCallbackPin
+    // drops: publishTerminalIfDone (eventfd wake) still runs under that pin.
+    // freeBatchID right after COMPLETED must wait for the pin to drain, or
+    // it spuriously defers cleanup (TCPTransportTest) and can race the
+    // destructor with the notify path.
+    constexpr auto kPinWait = std::chrono::milliseconds(100);
+    const auto deadline = std::chrono::steady_clock::now() + kPinWait;
+    while (batch_desc.active_completion_callbacks.load(
+               std::memory_order_acquire) != 0) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::BatchBusy(
+                "BatchID cannot be freed until completion callbacks are "
+                "quiescent");
+        }
+        std::this_thread::yield();
     }
     // Remove the id before the descriptor is deleted. A completion callback
     // still holding a pin cannot pass the pin check above; one that runs
