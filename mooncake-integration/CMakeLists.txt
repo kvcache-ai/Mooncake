@@ -82,6 +82,20 @@ if(WITH_TE)
   if(USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)
+
+    if(BUILD_UNIT_TESTS)
+      find_package(
+        Python3
+        COMPONENTS Development.Embed
+        REQUIRED)
+      add_executable(on_cuda_transport_guard_test
+                     tests/on_cuda_transport_guard_test.cpp)
+      target_link_libraries(
+        on_cuda_transport_guard_test PRIVATE transfer_engine pybind11::headers
+                                             Python3::Python)
+      add_test(NAME on_cuda_transport_guard_test
+               COMMAND on_cuda_transport_guard_test)
+    endif()
   endif()
 
   if(BUILD_UNIT_TESTS AND USE_TENT)

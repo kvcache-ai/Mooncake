@@ -1314,20 +1314,44 @@ size_t RdmaEndPoint::collectPostedCompletions(
     return n;
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
+    return submitPostSendLimited(slice_list, failed_slice_list,
+                                 slice_list.size());
+}
+
+int RdmaEndPoint::submitPostSendLimited(
+    std::vector<Transport::Slice *> &slice_list,
+    std::vector<Transport::Slice *> &failed_slice_list, size_t max_count) {
+#else
+int RdmaEndPoint::submitPostSend(
+    std::vector<Transport::Slice *> &slice_list,
+    std::vector<Transport::Slice *> &failed_slice_list) {
+#endif
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_.load(std::memory_order_acquire) ||
         status_.load(std::memory_order_relaxed) != CONNECTED) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        const size_t requested = std::min(slice_list.size(), max_count);
+        failed_slice_list.insert(failed_slice_list.end(), slice_list.begin(),
+                                 slice_list.begin() + requested);
+        slice_list.erase(slice_list.begin(), slice_list.begin() + requested);
+#else
         for (auto &slice : slice_list) failed_slice_list.push_back(slice);
         slice_list.clear();
+#endif
         return 0;
     }
 
     const size_t num_qp = qp_list_.size();
-    if (slice_list.empty()) return 0;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const size_t requested = std::min(slice_list.size(), max_count);
+#else
     const size_t requested = slice_list.size();
+#endif
+    if (requested == 0) return 0;
     int cq_remaining = int(globalConfig().max_cqe) -
                        cq_outstanding_->load(std::memory_order_relaxed);
     if (cq_remaining <= 0) return 0;
