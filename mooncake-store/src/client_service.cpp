@@ -1415,9 +1415,15 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    return BatchQuery(object_keys, tenant_id, std::string());
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id,
+    const std::string& session_id) {
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
+    auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id, session_id);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {

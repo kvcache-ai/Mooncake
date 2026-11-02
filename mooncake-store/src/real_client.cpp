@@ -6222,9 +6222,15 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
+        return batch_get_into(keys, buffers, sizes, std::string());
+}
+
+std::vector<int64_t> RealClient::batch_get_into(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, const std::string &session_id) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
-            [&]() { return batch_get_into_internal(keys, buffers, sizes); },
+            [&]() { return batch_get_into_internal(keys, buffers, sizes, session_id); },
             [this](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int64_t> py_results;
@@ -6655,7 +6661,8 @@ RealClient::get_into_ranges_shm_helper_impl(
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
-                                    const std::vector<size_t> &sizes) {
+                                    const std::vector<size_t> &sizes,
+                                    const std::string &session_id) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
@@ -6672,7 +6679,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return {};
     }
 
-    const auto query_results = client_->BatchQuery(keys);
+    const auto query_results = client_->BatchQuery(keys, client_->tenant_id(), session_id);
     return batch_get_into_internal(
         keys, buffers, sizes, query_results,
         [this](const std::string &endpoint, LocalDiskOffloadObjects &objects) {

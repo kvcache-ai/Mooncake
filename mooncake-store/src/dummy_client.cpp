@@ -1783,6 +1783,13 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
 std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes) {
+    return batch_get_into(keys, buffer_ptrs, sizes, std::string());
+}
+
+std::vector<int64_t> DummyClient::batch_get_into(
+    const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
+    const std::vector<size_t>& sizes,
+    const std::string&) {
     if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
         return std::vector<int64_t>(keys.size(),
                                     toInt(ErrorCode::INVALID_PARAMS));

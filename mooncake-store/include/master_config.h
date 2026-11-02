@@ -113,6 +113,8 @@ struct MasterConfig {
     double nof_eviction_high_watermark_ratio;
     int64_t client_active_ttl_sec;
     int64_t client_suspicion_ttl_sec;
+    int64_t session_ttl_sec = 0;    // 0 = no auto session cleanup
+    int64_t session_cleanup_batch_size_bytes = 0; // 0 = no limit
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
     uint32_t nof_heartbeat_failures_threshold;
@@ -335,6 +337,9 @@ class MasterServiceSupervisorConfig {
     HttpMetadataServer* http_metadata_server = nullptr;
     std::string http_metadata_remote_url;
 
+    int64_t session_ttl_sec = 0;
+    int64_t session_cleanup_batch_size_bytes = 0;
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -354,6 +359,8 @@ class MasterServiceSupervisorConfig {
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
         client_active_ttl_sec = config.client_active_ttl_sec;
+        session_ttl_sec = config.session_ttl_sec;
+        session_cleanup_batch_size_bytes = config.session_cleanup_batch_size_bytes;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
@@ -551,6 +558,8 @@ class WrappedMasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
+    int64_t session_ttl_sec = 0;
+    int64_t session_cleanup_batch_size_bytes = 0;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -645,6 +654,8 @@ class WrappedMasterServiceConfig {
         view_version = view_version_param;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
+        session_ttl_sec = config.session_ttl_sec;
+        session_cleanup_batch_size_bytes = config.session_cleanup_batch_size_bytes;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -770,6 +781,8 @@ class WrappedMasterServiceConfig {
         view_version = view_version_param;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
+        session_ttl_sec = config.session_ttl_sec;
+        session_cleanup_batch_size_bytes = config.session_cleanup_batch_size_bytes;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -866,6 +879,8 @@ class MasterServiceConfigBuilder {
     ViewVersionId view_version_ = 0;
     int64_t client_active_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool client_active_ttl_explicitly_set_ = false;
+    int64_t session_ttl_sec = 0;
+    int64_t session_cleanup_batch_size_bytes = 0;
     std::optional<int64_t> client_suspicion_ttl_sec_;
     int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms_ =
@@ -1220,6 +1235,8 @@ class MasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
+    int64_t session_ttl_sec = 0;
+    int64_t session_cleanup_batch_size_bytes = 0;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -1312,6 +1329,8 @@ class MasterServiceConfig {
         view_version = config.view_version;
         client_active_ttl_sec = config.client_active_ttl_sec;
         client_suspicion_ttl_sec = config.client_suspicion_ttl_sec;
+        session_ttl_sec = config.session_ttl_sec;
+        session_cleanup_batch_size_bytes = config.session_cleanup_batch_size_bytes;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -1416,6 +1435,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.view_version = view_version_;
     config.client_active_ttl_sec = client_active_ttl_sec_;
     config.client_suspicion_ttl_sec = suspicion_ttl;
+    config.session_ttl_sec = session_ttl_sec_;
+    config.session_cleanup_batch_size_bytes = session_cleanup_batch_size_bytes_;
     config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
     config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;

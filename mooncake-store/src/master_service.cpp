@@ -413,6 +413,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       view_version_(config.view_version),
       client_active_ttl_sec_(config.client_active_ttl_sec),
       client_suspicion_ttl_sec_(config.client_suspicion_ttl_sec),
+      session_ttl_sec_(config.session_ttl_sec),
+      session_cleanup_batch_size_bytes_(config.session_cleanup_batch_size_bytes),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -691,6 +693,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
     task_cleanup_thread_ =
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
+
+    // Start session cleanup thread (only if TTL is configured)
+    if(session_ttl_sec_ > 0) {
+        session_cleanup_running_ = true;
+        session_cleanup_thread_ = std::thread(&MasterService::SessionCleanupFunc, this);
+        VLOG(1) << "action=start_session_cleanup_thread";
+    }
 
     weight_reconciliation_running_ = true;
     weight_reconciliation_thread_ =
@@ -2112,6 +2121,8 @@ void MasterService::EraseMetadata(
     if (metadata.GetCommittedSoftPinTimeout()) {
         soft_pin_deadline_index_.Remove(tenant_id.MakeScopedKey(key));
     }
+    session_key_index_.UnregisterKeyFromAllSessions(
+        tenant_id.MakeScopedKey(key));
     hold.TearDown();
 }
 
@@ -3458,6 +3469,15 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
+        // Restore session refcount from standby snapshot.
+        metadata.session_refcount_.store(
+            standby_meta.session_refcount.value_or(
+                !standby_meta.session_id.value_or("").empty() ? 1 : 0));
+        if (!standby_meta.session_id.value_or("").empty()) {
+            session_key_index_.RegisterKey(
+                standby_meta.session_id.value(),
+                object.tenant_id.MakeScopedKey(object.user_key));
+        }
         installed.emplace_back(object.tenant_id,
                                route::ObjectRef{object.user_key, generation});
     }
@@ -4559,7 +4579,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
 }
 
 auto MasterService::GetReplicaList(const std::string& key,
-                                   const TenantId& tenant_id)
+                                   const TenantId& tenant_id,
+                                   std::optional<std::string> session_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -4575,7 +4596,7 @@ auto MasterService::GetReplicaList(const std::string& key,
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         return ReadReplicaList(object_id.tenant_id, key, accessor.Get(),
-                               follow_ups);
+                               follow_ups, std::move(session_id));
     }();
     // RO accessor released. Safe to take a fresh RW accessor now.
     follow_ups.Run(*this);
@@ -4585,7 +4606,8 @@ auto MasterService::GetReplicaList(const std::string& key,
 auto MasterService::ReadReplicaList(const TenantId& tenant_id,
                                     const std::string& key,
                                     const ObjectMetadata& metadata,
-                                    ReadFollowUps& follow_ups)
+                                    ReadFollowUps& follow_ups,
+                                    std::optional<std::string> session_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     auto replica_list = GetReadableReplicaDescriptors(metadata);
     if (dfs_allocator_) {
@@ -4623,6 +4645,15 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
     // when the client is reading it. Read path is group-agnostic: only the
     // object's own lease is refreshed.
     metadata.GrantReadLease(std::chrono::milliseconds(default_kv_lease_ttl_));
+
+
+    if (session_id.has_value() && !session_id->empty()) {
+        bool inserted = session_key_index_.RegisterKey(
+            *session_id, tenant_id.MakeScopedKey(key));
+        if(inserted) {
+            metadata.session_refcount_.fetch_add(1);
+        }
+    }
 
     // Promotion-on-hit eligibility: only when no MEMORY replica is
     // present but at least one LOCAL_DISK replica is. Decided here while
@@ -4704,7 +4735,8 @@ auto MasterService::ReadReplicaListForAdmin(const ObjectMetadata& metadata)
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
-                                   const TenantId& tenant_id) {
+                                   const TenantId& tenant_id,
+                                   std::optional<std::string> session_id) {
     using GetResult = tl::expected<GetReplicaListResponse, ErrorCode>;
 
     assert(tenant_id.IsValid());
@@ -4726,7 +4758,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             continue;
         }
         results[i] = ReadReplicaList(normalized_tenant, keys[i], accessor.Get(),
-                                     follow_ups);
+                                     follow_ups, session_id);
     }
     follow_ups.Run(*this);
     return results;
@@ -5001,6 +5033,12 @@ auto MasterService::InsertMetadata(
                      config.with_hard_pin, config.data_type, group_id,
                      tenant_id, key);
     auto& metadata = accessor.Get();
+   if (config.session_id.has_value() && !config.session_id->empty()) {
+        session_key_index_.RegisterKey(*config.session_id,
+                                        tenant_id.MakeScopedKey(key));
+        // First session to reference this object: refcount = 1.
+        metadata.session_refcount_.store(1);
+    }
     metadata.BeginSessionTag(config.SessionId(), eligible_replica_ids);
     metadata.BeginSoftPinAction(soft_pin_request,
                                 std::move(eligible_replica_ids));
@@ -11477,11 +11515,52 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
 
 std::string MasterService::SerializeMetadataForOpLog(
     const ObjectMetadata& metadata) const {
-    const auto all_replicas = metadata.GetAllReplicas();
-    std::vector<Replica::Descriptor> replicas;
-    replicas.reserve(all_replicas.size());
-    for (const auto& replica : all_replicas) {
-        replicas.push_back(replica.get_descriptor());
+    MetadataPayload payload;
+    payload.client_id = metadata.client_id;
+    payload.size = metadata.TotalLength();
+    payload.group_id = metadata.group_id;
+    payload.session_id = metadata.session_id;
+    payload.data_type = metadata.data_type;
+    payload.hard_pinned = metadata.IsHardPinned();
+    payload.object_checksum = metadata.GetPart(0).checksum();
+    payload.session_refcount = metadata.session_refcount_.load();
+
+    // Extract replica descriptors - get them all at once
+    const auto& replicas = metadata.GetAllReplicas();
+    payload.replicas.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        payload.replicas.push_back(replica.get_descriptor());
+    }
+
+    // NOTE: Lease information is NOT serialized because:
+    // 1. Standby does not perform eviction, so lease info is not used
+    // 2. After promotion, new Primary should grant fresh leases, not restore
+    // old ones
+
+    // Serialize using struct_pack (msgpack binary format)
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
+    const ObjectMetadata& metadata) const {
+    MetadataPayload payload;
+    payload.client_id = metadata.client_id;
+    payload.size = metadata.TotalLength();
+    payload.group_id = metadata.group_id;
+    payload.session_id = metadata.session_id;
+    payload.data_type = metadata.data_type;
+    payload.hard_pinned = metadata.IsHardPinned();
+    payload.object_checksum = metadata.GetPart(0).checksum();
+    payload.session_refcount = metadata.session_refcount_.load();
+
+    const auto& replicas = metadata.GetAllReplicas();
+    payload.replicas.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        if (replica.type() == ReplicaType::MEMORY) {
+            continue;
+        }
+        payload.replicas.push_back(replica.get_descriptor());
     }
     return SerializeMetadataForOpLogFromReplicaDescriptors(metadata, replicas);
 }
@@ -11500,6 +11579,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
+    payload.session_refcount = metadata.session_refcount_.load();
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
@@ -11728,6 +11808,163 @@ MasterService::BuildRemainingReplicaDescriptors(
         }
     }
     return remaining;
+}
+
+std::vector<MasterService::SessionInfo>
+MasterService::GetActiveSessionInfo() const {
+    auto active_sessions = active_session_tracker_.GetActiveSessions();
+    std::vector<SessionInfo> result;
+    result.reserve(active_sessions.size());
+    for (const auto& [session_id, last_active] : active_sessions) {
+        SessionInfo info;
+        info.session_id = session_id;
+        info.last_active_ts_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                last_active.time_since_epoch())
+                .count();
+        auto keys = session_key_index_.GetKeys(session_id);
+        info.key_count = keys.size();
+        result.push_back(std::move(info));
+    }
+    return result;
+}
+
+size_t MasterService::RemoveBySession(const std::string& session_id,
+                                       const TenantId& tenant_id,
+                                       int64_t* cleaned_bytes) {
+    if (session_id.empty()) {
+        return 0;
+    }
+
+    auto scoped_keys = session_key_index_.GetKeys(session_id);
+    if (scoped_keys.empty()) {
+        active_session_tracker_.Remove(session_id);
+        return 0;
+    }
+
+    // Decrement refcount for each key. Only erase the key when refcount
+    // reaches 0 (no other session is referencing it).
+    std::vector<std::string> keys_to_delete;
+    int64_t total_bytes = 0;
+    keys_to_delete.reserve(scoped_keys.size());
+    for (const auto& scoped_key : scoped_keys) {
+        auto [tid, user_key] = TenantId::ParseScopedKey(scoped_key);
+        bool should_delete = false;
+        {
+            MetadataAccessorRW accessor(this,
+                                        MakeObjectIdentity(user_key, tid));
+            if (!accessor.IsPublished()) {
+                continue;
+            }
+            auto& metadata = accessor.Get();
+            // Decrement refcount. If this was the object's original session,
+            // the refcount was set to 1 on creation; cross-session reads may
+            // have incremented it further.
+            uint32_t prev = metadata.session_refcount_.fetch_sub(1);
+            if (prev <= 1) {
+                // No other session references this object -- safe to delete.
+                metadata.session_refcount_.store(0);
+                should_delete = true;
+                total_bytes += static_cast<int64_t>(metadata.TotalLength());
+            }
+        }
+        if (should_delete) {
+            keys_to_delete.push_back(std::move(user_key));
+        }
+        // Unregister this session's forward mapping for the key.
+        session_key_index_.UnregisterKey(session_id, scoped_key);
+    }
+
+    // Force-remove only the keys whose refcount reached 0.
+    size_t removed = 0;
+    if (!keys_to_delete.empty()) {
+        auto results = BatchRemove(keys_to_delete, tenant_id, true /* force */);
+        for (const auto& r : results) {
+            if (r.has_value()) ++removed;
+        }
+    }
+
+    session_key_index_.RemoveSession(session_id);
+    active_session_tracker_.Remove(session_id);
+
+    LOG(INFO) << "RemoveBySession: session_id=" << session_id
+              << ", total_keys=" << scoped_keys.size()
+              << ", deleted=" << removed
+              << ", cleaned_bytes=" << total_bytes
+              << ", retained=" << scoped_keys.size() - removed;
+    if (cleaned_bytes) {
+        *cleaned_bytes = total_bytes;
+    }
+    return removed;
+}
+
+void MasterService::SessionCleanupFunc() {
+    LOG(INFO) << "Session cleanup thread started, ttl_sec=" << session_ttl_sec_
+              << ", batch_size_bytes=" << session_cleanup_batch_size_bytes_;
+    while (session_cleanup_running_) {
+        auto now = std::chrono::system_clock::now();
+        auto active_sessions = active_session_tracker_.GetActiveSessions();
+
+        // Sort expired sessions by age (oldest first) so we clean up the
+        // most stale sessions within the batch size budget.
+        std::vector<std::pair<std::string,
+                              std::chrono::system_clock::time_point>>
+            expired;
+        for (const auto& [session_id, last_active] : active_sessions) {
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_active);
+            if (age.count() > session_ttl_sec_) {
+                expired.emplace_back(session_id, last_active);
+            }
+        }
+        if (expired.empty()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kSessionCleanupSleepMs));
+            continue;
+        }
+        std::sort(expired.begin(), expired.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.second < b.second;
+                  });
+
+        // Clean up expired sessions until the batch size budget is exhausted.
+        int64_t total_cleaned_bytes = 0;
+        for (const auto& [session_id, last_active] : expired) {
+            if (session_cleanup_batch_size_bytes_ > 0 &&
+                total_cleaned_bytes >= session_cleanup_batch_size_bytes_) {
+                LOG(INFO) << "Session cleanup batch size limit reached ("
+                          << total_cleaned_bytes << " bytes), deferring "
+                          << "remaining expired sessions";
+                break;
+            }
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_active);
+            LOG(INFO) << "Session expired, cleaning up: session_id="
+                      << session_id << ", age_sec=" << age.count()
+                      << ", ttl_sec=" << session_ttl_sec_;
+            int64_t cleaned = 0;
+            RemoveBySession(session_id, TenantId::Default(), &cleaned);
+            total_cleaned_bytes += cleaned;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kSessionCleanupSleepMs));
+    }
+    LOG(INFO) << "Session cleanup thread stopped";
+}
+
+void MasterService::RebuildSessionKeyIndex() {
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    namespaces_.Visit([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+        for (auto object : ns.objects.ReadCursor()) {
+            auto& metadata = object.metadata();
+            if (!metadata.session_id.empty()) {
+                session_key_index_.RegisterKey(
+                    metadata.session_id,
+                    tenant_id.MakeScopedKey(object.key()));
+            }
+        }
+    });
+    LOG(INFO) << "Rebuilt session key index";
 }
 
 }  // namespace mooncake

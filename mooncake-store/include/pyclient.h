@@ -418,6 +418,11 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers,
         const std::vector<size_t> &sizes) = 0;
+    virtual std::vector<int64_t> batch_get_into(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers,
+        const std::vector<size_t> &sizes,
+        const std::string &session_id) = 0
 
     virtual std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,

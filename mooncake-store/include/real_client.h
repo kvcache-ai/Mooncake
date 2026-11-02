@@ -179,6 +179,11 @@ class RealClient : public PyClient {
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
 
+    std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
+                                        const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes,
+                                        const std::string &session_id);
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys
@@ -750,7 +755,8 @@ class RealClient : public PyClient {
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const std::string &session_id = {});
 
     using LocalDiskOffloadObjects =
         std::unordered_map<std::string, std::vector<Slice>>;

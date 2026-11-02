@@ -357,6 +357,14 @@ DEFINE_int64(client_suspicion_ttl_sec,
              "Seconds a suspected client may recover before going offline; "
              "defaults to 20 seconds, or to an explicitly configured active "
              "TTL when omitted");
+DEFINE_int64(session_ttl_sec, 0,
+             "Session TTL in seconds. 0 = no auto cleanup. When > 0, sessions "
+             "that have not been updated via the HTTP API within this TTL will "
+             "have their KV cache data automatically removed");
+DEFINE_int64(session_cleanup_batch_size_bytes, 0,
+             "Max bytes to clean up per session cleanup cycle. 0 = no limit. "
+             "When > 0, the cleanup thread stops after freeing this amount of "
+             "data, deferring remaining expired sessions to the next cycle");
 DEFINE_int64(nof_heartbeat_interval_sec,
              mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
              "How often master probes each mounted NoF segment");
@@ -1480,6 +1488,32 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "Invalid Client liveness configuration: " << error.what();
         return 1;
     }
+
+
+    // Session cleanup configuration
+    {
+        google::CommandLineFlagInfo info;
+        if (loaded_default_config) {
+            loaded_default_config->GetInt64(
+                "session_ttl_sec", &master_config.session_ttl_sec,
+                FLAGS_session_ttl_sec);
+            loaded_default_config->GetInt64(
+                "session_cleanup_batch_size_bytes",
+                &master_config.session_cleanup_batch_size_bytes,
+                FLAGS_session_cleanup_batch_size_bytes);
+        }
+        if ((google::GetCommandLineFlagInfo("session_ttl_sec", &info) &&
+             !info.is_default)) {
+            master_config.session_ttl_sec = FLAGS_session_ttl_sec;
+        }
+        if ((google::GetCommandLineFlagInfo(
+                "session_cleanup_batch_size_bytes", &info) &&
+             !info.is_default)) {
+            master_config.session_cleanup_batch_size_bytes =
+                FLAGS_session_cleanup_batch_size_bytes;
+        }
+    }
+
     ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     // Fall back to environment variables for pod identity (K8s Downward API)

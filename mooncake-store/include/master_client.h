@@ -206,6 +206,9 @@ class MasterClient {
     GetReplicaList(const std::string& object_key);
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key, const std::string& tenant_id);
+     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaList(const std::string& object_key, const std::string& tenant_id,
+                    const std::string& session_id);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex
@@ -230,6 +233,10 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys,
                         const std::string& tenant_id);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& object_keys,
+                        const std::string& tenant_id,
+                        const std::string& session_id);
 
     /**
      * @brief Read-only variants of GetReplicaList / BatchGetReplicaList.
