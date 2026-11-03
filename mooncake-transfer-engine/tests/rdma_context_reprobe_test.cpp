@@ -19,6 +19,7 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <string>
 
 #ifdef __linux__
@@ -31,6 +32,8 @@
 #include "transfer_metadata.h"
 #include "ib_link_speed.h"
 #include "transport/rdma_transport/rdma_context.h"
+#include "transport/rdma_transport/rdma_endpoint.h"
+#include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_SHCA
 #include <infiniband/shca_17b_types.h>
@@ -50,6 +53,16 @@
 
 using namespace mooncake;
 
+namespace mooncake {
+class RdmaEndPointTestPeer {
+   public:
+    static void bindSelection(RdmaEndPoint &endpoint,
+                              const PeerAutoGidSelection &selection) {
+        endpoint.connected_auto_gid_ = selection;
+    }
+};
+}  // namespace mooncake
+
 #ifdef __linux__
 namespace {
 
@@ -63,6 +76,7 @@ struct FakeVerbsDevice {
     uint8_t active_speed = 0;
     uint8_t active_width = 0;
     uint32_t active_speed_ex = 0;
+    std::vector<ibv_gid> gids;
 };
 
 FakeVerbsDevice fake_verbs;
@@ -77,6 +91,7 @@ class FakeVerbsDeviceScope {
         fake_verbs.active_speed = 0;
         fake_verbs.active_width = 0;
         fake_verbs.active_speed_ex = 0;
+        fake_verbs.gids.clear();
     }
 
     ~FakeVerbsDeviceScope() { fake_verbs.enabled = false; }
@@ -127,6 +142,7 @@ int ibv_query_port(ibv_context *context, uint8_t,
     port_attr->lid = 1;
 #endif
     port_attr->active_mtu = IBV_MTU_4096;
+    port_attr->gid_tbl_len = fake_verbs.gids.size();
     port_attr->active_speed = fake_verbs.active_speed;
     port_attr->active_width = fake_verbs.active_width;
 #ifdef HAVE_IBV_ACTIVE_SPEED_EX
@@ -147,10 +163,27 @@ int ibv_query_device(ibv_context *context, ibv_device_attr *device_attr) {
     return 0;
 }
 
-int ibv_query_gid(ibv_context *context, uint8_t, int, ibv_gid *gid) {
+int ibv_query_gid(ibv_context *context, uint8_t, int index, ibv_gid *gid) {
     if (!fake_verbs.enabled || context != &fake_verbs.context) return EINVAL;
+    if (!fake_verbs.gids.empty()) {
+        if (index < 0 || static_cast<size_t>(index) >= fake_verbs.gids.size())
+            return EINVAL;
+        *gid = fake_verbs.gids[index];
+        return 0;
+    }
     *gid = {};
     gid->raw[15] = 1;
+    return 0;
+}
+
+int _ibv_query_gid_ex(ibv_context *context, uint32_t, uint32_t index,
+                      ibv_gid_entry *entry, uint32_t, size_t) {
+    if (!fake_verbs.enabled || context != &fake_verbs.context ||
+        index >= fake_verbs.gids.size())
+        return EINVAL;
+    *entry = {};
+    entry->gid = fake_verbs.gids[index];
+    entry->gid_type = IBV_GID_TYPE_ROCE_V2;
     return 0;
 }
 
@@ -355,18 +388,159 @@ class RdmaContextReprobeTest : public ::testing::Test {
     RdmaContext *context_ = nullptr;
 };
 
-TEST_F(RdmaContextReprobeTest,
-       ReprobeStopsWhenExpectedSelectionDoesNotMatchCurrentState) {
-    auto before_desc = localDesc();
-    ASSERT_TRUE(before_desc);
+TEST_F(RdmaContextReprobeTest, RefreshRetiresOnlyInvalidPeerBindings) {
+#ifdef __linux__
+    FakeVerbsDeviceScope device(1);
+    const auto initial = makeGid(kCurrentGid);
+    auto fallback = initial;
+    fallback.raw[15] = 0x22;
+    auto other = initial;
+    other.raw[15] = 0x33;
+    fake_verbs.gids = {initial, fallback, other};
+    RdmaContextTestPeer::seedAutoGidState(*context_, &fake_verbs.context, 1, 23,
+                                          initial, 0);
+    RdmaContextTestPeer::enablePeerGidRecovery(*context_);
 
-    bool changed = context_->reprobeAutoGid({formatGid(kCurrentGid), 9}, {});
+    class PeerStore : public FIFOEndpointStore {
+       public:
+        PeerStore() : FIFOEndpointStore(8) {}
+        std::shared_ptr<RdmaEndPoint> getEndpoint(
+            const std::string &peer) override {
+            auto it = peers.find(peer);
+            return it == peers.end() ? nullptr : it->second;
+        }
+        int deleteEndpoint(const std::string &peer) override {
+            peers.erase(peer);
+            return 0;
+        }
+        std::map<std::string, std::shared_ptr<RdmaEndPoint>> peers;
+    };
+    auto store = std::make_shared<PeerStore>();
+    RdmaContextTestPeer::bindEndpointStore(*context_, store);
+    const std::string peer_a = "remote-a:15365@nic";
+    const std::string peer_b = "remote-a:15366@nic";
+    context_->preparePeerGidSelection(peer_a);
+    context_->requestPeerGidAdvance(peer_a);
+    auto selected_a = context_->preparePeerGidSelection(peer_a);
+    auto selected_b = context_->preparePeerGidSelection(peer_b);
+    ASSERT_EQ(selected_a.selection.gid_index, 1);
+    EXPECT_EQ(selected_b.selection.gid_index, 0);
+    auto attach = [&](const std::string &peer,
+                      const PeerAutoGidSelection &selected) {
+        auto endpoint = std::make_shared<RdmaEndPoint>(*context_);
+        RdmaEndPointTestPeer::bindSelection(*endpoint, selected);
+        store->peers[peer] = endpoint;
+        return endpoint;
+    };
+    auto endpoint_a = attach(peer_a, selected_a);
+    auto endpoint_b = attach(peer_b, selected_b);
 
-    EXPECT_FALSE(changed);
-    EXPECT_EQ(context_->gidIndex(), 0);
-    EXPECT_EQ(context_->gid(), formatGid(kCurrentGid));
-    auto after_desc = localDesc();
-    EXPECT_EQ(after_desc.get(), before_desc.get());
+    EXPECT_EQ(context_->refreshCurrentGid(), GidRefreshResult::UNCHANGED);
+    EXPECT_EQ(store->getEndpoint(peer_a), endpoint_a);
+    EXPECT_EQ(store->getEndpoint(peer_b), endpoint_b);
+    EXPECT_EQ(context_->preparePeerGidSelection(peer_a).selection_epoch,
+              selected_a.selection_epoch);
+
+    std::swap(fake_verbs.gids[1], fake_verbs.gids[2]);
+    EXPECT_EQ(context_->refreshCurrentGid(), GidRefreshResult::UNCHANGED);
+    EXPECT_EQ(store->getEndpoint(peer_a), nullptr);
+    EXPECT_EQ(store->getEndpoint(peer_b), endpoint_b);
+    auto rebound = context_->preparePeerGidSelection(peer_a);
+    EXPECT_EQ(rebound.selection.gid, selected_a.selection.gid);
+    EXPECT_EQ(rebound.selection.gid_index, 2);
+    EXPECT_NE(rebound.selection_epoch, selected_a.selection_epoch);
+    const auto old = endpoint_a->autoGidCompletionToken();
+    EXPECT_EQ(context_->recordAutoGidCompletion(
+                  peer_a, {old.endpoint_id, old.selection_epoch}, false),
+              AutoGidDataPathAction::kIgnoreDuplicate);
+    endpoint_a = attach(peer_a, rebound);
+
+    fake_verbs.gids.resize(2);
+    EXPECT_EQ(context_->refreshCurrentGid(), GidRefreshResult::UNCHANGED);
+    EXPECT_EQ(store->getEndpoint(peer_a), nullptr);
+    EXPECT_EQ(store->getEndpoint(peer_b), endpoint_b);
+    EXPECT_NE(context_->preparePeerGidSelection(peer_a).selection.gid,
+              rebound.selection.gid);
+    RdmaContextTestPeer::disableContextForTeardown(*context_);
+#else
+    GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
+#endif
+}
+
+TEST_F(RdmaContextReprobeTest, PeerRecoveryPreservesTransientState) {
+#ifdef __linux__
+    FakeVerbsDeviceScope device(1);
+    const auto initial = makeGid(kCurrentGid);
+    auto fallback = initial;
+    fallback.raw[15] = 0x22;
+    auto third = initial;
+    third.raw[15] = 0x33;
+    fake_verbs.gids = {initial, fallback};
+    RdmaContextTestPeer::seedAutoGidState(*context_, &fake_verbs.context, 1, 23,
+                                          initial, 0);
+    RdmaContextTestPeer::enablePeerGidRecovery(*context_);
+
+    for (const std::string mode : {"refresh", "advisory", "advisory-pending",
+                                   "advisory-budget", "empty"}) {
+        SCOPED_TRACE(mode);
+        fake_verbs.gids = {initial, fallback};
+        if (mode == "advisory-budget") fake_verbs.gids.push_back(third);
+        const std::string peer = mode + ":15365@nic";
+        auto selected = context_->preparePeerGidSelection(peer);
+        uint64_t endpoint = 1;
+        auto fail_twice = [&] {
+            context_->recordAutoGidCompletion(
+                peer, {endpoint++, selected.selection_epoch}, false);
+            context_->recordAutoGidCompletion(
+                peer, {endpoint++, selected.selection_epoch}, false);
+        };
+        fail_twice();
+        if (mode == "empty") {
+            fake_verbs.gids.clear();
+            for (int i = 0; i < 2; ++i) {
+                EXPECT_EQ(
+                    context_->preparePeerGidSelection(peer).selection_epoch,
+                    selected.selection_epoch);
+            }
+            fake_verbs.gids = {initial, fallback};
+            EXPECT_EQ(
+                context_->preparePeerGidSelection(peer).selection.gid_index, 1);
+            continue;
+        }
+        selected = context_->preparePeerGidSelection(peer);
+        ASSERT_EQ(selected.selection.gid_index, 1);
+        fail_twice();
+        if (mode != "advisory-pending" && mode != "advisory-budget") {
+            selected = context_->preparePeerGidSelection(peer);
+            ASSERT_EQ(context_->recordAutoGidCompletion(
+                          peer, {endpoint++, selected.selection_epoch}, false),
+                      AutoGidDataPathAction::kExhausted);
+        }
+        if (mode == "refresh") {
+            EXPECT_EQ(context_->refreshCurrentGid(),
+                      GidRefreshResult::UNCHANGED);
+            fail_twice();
+            EXPECT_EQ(context_->preparePeerGidSelection(peer).selection_epoch,
+                      selected.selection_epoch);
+        } else {
+            context_->rememberPeerAdvertisedGid(peer, "remote-gid");
+            auto next =
+                context_->preparePeerGidSelection(peer, selected.selection.gid);
+            EXPECT_EQ(next.selection.gid_index,
+                      mode == "advisory-budget" ? 2 : 0);
+            EXPECT_NE(next.selection_epoch, selected.selection_epoch);
+            EXPECT_EQ(next.auto_gid_reprobe_from,
+                      mode == "advisory-budget" ? "remote-gid" : "");
+            EXPECT_EQ(
+                context_->preparePeerGidSelection(peer, selected.selection.gid)
+                    .selection_epoch,
+                next.selection_epoch);
+        }
+    }
+    RdmaContextTestPeer::disableContextForTeardown(*context_);
+#else
+    GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
+#endif
 }
 
 // Regression tests for the HCA-index / context_list_ alignment invariant.

@@ -1,7 +1,16 @@
-if(USE_ASCEND OR USE_ASCEND_DIRECT)
+if(USE_ASCEND
+   OR USE_ASCEND_DIRECT
+   OR USE_MEMFABRIC)
   file(GLOB TENT_PLATFORM_ASCEND_SOURCES "*.cpp")
   add_library(platform_ascend STATIC ${TENT_PLATFORM_ASCEND_SOURCES})
-  target_link_libraries(platform_ascend PUBLIC tent_common ascendcl)
+  if(BUILD_UNIT_TESTS AND USE_MEMFABRIC)
+    target_include_directories(
+      platform_ascend
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/mock_acl)
+    target_link_libraries(platform_ascend PUBLIC tent_common)
+  else()
+    target_link_libraries(platform_ascend PUBLIC tent_common ascendcl)
+  endif()
   if(USE_ASCEND_DIRECT OR USE_UBSHMEM)
     # adxl::AdxlEngine::MallocMem / FreeMem live in llm_datadist (weak in
     # adxl_compat.h). Keep this dependency out of classic USE_ASCEND builds.

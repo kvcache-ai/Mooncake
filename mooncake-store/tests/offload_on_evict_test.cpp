@@ -81,7 +81,7 @@ class OffloadOnEvictTest : public ::testing::Test {
 // =============================================================================
 // UpsertStart interaction with an outstanding offload task.
 //
-// The task passes through two observable states in offloading_tasks[key]:
+// The object's offloading task passes through two observable states:
 //   QUEUED    - mirror entry still present in offloading_objects; the store
 //               worker has not observed the task. UpsertStart cancels the
 //               task in place and allocates a fresh replica.

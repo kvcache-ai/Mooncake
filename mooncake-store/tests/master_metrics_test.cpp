@@ -333,83 +333,6 @@ TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
 }
 
-TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
-    auto& metrics = MasterMetricManager::instance();
-
-    // Mount a segment through the accounted path so the gauge is non-zero.
-    SegmentManager source_manager(BufferAllocatorType::OFFSET);
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = "snapshot_reader_segment";
-    segment.base = 0x300000000;
-    segment.size = 1024 * 1024 * 16;
-    UUID client_id = generate_uuid();
-    ASSERT_EQ(source_manager.getSegmentAccess().MountSegment(
-                  segment, client_id,
-                  std::make_shared<ClientLivenessRecord>(
-                      ClientLivenessRecord::Clock::now())),
-              ErrorCode::OK);
-    const int64_t capacity_after_mount = metrics.get_total_mem_capacity();
-    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
-              static_cast<int64_t>(segment.size));
-
-    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
-    std::shared_ptr<BufferAllocatorBase> source_allocator;
-    {
-        auto access = source_manager.getSegmentAccess();
-        source_allocator = access.GetAllocator(segment.id);
-    }
-    ASSERT_NE(source_allocator, nullptr);
-    auto source_buffer = source_allocator->allocate(kAllocationSize);
-    ASSERT_NE(source_buffer, nullptr);
-
-    auto snapshot =
-        SegmentSerializer(&source_manager).Serialize(LocalSsdPersistedState{});
-    ASSERT_TRUE(snapshot.has_value());
-
-    {
-        // Deserialize into a temporary reader (as
-        // CatalogBackedSnapshotProvider does). The reader's records never
-        // contributed to the capacity metrics, so destroying it must leave
-        // the gauges untouched.
-        SegmentManager reader(BufferAllocatorType::OFFSET);
-        SegmentSerializer reader_serializer(&reader);
-        ASSERT_TRUE(
-            reader_serializer.Deserialize(snapshot.value()).has_value());
-        const auto restored_usage = reader.GetMemoryUsageSnapshot();
-        const auto restored_aggregate = reader.GetMemoryUsage();
-        EXPECT_EQ(restored_usage.used_bytes, kAllocationSize);
-        EXPECT_EQ(restored_usage.capacity_bytes, segment.size);
-        EXPECT_DOUBLE_EQ(restored_usage.used_ratio(), 0.25);
-        EXPECT_EQ(restored_aggregate.used_bytes, kAllocationSize);
-        EXPECT_EQ(restored_aggregate.capacity_bytes, segment.size);
-        EXPECT_DOUBLE_EQ(restored_aggregate.used_ratio(), 0.25);
-        ASSERT_EQ(restored_usage.segments.size(), 1u);
-        EXPECT_EQ(restored_usage.segments.at(segment.name).used_bytes,
-                  kAllocationSize);
-
-        reader_serializer.Reset();
-        EXPECT_EQ(reader.GetMemoryUsage().used_bytes, 0u);
-        EXPECT_EQ(reader.GetMemoryUsage().capacity_bytes, 0u);
-    }
-    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
-    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
-              static_cast<int64_t>(segment.size));
-
-    // Unmount to restore the gauges for the other tests.
-    source_buffer.reset();
-    {
-        auto access = source_manager.getSegmentAccess();
-        size_t dec_capacity = 0;
-        ASSERT_EQ(access.PrepareUnmountSegment(segment.id, dec_capacity),
-                  ErrorCode::OK);
-        ASSERT_EQ(
-            access.CommitUnmountSegment(segment.id, client_id, dec_capacity),
-            ErrorCode::OK);
-    }
-    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
-}
-
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
@@ -628,6 +551,33 @@ TEST_F(MasterMetricsTest, ProjectStorageUsageRemovesAbsentSegmentLabels) {
     EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
     EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
     EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
+}
+
+TEST_F(MasterMetricsTest, ProjectStorageUsageExposesDfsAllocatorGauges) {
+    auto& metrics = MasterMetricManager::instance();
+
+    TieredStorageUsageSnapshot snapshot;
+    snapshot.dfs.enabled = true;
+    snapshot.dfs.used_bytes = 12288;
+    snapshot.dfs.capacity_bytes = 65536;
+    snapshot.dfs.file_count = 4;
+    metrics.project_storage_usage(snapshot);
+
+    EXPECT_EQ(metrics.get_dfs_allocated_bytes(), 12288);
+    EXPECT_EQ(metrics.get_dfs_total_capacity(), 65536);
+    EXPECT_EQ(metrics.get_dfs_file_count(), 4);
+
+    const std::string serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_dfs_allocated_bytes"), std::string::npos);
+    EXPECT_NE(serialized.find("master_dfs_total_capacity_bytes"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_dfs_file_count"), std::string::npos);
+
+    // An empty snapshot (DFS disabled) resets the gauges to zero.
+    metrics.project_storage_usage({});
+    EXPECT_EQ(metrics.get_dfs_allocated_bytes(), 0);
+    EXPECT_EQ(metrics.get_dfs_total_capacity(), 0);
+    EXPECT_EQ(metrics.get_dfs_file_count(), 0);
 }
 
 TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {

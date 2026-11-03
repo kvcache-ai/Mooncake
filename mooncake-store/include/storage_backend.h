@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -233,8 +234,8 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
-    // DFS page-offset mode. Enabled for filesystem-mode distributed storage;
-    // object storage uses the regular offload control plane.
+    // DFS control-plane mode. Enabled for filesystem-mode distributed storage
+    // and KVCS; other object stores use the regular offload control plane.
     bool enable_dfs = false;
     // Proactively evict local disk objects from the heartbeat thread once
     // backend usage crosses the high watermark.
@@ -259,6 +260,16 @@ struct FileStorageConfig {
     static FileStorageConfig FromEnvironment();
 };
 
+// A window inside one stored value. `offset` is relative to the value, not
+// the file. `slice` is the destination for `slice.size` bytes starting at
+// `offset`. `object_size` is the full value length when the caller knows it;
+// 0 means `slice.size` is the whole value.
+struct StorageValueSpan {
+    uint64_t offset = 0;
+    uint64_t object_size = 0;
+    Slice slice;
+};
+
 class StorageBackendInterface {
    public:
     explicit StorageBackendInterface(const FileStorageConfig& config)
@@ -280,7 +291,25 @@ class StorageBackendInterface {
     virtual tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) = 0;
 
+    // Reads a byte window of each value. The default reads the whole value
+    // and copies the window. Backends that can seek override this so a layer
+    // read does not load the rest of the object.
+    virtual tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans);
+
     virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
+
+    /**
+     * @brief Returns the stored data size for a key, or std::nullopt when the
+     * key is unknown (or the backend cannot answer cheaply). Used by SSD
+     * prefetch to size the staging allocation from authoritative local
+     * metadata instead of trusting a remote caller's hint.
+     */
+    virtual std::optional<int64_t> GetObjectDataSize(
+        const std::string& key) const {
+        (void)key;
+        return std::nullopt;
+    }
 
     virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
 
@@ -496,7 +525,8 @@ class StorageBackend {
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
                                              std::vector<Slice>& slices,
-                                             int64_t length);
+                                             int64_t length,
+                                             int64_t file_offset = 0);
 
     /**
      * @brief Loads an object as a string
@@ -582,6 +612,7 @@ class StorageBackend {
     FileRecord PopFileToEvictByFIFO();
 
     void RestoreFileToWriteQueueFront(const FileRecord& record);
+    void RestoreFileToWriteQueue(const FileRecord& record, bool to_front);
 
     tl::expected<void, ErrorCode> DeleteEvictedFile(const FileRecord& record);
 
@@ -818,6 +849,9 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans) override;
+
     /**
      * @brief Retrieves the list of object keys belonging to a specific bucket.
      * @param bucket_id The unique identifier of the bucket to query.
@@ -841,6 +875,13 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    /**
+     * @brief Returns the data size recorded in the in-memory bucket index,
+     * or std::nullopt when the key is unknown.
+     */
+    std::optional<int64_t> GetObjectDataSize(
+        const std::string& key) const override;
 
     /**
      * @brief Scan existing object metadata from storage and report via handler.
@@ -873,13 +914,30 @@ class BucketStorageBackend : public StorageBackendInterface {
      * (bytes).
      * @param buckets_keys Output: bucketized keys; each inner vector is a
      * bucket.
+     * @param deferred_keys Optional output: keys moved to the internal
+     * ungrouped pool this call (the tail partial bucket, deferred so the next
+     * call can write them as part of a full bucket). These keys are NOT in
+     * buckets_keys now but WILL be emitted in a bucket by a later call. The
+     * caller must keep their offload tasks alive across the deferral — a key
+     * re-emitted from the pool arrives without a task otherwise
+     * (neuralwatt: the silent deferred-tail loss, upstream #3006).
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr);
 
     void ClearUngroupedOffloadingObjects();
+
+    /**
+     * @brief Remove a single key from the ungrouped (deferred) pool.
+     * Used when a deferred key is re-drained before re-emission: the caller
+     * discards the pooled copy (stale size) so the freshly drained entry
+     * flows through grouping as new input with current size accounting.
+     * @return true if the key was present and removed.
+     */
+    bool RemoveUngroupedOffloadingObject(const std::string& key);
 
     size_t UngroupedOffloadingObjectsSize() const;
 
@@ -932,6 +990,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         EvictionHandler eviction_handler = nullptr) override;
 
    private:
+    tl::expected<void, ErrorCode> ReadBucketValues(
+        std::unordered_map<std::string, StorageValueSpan>& spans,
+        bool require_exact_size);
+
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -960,7 +1022,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr);
 
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<
@@ -1209,6 +1272,9 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans) override;
+
     /**
      * @brief Checks whether an object with the specified key exists in the
      * storage system.
@@ -1405,6 +1471,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     };
 
    private:
+    tl::expected<void, ErrorCode> ReadOffsetValues(
+        std::unordered_map<std::string, StorageValueSpan>& spans,
+        bool require_exact_size);
+
     // Maximum key length accepted by BatchOffload and trusted on recovery.
     // Write-side enforcement (BatchOffload) and recovery-side validation
     // (RebuildShardMapsFromAllocator) must agree on this bound.

@@ -109,16 +109,13 @@ class AllocatedBuffer {
         if (!isAllocatorValid()) {
             return false;
         }
-        const auto record = std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire);
-        return !record || record->IsServing();
+        const ClientLivenessRecord* record = client_liveness_.get();
+        return record == nullptr || record->IsServing();
     }
 
     void bindClientLiveness(
         std::shared_ptr<ClientLivenessRecord> client_liveness) {
-        std::atomic_store_explicit(&client_liveness_,
-                                   std::move(client_liveness),
-                                   std::memory_order_release);
+        client_liveness_ = std::move(client_liveness);
     }
 
     void bindSegmentLifetime(SegmentLifetime lifetime) {
@@ -127,14 +124,18 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
         const {
-        return std::atomic_load_explicit(&client_liveness_,
-                                         std::memory_order_acquire);
+        return client_liveness_;
     }
 
     // Serialize the buffer into a descriptor for transfer
-    [[nodiscard]] Descriptor get_descriptor() const;
+    [[nodiscard]] Descriptor get_descriptor(
+        std::optional<SegmentLocality>* locality = nullptr) const;
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
+
+    // The endpoint a reader transfers from, as get_descriptor() reports it.
+    [[nodiscard]] std::string getTransportEndpoint(
+        std::optional<SegmentLocality>* locality = nullptr) const;
 
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
@@ -157,6 +158,11 @@ class AllocatedBuffer {
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    // Both bindings are set before the buffer is published to readers and not
+    // changed while readers can see it, so neither needs atomic access. The
+    // one rebind of a published buffer is the snapshot restore pass
+    // (RebuildClientLivenessAfterSnapshotRestore), which runs inside the
+    // MasterService constructor, before any reader.
     SegmentLifetime segment_lifetime_;
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
@@ -167,7 +173,6 @@ class AllocatedBuffer {
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
 
-    friend class Serializer<AllocatedBuffer>;
     friend class Replica;
     friend class SegmentAllocatorRegistration;
 };
@@ -187,6 +192,27 @@ class BufferAllocatorBase {
     virtual uintptr_t base() const = 0;
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
+
+    // Publish an immutable value; legacy remounts may enrich unknown locality.
+    void SetLocality(std::optional<SegmentLocality> locality) {
+        std::atomic_store_explicit(
+            &locality_,
+            locality
+                ? std::make_shared<const SegmentLocality>(std::move(*locality))
+                : nullptr,
+            std::memory_order_release);
+        // Monotonic: a concurrent clear must not hide a later publication.
+        if (locality) has_locality_.store(true, std::memory_order_release);
+    }
+    std::shared_ptr<const SegmentLocality> GetLocalityHandle() const {
+        if (!has_locality_.load(std::memory_order_acquire)) return nullptr;
+        return std::atomic_load_explicit(&locality_, std::memory_order_acquire);
+    }
+    std::optional<SegmentLocality> GetLocality() const {
+        const auto locality = GetLocalityHandle();
+        return locality ? std::optional<SegmentLocality>(*locality)
+                        : std::nullopt;
+    }
 
     /**
      * Returns the largest free region available in this allocator.
@@ -220,6 +246,8 @@ class BufferAllocatorBase {
    private:
     std::atomic_size_t cur_size_{0};
     std::unique_ptr<StorageUsageRegistration> usage_registration_;
+    std::shared_ptr<const SegmentLocality> locality_;
+    std::atomic<bool> has_locality_{false};
 };
 
 /**
@@ -345,26 +373,6 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
-// A detached capture of host-memory allocator metadata; owns no live allocator
-// and contributes neither usage nor capacity metrics.
-struct OffsetBufferAllocatorSnapshot {
-    std::string segment_name;
-    size_t base;
-    size_t capacity;
-    size_t used_bytes;
-    std::string transport_endpoint;
-    offset_allocator::OffsetAllocatorSnapshot allocation_state;
-
-    // Validate the detached snapshot without publishing resources or metrics.
-    [[nodiscard]] tl::expected<void, std::string> Validate() const;
-
-   private:
-    tl::expected<void, std::string> ValidateMetadata() const;
-    // Restore composes this cheap outer check with OffsetAllocator::Restore's
-    // mandatory layout validation, avoiding two graph scans in one factory.
-    friend class OffsetBufferAllocator;
-};
-
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
  * strategy, which provides efficient memory allocation with bin-based
@@ -379,18 +387,6 @@ class OffsetBufferAllocator
                           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
-
-    // Restore an unpublished allocator from decoded state. Installs the
-    // allocation layout and accounts usage before returning a runtime-ready
-    // object; capacity accounting remains the owning pool's responsibility.
-    // Consumes the snapshot and rejects inconsistent state with
-    // ErrorCode::INVALID_PARAMS.
-    static tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
-    Restore(OffsetBufferAllocatorSnapshot snapshot);
-
-    // Requires a forked snapshot child or externally quiesced state. Does not
-    // acquire inherited runtime locks; copies all state needed by the codec.
-    OffsetBufferAllocatorSnapshot CaptureSnapshot() const;
 
     std::unique_ptr<AllocatedBuffer> allocate(size_t size) override;
 
@@ -416,10 +412,6 @@ class OffsetBufferAllocator
     }
 
    private:
-    OffsetBufferAllocator(
-        OffsetBufferAllocatorSnapshot snapshot,
-        std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator);
-
     // metadata
     const std::string segment_name_;
     const size_t base_;

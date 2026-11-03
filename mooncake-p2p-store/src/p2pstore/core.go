@@ -378,6 +378,31 @@ func hasSameLayout(old *Payload, new *Payload) bool {
 	return true
 }
 
+// validateReplicaLayout checks that the caller's buffers describe exactly the
+// registered layout. doGetReplica and updatePayloadMetadata walk the caller's
+// sizes in MaxShardSize steps and index payload.Shards by position, so a
+// mismatch would run past the shard list or transfer a stored shard length
+// into a shorter buffer.
+func validateReplicaLayout(payload *Payload, sizeList []uint64) error {
+	if payload.MaxShardSize == 0 || len(sizeList) != len(payload.SizeList) {
+		return ErrInvalidArgument
+	}
+	var shardCount uint64
+	for i, size := range sizeList {
+		if size != payload.SizeList[i] {
+			return ErrInvalidArgument
+		}
+		shardCount += size / payload.MaxShardSize
+		if size%payload.MaxShardSize != 0 {
+			shardCount++
+		}
+	}
+	if shardCount != uint64(len(payload.Shards)) {
+		return ErrInvalidArgument
+	}
+	return nil
+}
+
 // reconcilePayloadAfterTransfer decides whether a transfer must be retried
 // after its metadata snapshot changed. A retry is only needed when at least
 // one source used by the completed transfer disappeared.
@@ -413,6 +438,9 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 	}
 	if payload == nil {
 		return ErrPayloadNotFound
+	}
+	if err := validateReplicaLayout(payload, sizeList); err != nil {
+		return err
 	}
 	replicaBuffers := buffersFromLists(addrList, sizeList)
 	for {
@@ -627,6 +655,9 @@ func (store *P2PStore) updatePayloadMetadata(ctx context.Context, name string, a
 
 			if payload == nil {
 				return ErrPayloadNotFound
+			}
+			if err := validateReplicaLayout(payload, sizeList); err != nil {
+				return err
 			}
 		}
 	}

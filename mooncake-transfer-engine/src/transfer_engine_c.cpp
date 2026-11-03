@@ -199,6 +199,21 @@ int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
     return (int)s.code();
 }
 
+int getBatchTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
+                           struct transfer_status *status) {
+    if (!engine || !status || batch_id == INVALID_BATCH) {
+        return static_cast<int>(Status::Code::kInvalidArgument);
+    }
+    auto *native = static_cast<TransferEngine *>(engine);
+    Transport::TransferStatus native_status;
+    Status result = native->getBatchTransferStatus(batch_id, native_status);
+    if (result.ok()) {
+        status->status = static_cast<int>(native_status.s);
+        status->transferred_bytes = native_status.transferred_bytes;
+    }
+    return static_cast<int>(result.code());
+}
+
 notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
     TransferEngine *native = (TransferEngine *)engine;
     std::vector<TransferMetadata::NotifyDesc> notifies_desc;

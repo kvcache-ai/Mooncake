@@ -308,7 +308,7 @@ tl::expected<void, std::string> UdsAcceptor::start() {
     }
 
     running_ = true;
-    thread_ = std::jthread([this]() { acceptLoop(); });
+    thread_ = std::thread([this]() { acceptLoop(); });
     return {};
 }
 
@@ -343,11 +343,6 @@ void UdsAcceptor::acceptLoop() {
         active_client_fd_ = connection.fd();
         if (handler_) handler_(connection);
         active_client_fd_ = -1;
-    }
-
-    if (listen_fd_ >= 0) {
-        ::close(listen_fd_);
-        listen_fd_ = -1;
     }
 }
 

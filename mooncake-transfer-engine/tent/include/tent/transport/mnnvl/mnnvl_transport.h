@@ -59,6 +59,8 @@ struct MnnvlSubBatch : public Transport::SubBatch {
 };
 
 class MnnvlTransport : public Transport {
+    friend class MnnvlTransportTestPeer;
+
    public:
     MnnvlTransport();
 
