@@ -68,9 +68,9 @@ tl::expected<void, ErrorCode> NvmeKvConnector::Init(
                     config.runtime_transfer_limit);
             case NvmeKvTransport::kSpdk:
 #if defined(USE_NOF) && defined(MOONCAKE_HAVE_SPDK_NVME_KV)
-                return CreateNvmeKvSpdkExecutor(
-                    config.device_path, config.nsid, config.queue_depth,
-                    config.runtime_transfer_limit);
+                return CreateNvmeKvSpdkExecutor(config.device_path, config.nsid,
+                                                config.queue_depth,
+                                                config.runtime_transfer_limit);
 #else
                 LOG(ERROR) << "SPDK NVMe KV executor requires USE_NOF and SPDK "
                            << "26.05+ typed KV API support";

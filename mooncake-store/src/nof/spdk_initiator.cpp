@@ -199,7 +199,7 @@ class SpdkEnvGuard {
         // Deliberately leaked (like RegistryMutex): a probe-only initiator
         // never registers memory, so the NofRegistryBundle below is first
         // constructed by its ~Impl backstop during static destruction —
-        // after function-local statics like this one have already been
+        // after function-local static objects like this one have already been
         // destroyed. The bundle's constructor calls Acquire(), which must
         // not touch a destroyed static. Leaking also means the pin below
         // never releases, so spdk_env_fini never runs at all; the OS
@@ -971,43 +971,71 @@ NofCapabilities SpdkInitiator::GetCapabilities() const {
     return caps;
 }
 
-#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
 NofSegmentHandle* SpdkInitiator::OpenKvSegment(const std::string& tr_str) {
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
     return impl_->OpenKvSegment(tr_str);
+#else
+    return NVMeoFInitiator::OpenKvSegment(tr_str);
+#endif
 }
 
 void SpdkInitiator::CloseKvSegment(NofSegmentHandle* handle) {
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
     impl_->CloseKvSegment(handle);
+#else
+    NVMeoFInitiator::CloseKvSegment(handle);
+#endif
 }
 
 void SpdkInitiator::AbortKvSegment(NofSegmentHandle* handle) {
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
     impl_->AbortKvSegment(handle);
+#else
+    NVMeoFInitiator::AbortKvSegment(handle);
+#endif
 }
 
 bool SpdkInitiator::IsKvNamespace(const NofSegmentHandle* handle) const {
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
     return impl_->IsKvNamespace(handle);
+#else
+    return NVMeoFInitiator::IsKvNamespace(handle);
+#endif
 }
 
 int SpdkInitiator::SubmitKvStore(NofSegmentHandle* handle, const void* key,
                                  uint8_t key_len, const void* value,
                                  uint32_t value_len, bool create_only,
                                  NofKvAdaptor* adaptor) {
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
     return impl_->SubmitKvStore(handle, key, key_len, value, value_len,
                                 create_only, adaptor);
+#else
+    return NVMeoFInitiator::SubmitKvStore(handle, key, key_len, value,
+                                          value_len, create_only, adaptor);
+#endif
 }
 
 int SpdkInitiator::SubmitKvRetrieve(NofSegmentHandle* handle, const void* key,
                                     uint8_t key_len, void* value,
                                     uint32_t value_len, NofKvAdaptor* adaptor) {
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
     return impl_->SubmitKvRetrieve(handle, key, key_len, value, value_len,
                                    adaptor);
+#else
+    return NVMeoFInitiator::SubmitKvRetrieve(handle, key, key_len, value,
+                                             value_len, adaptor);
+#endif
 }
 
 int SpdkInitiator::SubmitKvDelete(NofSegmentHandle* handle, const void* key,
                                   uint8_t key_len, NofKvAdaptor* adaptor) {
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
     return impl_->SubmitKvDelete(handle, key, key_len, adaptor);
-}
+#else
+    return NVMeoFInitiator::SubmitKvDelete(handle, key, key_len, adaptor);
 #endif
+}
 
 // ---------------------------------------------------------------------------
 // SpdkDmaAllocator
