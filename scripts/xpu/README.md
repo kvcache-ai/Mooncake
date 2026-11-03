@@ -88,6 +88,11 @@ Fork PR heads are supported through their commit SHA.
 The hosted builder receives that exact SHA. Hardware downloads its artifact
 by ID in the same run and verifies the API identity, run/attempt, ZIP digest,
 payload/native hashes, source/image provenance, and build/runtime inventories.
+The builder passes its producing `build_attempt` alongside the artifact ID,
+digest and source SHA. A retry of only the failed hardware jobs may consume
+that earlier successful build; artifact names and provenance are checked
+against the producing attempt, not the retry's current attempt. Artifacts
+from a different workflow run, SHA, or producing attempt remain invalid.
 The host runs the trusted workflow-revision harness, not PR host scripts.
 
 The shared `E2E Gate` requires XPU authorization, build, hardware tests and
@@ -163,7 +168,9 @@ side's first KV pull with `std::system_error: Resource temporarily unavailable`
 not an alternative: oneCCL in the core suite pins workers from host-sized core
 lists and fails to start under `--cpuset-cpus`. `cpu-resources.json` and
 `result.json` record `pids.current`/`pids.peak`/`pids.max` so the remaining
-headroom stays visible. The ROCm harness uses `--pids-limit=32768` for a
+headroom stays visible. Optional counters absent from the kernel are logged
+and recorded as `null`; other read errors fail the job.
+The ROCm harness uses `--pids-limit=32768` for a
 comparable single-instance workload.
 
 Nightly Gate requires the builder and both selected hardware jobs to succeed.
@@ -182,6 +189,13 @@ concurrency guarantees. Core and application containers have suite-specific
 labels and diagnostic artifact names, so same-run cleanup cannot stop another
 suite's container on a shared eight-GPU host. Existing current-container
 cleanup checks and mandatory ephemeral-runner reimaging still apply.
+Host-generated records (including cleanup, container inspection and scheduling)
+live in the unmounted `host-output` directory, separate from the container's
+writable `output` mount. Only after cleanup succeeds does the trusted harness
+copy container diagnostics into an unmounted `diagnostics` directory,
+rejecting symbolic links and special files before copying. Artifact upload
+reads these host-owned directories, never the raw container output; rejected
+diagnostics fail the job while host cleanup records remain available.
 
 ## Required coverage and diagnostics
 
@@ -223,7 +237,7 @@ CPU-only regression validation:
 
 ```sh
 python3 -m unittest scripts.ci.tests.test_xpu_ci \
-  scripts.ci.tests.test_run_ctest -v
+  scripts.ci.tests.test_run_ctest scripts.ci.tests.test_nightly_ci -v
 ```
 
 XPU CI regressions share one test module and common workflow/module loaders;
@@ -245,8 +259,15 @@ test container.
 `scripts/e2e/python/verify_xpu_ci.py` is the single verification entry point:
 no arguments retain the hosted wheel smoke checks; `unpack` verifies the
 downloaded artifact, `seccomp` prepares the pinned profile, and `run` installs
-the wheel offline and launches the `suite`/`store` hardware checks. There are
-no separate XPU runtime scripts under `scripts/ci/`.
+the wheel offline and launches the selected core/nightly `suite` or
+`applications` checks. `model` downloads the revision-pinned offline model
+on the hosted builder; `scheduling` records the hardware job's queue time.
+Workflows call these functions through the same CLI instead of embedding
+Python code. Both vLLM smoke scripts reuse their common argument definitions
+from `vllm_store_smoke.py`. There are no separate XPU runtime scripts under
+`scripts/ci/`.
+The `diagnostics` command performs the post-cleanup container-output check and
+copy used by hardware artifact collection.
 
 Enable hardware only after provisioning and successfully running the exact
 core workflow; record real queue/runtime measurements during rollout.

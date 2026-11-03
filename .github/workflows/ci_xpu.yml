@@ -22,6 +22,8 @@ on:
         value: ${{ jobs.build-wheel-xpu.outputs.artifact_id }}
       artifact_digest:
         value: ${{ jobs.build-wheel-xpu.outputs.artifact_digest }}
+      build_attempt:
+        value: ${{ jobs.build-wheel-xpu.outputs.build_attempt }}
   workflow_dispatch:
 
 permissions:
@@ -40,6 +42,7 @@ jobs:
       source_sha: ${{ steps.source.outputs.sha }}
       artifact_id: ${{ steps.artifact.outputs.artifact-id }}
       artifact_digest: ${{ steps.artifact.outputs.artifact-digest }}
+      build_attempt: ${{ steps.source.outputs.build_attempt }}
     env:
       XPU_BUILD: "1"
       PYTHON_VERSION: "3.12"
@@ -68,6 +71,7 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Install toolchain and dependencies
         run: |
@@ -187,26 +191,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install huggingface-hub==0.36.0
-          PYTHONPATH=scripts/e2e/python python - <<'PY'
-          import json
-          from pathlib import Path
-          import shutil
-          from huggingface_hub import hf_hub_download, list_repo_files
-          from verify_xpu_wheel import MODEL_ID, MODEL_REVISION
-
-          destination = Path("xpu-ci-output/model")
-          destination.mkdir()
-          files = list_repo_files(MODEL_ID, revision=MODEL_REVISION)
-          for name in files:
-              if "/" not in name and name.endswith((".json", ".safetensors", ".txt", ".model")):
-                  cached = hf_hub_download(MODEL_ID, name, revision=MODEL_REVISION)
-                  shutil.copyfile(cached, destination / name)
-          if not list(destination.glob("*.safetensors")):
-              raise RuntimeError("Pinned model has no safetensors weights")
-          (destination / "model-provenance.json").write_text(json.dumps({
-              "model": MODEL_ID, "revision": MODEL_REVISION,
-          }, indent=2))
-          PY
+          python scripts/e2e/python/verify_xpu_ci.py model xpu-ci-output/model
 
       - name: Package native tests
         env:

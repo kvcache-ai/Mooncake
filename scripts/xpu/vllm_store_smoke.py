@@ -59,8 +59,7 @@ PROMPT_PARAGRAPH = (
 )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", required=True, help="HF model id or local path")
     parser.add_argument(
         "--master", default="127.0.0.1:50051", help="mooncake_master address"
@@ -83,6 +82,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-repeats", type=int, default=12)
     parser.add_argument("--save-timeout", type=float, default=60.0)
     parser.add_argument("--report", help="Write a successful CI result as JSON")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    add_common_arguments(parser)
     return parser.parse_args()
 
 

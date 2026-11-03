@@ -15,6 +15,10 @@ on:
       artifact_digest:
         type: string
         required: true
+      build_attempt:
+        description: Workflow run attempt that produced the build artifact
+        type: string
+        required: true
       suite:
         description: core (PR), nightly (expanded EP), or applications (both vLLM scenarios)
         type: string
@@ -47,6 +51,7 @@ jobs:
         run: |
           set -euo pipefail
           directory=$(mktemp -d "$RUNNER_TEMP/xpu-core.XXXXXX")
+          mkdir "$directory/host-output"
           echo "directory=$directory" >> "$GITHUB_OUTPUT"
           cat > "$directory/cleanup.sh" <<'SH'
           fail() { echo "::error::$*" >&2; exit 1; }
@@ -54,7 +59,7 @@ jobs:
           cleanup_container() {
             local status=0
             docker stop --time 10 "$container_id" || status=1
-            docker inspect "$container_id" > "$run_directory/output/container-final.json" || status=1
+            docker inspect "$container_id" > "$run_directory/host-output/container-final.json" || status=1
             if [ "$(docker inspect --format '{{.State.Running}}' "$container_id")" != false ]; then
               echo "Container processes were not released" >&2
               status=1
@@ -75,34 +80,10 @@ jobs:
           RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUN_DIRECTORY/output"
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
-            --jq '.jobs[]' | jq -s . > "$RUN_DIRECTORY/output/jobs.json"
-          python3 - <<'PY'
-          from datetime import datetime
-          import json
-          import os
-          from pathlib import Path
-          output = Path(os.environ["RUN_DIRECTORY"]) / "output"
-          jobs = json.loads((output / "jobs.json").read_text())
-          matches = [job for job in jobs
-                     if job["runner_name"] == os.environ["RUNNER_NAME"]
-                     and job["name"].endswith("XPU " + os.environ["XPU_SUITE"])
-                     and job["status"] == "in_progress"]
-          if len(matches) != 1:
-              raise RuntimeError("Cannot identify the current XPU job for queue measurements")
-          job = matches[0]
-          queued = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
-          started = datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
-          seconds = (started - queued).total_seconds()
-          if seconds < 0:
-              raise RuntimeError("Negative XPU queue time")
-          (output / "scheduling.json").write_text(json.dumps({
-              "job_id": job["id"], "runner": job["runner_name"],
-              "created_at": job["created_at"], "started_at": job["started_at"],
-              "queue_seconds": seconds, "suite": os.environ["XPU_SUITE"],
-          }, indent=2))
-          PY
+            --jq '.jobs[]' | jq -s . > "$RUN_DIRECTORY/host-output/jobs.json"
+          python3 xpu-control/scripts/e2e/python/verify_xpu_ci.py scheduling \
+            "$RUN_DIRECTORY/host-output"
 
       - name: Download exact build artifact
         shell: bash
@@ -110,6 +91,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ inputs.artifact_id }}
           ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          BUILD_ATTEMPT: ${{ inputs.build_attempt }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           CHECKOUT_SHA: ${{ inputs.checkout_sha }}
           RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
@@ -122,7 +104,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$RUN_DIRECTORY/artifact.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUN_DIRECTORY/artifact.zip"
           python3 xpu-control/scripts/e2e/python/verify_xpu_ci.py unpack \
-            "$RUN_DIRECTORY" "$CHECKOUT_SHA" "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
+            "$RUN_DIRECTORY" "$CHECKOUT_SHA" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" "$BUILD_ATTEMPT"
 
       - name: Check out authorized test source
         uses: actions/checkout@v4
@@ -145,8 +127,8 @@ jobs:
           source_directory=$(realpath "$GITHUB_WORKSPACE/xpu-tested-source")
           control_directory=$(realpath "$GITHUB_WORKSPACE/xpu-control/scripts")
           source "$run_directory/cleanup.sh"
-          mkdir -p "$run_directory/output"
-          exec > >(tee "$run_directory/output/runner.log") 2>&1
+          mkdir -p "$run_directory/output" "$run_directory/host-output"
+          exec > >(tee "$run_directory/host-output/runner.log") 2>&1
 
           [ "$(id -u)" -ne 0 ] || { echo "XPU runner must not run as root" >&2; exit 1; }
           : "${ZE_AFFINITY_MASK:?Set a host-owned two-GPU ZE_AFFINITY_MASK}"
@@ -171,7 +153,7 @@ jobs:
               || fail "Not a GPU render character device: $device"
             device_args+=(--device "$device" --group-add "$(stat -c %g "$device")")
           done
-          python3 "$control_directory/e2e/python/verify_xpu_ci.py" seccomp "$run_directory/output/seccomp.json"
+          python3 "$control_directory/e2e/python/verify_xpu_ci.py" seccomp "$run_directory/host-output/seccomp.json"
 
           container_id=
           cleanup() {
@@ -181,7 +163,7 @@ jobs:
               cleanup_container || cleanup_status=1
             fi
             printf '{"cleanup_status":%d,"suite_status":%d}\n' "$cleanup_status" "$status" \
-              > "$run_directory/output/cleanup.json"
+              > "$run_directory/host-output/cleanup.json"
             if [ "$cleanup_status" -ne 0 ]; then exit 1; fi
             exit "$status"
           }
@@ -190,12 +172,12 @@ jobs:
           trap 'exit 143' TERM
 
           docker pull "$XPU_IMAGE"
-          docker image inspect "$XPU_IMAGE" > "$run_directory/output/image.json"
+          docker image inspect "$XPU_IMAGE" > "$run_directory/host-output/image.json"
           container_id=$(docker create \
             --label "mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${XPU_SUITE:-core}" \
             --user "$(id -u):$(id -g)" --cap-drop ALL \
             --security-opt no-new-privileges \
-            --security-opt "seccomp=$run_directory/output/seccomp.json" \
+            --security-opt "seccomp=$run_directory/host-output/seccomp.json" \
             --network none --ipc private --shm-size 2g \
             --pids-limit 4096 --ulimit core=0 \
             "${device_args[@]}" \
@@ -224,6 +206,7 @@ jobs:
           timeout --signal=TERM --kill-after=30s 70m docker start --attach "$container_id"
 
       - name: Recheck current-run container cleanup
+        id: cleanup
         if: always() && steps.run.outputs.directory != ''
         shell: bash
         env:
@@ -232,7 +215,6 @@ jobs:
           set -euo pipefail
           run_directory=$(realpath "$RUN_DIRECTORY")
           source "$run_directory/cleanup.sh"
-          mkdir -p "$run_directory/output"
           remaining=$(docker ps -aq --no-trunc \
             --filter "label=mooncake.xpu.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-${XPU_SUITE:-core}")
           docker info >/dev/null
@@ -242,7 +224,15 @@ jobs:
               cleanup_container
             done <<< "$remaining"
           fi
-          echo '{"cleanup_recheck":"passed"}' > "$run_directory/output/cleanup-recheck.json"
+          echo '{"cleanup_recheck":"passed"}' > "$run_directory/host-output/cleanup-recheck.json"
+
+      - name: Collect container diagnostics
+        if: always() && steps.cleanup.outcome == 'success'
+        shell: bash
+        env:
+          RUN_DIRECTORY: ${{ steps.run.outputs.directory }}
+        run: |
+          python3 xpu-control/scripts/e2e/python/verify_xpu_ci.py diagnostics "$RUN_DIRECTORY"
 
       - name: Preserve hardware diagnostics
         if: always() && steps.run.outputs.directory != ''
@@ -250,12 +240,8 @@ jobs:
         with:
           name: xpu-${{ inputs.suite }}-${{ inputs.checkout_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ steps.run.outputs.directory }}/output/*.json
-            ${{ steps.run.outputs.directory }}/output/*.xml
-            ${{ steps.run.outputs.directory }}/output/*.log
-            ${{ steps.run.outputs.directory }}/output/*.list
-            ${{ steps.run.outputs.directory }}/output/*.ldd
-            ${{ steps.run.outputs.directory }}/output/mooncake-xpu-pd-*/*.log
+            ${{ steps.run.outputs.directory }}/host-output/
+            ${{ steps.run.outputs.directory }}/diagnostics/
             ${{ steps.run.outputs.directory }}/artifact.json
           if-no-files-found: error
           retention-days: 14

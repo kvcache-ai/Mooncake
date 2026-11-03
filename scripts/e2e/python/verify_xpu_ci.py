@@ -1,6 +1,7 @@
 """Verify XPU CI artifacts and hardware suites; no arguments check the wheel."""
 
 from collections import deque
+from datetime import datetime
 import hashlib
 import importlib
 import importlib.util
@@ -159,6 +160,57 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def record_scheduling(output: Path) -> None:
+    jobs = json.loads((output / "jobs.json").read_text())
+    matches = [
+        job
+        for job in jobs
+        if job["runner_name"] == os.environ["RUNNER_NAME"]
+        and job["name"].endswith("XPU " + os.environ["XPU_SUITE"])
+        and job["status"] == "in_progress"
+    ]
+    require(
+        len(matches) == 1, "Cannot identify the current XPU job for queue measurements"
+    )
+    job = matches[0]
+    queued = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
+    started = datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
+    seconds = (started - queued).total_seconds()
+    require(seconds >= 0, "Negative XPU queue time")
+    (output / "scheduling.json").write_text(
+        json.dumps(
+            {
+                "job_id": job["id"],
+                "runner": job["runner_name"],
+                "created_at": job["created_at"],
+                "started_at": job["started_at"],
+                "queue_seconds": seconds,
+                "suite": os.environ["XPU_SUITE"],
+            },
+            indent=2,
+        )
+    )
+
+
+def download_model(destination: Path) -> None:
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    destination.mkdir()
+    for name in list_repo_files(MODEL_ID, revision=MODEL_REVISION):
+        if "/" not in name and name.endswith(
+            (".json", ".safetensors", ".txt", ".model")
+        ):
+            cached = hf_hub_download(MODEL_ID, name, revision=MODEL_REVISION)
+            shutil.copyfile(cached, destination / name)
+    require(
+        bool(list(destination.glob("*.safetensors"))),
+        "Pinned model has no safetensors weights",
+    )
+    (destination / "model-provenance.json").write_text(
+        json.dumps({"model": MODEL_ID, "revision": MODEL_REVISION}, indent=2)
+    )
+
+
 def digest(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -200,9 +252,16 @@ def verify_provenance(root: Path, sha: str, image: str, run: str) -> None:
         require(lines.count(item) == 1, f"Missing or mismatched provenance: {item}")
 
 
-def unpack(directory: Path, sha: str, artifact_id: str, checksum: str) -> None:
+def unpack(
+    directory: Path, sha: str, artifact_id: str, checksum: str, build_attempt: str
+) -> None:
     info = json.loads((directory / "artifact.json").read_text())
-    run = f"{os.environ['GITHUB_RUN_ID']}/{os.environ['GITHUB_RUN_ATTEMPT']}"
+    require(
+        re.fullmatch(r"[1-9][0-9]*", build_attempt) is not None
+        and int(build_attempt) <= int(os.environ["GITHUB_RUN_ATTEMPT"]),
+        "Invalid producing build attempt",
+    )
+    run = f"{os.environ['GITHUB_RUN_ID']}/{build_attempt}"
     expected_name = f"mooncake-xpu-ci-py312-{sha}-{run.replace('/', '-')}"
     checksum = checksum.removeprefix("sha256:")
     require(
@@ -249,6 +308,21 @@ def unpack(directory: Path, sha: str, artifact_id: str, checksum: str) -> None:
     verify_provenance(
         bundle, sha, os.environ.get("XPU_BUILD_IMAGE", os.environ["XPU_IMAGE"]), run
     )
+
+
+def collect_diagnostics(directory: Path) -> None:
+    source = directory / "output"
+    require(not source.is_symlink(), f"Diagnostics directory is a symlink: {source}")
+    if not source.exists():
+        print(f"No container diagnostics produced: {source}", file=sys.stderr)
+        return
+    for path in source.rglob("*"):
+        mode = path.lstat().st_mode
+        require(
+            stat.S_ISREG(mode) or stat.S_ISDIR(mode),
+            f"Diagnostics contain a symlink or special file: {path}",
+        )
+    shutil.copytree(source, directory / "diagnostics")
 
 
 def extract_native(bundle: Path, output: Path) -> Path:
@@ -733,15 +807,14 @@ def validate_application_report(path: Path, scenario: str) -> dict:
 
 
 def pids_cgroup_snapshot() -> dict:
-    # Task budget evidence: the pd scenario runs the master and two vLLM
-    # processes in one container, and thread pools in that stack are mostly
-    # fixed-size, so the pid cgroup is the binding limit when it aborts
-    # thread creation with EAGAIN (std::system_error).
+    # Some kernels omit optional PID counters; other read errors must surface.
     snapshot = {}
     for name in ("pids.current", "pids.peak", "pids.max"):
+        path = Path("/sys/fs/cgroup") / name
         try:
-            snapshot[name] = (Path("/sys/fs/cgroup") / name).read_text().strip()
-        except OSError:
+            snapshot[name] = path.read_text().strip()
+        except FileNotFoundError:
+            print(f"PID cgroup measurement unavailable: {path}", file=sys.stderr)
             snapshot[name] = None
     return snapshot
 
@@ -848,8 +921,8 @@ def cli() -> None:
         return
     mode, *args = sys.argv[1:]
     if mode == "unpack":
-        directory, sha, artifact_id, checksum = args
-        unpack(Path(directory), sha, artifact_id, checksum)
+        directory, sha, artifact_id, checksum, build_attempt = args
+        unpack(Path(directory), sha, artifact_id, checksum, build_attempt)
     elif mode == "run":
         run(*(Path(arg) for arg in args))
     elif mode == "suite":
@@ -860,6 +933,12 @@ def cli() -> None:
         store_test(*(Path(arg) for arg in args))
     elif mode == "seccomp":
         prepare_seccomp(Path(args[0]))
+    elif mode == "scheduling":
+        record_scheduling(Path(args[0]))
+    elif mode == "model":
+        download_model(Path(args[0]))
+    elif mode == "diagnostics":
+        collect_diagnostics(Path(args[0]))
     else:
         raise RuntimeError(f"Unknown XPU verification command: {mode}")
 

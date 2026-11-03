@@ -59,30 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--role", default="local", choices=["local", "prefill", "decode"]
     )
-    parser.add_argument("--model", required=True, help="HF model id or local path")
-    parser.add_argument(
-        "--master", default="127.0.0.1:50051", help="mooncake_master address"
-    )
-    parser.add_argument(
-        "--master-bin",
-        default=None,
-        help="Path to mooncake_master; started by the prefill side on --master's port",
-    )
-    parser.add_argument("--metadata-server", default="P2PHANDSHAKE")
-    parser.add_argument("--protocol", default="tcp", choices=["tcp", "rdma"])
-    parser.add_argument(
-        "--device-name", default="", help="Transfer Engine device filter"
-    )
-    parser.add_argument(
-        "--global-segment-size", default="2GB", help="prefill side segment"
-    )
-    parser.add_argument("--local-buffer-size", default="512MB")
-    parser.add_argument("--max-model-len", type=int, default=2048)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
-    parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--prompt-repeats", type=int, default=12)
-    parser.add_argument("--save-timeout", type=float, default=60.0)
-    parser.add_argument("--report", help="Write the successful PD CI result as JSON")
+    base.add_common_arguments(parser)
     parser.add_argument(
         "--prefill-xpu", type=int, default=0, help="local: Level Zero index"
     )

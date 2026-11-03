@@ -175,6 +175,7 @@ jobs:
       source_sha: ${{ needs.build-wheel-xpu.outputs.source_sha }}
       artifact_id: ${{ needs.build-wheel-xpu.outputs.artifact_id }}
       artifact_digest: ${{ needs.build-wheel-xpu.outputs.artifact_digest }}
+      build_attempt: ${{ needs.build-wheel-xpu.outputs.build_attempt }}
       suite: nightly
 
   xpu-nightly-applications:
@@ -189,6 +190,7 @@ jobs:
       source_sha: ${{ needs.build-wheel-xpu.outputs.source_sha }}
       artifact_id: ${{ needs.build-wheel-xpu.outputs.artifact_id }}
       artifact_digest: ${{ needs.build-wheel-xpu.outputs.artifact_digest }}
+      build_attempt: ${{ needs.build-wheel-xpu.outputs.build_attempt }}
       suite: applications
 
   rocm-integration-test:

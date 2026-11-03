@@ -326,7 +326,7 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
             jobs["xpu-integration-test"]["with"]["checkout_sha"],
             "${{ needs.xpu-authorize.outputs.sha }}",
         )
-        for name in ("artifact_id", "artifact_digest", "source_sha"):
+        for name in ("artifact_id", "artifact_digest", "source_sha", "build_attempt"):
             self.assertEqual(
                 jobs["xpu-integration-test"]["with"][name],
                 "${{ needs.build-wheel-xpu.outputs." + name + " }}",
@@ -576,9 +576,9 @@ class CommandLineTest(unittest.TestCase):
     def test_hardware_subcommands_and_unknown_command(self):
         for arguments, callback, expected in (
             (
-                ["unpack", "dir", "sha", "42", "digest"],
+                ["unpack", "dir", "sha", "42", "digest", "1"],
                 "unpack",
-                [Path("dir"), "sha", "42", "digest"],
+                [Path("dir"), "sha", "42", "digest", "1"],
             ),
             (
                 ["run", "bundle", "source", "output"],
@@ -601,6 +601,9 @@ class CommandLineTest(unittest.TestCase):
                 [Path("source"), Path("report")],
             ),
             (["seccomp", "profile"], "prepare_seccomp", [Path("profile")]),
+            (["scheduling", "output"], "record_scheduling", [Path("output")]),
+            (["model", "destination"], "download_model", [Path("destination")]),
+            (["diagnostics", "directory"], "collect_diagnostics", [Path("directory")]),
         ):
             with (
                 self.subTest(arguments=arguments),
@@ -823,6 +826,47 @@ def write_sums(root, excluded=()):
 
 
 class ArtifactTest(unittest.TestCase):
+    def test_collect_diagnostics_copies_regular_files_and_nested_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            logs = output / "mooncake-xpu-pd-test"
+            logs.mkdir(parents=True)
+            (output / "result.json").write_text('{"status":"passed"}')
+            (logs / "decode.log").write_text("decode completed")
+            VERIFY.collect_diagnostics(root)
+            self.assertEqual(
+                (root / "diagnostics/result.json").read_text(), '{"status":"passed"}'
+            )
+            self.assertEqual(
+                (root / "diagnostics/mooncake-xpu-pd-test/decode.log").read_text(),
+                "decode completed",
+            )
+
+    def test_collect_diagnostics_rejects_links_and_special_files_before_copying(self):
+        for kind in ("file-link", "directory-link", "broken-link", "fifo", "root-link"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                sentinel = root / "host-only.txt"
+                sentinel.write_text("host data")
+                output = root / "output"
+                if kind == "root-link":
+                    output.symlink_to(root / "missing", target_is_directory=True)
+                else:
+                    output.mkdir()
+                    (output / "regular.log").write_text("container log")
+                    if kind == "fifo":
+                        os.mkfifo(output / "pipe")
+                    elif kind == "directory-link":
+                        (output / "nested").symlink_to(root, target_is_directory=True)
+                    else:
+                        target = sentinel if kind == "file-link" else root / "missing"
+                        (output / "cleanup.json").symlink_to(target)
+                with self.assertRaisesRegex(RuntimeError, "symlink|special file"):
+                    VERIFY.collect_diagnostics(root)
+                self.assertFalse((root / "diagnostics").exists())
+                self.assertEqual(sentinel.read_text(), "host data")
+
     def test_exact_artifact_identity_digest_sha_and_complete_manifest(self):
         sha = "a" * 40
         image = "intel/pytorch@sha256:" + "b" * 64
@@ -851,7 +895,7 @@ class ArtifactTest(unittest.TestCase):
             }
             environment = {
                 "GITHUB_RUN_ID": "123",
-                "GITHUB_RUN_ATTEMPT": "2",
+                "GITHUB_RUN_ATTEMPT": "3",
                 "XPU_IMAGE": VERIFY.APPLICATION_IMAGE,
                 "XPU_BUILD_IMAGE": image,
             }
@@ -867,17 +911,22 @@ class ArtifactTest(unittest.TestCase):
                         json.dumps({**original, **change})
                     )
                     with self.assertRaises(RuntimeError):
-                        VERIFY.unpack(root, sha, "42", checksum)
+                        VERIFY.unpack(root, sha, "42", checksum, "2")
             (root / "artifact.json").write_text(json.dumps(original))
             with patch.dict(os.environ, environment):
+                for attempt in ("0", "1", "4", "invalid"):
+                    with self.subTest(attempt=attempt), self.assertRaises(RuntimeError):
+                        VERIFY.unpack(root, sha, "42", checksum, attempt)
                 with self.assertRaises(RuntimeError):
-                    VERIFY.unpack(root, sha, "42", "0" * 64)
-                VERIFY.unpack(root, sha, "42", checksum)
+                    VERIFY.unpack(root, sha, "42", "0" * 64, "2")
+                VERIFY.unpack(root, sha, "42", checksum, "2")
             bundle = root / "bundle"
             with self.assertRaises(RuntimeError):
                 VERIFY.verify_provenance(bundle, "c" * 40, image, "123/2")
             with self.assertRaises(RuntimeError):
                 VERIFY.verify_provenance(bundle, sha, image + "changed", "123/2")
+            with self.assertRaises(RuntimeError):
+                VERIFY.verify_provenance(bundle, sha, image, "123/3")
             (bundle / wheel).write_bytes(b"corrupted")
             with self.assertRaises(RuntimeError):
                 VERIFY.verify_hashes(bundle, {"provenance.txt"})
@@ -909,7 +958,7 @@ class ArtifactTest(unittest.TestCase):
                     os.environ, {"GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1"}
                 ):
                     with self.assertRaises(RuntimeError):
-                        VERIFY.unpack(root, "a" * 40, "1", checksum)
+                        VERIFY.unpack(root, "a" * 40, "1", checksum, "1")
 
     def test_hash_inventory_rejects_unhashed_missing_duplicate_and_unsafe_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1359,7 +1408,7 @@ echo container-id
         self.assertIn("devices=(/dev/dri/renderD*)", script)
         self.assertIn('--env "ZE_AFFINITY_MASK=$ZE_AFFINITY_MASK"', script)
         self.assertIn(
-            '--security-opt "seccomp=$run_directory/output/seccomp.json"', script
+            '--security-opt "seccomp=$run_directory/host-output/seccomp.json"', script
         )
 
     def test_cleanup_recheck_propagates_docker_query_failure(self):
@@ -1399,7 +1448,7 @@ esac
                 )
                 self.assertEqual(result.returncode, query_status, result.stderr)
                 self.assertEqual(
-                    (run_directory / "output/cleanup-recheck.json").exists(),
+                    (run_directory / "host-output/cleanup-recheck.json").exists(),
                     query_status == 0,
                 )
 
@@ -1425,6 +1474,10 @@ esac
                     root = Path(temporary)
                     run_directory = self.prepare_run(root)
                     (run_directory / "output").mkdir()
+                    sentinel = root / "host-only.txt"
+                    sentinel.write_text("host data")
+                    for name in ("container-final.json", "cleanup.json"):
+                        (run_directory / "output" / name).symlink_to(sentinel)
                     docker = root / "docker"
                     docker.write_text("""#!/bin/bash
 set -eu
@@ -1466,8 +1519,12 @@ esac
                     self.assertIn("stop --time 10 owned-container", commands)
                     self.assertIn("rm owned-container", commands)
                     self.assertNotIn("prune", commands)
+                    self.assertEqual(sentinel.read_text(), "host data")
+                    self.assertTrue(
+                        (run_directory / "host-output/container-final.json").is_file()
+                    )
                     report = json.loads(
-                        (run_directory / "output/cleanup.json").read_text()
+                        (run_directory / "host-output/cleanup.json").read_text()
                     )
                     self.assertEqual(
                         report["cleanup_status"] == 0, cleanup_failure == "no"
@@ -1480,6 +1537,10 @@ esac
             ), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 run_directory = self.prepare_run(root)
+                (run_directory / "output").mkdir()
+                sentinel = root / "host-only.txt"
+                sentinel.write_text("host data")
+                (run_directory / "output/cleanup-recheck.json").symlink_to(sentinel)
                 docker = root / "docker"
                 docker.write_text("""#!/bin/bash
 set -eu
@@ -1514,11 +1575,12 @@ esac
                     timeout=10,
                 )
                 self.assertEqual(result.returncode == 0, valid, result.stderr)
+                self.assertEqual(sentinel.read_text(), "host data")
                 commands = (run_directory / "docker.commands").read_text()
                 self.assertIn("--filter label=mooncake.xpu.run=123-1", commands)
                 self.assertEqual((run_directory / "removed").exists(), valid)
                 self.assertEqual(
-                    (run_directory / "output/cleanup-recheck.json").exists(), valid
+                    (run_directory / "host-output/cleanup-recheck.json").exists(), valid
                 )
                 if valid:
                     self.assertIn(f"rm {container_id}", commands)
@@ -1658,7 +1720,12 @@ class NightlyXpuTest(unittest.TestCase):
             self.assertEqual(
                 job["uses"], "./.github/workflows/integration-test-xpu.yml"
             )
-            for key in ("source_sha", "artifact_id", "artifact_digest"):
+            for key in (
+                "source_sha",
+                "artifact_id",
+                "artifact_digest",
+                "build_attempt",
+            ):
                 self.assertEqual(
                     job["with"][key], "${{ needs.build-wheel-xpu.outputs." + key + " }}"
                 )
@@ -1680,7 +1747,7 @@ class NightlyXpuTest(unittest.TestCase):
             if step.get("name") == "Download pinned application model (hosted CPU)"
         )
         self.assertEqual(model["if"], "inputs.include_application_model")
-        self.assertIn("revision=MODEL_REVISION", model["run"])
+        self.assertIn("verify_xpu_ci.py model xpu-ci-output/model", model["run"])
         self.assertIn(
             'cp -R xpu-ci-output/model "$out/"', workflow_step("Package native tests")
         )
@@ -1768,13 +1835,22 @@ class NightlyXpuTest(unittest.TestCase):
         self.assertIn('--env "XPU_SUITE=${XPU_SUITE:-core}"', launch)
         upload = INTEGRATION["jobs"]["core"]["steps"][-1]
         self.assertIn("inputs.suite", upload["with"]["name"])
-        self.assertIn("mooncake-xpu-pd-*/*.log", upload["with"]["path"])
+        self.assertIn("/diagnostics/", upload["with"]["path"])
+        self.assertIn("/host-output/", upload["with"]["path"])
+        self.assertNotIn("/output/", upload["with"]["path"])
+        collect = next(
+            step
+            for step in INTEGRATION["jobs"]["core"]["steps"]
+            if step.get("name") == "Collect container diagnostics"
+        )
+        self.assertIn("steps.cleanup.outcome == 'success'", collect["if"])
+        self.assertIn("verify_xpu_ci.py diagnostics", collect["run"])
+        self.assertNotIn("src=$run_directory/host-output", launch)
 
     def test_queue_measurement_uses_current_job_created_and_started_times(self):
-        code = (
-            hardware_step("Record scheduling measurements")
-            .split("python3 - <<'PY'\n")[1]
-            .rsplit("\nPY", 1)[0]
+        self.assertIn(
+            "verify_xpu_ci.py scheduling",
+            hardware_step("Record scheduling measurements"),
         )
         job = {
             "id": 42,
@@ -1794,25 +1870,84 @@ class NightlyXpuTest(unittest.TestCase):
                 ([{**job, "started_at": "2026-10-29T00:00:00Z"}], False),
             ):
                 (output / "jobs.json").write_text(json.dumps(jobs))
-                result = subprocess.run(
-                    [sys.executable, "-c", code],
-                    env={
-                        **os.environ,
-                        "RUN_DIRECTORY": temporary,
-                        "RUNNER_NAME": "pair-45",
-                        "XPU_SUITE": "nightly",
-                    },
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                self.assertEqual(result.returncode == 0, valid, result.stderr)
+                with patch.dict(
+                    os.environ, {"RUNNER_NAME": "pair-45", "XPU_SUITE": "nightly"}
+                ):
+                    if valid:
+                        VERIFY.record_scheduling(output)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            VERIFY.record_scheduling(output)
                 if valid:
                     self.assertEqual(
                         json.loads((output / "scheduling.json").read_text())[
                             "queue_seconds"
                         ],
                         12,
+                    )
+
+    def test_model_download_pins_revision_and_filters_artifacts(self):
+        for weights in (True, False):
+            with self.subTest(
+                weights=weights
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                cached = root / "cached"
+                cached.write_bytes(b"model artifact")
+                files = [
+                    "config.json",
+                    "tokenizer.txt",
+                    "vocab.model",
+                    "nested/file.json",
+                    "README.md",
+                ]
+                if weights:
+                    files.append("model.safetensors")
+
+                def repo_files(model, revision):
+                    self.assertEqual(
+                        (model, revision), (VERIFY.MODEL_ID, VERIFY.MODEL_REVISION)
+                    )
+                    return files
+
+                def download(model, name, revision):
+                    self.assertEqual(
+                        (model, revision), (VERIFY.MODEL_ID, VERIFY.MODEL_REVISION)
+                    )
+                    return cached
+
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "huggingface_hub": SimpleNamespace(
+                                list_repo_files=repo_files,
+                                hf_hub_download=download,
+                            )
+                        },
+                    ),
+                    patch.object(
+                        VERIFY.shutil, "copyfile", wraps=VERIFY.shutil.copyfile
+                    ) as copy,
+                ):
+                    destination = root / "model"
+                    if not weights:
+                        with self.assertRaisesRegex(RuntimeError, "no safetensors"):
+                            VERIFY.download_model(destination)
+                        continue
+                    VERIFY.download_model(destination)
+                    self.assertEqual(
+                        {call.args[1].name for call in copy.call_args_list},
+                        {
+                            "config.json",
+                            "tokenizer.txt",
+                            "vocab.model",
+                            "model.safetensors",
+                        },
+                    )
+                    self.assertEqual(
+                        json.loads((destination / "model-provenance.json").read_text()),
+                        {"model": VERIFY.MODEL_ID, "revision": VERIFY.MODEL_REVISION},
                     )
 
 
@@ -1859,6 +1994,22 @@ class ApplicationTest(unittest.TestCase):
         for name, value in snapshot.items():
             if value is not None:
                 self.assertRegex(value, r"^(max|\d+)$", name)
+
+    def test_pid_cgroup_missing_counters_are_reported_but_read_errors_propagate(self):
+        with (
+            patch.object(Path, "read_text", side_effect=FileNotFoundError),
+            patch.object(sys, "stderr", new_callable=io.StringIO) as errors,
+        ):
+            self.assertEqual(
+                VERIFY.pids_cgroup_snapshot(),
+                dict.fromkeys(("pids.current", "pids.peak", "pids.max")),
+            )
+            self.assertIn("measurement unavailable", errors.getvalue())
+        with (
+            patch.object(Path, "read_text", side_effect=PermissionError),
+            self.assertRaises(PermissionError),
+        ):
+            VERIFY.pids_cgroup_snapshot()
 
     def test_artifact_install_dispatches_only_the_selected_suite(self):
         for selected, mode in (
@@ -2112,6 +2263,11 @@ class ApplicationTest(unittest.TestCase):
             patch.object(sys, "path", list(sys.path)),
         ):
             pd = load_script("xpu_pd_smoke", "scripts/xpu/vllm_store_pd_smoke.py")
+        with patch.object(sys, "argv", ["smoke", "--model", "offline"]):
+            common = vars(base.parse_args())
+            combined = vars(pd.parse_args())
+        for name, value in common.items():
+            self.assertEqual(combined[name], value, name)
         llm = SimpleNamespace(
             generate=lambda *args: [
                 SimpleNamespace(outputs=[SimpleNamespace(token_ids=[1, 2])])
