@@ -57,6 +57,7 @@ class NightlyCITest(unittest.TestCase):
             NEEDS_JSON=json.dumps(needs),
             ALLOW_ROCM_SKIP=str(allow_rocm).lower(),
             ALLOW_PUBLISH_SKIP=str(allow_publish).lower(),
+            ALLOW_XPU_SKIP="false",
         )
 
     def test_all_required_jobs_pass(self):

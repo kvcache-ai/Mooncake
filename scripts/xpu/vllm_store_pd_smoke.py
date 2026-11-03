@@ -59,29 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--role", default="local", choices=["local", "prefill", "decode"]
     )
-    parser.add_argument("--model", required=True, help="HF model id or local path")
-    parser.add_argument(
-        "--master", default="127.0.0.1:50051", help="mooncake_master address"
-    )
-    parser.add_argument(
-        "--master-bin",
-        default=None,
-        help="Path to mooncake_master; started by the prefill side on --master's port",
-    )
-    parser.add_argument("--metadata-server", default="P2PHANDSHAKE")
-    parser.add_argument("--protocol", default="tcp", choices=["tcp", "rdma"])
-    parser.add_argument(
-        "--device-name", default="", help="Transfer Engine device filter"
-    )
-    parser.add_argument(
-        "--global-segment-size", default="2GB", help="prefill side segment"
-    )
-    parser.add_argument("--local-buffer-size", default="512MB")
-    parser.add_argument("--max-model-len", type=int, default=2048)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
-    parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--prompt-repeats", type=int, default=12)
-    parser.add_argument("--save-timeout", type=float, default=60.0)
+    base.add_common_arguments(parser)
     parser.add_argument(
         "--prefill-xpu", type=int, default=0, help="local: Level Zero index"
     )
@@ -139,6 +117,8 @@ def build_llm(args: argparse.Namespace, kv_role: str):
     from vllm import LLM
     from vllm.config import KVTransferConfig
 
+    if args.report and torch.xpu.device_count() != 1:
+        raise RuntimeError("CI requires exactly one visible XPU per PD role")
     return LLM(
         model=args.model,
         max_model_len=args.max_model_len,
@@ -205,6 +185,7 @@ def run_prefill(args: argparse.Namespace) -> int:
             "tokens": list(out.token_ids),
             "saved": saved,
             "save_failed": save_failed,
+            "memory": base.memory_report(),
         }
         print(f"[prefill] prompt tokens : {result['prompt_tokens']}", flush=True)
         print(f"[prefill] reference     : {result['tokens']}", flush=True)
@@ -280,6 +261,23 @@ def run_decode(args: argparse.Namespace) -> int:
         if failures:
             print("FAIL: " + "; ".join(failures), file=sys.stderr)
             return 1
+        if args.report:
+            with open(args.report, "w") as report:
+                json.dump(
+                    {
+                        "scenario": "pd",
+                        "tokens": list(out.token_ids),
+                        "reference_tokens": reference["tokens"],
+                        "saved": reference["saved"],
+                        "loaded": loaded,
+                        "save_failed": reference["save_failed"],
+                        "load_failed": load_failed,
+                        "memory": base.memory_report(),
+                        "prefill_memory": reference["memory"],
+                    },
+                    report,
+                    indent=2,
+                )
         print("PASS: vLLM-XPU prefill (XPU A) -> Mooncake Store -> decode (XPU B)")
         return 0
     finally:
@@ -291,6 +289,8 @@ def run_decode(args: argparse.Namespace) -> int:
 
 
 def run_local(args: argparse.Namespace) -> int:
+    if args.prefill_xpu == args.decode_xpu:
+        raise ValueError("Prefill and decode must use distinct XPUs")
     if torch.xpu.device_count() < 2:
         print(f"FAIL: need 2 XPUs, found {torch.xpu.device_count()}", file=sys.stderr)
         return 2
@@ -314,6 +314,7 @@ def run_local(args: argparse.Namespace) -> int:
         "save_timeout",
         "hold_timeout",
         "wait_timeout",
+        "report",
     ):
         value = getattr(args, name)
         if value is not None:

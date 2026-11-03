@@ -1,0 +1,273 @@
+# XPU hardware CI (Stages 2 and 3)
+
+Stage 1 builds a CPython 3.12 wheel and matching native tests on hosted CPU
+runners. Stage 2 consumes that exact artifact on a fixed two-B60 allocation.
+It does not build while holding GPUs or publish wheels. Stage 3 adds opt-in
+nightly expanded core and a separate application job, reusing this builder,
+artifact contract, runner allocation, and isolated hardware workflow.
+
+## Runner contract
+
+Register dedicated, isolated, **non-root, ephemeral** runners with the `xpu`
+label (`runs-on: xpu`). PR code executes inside the runtime container;
+do not place credentials, other tenants, or persistent trusted workloads on
+these runners. Destroy/reimage the runner after each job. Docker access is
+host administration capability: container flags are not a substitute for this
+runner isolation.
+
+Each eight-GPU host runs four runners, each owning a fixed, non-overlapping
+pair. GitHub runs one job at a time per runner; no additional allocation lock
+or lock-directory configuration is needed. No other workload may use those
+assigned devices.
+
+Install Docker, `gh`, Python 3.12, and `timeout`. The only required GPU
+configuration is the runner's existing **host-owned** environment variable:
+
+```sh
+ZE_AFFINITY_MASK=0,1
+```
+
+For example, the four masks can be `0,1`, `2,3`, `4,5`, and `6,7`, using the
+host's Level Zero whole-device ordinals. All render nodes are passed into the
+container to preserve device enumeration; the mask selects the assigned pair.
+Preflight requires exactly two visible B60s and real GPU arithmetic.
+**The mask is not a security boundary:** this setup trusts the fixed runner
+allocation and test code not to use other devices. It is not suitable for
+untrusted multi-tenant code. No privileged mode, host network/PID/IPC namespace,
+Docker socket, publishing token, or `CAP_SYS_PTRACE` is passed to the container.
+
+CI automatically downloads a commit-pinned Moby default seccomp profile,
+verifies its SHA256, and writes a per-run profile allowing `pidfd_open`,
+`pidfd_getfd`, `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
+All other default rules remain unchanged. No `XPU_SECCOMP_PROFILE`,
+`XPU_LOCK_DIRECTORY`, or `XPU_RENDER_DEVICES` setting is required or consumed.
+The host needs HTTPS access to `raw.githubusercontent.com`; download or
+checksum failure aborts the job, never falls back to `seccomp=unconfined`.
+The generated profile is retained in the diagnostic artifact.
+Host Yama `ptrace_scope` must be 0 or 1,
+Level Zero IPC/P2P must work, and the run's output filesystem must support
+`O_DIRECT` and io_uring. Missing permissions/capabilities fail core, not skip it.
+
+The container keeps `--network none`: Store and EP peers communicate only
+inside its private loopback network. CI sets both the Python Store's
+`LOCAL_HOSTNAME` and TENT's distinct `MOONCAKE_LOCAL_HOSTNAME` to `127.0.0.1`.
+TENT's automatic address discovery skips loopback, so the latter must be
+explicit even when Store setup already supplies a local segment name.
+EP's oneCCL KVS also excludes loopback during automatic discovery, so CI sets
+`CCL_KVS_IFACE=lo`; the EP test's CPU process group uses
+`GLOO_SOCKET_IFNAME=lo`. These are container-local interface selections, not
+additional runner-service settings. XCCL and the native Level Zero IPC fast
+path remain enabled; no network access or fallback-only coverage is introduced.
+
+The runtime uses the same digest-pinned Intel PyTorch image as Stage 1.
+Provision compatible Intel GPU drivers and matching SYCL/Level Zero runtimes;
+dependency loading, wheel RECORD/native capabilities, and real GPU arithmetic
+are checked before the suites. The hosted builder also downloads the wheel's
+Python dependencies into the hashed native bundle. The offline container
+installs only this wheel and those dependencies (`--no-index --find-links`)
+into a fresh temporary import directory, retaining the pinned image's PyTorch.
+Intel's native runtime is resolved from that image's Python prefix; no SYCL or
+Level Zero runtime is added to the Mooncake wheel.
+
+## Trigger and revision binding
+
+After these workflows are available on upstream `main`, a maintainer with
+write/maintain/admin permission can add `run-e2e-ci` to an open PR targeting
+`main`. The shared **E2E CI** entry point runs XPU alongside the existing ROCm,
+Ascend and other integration jobs; XPU is required, not an optional selection.
+The existing E2E label cleanup removes the label after the gate; add it again
+to rerun. A new PR head needs new authorization; leaving the label attached
+does not authorize later pushes.
+
+Alternatively dispatch **E2E CI** on trusted `main`, supplying `pr_number`
+(current head) and optionally `pr_sha` (must match), or a full 40-character
+`pr_sha` without a PR. With neither input, XPU tests the dispatch's `main`
+commit. No branch names or implicit latest artifacts are accepted.
+Fork PR heads are supported through their commit SHA.
+
+The hosted builder receives that exact SHA. Hardware downloads its artifact
+by ID in the same run and verifies the API identity, run/attempt, ZIP digest,
+payload/native hashes, source/image provenance, and build/runtime inventories.
+The builder passes its producing `build_attempt` alongside the artifact ID,
+digest and source SHA. A retry of only the failed hardware jobs may consume
+that earlier successful build; artifact names and provenance are checked
+against the producing attempt, not the retry's current attempt. Artifacts
+from a different workflow run, SHA, or producing attempt remain invalid.
+The host runs the trusted workflow-revision harness, not PR host scripts.
+
+The shared `E2E Gate` requires XPU authorization, build, hardware tests and
+cleanup to succeed. Its hosted-only XPU step publishes the `XPU Core` check
+on the authorized commit, rechecking the PR head and build SHA before success.
+Failed, cancelled, skipped, missing or stale required XPU results cannot pass.
+The existing E2E concurrency policy cancels older runs for the same PR;
+an interrupted controller can leave an in-progress check, never a successful
+check. Other platforms retain their existing jobs and gate policy.
+The normal Stage 1 hosted build remains independent and required by the
+existing PR CI gate. PR core remains model-free and unchanged by the nightly
+profiles below.
+
+## Stage 3: nightly hardware and applications
+
+The official repository's **Nightly Build & Test** always builds and checks the
+XPU wheel on CPU. After provisioning the runners, set the repository variable
+`NIGHTLY_XPU_INTEGRATION=true` to require hardware coverage each night.
+Alternatively select `run_xpu_integration` when manually dispatching Nightly
+Build & Test. The same selection enables **both** jobs:
+
+- `xpu-nightly-core`: all 150 non-RDMA C++ cases, Python Store, and expanded
+  two-rank native EP. EP uses 128 maximum tokens, hidden size 4096, 16 experts,
+  top-k 4, and 24 fixed-seed rounds, plus the existing empty-rank, overlap,
+  duplicate-expert, handle, stream, and fallback checks. PR core retains its
+  32-token, hidden-1024, 8-expert, top-k-2, eight-round profile.
+- `xpu-nightly-applications`: one two-B60 allocation runs the existing
+  `vllm_store_smoke.py`, then `vllm_store_pd_smoke.py`. Single-instance Store
+  must save and load real KV and reproduce nonempty greedy output with zero
+  failed keys. PD uses separate producer/consumer processes on distinct local
+  device indices 0 and 1 within the runner's host-owned mask; each role must
+  see exactly one XPU. It must load exactly the producer's saved keys and
+  reproduce its tokens, with zero save/load failures. Local prefix caching is
+  disabled in both scenarios.
+
+The hardware jobs can run independently on different runner pairs. Both use
+the nightly commit's **same artifact ID and digest**, not a rebuilt or indexed
+wheel. The hosted builder optionally downloads
+`Qwen/Qwen2.5-0.5B-Instruct` at revision
+`7ae557604adf67be50417f59c2c2f167def9a775` into the native bundle, with model
+provenance and the bundle's complete SHA256 inventory. No model download or
+Mooncake build runs on a GPU runner. Disabled nightly hardware and PR builds do
+not download this model.
+
+Core uses Stage 1's Intel PyTorch runtime. Applications use
+`vllm/vllm-openai-xpu:v0.29.0@sha256:1db27a8b75ae1d6b3cbf16ebbb88310c2b5548221c8df1335082b2a54dba209a`
+(CPython 3.12, PyTorch 2.13.0, installed vLLM `0.29.0+xpu`). The full XPU
+package version, including its local suffix, is checked exactly; the image
+tag's `v0.29.0` is not the installed distribution version. Package inventory
+is retained before this check, and mismatches report actual/expected versions.
+Builder-image provenance is checked separately
+from this application runtime. Both containers verify the installed wheel's
+native extensions and packaged master; applications also check vLLM's version
+and the model revision. Runtime execution stays offline (`--network none`,
+Hugging Face/Transformers offline mode). `MC_FORCE_TCP=1` and
+`MC_TENT_CONF={"transports":{"xpu":{"disable_ipc":true}}}` prevent RDMA or
+same-node XPU IPC shortcuts in the application path. Native EP/IPC coverage
+remains enabled in core.
+
+Applications set `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+`NUMEXPR_NUM_THREADS`, and `RAYON_NUM_THREADS` to 2 **before** preflight imports
+PyTorch. Both PD children inherit these settings. This prevents host-sized
+Torch/BLAS and tokenizer Rayon pools from exhausting the shared container
+thread budget on large CPU hosts. Tokenizer parallelism remains enabled and
+the core profile remains unchanged.
+`cpu-resources.json` retains CPU visibility and the enforced thread settings.
+
+The hardware container runs with `--pids-limit 4096`. The PD scenario
+legitimately runs the master plus two vLLM-XPU processes, whose thread pools
+are mostly fixed-size; a 1024-task budget deterministically aborted the decode
+side's first KV pull with `std::system_error: Resource temporarily unavailable`
+(EAGAIN from `pthread_create`). Pinning the container to a reduced CPU set is
+not an alternative: oneCCL in the core suite pins workers from host-sized core
+lists and fails to start under `--cpuset-cpus`. `cpu-resources.json` and
+`result.json` record `pids.current`/`pids.peak`/`pids.max` so the remaining
+headroom stays visible. Optional counters absent from the kernel are logged
+and recorded as `null`; other read errors fail the job.
+The ROCm harness uses `--pids-limit=32768` for a
+comparable single-instance workload.
+
+Nightly Gate requires the builder and both selected hardware jobs to succeed.
+Missing results, unexpected skips, cancellation, test errors, absent completion
+records, invalid JSON results, or cleanup failures cannot pass. Hardware jobs
+may be skipped **only** when the recorded selection is explicitly false.
+That state emits a warning and an explicit absent-coverage summary, not a
+hardware pass. Fork nightly runs remain disabled. XPU artifacts are not added
+to TestPyPI or release publishing; release integration remains a later stage.
+
+Diagnostics additionally retain job creation/start times and measured queue
+seconds, suite elapsed time, the pinned image/model identity, scenario JSON
+results with per-process peak XPU allocated/reserved memory, and full PD child
+logs even on failure. These are measurements from actual runs, not runtime or
+concurrency guarantees. Core and application containers have suite-specific
+labels and diagnostic artifact names, so same-run cleanup cannot stop another
+suite's container on a shared eight-GPU host. Existing current-container
+cleanup checks and mandatory ephemeral-runner reimaging still apply.
+Host-generated records (including cleanup, container inspection and scheduling)
+live in the unmounted `host-output` directory, separate from the container's
+writable `output` mount. Only after cleanup succeeds does the trusted harness
+copy container diagnostics into an unmounted `diagnostics` directory,
+rejecting symbolic links and special files before copying. Artifact upload
+reads these host-owned directories, never the raw container output; rejected
+diagnostics fail the job while host cleanup records remain available.
+
+## Required coverage and diagnostics
+
+Core executes sequentially:
+
+- 20 platform cases, including foreign/interior USM, dma-buf export,
+  concurrent host/device copies, and same-/cross-device IPC and copies.
+- 7 XPU transport cases.
+- 114 engine cases: local copies, TCP/HP-TCP staging (tests explicitly disable
+  IPC for those paths), retry/routing, IPC lifetime/policies, and io_uring.
+- 8 real cross-process IPC/fallback cases, including permission-denied peers.
+- 1 C++ Store foreign-USM roundtrip with an in-process master.
+- 1 existing Python Store tensor/registered-buffer roundtrip with a packaged
+  local master.
+- Native EP on two ranks: eight fixed-seed rounds covering BF16/FP8,
+  event/hook completion and dispatch weights, plus empty-rank, overlap,
+  duplicate-expert, handle, cross-stream, and fallback-agreement checks.
+  The existing script asserts native selection and must print its exact final
+  completion record; missing rounds or zero-test execution fail.
+
+The **150 C++ cases** require exact GoogleTest identities and completed XML
+results. Ten parameter combinations that unconditionally skip because they
+are inapplicable are excluded *before* execution, with reasons in
+`selection.json`. No runtime skips are allowed. The eight direct-RDMA
+parameterizations are explicitly excluded; dma-buf export itself needs no NIC.
+GDS, multi-node, and more than two EP ranks are not claimed as coverage.
+vLLM belongs only to the separate nightly application job.
+
+Artifacts retain runner/container cleanup state, device/runtime identity,
+selection, XML, logs, inventories, dependency diagnostics, artifact metadata,
+source SHA, and elapsed suite time, including on failure. A failed/timed-out
+command's final 40 log lines are also printed so nested test errors appear in
+the Actions step; full logs remain in the artifact. Only the current container
+is stopped/removed; its PID namespace owns all test descendants.
+Cleanup failure fails the hardware job. Runner reimaging remains mandatory
+after failure or cancellation.
+
+CPU-only regression validation:
+
+```sh
+python3 -m unittest scripts.ci.tests.test_xpu_ci \
+  scripts.ci.tests.test_run_ctest scripts.ci.tests.test_nightly_ci -v
+```
+
+XPU CI regressions share one test module and common workflow/module loaders;
+they validate packaging and orchestration contracts, not actual B60 behavior.
+Shared XML report validation lives in `scripts/ci/check_test_reports.py`.
+Both the hosted XPU tests and hardware suites require GoogleTest's explicit
+`run`/`completed` status and reject skipped cases. Hardware suites additionally
+pass their expected case identities to the same validator. The shared CTest
+action and TENT CI also use it for JUnit reports, preserving CTest's existing
+skip policy via `--allow-skipped`. Targeted CTest steps without XML reports
+retain their native exit-code and `--no-tests=error` checks.
+
+Docker launch, device mapping, traps and cleanup are inline in
+`.github/workflows/integration-test-xpu.yml`. A temporary cleanup helper is
+created from that trusted workflow in the host run directory and shared by
+the exit trap and the `always()` cleanup recheck; it is not mounted into the
+test container.
+
+`scripts/e2e/python/verify_xpu_ci.py` is the single verification entry point:
+no arguments retain the hosted wheel smoke checks; `unpack` verifies the
+downloaded artifact, `seccomp` prepares the pinned profile, and `run` installs
+the wheel offline and launches the selected core/nightly `suite` or
+`applications` checks. `model` downloads the revision-pinned offline model
+on the hosted builder; `scheduling` records the hardware job's queue time.
+Workflows call these functions through the same CLI instead of embedding
+Python code. Both vLLM smoke scripts reuse their common argument definitions
+from `vllm_store_smoke.py`. There are no separate XPU runtime scripts under
+`scripts/ci/`.
+The `diagnostics` command performs the post-cleanup container-output check and
+copy used by hardware artifact collection.
+
+Enable hardware only after provisioning and successfully running the exact
+core workflow; record real queue/runtime measurements during rollout.

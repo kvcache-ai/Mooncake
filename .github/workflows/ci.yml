@@ -574,6 +574,7 @@ jobs:
       src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
       tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
       store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
+      xpu: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.xpu }}
       docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
@@ -627,6 +628,19 @@ jobs:
             docs:
               - 'docs/**'
               - '.github/workflows/ci.yml'
+            xpu:
+              - 'mooncake-*/**'
+              - 'python/**'
+              - 'extern/**'
+              - 'cmake/**'
+              - 'CMakeLists.txt'
+              - 'dependencies.sh'
+              - '.gitmodules'
+              - 'scripts/**'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/ci_xpu.yml'
+              - '.github/workflows/nightly.yml'
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
@@ -667,6 +681,11 @@ jobs:
     if: needs.check-paths.outputs.src == 'true'
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
+
+  build-wheel-xpu:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/ci_xpu.yml
 
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
@@ -841,6 +860,9 @@ jobs:
           --output-on-failure \
           --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml" \
           "${ctest_args[@]}"
+        cd "$GITHUB_WORKSPACE"
+        python3 scripts/ci/check_test_reports.py --allow-skipped \
+          build-tent/test-results/ctest.xml
       shell: bash
 
     - name: Preserve TENT CTest diagnostics
@@ -1022,6 +1044,7 @@ jobs:
       - build-wheel-cu13-arm64
       - build-wheel-efa
       - build-wheel-rocm
+      - build-wheel-xpu
       - tent-ci
       - store-rs-ci
     runs-on: ubuntu-latest
@@ -1055,10 +1078,17 @@ jobs:
             ${{ needs.build-wheel-cu13-arm64.result }}
             ${{ needs.build-wheel-efa.result }}
             ${{ needs.build-wheel-rocm.result }}
+            ${{ needs.build-wheel-xpu.result }}
         run: |
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1
           done
+
+      - name: Check XPU build and packaging
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.xpu == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.build-wheel-xpu.result }}
+        run: test "$RESULT" = "$EXPECTED"
 
       - name: Check TENT jobs
         env:

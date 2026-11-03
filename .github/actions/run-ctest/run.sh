@@ -9,13 +9,14 @@ args=(--parallel "$(nproc)" --output-on-failure)
 if [ -n "${CTEST_LABEL_EXCLUDE:-}" ]; then
   args+=(--label-exclude "$CTEST_LABEL_EXCLUDE")
 fi
-if [ -n "$JUNIT_REPORT" ]; then
-  report="$GITHUB_WORKSPACE/$JUNIT_REPORT"
-  mkdir -p "$(dirname "$report")"
-  args+=(--output-junit "$report")
-fi
+report="$GITHUB_WORKSPACE/${JUNIT_REPORT:-build/test-results/ctest.xml}"
+mkdir -p "$(dirname "$report")"
+rm -f "$report"
+args+=(--output-junit "$report")
 cd build
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
 DEFAULT_KV_LEASE_TTL=500 \
   ctest "${args[@]}"
+python3 "$GITHUB_ACTION_PATH/../../../scripts/ci/check_test_reports.py" \
+  --allow-skipped "$report"
