@@ -194,28 +194,11 @@ Status TcpTransport::submitTransferTasks(
 #endif
         task.status_word.store(TransferStatusEnum::PENDING,
                                std::memory_order_release);
-#if TENT_METRICS_ENABLED
-        TentMetrics::instance().recordStreamEvent(
-            TransportType::TCP, request.opcode,
-            TentMetrics::StreamEvent::Queued);
-#endif
     }
 
     for (size_t i = start_idx; i < tcp_batch->task_list.size(); ++i) {
         TcpTask *task_ptr = &tcp_batch->task_list[i];
-#if TENT_METRICS_ENABLED
-        TentMetrics::instance().recordStreamQueueDepth(TransportType::TCP, 1);
-#endif
-        try {
-            thread_pool_->enqueue(
-                [this, task_ptr]() { startTransfer(task_ptr); });
-        } catch (...) {
-#if TENT_METRICS_ENABLED
-            TentMetrics::instance().recordStreamQueueDepth(TransportType::TCP,
-                                                           -1);
-#endif
-            throw;
-        }
+        thread_pool_->enqueue([this, task_ptr]() { startTransfer(task_ptr); });
     }
     return Status::OK();
 }
@@ -252,8 +235,6 @@ void TcpTransport::startTransfer(TcpTask *task) {
     const auto progress_batch_id = task->progress_batch_id;
     bool completed = false;
 #if TENT_METRICS_ENABLED
-    TentMetrics::instance().recordStreamQueueDepth(TransportType::TCP, -1);
-    TentMetrics::instance().recordStreamBusyWorkers(TransportType::TCP, 1);
     if (task->enqueue_time != std::chrono::steady_clock::time_point{}) {
         TentMetrics::instance().recordStreamQueueWait(
             TransportType::TCP, task->request.opcode,
@@ -296,9 +277,6 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::FAILED,
                                 std::memory_order_release);
     }
-#if TENT_METRICS_ENABLED
-    TentMetrics::instance().recordStreamBusyWorkers(TransportType::TCP, -1);
-#endif
     if (notify_progress) notify_progress(progress_batch_id);
 }
 
@@ -343,9 +321,6 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
 
 #if TENT_METRICS_ENABLED
         const auto attempt_start = std::chrono::steady_clock::now();
-        TentMetrics::instance().recordStreamEvent(
-            TransportType::TCP, task->request.opcode,
-            TentMetrics::StreamEvent::AttemptStarted);
 #endif
         if (task->request.opcode == Request::WRITE) {
             status = ControlClient::sendData(
@@ -358,17 +333,8 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         }
 
 #if TENT_METRICS_ENABLED
-        TentMetrics::StreamOutcome outcome =
-            TentMetrics::StreamOutcome::IoError;
-        if (status.ok()) {
-            outcome = TentMetrics::StreamOutcome::Success;
-        } else if (status.IsRpcConnectionError()) {
-            outcome = TentMetrics::StreamOutcome::ConnectionError;
-        } else if (status.IsRpcServiceError()) {
-            outcome = TentMetrics::StreamOutcome::RemoteError;
-        }
         TentMetrics::instance().recordStreamAttempt(
-            TransportType::TCP, task->request.opcode, outcome,
+            TransportType::TCP, task->request.opcode,
             ElapsedMicroseconds(attempt_start));
 #endif
         if (status.ok()) return Status::OK();

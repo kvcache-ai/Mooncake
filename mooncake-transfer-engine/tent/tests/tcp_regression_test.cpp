@@ -261,23 +261,12 @@ TEST_F(TcpRegression, RealTransferRecordsStreamMetrics) {
         return test::PrometheusSeriesValue(after, series) -
                test::PrometheusSeriesValue(before, series);
     };
-    EXPECT_EQ(delta("tent_stream_events_total{transport=\"tcp\","
-                    "operation=\"write\",event=\"queued\"}"),
-              1);
-    EXPECT_EQ(delta("tent_stream_events_total{transport=\"tcp\","
-                    "operation=\"write\",event=\"attempt_started\"}"),
-              1);
-    EXPECT_EQ(delta("tent_stream_events_total{transport=\"tcp\","
-                    "operation=\"write\",event=\"attempt_success\"}"),
-              1);
     EXPECT_EQ(delta("tent_stream_queue_wait_us_count{transport=\"tcp\","
                     "operation=\"write\"}"),
               1);
     EXPECT_EQ(delta("tent_stream_attempt_latency_us_count{transport=\"tcp\","
-                    "operation=\"write\",outcome=\"success\"}"),
+                    "operation=\"write\"}"),
               1);
-    EXPECT_EQ(delta("tent_stream_queue_depth{transport=\"tcp\"}"), 0);
-    EXPECT_EQ(delta("tent_stream_busy_workers{transport=\"tcp\"}"), 0);
 }
 #endif
 

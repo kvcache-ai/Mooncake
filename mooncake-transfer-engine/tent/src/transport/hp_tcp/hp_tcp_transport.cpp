@@ -713,7 +713,7 @@ Status HighPerformanceTcpTransport::planTask(
                     } else {
                         (void)task->completeSlice(CANCELED);
                     }
-                    return HighPerformanceTcpWorkers::QueueDisposition::Settled;
+                    return;
                 }
 #if TENT_METRICS_ENABLED
                 operation.enqueue_time = enqueue_time;
@@ -721,7 +721,6 @@ Status HighPerformanceTcpTransport::planTask(
                 (void)enqueue_time;
 #endif
                 client_->enqueueOnOwner(worker_id, std::move(operation));
-                return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
             };
         command.cancel = [task, slice_count, slot] {
             if (slice_count == 1) {
@@ -731,9 +730,6 @@ Status HighPerformanceTcpTransport::planTask(
                 (void)task->completeSlice(CANCELED);
             }
         };
-#if TENT_METRICS_ENABLED
-        command.metrics_operation = request.opcode;
-#endif
         commands.push_back(std::move(command));
         slice_offset += slice_length;
     }

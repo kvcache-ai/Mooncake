@@ -52,11 +52,8 @@ uint64_t Get64(const uint8_t* in) {
 }
 
 Status InvalidFrame(const std::string& detail, HighPerformanceTcpStatus error,
-                    HighPerformanceTcpStatus* wire_error,
-                    HighPerformanceTcpFrameError classification,
-                    HighPerformanceTcpFrameError* frame_error) {
+                    HighPerformanceTcpStatus* wire_error) {
     if (wire_error != nullptr) *wire_error = error;
-    if (frame_error != nullptr) *frame_error = classification;
     return Status::InvalidArgument(
         "Invalid high-performance TCP frame: " + detail + LOC_MARK);
 }
@@ -105,52 +102,43 @@ EncodeHighPerformanceTcpRequest(const HighPerformanceTcpRequestFrame& frame) {
     return bytes;
 }
 
-Status DecodeHighPerformanceTcpRequest(
-    const uint8_t* bytes, size_t size, HighPerformanceTcpRequestFrame* frame,
-    HighPerformanceTcpStatus* wire_error,
-    HighPerformanceTcpFrameError* frame_error) {
+Status DecodeHighPerformanceTcpRequest(const uint8_t* bytes, size_t size,
+                                       HighPerformanceTcpRequestFrame* frame,
+                                       HighPerformanceTcpStatus* wire_error) {
     if (wire_error != nullptr) {
         *wire_error = HighPerformanceTcpStatus::kInternalError;
     }
-    if (frame_error != nullptr)
-        *frame_error = HighPerformanceTcpFrameError::kNone;
     if (bytes == nullptr || frame == nullptr ||
         size != kHighPerformanceTcpRequestSize) {
-        return InvalidFrame(
-            "request size", HighPerformanceTcpStatus::kInternalError,
-            wire_error, HighPerformanceTcpFrameError::kInvalidSize,
-            frame_error);
+        return InvalidFrame("request size",
+                            HighPerformanceTcpStatus::kInternalError,
+                            wire_error);
     }
     if (Get32(bytes) != kHighPerformanceTcpMagic) {
         return InvalidFrame("magic", HighPerformanceTcpStatus::kInternalError,
-                            wire_error, HighPerformanceTcpFrameError::kBadMagic,
-                            frame_error);
+                            wire_error);
     }
     if (Get16(bytes + 4) != kHighPerformanceTcpVersion) {
-        return InvalidFrame(
-            "version", HighPerformanceTcpStatus::kBadVersion, wire_error,
-            HighPerformanceTcpFrameError::kBadVersion, frame_error);
+        return InvalidFrame("version", HighPerformanceTcpStatus::kBadVersion,
+                            wire_error);
     }
     if (bytes[7] != 0 || Get64(bytes + 40) != 0) {
-        return InvalidFrame(
-            "flags/reserved", HighPerformanceTcpStatus::kInternalError,
-            wire_error, HighPerformanceTcpFrameError::kInvalidReserved,
-            frame_error);
+        return InvalidFrame("flags/reserved",
+                            HighPerformanceTcpStatus::kInternalError,
+                            wire_error);
     }
     if (bytes[6] != static_cast<uint8_t>(HighPerformanceTcpOpcode::kRead) &&
         bytes[6] != static_cast<uint8_t>(HighPerformanceTcpOpcode::kWrite)) {
-        return InvalidFrame(
-            "opcode", HighPerformanceTcpStatus::kBadOpcode, wire_error,
-            HighPerformanceTcpFrameError::kBadOpcode, frame_error);
+        return InvalidFrame("opcode", HighPerformanceTcpStatus::kBadOpcode,
+                            wire_error);
     }
 
     const uint64_t remote_addr = Get64(bytes + 24);
     const uint64_t length = Get64(bytes + 32);
     if (length == 0 ||
         remote_addr > std::numeric_limits<uint64_t>::max() - length) {
-        return InvalidFrame(
-            "length/range", HighPerformanceTcpStatus::kBadLength, wire_error,
-            HighPerformanceTcpFrameError::kBadLength, frame_error);
+        return InvalidFrame("length/range",
+                            HighPerformanceTcpStatus::kBadLength, wire_error);
     }
 
     frame->opcode = static_cast<HighPerformanceTcpOpcode>(bytes[6]);
@@ -174,40 +162,21 @@ EncodeHighPerformanceTcpResponse(const HighPerformanceTcpResponseFrame& frame) {
 }
 
 Status DecodeHighPerformanceTcpResponse(
-    const uint8_t* bytes, size_t size, HighPerformanceTcpResponseFrame* frame,
-    HighPerformanceTcpFrameError* frame_error) {
-    if (frame_error != nullptr)
-        *frame_error = HighPerformanceTcpFrameError::kNone;
+    const uint8_t* bytes, size_t size, HighPerformanceTcpResponseFrame* frame) {
     if (bytes == nullptr || frame == nullptr ||
         size != kHighPerformanceTcpResponseSize) {
-        if (frame_error != nullptr)
-            *frame_error = HighPerformanceTcpFrameError::kInvalidSize;
         return Status::InvalidArgument(
             "Invalid high-performance TCP response size" LOC_MARK);
     }
-    if (Get32(bytes) != kHighPerformanceTcpMagic) {
-        if (frame_error != nullptr)
-            *frame_error = HighPerformanceTcpFrameError::kBadMagic;
-        return Status::InvalidArgument(
-            "Invalid high-performance TCP response magic" LOC_MARK);
-    }
-    if (Get16(bytes + 4) != kHighPerformanceTcpVersion) {
-        if (frame_error != nullptr)
-            *frame_error = HighPerformanceTcpFrameError::kBadVersion;
-        return Status::InvalidArgument(
-            "Invalid high-performance TCP response version" LOC_MARK);
-    }
-    if (Get64(bytes + 24) != 0) {
-        if (frame_error != nullptr)
-            *frame_error = HighPerformanceTcpFrameError::kInvalidReserved;
+    if (Get32(bytes) != kHighPerformanceTcpMagic ||
+        Get16(bytes + 4) != kHighPerformanceTcpVersion ||
+        Get64(bytes + 24) != 0) {
         return Status::InvalidArgument(
             "Invalid high-performance TCP response header" LOC_MARK);
     }
     const uint16_t status = Get16(bytes + 6);
     if (status >
         static_cast<uint16_t>(HighPerformanceTcpStatus::kInternalError)) {
-        if (frame_error != nullptr)
-            *frame_error = HighPerformanceTcpFrameError::kInvalidStatus;
         return Status::InvalidArgument(
             "Invalid high-performance TCP response status" LOC_MARK);
     }

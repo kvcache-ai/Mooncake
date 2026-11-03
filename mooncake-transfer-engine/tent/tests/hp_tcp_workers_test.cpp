@@ -32,7 +32,6 @@ Status SubmitToWorker(HighPerformanceTcpWorkers& workers, size_t owner,
     command.run = [task = std::move(task)](
                       size_t actual, HighPerformanceTcpWorkers::QueueTime) {
         task(actual);
-        return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
     };
     std::vector<HighPerformanceTcpWorkers::Command> commands;
     commands.push_back(std::move(command));
@@ -61,9 +60,7 @@ TEST(HighPerformanceTcpWorkersTest, BatchAdmissionHasNoPartialCommit) {
     bool committed = false;
     HighPerformanceTcpWorkers::Command command;
     command.worker_id = 0;
-    command.run = [](size_t, HighPerformanceTcpWorkers::QueueTime) {
-        return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
-    };
+    command.run = [](size_t, HighPerformanceTcpWorkers::QueueTime) {};
     command.cancel = [] {};
     std::vector<HighPerformanceTcpWorkers::Command> commands;
     commands.push_back(std::move(command));

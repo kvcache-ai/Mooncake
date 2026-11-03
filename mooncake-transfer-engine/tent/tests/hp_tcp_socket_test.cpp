@@ -100,12 +100,6 @@ class Runtime {
         std::vector<HighPerformanceTcpWorkers::Command> commands;
         HighPerformanceTcpWorkers::Command command;
         command.worker_id = owner;
-#if TENT_METRICS_ENABLED
-        command.metrics_operation =
-            operation.opcode == HighPerformanceTcpOpcode::kRead
-                ? Request::READ
-                : Request::WRITE;
-#endif
         command.run =
             [this, owner, operation = std::move(operation)](
                 size_t,
@@ -116,7 +110,6 @@ class Runtime {
                 (void)queued_at;
 #endif
                 client.enqueueOnOwner(owner, std::move(operation));
-                return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
             };
         commands.push_back(std::move(command));
         return workers.tryCommitBatch(commands, nullptr, 0, 0, [] {});
@@ -192,7 +185,7 @@ TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
 
 #if TENT_METRICS_ENABLED
 TEST(HighPerformanceTcpSocketTest,
-     QueueMetricsIncludeCommittedOwnerDispatchWait) {
+     QueueWaitIsRecordedOnlyWhenCommittedOperationStarts) {
     auto& metrics = TentMetrics::instance();
     metrics.shutdown();
     struct MetricsShutdownGuard {
@@ -250,11 +243,12 @@ TEST(HighPerformanceTcpSocketTest,
                     .ok());
 
     const std::string blocked = metrics.getPrometheusMetrics();
-    const std::string queue_depth =
-        "tent_stream_queue_depth{transport=\"hp_tcp\"}";
-    EXPECT_EQ(test::PrometheusSeriesValue(blocked, queue_depth) -
-                  test::PrometheusSeriesValue(before, queue_depth),
-              1);
+    const std::string queue_count =
+        "tent_stream_queue_wait_us_count{transport=\"hp_tcp\","
+        "operation=\"write\"}";
+    EXPECT_EQ(test::PrometheusSeriesValue(blocked, queue_count) -
+                  test::PrometheusSeriesValue(before, queue_count),
+              0);
     std::this_thread::sleep_for(100ms);
     release_blocker.store(true, std::memory_order_release);
 
@@ -263,27 +257,9 @@ TEST(HighPerformanceTcpSocketTest,
     EXPECT_TRUE(SocketOrderedEqual(remote, source));
     const std::string after = metrics.getPrometheusMetrics();
 
-    EXPECT_EQ(test::PrometheusSeriesValue(after, queue_depth) -
-                  test::PrometheusSeriesValue(before, queue_depth),
-              0);
-    const std::string queued =
-        "tent_stream_events_total{transport=\"hp_tcp\",operation=\"write\","
-        "event=\"queued\"}";
-    const std::string attempt_started =
-        "tent_stream_events_total{transport=\"hp_tcp\",operation=\"write\","
-        "event=\"attempt_started\"}";
-    const std::string queue_count =
-        "tent_stream_queue_wait_us_count{transport=\"hp_tcp\","
-        "operation=\"write\"}";
     const std::string queue_sum =
         "tent_stream_queue_wait_us_sum{transport=\"hp_tcp\","
         "operation=\"write\"}";
-    EXPECT_EQ(test::PrometheusSeriesValue(after, queued) -
-                  test::PrometheusSeriesValue(before, queued),
-              1);
-    EXPECT_EQ(test::PrometheusSeriesValue(after, attempt_started) -
-                  test::PrometheusSeriesValue(before, attempt_started),
-              1);
     EXPECT_EQ(test::PrometheusSeriesValue(after, queue_count) -
                   test::PrometheusSeriesValue(before, queue_count),
               1);
@@ -499,11 +475,7 @@ TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
         (void)queued_at;
 #endif
         client.enqueueOnOwner(0, std::move(operation));
-        return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
     };
-#if TENT_METRICS_ENABLED
-    command.metrics_operation = Request::READ;
-#endif
     commands.push_back(std::move(command));
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
@@ -676,11 +648,7 @@ TEST(HighPerformanceTcpSocketTest, ClientBindsConfiguredSourceAddress) {
         (void)queued_at;
 #endif
         client.enqueueOnOwner(0, std::move(operation));
-        return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
     };
-#if TENT_METRICS_ENABLED
-    command.metrics_operation = Request::READ;
-#endif
     commands.push_back(std::move(command));
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
@@ -724,11 +692,7 @@ TEST(HighPerformanceTcpSocketTest,
         (void)queued_at;
 #endif
         client.enqueueOnOwner(0, std::move(operation));
-        return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
     };
-#if TENT_METRICS_ENABLED
-    command.metrics_operation = Request::WRITE;
-#endif
     commands.push_back(std::move(command));
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());

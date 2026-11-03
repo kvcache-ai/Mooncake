@@ -16,12 +16,10 @@ namespace mooncake::tent {
 
 struct TcpSocketObservation {
     uint32_t total_retransmissions{0};
-    uint32_t rtt_us{0};
-    uint32_t congestion_window_segments{0};
 };
 
-inline bool ReadTcpSocketObservation(asio::ip::tcp::socket& socket,
-                                     TcpSocketObservation* observation) {
+inline bool ReadTcpSocketObservation(
+    asio::ip::tcp::socket& socket, TcpSocketObservation* observation) noexcept {
 #if defined(__linux__)
     if (observation == nullptr || !socket.is_open()) return false;
     tcp_info info{};
@@ -31,8 +29,6 @@ inline bool ReadTcpSocketObservation(asio::ip::tcp::socket& socket,
         return false;
     }
     observation->total_retransmissions = info.tcpi_total_retrans;
-    observation->rtt_us = info.tcpi_rtt;
-    observation->congestion_window_segments = info.tcpi_snd_cwnd;
     return true;
 #else
     (void)socket;

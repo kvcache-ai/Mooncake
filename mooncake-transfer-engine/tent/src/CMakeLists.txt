@@ -131,8 +131,7 @@ if(USE_FABRIC
     # USE_EFA/USE_CXI wheel builds may provision libfabric headers only (the
     # classic engine dlopens the library at runtime). With no linkable library,
     # build TENT without its fabric transport instead of failing the configure.
-    message(
-      WARNING "libfabric library not found; TENT fabric transport disabled")
+    message(WARNING "libfabric library not found; TENT fabric transport disabled")
     set(TENT_WITH_FABRIC
         OFF
         CACHE INTERNAL "")
@@ -143,8 +142,7 @@ if(USE_FABRIC
         CACHE INTERNAL "")
     message(STATUS "Fabric (libfabric): Enabled, ${LIBFABRIC_LIBRARY}")
     target_compile_definitions(tent_interface INTERFACE USE_FABRIC)
-    target_include_directories(tent_interface
-                               INTERFACE ${LIBFABRIC_INCLUDE_DIR})
+    target_include_directories(tent_interface INTERFACE ${LIBFABRIC_INCLUDE_DIR})
     target_link_libraries(tent_interface INTERFACE ${LIBFABRIC_LIBRARY})
   endif()
 else()
@@ -179,11 +177,11 @@ if(USE_SUNRISE)
 endif()
 
 add_subdirectory(common)
-add_subdirectory(metrics)
 add_subdirectory(rpc)
 add_subdirectory(metastore)
 add_subdirectory(runtime)
 add_subdirectory(platform)
+add_subdirectory(metrics)
 add_subdirectory(transport)
 if(NOT TARGET pybind11::module)
   find_package(pybind11 QUIET)

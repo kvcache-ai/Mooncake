@@ -15,32 +15,6 @@
 #include "tent/transport/hp_tcp/hp_tcp_socket_observability.h"
 
 namespace mooncake::tent {
-#if TENT_METRICS_ENABLED
-namespace {
-TentMetrics::ProtocolErrorKind protocolErrorKind(
-    HighPerformanceTcpFrameError error) {
-    switch (error) {
-        case HighPerformanceTcpFrameError::kInvalidSize:
-            return TentMetrics::ProtocolErrorKind::InvalidSize;
-        case HighPerformanceTcpFrameError::kBadMagic:
-            return TentMetrics::ProtocolErrorKind::BadMagic;
-        case HighPerformanceTcpFrameError::kBadVersion:
-            return TentMetrics::ProtocolErrorKind::BadVersion;
-        case HighPerformanceTcpFrameError::kInvalidReserved:
-            return TentMetrics::ProtocolErrorKind::InvalidReserved;
-        case HighPerformanceTcpFrameError::kBadOpcode:
-            return TentMetrics::ProtocolErrorKind::BadOpcode;
-        case HighPerformanceTcpFrameError::kBadLength:
-            return TentMetrics::ProtocolErrorKind::BadLength;
-        case HighPerformanceTcpFrameError::kInvalidStatus:
-            return TentMetrics::ProtocolErrorKind::InvalidStatus;
-        case HighPerformanceTcpFrameError::kNone:
-            return TentMetrics::ProtocolErrorKind::InvalidReserved;
-    }
-    return TentMetrics::ProtocolErrorKind::InvalidReserved;
-}
-}  // namespace
-#endif
 
 class HighPerformanceTcpServer::Session
     : public std::enable_shared_from_this<HighPerformanceTcpServer::Session> {
@@ -139,15 +113,13 @@ class HighPerformanceTcpServer::Session
     void handleHeader() {
         HighPerformanceTcpStatus wire_error =
             HighPerformanceTcpStatus::kInternalError;
-        HighPerformanceTcpFrameError frame_error =
-            HighPerformanceTcpFrameError::kNone;
         const Status decoded = DecodeHighPerformanceTcpRequest(
             request_bytes_.data(), request_bytes_.size(), &request_,
-            &wire_error, &frame_error);
+            &wire_error);
         if (!decoded.ok()) {
 #if TENT_METRICS_ENABLED
             TentMetrics::instance().recordProtocolError(
-                TransportType::HP_TCP, protocolErrorKind(frame_error));
+                TransportType::HP_TCP, TentMetrics::ProtocolErrorKind::Frame);
 #endif
             request_.request_id = 0;
             sendResponse(wire_error, 0, true);
@@ -156,8 +128,7 @@ class HighPerformanceTcpServer::Session
         if (request_.length > config_.max_transfer_bytes) {
 #if TENT_METRICS_ENABLED
             TentMetrics::instance().recordProtocolError(
-                TransportType::HP_TCP,
-                TentMetrics::ProtocolErrorKind::BadLength);
+                TransportType::HP_TCP, TentMetrics::ProtocolErrorKind::Frame);
 #endif
             sendResponse(HighPerformanceTcpStatus::kBadLength, 0, true);
             return;
@@ -386,8 +357,7 @@ class HighPerformanceTcpServer::Session
         last_total_retransmissions_ = observation.total_retransmissions;
         TentMetrics::instance().recordTcpSocketSample(
             TransportType::HP_TCP, TentMetrics::StreamConnectionRole::Server,
-            retransmit_delta, observation.rtt_us,
-            observation.congestion_window_segments);
+            retransmit_delta);
     }
 #endif
 
