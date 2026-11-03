@@ -98,7 +98,14 @@ class MockMetadataStore : public MetadataStore {
     }
 
     // Test helper methods
-    void Clear() { metadata_map_.clear(); }
+    void Clear() {
+        metadata_map_.clear();
+        weight_metadata_.clear();
+        weight_metadata_tombstones_.clear();
+        weight_leases_.clear();
+        weight_lease_tombstones_.clear();
+        weight_operations_.clear();
+    }
 
     size_t Size() const { return GetKeyCount(); }
 
@@ -106,9 +113,106 @@ class MockMetadataStore : public MetadataStore {
         return Exists("default", key);
     }
 
+    bool PutWeightMetadata(const WeightRevisionMetadata& metadata) override {
+        weight_metadata_[metadata.identity] = metadata;
+        return true;
+    }
+
+    bool PutWeightMetadataAndOperation(
+        const WeightRevisionMetadata& metadata,
+        const std::optional<WeightResidencyOperation>& operation) override {
+        weight_metadata_[metadata.identity] = metadata;
+        if (operation.has_value()) {
+            weight_operations_[operation->operation_id] = *operation;
+        }
+        return true;
+    }
+
+    std::optional<WeightRevisionMetadata> GetWeightMetadata(
+        const WeightRevisionIdentity& identity) const override {
+        const auto it = weight_metadata_.find(identity);
+        return it == weight_metadata_.end()
+                   ? std::nullopt
+                   : std::optional<WeightRevisionMetadata>(it->second);
+    }
+
+    std::optional<uint64_t> GetWeightMetadataTombstoneGeneration(
+        const WeightRevisionIdentity& identity) const override {
+        const auto it = weight_metadata_tombstones_.find(identity);
+        return it == weight_metadata_tombstones_.end()
+                   ? std::nullopt
+                   : std::optional<uint64_t>(it->second);
+    }
+
+    bool RemoveWeightMetadata(const WeightRevisionIdentity& identity,
+                              uint64_t metadata_generation) override {
+        weight_metadata_.erase(identity);
+        weight_metadata_tombstones_[identity] = metadata_generation;
+        return true;
+    }
+
+    bool PutWeightLease(const WeightRevisionLease& lease) override {
+        weight_leases_[lease.lease_id] = lease;
+        return true;
+    }
+
+    std::optional<WeightRevisionLease> GetWeightLease(
+        uint64_t lease_id) const override {
+        const auto it = weight_leases_.find(lease_id);
+        return it == weight_leases_.end()
+                   ? std::nullopt
+                   : std::optional<WeightRevisionLease>(it->second);
+    }
+
+    std::optional<WeightRevisionLease> GetWeightLeaseTombstone(
+        uint64_t lease_id) const override {
+        const auto it = weight_lease_tombstones_.find(lease_id);
+        return it == weight_lease_tombstones_.end()
+                   ? std::nullopt
+                   : std::optional<WeightRevisionLease>(it->second);
+    }
+
+    bool RemoveWeightLease(uint64_t lease_id,
+                           const WeightRevisionIdentity& identity,
+                           uint64_t fenced_metadata_generation) override {
+        auto it = weight_leases_.find(lease_id);
+        WeightRevisionLease tombstone{
+            .lease_id = lease_id,
+            .identity = identity,
+            .holder = {},
+            .expires_at_ms = 0,
+            .fenced_metadata_generation = fenced_metadata_generation,
+        };
+        if (it != weight_leases_.end()) {
+            tombstone = it->second;
+            weight_leases_.erase(it);
+        }
+        weight_lease_tombstones_[lease_id] = std::move(tombstone);
+        return true;
+    }
+
+    bool PutWeightOperation(
+        const WeightResidencyOperation& operation) override {
+        weight_operations_[operation.operation_id] = operation;
+        return true;
+    }
+
+    std::optional<WeightResidencyOperation> GetWeightOperation(
+        uint64_t operation_id) const override {
+        const auto it = weight_operations_.find(operation_id);
+        return it == weight_operations_.end()
+                   ? std::nullopt
+                   : std::optional<WeightResidencyOperation>(it->second);
+    }
+
    private:
     std::map<std::string, std::map<std::string, StandbyObjectMetadata>>
         metadata_map_;
+    std::map<WeightRevisionIdentity, WeightRevisionMetadata> weight_metadata_;
+    std::map<WeightRevisionIdentity, uint64_t> weight_metadata_tombstones_;
+    std::map<uint64_t, WeightRevisionLease> weight_leases_;
+    std::map<uint64_t, WeightRevisionLease> weight_lease_tombstones_;
+    std::map<uint64_t, WeightResidencyOperation> weight_operations_;
 };
 
 }  // namespace mooncake::test

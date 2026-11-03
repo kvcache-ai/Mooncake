@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <atomic>
 #include <chrono>
@@ -18,7 +19,7 @@
 #include <unistd.h>
 
 #include "allocation_strategy.h"
-#include "tenant_quota_policy_store.h"
+#include "tenant/quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -135,6 +136,37 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         return builder.build();
     }
 
+    // Config for the tenant-scoped eviction watermark. Two settings here are
+    // load-bearing rather than incidental:
+    //   default_kv_lease_ttl(0) -- EvictNamespaceMemory skips any object
+    //     whose lease is still live, so with the 10 s default the pass under
+    //     test would be a no-op and the assertions would pass for the wrong
+    //     reason.
+    //   eviction_high_watermark_ratio(1.0) -- keeps the POOL-wide evictor out
+    //     of the way. The whole point of the tenant watermark is that it fires
+    //     while the pool is nowhere near its own, so the test must not let the
+    //     pool-level path account for the bytes freed.
+    // A nullopt ratio leaves the builder default in place, which is how the
+    // "on out of the box" behaviour is exercised.
+    MasterServiceConfig MakeTenantWatermarkConfig(
+        const std::map<TenantId, uint64_t>& tenant_quotas,
+        std::optional<double> tenant_high_watermark_ratio,
+        double eviction_ratio = 0.05) {
+        auto builder =
+            MasterServiceConfig::builder()
+                .set_enable_multi_tenants(true)
+                .set_tenant_quota_connector_type("file")
+                .set_tenant_quota_connector_uri(WritePolicyFile(tenant_quotas))
+                .set_default_kv_lease_ttl(0)
+                .set_eviction_ratio(eviction_ratio)
+                .set_eviction_high_watermark_ratio(1.0);
+        if (tenant_high_watermark_ratio.has_value()) {
+            builder.set_tenant_eviction_high_watermark_ratio(
+                *tenant_high_watermark_ratio);
+        }
+        return builder.build();
+    }
+
     UUID MountSegment(MasterService& service, size_t size = 4096,
                       std::string name = "quota_segment") {
         Segment segment;
@@ -186,25 +218,35 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         ASSERT_TRUE(end.has_value()) << toString(end.error());
     }
 
+    // MasterService befriends this fixture, but TEST_F bodies are a derived
+    // class and friendship does not inherit -- so private access has to go
+    // through a fixture method, as it does for the helpers around this one.
+    void RunTenantEvictionPass(MasterService& service) {
+        MasterServiceTestPeer(service).RunTenantEvictForTesting();
+    }
+
     TenantQuotaSnapshot Snapshot(MasterService& service,
                                  const TenantId& tenant_id) {
-        auto snapshot = service.GetTenantQuotaSnapshot(tenant_id);
+        auto snapshot = service.tenant_quota_policy()->GetSnapshot(tenant_id);
         EXPECT_TRUE(snapshot.has_value());
         return *snapshot;
     }
 
     void ReloadTenantQuotaPolicyFromStore(MasterService& service) {
-        service.LoadTenantQuotaPoliciesFromStoreOrThrow();
-        service.RebuildTenantQuotaUsageFromMetadata();
+        MasterServiceTestPeer(service)
+            .LoadTenantQuotaPoliciesFromStoreOrThrow();
+        service.tenant_quota_policy()->OnRestored();
     }
 
     void ReplaceTenantQuotaPolicyStore(
         MasterService& service, std::unique_ptr<TenantQuotaPolicyStore> store) {
-        service.tenant_quota_policy_store_ = std::move(store);
+        MasterServiceTestPeer::TenantQuotaPolicyStore(service) =
+            std::move(store);
     }
 
     int64_t LocalDiskUsedBytes(MasterService& service, const UUID& client_id) {
-        auto usage = service.local_ssd_manager_.GetUsage(client_id);
+        auto usage =
+            MasterServiceTestPeer::LocalSsdManager(service).GetUsage(client_id);
         EXPECT_TRUE(usage.has_value());
         if (!usage) {
             return -1;
@@ -215,53 +257,45 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 #ifdef USE_NOF
     void ReplaceAllocationStrategy(
         MasterService& service, std::shared_ptr<AllocationStrategy> strategy) {
-        service.allocation_strategy_ = std::move(strategy);
+        MasterServiceTestPeer::AllocationStrategy(service) =
+            std::move(strategy);
     }
 #endif
 
+    // Asks the tenant's policy for `bytes` of growth on a probe key, the way
+    // a write asks before it allocates. The probe holds no object, so the
+    // growth is given back as the key is let go.
     tl::expected<void, ErrorCode> ChargeTenantQuotaForTest(
         MasterService& service, const TenantId& tenant_id, uint64_t bytes) {
-        return service.ChargeTenantQuota(
-            service.tenant_quota_table_.GetOrCreateTenantHandle(tenant_id),
-            bytes);
-    }
-
-    TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
-        MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
-        auto& tenant_state =
-            service.GetOrCreateTenantState(shard.get(), tenant_id);
-        return service.GetBoundTenantQuotaHandle(tenant_state);
-    }
-
-    tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
-        MasterService& service, TenantQuotaHandle account, uint64_t bytes) {
-        return service.ChargeTenantQuota(account, bytes);
-    }
-
-    void ReleaseBoundTenantQuotaForTest(MasterService& service,
-                                        TenantQuotaHandle account,
-                                        uint64_t bytes) {
-        service.ReleaseTenantQuota(account, bytes);
+        metadata::Namespace& ns =
+            MasterServiceTestPeer(service).GetOrCreateNamespace(tenant_id);
+        const auto hold = ns.objects.WriteKey("quota-probe");
+        return ns.Grow(hold, bytes);
     }
 
     void DiscardExpiredProcessingForTest(MasterService& service,
-                                         const TenantId& tenant_id,
-                                         const std::string& key) {
-        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
-        service.DiscardExpiredProcessingReplicas(
-            shard, std::chrono::system_clock::time_point::max());
+                                         const TenantId& tenant_id) {
+        MasterServiceTestPeer(service).DiscardExpiredProcessingReplicas(
+            tenant_id, std::chrono::system_clock::time_point::max());
     }
 
     void FinalizeExpiredProcessingForTest(MasterService& service,
                                           const TenantId& tenant_id,
                                           const std::string& key) {
+        route::ObjectRef object;
+        {
+            MasterServiceTestPeer::MetadataAccessorRW accessor(
+                &service,
+                MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+            ASSERT_TRUE(accessor.IsPublished());
+            object = accessor.GetRef();
+        }
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
-        service.FinalizeExpiredProcessingReplicasAfterDurable(
-            entry, std::chrono::system_clock::now());
+        MasterServiceTestPeer(service)
+            .FinalizeExpiredProcessingReplicasAfterDurable(
+                object, entry, std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
@@ -269,8 +303,9 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
                                               const std::string& key) {
         std::vector<ReplicaID> removed_ids;
         {
-            MasterService::MetadataAccessorRW accessor(
-                &service, MasterService::ObjectIdentity{tenant_id, key});
+            MasterServiceTestPeer::MetadataAccessorRW accessor(
+                &service,
+                MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
             ASSERT_TRUE(accessor.Exists());
             accessor.Get().VisitReplicas(
                 &Replica::fn_is_memory_replica,
@@ -284,8 +319,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
-        service.FinalizeRemovedReplicasAfterDurable(
-            entry, removed_ids, MasterService::QuotaEraseMode::kFull);
+        MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
+            entry, removed_ids);
     }
 
     void AddCompletedDiskReplica(MasterService& service, const UUID& client_id,
@@ -311,18 +346,20 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
 
     std::unique_lock<std::shared_mutex> LockSnapshotForTest(
         MasterService& service) {
-        return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
+        return std::unique_lock<std::shared_mutex>(
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
     std::unique_lock<std::mutex> LockTenantQuotaRecomputeForTest(
         MasterService& service) {
         return std::unique_lock<std::mutex>(
-            service.tenant_quota_recompute_mutex_);
+            MasterServiceTestPeer::TenantQuotaRecomputeMutex(service));
     }
 
     std::unique_lock<std::mutex> LockTenantQuotaPolicyForTest(
         MasterService& service) {
-        return std::unique_lock<std::mutex>(service.tenant_quota_policy_mutex_);
+        return std::unique_lock<std::mutex>(
+            MasterServiceTestPeer::TenantQuotaPolicyMutex(service));
     }
 
     ErrorCode MountSegmentWithoutQuotaRecomputeForTest(MasterService& service,
@@ -336,20 +373,21 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         segment.te_endpoint = segment.name;
         next_segment_offset_ += size + 4096;
 
-        auto segment_access = service.segment_manager_.getSegmentAccess();
-        return segment_access.MountSegment(segment, generate_uuid());
-    }
-
-    void RecomputeTenantEffectiveQuotasForTest(MasterService& service) {
-        service.RecomputeTenantEffectiveQuotas();
+        auto segment_access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        return segment_access.MountSegment(
+            segment, generate_uuid(),
+            std::make_shared<ClientLivenessRecord>(
+                ClientLivenessRecord::Clock::now()));
     }
 
     bool WaitForTenantQuotaPolicyMutexContention(MasterService& service) {
         for (int i = 0; i < 500; ++i) {
-            if (!service.tenant_quota_policy_mutex_.try_lock()) {
+            if (!MasterServiceTestPeer::TenantQuotaPolicyMutex(service)
+                     .try_lock()) {
                 return true;
             }
-            service.tenant_quota_policy_mutex_.unlock();
+            MasterServiceTestPeer::TenantQuotaPolicyMutex(service).unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         return false;
@@ -383,8 +421,8 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("shared-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-a")).has_value());
+    // Single-tenant mode has no quota policy at all.
+    EXPECT_EQ(service.tenant_quota_policy(), nullptr);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -396,6 +434,14 @@ TEST_F(MasterServiceTenantQuotaTest,
                                     10, MemoryConfig());
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(missing.error(), ErrorCode::TENANT_NOT_REGISTERED);
+    auto missing_upsert = service.UpsertStart(
+        client_id, "missing", TenantId("tenant-b"), 10, MemoryConfig());
+    ASSERT_FALSE(missing_upsert.has_value());
+    EXPECT_EQ(missing_upsert.error(), ErrorCode::TENANT_NOT_REGISTERED);
+    // A refused write leaves no namespace behind, which would stay for good.
+    EXPECT_EQ(
+        MasterServiceTestPeer::Namespaces(service).Lookup(TenantId("tenant-b")),
+        nullptr);
 
     auto implicit_default = service.PutStart(
         client_id, "default-key", TenantId::Default(), 10, MemoryConfig());
@@ -406,47 +452,13 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_FALSE(TenantId(control_tenant).IsValid());
 
     auto register_default =
-        service.UpsertTenantQuotaPolicy(TenantId::Default(), 100);
+        service.tenant_quota_policy()->UpsertPolicy(TenantId::Default(), 100);
     ASSERT_TRUE(register_default.has_value())
         << toString(register_default.error());
     PutComplete(service, client_id, "registered-default", TenantId::Default(),
                 10);
 
     PutComplete(service, client_id, "ok", TenantId("tenant-a"), 10);
-}
-
-TEST_F(MasterServiceTenantQuotaTest,
-       SameTenantStatesAcrossMetadataShardsShareBoundHandle) {
-    const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
-    MountSegment(service);
-
-    auto* first_handle =
-        GetOrCreateTenantStateHandleForTest(service, 0, tenant_id);
-    auto* second_handle =
-        GetOrCreateTenantStateHandleForTest(service, 1, tenant_id);
-
-    ASSERT_NE(first_handle, nullptr);
-    EXPECT_EQ(first_handle, second_handle);
-
-    auto charge = ChargeBoundTenantQuotaForTest(service, first_handle, 128);
-    ASSERT_TRUE(charge.has_value()) << toString(charge.error());
-    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
-
-    ReleaseBoundTenantQuotaForTest(service, second_handle, 128);
-    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
-}
-
-TEST_F(MasterServiceTenantQuotaTest,
-       ChargeRejectsMissingHandleWhenQuotaIsEnabled) {
-    const TenantId tenant_id("tenant-a");
-    MasterService service(MakeConfig({{tenant_id, 1000}}));
-    MountSegment(service);
-
-    auto charge = ChargeBoundTenantQuotaForTest(service, nullptr, 1);
-    ASSERT_FALSE(charge.has_value());
-    EXPECT_EQ(charge.error(), ErrorCode::INTERNAL_ERROR);
-    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -517,13 +529,15 @@ TEST_F(MasterServiceTenantQuotaTest,
     }
     ReloadTenantQuotaPolicyFromStore(service);
 
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-b")).has_value());
+    EXPECT_FALSE(service.tenant_quota_policy()
+                     ->GetSnapshot(TenantId("tenant-b"))
+                     .has_value());
 
     EXPECT_TRUE(service.Remove("cold", TenantId("tenant-b"), /*force=*/true)
                     .has_value());
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-b")).has_value());
+    EXPECT_FALSE(service.tenant_quota_policy()
+                     ->GetSnapshot(TenantId("tenant-b"))
+                     .has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -663,8 +677,9 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_FALSE(over.has_value());
     EXPECT_EQ(over.error(), ErrorCode::TENANT_QUOTA_EXCEEDED);
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 80);
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-b")).has_value());
+    EXPECT_FALSE(service.tenant_quota_policy()
+                     ->GetSnapshot(TenantId("tenant-b"))
+                     .has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest, PutRevokeRefundsStartCharge) {
@@ -762,7 +777,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     AddCompletedDiskReplica(service, client_id, "key", tenant_id, 100);
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
 
-    DiscardExpiredProcessingForTest(service, tenant_id, "key");
+    DiscardExpiredProcessingForTest(service, tenant_id);
 
     ExpectDiskOnlyObjectAndChargedBytes(service, tenant_id, "key", 0);
 }
@@ -956,13 +971,15 @@ TEST_F(MasterServiceTenantQuotaTest, DeletePolicyRequiresTenantWithoutObjects) {
     PutComplete(service, client_id, "key", TenantId("tenant-a"), 100);
 
     auto delete_non_empty =
-        service.DeleteTenantQuotaPolicy(TenantId("tenant-a"));
+        service.tenant_quota_policy()->DeletePolicy(TenantId("tenant-a"));
     ASSERT_FALSE(delete_non_empty.has_value());
     EXPECT_EQ(delete_non_empty.error(), ErrorCode::TENANT_NOT_EMPTY);
 
-    auto upsert = service.UpsertTenantQuotaPolicy(TenantId("tenant-b"), 100);
+    auto upsert =
+        service.tenant_quota_policy()->UpsertPolicy(TenantId("tenant-b"), 100);
     ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
-    auto delete_empty = service.DeleteTenantQuotaPolicy(TenantId("tenant-b"));
+    auto delete_empty =
+        service.tenant_quota_policy()->DeletePolicy(TenantId("tenant-b"));
     ASSERT_TRUE(delete_empty.has_value()) << toString(delete_empty.error());
     EXPECT_FALSE(delete_empty.value().has_value());
 }
@@ -985,7 +1002,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     std::optional<DeleteResult> delete_result;
     std::thread delete_thread([&] {
         delete_result.emplace(
-            service.DeleteTenantQuotaPolicy(TenantId("tenant-a")));
+            service.tenant_quota_policy()->DeletePolicy(TenantId("tenant-a")));
     });
 
     if (save_started.wait_for(std::chrono::seconds(5)) !=
@@ -1010,8 +1027,9 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(delete_result.has_value());
     ASSERT_TRUE(delete_result->has_value()) << toString(delete_result->error());
     EXPECT_FALSE(delete_result->value().has_value());
-    EXPECT_FALSE(
-        service.GetTenantQuotaSnapshot(TenantId("tenant-a")).has_value());
+    EXPECT_FALSE(service.tenant_quota_policy()
+                     ->GetSnapshot(TenantId("tenant-a"))
+                     .has_value());
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -1048,7 +1066,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     std::optional<DeleteResult> delete_result;
     std::thread delete_thread([&] {
         delete_result.emplace(
-            service.DeleteTenantQuotaPolicy(TenantId("tenant-a")));
+            service.tenant_quota_policy()->DeletePolicy(TenantId("tenant-a")));
     });
 
     const auto premature_save =
@@ -1075,7 +1093,7 @@ TEST_F(MasterServiceTenantQuotaTest,
 
 #ifdef USE_NOF
 TEST_F(MasterServiceTenantQuotaTest,
-       DeletePolicySeesZeroChargePutStartMetadataCreateWithoutPolicyLock) {
+       DeletePolicyRefusesWhileZeroChargePutStartAllocates) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
     UUID client_id = MountNoFSegment(service);
 
@@ -1105,29 +1123,20 @@ TEST_F(MasterServiceTenantQuotaTest,
     }
     policy_lock.unlock();
 
-    using DeleteResult =
-        tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>;
-    std::promise<DeleteResult> delete_promise;
-    auto delete_future = delete_promise.get_future();
-    std::thread delete_thread([&] {
-        delete_promise.set_value(
-            service.DeleteTenantQuotaPolicy(TenantId("tenant-a")));
-    });
-
-    EXPECT_EQ(delete_future.wait_for(std::chrono::milliseconds(200)),
-              std::future_status::timeout)
-        << "tenant deletion passed the metadata scan while zero-charge "
-           "PutStart still held the target metadata shard";
+    // The write charges nothing and has not published its object, yet it
+    // keeps the tenant from being deleted.
+    auto delete_result =
+        service.tenant_quota_policy()->DeletePolicy(TenantId("tenant-a"));
 
     blocking_strategy_ptr->AllowAllocation();
     put_thread.join();
-    delete_thread.join();
 
-    ASSERT_TRUE(put_result.has_value());
-    ASSERT_TRUE(put_result->has_value()) << toString(put_result->error());
-    auto delete_result = delete_future.get();
     ASSERT_FALSE(delete_result.has_value());
     EXPECT_EQ(delete_result.error(), ErrorCode::TENANT_NOT_EMPTY);
+    ASSERT_TRUE(put_result.has_value());
+    ASSERT_TRUE(put_result->has_value()) << toString(put_result->error());
+    EXPECT_TRUE(service.tenant_quota_policy()->IsTenantRegistered(
+        TenantId("tenant-a")));
 
     auto snapshot = Snapshot(service, TenantId("tenant-a"));
     EXPECT_EQ(snapshot.charged_bytes, 0);
@@ -1158,7 +1167,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     auto recompute_started_future = recompute_started.get_future();
     auto recompute = std::async(std::launch::async, [&] {
         recompute_started.set_value();
-        RecomputeTenantEffectiveQuotasForTest(service);
+        service.tenant_quota_policy()->OnCapacityChanged();
     });
     recompute_started_future.wait();
 
@@ -1214,6 +1223,126 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("orphan-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
+}
+
+// --- Tenant-scoped eviction watermark -------------------------------------
+//
+// This pass is the only thing that makes room for a tenant. A tenant whose
+// effective quota sits at or below the pool-wide eviction_high_watermark_ratio
+// reaches its own ceiling before the pool crosses the pool-wide watermark:
+// EvictionThreadFunc gates on a pool-global used_ratio (strictly greater), and
+// the quota path cannot arm it either -- need_mem_eviction_ is only set next to
+// inc_put_start_alloc_failures(), and a quota rejection returns before
+// allocation is attempted. Admission itself does not evict; it rejects with
+// TENANT_QUOTA_EXCEEDED and leaves the headroom to this pass.
+
+TEST_F(MasterServiceTenantQuotaTest, TenantEvictionWatermarkDefaultsToOn) {
+    const TenantId tenant("tenant-a");
+    // No explicit ratio: the tenant watermark must default to the same 0.90 as
+    // the pool-wide one, so a multi-tenant master gets the evict-to-make-room
+    // contract without having to opt in.
+    ASSERT_DOUBLE_EQ(DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO,
+                     DEFAULT_EVICTION_HIGH_WATERMARK_RATIO);
+    MasterService service(MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                    /*watermark=*/std::nullopt,
+                                                    /*eviction_ratio=*/0.05));
+    UUID client_id = MountSegment(service, /*size=*/4096);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                    240);
+    }
+    ASSERT_EQ(Snapshot(service, tenant).charged_bytes, 960u);  // 0.96 > 0.90
+
+    RunTenantEvictionPass(service);
+
+    EXPECT_LE(Snapshot(service, tenant).charged_bytes, 850u)
+        << "the pass must run without an explicit watermark setting";
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionWatermarkOfZeroDisablesThePass) {
+    const TenantId tenant("tenant-a");
+    // Watermark 0.0 == the pre-existing behaviour, and remains available as an
+    // opt-out.
+    MasterService service(MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                    /*watermark=*/0.0));
+    UUID client_id = MountSegment(service, /*size=*/4096);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                    240);
+    }
+    ASSERT_EQ(Snapshot(service, tenant).charged_bytes, 960u);
+
+    RunTenantEvictionPass(service);
+
+    EXPECT_EQ(Snapshot(service, tenant).charged_bytes, 960u)
+        << "the pass must not run when the watermark is 0";
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionWatermarkLeavesTenantsBelowItAlone) {
+    const TenantId tenant("tenant-a");
+    MasterService service(MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                    /*watermark=*/0.9));
+    UUID client_id = MountSegment(service, /*size=*/4096);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                    200);
+    }
+    ASSERT_EQ(Snapshot(service, tenant).charged_bytes, 800u);  // 0.80
+
+    RunTenantEvictionPass(service);
+
+    EXPECT_EQ(Snapshot(service, tenant).charged_bytes, 800u);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionWatermarkEvictsDownToTargetRatio) {
+    const TenantId tenant("tenant-a");
+    // watermark 0.9, eviction_ratio 0.05 -> evict down to 0.85 of the quota.
+    MasterService service(MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                    /*watermark=*/0.9,
+                                                    /*eviction_ratio=*/0.05));
+    UUID client_id = MountSegment(service, /*size=*/4096);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                    240);
+    }
+    ASSERT_EQ(Snapshot(service, tenant).charged_bytes, 960u);  // 0.96 > 0.90
+
+    RunTenantEvictionPass(service);
+
+    const uint64_t charged = Snapshot(service, tenant).charged_bytes;
+    EXPECT_LT(charged, 960u) << "tenant was over its watermark and not evicted";
+    EXPECT_LE(charged, 850u) << "must reach (watermark - eviction_ratio)";
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionWatermarkOnlyTouchesTenantsOverIt) {
+    const TenantId hot("tenant-hot");
+    const TenantId cold("tenant-cold");
+    // Sum of requested (2000) is below capacity, so each tenant gets its
+    // literal quota rather than a proportional share.
+    MasterService service(MakeTenantWatermarkConfig({{hot, 1000}, {cold, 1000}},
+                                                    /*watermark=*/0.9));
+    UUID client_id = MountSegment(service, /*size=*/8192);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "hot-" + std::to_string(i), hot, 240);
+        PutComplete(service, client_id, "cold-" + std::to_string(i), cold, 100);
+    }
+    ASSERT_EQ(Snapshot(service, hot).charged_bytes, 960u);   // 0.96
+    ASSERT_EQ(Snapshot(service, cold).charged_bytes, 400u);  // 0.40
+
+    RunTenantEvictionPass(service);
+
+    EXPECT_LE(Snapshot(service, hot).charged_bytes, 850u);
+    EXPECT_EQ(Snapshot(service, cold).charged_bytes, 400u)
+        << "a tenant under its own watermark must not pay for a noisy one";
 }
 
 }  // namespace mooncake::test

@@ -5,10 +5,8 @@
 # consumers that link transfer_engine via hand- written ldflags (Go p2p-store /
 # mooncake-store), which bypass CMake's target_link_libraries propagation.
 set(DEVICE_TRANSPORT_SOURCES p2p_device_transport.cpp)
-if((USE_CUDA OR USE_MUSA) AND NOT USE_CXI)
+if((USE_CUDA OR USE_MUSA OR USE_MACA) AND NOT USE_CXI)
     list(APPEND DEVICE_TRANSPORT_SOURCES ibgda_device_transport.cpp mlx5gda.cpp)
-elseif(USE_MACA)
-    list(APPEND DEVICE_TRANSPORT_SOURCES ibgda_device_transport_maca_stub.cpp)
 endif()
 if(USE_NCCL_DEVICE)
     list(APPEND DEVICE_TRANSPORT_SOURCES nccl_device_transport.cpp)

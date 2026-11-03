@@ -3,6 +3,8 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <type_traits>
+
 #include <elastic/mooncake_ep_elastic_transport.cuh>
 
 #include <elastic/mooncake_ep_elastic_comm.cuh>
@@ -15,26 +17,63 @@
 
 namespace mooncake::elastic {
 
-template <bool kIsScaleupNVLink, bool kDoCPUSync, bool kReuseSlotIndices,
-          int kNumSMs, int kNumNotifyWarps, int kNumDispatchWarps,
-          int kNumRanks, int kNumHiddenBytes, int kNumSFPacks,
-          int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk,
-          int kExpertAlignment, int kNumQPs, int64_t kNumTimeoutCycles,
+template <typename Ops>
+struct DispatchKernelArgs {
+    void* x;
+    sf_pack_t* sf;
+    topk_idx_t* topk_idx;
+    float* topk_weights;
+    topk_idx_t* copied_topk_idx;
+    int* cumulative_local_expert_recv_stats;
+    int* psum_num_recv_tokens_per_scaleup_rank;
+    int* psum_num_recv_tokens_per_expert;
+    int* dst_buffer_slot_idx;
+    int num_tokens;
+    int sf_token_stride;
+    int sf_hidden_stride;
+    typename Ops::Context comm_ctx;
+    void* buffer;
+    void* workspace;
+    void* mapped_host_workspace;
+    int rank_idx;
+};
+
+template <typename Ops, bool kIsScaleupNVLink, bool kDoCPUSync,
+          bool kReuseSlotIndices, int kNumSMs, int kNumNotifyWarps,
+          int kNumDispatchWarps, int kNumRanks, int kNumHiddenBytes,
+          int kNumSFPacks, int kNumMaxTokensPerRank, int kNumExperts,
+          int kNumTopk, int kExpertAlignment, int kNumQPs,
+          int64_t kNumTimeoutCycles,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumDispatchThreads = kNumDispatchWarps * 32,
           int kNumThreads = kNumNotifyThreads + kNumDispatchThreads,
           typename team_t = std::conditional_t<
               kIsScaleupNVLink, transport::ScaleupTeam, transport::WorldTeam>>
-__global__ void __launch_bounds__(kNumThreads, 1)
-    dispatch_impl(void* x, sf_pack_t* sf, topk_idx_t* topk_idx,
-                  float* topk_weights, topk_idx_t* copied_topk_idx,
-                  int* cumulative_local_expert_recv_stats,
-                  int* psum_num_recv_tokens_per_scaleup_rank,
-                  int* psum_num_recv_tokens_per_expert,
-                  int* dst_buffer_slot_idx, const int num_tokens,
-                  const int sf_token_stride, const int sf_hidden_stride,
-                  const device::CommCtx comm_ctx, void* buffer, void* workspace,
-                  void* mapped_host_workspace, const int rank_idx) {
+__device__ __forceinline__ void dispatch_kernel_impl(
+    const DispatchKernelArgs<Ops>& args) {
+    static_assert(std::is_trivially_copyable<DispatchKernelArgs<Ops>>::value,
+                  "DispatchKernelArgs must be trivially copyable");
+
+    void* x = args.x;
+    sf_pack_t* sf = args.sf;
+    topk_idx_t* topk_idx = args.topk_idx;
+    float* topk_weights = args.topk_weights;
+    topk_idx_t* copied_topk_idx = args.copied_topk_idx;
+    int* cumulative_local_expert_recv_stats =
+        args.cumulative_local_expert_recv_stats;
+    int* psum_num_recv_tokens_per_scaleup_rank =
+        args.psum_num_recv_tokens_per_scaleup_rank;
+    int* psum_num_recv_tokens_per_expert = args.psum_num_recv_tokens_per_expert;
+    int* dst_buffer_slot_idx = args.dst_buffer_slot_idx;
+    const int num_tokens = args.num_tokens;
+    const int sf_token_stride = args.sf_token_stride;
+    const int sf_hidden_stride = args.sf_hidden_stride;
+    const typename Ops::Context& comm_ctx = args.comm_ctx;
+    void* buffer = args.buffer;
+    void* workspace = args.workspace;
+    void* mapped_host_workspace = args.mapped_host_workspace;
+    const int rank_idx = args.rank_idx;
+
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0,
                      "Invalid number of experts or ranks");
@@ -71,11 +110,11 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumDispatchWarps,
                           (kNumNotifyWarps > 0)>(
             sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
-    const auto gin = transport::MooncakeGin(comm_ctx, qp_idx, sharing_mode,
-                                            kNumQPs, 0, 0, 0, kNumRanks);
+    const auto gin =
+        Ops(comm_ctx, qp_idx, sharing_mode, kNumQPs, 0, 0, 0, kNumRanks);
 
     // Barrier without TMA store flush, without prologue grid sync
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks, kNumSMs, kNumThreads,
+    comm::gpu_barrier<Ops, kIsScaleupNVLink, 1, kNumRanks, kNumSMs, kNumThreads,
                       kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false,
                       false, true>(gin, workspace_layout, 0, rank_idx, sm_idx,
                                    thread_idx);
@@ -178,9 +217,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 const auto dst_rank_counter =
                     workspace_layout.get_scaleup_rank_count_ptr<false>() +
                     rank_idx;
-                gin.put_value<team_t>(dst_rank_counter,
-                                      static_cast<int64_t>(rank_count[i]), i,
-                                      0);
+                gin.template put_value<team_t>(
+                    dst_rank_counter, static_cast<int64_t>(rank_count[i]), i,
+                    0);
             }
             __syncwarp();
 
@@ -193,7 +232,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                      i += kNumNotifyThreads) {
                     const auto idx = kNumExpertsPerRank * rank_idx +
                                      (i % kNumExpertsPerRank);
-                    gin.put_value<team_t>(
+                    gin.template put_value<team_t>(
                         workspace_layout.get_scaleup_expert_count_ptr<false>() +
                             idx,
                         static_cast<int64_t>(expert_count[i]),
@@ -209,8 +248,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     const auto dst_ptr =
                         workspace_layout.get_scaleup_expert_count_ptr<false>() +
                         kNumExpertsPerRank * rank_idx;
-                    gin.put<team_t>(dst_ptr, src_ptr,
-                                    kNumExpertsPerRank * sizeof(int64_t), i);
+                    gin.template put<team_t>(
+                        dst_ptr, src_ptr, kNumExpertsPerRank * sizeof(int64_t),
+                        i);
                 }
             }
 
@@ -461,7 +501,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid top-k selection");
             const auto dst_ptr =
                 stored_dst_slot_idx >= 0
-                    ? gin.get_sym_ptr<team_t>(
+                    ? gin.template get_sym_ptr<team_t>(
                           recv_buffer.get_token_buffer(stored_dst_slot_idx)
                               .get_base_ptr(),
                           stored_dst_rank_idx)
@@ -480,7 +520,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
                 // NOTES: we should skip the NVLink accessible ranks
                 if (stored_dst_slot_idx >= 0 and dst_ptr == nullptr) {
-                    gin.put<team_t>(
+                    gin.template put<team_t>(
                         recv_buffer.get_token_buffer(stored_dst_slot_idx)
                             .get_base_ptr(),
                         send_buffer_ptr, tma_buffer.get_num_bytes<false>(),
@@ -492,7 +532,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     }
 
     // Barrier to ensure data arrival
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks, kNumSMs, kNumThreads,
+    comm::gpu_barrier<Ops, kIsScaleupNVLink, 1, kNumRanks, kNumSMs, kNumThreads,
                       kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true,
                       true, false>(gin, workspace_layout, 0, rank_idx, sm_idx,
                                    thread_idx);
@@ -507,6 +547,22 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
     if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+}
+
+template <typename Ops, bool kIsScaleupNVLink, bool kDoCPUSync,
+          bool kReuseSlotIndices, int kNumSMs, int kNumNotifyWarps,
+          int kNumDispatchWarps, int kNumRanks, int kNumHiddenBytes,
+          int kNumSFPacks, int kNumMaxTokensPerRank, int kNumExperts,
+          int kNumTopk, int kExpertAlignment, int kNumQPs,
+          int64_t kNumTimeoutCycles,
+          int kNumThreads = (kNumNotifyWarps + kNumDispatchWarps) * 32>
+__global__ void __launch_bounds__(kNumThreads, 1)
+    dispatch(const DispatchKernelArgs<Ops> args) {
+    dispatch_kernel_impl<Ops, kIsScaleupNVLink, kDoCPUSync, kReuseSlotIndices,
+                         kNumSMs, kNumNotifyWarps, kNumDispatchWarps, kNumRanks,
+                         kNumHiddenBytes, kNumSFPacks, kNumMaxTokensPerRank,
+                         kNumExperts, kNumTopk, kExpertAlignment, kNumQPs,
+                         kNumTimeoutCycles>(args);
 }
 
 }  // namespace mooncake::elastic

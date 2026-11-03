@@ -2,11 +2,23 @@
 name = "transfer_engine_rust"
 version = "0.1.0"
 edition = "2021"
+description = "High-performance Rust bindings for the Mooncake Transfer Engine"
+license = "Apache-2.0"
+
+[lib]
+name = "transfer_engine_rust"
+crate-type = ["rlib"]
+
+[[example]]
+name = "transfer_engine_bench"
+path = "examples/transfer_engine_bench.rs"
 
 [dependencies]
+thiserror = "2.0"
+
+[dev-dependencies]
 anyhow = "1.0.79"
-libc = "0.2"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "~4.4.18", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3.20"
 hostname = "0.3"
@@ -14,4 +26,3 @@ dns-lookup = "1.0"
 
 [build-dependencies]
 bindgen = "0.70"
-cmake = "0.1.50"

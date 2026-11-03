@@ -98,7 +98,9 @@ class RocmPlatformTest : public ::testing::Test {
     std::shared_ptr<RocmPlatform> platform_;
 };
 
-TEST_F(RocmPlatformTest, TypeString) { EXPECT_EQ(platform_->type(), "rocm"); }
+TEST_F(RocmPlatformTest, TypeString) {
+    EXPECT_EQ(platform_->type(), kAmdGpuLocationType);
+}
 
 TEST_F(RocmPlatformTest, ProbeDiscoversMems) {
     std::vector<Topology::NicEntry> nics;
@@ -110,7 +112,7 @@ TEST_F(RocmPlatformTest, ProbeDiscoversMems) {
     for (const auto& m : mems) {
         if (m.type == Topology::MEM_ROCM) {
             found_rocm = true;
-            EXPECT_EQ(m.name.substr(0, 5), "rocm:");
+            EXPECT_EQ(m.name.substr(0, 4), "hip:");
         }
     }
     EXPECT_TRUE(found_rocm) << "probe() found no MEM_ROCM entries";
@@ -118,7 +120,7 @@ TEST_F(RocmPlatformTest, ProbeDiscoversMems) {
 
 TEST_F(RocmPlatformTest, AllocateAndFreeDeviceMemory) {
     MemoryOptions opts;
-    opts.location = "rocm:0";
+    opts.location = "hip:0";
     void* ptr = nullptr;
     constexpr size_t kSize = 1024 * 1024;  // 1 MiB
 
@@ -150,7 +152,7 @@ TEST_F(RocmPlatformTest, AllocateAndFreeCpuMemory) {
 
 TEST_F(RocmPlatformTest, CopyDeviceToDevice) {
     MemoryOptions opts;
-    opts.location = "rocm:0";
+    opts.location = "hip:0";
     constexpr size_t kSize = 256;
     void *src = nullptr, *dst = nullptr;
 
@@ -177,7 +179,7 @@ TEST_F(RocmPlatformTest, CopyDeviceToDevice) {
 
 TEST_F(RocmPlatformTest, CopyHostToDevice) {
     MemoryOptions dev_opts;
-    dev_opts.location = "rocm:0";
+    dev_opts.location = "hip:0";
     MemoryOptions cpu_opts;
     cpu_opts.location = "cpu:0";
     constexpr size_t kSize = 512;
@@ -204,14 +206,28 @@ TEST_F(RocmPlatformTest, CopyHostToDevice) {
 
 TEST_F(RocmPlatformTest, GetLocationDeviceMemory) {
     MemoryOptions opts;
-    opts.location = "rocm:0";
+    opts.location = "hip:0";
     constexpr size_t kSize = 4096;
     void* ptr = nullptr;
 
     ASSERT_TRUE(platform_->allocate(&ptr, kSize, opts).ok());
     auto locs = platform_->getLocation(ptr, kSize);
     ASSERT_FALSE(locs.empty());
-    EXPECT_EQ(locs[0].location, "rocm:0");
+    EXPECT_EQ(locs[0].location, "hip:0");
+    EXPECT_TRUE(platform_->free(ptr, kSize).ok());
+}
+
+TEST_F(RocmPlatformTest, LegacyRocmPrefixStillAllocates) {
+    MemoryOptions opts;
+    opts.location = "rocm:0";
+    constexpr size_t kSize = 4096;
+    void* ptr = nullptr;
+
+    ASSERT_TRUE(platform_->allocate(&ptr, kSize, opts).ok());
+    EXPECT_EQ(platform_->getMemoryType(ptr), MTYPE_ROCM);
+    auto locs = platform_->getLocation(ptr, kSize);
+    ASSERT_FALSE(locs.empty());
+    EXPECT_EQ(locs[0].location, "hip:0");
     EXPECT_TRUE(platform_->free(ptr, kSize).ok());
 }
 
@@ -231,7 +247,7 @@ TEST_F(RocmPlatformTest, AllocateOnSecondGpu) {
     if (getHipDeviceCount() < 2) GTEST_SKIP() << "Requires >= 2 AMD GPUs";
 
     MemoryOptions opts;
-    opts.location = "rocm:1";
+    opts.location = "hip:1";
     void* ptr = nullptr;
     constexpr size_t kSize = 1024;
 

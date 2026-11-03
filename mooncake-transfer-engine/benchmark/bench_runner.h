@@ -56,11 +56,16 @@ class BenchRunner {
 
     virtual size_t getTargetCount() const = 0;
 
+    virtual size_t getTargetIndex(int thread_id) const = 0;
+
     virtual uint64_t getTargetSegmentId(int thread_id) const = 0;
 
     virtual uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
                                          uint64_t batch_size) const = 0;
 
+    // Returns elapsed microseconds on success, or a negative value if the
+    // transfer failed. Implementations must not call exit() from worker
+    // threads.
     virtual double runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                                      uint64_t target_addr, uint64_t block_size,
                                      uint64_t batch_size, OpCode opcode,

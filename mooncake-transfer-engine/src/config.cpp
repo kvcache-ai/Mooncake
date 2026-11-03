@@ -14,6 +14,11 @@
 
 #include "config.h"
 
+#include "bool_parser.h"
+#include "integer_parser.h"
+
+#include "glog_compat.h"
+
 #include <charconv>
 #include <cstring>
 #include <cstdio>
@@ -100,7 +105,19 @@ void parseNicPeerAffinity(
 
 }  // namespace
 
+// Whether a GPU peer-memory kernel module is loaded: nvidia-peermem, or
+// nv_peer_mem from MLNX_OFED. ibv_reg_mr() on device memory needs one.
+static bool peerMemoryModuleLoaded() {
+    return std::filesystem::exists("/sys/module/nvidia_peermem") ||
+           std::filesystem::exists("/sys/module/nv_peer_mem");
+}
+
 void loadGlobalConfig(GlobalConfig& config) {
+    // Without a peer-memory module, ibv_reg_mr() fails with EFAULT at the
+    // first GPU buffer, so the dma_buf export is the default there;
+    // WITH_NVIDIA_PEERMEM below still decides when set.
+    config.with_nvidia_peermem = peerMemoryModuleLoaded();
+
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
         int val = atoi(num_cq_per_ctx_env);
@@ -178,9 +195,15 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* max_ep_per_ctx_env = std::getenv("MC_MAX_EP_PER_CTX");
     if (max_ep_per_ctx_env) {
-        size_t val = atoi(max_ep_per_ctx_env);
-        if (val > 0 && val <= UINT16_MAX)
-            config.max_ep_per_ctx = val;
+        // Ceiling is INT32_MAX, not UINT16_MAX: the field is an int whose
+        // default is already 65536, so a UINT16_MAX bound made the default
+        // value impossible to set explicitly.  The real RDMA constraint is
+        // enforced later against device_attr.max_qp; on EFA (SRD) this only
+        // sizes the AV table and the peer_map_ eviction cap, neither of which
+        // is 16-bit.
+        long long val = atoll(max_ep_per_ctx_env);
+        if (val > 0 && val <= INT32_MAX)
+            config.max_ep_per_ctx = static_cast<int>(val);
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_MAX_EP_PER_CTX";
@@ -214,6 +237,16 @@ void loadGlobalConfig(GlobalConfig& config) {
         } else {
             LOG(WARNING) << "Ignore value from environment variable MC_MAX_WR";
         }
+    }
+
+    const char* signal_interval_env = std::getenv("MC_RDMA_SIGNAL_INTERVAL");
+    if (signal_interval_env) {
+        int val = atoi(signal_interval_env);
+        if (val > 0 && val <= UINT16_MAX)
+            config.rdma_signal_interval = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_SIGNAL_INTERVAL";
     }
 
     const char* max_inline_env = std::getenv("MC_MAX_INLINE");
@@ -390,6 +423,26 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* rdma_worker_idle_spin_us =
+        std::getenv("MC_RDMA_WORKER_IDLE_SPIN_US");
+    if (rdma_worker_idle_spin_us) {
+        // Strict parse (not atoi): a typo keeps the default instead of
+        // silently parking or spinning every worker. 0 is a valid value.
+        uint64_t val = 0;
+        const char* end =
+            rdma_worker_idle_spin_us + strlen(rdma_worker_idle_spin_us);
+        auto [ptr, ec] = std::from_chars(rdma_worker_idle_spin_us, end, val);
+        if (ec == std::errc() && ptr == end && val <= 10000000) {
+            config.rdma_worker_idle_spin_us = val;
+            LOG(INFO) << "Set MC_RDMA_WORKER_IDLE_SPIN_US=" << val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_WORKER_IDLE_SPIN_US: "
+                         << rdma_worker_idle_spin_us
+                         << ". Expected an integer in range 0-10000000";
+        }
+    }
+
     const char* log_level = std::getenv("MC_LOG_LEVEL");
     config.trace = false;
     if (log_level) {
@@ -441,9 +494,36 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* context_pause_ttl_env = std::getenv("MC_CONTEXT_PAUSE_TTL_MS");
+    if (context_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0 and re-enable the legacy latch.
+        // Non-positive, out-of-range and garbage values are rejected.
+        int val = 0;
+        const char* end = context_pause_ttl_env + strlen(context_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(context_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 1 && val <= 600000) {
+                config.context_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONTEXT_PAUSE_TTL_MS, value "
+                             << context_pause_ttl_env
+                             << " out of range (should be 1-600000)";
+            }
+        } else {
+            LOG(WARNING)
+                << "Invalid MC_CONTEXT_PAUSE_TTL_MS environment value: "
+                << context_pause_ttl_env
+                << ". Expected an integer in range 1-600000";
+        }
+    }
+
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
+        // Skip initialization when the caller (host program) has already
+        // initialized glog — see glog_compat.h.
+        mooncake::InitGoogleLoggingOnce("mooncake-transfer-engine");
         std::error_code ec;
         if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
@@ -530,6 +610,84 @@ void loadGlobalConfig(GlobalConfig& config) {
                            config.track_rdma_posted_slices);
     }
 
+    const char* efa_homogeneous_peers_env =
+        std::getenv("MC_EFA_HOMOGENEOUS_PEERS");
+    if (efa_homogeneous_peers_env) {
+        parseBoolConfigEnv(efa_homogeneous_peers_env,
+                           "MC_EFA_HOMOGENEOUS_PEERS",
+                           config.efa_homogeneous_peers);
+    }
+
+    const char* efa_cq_drain_timeout_env =
+        std::getenv("MC_EFA_CQ_DRAIN_TIMEOUT_MS");
+    if (efa_cq_drain_timeout_env) {
+        config.efa_cq_drain_timeout_ms = atoll(efa_cq_drain_timeout_env);
+    }
+
+    const char* efa_stall_min_env = std::getenv("MC_EFA_STALL_MIN_MS");
+    if (efa_stall_min_env) {
+        config.efa_stall_min_ms = atoll(efa_stall_min_env);
+    }
+
+    const char* use_rdma_twosided_env = std::getenv("MC_USE_RDMA_TWOSIDED");
+    if (use_rdma_twosided_env) {
+        parseBoolConfigEnv(use_rdma_twosided_env, "MC_USE_RDMA_TWOSIDED",
+                           config.use_rdma_twosided);
+    }
+
+    const char* rdma_notify_enabled_env = std::getenv("MC_RDMA_NOTIFY_ENABLED");
+    if (rdma_notify_enabled_env) {
+        parseBoolConfigEnv(rdma_notify_enabled_env, "MC_RDMA_NOTIFY_ENABLED",
+                           config.rdma_notify_enabled);
+    }
+    const char* rdma_notify_recv_count_env =
+        std::getenv("MC_RDMA_NOTIFY_RECV_COUNT");
+    if (rdma_notify_recv_count_env) {
+        int val = atoi(rdma_notify_recv_count_env);
+        if (val > 0 && val <= 4096)
+            config.rdma_notify_recv_count = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_RECV_COUNT";
+    }
+    const char* rdma_notify_buffer_size_env =
+        std::getenv("MC_RDMA_NOTIFY_BUFFER_SIZE");
+    if (rdma_notify_buffer_size_env) {
+        int val = atoi(rdma_notify_buffer_size_env);
+        if (val >= 256 && val <= 65536)
+            config.rdma_notify_buffer_size = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_BUFFER_SIZE";
+    }
+    const char* rdma_notify_max_pending_sends_env =
+        std::getenv("MC_RDMA_NOTIFY_MAX_PENDING_SENDS");
+    if (rdma_notify_max_pending_sends_env) {
+        int val = atoi(rdma_notify_max_pending_sends_env);
+        if (val > 0 && val <= 4096)
+            config.rdma_notify_max_pending_sends = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_MAX_PENDING_SENDS";
+    }
+    const char* rdma_notify_oob_fallback_env =
+        std::getenv("MC_RDMA_NOTIFY_OOB_FALLBACK");
+    if (rdma_notify_oob_fallback_env) {
+        parseBoolConfigEnv(rdma_notify_oob_fallback_env,
+                           "MC_RDMA_NOTIFY_OOB_FALLBACK",
+                           config.rdma_notify_oob_fallback);
+    }
+    const char* rdma_notify_connect_timeout_env =
+        std::getenv("MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS");
+    if (rdma_notify_connect_timeout_env) {
+        int val = atoi(rdma_notify_connect_timeout_env);
+        if (val >= 100 && val <= 600000)
+            config.rdma_notify_connect_timeout_ms = static_cast<uint32_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS";
+    }
+
     const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
     if (enable_parallel_reg_mr) {
@@ -571,6 +729,50 @@ void loadGlobalConfig(GlobalConfig& config) {
             LOG(WARNING) << "Invalid MC_EFA_NIC_SELECTION environment value: "
                          << efa_nic_selection
                          << ", expected all|local, keeping default";
+        }
+    }
+
+    if (const char* value = std::getenv("MC_HIP_KFD_PIN_FIX")) {
+        const auto parsed = TryParseBool(value);
+        if (strcasecmp(value, "force") == 0) {
+            config.hip_kfd_pin_fix = HipKfdPinFix::FORCE;
+        } else if (parsed.has_value()) {
+            config.hip_kfd_pin_fix =
+                *parsed ? HipKfdPinFix::PROBE : HipKfdPinFix::OFF;
+        } else {
+            LOG(WARNING) << "Invalid MC_HIP_KFD_PIN_FIX environment value: "
+                         << value << ", expected 0|1|force, keeping default";
+        }
+    }
+
+    if (const char* value = std::getenv("MC_EFA_CQ_THREADS")) {
+        const auto parsed = TryParseInteger<int>(
+            value, {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+        if (parsed.has_value()) {
+            config.efa_cq_threads = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MC_EFA_CQ_THREADS environment value: "
+                         << value << ", keeping default "
+                         << config.efa_cq_threads;
+        }
+    }
+
+    for (const auto& [env_name, field] :
+         {std::pair{"WITH_NVIDIA_PEERMEM", &config.with_nvidia_peermem},
+          std::pair{"MC_RDMA_DATA_DIRECT", &config.rdma_data_direct},
+          std::pair{"MC_RDMA_DATA_DIRECT_PAIRING",
+                    &config.rdma_data_direct_pairing}}) {
+        const char* value = std::getenv(env_name);
+        if (value == nullptr) {
+            continue;
+        }
+        const auto parsed = TryParseBool(value);
+        if (parsed.has_value()) {
+            *field = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid " << env_name
+                         << " environment value: " << value
+                         << ", keeping default " << *field;
         }
     }
 
@@ -735,9 +937,13 @@ void dumpGlobalConfig() {
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
+    LOG(INFO) << "rdma_signal_interval = " << config.rdma_signal_interval;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
+    LOG(INFO) << "efa_homogeneous_peers = " << config.efa_homogeneous_peers;
+    LOG(INFO) << "efa_cq_drain_timeout_ms = " << config.efa_cq_drain_timeout_ms;
+    LOG(INFO) << "efa_stall_min_ms = " << config.efa_stall_min_ms;
     LOG(INFO) << "efa_nic_selection = "
               << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
                                                                      : "all");
@@ -746,6 +952,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
+    LOG(INFO) << "rdma_worker_idle_spin_us = "
+              << config.rdma_worker_idle_spin_us;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
@@ -762,6 +970,16 @@ void dumpGlobalConfig() {
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "
               << (config.track_rdma_posted_slices ? "true" : "false");
+    LOG(INFO) << "use_rdma_twosided = "
+              << (config.use_rdma_twosided ? "true" : "false");
+    LOG(INFO) << "rdma_notify_enabled = "
+              << (config.rdma_notify_enabled ? "true" : "false");
+    LOG(INFO) << "rdma_notify_recv_count = " << config.rdma_notify_recv_count;
+    LOG(INFO) << "rdma_notify_buffer_size = " << config.rdma_notify_buffer_size;
+    LOG(INFO) << "rdma_notify_max_pending_sends = "
+              << config.rdma_notify_max_pending_sends;
+    LOG(INFO) << "rdma_notify_oob_fallback = "
+              << (config.rdma_notify_oob_fallback ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

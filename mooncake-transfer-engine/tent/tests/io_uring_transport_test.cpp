@@ -1,0 +1,949 @@
+// Copyright 2026 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <gtest/gtest.h>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <vector>
+
+#include "tent/common/config.h"
+#include "tent/runtime/control_plane.h"
+#include "tent/transport/io_uring/io_uring_transport.h"
+
+namespace mooncake {
+namespace tent {
+namespace {
+
+constexpr size_t kPageSize = 4096;
+constexpr SegmentID kUnknownSegment = 0x7fff;
+
+class ScopedTempFile {
+   public:
+    explicit ScopedTempFile(size_t length) {
+        // /dev/shm (tmpfs) rather than /tmp: on overlayfs-backed /tmp an
+        // O_DIRECT open succeeds but the io_uring operations fail with
+        // EINVAL on older kernels. On tmpfs the O_DIRECT open itself fails,
+        // so the transport falls back to buffered I/O and the requests
+        // succeed.
+        char tmpl[] = "/dev/shm/mooncake_tent_io_uring_test_XXXXXX";
+        fd_ = mkstemp(tmpl);
+        EXPECT_GE(fd_, 0);
+        if (fd_ >= 0) {
+            path_ = tmpl;
+            EXPECT_EQ(ftruncate(fd_, (off_t)length), 0);
+        }
+    }
+
+    ~ScopedTempFile() {
+        if (fd_ >= 0) close(fd_);
+        if (!path_.empty()) unlink(path_.c_str());
+    }
+
+    int fd() const { return fd_; }
+    const std::string& path() const { return path_; }
+
+   private:
+    int fd_{-1};
+    std::string path_;
+};
+
+Status installLocalFileSegment(ControlService& metadata,
+                               const std::string& path, size_t length) {
+    return metadata.segmentManager().updateLocal(
+        [&](SegmentDesc& segment) -> Status {
+            segment.name = "io_uring_test_segment";
+            segment.machine_id = "io_uring_test_machine";
+            segment.type = SegmentType::File;
+            segment.detail = FileSegmentDesc{};
+            auto& files = std::get<FileSegmentDesc>(segment.detail);
+            files.buffers.clear();
+            FileBufferDesc buffer;
+            buffer.path = path;
+            buffer.length = length;
+            buffer.offset = 0;
+            files.buffers.push_back(std::move(buffer));
+            return Status::OK();
+        });
+}
+
+// Reports a positive short submission result on the first successful call
+// while letting the real io_uring_submit() through, so the kernel-side
+// state matches a genuine short submission.
+class ShortSubmitIOUringTransport : public IOUringTransport {
+   public:
+    void injectShortSubmit(int reported) { short_report_ = reported; }
+
+    int submitCalls() const { return submit_calls_; }
+
+   protected:
+    int submitSqes(struct io_uring* ring) override {
+        int rc = IOUringTransport::submitSqes(ring);
+        ++submit_calls_;
+        if (short_report_ > 0 && rc > short_report_) {
+            deficit_ = rc - short_report_;
+            int reported = short_report_;
+            short_report_ = 0;
+            return reported;
+        }
+        if (deficit_ > 0) {
+            rc += deficit_;
+            deficit_ = 0;
+        }
+        return rc;
+    }
+
+   private:
+    int short_report_ = 0;
+    int deficit_ = 0;
+    int submit_calls_ = 0;
+};
+
+Status installTransport(IOUringTransport& transport,
+                        std::shared_ptr<ControlService>& metadata) {
+    std::string local_segment_name = "io_uring_test_segment";
+    return transport.install(local_segment_name, metadata, nullptr,
+                             std::make_shared<Config>());
+}
+
+TransferStatus pollUntilSettled(IOUringTransport& transport,
+                                Transport::SubBatchRef batch, int task_id) {
+    TransferStatus ts{};
+    for (int attempts = 0; attempts < 10000; ++attempts) {
+        EXPECT_TRUE(transport.getTransferStatus(batch, task_id, ts).ok());
+        if (ts.s != TransferStatusEnum::PENDING &&
+            ts.s != TransferStatusEnum::INITIAL)
+            return ts;
+        usleep(1000);
+    }
+    return ts;
+}
+
+class IOUringFileContextTest : public ::testing::TestWithParam<bool> {};
+
+TEST_P(IOUringFileContextTest, DoesNotReuseAnotherTransportsFile) {
+    ScopedTempFile first_file(kPageSize);
+    ScopedTempFile second_file(kPageSize);
+    ASSERT_GE(first_file.fd(), 0);
+    ASSERT_GE(second_file.fd(), 0);
+    std::vector<uint8_t> first_contents(kPageSize, 0x11);
+    std::vector<uint8_t> second_contents(kPageSize, 0x22);
+    ASSERT_EQ(pwrite(first_file.fd(), first_contents.data(), kPageSize, 0),
+              static_cast<ssize_t>(kPageSize));
+    ASSERT_EQ(pwrite(second_file.fd(), second_contents.data(), kPageSize, 0),
+              static_cast<ssize_t>(kPageSize));
+
+    auto first_metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto second_metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    SegmentID first_id = 0;
+    SegmentID second_id = 0;
+    ASSERT_TRUE(
+        first_metadata->segmentManager()
+            .openRemote(first_id, kLocalFileSegmentPrefix + first_file.path())
+            .ok());
+    ASSERT_TRUE(
+        second_metadata->segmentManager()
+            .openRemote(second_id, kLocalFileSegmentPrefix + second_file.path())
+            .ok());
+    ASSERT_EQ(first_id, second_id);
+
+    auto first = std::make_unique<IOUringTransport>();
+    auto installed = installTransport(*first, first_metadata);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+    IOUringTransport second;
+    ASSERT_TRUE(installTransport(second, second_metadata).ok());
+
+    auto read_then_write = [&](IOUringTransport& transport, SegmentID id,
+                               uint8_t expected, uint8_t replacement) {
+        void* allocation = nullptr;
+        ASSERT_EQ(posix_memalign(&allocation, kPageSize, kPageSize), 0);
+        std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+        auto* bytes = static_cast<uint8_t*>(allocation);
+        std::memset(bytes, 0, kPageSize);
+        Transport::SubBatchRef batch = nullptr;
+        ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+        Request request{};
+        request.opcode = Request::READ;
+        request.source = bytes;
+        request.target_id = id;
+        request.length = kPageSize;
+        ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+        auto status = pollUntilSettled(transport, batch, 0);
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kPageSize);
+        EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + kPageSize),
+                  std::vector<uint8_t>(kPageSize, expected));
+        std::memset(bytes, replacement, kPageSize);
+        request.opcode = Request::WRITE;
+        ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+        status = pollUntilSettled(transport, batch, 1);
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kPageSize);
+        ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    };
+
+    read_then_write(*first, first_id, 0x11, 0xA1);
+    if (GetParam()) first.reset();
+    read_then_write(second, second_id, 0x22, 0xB2);
+    ASSERT_EQ(pread(first_file.fd(), first_contents.data(), kPageSize, 0),
+              static_cast<ssize_t>(kPageSize));
+    ASSERT_EQ(pread(second_file.fd(), second_contents.data(), kPageSize, 0),
+              static_cast<ssize_t>(kPageSize));
+    EXPECT_EQ(first_contents, std::vector<uint8_t>(kPageSize, 0xA1));
+    EXPECT_EQ(second_contents, std::vector<uint8_t>(kPageSize, 0xB2));
+}
+
+INSTANTIATE_TEST_SUITE_P(OwnerLifetime, IOUringFileContextTest,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                             return info.param ? "RetiredOwner" : "LiveOwners";
+                         });
+
+// A positive short io_uring_submit() result must not fail the submission:
+// part of the batch is already dispatched, so an error return would make
+// the engine's submit-stage failover re-execute those requests.
+TEST(IOUringTransportTest, ShortSubmitIsNotAnErrorAndExecutesExactlyOnce) {
+    const size_t kFileLength = 4 * kPageSize;
+    const size_t kRequestCount = 3;
+
+    ScopedTempFile file(kFileLength);
+    ASSERT_GE(file.fd(), 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(
+        installLocalFileSegment(*metadata, file.path(), kFileLength).ok());
+
+    ShortSubmitIOUringTransport transport;
+    transport.injectShortSubmit(1);
+    auto install_status = installTransport(transport, metadata);
+    if (!install_status.ok()) {
+        GTEST_SKIP() << "io_uring unavailable: " << install_status.message();
+    }
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 8).ok());
+
+    // Page-aligned source keeps every request on the direct (non-staging)
+    // path and valid under O_DIRECT.
+    void* source = nullptr;
+    ASSERT_EQ(posix_memalign(&source, kPageSize, kRequestCount * kPageSize), 0);
+    auto* source_bytes = static_cast<uint8_t*>(source);
+
+    std::vector<Request> requests;
+    for (size_t i = 0; i < kRequestCount; ++i) {
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = source_bytes + i * kPageSize;
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = i * kPageSize;
+        req.length = kPageSize;
+        // Distinct pattern per request: verifies exactly-once placement.
+        std::memset(req.source, 0x10 + i, kPageSize);
+        requests.push_back(req);
+    }
+
+    auto status = transport.submitTransferTasks(batch, requests);
+    // The old code returned InternalError here while the SQEs were already
+    // in flight.
+    EXPECT_TRUE(status.ok());
+    // The flush loop retried after the short report.
+    EXPECT_GE(transport.submitCalls(), 2);
+
+    for (size_t i = 0; i < kRequestCount; ++i) {
+        auto ts = pollUntilSettled(transport, batch, (int)i);
+        EXPECT_EQ(ts.s, TransferStatusEnum::COMPLETED);
+    }
+
+    // Exactly-once: every page holds its own request's pattern.
+    std::vector<uint8_t> expected(kFileLength, 0);
+    for (size_t i = 0; i < kRequestCount; ++i)
+        std::memset(expected.data() + i * kPageSize, 0x10 + i, kPageSize);
+    std::vector<uint8_t> actual(kFileLength, 0);
+    ASSERT_EQ(pread(file.fd(), actual.data(), kFileLength, 0),
+              (ssize_t)kFileLength);
+    EXPECT_EQ(std::memcmp(actual.data(), expected.data(), kFileLength), 0);
+
+    free(source);
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+// Regression for the all-or-nothing submission contract: a mid-batch
+// segment-lookup failure (the second of three requests targets an unknown
+// segment) must return an error without appending tasks, preparing SQEs or
+// executing anything. The old loop appended each task before validating it
+// and left the earlier requests' SQEs queued in the ring, so the next
+// submission on the same sub-batch would have flushed them.
+TEST(IOUringTransportTest, SubmitIsAllOrNothingWhenSegmentLookupFailsMidBatch) {
+    const size_t kFileLength = 2 * kPageSize;
+
+    ScopedTempFile file(kFileLength);
+    ASSERT_GE(file.fd(), 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(
+        installLocalFileSegment(*metadata, file.path(), kFileLength).ok());
+
+    IOUringTransport transport;
+    auto install_status = installTransport(transport, metadata);
+    if (!install_status.ok()) {
+        GTEST_SKIP() << "io_uring unavailable: " << install_status.message();
+    }
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 8).ok());
+    auto* uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
+    ASSERT_NE(uring_batch, nullptr);
+    const int sq_space_before = io_uring_sq_space_left(&uring_batch->ring);
+
+    // Heap (page-unaligned) source exercises the staging-buffer allocation
+    // that must be rolled back on failure.
+    std::vector<uint8_t> source(kPageSize, 0xA5);
+    auto makeRequest = [&](SegmentID target_id, uint64_t target_offset) {
+        Request req;
+        req.opcode = Request::WRITE;
+        req.source = source.data();
+        req.target_id = target_id;
+        req.target_offset = target_offset;
+        req.length = kPageSize;
+        return req;
+    };
+    std::vector<Request> requests{
+        makeRequest(LOCAL_SEGMENT_ID, 0),
+        // Unknown target segment: lookup fails fast with an error.
+        makeRequest(kUnknownSegment, 0),
+        makeRequest(LOCAL_SEGMENT_ID, kPageSize)};
+
+    auto status = transport.submitTransferTasks(batch, requests);
+    EXPECT_FALSE(status.ok());
+
+    // Nothing was accepted: no tasks appended ...
+    EXPECT_EQ(uring_batch->task_list.size(), 0u);
+    // ... and no SQE was prepared for the rejected batch.
+    EXPECT_EQ(io_uring_sq_space_left(&uring_batch->ring), sq_space_before);
+
+    // Nothing was executed: the file stays zeroed.
+    std::vector<uint8_t> actual(kFileLength, 1);
+    ASSERT_EQ(pread(file.fd(), actual.data(), kFileLength, 0),
+              (ssize_t)kFileLength);
+    for (size_t i = 0; i < kFileLength; ++i) EXPECT_EQ(actual[i], 0u);
+
+    // The transport stays usable after the rejected batch: the valid
+    // requests (minus the bad one) submit and complete cleanly.
+    std::vector<Request> valid_requests{makeRequest(LOCAL_SEGMENT_ID, 0)};
+    EXPECT_TRUE(transport.submitTransferTasks(batch, valid_requests).ok());
+    EXPECT_EQ(uring_batch->task_list.size(), 1u);
+    auto ts = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(ts.s, TransferStatusEnum::COMPLETED);
+
+    std::memset(actual.data(), 1, kFileLength);
+    ASSERT_EQ(pread(file.fd(), actual.data(), kFileLength, 0),
+              (ssize_t)kFileLength);
+    for (size_t i = 0; i < kPageSize; ++i) EXPECT_EQ(actual[i], 0xA5);
+    // The never-submitted second page stays zeroed: no phantom SQE from the
+    // rejected batch leaked into this submission.
+    for (size_t i = kPageSize; i < kFileLength; ++i) EXPECT_EQ(actual[i], 0u);
+
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+using CompletionParams = std::tuple<bool, size_t>;
+
+class PoisonedReadIOUringTransport : public IOUringTransport {
+   public:
+    IOUringSubBatch* batch = nullptr;
+
+   protected:
+    int submitSqes(struct io_uring* ring) override {
+        if (!initialized_) {
+            // Poison before kernel submission, so no test code touches the
+            // staging buffer while the read is in flight.
+            for (auto& task : batch->task_list) {
+                if (task.buffer)
+                    std::memset(task.buffer, 0xD7, task.request.length);
+            }
+            initialized_ = true;
+        }
+        return IOUringTransport::submitSqes(ring);
+    }
+
+   private:
+    bool initialized_ = false;
+};
+
+class IOUringReadCompletionTest
+    : public ::testing::TestWithParam<CompletionParams> {};
+
+TEST_P(IOUringReadCompletionTest, ReportsActualBytesAndPreservesUnreadTail) {
+    const auto [staged, file_length] = GetParam();
+    ScopedTempFile file(file_length);
+    ASSERT_GE(file.fd(), 0);
+    std::vector<uint8_t> file_data(file_length, 0xA5);
+    ASSERT_EQ(pwrite(file.fd(), file_data.data(), file_length, 0),
+              static_cast<ssize_t>(file_length));
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(
+        installLocalFileSegment(*metadata, file.path(), kPageSize).ok());
+    PoisonedReadIOUringTransport transport;
+    auto installed = installTransport(transport, metadata);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, 2 * kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    auto* destination = static_cast<uint8_t*>(allocation) + (staged ? 1 : 0);
+    std::memset(destination, 0x5A, kPageSize);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    transport.batch = static_cast<IOUringSubBatch*>(batch);
+    Request request{};
+    request.opcode = Request::READ;
+    request.source = destination;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.length = kPageSize;
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+    auto* uring_batch = static_cast<IOUringSubBatch*>(batch);
+    auto& task = uring_batch->task_list[0];
+    ASSERT_EQ(task.buffer != nullptr, staged);
+    const auto status = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(status.s, file_length == kPageSize ? COMPLETED : FAILED);
+    EXPECT_EQ(status.transferred_bytes, file_length);
+    EXPECT_EQ(task.buffer, nullptr);
+    for (size_t i = 0; i < kPageSize; ++i) {
+        ASSERT_EQ(destination[i], i < file_length ? 0xA5 : 0x5A) << i;
+    }
+    TransferStatus repeated{};
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, repeated).ok());
+    EXPECT_EQ(repeated.s, status.s);
+    EXPECT_EQ(repeated.transferred_bytes, status.transferred_bytes);
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AlignedAndStaged, IOUringReadCompletionTest,
+    ::testing::Combine(::testing::Bool(),
+                       ::testing::Values(size_t{0}, kPageSize / 4, kPageSize)));
+
+// Limit the submitted iovec while retaining the original request length.
+// This produces a real zero/short WRITE CQE without relying on a full disk.
+class ShortWriteIOUringTransport : public IOUringTransport {
+   public:
+    IOUringSubBatch* batch = nullptr;
+    size_t limit = 0;
+
+   protected:
+    int submitSqes(struct io_uring* ring) override {
+        if (!limited_) {
+            for (auto& task : batch->task_list) task.iov.iov_len = limit;
+            limited_ = true;
+        }
+        return IOUringTransport::submitSqes(ring);
+    }
+
+   private:
+    bool limited_ = false;
+};
+
+class IOUringWriteCompletionTest
+    : public ::testing::TestWithParam<CompletionParams> {};
+
+TEST_P(IOUringWriteCompletionTest, ShortWriteFailsWithActualByteCount) {
+    const auto [staged, written] = GetParam();
+    ScopedTempFile file(kPageSize);
+    ASSERT_GE(file.fd(), 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(
+        installLocalFileSegment(*metadata, file.path(), kPageSize).ok());
+    ShortWriteIOUringTransport transport;
+    auto installed = installTransport(transport, metadata);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, 2 * kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    auto* source = static_cast<uint8_t*>(allocation) + (staged ? 1 : 0);
+    std::memset(source, 0xA5, kPageSize);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    transport.batch = static_cast<IOUringSubBatch*>(batch);
+    transport.limit = written;
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = source;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.length = kPageSize;
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
+    ASSERT_EQ(transport.batch->task_list[0].buffer != nullptr, staged);
+    auto status = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(status.transferred_bytes, written);
+    EXPECT_EQ(transport.batch->task_list[0].buffer, nullptr);
+    std::vector<uint8_t> contents(kPageSize);
+    ASSERT_EQ(pread(file.fd(), contents.data(), contents.size(), 0),
+              static_cast<ssize_t>(contents.size()));
+    for (size_t i = 0; i < contents.size(); ++i) {
+        ASSERT_EQ(contents[i], i < written ? 0xA5 : 0) << i;
+    }
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+}
+
+INSTANTIATE_TEST_SUITE_P(AlignedAndStaged, IOUringWriteCompletionTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Values(size_t{0},
+                                                              kPageSize / 4)));
+
+TEST(IOUringTransportTest, FailedCompletionReleasesStagingBuffer) {
+    IOUringTransport transport;
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    auto installed = installTransport(transport, metadata);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    auto* uring_batch = static_cast<IOUringSubBatch*>(batch);
+    uring_batch->task_list.emplace_back();
+    auto& task = uring_batch->task_list.back();
+    std::vector<uint8_t> destination(kPageSize, 0x5A);
+    task.request = {};
+    task.request.opcode = Request::READ;
+    task.request.source = destination.data();
+    task.request.length = kPageSize;
+    task.status_word = PENDING;
+    task.transferred_bytes = 0;
+    task.buffer = malloc(kPageSize);
+    ASSERT_NE(task.buffer, nullptr);
+    task.iov = {task.buffer, kPageSize};
+    auto* sqe = io_uring_get_sqe(&uring_batch->ring);
+    ASSERT_NE(sqe, nullptr);
+    io_uring_prep_readv(sqe, -1, &task.iov, 1, 0);
+    sqe->user_data = reinterpret_cast<uintptr_t>(&task);
+    ASSERT_EQ(io_uring_submit(&uring_batch->ring), 1);
+    const auto status = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_EQ(status.transferred_bytes, 0u);
+    EXPECT_EQ(task.buffer, nullptr);
+    EXPECT_EQ(destination, std::vector<uint8_t>(kPageSize, 0x5A));
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+}
+
+TEST(IOUringStagingPoolTest, LendsPageAlignedSlotsWithoutBlocking) {
+    IOUringStagingPool pool;
+    EXPECT_EQ(pool.acquire(1), nullptr);
+    ASSERT_TRUE(pool.init(2 * kPageSize, 2).ok());
+    EXPECT_FALSE(pool.init(2 * kPageSize, 2).ok());
+    EXPECT_EQ(pool.freeSlots(), 2u);
+    EXPECT_EQ(pool.acquire(2 * kPageSize + 1), nullptr);
+    void* first = pool.acquire(2 * kPageSize);
+    void* second = pool.acquire(1);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(first) % kPageSize, 0u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(second) % kPageSize, 0u);
+    const auto distance =
+        static_cast<uint8_t*>(first) > static_cast<uint8_t*>(second)
+            ? static_cast<uint8_t*>(first) - static_cast<uint8_t*>(second)
+            : static_cast<uint8_t*>(second) - static_cast<uint8_t*>(first);
+    EXPECT_GE(static_cast<size_t>(distance), 2 * kPageSize);
+    EXPECT_EQ(pool.acquire(1), nullptr);
+    EXPECT_EQ(pool.freeSlots(), 0u);
+    EXPECT_TRUE(pool.release(first));
+    EXPECT_EQ(pool.acquire(1), first);
+    EXPECT_TRUE(pool.release(first));
+    EXPECT_TRUE(pool.release(second));
+    EXPECT_EQ(pool.freeSlots(), 2u);
+}
+
+// Opens an unlinked scratch file with O_DIRECT in the first directory where
+// O_DIRECT I/O from ordinary page-aligned memory works, and writes `data` to
+// it. Returns -1 if no candidate directory supports O_DIRECT.
+int openDirectIoScratch(const void* data, size_t length) {
+    std::vector<std::string> dirs;
+    if (const char* tmpdir = getenv("TMPDIR")) dirs.push_back(tmpdir);
+    dirs.insert(dirs.end(), {"/var/tmp", "/tmp", "."});
+    for (const auto& dir : dirs) {
+        std::string tmpl = dir + "/mooncake_tent_odirect_XXXXXX";
+        int fd = mkostemp(tmpl.data(), O_DIRECT);
+        if (fd < 0) continue;
+        unlink(tmpl.c_str());
+        if (pwrite(fd, data, length, 0) == (ssize_t)length) return fd;
+        close(fd);
+    }
+    return -1;
+}
+
+// io_uring reads and writes the file directly from the staging slots, with
+// O_DIRECT, so the kernel must be able to pin slot memory. USM host memory
+// (sycl::aligned_alloc_host) cannot be pinned, so every request would fail
+// with EFAULT. The transport tests above use tmpfs, where O_DIRECT is
+// unavailable and buffered I/O hides this.
+TEST(IOUringStagingPoolTest, SlotsSupportODirectFileIO) {
+    void* plain = nullptr;
+    ASSERT_EQ(posix_memalign(&plain, kPageSize, kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> plain_guard(plain, &free);
+    memset(plain, 0x5a, kPageSize);
+    const int fd = openDirectIoScratch(plain, kPageSize);
+    if (fd < 0) GTEST_SKIP() << "no candidate directory supports O_DIRECT";
+
+    IOUringStagingPool pool;
+    ASSERT_TRUE(pool.init(kPageSize, 1).ok());
+    void* slot = pool.acquire(kPageSize);
+    ASSERT_NE(slot, nullptr);
+    memset(slot, 0, kPageSize);
+    ssize_t n = pread(fd, slot, kPageSize, 0);
+    int err = n < 0 ? errno : 0;
+    EXPECT_EQ(n, (ssize_t)kPageSize) << "pread: " << strerror(err);
+    EXPECT_EQ(memcmp(slot, plain, kPageSize), 0);
+    n = pwrite(fd, slot, kPageSize, 0);
+    err = n < 0 ? errno : 0;
+    EXPECT_EQ(n, (ssize_t)kPageSize) << "pwrite: " << strerror(err);
+    EXPECT_TRUE(pool.release(slot));
+    close(fd);
+}
+
+TEST(IOUringStagingPoolTest, RejectsInvalidSizesAndForeignBuffers) {
+    IOUringStagingPool pool;
+    EXPECT_FALSE(pool.init(0, 1).ok());
+    EXPECT_FALSE(pool.init(kPageSize + 1, 1).ok());
+    EXPECT_FALSE(pool.init(kPageSize, 0).ok());
+    EXPECT_FALSE(pool.init(kPageSize, SIZE_MAX).ok());
+    ASSERT_TRUE(pool.init(kPageSize, 1).ok());
+    int foreign = 0;
+    EXPECT_FALSE(pool.owns(&foreign));
+    EXPECT_FALSE(pool.release(&foreign));
+    EXPECT_FALSE(pool.release(nullptr));
+    EXPECT_EQ(pool.freeSlots(), 1u);
+    // An interior pointer is not a slot and must not enter the free list.
+    char* slot = static_cast<char*>(pool.acquire(kPageSize));
+    ASSERT_NE(slot, nullptr);
+    EXPECT_FALSE(pool.owns(slot + 1));
+    EXPECT_FALSE(pool.release(slot + 1));
+    EXPECT_EQ(pool.freeSlots(), 0u);
+    EXPECT_TRUE(pool.release(slot));
+    EXPECT_EQ(pool.freeSlots(), 1u);
+}
+
+TEST(IOUringStagingPoolTest, TaskReturnsSlotOrFreesFallbackBuffer) {
+    auto pool = std::make_shared<IOUringStagingPool>();
+    ASSERT_TRUE(pool->init(kPageSize, 1).ok());
+    {
+        IOUringTask task{};
+        task.buffer = pool->acquire(kPageSize);
+        ASSERT_NE(task.buffer, nullptr);
+        task.pool = pool;
+        EXPECT_EQ(pool->freeSlots(), 0u);
+    }
+    EXPECT_EQ(pool->freeSlots(), 1u);
+    IOUringTask task{};
+    task.buffer = malloc(kPageSize);
+    ASSERT_NE(task.buffer, nullptr);
+    task.pool = pool;
+    task.releaseBuffer();
+    EXPECT_EQ(task.buffer, nullptr);
+    EXPECT_EQ(task.pool, nullptr);
+    EXPECT_EQ(pool->freeSlots(), 1u);
+}
+
+class PinnedStagingIOUringTransport : public IOUringTransport {
+   public:
+    using IOUringTransport::stagingPool;
+};
+
+Status installPinnedStaging(IOUringTransport& transport,
+                            std::shared_ptr<ControlService>& metadata,
+                            size_t slot_kb, size_t slots) {
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/io_uring/pinned_staging", true);
+    conf->set("transports/io_uring/staging_slot_kb", slot_kb);
+    conf->set("transports/io_uring/staging_slots", slots);
+    std::string local_segment_name = "io_uring_test_segment";
+    return transport.install(local_segment_name, metadata, nullptr, conf);
+}
+
+TEST(IOUringPinnedStagingTest, PoolIsOffByDefaultAndSizedFromConfig) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    PinnedStagingIOUringTransport plain;
+    auto installed = installTransport(plain, metadata);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+    EXPECT_EQ(plain.stagingPool(), nullptr);
+
+    PinnedStagingIOUringTransport pinned;
+    ASSERT_TRUE(installPinnedStaging(pinned, metadata, 5, 3).ok());
+    ASSERT_NE(pinned.stagingPool(), nullptr);
+    EXPECT_EQ(pinned.stagingPool()->slotSize(), 2 * kPageSize);
+    EXPECT_EQ(pinned.stagingPool()->freeSlots(), 3u);
+    ASSERT_TRUE(pinned.uninstall().ok());
+    EXPECT_EQ(pinned.stagingPool(), nullptr);
+
+    PinnedStagingIOUringTransport empty;
+    ASSERT_TRUE(installPinnedStaging(empty, metadata, 4, 0).ok());
+    EXPECT_EQ(empty.stagingPool(), nullptr);
+
+    // slot_kb * 1024 would wrap to 1024 bytes; reject it instead of building
+    // a pool far smaller than requested.
+    PinnedStagingIOUringTransport huge;
+    ASSERT_TRUE(
+        installPinnedStaging(huge, metadata, SIZE_MAX / 1024 + 2, 1).ok());
+    EXPECT_EQ(huge.stagingPool(), nullptr);
+}
+
+TEST(IOUringPinnedStagingTest, StagesThroughSlotsAndFallsBackWhenExhausted) {
+    ScopedTempFile file(2 * kPageSize);
+    ASSERT_GE(file.fd(), 0);
+    std::vector<uint8_t> file_data(2 * kPageSize, 0xA5);
+    std::memset(file_data.data() + kPageSize, 0x3C, kPageSize);
+    ASSERT_EQ(pwrite(file.fd(), file_data.data(), file_data.size(), 0),
+              static_cast<ssize_t>(file_data.size()));
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(
+        installLocalFileSegment(*metadata, file.path(), 2 * kPageSize).ok());
+    PinnedStagingIOUringTransport transport;
+    auto installed = installPinnedStaging(transport, metadata, 4, 1);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+    auto* pool = transport.stagingPool();
+    ASSERT_NE(pool, nullptr);
+
+    // Unaligned destinations force staging; the pool has a single slot, so
+    // the second request falls back to a pageable buffer.
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, 4 * kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    auto* first = static_cast<uint8_t*>(allocation) + 1;
+    auto* second = first + 2 * kPageSize;
+    std::memset(allocation, 0, 4 * kPageSize);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+    std::vector<Request> requests(2);
+    for (size_t i = 0; i < requests.size(); ++i) {
+        requests[i].opcode = Request::READ;
+        requests[i].source = i == 0 ? first : second;
+        requests[i].target_id = LOCAL_SEGMENT_ID;
+        requests[i].target_offset = i * kPageSize;
+        requests[i].length = kPageSize;
+    }
+    ASSERT_TRUE(transport.submitTransferTasks(batch, requests).ok());
+    auto* uring_batch = static_cast<IOUringSubBatch*>(batch);
+    EXPECT_TRUE(pool->owns(uring_batch->task_list[0].buffer));
+    EXPECT_EQ(uring_batch->task_list[0].pool.get(), pool);
+    ASSERT_NE(uring_batch->task_list[1].buffer, nullptr);
+    EXPECT_FALSE(pool->owns(uring_batch->task_list[1].buffer));
+    EXPECT_EQ(uring_batch->task_list[1].pool, nullptr);
+    EXPECT_EQ(pool->freeSlots(), 0u);
+    for (int i = 0; i < 2; ++i) {
+        auto status = pollUntilSettled(transport, batch, i);
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kPageSize);
+        EXPECT_EQ(uring_batch->task_list[i].buffer, nullptr);
+    }
+    EXPECT_EQ(std::vector<uint8_t>(first, first + kPageSize),
+              std::vector<uint8_t>(kPageSize, 0xA5));
+    EXPECT_EQ(std::vector<uint8_t>(second, second + kPageSize),
+              std::vector<uint8_t>(kPageSize, 0x3C));
+    EXPECT_EQ(pool->freeSlots(), 1u);
+
+    // WRITE stages through the returned slot as well.
+    std::memset(first, 0x7E, kPageSize);
+    Request write{};
+    write.opcode = Request::WRITE;
+    write.source = first;
+    write.target_id = LOCAL_SEGMENT_ID;
+    write.length = kPageSize;
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {write}).ok());
+    uring_batch = static_cast<IOUringSubBatch*>(batch);
+    EXPECT_TRUE(pool->owns(uring_batch->task_list[0].buffer));
+    auto status = pollUntilSettled(transport, batch, 0);
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(pool->freeSlots(), 1u);
+    std::vector<uint8_t> contents(kPageSize);
+    ASSERT_EQ(pread(file.fd(), contents.data(), contents.size(), 0),
+              static_cast<ssize_t>(contents.size()));
+    EXPECT_EQ(contents, std::vector<uint8_t>(kPageSize, 0x7E));
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+}
+
+TEST(IOUringPinnedStagingTest, RejectedSubmissionAndFreeSubBatchReturnSlots) {
+    ScopedTempFile file(kPageSize);
+    ASSERT_GE(file.fd(), 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(
+        installLocalFileSegment(*metadata, file.path(), kPageSize).ok());
+    PinnedStagingIOUringTransport transport;
+    auto installed = installPinnedStaging(transport, metadata, 4, 1);
+    if (!installed.ok()) GTEST_SKIP() << installed.message();
+    auto* pool = transport.stagingPool();
+    ASSERT_NE(pool, nullptr);
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, 2 * kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    Request staged{};
+    staged.opcode = Request::READ;
+    staged.source = static_cast<uint8_t*>(allocation) + 1;
+    staged.target_id = LOCAL_SEGMENT_ID;
+    staged.length = kPageSize;
+    Request invalid = staged;
+    invalid.target_id = kUnknownSegment;
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+    EXPECT_FALSE(transport.submitTransferTasks(batch, {staged, invalid}).ok());
+    EXPECT_TRUE(static_cast<IOUringSubBatch*>(batch)->task_list.empty());
+    EXPECT_EQ(pool->freeSlots(), 1u);
+
+    // A slot whose completion is never reaped returns when the sub-batch is
+    // freed.
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {staged}).ok());
+    EXPECT_EQ(pool->freeSlots(), 0u);
+    ASSERT_TRUE(transport.freeSubBatch(batch).ok());
+    EXPECT_EQ(pool->freeSlots(), 1u);
+}
+
+// Freeing a sub-batch whose read is still in flight waits for the read:
+// the kernel would otherwise complete it into the freed staging buffer. A
+// FIFO keeps the read in flight until the test writes to it.
+TEST(IOUringTransportTest, FreeSubBatchWaitsForInFlightIo) {
+    char dir_template[] = "/tmp/io_uring_fifo_XXXXXX";
+    ASSERT_NE(mkdtemp(dir_template), nullptr);
+    const std::string path = std::string(dir_template) + "/fifo";
+    ASSERT_EQ(mkfifo(path.c_str(), 0600), 0);
+    int writer = open(path.c_str(), O_RDWR | O_NONBLOCK);
+    ASSERT_GE(writer, 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalFileSegment(*metadata, path, kPageSize).ok());
+    IOUringTransport transport;
+    auto installed = installTransport(transport, metadata);
+    if (!installed.ok()) {
+        close(writer);
+        unlink(path.c_str());
+        rmdir(dir_template);
+        GTEST_SKIP() << installed.message();
+    }
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, 2 * kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    Request read{};
+    read.opcode = Request::READ;
+    read.source = static_cast<uint8_t*>(allocation) + 1;  // staged
+    read.target_id = LOCAL_SEGMENT_ID;
+    read.length = kPageSize;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {read}).ok());
+
+    // Free on a worker: it must stay blocked while the FIFO is unfed, and
+    // finish once the read is fed. Feed and join on every path, so that a
+    // failed check cannot leave the worker blocked.
+    std::atomic<bool> done{false};
+    Status freed;
+    std::thread worker([&] {
+        freed = transport.freeSubBatch(batch);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(done.load()) << "freeSubBatch() returned with I/O in flight";
+    std::vector<uint8_t> data(kPageSize, 0x5A);
+    EXPECT_EQ(write(writer, data.data(), data.size()), (ssize_t)kPageSize);
+    worker.join();
+    EXPECT_TRUE(freed.ok()) << freed.ToString();
+    close(writer);
+    unlink(path.c_str());
+    rmdir(dir_template);
+}
+
+// If that wait fails, freeSubBatch() keeps reaping by polling the CQ ring,
+// so it still frees nothing the kernel may write into. Replacing the ring fd
+// with a non-io_uring file makes io_uring_wait_cqe() fail, while the ring
+// itself stays alive through its mappings.
+TEST(IOUringPinnedStagingTest, FreeSubBatchDrainsWhenWaitFails) {
+    char dir_template[] = "/tmp/io_uring_fifo_XXXXXX";
+    ASSERT_NE(mkdtemp(dir_template), nullptr);
+    const std::string path = std::string(dir_template) + "/fifo";
+    ASSERT_EQ(mkfifo(path.c_str(), 0600), 0);
+    int writer = open(path.c_str(), O_RDWR | O_NONBLOCK);
+    ASSERT_GE(writer, 0);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalFileSegment(*metadata, path, kPageSize).ok());
+    PinnedStagingIOUringTransport transport;
+    auto installed = installPinnedStaging(transport, metadata, 4, 1);
+    if (!installed.ok()) {
+        close(writer);
+        unlink(path.c_str());
+        rmdir(dir_template);
+        GTEST_SKIP() << installed.message();
+    }
+    auto* pool = transport.stagingPool();
+    ASSERT_NE(pool, nullptr);
+
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPageSize, 2 * kPageSize), 0);
+    std::unique_ptr<void, decltype(&free)> memory(allocation, free);
+    Request read{};
+    read.opcode = Request::READ;
+    read.source = static_cast<uint8_t*>(allocation) + 1;  // staged
+    read.target_id = LOCAL_SEGMENT_ID;
+    read.length = kPageSize;
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {read}).ok());
+    EXPECT_EQ(pool->freeSlots(), 0u);
+
+    auto* sub_batch = static_cast<IOUringSubBatch*>(batch);
+    const auto* slot =
+        static_cast<const uint8_t*>(sub_batch->task_list[0].buffer);
+    const int ring_fd = sub_batch->ring.ring_fd;
+    int null_fd = open("/dev/null", O_RDONLY);
+    ASSERT_GE(null_fd, 0);
+    ASSERT_EQ(dup2(null_fd, ring_fd), ring_fd);
+    close(null_fd);
+
+    // As above: freeSubBatch() must stay blocked, with the slot out of the
+    // pool, until the read is fed.
+    std::atomic<bool> done{false};
+    Status freed;
+    std::thread worker([&] {
+        freed = transport.freeSubBatch(batch);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(done.load()) << "freeSubBatch() returned with I/O in flight";
+    EXPECT_EQ(pool->freeSlots(), 0u);
+    std::vector<uint8_t> data(kPageSize, 0x5A);
+    EXPECT_EQ(write(writer, data.data(), data.size()), (ssize_t)kPageSize);
+    worker.join();
+    EXPECT_TRUE(freed.ok()) << freed.ToString();
+    EXPECT_EQ(batch, nullptr);
+    // The read landed in the slot before the slot went back to the pool.
+    EXPECT_EQ(pool->freeSlots(), 1u);
+    EXPECT_TRUE(std::equal(data.begin(), data.end(), slot));
+    close(writer);
+    unlink(path.c_str());
+    rmdir(dir_template);
+}
+
+}  // namespace
+}  // namespace tent
+}  // namespace mooncake

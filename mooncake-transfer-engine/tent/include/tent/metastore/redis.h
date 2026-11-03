@@ -19,6 +19,8 @@
 #include <hiredis/hiredis.h>
 
 #include <atomic>
+#include <cstdarg>
+#include <mutex>
 
 #include "tent/runtime/metastore.h"
 #include "tent/common/utils/ip.h"
@@ -53,9 +55,23 @@ class RedisMetaStore : public MetaStore {
 
     virtual Status remove(const std::string &key);
 
-   private:
+   protected:
+    // Test seam: run a Redis command on client_. Virtual so tests can inject a
+    // fake that fabricates replies without a live server.
+    virtual redisReply *runCommand(const char *format, va_list ap);
+
     std::atomic<bool> connected_;
+
+   private:
+    // Variadic forwarder to runCommand().
+    redisReply *command(const char *format, ...);
+
     redisContext *client_;
+    // hiredis' synchronous redisContext is NOT thread-safe: concurrent
+    // redisCommand() calls corrupt its shared command/reply buffers. tent's
+    // RDMA workers call get() concurrently, so serialize client_ with this
+    // lock.
+    std::mutex client_mutex_;
 
     // Helper function for handling Redis replies
     Status handleRedisReply(redisReply *reply,

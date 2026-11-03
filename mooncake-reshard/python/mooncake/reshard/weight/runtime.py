@@ -11,10 +11,10 @@ from ..contracts import (
     ResourceId,
     ResourceKind,
     RevisionId,
+    RuntimeBindingFragment,
     RuntimeInstanceId,
 )
 from .types import (
-    RuntimeBindingFragment,
     _require_nonempty_string,
     _require_u64,
     require_manifest_items,

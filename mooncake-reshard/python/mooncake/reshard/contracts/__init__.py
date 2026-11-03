@@ -1,5 +1,6 @@
 """Public resource-neutral contracts for Mooncake resharding."""
 
+from .fragments import RuntimeBindingFragment
 from .ids import (
     LeaseId,
     ParticipantId,
@@ -10,6 +11,7 @@ from .ids import (
     RevisionId,
     RuntimeFragmentId,
     RuntimeInstanceId,
+    StoredFragmentSnapshotId,
     TensorId,
     TopologyId,
 )
@@ -18,6 +20,7 @@ from .manifest import (
     ResourceKind,
     ResourceManifest,
     RuntimeBindingManifest,
+    StoredResourceManifest,
     validate_resource_binding_identity,
 )
 
@@ -32,9 +35,12 @@ __all__ = [
     "ResourceKind",
     "ResourceManifest",
     "RevisionId",
+    "RuntimeBindingFragment",
     "RuntimeBindingManifest",
     "RuntimeFragmentId",
     "RuntimeInstanceId",
+    "StoredFragmentSnapshotId",
+    "StoredResourceManifest",
     "TensorId",
     "TopologyId",
     "validate_resource_binding_identity",

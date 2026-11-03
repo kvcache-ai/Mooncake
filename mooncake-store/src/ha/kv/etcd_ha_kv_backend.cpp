@@ -22,6 +22,8 @@ EtcdHelper::TxnCompareKind ToEtcdCompareKind(KvCompareKind kind) {
             return EtcdHelper::TxnCompareKind::kValueEquals;
         case KvCompareKind::kKeyNotExists:
             return EtcdHelper::TxnCompareKind::kKeyNotExists;
+        case KvCompareKind::kCreateRevisionEquals:
+            return EtcdHelper::TxnCompareKind::kCreateRevisionEquals;
     }
     return EtcdHelper::TxnCompareKind::kValueEquals;
 }
@@ -74,13 +76,28 @@ ErrorCode EtcdHaKvBackend::Range(std::string_view begin_key,
 
 bool EtcdHaKvBackend::SupportsTxn() const { return true; }
 
+ErrorCode EtcdHaKvBackend::DeleteRange(std::string_view begin_key,
+                                       std::string_view end_key) {
+    // etcd treats an empty end as a single-key delete and NUL as unbounded.
+    if (begin_key.empty() || end_key.empty() ||
+        end_key == std::string_view("\0", 1) || begin_key > end_key) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (begin_key == end_key) {
+        return ErrorCode::OK;
+    }
+    return EtcdHelper::DeleteRange(begin_key.data(), begin_key.size(),
+                                   end_key.data(), end_key.size());
+}
+
 ErrorCode EtcdHaKvBackend::Txn(const KvTxn& txn) {
     std::vector<EtcdHelper::TxnCompare> compares;
     compares.reserve(txn.compares.size());
     for (const auto& compare : txn.compares) {
         compares.push_back({.key = compare.key,
                             .kind = ToEtcdCompareKind(compare.kind),
-                            .expected_value = compare.expected_value});
+                            .expected_value = compare.expected_value,
+                            .expected_revision = compare.expected_revision});
     }
 
     std::vector<EtcdHelper::TxnPut> puts;

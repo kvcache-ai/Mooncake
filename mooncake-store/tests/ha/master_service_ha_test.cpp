@@ -1,15 +1,20 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
+#include "object_test_helpers.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <map>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -35,6 +40,10 @@ namespace mooncake::test {
 
 class FakeBatchHaKvBackend : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         auto it = kvs_.find(std::string(key));
         if (it == kvs_.end()) {
@@ -91,6 +100,13 @@ class BlockingBatchHaKvBackend : public FakeBatchHaKvBackend {
     void BlockTxn() {
         std::lock_guard<std::mutex> lock(mutex_);
         blocked_ = true;
+        txn_entered_ = false;
+    }
+
+    bool WaitForBlockedTxn(
+        std::chrono::seconds timeout = std::chrono::seconds(2)) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [&] { return txn_entered_; });
     }
 
     void AllowTxn() {
@@ -104,6 +120,8 @@ class BlockingBatchHaKvBackend : public FakeBatchHaKvBackend {
     ErrorCode Txn(const KvTxn& txn) override {
         {
             std::unique_lock<std::mutex> lock(mutex_);
+            txn_entered_ = true;
+            cv_.notify_all();
             cv_.wait(lock, [this] { return !blocked_; });
         }
         return FakeBatchHaKvBackend::Txn(txn);
@@ -113,6 +131,7 @@ class BlockingBatchHaKvBackend : public FakeBatchHaKvBackend {
     std::mutex mutex_;
     std::condition_variable cv_;
     bool blocked_{false};
+    bool txn_entered_{false};
 };
 
 class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
@@ -161,8 +180,45 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
     tl::expected<PendingHandle, ErrorCode> Commit(
         Reservation&& reservation, OpLogEntry entry,
         DurableCallback callback) override {
-        return OrderedOpLogWriter::Commit(
+        auto result = OrderedOpLogWriter::Commit(
             std::move(reservation), std::move(entry),
+            [this, callback = std::move(callback)](const OpLogEntry& durable) {
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    cv_.wait(lock, [&] {
+                        return stopping_ ||
+                               durable.sequence_id <= released_through_;
+                    });
+                }
+                if (callback) {
+                    callback(durable);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    completed_through_ = durable.sequence_id;
+                }
+                cv_.notify_all();
+            });
+        if (result) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++submitted_count_;
+            cv_.notify_all();
+        }
+        return result;
+    }
+
+    bool WaitForSubmittedCount(size_t count,
+                               std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout,
+                            [&] { return submitted_count_ >= count; });
+    }
+
+    tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback) override {
+        return OrderedOpLogWriter::CommitBatch(
+            std::move(reservation), std::move(entries),
             [this, callback = std::move(callback)](const OpLogEntry& durable) {
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
@@ -210,18 +266,228 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
         OrderedOpLogWriter::Stop();
     }
 
+    void ResumeCallbacks() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_through_ = UINT64_MAX;
+        }
+        cv_.notify_all();
+    }
+
+    void HoldCallbacks() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_through_ = 0;
+    }
+
    private:
     std::mutex mutex_;
     std::condition_variable cv_;
     uint64_t released_through_{UINT64_MAX};
     uint64_t completed_through_{0};
+    size_t submitted_count_{0};
     bool stopping_{false};
+};
+
+class RejectingOrderedOpLogWriter : public OrderedOpLogWriter {
+   public:
+    RejectingOrderedOpLogWriter(OrderedOpLogWriterConfig config,
+                                WriteBatchFn write_batch)
+        : OrderedOpLogWriter(std::move(config), std::move(write_batch)) {}
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        if (commit_error_ != ErrorCode::OK) {
+            ++rejected_commits_;
+            return tl::make_unexpected(commit_error_);
+        }
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+    tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback) override {
+        if (commit_error_ != ErrorCode::OK) {
+            ++rejected_commits_;
+            return tl::make_unexpected(commit_error_);
+        }
+        return OrderedOpLogWriter::CommitBatch(
+            std::move(reservation), std::move(entries), std::move(callback));
+    }
+
+    void RejectCommitsWith(ErrorCode error) { commit_error_ = error; }
+
+    size_t rejected_commits() const { return rejected_commits_; }
+
+   private:
+    ErrorCode commit_error_{ErrorCode::OK};
+    size_t rejected_commits_{0};
+};
+
+class RejectOnceOrderedOpLogWriter : public OrderedOpLogWriter {
+   public:
+    RejectOnceOrderedOpLogWriter(OrderedOpLogWriterConfig config,
+                                 WriteBatchFn write_batch)
+        : OrderedOpLogWriter(std::move(config), std::move(write_batch)) {}
+
+    void RejectNextCommit() { reject_next_.store(true); }
+
+    void RejectNextSegmentUnmount() {
+        reject_next_segment_unmount_.store(true);
+    }
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        if (reject_next_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        if (entry.op_type == OpType::SEGMENT_UNMOUNT &&
+            reject_next_segment_unmount_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry), std::move(callback));
+    }
+
+    tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
+        Reservation&& reservation, std::vector<OpLogEntry> entries,
+        DurableCallback callback) override {
+        if (reject_next_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        return OrderedOpLogWriter::CommitBatch(
+            std::move(reservation), std::move(entries), std::move(callback));
+    }
+
+   private:
+    std::atomic<bool> reject_next_{false};
+    std::atomic<bool> reject_next_segment_unmount_{false};
 };
 
 class MasterServiceHATest : public ::testing::Test {
    protected:
     static void EnableDfsForTesting(MasterService& service) {
-        service.enable_dfs_ = true;
+        MasterServiceTestPeer::EnableDfs(service) = true;
+    }
+
+    static WeightMetadataSnapshot ExportWeightMetadata(
+        const MasterService& service) {
+        return MasterServiceTestPeer::WeightMetadata(service).ExportSnapshot();
+    }
+
+    void CheckConcurrentWeightReplay(bool abandoned_import) {
+        const std::string cluster_id = abandoned_import
+                                           ? "weight_abandon_replay"
+                                           : "weight_reconcile_replay";
+        auto backend = std::make_shared<FakeBatchHaKvBackend>();
+        auto config =
+            MasterServiceConfig::builder()
+                .set_enable_ha(true)
+                .set_enable_oplog(true)
+                .set_weight_management_oplog_capability_confirmed(true)
+                .set_cluster_id(cluster_id)
+                .set_oplog_batch_max_entries(1)
+                .build();
+        MasterService service(config);
+        const WeightRevisionIdentity identity{
+            .tenant_id = "default",
+            .name_space = "production",
+            .resource_id = "replay",
+            .revision = "step-100",
+            .weight_generation = 7,
+        };
+        const WeightMetadataSnapshot baseline{
+            .metadata = {WeightRevisionMetadata{
+                .identity = identity,
+                .manifest =
+                    {
+                        .manifest_key = abandoned_import
+                                            ? ""
+                                            : MakeWeightManifestKey(identity),
+                        .manifest_sha256 =
+                            abandoned_import ? "" : std::string(64, 'a'),
+                        .payload_group_id = MakeWeightPayloadGroupId(identity),
+                        .payload_keys_sha256 =
+                            abandoned_import ? "" : std::string(64, 'b'),
+                        .payload_count = 1,
+                        .logical_bytes = 1024,
+                    },
+                .availability = abandoned_import
+                                    ? WeightAvailabilityState::IMPORTING
+                                    : WeightAvailabilityState::READY,
+                .residency = abandoned_import ? WeightResidencyState::UNKNOWN
+                                              : WeightResidencyState::HOT,
+                .operation = WeightOperationState::NONE,
+                .metadata_generation = abandoned_import ? 1u : 2u,
+                .created_at_ms = 100,
+                .updated_at_ms = 200,
+            }},
+            .leases = {},
+            .operations = {},
+            .next_lease_id = 1,
+            .next_operation_id = 1,
+        };
+        ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 0, {}, baseline));
+        auto* writer = InstallGatedWriter(service, backend);
+        ASSERT_TRUE(writer->PauseCallbacksAfter(0));
+        std::future<WeightMetadataStore::Result<WeightRevisionMetadata>> first;
+        std::future<void> second;
+        struct ResumeOnExit {
+            GatedOrderedOpLogWriter* writer;
+            ~ResumeOnExit() { writer->ResumeCallbacks(); }
+        } resume{writer};
+        first = std::async(std::launch::async, [&] {
+            return abandoned_import ? service.AbortWeightImport({
+                                          .identity = identity,
+                                          .expected_metadata_generation = 1,
+                                      })
+                                    : service.ReconcileWeightRevision(
+                                          {.identity = identity});
+        });
+        ASSERT_TRUE(writer->WaitForSubmittedCount(1, std::chrono::seconds(2)));
+        const auto now_ms = [] {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+        };
+        const auto first_submitted_at = now_ms();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        // Distinct timestamps make conflicting same-generation records visible.
+        while (now_ms() <= first_submitted_at &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        ASSERT_GT(now_ms(), first_submitted_at);
+        second = std::async(std::launch::async, [&] {
+            if (abandoned_import) {
+                MasterServiceTestPeer(service)
+                    .RunWeightReconciliationForTesting(now_ms(), 1);
+            } else {
+                (void)service.ReconcileWeightRevision({.identity = identity});
+            }
+        });
+        // A serialized caller cannot submit while the first callback is gated.
+        writer->WaitForSubmittedCount(2, std::chrono::milliseconds(150));
+        writer->ResumeCallbacks();
+        EXPECT_TRUE(first.get());
+        second.get();
+        service.StopBatchOpLogWriter();
+
+        StandbyMetadataStore standby;
+        ASSERT_TRUE(standby.RestoreWeightMetadata(baseline));
+        OpLogApplier applier(&standby, cluster_id);
+        OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+        const auto replayed = reader.PollOnce();
+        EXPECT_EQ(ErrorCode::OK, replayed.error);
+        ASSERT_TRUE(replayed.durable_prefix_present);
+        EXPECT_EQ(replayed.durable_prefix.last_seq + 1,
+                  applier.GetExpectedSequenceId());
+        EXPECT_EQ(ExportWeightMetadata(service),
+                  standby.SnapshotWeightMetadata());
     }
 
     static void SetUpTestSuite() {
@@ -294,15 +560,23 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static bool HasOpLogWriter(const MasterService& service) {
-        return service.ordered_oplog_writer_ != nullptr;
+        return MasterServiceTestPeer::OrderedOplogWriter(service) != nullptr;
     }
 
     static bool IsOpLogEnabled(const MasterService& service) {
-        return service.enable_oplog_;
+        return MasterServiceTestPeer::EnableOplog(service);
     }
 
     static bool HasBatchOpLogStorage(const MasterService& service) {
-        return service.batch_oplog_storage_ != nullptr;
+        return MasterServiceTestPeer::BatchOplogStorage(service) != nullptr;
+    }
+
+    static std::optional<OrderedOpLogWriterTerminalState>
+    GetWriterTerminalStateForTesting(const MasterService& service) {
+        return MasterServiceTestPeer::OrderedOplogWriter(service)
+                   ? MasterServiceTestPeer::OrderedOplogWriter(service)
+                         ->GetTerminalState()
+                   : std::nullopt;
     }
 
     Segment MakeSegment(std::string name = "test_segment",
@@ -395,20 +669,52 @@ class MasterServiceHATest : public ::testing::Test {
 
     static GatedOrderedOpLogWriter* InstallGatedWriter(
         MasterService& service, std::shared_ptr<HaKvBackend> backend) {
-        service.SetBatchOpLogWriterFactoryForTesting(
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
             [](OrderedOpLogWriterConfig config,
                OrderedOpLogWriter::WriteBatchFn write_batch) {
                 return std::make_unique<GatedOrderedOpLogWriter>(
                     std::move(config), std::move(write_batch));
             });
         EXPECT_EQ(ErrorCode::OK,
-                  service.SetBatchOpLogBackendForTesting(std::move(backend)));
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      std::move(backend)));
         return static_cast<GatedOrderedOpLogWriter*>(
-            service.ordered_oplog_writer_.get());
+            MasterServiceTestPeer::OrderedOplogWriter(service).get());
+    }
+
+    static RejectingOrderedOpLogWriter* InstallRejectingWriter(
+        MasterService& service, std::shared_ptr<HaKvBackend> backend) {
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig config,
+               OrderedOpLogWriter::WriteBatchFn write_batch) {
+                return std::make_unique<RejectingOrderedOpLogWriter>(
+                    std::move(config), std::move(write_batch));
+            });
+        EXPECT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      std::move(backend)));
+        return static_cast<RejectingOrderedOpLogWriter*>(
+            MasterServiceTestPeer::OrderedOplogWriter(service).get());
+    }
+
+    static RejectOnceOrderedOpLogWriter* InstallRejectOnceWriter(
+        MasterService& service, std::shared_ptr<HaKvBackend> backend) {
+        MasterServiceTestPeer(service).SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig config,
+               OrderedOpLogWriter::WriteBatchFn write_batch) {
+                return std::make_unique<RejectOnceOrderedOpLogWriter>(
+                    std::move(config), std::move(write_batch));
+            });
+        EXPECT_EQ(ErrorCode::OK,
+                  MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(
+                      std::move(backend)));
+        return static_cast<RejectOnceOrderedOpLogWriter*>(
+            MasterServiceTestPeer::OrderedOplogWriter(service).get());
     }
 
     static uint64_t TenantUsedBytes(MasterService& service) {
-        auto snapshot = service.GetTenantQuotaSnapshot(kDefaultTenant);
+        auto snapshot =
+            service.tenant_quota_policy()->GetSnapshot(kDefaultTenant);
         EXPECT_TRUE(snapshot.has_value());
         return snapshot ? snapshot->charged_bytes : 0;
     }
@@ -487,6 +793,21 @@ class MasterServiceHATest : public ::testing::Test {
         return replica;
     }
 
+    Replica::Descriptor MakeStandbyLocalDiskReplica(const UUID& owner,
+                                                    const std::string& endpoint,
+                                                    size_t size = 1024) const {
+        Replica::Descriptor replica;
+        replica.id = 1;
+        replica.status = ReplicaStatus::COMPLETE;
+
+        LocalDiskDescriptor disk_desc;
+        disk_desc.client_id = owner;
+        disk_desc.object_size = size;
+        disk_desc.transport_endpoint = endpoint;
+        replica.descriptor_variant = std::move(disk_desc);
+        return replica;
+    }
+
     StandbyObjectEntry MakeStandbyObject(const std::string& key,
                                          const std::string& endpoint,
                                          size_t size = 1024) const {
@@ -508,10 +829,7 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
-    // Friend access to MasterService::metadata_shards_ and
-    // getMetadataShardIndex, which are otherwise private.
-    // MasterServiceHATest is friended; TEST_F-generated subclasses are not,
-    // hence this static funnel. Seeds an in-flight PromotionTask for a
+    // Use the test peer to seed an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
     // going through the on-hit admission gate (which is currently
     // restricted to the "default" tenant). Used only by the non-default
@@ -519,47 +837,41 @@ class MasterServiceHATest : public ::testing::Test {
     static void SeedPromotionTaskForTesting(
         MasterService* service, const TenantId& tenant, const std::string& key,
         const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
-        const size_t shard_idx = service->getMetadataShardIndex(tenant, key);
-        auto shard_access =
-            MasterService::MetadataShardAccessorRW(service, shard_idx);
-        auto& tenant_state =
-            service->GetOrCreateTenantState(shard_access.get(), tenant);
-        tenant_state.promotion_tasks.emplace(
-            key, MasterService::PromotionTask{
-                     .source_id = 0,
-                     .alloc_id = alloc_id,
-                     .object_size = object_size,
-                     .start_time = std::chrono::system_clock::now(),
-                     .holder_id = holder_id});
-    }
-
-    static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
-        return service.snapshot_manager_ != nullptr;
+        auto hold = MasterServiceTestPeer::WriteObject(
+            *service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_TRUE(hold.has_value());
+        hold->state().promotion_task = MasterServiceTestPeer::PromotionTask{
+            .source_id = 0,
+            .alloc_id = alloc_id,
+            .object_size = object_size,
+            .start_time = std::chrono::system_clock::now(),
+            .holder_id = holder_id};
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
-        return service.need_mem_eviction_.load(std::memory_order_relaxed);
+        return MasterServiceTestPeer::NeedMemEviction(service).load(
+            std::memory_order_relaxed);
     }
 
     static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
         MasterService& service, OpType type, const std::string& tenant_id,
         const std::string& key, const std::string& payload) {
-        return service.AppendOpLogVisibleBeforeDurable(type, tenant_id, key,
-                                                       payload);
+        return MasterServiceTestPeer(service).AppendOpLogVisibleBeforeDurable(
+            type, tenant_id, key, payload);
     }
 
     static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
         MasterService& service, OpType type, const TenantId& tenant_id,
         const std::string& key, const std::string& payload) {
-        return service.AppendOpLogVisibleBeforeDurable(type, tenant_id.value(),
-                                                       key, payload);
+        return MasterServiceTestPeer(service).AppendOpLogVisibleBeforeDurable(
+            type, tenant_id.value(), key, payload);
     }
 
     static tl::expected<OpLogEntry, ErrorCode> AppendFinalizeForTesting(
         MasterService& service, OpType type, const std::string& tenant_id,
         const std::string& key, const std::string& payload,
         MasterService::DurableFinalizeCallback callback) {
-        return service.AppendOpLogWithDurableFinalize(
+        return MasterServiceTestPeer(service).AppendOpLogWithDurableFinalize(
             type, tenant_id, key, payload, std::move(callback));
     }
 
@@ -567,41 +879,67 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService& service, OpType type, const TenantId& tenant_id,
         const std::string& key, const std::string& payload,
         MasterService::DurableFinalizeCallback callback) {
-        return service.AppendOpLogWithDurableFinalize(
+        return MasterServiceTestPeer(service).AppendOpLogWithDurableFinalize(
             type, tenant_id.value(), key, payload, std::move(callback));
     }
 
     static tl::expected<OrderedOpLogWriter::Reservation, ErrorCode>
     ReserveBatchSlotForTesting(MasterService& service) {
-        if (!service.ordered_oplog_writer_) {
+        if (!MasterServiceTestPeer::OrderedOplogWriter(service)) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        return service.ordered_oplog_writer_->Reserve();
+        return MasterServiceTestPeer::OrderedOplogWriter(service)->Reserve();
+    }
+
+    static void SetNeedMemEvictionForTesting(MasterService& service,
+                                             bool value) {
+        MasterServiceTestPeer::NeedMemEviction(service).store(value);
+    }
+
+    static bool NeedMemEvictionForTesting(const MasterService& service) {
+        return MasterServiceTestPeer::NeedMemEviction(service).load();
     }
 
     static void ClearInvalidHandlesForTesting(
         MasterService& service,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-        service.ClearInvalidHandles(alive_clients);
+        MasterServiceTestPeer(service).ClearInvalidHandles(alive_clients);
     }
 
     static void ClearInvalidHandlesForTesting(MasterService& service) {
-        service.ClearInvalidHandles();
+        MasterServiceTestPeer(service).ClearInvalidHandles();
     }
 
     static size_t ReplicaCountForTesting(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
+    }
+
+    static bool IsHardPinnedForTesting(MasterService& service,
+                                       const TenantId& tenant_id,
+                                       const std::string& key) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() && accessor.Get().IsHardPinned();
+    }
+
+    static std::string GroupIdForTesting(MasterService& service,
+                                         const TenantId& tenant_id,
+                                         const std::string& key) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() ? accessor.Get().group_id
+                                 : std::string("<absent>");
     }
 
     static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         if (!accessor.Exists()) {
             return {};
         }
@@ -612,11 +950,20 @@ class MasterServiceHATest : public ::testing::Test {
         return descriptors;
     }
 
+    static bool HasMetadataEntryForTesting(MasterService& service,
+                                           const TenantId& tenant_id,
+                                           const std::string& key) {
+        return MasterServiceTestPeer::ReadObject(
+                   service,
+                   MasterServiceTestPeer::ObjectIdentity{tenant_id, key})
+            .has_value();
+    }
+
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,
                                                  const TenantId& tenant_id,
                                                  const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         if (!accessor.Exists()) {
             return true;
         }
@@ -631,108 +978,198 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasReadableReplicaForTesting(MasterService& service,
                                              const TenantId& tenant_id,
                                              const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         return accessor.Exists() &&
                accessor.Get().HasReplica([&service](const Replica& replica) {
-                   return service.IsReplicaReadable(replica);
+                   return MasterServiceTestPeer(service).IsReplicaReadable(
+                       replica);
                });
+    }
+
+    static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
+        MasterService& service, const UUID& client_id) {
+        return MasterServiceTestPeer(service).FindClientRecord(client_id);
+    }
+
+    static tl::expected<bool, ErrorCode> AddReplicaForRetainedClientForTesting(
+        MasterService& service, const UUID& client_id, const std::string& key,
+        Replica& replica) {
+        return MasterServiceTestPeer(service).AddReplicaForRetainedClient(
+            client_id, key, kDefaultTenant, replica);
+    }
+
+    static bool ProcessClientOffboardingForTesting(MasterService& service,
+                                                   ClientOffboardingJob& job) {
+        return MasterServiceTestPeer(service).ProcessClientOffboardingJob(job);
+    }
+
+    static bool HasCompletedMemoryReplicaForTesting(MasterService& service,
+                                                    const TenantId& tenant_id,
+                                                    const std::string& key) {
+        const auto hold = MasterServiceTestPeer::ReadObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        return hold.has_value() &&
+               hold->metadata().HasReplica([](const Replica& replica) {
+                   return replica.is_memory_replica() && replica.is_completed();
+               });
+    }
+
+    static bool MemoryReplicaAffiliatedWithForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key,
+        const std::shared_ptr<ClientLivenessRecord>& record) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return false;
+        }
+        return accessor.Get().HasReplica([&](const Replica& replica) {
+            return replica.is_memory_replica() &&
+                   replica.isAffiliatedWith(record);
+        });
     }
 
     static void SetLeaseDeadlineForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key,
         std::chrono::system_clock::time_point deadline) {
-        MasterService::MetadataAccessorRW accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
         SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_timeout = deadline;
+        accessor.Get().lease_->SetDeadline(deadline);
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         EXPECT_TRUE(accessor.Exists());
         if (!accessor.Exists()) {
             return {};
         }
         SpinLocker locker(&accessor.Get().lock);
-        return accessor.Get().lease_timeout;
+        return accessor.Get().lease_->ExpiresAt();
     }
 
-    static uint64_t EvictTenantMemoryForQuotaForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        uint64_t target_bytes) {
-        return service.EvictTenantMemoryForQuota(tenant_id, target_bytes)
+    static uint64_t EvictNamespaceMemoryForTesting(MasterService& service,
+                                                   const TenantId& tenant_id,
+                                                   uint64_t target_bytes) {
+        return MasterServiceTestPeer(service)
+            .EvictNamespaceMemory(tenant_id, target_bytes)
             .freed_bytes;
     }
 
     static std::unique_lock<std::shared_mutex> LockSnapshotForTesting(
         MasterService& service) {
-        return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
+        return std::unique_lock<std::shared_mutex>(
+            MasterServiceTestPeer::MasterStateMutex(service));
     }
 
-    static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
-        return std::unique_lock<SharedMutex>(
-            service.metadata_shards_[shard_idx].mutex);
+    // Holds `key` exclusively, whether or not it holds an object, the way a
+    // write path holds it.
+    static route::WriteGuard LockKeyForTesting(MasterService& service,
+                                               const TenantId& tenant_id,
+                                               const std::string& key) {
+        return MasterServiceTestPeer(service)
+            .GetOrCreateNamespace(tenant_id)
+            .objects.WriteKey(key);
     }
 
-    static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key) {
-        const auto scoped_key = tenant_id.MakeScopedKey(key);
-        const size_t stripe_idx = std::hash<std::string>{}(scoped_key) %
-                                  MasterService::kObjectOperationLockStripes;
-        std::unique_lock<std::mutex> object_lock(
-            service.object_operation_locks_[stripe_idx], std::try_to_lock);
-        if (object_lock.owns_lock()) {
+    template <typename CreateTask>
+    static bool CreateTaskReleasesMetadataBeforeServingGuardForTesting(
+        MasterService& service, const UUID& source_client,
+        const TenantId& tenant_id, const std::string& key,
+        CreateTask create_task) {
+        auto liveness =
+            MasterServiceTestPeer(service).FindClientRecord(source_client);
+        auto serving_guard =
+            liveness ? liveness->TryAcquireServingGuard() : std::nullopt;
+        if (!serving_guard) {
             return false;
         }
-        std::unique_lock<std::shared_mutex> client_lock(service.client_mutex_,
-                                                        std::try_to_lock);
+
+        auto segment_lock = std::make_unique<ScopedSegmentAccess>(
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess());
+        auto task = std::async(std::launch::async, std::move(create_task));
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(tenant_id);
+        if (ns == nullptr) {
+            return false;
+        }
+        const auto wait_for_metadata = [&](bool available, auto timeout) {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (ObjectRouteTestPeer::KeyLockFree(ns->objects, key) ==
+                    available) {
+                    return true;
+                }
+                std::this_thread::yield();
+            }
+            return false;
+        };
+
+        const bool reached_discovery =
+            wait_for_metadata(false, std::chrono::seconds(5));
+        segment_lock.reset();
+        const bool metadata_released =
+            reached_discovery &&
+            wait_for_metadata(true, std::chrono::seconds(1));
+        serving_guard.reset();
+        return task.get().has_value() && reached_discovery && metadata_released;
+    }
+
+    // PutStart is the only caller in these tests that holds the snapshot
+    // barrier shared, so a barrier that cannot be taken exclusively while the
+    // client lock is free means PutStart reached it and let the client lock
+    // go.
+    static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
+        MasterService& service) {
+        std::unique_lock<std::shared_mutex> client_lock(
+            MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
         if (!client_lock.owns_lock()) {
             return false;
         }
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            service.snapshot_mutex_, std::try_to_lock);
+            MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
     }
 
     static std::unique_lock<std::shared_mutex> LockClientForTesting(
         MasterService& service) {
-        return std::unique_lock<std::shared_mutex>(service.client_mutex_);
+        return std::unique_lock<std::shared_mutex>(
+            MasterServiceTestPeer::ClientMutex(service));
     }
 
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
                                                  const std::string& name) {
-        auto access = service.segment_manager_.getAllocatorAccess();
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
         const auto* allocators =
             access.getAllocatorManager().getAllocators(name);
         EXPECT_NE(allocators, nullptr);
         EXPECT_EQ(allocators == nullptr ? 0 : allocators->size(), 1);
-        return allocators == nullptr || allocators->empty()
-                   ? 0
-                   : allocators->front()->size();
+        const auto allocator = allocators == nullptr || allocators->empty()
+                                   ? nullptr
+                                   : allocators->front()->GetAllocator();
+        return allocator ? allocator->size() : 0;
     }
 
     static void EraseObjectForTesting(MasterService& service,
                                       const TenantId& tenant_id,
                                       const std::string& key) {
-        MasterService::MetadataAccessorRW accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
         accessor.Erase();
     }
 
     static void PrepareUnmountSegmentForTesting(MasterService& service,
                                                 const UUID& segment_id) {
-        auto segment_access = service.segment_manager_.getSegmentAccess();
+        auto segment_access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
         size_t metrics_dec_capacity = 0;
         ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
                                      segment_id, metrics_dec_capacity));
@@ -741,8 +1178,8 @@ class MasterServiceHATest : public ::testing::Test {
     static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterService::MetadataAccessorRW accessor(
-            &service, MasterService::ObjectIdentity{tenant_id, key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant_id, key});
         if (!accessor.Exists()) {
             return {};
         }
@@ -758,27 +1195,30 @@ class MasterServiceHATest : public ::testing::Test {
     static void FinalizeRemovedReplicasForTesting(
         MasterService& service, const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids) {
-        service.FinalizeRemovedReplicasAfterDurable(
-            durable_entry, replica_ids, MasterService::QuotaEraseMode::kFull);
+        MasterServiceTestPeer(service).FinalizeRemovedReplicasAfterDurable(
+            durable_entry, replica_ids);
     }
 
     static void SetLocalDiskUsedBytesForTesting(MasterService& service,
                                                 const UUID& client_id,
                                                 int64_t used_bytes) {
-        auto usage = service.local_ssd_manager_.GetUsage(client_id);
+        auto usage =
+            MasterServiceTestPeer::LocalSsdManager(service).GetUsage(client_id);
         ASSERT_TRUE(usage.has_value());
-        service.local_ssd_manager_.AdjustUsedBytes(
+        MasterServiceTestPeer::LocalSsdManager(service).AdjustUsedBytes(
             client_id, used_bytes - usage->used_bytes);
     }
 
     static int64_t GetLocalDiskUsedBytesForTesting(
         MasterService& service, const std::string& segment_name) {
-        auto access = service.segment_manager_.getAllocatorAccess();
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getAllocatorAccess();
         auto client_id = access.GetOwnerClientId(segment_name);
         if (!client_id) {
             return 0;
         }
-        auto usage = service.local_ssd_manager_.GetUsage(*client_id);
+        auto usage = MasterServiceTestPeer::LocalSsdManager(service).GetUsage(
+            *client_id);
         return usage ? usage->used_bytes : 0;
     }
 
@@ -910,7 +1350,419 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
 
-TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
+TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
+    const std::string endpoint = "checksum_restore_segment";
+    auto legacy_object = MakeStandbyObject("checksum_legacy_key", endpoint);
+    legacy_object.metadata.object_checksum = 0x1234;
+    auto batch_object = MakeStandbyObject("checksum_batch_key", endpoint);
+    batch_object.metadata.object_checksum = 0;
+
+    MasterService legacy_service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ASSERT_TRUE(
+        legacy_service
+            .RestoreFromStandbySnapshot({legacy_object}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+    MasterServiceTestPeer::MetadataAccessorRO legacy_accessor(
+        &legacy_service, MasterServiceTestPeer::ObjectIdentity{
+                             kDefaultTenant, legacy_object.key});
+    ASSERT_TRUE(legacy_accessor.Exists());
+    EXPECT_EQ(legacy_accessor.Get().GetPart(0).checksum(),
+              std::optional<uint64_t>(0x1234));
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
+                                    batch_object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = batch_object.metadata.replicas.front().id;
+
+    MasterService batch_service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ASSERT_TRUE(
+        batch_service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    MasterServiceTestPeer::MetadataAccessorRO batch_accessor(
+        &batch_service, MasterServiceTestPeer::ObjectIdentity{
+                            kDefaultTenant, batch_object.key});
+    ASSERT_TRUE(batch_accessor.Exists());
+    EXPECT_EQ(batch_accessor.Get().GetPart(0).checksum(),
+              std::optional<uint64_t>(0));
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_replica_id_segment";
+    PrepareSimpleSegment(service, endpoint);
+    auto object = MakeStandbyObject("standby_replica_id_key", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    object.metadata.replicas.front().id = 41;
+    auto removed = MakeStandbyMemoryReplica(endpoint);
+    removed.id = 42;
+    removed.status = ReplicaStatus::REMOVED;
+    object.metadata.replicas.push_back(std::move(removed));
+
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_replica_id_key");
+    ASSERT_EQ(replicas.size(), 2);
+    EXPECT_EQ(replicas[0].id, 41);
+    EXPECT_EQ(replicas[1].id, 42);
+
+    const UUID client_id = generate_uuid();
+    const std::string new_key = "standby_replica_id_new_key";
+    PutObjectOnSegment(service, client_id, new_key, endpoint);
+    auto new_replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, new_key);
+    ASSERT_EQ(new_replicas.size(), 1);
+    EXPECT_GE(new_replicas.front().id, 43);
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionCopiesMultipleChunksAndPreservesIds) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "batch_promotion_segment";
+
+    auto first = MakeStandbyObject("batch_promotion_first", endpoint);
+    first.metadata.replicas.front().id = 41;
+    first.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto second = MakeStandbyObject("batch_promotion_second", endpoint);
+    second.tenant_id = "batch-promotion-tenant";
+    second.metadata.replicas.front().id = 42;
+    second.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(first.tenant_id, first.key, first.metadata));
+    ASSERT_TRUE(
+        source->PutMetadata(second.tenant_id, second.key, second.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 42;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
+    auto first_descriptors =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, first.key);
+    auto second_descriptors = ReplicaDescriptorsForTesting(
+        service, TenantId(second.tenant_id), second.key);
+    ASSERT_EQ(first_descriptors.size(), 1);
+    ASSERT_EQ(second_descriptors.size(), 1);
+    EXPECT_EQ(first_descriptors.front().id, 41);
+    EXPECT_EQ(second_descriptors.front().id, 42);
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "batch_promotion_overlap_segment";
+    auto first = MakeStandbyObject("batch_promotion_overlap_first", endpoint);
+    first.metadata.replicas.front().id = 51;
+    first.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto second = MakeStandbyObject("batch_promotion_overlap_second", endpoint);
+    second.metadata.replicas.front().id = 52;
+    second.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(first.tenant_id, first.key, first.metadata));
+    ASSERT_TRUE(
+        source->PutMetadata(second.tenant_id, second.key, second.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 52;
+
+    auto result = service.RestoreFromBatchOpLogPromotion(handoff, 1);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(2u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(first.tenant_id, first.key));
+    EXPECT_TRUE(handoff.metadata_store->Exists(second.tenant_id, second.key));
+    EXPECT_EQ(
+        HasMetadataEntryForTesting(service, kDefaultTenant, first.key) +
+            HasMetadataEntryForTesting(service, kDefaultTenant, second.key),
+        1);
+}
+
+TEST_F(MasterServiceHATest,
+       BatchPromotionRestoreLeavesHandoffIntactForPreserve) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "batch_promotion_preserve_segment";
+    auto object = MakeStandbyObject("batch_promotion_preserve_key", endpoint);
+    object.metadata.replicas.front().id = 61;
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(object.tenant_id, object.key, object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 11, .last_seq = 11};
+    handoff.max_replica_id = 61;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(handoff, 1).has_value());
+    ASSERT_TRUE(handoff.metadata_store);
+    EXPECT_EQ(1u, handoff.metadata_store->GetKeyCount());
+    EXPECT_TRUE(handoff.metadata_store->Exists(object.tenant_id, object.key));
+    auto replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, object.key);
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front().id, 61);
+
+    HotStandbyConfig config;
+    config.enable_verification = false;
+    HotStandbyService standby(config);
+    ASSERT_EQ(ErrorCode::OK,
+              standby.PreservePromotionBaseline(
+                  std::move(handoff.metadata_store), handoff.applied_cursor,
+                  /*producer_view_version=*/7, handoff.segments));
+    EXPECT_EQ(11u, standby.GetSyncStatus().applied_seq_id);
+    EXPECT_EQ(1u, standby.GetMetadataCount());
+}
+
+TEST_F(MasterServiceHATest, RestoreRejectsInvalidReplicaIds) {
+    const std::string endpoint = "standby_invalid_replica_id_segment";
+    for (const ReplicaID id :
+         {ReplicaID{0}, std::numeric_limits<ReplicaID>::max()}) {
+        MasterService service(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
+        auto object = MakeStandbyObject("standby_invalid_replica_id", endpoint);
+        object.metadata.replicas.front().id = id;
+
+        auto result = service.RestoreFromStandbySnapshot(
+            {object}, 7, {MakeStandbyMemorySegment(endpoint)});
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto object = MakeStandbyObject("standby_duplicate_replica_id", endpoint);
+    auto duplicate = MakeStandbyMemoryReplica(endpoint);
+    duplicate.id = object.metadata.replicas.front().id;
+    duplicate.status = ReplicaStatus::REMOVED;
+    object.metadata.replicas.push_back(std::move(duplicate));
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {object}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+
+    auto first = MakeStandbyObject("standby_cross_object_id_first", endpoint);
+    auto second = MakeStandbyObject("standby_cross_object_id_second", endpoint);
+    first.metadata.replicas.front().id = 73;
+    second.metadata.replicas.front().id = 73;
+    second.metadata.replicas.front().status = ReplicaStatus::REMOVED;
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({first, second}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
+}
+
+TEST_F(MasterServiceHATest, FailedRestoreDoesNotAdvanceReplicaIdCounter) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    PrepareSimpleSegment(service, "replica_id_counter");
+    const UUID first_client = generate_uuid();
+    const std::string first_key = "replica_id_counter_first";
+    PutObjectOnSegment(service, first_client, first_key, "replica_id_counter");
+    const auto first =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, first_key);
+    ASSERT_EQ(first.size(), 1);
+
+    // With the tolerant restore, a whole-restore failure only happens when
+    // nothing lands at all. Give both entries unknown endpoints so neither
+    // can land, then the counter must stay exactly where it was.
+    auto valid = MakeStandbyObject("replica_id_counter_valid",
+                                   "unknown_replica_id_endpoint_a");
+    valid.metadata.replicas.front().id = first.front().id + 1000;
+    valid.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    auto invalid = MakeStandbyObject("replica_id_counter_invalid",
+                                     "unknown_replica_id_endpoint_b");
+    invalid.metadata.replicas.front().id = first.front().id + 2000;
+    auto result = service.RestoreFromStandbySnapshot(
+        {valid, invalid}, 7, {MakeStandbyMemorySegment("replica_id_counter")});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "replica_id_counter_valid"),
+              0);
+
+    const UUID second_client = generate_uuid();
+    const std::string second_key = "replica_id_counter_second";
+    PutObjectOnSegment(service, second_client, second_key,
+                       "replica_id_counter");
+    const auto second =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, second_key);
+    ASSERT_EQ(second.size(), 1);
+    EXPECT_EQ(second.front().id, first.front().id + 1);
+}
+
+TEST_F(MasterServiceHATest,
+       StandbyMemoryRemainsUnaffiliatedUntilActualOwnerRemounts) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_unaffiliated_key";
+    const std::string endpoint = "standby_unaffiliated_segment";
+    auto object = MakeStandbyObject(key, endpoint);
+    const UUID writer_id = object.metadata.client_id;
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    EXPECT_FALSE(ClientRecordForTesting(service, writer_id));
+    auto before_remount = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_FALSE(before_remount.has_value());
+    EXPECT_EQ(before_remount.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    const UUID actual_owner = generate_uuid();
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, actual_owner)
+                    .has_value());
+    const auto actual_record = ClientRecordForTesting(service, actual_owner);
+    ASSERT_TRUE(actual_record);
+    EXPECT_FALSE(ClientRecordForTesting(service, writer_id));
+    EXPECT_TRUE(MemoryReplicaAffiliatedWithForTesting(service, kDefaultTenant,
+                                                      key, actual_record));
+}
+
+TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesHardPinned) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_restore_hard_pinned";
+    const std::string endpoint = "standby_restore_hard_pinned_segment";
+    auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.hard_pinned = true;
+
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    EXPECT_TRUE(IsHardPinnedForTesting(service, kDefaultTenant, key));
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionDropsReplicasOnUnloadedSegments) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "batch_drop_live_segment";
+    const std::string stale_endpoint = "batch_drop_unloaded_segment";
+    auto object = MakeStandbyObject("batch_drop_key", endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    // A replica on a segment that was unloaded before the handoff must not
+    // fail the promotion; it is simply gone.
+    auto stale = MakeStandbyMemoryReplica(stale_endpoint);
+    stale.id = 2;
+    stale.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + 4096;
+    object.metadata.replicas.push_back(std::move(stale));
+    auto stale_tombstone = MakeStandbyMemoryReplica(stale_endpoint);
+    stale_tombstone.id = 3;
+    stale_tombstone.status = ReplicaStatus::REMOVED;
+    object.metadata.replicas.push_back(std::move(stale_tombstone));
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(
+        source->PutMetadata(object.tenant_id, object.key, object.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 3;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+
+    auto replicas =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, "batch_drop_key");
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front().id, 1);
+    EXPECT_EQ(replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint);
+}
+
+TEST_F(MasterServiceHATest, BatchPromotionSkipsObjectWhenAllReplicasAreStale) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "batch_skip_live_segment";
+    auto good = MakeStandbyObject("batch_skip_good", endpoint);
+    good.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto stale_only =
+        MakeStandbyObject("batch_skip_stale", "batch_skip_unloaded_segment");
+    stale_only.metadata.replicas.front().id = 2;
+    auto empty = MakeStandbyObject("batch_skip_empty", endpoint);
+    empty.metadata.replicas.clear();
+
+    auto source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(source->PutMetadata(good.tenant_id, good.key, good.metadata));
+    ASSERT_TRUE(source->PutMetadata(stale_only.tenant_id, stale_only.key,
+                                    stale_only.metadata));
+    ASSERT_TRUE(
+        source->PutMetadata(empty.tenant_id, empty.key, empty.metadata));
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 2;
+
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "batch_skip_good"), 1);
+    EXPECT_FALSE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                            "batch_skip_stale"));
+    EXPECT_TRUE(HasMetadataEntryForTesting(service, kDefaultTenant,
+                                           "batch_skip_empty"));
+}
+
+TEST_F(MasterServiceHATest, RestoreSkipsBadObjectAndKeepsExistingState) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -923,9 +1775,10 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
                     .RestoreFromStandbySnapshot(
                         {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
-    const auto metric_after_restore =
-        MasterMetricManager::instance().get_allocated_mem_size();
 
+    // #3760: a bad entry is skipped and the previously restored state is
+    // untouched, but a snapshot in which nothing lands at all is a failed
+    // restore, not a successful empty one.
     auto invalid =
         MakeStandbyObject("standby_restore_invalid", "unknown_endpoint");
     auto result = service.RestoreFromStandbySnapshot(
@@ -939,13 +1792,88 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_restore_invalid"),
               0);
-    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
-              metric_after_restore);
     ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
                     .has_value());
 }
 
-TEST_F(MasterServiceHATest, RestoreRejectsDescriptorSizeMismatch) {
+TEST_F(MasterServiceHATest, RestoreToleratesBadObjectAlongsideGoodOnes) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_mixed_segment";
+    auto good = MakeStandbyObject("standby_mixed_good", endpoint);
+    good.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto bad = MakeStandbyObject("standby_mixed_bad", "unknown_endpoint");
+
+    // Per-object tolerance holds for a mixed snapshot: the good entry lands,
+    // the bad one is skipped, and the restore succeeds because something
+    // actually restored.
+    auto result = service.RestoreFromStandbySnapshot(
+        {good, bad}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "standby_mixed_good"),
+        1);
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "standby_mixed_bad"),
+        0);
+}
+
+TEST_F(MasterServiceHATest, RestoreSkipsUngroupedObjectDuplicatedIntoAGroup) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_cross_shard_duplicate";
+    const std::string endpoint = "standby_cross_shard_segment";
+    auto existing = MakeStandbyObject(key, endpoint);
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    // #3760: the duplicate is skipped and the original entry is kept.
+    auto duplicate = MakeStandbyObject(key, endpoint);
+    duplicate.metadata.group_id = "duplicate-group";
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    EXPECT_TRUE(GroupIdForTesting(service, kDefaultTenant, key).empty());
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreSkipsGroupedObjectDuplicatedIntoAnotherGroup) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_cross_group_duplicate";
+    const std::string endpoint = "standby_cross_group_segment";
+    auto existing = MakeStandbyObject(key, endpoint);
+    existing.metadata.group_id = "existing-group";
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {existing}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+
+    // #3760: the duplicate is skipped and the original grouping is kept.
+    auto duplicate = MakeStandbyObject(key, endpoint);
+    duplicate.metadata.group_id = "replacement-group";
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    EXPECT_EQ(GroupIdForTesting(service, kDefaultTenant, key),
+              "existing-group");
+}
+
+TEST_F(MasterServiceHATest, RestoreSkipsDescriptorSizeMismatch) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -955,14 +1883,19 @@ TEST_F(MasterServiceHATest, RestoreRejectsDescriptorSizeMismatch) {
         .get_memory_descriptor()
         .buffer_descriptor.size_ = object.metadata.size + 1;
 
+    // #3760: the mismatched entry is skipped, and since nothing lands from
+    // this snapshot the restore reports failure instead of an empty success.
     auto result = service.RestoreFromStandbySnapshot(
         {object}, 7, {MakeStandbyMemorySegment(endpoint)});
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_descriptor_mismatch"),
+              0);
 }
 
-TEST_F(MasterServiceHATest, RestoreRejectsDescriptorsBeyondSegmentCapacity) {
+TEST_F(MasterServiceHATest, RestoreSkipsDescriptorsBeyondSegmentCapacity) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -976,11 +1909,70 @@ TEST_F(MasterServiceHATest, RestoreRejectsDescriptorsBeyondSegmentCapacity) {
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
 
+    // #3760: the first entry fills the segment exactly and survives; the
+    // second would push past capacity and is skipped on its own.
     auto result = service.RestoreFromStandbySnapshot(
         {first, second}, 7, {MakeStandbyMemorySegment(endpoint, 1024)});
 
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_capacity_first"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_capacity_second"),
+              0);
+}
+
+TEST_F(MasterServiceHATest, RestoreWithChangedEndpointGetsFreshAllocator) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    // The same segment name returns under a new endpoint in the next
+    // snapshot. Reusing the first endpoint's allocator through the name
+    // alias would make the new replica report the stale endpoint and look
+    // readable before the new endpoint remounts.
+    const std::string name = "standby_rebind_segment";
+    const std::string endpoint_v1 = "standby_rebind_endpoint_v1";
+    const std::string endpoint_v2 = "standby_rebind_endpoint_v2";
+
+    auto segment_v1 = MakeStandbyMemorySegment(endpoint_v1);
+    segment_v1.segment_name = name;
+    auto first = MakeStandbyObject("standby_rebind_first", endpoint_v1);
+    first.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({first}, 7, {segment_v1})
+                    .has_value());
+
+    auto segment_v2 = MakeStandbyMemorySegment(endpoint_v2);
+    segment_v2.segment_name = name;
+    auto second = MakeStandbyObject("standby_rebind_second", endpoint_v2);
+    second.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({second}, 7, {segment_v2})
+                    .has_value());
+
+    auto replicas = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_rebind_second");
+    ASSERT_EQ(replicas.size(), 1);
+    EXPECT_EQ(replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              endpoint_v2);
+    EXPECT_FALSE(HasReadableReplicaForTesting(service, kDefaultTenant,
+                                              "standby_rebind_second"));
+
+    Segment segment_v2_live;
+    segment_v2_live.id = generate_uuid();
+    segment_v2_live.name = name;
+    segment_v2_live.te_endpoint = endpoint_v2;
+    segment_v2_live.base = kDefaultSegmentBase;
+    segment_v2_live.size = kDefaultSegmentSize;
+    ASSERT_TRUE(
+        service.ReMountSegment({segment_v2_live}, generate_uuid()).has_value());
+    EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant,
+                                             "standby_rebind_second"));
 }
 
 TEST_F(MasterServiceHATest, RestoreRejectsDfsMode) {
@@ -1015,11 +2007,13 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsTenantQuotaAccounting) {
                         {object}, 7, {MakeStandbyMemorySegment(endpoint)})
                     .has_value());
 
-    auto snapshot = service.GetTenantQuotaSnapshot(tenant_id);
+    auto snapshot = service.tenant_quota_policy()->GetSnapshot(tenant_id);
     ASSERT_TRUE(snapshot.has_value());
     EXPECT_EQ(snapshot->charged_bytes, object_size);
     ASSERT_TRUE(service.Remove(key, tenant_id, /*force=*/true).has_value());
-    EXPECT_EQ(service.GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 0);
+    EXPECT_EQ(
+        service.tenant_quota_policy()->GetSnapshot(tenant_id)->charged_bytes,
+        0);
 }
 
 TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
@@ -1042,12 +2036,13 @@ TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
     SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
                                std::chrono::system_clock::time_point{});
 
-    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                    /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
-    EXPECT_EQ(EvictTenantMemoryForQuotaForTesting(service, kDefaultTenant,
-                                                  object_size),
-              0);
+    EXPECT_EQ(
+        EvictNamespaceMemoryForTesting(service, kDefaultTenant, object_size),
+        0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
     EXPECT_FALSE(HasReadableReplicaForTesting(service, kDefaultTenant, key));
     auto get = service.GetReplicaList(key, kDefaultTenant);
@@ -1078,14 +2073,16 @@ TEST_F(MasterServiceHATest, SuccessfulRemountGrantsEvictionLease) {
     EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant, key));
     EXPECT_GT(LeaseDeadlineForTesting(service, kDefaultTenant, key),
               std::chrono::system_clock::now());
-    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                    /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
 
     SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
                                std::chrono::system_clock::time_point{});
-    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                    /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 0);
 }
 
@@ -1143,7 +2140,8 @@ TEST_F(MasterServiceHATest,
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto shard_lock = LockMetadataShardForTesting(service, kDefaultTenant, key);
+    std::optional<route::WriteGuard> key_lock(
+        LockKeyForTesting(service, kDefaultTenant, key));
     auto put = std::async(std::launch::async, [&] {
         return service.PutStart(client_id, key, kDefaultTenant, 1024, config);
     });
@@ -1152,15 +2150,14 @@ TEST_F(MasterServiceHATest,
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     bool reached_snapshot = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
-                service, kDefaultTenant, key)) {
+        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(service)) {
             reached_snapshot = true;
             break;
         }
         std::this_thread::yield();
     }
     if (!reached_snapshot) {
-        shard_lock.unlock();
+        key_lock.reset();
         EXPECT_EQ(put.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
         if (put.wait_for(std::chrono::seconds(0)) ==
@@ -1173,7 +2170,7 @@ TEST_F(MasterServiceHATest,
     // ReMountSegment holds client_mutex_ exclusively while waiting for the
     // snapshot barrier. PutStart must not reacquire it inside that barrier.
     auto client_lock = LockClientForTesting(service);
-    shard_lock.unlock();
+    key_lock.reset();
     const bool completed_while_client_locked =
         put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
     client_lock.unlock();
@@ -1184,6 +2181,174 @@ TEST_F(MasterServiceHATest,
     EXPECT_TRUE(completed_while_client_locked);
 }
 
+TEST_F(MasterServiceHATest,
+       CopyAndMoveTaskCreationReleaseMetadataBeforeServingGuard) {
+    for (const bool move : {false, true}) {
+        SCOPED_TRACE(move ? "move" : "copy");
+        MasterService service(MasterServiceConfig::builder().build());
+        const std::string suffix = move ? "move" : "copy";
+        const std::string source_name = "task_lock_order_" + suffix + "_src";
+        const std::string target_name = "task_lock_order_" + suffix + "_dst";
+        const std::string key = "task_lock_order_" + suffix + "_key";
+        auto source = PrepareSimpleSegment(service, source_name);
+        PrepareSimpleSegment(service, target_name,
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+        PutObjectOnSegment(service, source.client_id, key, source_name);
+
+        EXPECT_TRUE(CreateTaskReleasesMetadataBeforeServingGuardForTesting(
+            service, source.client_id, kDefaultTenant, key,
+            [&service, move, &key, &source_name, &target_name] {
+                if (move) {
+                    return service.CreateMoveTask(key, kDefaultTenant,
+                                                  source_name, target_name);
+                }
+                return service.CreateCopyTask(key, kDefaultTenant,
+                                              {target_name});
+            }));
+    }
+}
+
+TEST_F(MasterServiceHATest,
+       RetainedAddReplicaDoesNotReacquireClientRegistryLock) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    auto mounted =
+        PrepareSimpleSegment(service, "retained_add_replica_segment");
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(mounted.client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
+    const auto record = ClientRecordForTesting(service, mounted.client_id);
+    ASSERT_TRUE(record);
+    auto retaining_guard = record->TryAcquireRetainingGuard();
+    ASSERT_TRUE(retaining_guard);
+
+    Replica replica(mounted.client_id, 1024, "retained_add_replica_endpoint",
+                    ReplicaStatus::COMPLETE, record);
+    auto client_lock = LockClientForTesting(service);
+    auto add = std::async(std::launch::async, [&] {
+        return AddReplicaForRetainedClientForTesting(
+            service, mounted.client_id, "retained_add_replica_key", replica);
+    });
+    const bool completed_while_client_locked =
+        add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    client_lock.unlock();
+
+    ASSERT_EQ(add.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto result = add.get();
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    EXPECT_TRUE(completed_while_client_locked);
+}
+
+TEST_F(MasterServiceHATest,
+       ClientOffboardingRetriesRejectedMetadataOpLogBeforeSegmentCommit) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("offboarding_retry_oplog")
+                      .build();
+    MasterService service(config);
+    auto writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    auto segment = MakeSegment("offboarding_retry_oplog_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    const std::string key = "offboarding_retry_oplog_key";
+    PutObjectOnSegment(service, client_id, key, segment.name);
+
+    const auto liveness = ClientRecordForTesting(service, client_id);
+    ASSERT_TRUE(liveness);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = liveness;
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    writer->RejectNextCommit();
+    ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
+    EXPECT_FALSE(job.metadata_cleanup_accepted);
+    ASSERT_EQ(job.prepared_segments.size(), 1u);
+    EXPECT_TRUE(
+        HasCompletedMemoryReplicaForTesting(service, kDefaultTenant, key));
+    EXPECT_TRUE(service.QuerySegmentStatusById(segment.id).has_value());
+
+    ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
+    EXPECT_TRUE(job.prepared_segments.empty());
+    EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
+    EXPECT_FALSE(ClientRecordForTesting(service, client_id));
+}
+
+TEST_F(MasterServiceHATest,
+       ClientOffboardingRetainsNameAcrossRejectedUnmountOpLog) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id("offboarding_retry_unmount_oplog")
+                      .build();
+    MasterService service(config);
+    auto writer = InstallRejectOnceWriter(
+        service, std::make_shared<FakeBatchHaKvBackend>());
+    ASSERT_NE(writer, nullptr);
+
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline_capacity = metrics.get_total_mem_capacity();
+    auto segment = MakeSegment("offboarding_reserved_segment_name");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    ASSERT_EQ(metrics.get_total_mem_capacity(),
+              baseline_capacity + static_cast<int64_t>(segment.size));
+
+    const auto liveness = ClientRecordForTesting(service, client_id);
+    ASSERT_TRUE(liveness);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    MasterMetricManager::instance().client_liveness_became_suspected();
+    ASSERT_EQ(liveness->Evaluate(now, std::chrono::seconds::zero(),
+                                 std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+    MasterMetricManager::instance().client_liveness_became_offline();
+
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = liveness;
+    job.pending_prepare_segments.push_back(
+        {.segment_id = segment.id,
+         .segment_name = segment.name,
+         .transport_endpoint = segment.te_endpoint});
+
+    writer->RejectNextSegmentUnmount();
+    ASSERT_FALSE(ProcessClientOffboardingForTesting(service, job));
+    EXPECT_FALSE(service.QuerySegmentStatusById(segment.id).has_value());
+    EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
+
+    auto replacement = MakeSegment(segment.name, /*base=*/0x400000000);
+    const UUID replacement_client = generate_uuid();
+    auto blocked_mount = service.MountSegment(replacement, replacement_client);
+    ASSERT_FALSE(blocked_mount.has_value());
+    EXPECT_EQ(blocked_mount.error(), ErrorCode::INVALID_PARAMS);
+
+    ASSERT_TRUE(ProcessClientOffboardingForTesting(service, job));
+    EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
+    ASSERT_TRUE(
+        service.MountSegment(replacement, replacement_client).has_value());
+}
+
 TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -1192,8 +2357,9 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {
     auto started_future = started.get_future();
     auto eviction = std::async(std::launch::async, [&] {
         started.set_value();
-        service.RunNoFBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                           /*evict_ratio_lowerbound=*/1.0);
+        MasterServiceTestPeer(service).RunNoFBatchEvictForTesting(
+            /*evict_ratio_target=*/1.0,
+            /*evict_ratio_lowerbound=*/1.0);
     });
     started_future.wait();
     EXPECT_EQ(eviction.wait_for(std::chrono::milliseconds(100)),
@@ -1322,6 +2488,48 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               3072);
 }
 
+TEST_F(MasterServiceHATest, RemountMatchesSharedEndpointRangesByAddress) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "shared_endpoint_numa_ranges";
+    const size_t range_size = 4096;
+    const size_t second_range_base = kDefaultSegmentBase + range_size;
+    auto first_object = MakeStandbyObject("shared_range_first", endpoint);
+    first_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 128;
+    auto second_object = MakeStandbyObject("shared_range_second", endpoint);
+    second_object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = second_range_base + 128;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {first_object, second_object}, 7,
+                        {MakeStandbyMemorySegment(endpoint, range_size)})
+                    .has_value());
+
+    Segment first_segment =
+        MakeSegment(endpoint, kDefaultSegmentBase, range_size);
+    Segment second_segment =
+        MakeSegment(endpoint, second_range_base, range_size);
+    ASSERT_TRUE(
+        service.ReMountSegment({first_segment, second_segment}, generate_uuid())
+            .has_value());
+
+    for (const auto& [key, expected_address] :
+         std::vector<std::pair<std::string, uintptr_t>>{
+             {"shared_range_first", kDefaultSegmentBase + 128},
+             {"shared_range_second", second_range_base + 128}}) {
+        auto replicas = service.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+        ASSERT_EQ(replicas->replicas.size(), 1);
+        EXPECT_EQ(replicas->replicas.front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.buffer_address_,
+                  expected_address);
+    }
+}
+
 TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     MasterService service(
         MasterServiceConfig::builder()
@@ -1337,6 +2545,9 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     object.metadata.replicas.front()
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.protocol_ = "rdma";
     ASSERT_TRUE(service
                     .RestoreFromStandbySnapshot(
                         {object}, 7, {MakeStandbyMemorySegment(endpoint)})
@@ -1360,6 +2571,11 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     ASSERT_TRUE(batch_after[0].has_value());
     EXPECT_FALSE(
         HasInvalidMemoryHandleForTesting(service, kDefaultTenant, key));
+    EXPECT_EQ(batch_after[0]
+                  ->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.protocol_,
+              "rdma");
     EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 64);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
@@ -1379,7 +2595,7 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     EXPECT_NE(new_descriptor.buffer_address_, old_descriptor.buffer_address_);
 }
 
-TEST_F(MasterServiceHATest, RestoreRejectsOverlappingMemoryDescriptors) {
+TEST_F(MasterServiceHATest, RestoreDiscardsAmbiguousOverlap) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
@@ -1392,6 +2608,12 @@ TEST_F(MasterServiceHATest, RestoreRejectsOverlappingMemoryDescriptors) {
     conflicting.metadata.replicas.front()
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    // #3760: eviction freed and reallocated the buffer, so the standby can
+    // replay two live-looking replicas at one address. The promotion context
+    // carries no replay order, so neither side can prove it is newer: both
+    // descriptors are discarded, and with nothing restored the restore
+    // reports failure instead of an empty-cluster success.
     auto result = service.RestoreFromStandbySnapshot(
         {first, conflicting}, 7, {MakeStandbyMemorySegment(endpoint)});
 
@@ -1403,6 +2625,770 @@ TEST_F(MasterServiceHATest, RestoreRejectsOverlappingMemoryDescriptors) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_overlap_second"),
               0);
+}
+
+TEST_F(MasterServiceHATest, RestoreKeepsIndependentReplicaOfConflictedObject) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_partial_overlap_segment";
+    auto survivor = MakeStandbyObject("standby_overlap_survivor", endpoint);
+    auto conflicting = MakeStandbyObject("standby_overlap_lost", endpoint);
+    // The survivor carries two memory replicas: one collides with the other
+    // object's only replica, the second is independent of the conflict.
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    conflicting.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    // Only the ambiguous descriptors are discarded. The survivor keeps its
+    // independent replica and stays servable; the other object has no
+    // reliable replica left and is dropped.
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, conflicting}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_overlap_survivor"),
+              1);
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "standby_overlap_lost"),
+        0);
+    auto restored = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                 "standby_overlap_survivor");
+    ASSERT_EQ(restored.size(), 1);
+    EXPECT_EQ(restored.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              kDefaultSegmentBase + 8192);
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardsTransitivelyOverlappingGroup) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_transitive_overlap_segment";
+    auto chain_a = MakeStandbyObject("standby_overlap_chain_a", endpoint);
+    auto chain_b = MakeStandbyObject("standby_overlap_chain_b", endpoint);
+    auto chain_c = MakeStandbyObject("standby_overlap_chain_c", endpoint);
+    auto independent =
+        MakeStandbyObject("standby_overlap_independent", endpoint);
+    chain_a.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    chain_b.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 512;
+    chain_c.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 1024;
+    independent.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+
+    // A overlaps B and B overlaps C, so the chain is one ambiguous group even
+    // though A and C never touch. All three conflicted objects are dropped;
+    // the one outside the group restores normally.
+    auto result = service.RestoreFromStandbySnapshot(
+        {chain_a, chain_b, chain_c, independent}, 7,
+        {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    for (const char* key :
+         {"standby_overlap_chain_a", "standby_overlap_chain_b",
+          "standby_overlap_chain_c"}) {
+        EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 0)
+            << key;
+    }
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_overlap_independent"),
+              1);
+}
+
+TEST_F(MasterServiceHATest, RestoreDropsObjectWithOnlyTerminalReplicas) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_terminal_replica_segment";
+    auto dead_removed = MakeStandbyObject("standby_terminal_removed", endpoint);
+    dead_removed.metadata.replicas.front().status = ReplicaStatus::REMOVED;
+    dead_removed.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto dead_failed = MakeStandbyObject("standby_terminal_failed", endpoint);
+    dead_failed.metadata.replicas.front().status = ReplicaStatus::FAILED;
+    dead_failed.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 2048;
+    auto clean = MakeStandbyObject("standby_terminal_clean", endpoint);
+    clean.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+
+    // An object whose replicas are all REMOVED/FAILED has no readable copy:
+    // restore drops it explicitly (same durable REMOVE path as overlap
+    // casualties) instead of retaining metadata with zero servable replicas.
+    auto result = service.RestoreFromStandbySnapshot(
+        {dead_removed, dead_failed, clean}, 7,
+        {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_terminal_removed"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_terminal_failed"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_terminal_clean"),
+              1);
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
+    const std::string cluster_id = "test_restore_repair_durable";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    ASSERT_TRUE(HasOpLogWriter(service));
+
+    const std::string endpoint = "standby_repair_durable_segment";
+    auto survivor = MakeStandbyObject("standby_repair_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value());
+
+    // The dropped object must leave a durable REMOVE so a later promotion
+    // cannot replay its discarded descriptor; the partial survivor gets a
+    // canonical PUT_END. Both land in ONE batch record: the repair set is an
+    // indivisible group, so no durable prefix can capture a proper subset
+    // and leave one side of the conflict able to survive a replay alone.
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord repair_batch;
+    ReadBatchEventually(storage, 1, repair_batch);
+    ASSERT_EQ(2u, repair_batch.entries.size());
+    EXPECT_EQ(OpType::REMOVE, repair_batch.entries[0].op_type);
+    EXPECT_EQ("standby_repair_lost", repair_batch.entries[0].object_key);
+    EXPECT_EQ(1u, repair_batch.entries[0].sequence_id);
+    EXPECT_EQ(OpType::PUT_END, repair_batch.entries[1].op_type);
+    EXPECT_EQ("standby_repair_survivor", repair_batch.entries[1].object_key);
+    EXPECT_EQ(2u, repair_batch.entries[1].sequence_id);
+
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(1u, prefix.batch_id);
+    EXPECT_EQ(2u, prefix.last_seq);
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
+    const std::string cluster_id = "test_restore_repair_rejected";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallRejectOnceWriter(service, backend);
+    writer->RejectNextCommit();
+
+    const std::string endpoint = "standby_repair_reject_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_reject_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_reject_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    // The gauge must not move on a failed restore: the failed attempt and the
+    // successful retry together should look like exactly one clean restore.
+    const auto metric_before =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
+    // Fail-closed: when the repair records cannot be made durable, the
+    // restore must not complete with an index whose discards could replay.
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, result.error());
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before);
+
+    // Rollback leaves nothing behind: no metadata, no liveness records. A
+    // retry must see an empty index rather than already-existing objects.
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+
+    // Retry: the writer accepts now, and the same restore lands cleanly.
+    auto retry = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_survivor"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_lost"),
+              0);
+    // Only the survivor's non-overlapping replica is accounted; its twin at
+    // the same address as the discarded object is conflict-dropped, and the
+    // discarded object contributes nothing.
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before + 1024);
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreDiscardRepairFailureWithLocalDiskReplicaRollsBack) {
+    const std::string cluster_id = "test_restore_repair_reject_local_disk";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallRejectOnceWriter(service, backend);
+    writer->RejectNextCommit();
+
+    const std::string endpoint = "standby_repair_reject_ld_segment";
+    // The survivor carries a local-disk replica owned by a client that never
+    // mounted, so construction registers a NEW liveness record for it. The
+    // memory replica at kDefaultSegmentBase overlaps the lost object's twin
+    // and is conflict-dropped, which is what puts the repair set on the
+    // durable path at all.
+    const UUID disk_owner = generate_uuid();
+    StandbyObjectMetadata survivor_meta;
+    survivor_meta.client_id = generate_uuid();
+    survivor_meta.size = 1024;
+    survivor_meta.replicas.push_back(
+        MakeStandbyLocalDiskReplica(disk_owner, endpoint));
+    auto survivor_conflict = MakeStandbyMemoryReplica(endpoint);
+    survivor_conflict.id = 2;
+    survivor_conflict.get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor_meta.replicas.push_back(std::move(survivor_conflict));
+    StandbyObjectEntry survivor{"default", "standby_repair_reject_ld_survivor",
+                                std::move(survivor_meta)};
+    auto lost = MakeStandbyObject("standby_repair_reject_ld_lost", endpoint);
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    // With the liveness record moved out before the repair commit, this
+    // rollback used to dereference the null shared_ptr instead of returning
+    // the error.
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, result.error());
+    // Rollback leaves nothing behind: no metadata, and the freshly created
+    // liveness record for the disk owner goes back out with its counter.
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_ld_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_ld_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+
+    // Retry with the writer accepting: the restore lands, and the disk
+    // owner's record is installed for real this time.
+    auto retry = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_ld_survivor"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_reject_ld_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
+        disk_owner));
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
+    const std::string cluster_id = "test_restore_repair_timeout_retry";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .set_restore_repair_durable_timeout_ms(50)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallGatedWriter(service, backend);
+    writer->HoldCallbacks();
+
+    const std::string endpoint = "standby_repair_timeout_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_timeout_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_timeout_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    const auto metric_before =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, result.error());
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+
+    // The first repair may still become durable after the local restore
+    // has rolled back. Resume the writer, then retry the same snapshot.
+    writer->ResumeCallbacks();
+    auto retry = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_survivor"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_timeout_lost"),
+              0);
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before + 1024);
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
+    const std::string cluster_id = "test_restore_repair_no_writer";
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build();
+    MasterService service(service_config);
+    // OpLog is enabled but no HA backend connection string configured, so
+    // the constructor leaves the writer unset. A filtered discard cannot
+    // become a durable repair record, and the restore must say so loudly
+    // instead of succeeding with an unrepaired drop.
+    ASSERT_FALSE(HasOpLogWriter(service));
+
+    const std::string endpoint = "standby_repair_nowriter_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_nowriter_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_nowriter_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    const auto metric_before =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    // A restore that failed closed must not have published any accounting:
+    // the exported gauge stays exactly where it was.
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              metric_before);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_nowriter_survivor"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_repair_nowriter_lost"),
+              0);
+    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+}
+
+TEST_F(MasterServiceHATest, FailedRepairRestoreKeepsReplicaIdCounterAdvanced) {
+    // The restore advances the process-wide replica id counter past the max
+    // restored id before the durable repair runs, and a failed repair must
+    // not roll it back: ids are never reused, so a replica created after the
+    // failure still lands above everything the snapshot carried.
+    const std::string cluster_id = "test_restore_repair_id_counter";
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .build();
+    MasterService service(service_config);
+    // Same fail-closed setup as the no-writer case above.
+    ASSERT_FALSE(HasOpLogWriter(service));
+
+    const ReplicaID base_id = ReplicaID{1} << 40;
+    const std::string endpoint = "standby_repair_id_counter_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_id_counter_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_id_counter_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[0].id = base_id;
+    survivor.metadata.replicas[1].id = base_id + 1;
+    lost.metadata.replicas.front().id = base_id;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_FALSE(result.has_value());
+
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    PutObjectOnSegment(service, generate_uuid(),
+                       "standby_repair_id_counter_new", endpoint);
+    const auto fresh = ReplicaDescriptorsForTesting(
+        service, kDefaultTenant, "standby_repair_id_counter_new");
+    ASSERT_EQ(fresh.size(), 1);
+    EXPECT_GE(fresh.front().id, base_id + 2);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RestoreRepairSecondPromotionDoesNotResurrect) {
+    const std::string cluster_id = "test_restore_repair_replay_no_revive";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string endpoint = "standby_repair_replay_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_replay_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_replay_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value());
+
+    // A standby that trusted the unfiltered snapshot still carries both
+    // conflicting objects. Replaying the durable suffix into it must remove
+    // the discard and leave only the survivor's canonical replica. The
+    // repair went out as one batch record, so no durable prefix can replay
+    // a proper subset that keeps one side of the conflict alive.
+    MockMetadataStore standby_metadata;
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_repair_replay_survivor",
+                                 survivor.metadata);
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_repair_replay_lost", lost.metadata);
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    ASSERT_EQ(2u, prefix.last_seq);
+
+    size_t applied = 0;
+    for (int i = 0; i < 50 && applied < prefix.last_seq; ++i) {
+        auto poll = reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, poll.error);
+        applied += poll.applied_entries;
+        if (applied < prefix.last_seq) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(prefix.last_seq, applied);
+
+    EXPECT_FALSE(standby_metadata.Exists(kDefaultTenant.value(),
+                                         "standby_repair_replay_lost"));
+    auto canonical = standby_metadata.GetMetadata(kDefaultTenant.value(),
+                                                  "standby_repair_replay_"
+                                                  "survivor");
+    ASSERT_TRUE(canonical.has_value());
+    ASSERT_EQ(1u, canonical->replicas.size());
+    EXPECT_EQ(kDefaultSegmentBase + 8192,
+              canonical->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RestoreRepairAddressReuseDoesNotServeOldKey) {
+    const std::string cluster_id = "test_restore_repair_addr_reuse";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(2)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string endpoint = "standby_repair_reuse_segment";
+    auto survivor =
+        MakeStandbyObject("standby_repair_reuse_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_reuse_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value());
+
+    // Both descriptors at the conflicting address were dropped, so the
+    // block is free again; the next allocation on the remounted segment
+    // reuses it for a new object.
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    PutObjectOnSegment(service, generate_uuid(), "standby_repair_reuse_new",
+                       endpoint);
+    const auto fresh = ReplicaDescriptorsForTesting(service, kDefaultTenant,
+                                                    "standby_repair_reuse_"
+                                                    "new");
+    ASSERT_EQ(1u, fresh.size());
+    const uint64_t reused_address =
+        fresh.front().get_memory_descriptor().buffer_descriptor.buffer_address_;
+    EXPECT_EQ(kDefaultSegmentBase, reused_address);
+
+    // Replay the whole log into a standby that trusted the snapshot. The
+    // old key must stay gone, so a stale read can never resolve to the
+    // address the new object now owns. PutEnd returns before its record is
+    // durable, so wait until the new object's PUT_END is inside the durable
+    // prefix before replaying.
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    bool new_key_durable = false;
+    for (int i = 0; i < 50 && !new_key_durable; ++i) {
+        if (storage.ReadDurablePrefix(prefix) == ErrorCode::OK) {
+            for (uint64_t batch_id = 1;
+                 batch_id <= prefix.batch_id && !new_key_durable; ++batch_id) {
+                OpLogBatchRecord batch;
+                if (storage.ReadBatch(batch_id, batch) != ErrorCode::OK) {
+                    continue;
+                }
+                for (const auto& entry : batch.entries) {
+                    if (entry.op_type == OpType::PUT_END &&
+                        entry.object_key == "standby_repair_reuse_new") {
+                        new_key_durable = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!new_key_durable) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_TRUE(new_key_durable);
+
+    MockMetadataStore standby_metadata;
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_repair_reuse_survivor",
+                                 survivor.metadata);
+    standby_metadata.PutMetadata(kDefaultTenant.value(),
+                                 "standby_repair_reuse_lost", lost.metadata);
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+
+    size_t applied = 0;
+    for (int i = 0; i < 50 && applied < prefix.last_seq; ++i) {
+        auto poll = reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, poll.error);
+        applied += poll.applied_entries;
+        if (applied < prefix.last_seq) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(prefix.last_seq, applied);
+
+    EXPECT_FALSE(standby_metadata.Exists(kDefaultTenant.value(),
+                                         "standby_repair_reuse_lost"));
+    auto reused = standby_metadata.GetMetadata(kDefaultTenant.value(),
+                                               "standby_repair_reuse_new");
+    ASSERT_TRUE(reused.has_value());
+    ASSERT_EQ(1u, reused->replicas.size());
+    EXPECT_EQ(reused_address, reused->replicas.front()
+                                  .get_memory_descriptor()
+                                  .buffer_descriptor.buffer_address_);
+    auto canonical = standby_metadata.GetMetadata(kDefaultTenant.value(),
+                                                  "standby_repair_reuse_"
+                                                  "survivor");
+    ASSERT_TRUE(canonical.has_value());
+    EXPECT_EQ(1u, canonical->replicas.size());
+}
+
+TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_stale_range_segment";
+    auto rejected = MakeStandbyObject("standby_stale_range_rejected", endpoint);
+    rejected.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    // The first replica records a valid range, then the second descriptor
+    // fails validation and the object is rejected mid-loop.
+    auto stale_unknown = MakeStandbyMemoryReplica("unknown_endpoint");
+    stale_unknown.id = 2;
+    rejected.metadata.replicas.push_back(std::move(stale_unknown));
+    auto clean = MakeStandbyObject("standby_stale_range_clean", endpoint);
+    clean.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 512;
+
+    // The rejected object must leave no range behind: a stale range would
+    // alias the owner index of the next accepted object and drag it into a
+    // phantom overlap. The clean object restores even where it overlaps the
+    // rejected one's recorded address.
+    auto result = service.RestoreFromStandbySnapshot(
+        {rejected, clean}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_stale_range_rejected"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_stale_range_clean"),
+              1);
+}
+
+TEST_F(MasterServiceHATest, RestoreRollsBackAccountingOfRejectedObject) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_accounting_rollback_segment";
+    const size_t capacity = 2048;
+    auto rejected = MakeStandbyObject("standby_accounting_rejected", endpoint);
+    // Three full-size replicas: the third trips the capacity check during
+    // construction, after the first two have already accumulated bytes.
+    rejected.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    rejected.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    rejected.metadata.replicas[1].id = 2;
+    rejected.metadata.replicas[2].id = 3;
+    rejected.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    rejected.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 1024;
+    rejected.metadata.replicas[2]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 2048;
+    auto clean = MakeStandbyObject("standby_accounting_clean", endpoint);
+    clean.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+
+    // The rejected object's bytes roll back with it: the clean object sees
+    // the real free capacity and restores. With phantom accounting it would
+    // be rejected on capacity it never used.
+    auto result = service.RestoreFromStandbySnapshot(
+        {rejected, clean}, 7, {MakeStandbyMemorySegment(endpoint, capacity)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_accounting_rejected"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_accounting_clean"),
+              1);
 }
 
 TEST_F(MasterServiceHATest, FailedRemountKeepsReplicaInvalidAndCanBeRetried) {
@@ -1739,17 +3725,729 @@ TEST_F(MasterServiceHATest, OplogExplicitEnableCreatesWriter) {
                       .build();
 
     MasterService service(config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
     EXPECT_TRUE(IsOpLogEnabled(service));
     EXPECT_TRUE(HasOpLogWriter(service));
     EXPECT_TRUE(HasBatchOpLogStorage(service));
+    std::string producer_view;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              backend->Get(BuildProducerViewKey("oplog_explicit_enable"),
+                           producer_view));
+}
+
+TEST_F(MasterServiceHATest,
+       WeightMutationsRequireCapabilityConfirmationBeforeAppend) {
+    const std::string cluster_id = "weight_capability_gate";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .build();
+    MasterService service(config);
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    WeightMetadataSnapshot snapshot{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key = MakeWeightManifestKey(identity),
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .metadata_generation = 2,
+            .created_at_ms = 100,
+            .updated_at_ms = 200,
+        }},
+        .next_lease_id = 1,
+        .next_operation_id = 1,
+    };
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 0, {}, snapshot));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    auto new_identity = identity;
+    new_identity.revision = "step-101";
+    const auto imported = service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = new_identity,
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    });
+    EXPECT_FALSE(imported.has_value());
+    if (!imported) {
+        EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, imported.error());
+    }
+    const auto acquired =
+        service.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
+            .identity = identity,
+            .expected_metadata_generation = 2,
+            .holder = "worker-0",
+            .ttl_ms = 60'000,
+        });
+    EXPECT_FALSE(acquired.has_value());
+    if (!acquired) {
+        EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, acquired.error());
+    }
+    service.StopBatchOpLogWriter();
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, batch));
+    const auto restored = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = identity});
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(snapshot.metadata.front(), restored->metadata);
+    const auto after = ExportWeightMetadata(service);
+    EXPECT_EQ(snapshot.metadata, after.metadata);
+    EXPECT_TRUE(after.leases.empty());
+    EXPECT_TRUE(after.operations.empty());
+}
+
+TEST_F(MasterServiceHATest,
+       WeightMetadataWaitsForDurableCallbackBeyondThirtySeconds) {
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_metadata_durable_first")
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallGatedWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(0));
+
+    WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto accepted = std::async(std::launch::async, [&] {
+        return service.BeginWeightImport(BeginWeightImportRequest{
+            .identity = identity,
+            .payload_group_id = {},
+            .expected_payload_count = 2,
+            .expected_logical_bytes = 2048,
+        });
+    });
+
+    OpLogBatchStorage storage("weight_metadata_durable_first", *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    if (batch.entries.size() != 1) {
+        writer->Stop();
+        accepted.get();
+        FAIL() << "Expected one durable weight metadata entry";
+    }
+    EXPECT_EQ(OpType::WEIGHT_METADATA_UPSERT, batch.entries.front().op_type);
+    const auto pending = accepted.wait_for(std::chrono::seconds(31));
+    EXPECT_FALSE(
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
+
+    const bool callbacks_completed =
+        writer->RunCallbacksThrough(batch.entries.front().sequence_id);
+    if (!callbacks_completed) {
+        writer->Stop();
+    }
+    auto result = accepted.get();
+    EXPECT_TRUE(callbacks_completed);
+    EXPECT_EQ(std::future_status::timeout, pending);
+    ASSERT_TRUE(result.has_value());
+    auto visible = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = identity});
+    ASSERT_TRUE(visible.has_value());
+    EXPECT_EQ(*result, visible->metadata);
+}
+
+TEST_F(MasterServiceHATest,
+       ImportingReconcileDoesNotAppendUnpublishableWeightMutation) {
+    const std::string cluster_id = "weight_importing_reconcile_rejected";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    ASSERT_TRUE(service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    }));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    auto reconciled = service.ReconcileWeightRevision(
+        ReconcileWeightRevisionRequest{.identity = identity});
+    EXPECT_FALSE(reconciled.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(2, batch));
+}
+
+TEST_F(MasterServiceHATest,
+       WeightMutationRequiresConfirmedStandbyOpLogCapability) {
+    const std::string cluster_id = "weight_metadata_capability_gate";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto rejected = service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 2,
+        .expected_logical_bytes = 2048,
+    });
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, rejected.error());
+    EXPECT_FALSE(
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, storage.ReadBatch(1, batch));
+}
+
+TEST_F(MasterServiceHATest, WeightMetadataRejectsOpLogSubmissionFailure) {
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_metadata_rejected")
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallRejectingWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+    writer->RejectCommitsWith(ErrorCode::ETCD_TRANSACTION_FAIL);
+
+    WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto rejected = service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 2,
+        .expected_logical_bytes = 2048,
+    });
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, rejected.error());
+    EXPECT_FALSE(
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
+}
+
+TEST_F(MasterServiceHATest,
+       WeightMetadataAcceptedTerminalFailureCompletesWithoutPublishTimeout) {
+    auto backend = std::make_shared<FailingBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_metadata_terminal_failure")
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    backend->SetTxnError(ErrorCode::ETCD_TRANSACTION_FAIL);
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    ::testing::internal::CaptureStderr();
+    auto importing = std::async(std::launch::async, [&] {
+        return service.BeginWeightImport(BeginWeightImportRequest{
+            .identity = identity,
+            .expected_payload_count = 2,
+            .expected_logical_bytes = 2048,
+        });
+    });
+    const bool attempted = backend->WaitForTxnCalls(1);
+    const auto completed = importing.wait_for(std::chrono::seconds(2));
+    // Stop wakes durability waiters and keeps cleanup safe if an assertion
+    // fails.
+    MasterServiceTestPeer::OrderedOplogWriter(service)->Stop();
+    const auto result = importing.get();
+    const auto failure_log = ::testing::internal::GetCapturedStderr();
+    EXPECT_NE(std::string::npos,
+              failure_log.find("Failed to durably persist weight metadata"));
+    EXPECT_NE(std::string::npos,
+              failure_log.find(MakeWeightRevisionMetadataKey(identity)));
+    EXPECT_TRUE(attempted);
+    EXPECT_EQ(std::future_status::ready, completed);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, result.error());
+    EXPECT_FALSE(
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
+}
+
+TEST_F(MasterServiceHATest, WeightDurabilityWaitDoesNotBlockTaskCleanup) {
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_cleanup_isolation")
+                      .set_weight_import_idle_timeout_ms(1)
+                      .set_pending_task_timeout_sec(1)
+                      .set_max_retry_attempts(0)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "cleanup",
+        .revision = "abandoned",
+        .weight_generation = 1,
+    };
+    ASSERT_TRUE(service.BeginWeightImport({
+        .identity = identity,
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    }));
+    backend->BlockTxn();
+    struct ReleaseOnExit {
+        BlockingBatchHaKvBackend& backend;
+        ~ReleaseOnExit() { backend.AllowTxn(); }
+    } release{*backend};
+    // Let the real background worker enter the abandoned-import durable wait.
+    ASSERT_TRUE(backend->WaitForBlockedTxn(std::chrono::seconds(35)));
+    UUID task_id;
+    {
+        auto tasks =
+            MasterServiceTestPeer::TaskManager(service).get_write_access();
+        auto submitted = tasks.submit_task_typed<TaskType::REPLICA_COPY>(
+            generate_uuid(), ReplicaCopyPayload{});
+        ASSERT_TRUE(submitted.has_value());
+        task_id = *submitted;
+    }
+    const auto pending = service.QueryTask(task_id);
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_EQ(TaskStatus::PENDING, pending->status);
+    // Let the real pending timeout expire while weight reconciliation blocks.
+    bool cleaned = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(35);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto task = service.QueryTask(task_id);
+        if (task && task->status == TaskStatus::FAILED) {
+            cleaned = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    backend->AllowTxn();
+    EXPECT_TRUE(cleaned);
+}
+
+TEST_F(MasterServiceHATest,
+       WeightMetadataStopFailureSuppressesLateSuccessfulPublish) {
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_metadata_stop_race")
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    backend->BlockTxn();
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto importing = std::async(std::launch::async, [&] {
+        return service.BeginWeightImport(BeginWeightImportRequest{
+            .identity = identity,
+            .expected_payload_count = 2,
+            .expected_logical_bytes = 2048,
+        });
+    });
+    const bool blocked = backend->WaitForBlockedTxn();
+    auto stopping = std::async(std::launch::async, [&] {
+        MasterServiceTestPeer::OrderedOplogWriter(service)->Stop();
+    });
+    const auto completed = importing.wait_for(std::chrono::seconds(2));
+    // Let the in-flight storage write succeed after Stop notifies its waiters.
+    backend->AllowTxn();
+    stopping.get();
+    const auto result = importing.get();
+    EXPECT_TRUE(blocked);
+    EXPECT_EQ(std::future_status::ready, completed);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, result.error());
+    EXPECT_FALSE(
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
+}
+
+TEST_F(MasterServiceHATest,
+       ConcurrentWeightMutationDoesNotAppendUnpublishableHistory) {
+    const std::string cluster_id = "weight_metadata_concurrent_mutation";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallGatedWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(0));
+
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    auto begin = [&](uint64_t payload_count, uint64_t logical_bytes) {
+        return service.BeginWeightImport(BeginWeightImportRequest{
+            .identity = identity,
+            .payload_group_id = {},
+            .expected_payload_count = payload_count,
+            .expected_logical_bytes = logical_bytes,
+        });
+    };
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord first_batch;
+    auto first = std::async(std::launch::async, [&] { return begin(2, 2048); });
+    ReadBatchEventually(storage, 1, first_batch);
+    ASSERT_EQ(1u, first_batch.entries.size());
+
+    auto second =
+        std::async(std::launch::async, [&] { return begin(3, 3072); });
+    OpLogBatchRecord second_batch;
+    ErrorCode second_batch_error = ErrorCode::ETCD_KEY_NOT_EXIST;
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        second_batch_error = storage.ReadBatch(2, second_batch);
+        if (second_batch_error == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST, second_batch_error);
+
+    ASSERT_TRUE(writer->RunCallbacksThrough(
+        second_batch_error == ErrorCode::OK ? 2 : 1));
+    const auto first_result = first.get();
+    const auto second_result = second.get();
+    EXPECT_TRUE(first_result.has_value());
+    EXPECT_FALSE(second_result.has_value());
+}
+
+TEST_F(MasterServiceHATest,
+       WeightLeaseWaitsForDurableCallbackBeyondThirtySeconds) {
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_lease_durable_first")
+                      .build();
+    MasterService service(config);
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    WeightMetadataSnapshot snapshot{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key =
+                        "weights/production/llama-70b/step-100/7/manifest",
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .operation = WeightOperationState::NONE,
+            .metadata_generation = 2,
+            .created_at_ms = 100,
+            .updated_at_ms = 200,
+        }},
+        .leases = {},
+        .operations = {},
+        .next_lease_id = 1,
+        .next_operation_id = 1,
+    };
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 0, {}, snapshot));
+    auto* writer = InstallGatedWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(0));
+
+    auto acquiring = std::async(std::launch::async, [&] {
+        return service.AcquireWeightRevisionLease(
+            AcquireWeightRevisionLeaseRequest{
+                .identity = identity,
+                .expected_metadata_generation = 2,
+                .holder = "worker-0",
+                .ttl_ms = 60'000,
+            });
+    });
+    OpLogBatchStorage storage("weight_lease_durable_first", *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    if (batch.entries.size() != 1) {
+        writer->Stop();
+        acquiring.get();
+        FAIL() << "Expected one durable weight lease entry";
+    }
+    EXPECT_EQ(OpType::WEIGHT_LEASE_UPSERT, batch.entries.front().op_type);
+    auto before = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = identity});
+    EXPECT_TRUE(before.has_value());
+    if (before) {
+        EXPECT_EQ(0u, before->active_lease_count);
+    }
+    const auto pending = acquiring.wait_for(std::chrono::seconds(31));
+
+    const bool callbacks_completed =
+        writer->RunCallbacksThrough(batch.entries.front().sequence_id);
+    if (!callbacks_completed) {
+        writer->Stop();
+    }
+    auto acquired = acquiring.get();
+    EXPECT_TRUE(callbacks_completed);
+    EXPECT_EQ(std::future_status::timeout, pending);
+    ASSERT_TRUE(acquired.has_value());
+    auto after = service.GetWeightRevision(
+        GetWeightRevisionRequest{.identity = identity});
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(1u, after->active_lease_count);
+}
+
+TEST_F(MasterServiceHATest,
+       StandbyPromotionRestoresCompleteWeightMetadataStore) {
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    const WeightMetadataSnapshot snapshot{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key =
+                        "weights/production/llama-70b/step-100/7/manifest",
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .operation = WeightOperationState::EVICTING,
+            .operation_id = 3,
+            .metadata_generation = 4,
+            .created_at_ms = 100,
+            .updated_at_ms = 200,
+        }},
+        .leases = {WeightRevisionLease{
+            .lease_id = 5,
+            .identity = identity,
+            .holder = "worker-0",
+            .expires_at_ms = 300,
+            .fenced_metadata_generation = 2,
+        }},
+        .operations = {WeightResidencyOperation{
+            .operation_id = 3,
+            .identity = identity,
+            .operation = WeightOperationState::EVICTING,
+            .target_residency = WeightResidencyState::COLD,
+            .fenced_metadata_generation = 4,
+            .started_at_ms = 150,
+            .updated_at_ms = 200,
+            .processed_members = 0,
+            .total_members = 2,
+            .cursor = {},
+            .message = {},
+        }},
+        .next_lease_id = 6,
+        .next_operation_id = 4,
+    };
+
+    MasterService service;
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 7, {}, snapshot));
+    EXPECT_EQ(snapshot, ExportWeightMetadata(service));
+}
+
+TEST_F(MasterServiceHATest, OldStandbyPromotionClearsWeightMetadata) {
+    MasterService service;
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    ASSERT_TRUE(service.BeginWeightImport(BeginWeightImportRequest{
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    }));
+
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 7, {}));
+    EXPECT_FALSE(
+        service
+            .GetWeightRevision(GetWeightRevisionRequest{.identity = identity})
+            .has_value());
+}
+
+TEST_F(MasterServiceHATest, FencedWriterClaimsConfiguredProducerView) {
+    constexpr ViewVersionId kProducerView = 7;
+    const std::string cluster_id = "fenced_writer_claim";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_view_version(kProducerView)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    std::string producer_view;
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Get(BuildProducerViewKey(cluster_id), producer_view));
+    EXPECT_EQ(std::to_string(kProducerView), producer_view);
+
+    ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END, "default",
+                                        "fenced_writer_key", {})
+                    .has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildProducerViewKey(cluster_id), "8"));
+    ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END, "default",
+                                        "stale_writer_key", {})
+                    .has_value());
+    std::optional<OrderedOpLogWriterTerminalState> terminal_state;
+    for (int i = 0; i < 100; ++i) {
+        terminal_state = GetWriterTerminalStateForTesting(service);
+        if (terminal_state.has_value()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(terminal_state.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, terminal_state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kFenced,
+              terminal_state->reason);
+}
+
+TEST_F(MasterServiceHATest, FencedWriterRejectsContendedProducerViewClaim) {
+    const std::string cluster_id = "fenced_writer_contention";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildProducerViewKey(cluster_id), "8"));
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_view_version(7)
+                      .set_cluster_id(cluster_id)
+                      .build();
+
+    MasterService service(config);
+    EXPECT_EQ(
+        ErrorCode::ETCD_TRANSACTION_FAIL,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    EXPECT_FALSE(HasOpLogWriter(service));
 }
 
 TEST_F(MasterServiceHATest, OplogDoesNotStartWithUnsupportedHABackend) {
     auto config = MasterServiceConfig::builder()
                       .set_enable_ha(true)
                       .set_enable_oplog(true)
-                      .set_ha_backend_type("redis")
+                      .set_ha_backend_type("k8s")
+                      .set_ha_backend_connstring("unused")
                       .set_cluster_id("oplog_unsupported_ha_backend")
                       .build();
 
@@ -1757,19 +4455,28 @@ TEST_F(MasterServiceHATest, OplogDoesNotStartWithUnsupportedHABackend) {
     EXPECT_FALSE(HasOpLogWriter(service));
 }
 
-TEST_F(MasterServiceHATest, BatchPrimaryDoesNotStartSnapshotWorker) {
-    auto config =
-        MasterServiceConfig::builder()
-            .set_enable_ha(true)
-            .set_enable_oplog(true)
-            .set_cluster_id("batch_snapshot_gate")
-            .set_enable_snapshot(true)
-            .set_snapshot_backup_dir(LegacyOpLogRootDir() + "/batch_snapshot")
-            .set_snapshot_object_store_type("local")
-            .build();
+TEST_F(MasterServiceHATest, OplogRedisWithoutConnstringDoesNotCreateWriter) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_ha_backend_type("redis")
+                      .set_cluster_id("oplog_redis_without_connstring")
+                      .build();
 
     MasterService service(config);
-    EXPECT_FALSE(SnapshotManagerCreatedForTesting(service));
+    EXPECT_FALSE(HasOpLogWriter(service));
+}
+
+TEST_F(MasterServiceHATest, OplogRedisInvalidConnstringThrows) {
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_ha_backend_type("redis")
+                      .set_ha_backend_connstring("redis://")
+                      .set_cluster_id("oplog_redis_bad_connstring")
+                      .build();
+
+    EXPECT_THROW({ MasterService service(config); }, std::runtime_error);
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
@@ -1961,7 +4668,9 @@ TEST_F(MasterServiceHATest, BatchRecordSubmissionHelpersUseOrderedWriter) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto visible = AppendVisibleForTesting(service, OpType::PUT_END, "tenant",
                                            "visible_key", "visible_payload");
@@ -2004,7 +4713,9 @@ TEST_F(MasterServiceHATest,
                               .set_enable_multi_tenants(false)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto appended = AppendFinalizeForTesting(service, OpType::REMOVE, "",
                                              "default_tenant_key", {}, nullptr);
@@ -2029,7 +4740,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_primary_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2072,7 +4785,9 @@ TEST_F(MasterServiceBatchRecordE2ETest, StandbyAppliesPrimaryBatchRecords) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_standby_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2106,7 +4821,9 @@ TEST_F(MasterServiceBatchRecordE2ETest, PromotionCatchesUpToDurablePrefix) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_promotion_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2154,7 +4871,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     backend->SetTxnError(ErrorCode::PERSISTENT_FAIL);
     auto first = AppendVisibleForTesting(service, OpType::PUT_END,
@@ -2189,7 +4908,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
 
@@ -2220,7 +4941,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_remove_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2262,7 +4985,9 @@ TEST_F(MasterServiceBatchRecordE2ETest, RemoveByRegexWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_regex_remove_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2307,7 +5032,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_remove_reserve_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2344,6 +5071,8 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_cluster_id(cluster_id)
             .set_oplog_batch_max_entries(1)
             .set_enable_multi_tenants(true)
+            // Keep quota release under the durable callback's control.
+            .set_tenant_eviction_high_watermark_ratio(0.0)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
@@ -2402,12 +5131,16 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_cluster_id(cluster_id)
             .set_oplog_batch_max_entries(1)
             .set_enable_multi_tenants(true)
+            // Keep quota release under the durable callback's control.
+            .set_tenant_eviction_high_watermark_ratio(0.0)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_stale_finalize_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2467,12 +5200,16 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_cluster_id(cluster_id)
             .set_oplog_batch_max_entries(1)
             .set_enable_multi_tenants(true)
+            // Keep quota release under the durable callback's control.
+            .set_tenant_eviction_high_watermark_ratio(0.0)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_upsert_stale_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2533,12 +5270,16 @@ TEST_F(MasterServiceBatchRecordE2ETest,
             .set_cluster_id(cluster_id)
             .set_oplog_batch_max_entries(1)
             .set_enable_multi_tenants(true)
+            // Keep quota release under the durable callback's control.
+            .set_tenant_eviction_high_watermark_ratio(0.0)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted =
         PrepareSimpleSegment(service, "batch_remove_stale_finalize_seg");
@@ -2601,7 +5342,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_partial_evict_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2624,8 +5367,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ReadBatchEventually(storage, 3, batch);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                    /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     ReadBatchEventually(storage, 4, batch);
 
     ASSERT_EQ(1u, batch.entries.size());
@@ -2650,7 +5394,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_evict_all_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2663,8 +5409,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ReadBatchEventually(storage, 2, batch);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                    /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     ReadBatchEventually(storage, 3, batch);
 
     auto replicas = service.GetReplicaList(key, kDefaultTenant);
@@ -2688,7 +5435,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_processing_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2724,7 +5473,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted =
         PrepareSimpleSegment(service, "batch_e2e_offload_promotion_seg");
@@ -2793,7 +5544,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
@@ -2840,7 +5593,9 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_put_end_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2858,6 +5613,7 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segments = {"batch_put_end_segment"};
+    config.with_hard_pin = true;
     const std::string key = "batch_put_end_key";
     auto put_start =
         service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config);
@@ -2879,6 +5635,10 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
     EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
+    MetadataPayload payload;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(payload, batch.entries[0].payload));
+    EXPECT_TRUE(payload.hard_pinned.value_or(false));
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
 
     DurablePrefix prefix;
@@ -2898,7 +5658,9 @@ TEST_F(MasterServiceHATest, PutEndVisibleBeforeBatchRecordDurable) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_put_visible_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2949,7 +5711,9 @@ TEST_F(MasterServiceHATest, CopyEndVisibleBeforeBatchRecordDurable) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto source = PrepareSimpleSegment(service, "batch_copy_visible_src");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3013,7 +5777,9 @@ TEST_F(MasterServiceHATest,
                               .set_eviction_high_watermark_ratio(1.0)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto source = PrepareSimpleSegment(service, "batch_move_visible_src",
                                        kDefaultSegmentBase, 1024);
@@ -3105,7 +5871,9 @@ TEST_F(MasterServiceHATest,
                 {{kDefaultTenant.value(), 2 * object_size}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     const std::string source_name = "batch_move_upsert_quota_src";
     const std::string target_name = "batch_move_upsert_quota_dst";
@@ -3139,7 +5907,9 @@ TEST_F(MasterServiceHATest,
     }
     auto move_end = move_future.get();
     ASSERT_TRUE(move_end.has_value()) << toString(move_end.error());
-    ASSERT_EQ(service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes,
+    ASSERT_EQ(service.tenant_quota_policy()
+                  ->GetSnapshot(kDefaultTenant)
+                  ->charged_bytes,
               2 * object_size);
 
     ReplicateConfig config;
@@ -3153,8 +5923,9 @@ TEST_F(MasterServiceHATest,
     ReadBatchEventually(storage, 4, batch);
     uint64_t charged_bytes = 2 * object_size;
     for (int i = 0; i < 50 && charged_bytes == 2 * object_size; ++i) {
-        charged_bytes =
-            service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes;
+        charged_bytes = service.tenant_quota_policy()
+                            ->GetSnapshot(kDefaultTenant)
+                            ->charged_bytes;
         if (charged_bytes == 2 * object_size) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
@@ -3164,7 +5935,9 @@ TEST_F(MasterServiceHATest,
     auto upsert_end = service.UpsertEnd(source.client_id, key, kDefaultTenant,
                                         ReplicaType::MEMORY);
     ASSERT_TRUE(upsert_end.has_value()) << toString(upsert_end.error());
-    EXPECT_EQ(service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes,
+    EXPECT_EQ(service.tenant_quota_policy()
+                  ->GetSnapshot(kDefaultTenant)
+                  ->charged_bytes,
               object_size);
 }
 
@@ -3180,7 +5953,9 @@ TEST_F(MasterServiceHATest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_offload_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3251,7 +6026,9 @@ TEST_F(MasterServiceHATest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_offload_visible_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3306,48 +6083,39 @@ TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    OpLogBatchStorage storage(cluster_id, *backend);
 
     const UUID client_id = generate_uuid();
     Segment mounted = MakeSegment("batch_segment_mount");
     ASSERT_TRUE(service.MountSegment(mounted, client_id).has_value());
+    OpLogBatchRecord mount_batch;
+    ReadBatchEventually(storage, 1, mount_batch);
 
     const UUID remount_client_id = generate_uuid();
     Segment remounted = MakeSegment("batch_segment_remount",
                                     kDefaultSegmentBase + kDefaultSegmentSize);
     ASSERT_TRUE(
         service.ReMountSegment({remounted}, remount_client_id).has_value());
+    OpLogBatchRecord remount_batch;
+    ReadBatchEventually(storage, 2, remount_batch);
 
     ASSERT_TRUE(service.UnmountSegment(mounted.id, client_id).has_value());
+    OpLogBatchRecord unmount_batch;
+    ReadBatchEventually(storage, 3, unmount_batch);
 
-    OpLogBatchStorage storage(cluster_id, *backend);
-    auto read_batch = [&](uint64_t batch_id) {
-        OpLogBatchRecord batch;
-        ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
-        for (int i = 0; i < 50; ++i) {
-            read_err = storage.ReadBatch(batch_id, batch);
-            if (read_err == ErrorCode::OK) {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        EXPECT_EQ(ErrorCode::OK, read_err);
-        return batch;
-    };
-
-    auto mount_batch = read_batch(1);
     ASSERT_EQ(1u, mount_batch.entries.size());
     EXPECT_EQ(OpType::SEGMENT_MOUNT, mount_batch.entries[0].op_type);
     EXPECT_EQ(1u, mount_batch.entries[0].sequence_id);
     EXPECT_FALSE(mount_batch.entries[0].payload.empty());
 
-    auto remount_batch = read_batch(2);
     ASSERT_EQ(1u, remount_batch.entries.size());
     EXPECT_EQ(OpType::SEGMENT_MOUNT, remount_batch.entries[0].op_type);
     EXPECT_EQ(2u, remount_batch.entries[0].sequence_id);
     EXPECT_FALSE(remount_batch.entries[0].payload.empty());
 
-    auto unmount_batch = read_batch(3);
     ASSERT_EQ(1u, unmount_batch.entries.size());
     EXPECT_EQ(OpType::SEGMENT_UNMOUNT, unmount_batch.entries[0].op_type);
     EXPECT_EQ(3u, unmount_batch.entries[0].sequence_id);
@@ -3365,7 +6133,9 @@ TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     const auto mounted = PrepareSimpleSegment(service, "batch_promotion_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3423,7 +6193,9 @@ TEST_F(MasterServiceHATest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     const auto mounted =
         PrepareSimpleSegment(service, "batch_promotion_visible_seg");
@@ -3478,7 +6250,9 @@ TEST_F(MasterServiceHATest, RemoveWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_remove_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3564,7 +6338,9 @@ TEST_F(MasterServiceHATest, BatchRemoveWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_remove_many_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3654,7 +6430,9 @@ TEST_F(MasterServiceHATest, RemoveAllWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_remove_all_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3687,6 +6465,8 @@ TEST_F(MasterServiceHATest, RemoveAllFinalizesAfterDurable) {
             .set_cluster_id(cluster_id)
             .set_oplog_batch_max_entries(1)
             .set_enable_multi_tenants(true)
+            // Keep quota release under the durable callback's control.
+            .set_tenant_eviction_high_watermark_ratio(0.0)
             .set_tenant_quota_connector_type("file")
             .set_tenant_quota_connector_uri(
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
@@ -3739,7 +6519,9 @@ TEST_F(MasterServiceHATest, BatchReplicaClearAllWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_clear_all_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3776,7 +6558,9 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_clear_seg1");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3959,7 +6743,9 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto mounted = PrepareSimpleSegment(service, "batch_disk_evict_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -4066,7 +6852,9 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWritesBatchRecordOpLog) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     NoFSegment nof_segment =
         MakeNoFSegment("batch_nof_evict_segment", "batch_nof_evict_endpoint");
@@ -4088,8 +6876,9 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWritesBatchRecordOpLog) {
     ReadBatchEventually(storage, 1, batch);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    service.RunNoFBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                       /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunNoFBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     ReadBatchEventually(storage, 2, batch);
 
     ASSERT_EQ(1u, batch.entries.size());
@@ -4135,8 +6924,9 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     backend->BlockTxn();
-    service.RunNoFBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                       /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunNoFBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
 
     const std::string before_finalize_key =
@@ -4156,6 +6946,199 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
 }
 #endif
 
+TEST_F(MasterServiceHATest,
+       BatchEvictQueueSaturationDoesNotRequestAnotherPass) {
+    const std::string cluster_id = "test_batch_evict_reservation_failure";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_eviction_ratio(0.0)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallGatedWriter(service, backend);
+
+    auto mounted = PrepareSimpleSegment(service, "batch_evict_reserve_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string first_key = "batch_evict_reserve_first";
+    const std::string second_key = "batch_evict_reserve_second";
+    PutObjectOnSegment(service, mounted.client_id, first_key,
+                       "batch_evict_reserve_segment");
+    ReadBatchEventually(storage, 2, batch);
+    PutObjectOnSegment(service, mounted.client_id, second_key,
+                       "batch_evict_reserve_segment");
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    {
+        auto held_reservation = ReserveBatchSlotForTesting(service);
+        ASSERT_TRUE(held_reservation.has_value())
+            << toString(held_reservation.error());
+        SetNeedMemEvictionForTesting(service, true);
+
+        ::testing::internal::CaptureStderr();
+        MasterServiceTestPeer(service).RunBatchEvictForTesting(
+            /*evict_ratio_target=*/0.5,
+            /*evict_ratio_lowerbound=*/0.5);
+        const std::string logs = ::testing::internal::GetCapturedStderr();
+        const std::string warning = "OpLog reservation failed";
+        const auto first_warning = logs.find(warning);
+        ASSERT_NE(std::string::npos, first_warning) << logs;
+        EXPECT_EQ(std::string::npos,
+                  logs.find(warning, first_warning + warning.size()))
+            << logs;
+        EXPECT_NE(std::string::npos, logs.find("err=-1401")) << logs;
+        EXPECT_FALSE(NeedMemEvictionForTesting(service));
+        EXPECT_EQ(1u,
+                  ReplicaCountForTesting(service, kDefaultTenant, first_key));
+        EXPECT_EQ(1u,
+                  ReplicaCountForTesting(service, kDefaultTenant, second_key));
+    }
+
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
+    ReadBatchEventually(storage, 4, batch);
+    ReadBatchEventually(storage, 5, batch);
+    EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, first_key));
+    EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, second_key));
+
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_EQ(0u, ReplicaCountForTesting(service, kDefaultTenant, first_key));
+    EXPECT_EQ(0u, ReplicaCountForTesting(service, kDefaultTenant, second_key));
+}
+
+TEST_F(MasterServiceHATest,
+       BatchEvictStopsWithoutRetryWhenOpLogWriterIsFenced) {
+    const std::string cluster_id = "test_batch_evict_writer_fenced";
+    auto backend = std::make_shared<FailingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_eviction_ratio(0.0)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallGatedWriter(service, backend);
+
+    auto mounted = PrepareSimpleSegment(service, "batch_evict_fenced_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    const std::string first_key = "batch_evict_fenced_first";
+    const std::string second_key = "batch_evict_fenced_second";
+    PutObjectOnSegment(service, mounted.client_id, first_key,
+                       "batch_evict_fenced_segment");
+    ReadBatchEventually(storage, 2, batch);
+    PutObjectOnSegment(service, mounted.client_id, second_key,
+                       "batch_evict_fenced_segment");
+    ReadBatchEventually(storage, 3, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    backend->SetTxnError(ErrorCode::ETCD_TRANSACTION_FAIL);
+    ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END,
+                                        kDefaultTenant,
+                                        "batch_evict_fence_writer", {})
+                    .has_value());
+    ASSERT_TRUE(backend->WaitForTxnCalls(1));
+    for (int i = 0; i < 100 && !writer->GetTerminalState().has_value(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto terminal_state = writer->GetTerminalState();
+    ASSERT_TRUE(terminal_state.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, terminal_state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kFenced,
+              terminal_state->reason);
+
+    SetNeedMemEvictionForTesting(service, true);
+    ::testing::internal::CaptureStderr();
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
+    const std::string logs = ::testing::internal::GetCapturedStderr();
+    const std::string warning = "OpLog reservation failed";
+    const auto first_warning = logs.find(warning);
+    ASSERT_NE(std::string::npos, first_warning) << logs;
+    EXPECT_EQ(std::string::npos,
+              logs.find(warning, first_warning + warning.size()))
+        << logs;
+    EXPECT_NE(std::string::npos, logs.find("err=-1002")) << logs;
+    EXPECT_FALSE(NeedMemEvictionForTesting(service));
+    for (const auto& key : {first_key, second_key}) {
+        auto replicas = service.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas.has_value())
+            << key << ": " << toString(replicas.error());
+        ASSERT_EQ(1u, replicas->replicas.size());
+        EXPECT_EQ(ReplicaStatus::COMPLETE, replicas->replicas.front().status);
+    }
+}
+
+TEST_F(MasterServiceHATest, BatchEvictCommitFailureRestoresRemovedReplicas) {
+    const std::string cluster_id = "test_batch_evict_commit_failure";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_eviction_ratio(0.0)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallRejectingWriter(service, backend);
+
+    auto mounted =
+        PrepareSimpleSegment(service, "batch_evict_commit_failure_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    const std::string first_key = "batch_evict_commit_failure_first";
+    const std::string second_key = "batch_evict_commit_failure_second";
+    PutObjectOnSegment(service, mounted.client_id, first_key,
+                       "batch_evict_commit_failure_segment");
+    ReadBatchEventually(storage, 2, batch);
+    PutObjectOnSegment(service, mounted.client_id, second_key,
+                       "batch_evict_commit_failure_segment");
+    ReadBatchEventually(storage, 3, batch);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    writer->RejectCommitsWith(ErrorCode::INVALID_PARAMS);
+    SetNeedMemEvictionForTesting(service, true);
+    ::testing::internal::CaptureStderr();
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
+    const std::string logs = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_EQ(1u, writer->rejected_commits());
+    EXPECT_NE(std::string::npos, logs.find("OpLog persist failed")) << logs;
+    EXPECT_NE(std::string::npos, logs.find("err=-600")) << logs;
+    EXPECT_FALSE(NeedMemEvictionForTesting(service));
+    for (const auto& key : {first_key, second_key}) {
+        auto replicas = service.GetReplicaList(key, kDefaultTenant);
+        ASSERT_TRUE(replicas.has_value())
+            << key << ": " << toString(replicas.error());
+        ASSERT_EQ(1u, replicas->replicas.size());
+        EXPECT_EQ(ReplicaStatus::COMPLETE, replicas->replicas.front().status);
+    }
+
+    auto released_reservation = ReserveBatchSlotForTesting(service);
+    ASSERT_TRUE(released_reservation.has_value())
+        << toString(released_reservation.error());
+    auto full = ReserveBatchSlotForTesting(service);
+    ASSERT_FALSE(full.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, full.error());
+}
+
 TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
     const std::string cluster_id =
         "test_batch_record_put_start_cleanup_cluster";
@@ -4170,7 +7153,9 @@ TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
                               .set_put_start_release_timeout_sec(2)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     [[maybe_unused]] const auto mounted =
         PrepareSimpleSegment(service, "batch_put_start_cleanup_segment");
@@ -4214,9 +7199,11 @@ TEST_F(MasterServiceHATest,
                               .set_put_start_release_timeout_sec(2)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
-    [[maybe_unused]] const auto mounted =
+    const auto mounted =
         PrepareSimpleSegment(service, "batch_discard_processing_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
@@ -4224,7 +7211,7 @@ TEST_F(MasterServiceHATest,
 
     ReplicateConfig config;
     config.replica_num = 1;
-    const UUID client_id = generate_uuid();
+    const UUID client_id = mounted.client_id;
     const std::string key = "batch_discard_processing_key";
     ASSERT_TRUE(service.PutStart(client_id, key, kDefaultTenant, 1024, config)
                     .has_value());
@@ -4237,8 +7224,9 @@ TEST_F(MasterServiceHATest,
     ReadBatchEventually(storage, 2, batch);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(2100));
-    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                    /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     ReadBatchEventually(storage, 3, batch);
 
     ASSERT_EQ(1u, batch.entries.size());
@@ -4264,7 +7252,9 @@ TEST_F(MasterServiceHATest,
                               .set_put_start_release_timeout_sec(2)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
 
     auto src = PrepareSimpleSegment(service, "batch_replication_src");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -4287,8 +7277,9 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(2100));
-    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                    /*evict_ratio_lowerbound=*/1.0);
+    MasterServiceTestPeer(service).RunBatchEvictForTesting(
+        /*evict_ratio_target=*/1.0,
+        /*evict_ratio_lowerbound=*/1.0);
     ReadBatchEventually(storage, 4, batch);
 
     ASSERT_EQ(1u, batch.entries.size());
@@ -4297,6 +7288,339 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(4u, batch.entries[0].sequence_id);
     EXPECT_FALSE(batch.entries[0].payload.empty());
+}
+
+TEST_F(MasterServiceHATest, WeightLeaseShorterTtlRenewalReplaysThroughReader) {
+    const std::string cluster_id = "weight_lease_shorter_ttl_replay";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    const WeightMetadataSnapshot baseline{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key = MakeWeightManifestKey(identity),
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .operation = WeightOperationState::NONE,
+            .metadata_generation = 2,
+            .created_at_ms = 100,
+            .updated_at_ms = 200,
+        }},
+        .leases = {},
+        .operations = {},
+        .next_lease_id = 1,
+        .next_operation_id = 1,
+    };
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 0, {}, baseline));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    auto acquired =
+        service.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
+            .identity = identity,
+            .expected_metadata_generation = 2,
+            .holder = "worker-0",
+            .ttl_ms = 60'000,
+        });
+    ASSERT_TRUE(acquired.has_value());
+    auto renewed =
+        service.RenewWeightRevisionLease(RenewWeightRevisionLeaseRequest{
+            .tenant_id = "default",
+            .lease_id = acquired->lease_id,
+            .ttl_ms = 1'000,
+        });
+    ASSERT_TRUE(renewed.has_value());
+    service.StopBatchOpLogWriter();
+
+    StandbyMetadataStore standby_metadata;
+    ASSERT_TRUE(standby_metadata.RestoreWeightMetadata(baseline));
+    OpLogApplier applier(&standby_metadata, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    const auto replayed = reader.PollOnce();
+    EXPECT_EQ(ErrorCode::OK, replayed.error)
+        << "acquired expiry=" << acquired->expires_at_ms
+        << ", renewed expiry=" << renewed->expires_at_ms;
+    EXPECT_EQ(2u, replayed.applied_entries);
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    const auto restored = standby_metadata.GetWeightLease(acquired->lease_id);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(*renewed, *restored);
+}
+
+TEST_F(MasterServiceHATest, WeightLeaseRenewalRechecksExpiryAfterGroupWait) {
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id("weight_lease_group_wait_expiry")
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "llama-70b",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    const WeightMetadataSnapshot baseline{
+        .metadata = {WeightRevisionMetadata{
+            .identity = identity,
+            .manifest =
+                WeightManifestReference{
+                    .manifest_key = MakeWeightManifestKey(identity),
+                    .manifest_sha256 = std::string(64, 'a'),
+                    .payload_group_id = MakeWeightPayloadGroupId(identity),
+                    .payload_keys_sha256 = std::string(64, 'b'),
+                    .payload_count = 1,
+                    .logical_bytes = 1024,
+                },
+            .availability = WeightAvailabilityState::READY,
+            .residency = WeightResidencyState::HOT,
+            .operation = WeightOperationState::NONE,
+            .metadata_generation = 2,
+            .created_at_ms = 100,
+            .updated_at_ms = 200,
+        }},
+        .leases = {},
+        .operations = {},
+        .next_lease_id = 1,
+        .next_operation_id = 1,
+    };
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 0, {}, baseline));
+    auto* writer = InstallGatedWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+    auto acquired =
+        service.AcquireWeightRevisionLease(AcquireWeightRevisionLeaseRequest{
+            .identity = identity,
+            .expected_metadata_generation = 2,
+            .holder = "worker-a",
+            .ttl_ms = 1'000,
+        });
+    ASSERT_TRUE(acquired.has_value());
+    ASSERT_TRUE(writer->PauseCallbacksAfter(1));
+
+    auto blocking_acquire = std::async(std::launch::async, [&] {
+        return service.AcquireWeightRevisionLease(
+            AcquireWeightRevisionLeaseRequest{
+                .identity = identity,
+                .expected_metadata_generation = 2,
+                .holder = "worker-b",
+                .ttl_ms = 60'000,
+            });
+    });
+    auto durable_promise = std::make_shared<std::promise<ErrorCode>>();
+    auto durable = durable_promise->get_future();
+    [[maybe_unused]] auto notification =
+        writer->AwaitDurable(2).thenValue([durable_promise](ErrorCode error) {
+            durable_promise->set_value(error);
+        });
+    if (durable.wait_for(std::chrono::seconds(1)) !=
+        std::future_status::ready) {
+        writer->Stop();
+        blocking_acquire.get();
+        FAIL() << "The second acquire did not become durable";
+    }
+    const auto durable_error = durable.get();
+    const auto before_renew_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    if (durable_error != ErrorCode::OK ||
+        before_renew_ms >= acquired->expires_at_ms) {
+        writer->Stop();
+        blocking_acquire.get();
+        FAIL() << "The original lease must remain valid before renewal starts";
+    }
+    EXPECT_EQ(std::future_status::timeout,
+              blocking_acquire.wait_for(std::chrono::milliseconds(0)));
+
+    auto renewing = std::async(std::launch::async, [&] {
+        return service.RenewWeightRevisionLease(RenewWeightRevisionLeaseRequest{
+            .tenant_id = "default",
+            .lease_id = acquired->lease_id,
+            .ttl_ms = 60'000,
+        });
+    });
+    const auto waiting = renewing.wait_for(std::chrono::seconds(5));
+    writer->ResumeCallbacks();
+    const auto completed = renewing.wait_for(std::chrono::seconds(2));
+    // Stop releases every callback gate before joining asynchronous requests.
+    writer->Stop();
+    const auto blocker = blocking_acquire.get();
+    const auto renewed = renewing.get();
+    EXPECT_EQ(std::future_status::timeout, waiting);
+    EXPECT_EQ(std::future_status::ready, completed);
+    EXPECT_TRUE(blocker.has_value());
+    ASSERT_FALSE(renewed.has_value());
+    EXPECT_EQ(WeightManagementError::LEASE_EXPIRED, renewed.error());
+}
+
+TEST_F(MasterServiceHATest, ConcurrentWeightReconciliationPreservesReplay) {
+    CheckConcurrentWeightReplay(false);
+}
+
+TEST_F(MasterServiceHATest, AbandonedWeightImportSweepPreservesReplay) {
+    CheckConcurrentWeightReplay(true);
+}
+
+TEST_F(MasterServiceHATest,
+       WeightOperationReplayRestoresActiveAndCompletedState) {
+    const std::string cluster_id = "weight_operation_replay_restore";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_weight_management_oplog_capability_confirmed(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallGatedWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+    const auto segment = PrepareSimpleSegment(service);
+    ASSERT_TRUE(writer->RunCallbacksThrough(1));
+    const WeightRevisionIdentity identity{
+        .tenant_id = "default",
+        .name_space = "production",
+        .resource_id = "replay",
+        .revision = "step-100",
+        .weight_generation = 7,
+    };
+    const auto importing = service.BeginWeightImport({
+        .identity = identity,
+        .payload_group_id = {},
+        .expected_payload_count = 1,
+        .expected_logical_bytes = 1024,
+    });
+    ASSERT_TRUE(importing);
+    const std::string payload_key = "operation-replay-payload";
+    const auto manifest_key = MakeWeightManifestKey(identity);
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    replicate.with_hard_pin = true;
+    replicate.group_ids =
+        std::vector<std::string>{importing->manifest.payload_group_id};
+    uint64_t put_sequence = 3;
+    for (const auto& key : {payload_key, manifest_key}) {
+        replicate.data_type = key == payload_key ? ObjectDataType::WEIGHT
+                                                 : ObjectDataType::METADATA;
+        ASSERT_TRUE(service.PutStart(segment.client_id, key, kDefaultTenant,
+                                     key == payload_key ? 1024 : 128,
+                                     replicate));
+        ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
+                                   ReplicaType::MEMORY));
+        // PutEnd returns before durability; drain the single-entry writer.
+        ASSERT_TRUE(writer->RunCallbacksThrough(put_sequence++));
+    }
+    const auto ready = service.CommitWeightImport({
+        .identity = identity,
+        .expected_metadata_generation = importing->metadata_generation,
+        .manifest =
+            {
+                .manifest_key = manifest_key,
+                .manifest_sha256 = std::string(64, 'a'),
+                .payload_group_id = importing->manifest.payload_group_id,
+                .payload_keys_sha256 =
+                    ComputeWeightPayloadKeysSha256({payload_key}),
+                .payload_count = 1,
+                .logical_bytes = 1024,
+            },
+    });
+    ASSERT_TRUE(ready);
+    const auto active = service.StartWeightResidencyOperation({
+        .identity = identity,
+        .expected_metadata_generation = ready->metadata_generation,
+        .target_residency = WeightResidencyState::HOT,
+    });
+    ASSERT_TRUE(active);
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    const auto verify_restored =
+        [&](const WeightResidencyOperation& operation) {
+            const auto replayed = reader.PollOnce();
+            ASSERT_EQ(ErrorCode::OK, replayed.error);
+            ASSERT_TRUE(replayed.durable_prefix_present);
+            EXPECT_EQ(replayed.durable_prefix.last_seq + 1,
+                      applier.GetExpectedSequenceId());
+            const auto snapshot = standby.SnapshotWeightMetadata();
+            EXPECT_EQ(ExportWeightMetadata(service), snapshot);
+            MasterService restored;
+            ASSERT_TRUE(restored.RestoreFromStandbySnapshot(
+                {}, replayed.durable_prefix.last_seq, {}, snapshot));
+            EXPECT_EQ(snapshot, ExportWeightMetadata(restored));
+            const auto queried = restored.QueryWeightOperation({
+                .operation_id = operation.operation_id,
+            });
+            ASSERT_TRUE(queried);
+            EXPECT_EQ(operation, *queried);
+        };
+    verify_restored(*active);
+    const auto finished =
+        service.ReconcileWeightRevision({.identity = identity});
+    ASSERT_TRUE(finished);
+    ASSERT_EQ(WeightOperationState::NONE, finished->operation);
+    const auto completed = service.QueryWeightOperation({
+        .operation_id = active->operation_id,
+    });
+    ASSERT_TRUE(completed);
+    ASSERT_EQ("completed", completed->message);
+    verify_restored(*completed);
+
+    const auto rehydrating = service.StartWeightResidencyOperation({
+        .identity = identity,
+        .expected_metadata_generation = finished->metadata_generation,
+        .target_residency = WeightResidencyState::HOT,
+    });
+    ASSERT_TRUE(rehydrating);
+    ASSERT_TRUE(service.UnmountSegment(segment.segment_id, segment.client_id));
+    for (const auto& key : {payload_key, manifest_key}) {
+        const auto readable = service.ExistKey(key, kDefaultTenant);
+        ASSERT_TRUE(readable);
+        ASSERT_FALSE(*readable);
+    }
+    const auto degraded =
+        service.ReconcileWeightRevision({.identity = identity});
+    ASSERT_TRUE(degraded);
+    EXPECT_EQ(WeightAvailabilityState::DEGRADED, degraded->availability);
+    EXPECT_EQ(WeightResidencyState::ABSENT, degraded->residency);
+    EXPECT_EQ(WeightOperationState::REHYDRATING, degraded->operation);
+    EXPECT_EQ(rehydrating->operation_id, degraded->operation_id);
+    EXPECT_EQ(rehydrating->fenced_metadata_generation + 1,
+              degraded->metadata_generation);
+    const auto pending = service.QueryWeightOperation({
+        .operation_id = rehydrating->operation_id,
+    });
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(degraded->metadata_generation,
+              pending->fenced_metadata_generation);
+    EXPECT_NE("completed", pending->message);
+    service.StopBatchOpLogWriter();
+    verify_restored(*pending);
 }
 
 }  // namespace mooncake::test

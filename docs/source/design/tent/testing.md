@@ -179,3 +179,32 @@ and CUDA stubs would bypass the fakes.
 Concurrency tests that touch shared runtime maps should also be run
 under ThreadSanitizer (`-fsanitize=thread`). Which binaries those are
 belongs in the test sources, not here.
+
+## What belongs in this suite
+
+Tests should call production functions or the public engine API. Do not
+reimplement a state machine in the test file and assert against that
+copy. Enum assignment, `std::atomic` store/load, and `Config::get/set`
+without going through `install()` / `TransferEngineImpl` do not lock
+runtime behavior.
+
+Binaries that are not ctest:
+
+- `tent_metrics_example` — HTTP metrics demo
+- `deadline_promotion_bench` — hot-path microbenchmark
+- `tent/benchmark/hip_bandwidth_bench.cpp` — standalone `hipcc` HIP
+  bandwidth sweep; CMake does not build it
+
+Hardware data-path tests (`tent_rdma_transport_test` roundtrip,
+`tent_nvlink_transport_test`, Sunrise, MPComm) skip or are omitted from
+ctest when the device is missing. That skip is expected; a green
+`cuda-off` run does not mean those paths were exercised. `tent_nvlink_transport_test`
+is built when CUDA is on but is not registered with ctest. The `tent_xpu_*`
+tests are built only with `USE_XPU=ON`; they skip without a SYCL device and
+some can fall back to an OpenCL CPU device, so check the GoogleTest skip
+counts before treating a run as Intel GPU coverage. On hardware expected to
+support dma-buf RDMA, set `MC_TENT_XPU_REQUIRE_DMABUF_RDMA=1` so missing
+dma-buf support fails instead of skipping. `tent_xpu_ipc_process_test` skips
+its IPC cases when ptrace forbids the cross-process import (Yama
+`ptrace_scope` 3, or 2 without `CAP_SYS_PTRACE`), and its fallback cases when
+the process has `CAP_SYS_PTRACE`.

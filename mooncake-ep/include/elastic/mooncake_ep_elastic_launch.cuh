@@ -4,9 +4,37 @@
 
 #include <cuda_alike.h>
 
+#ifdef USE_NCCL_DEVICE
+#include <transport/device/nccl_device_transport.h>
+#endif
+
 namespace mooncake {
 
+enum class ElasticTransportBackend : uint8_t {
+    kIbgda = 0,
+    kNccl = 1,
+};
+
+#ifdef USE_NCCL_DEVICE
+namespace elastic::transport {
+
+// Everything the NCCL kernel adapter needs in addition to NCCL's opaque
+// device context. The pointer fields identify offsets in the symmetric NCCL
+// registration; rank/team metadata is kept explicit so hot device paths do
+// not need capability queries.
+struct NcclContext {
+    device::NcclDeviceContext device;
+};
+
+}  // namespace elastic::transport
+#endif
+
 struct ElasticLaunchContext {
+    ElasticTransportBackend backend = ElasticTransportBackend::kIbgda;
+    int device_id = -1;
+#ifdef USE_NCCL_DEVICE
+    elastic::transport::NcclContext nccl;
+#endif
     void* gdr_buffer = nullptr;
     const int32_t* nvlink_available = nullptr;
     void* const* ipc_peer_ptrs = nullptr;
@@ -52,8 +80,8 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
     float* recv_topk_weights, int* recv_src_metadata, int* channel_linked_list,
     int num_recv_tokens, int num_max_tokens_per_rank, int hidden, int elem_size,
     int num_sf_packs, int recv_sf_token_stride, int recv_sf_hidden_stride,
-    int num_experts, int num_topk, int num_sms, int num_smem_bytes,
-    int num_channels, bool do_expand, bool cached_mode,
+    int num_experts, int num_topk, int num_sms, int num_epilogue_sms,
+    int num_smem_bytes, int num_channels, bool do_expand, bool cached_mode,
     const ElasticLaunchContext& ctx, int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert, cudaStream_t stream);
 
@@ -70,8 +98,8 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
     void* combined_x, float* combined_topk_weights, int64_t* combined_topk_idx,
     int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
     int num_experts, int num_topk, void* reduce_buffer, void* bias_0,
-    void* bias_1, int num_sms, int num_smem_bytes, bool use_expanded_layout,
-    bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
-    cudaStream_t stream);
+    void* bias_1, int num_sms, int num_epilogue_sms, int num_smem_bytes,
+    bool use_expanded_layout, bool allow_multiple_reduction,
+    const ElasticLaunchContext& ctx, cudaStream_t stream);
 
 }  // namespace mooncake

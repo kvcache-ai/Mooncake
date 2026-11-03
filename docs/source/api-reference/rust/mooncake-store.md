@@ -171,6 +171,34 @@ Batch version of `get_into()`.
 - **Returns**: per-key bytes written (≥ 0) or error code (< 0).
 - **Safety**: each destination buffer must be writable and at least `sizes[i]` bytes.
 
+#### `unsafe batch_put_from_multi_buffers(keys, buffers, config) -> Result<Vec<i32>, StoreError>`
+
+One object per key from several registered buffers each: `buffers[i]` is a slice of `(pointer, size)` pairs whose bytes, in order, are the value of `keys[i]` (a KV block's per-layer slices, say).
+
+- **Returns**: per-key result codes (0 = success, non-zero = error code for that key).
+- **Safety**: every buffer must be registered and valid for its size.
+
+#### `unsafe batch_get_into_multi_buffers(keys, buffers, prefer_alloc_in_same_node) -> Result<Vec<i64>, StoreError>`
+
+The reverse: each key's value is read into its `(pointer, size)` pairs in order. `prefer_alloc_in_same_node` sends the buffers of a key that live in one segment as one transfer.
+
+- **Returns**: per-key bytes written (≥ 0, the sum of the key's sizes) or error code (< 0).
+- **Safety**: every buffer must be registered and writable for its size.
+
+Example:
+
+```rust
+use std::ffi::c_void;
+
+// One 8 MiB object held as four 2 MiB slices of registered memory.
+let slices: Vec<(*mut c_void, usize)> =
+    (0..4).map(|i| (unsafe { base.add(i << 21) } as *mut c_void, 1 << 21)).collect();
+let put = unsafe { store.batch_put_from_multi_buffers(&["block"], &[&slices], None)? };
+assert_eq!(put, vec![0]);
+let got = unsafe { store.batch_get_into_multi_buffers(&["block"], &[&slices], false)? };
+assert_eq!(got, vec![8 << 20]);
+```
+
 #### `batch_is_exist(keys) -> Result<Vec<bool>, StoreError>`
 
 Batch existence check. Errors are returned as `OperationFailed(code)`.
@@ -182,19 +210,21 @@ Replication settings for write operations (`put`, `put_from`, `batch_put_from`).
 Fields:
 
 - `replica_num`: number of replicas (0 means “use server default”).
-- `with_soft_pin`: prefer retaining the object in memory (soft pin).
+- `soft_pin_action`: soft-pin intent for the write, one of `SoftPinAction::Preserve` (default; keeps an existing unexpired deadline), `SoftPinAction::Enable` (commits a new soft pin when the write becomes readable), or `SoftPinAction::Disable` (removes an existing soft pin). A soft pin guards an object from eviction until a deadline fixed at write time; reads never extend it.
+- `soft_pin_ttl_ms`: optional soft-pin TTL override in milliseconds. Only valid with `SoftPinAction::Enable`; `None` uses the master’s default TTL.
 - `with_hard_pin`: never evict (hard pin).
 - `preferred_segments`: whitelist of segment names that should host a replica.
 
 Example:
 
 ```rust
-use mooncake_store::{MooncakeStore, ReplicateConfig};
+use mooncake_store::{MooncakeStore, ReplicateConfig, SoftPinAction};
 
 fn write_with_replication(store: &MooncakeStore) -> Result<(), mooncake_store::StoreError> {
     let cfg = ReplicateConfig {
         replica_num: 2,
-        with_soft_pin: true,
+        soft_pin_action: SoftPinAction::Enable,
+        soft_pin_ttl_ms: None,
         with_hard_pin: false,
         preferred_segments: vec!["seg-a".to_string(), "seg-b".to_string()],
     };

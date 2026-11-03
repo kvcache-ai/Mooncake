@@ -9,6 +9,8 @@
 
 namespace mooncake {
 
+class NVMeoFInitiator;
+
 /**
  * @brief Manages anonymous shared memory segments backed by memfd.
  *
@@ -23,9 +25,18 @@ class ShmHelper {
     struct ShmSegment {
         int fd = -1;
         void *base_addr = nullptr;
+        // Size of the actual mapping; may be padded up to the hugepage/2MB
+        // boundary when SPDK registration is enabled
+        // (MC_STORE_REGISTER_SPDK=1).
         size_t size = 0;
+        // Size the caller requested in allocate(); == size unless padded.
+        // Callers that must match the original request (e.g.
+        // DummyClient::register_buffer) compare against this, not size, so they
+        // don't re-derive the alignment.
+        size_t requested_size = 0;
         std::string name;
         bool registered = false;
+        bool spdk_registered = false;
         bool is_local = false;
     };
 
@@ -45,6 +56,12 @@ class ShmHelper {
 
     bool is_hugepage() const { return use_hugepage_; }
 
+    // Whether the MC_STORE_REGISTER_SPDK feature is enabled (env == "1").
+    // Single source of truth for the env semantics, shared by ShmHelper's
+    // constructor and the RealClient-side (receiver) registration so both sides
+    // of the dummy/real split gate identically.
+    static bool is_register_spdk_enabled();
+
     ShmHelper(const ShmHelper &) = delete;
     ShmHelper &operator=(const ShmHelper &) = delete;
 
@@ -55,6 +72,12 @@ class ShmHelper {
     std::vector<std::shared_ptr<ShmSegment>> shms_;
     static std::mutex shm_mutex_;
     bool use_hugepage_ = false;
+    bool register_spdk_ = false;
+    // NoF initiator owning this process's registrations of the ShmHelper
+    // mappings (MC_STORE_REGISTER_SPDK=1). nullptr when NoF is unavailable.
+    // Registrations live in the process-global page registry, so they are
+    // visible to every other initiator instance (e.g. the RealClient's).
+    std::shared_ptr<NVMeoFInitiator> nof_initiator_;
 };
 
 }  // namespace mooncake

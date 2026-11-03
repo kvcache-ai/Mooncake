@@ -1,0 +1,53 @@
+name: Retrigger CI on run-ci label
+
+# Same-SHA retrigger for Build & Test. This is a separate workflow so labels
+# other than `run-ci` (especially `run-e2e-ci`) cannot start or cancel
+# `.github/workflows/ci.yml`.
+#
+# pull_request_target is required so fork PRs can rerun Actions. This
+# workflow only calls the GitHub API; it does not check out PR code.
+on:
+  pull_request_target:
+    branches:
+      - "main"
+      - "release/**"
+    types: [labeled]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  retrigger:
+    if: >
+      github.event.label.name == 'run-ci' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-run Build & Test for this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_json=$(gh api \
+            "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=20")
+          run_id=$(echo "$run_json" | jq -r '.workflow_runs[0].id // empty')
+          status=$(echo "$run_json" | jq -r '.workflow_runs[0].status // empty')
+
+          if [ -z "$run_id" ]; then
+            echo "No Build & Test run found for SHA ${SHA}."
+            echo "Open or push to the PR first so ci.yml has a run to rerun."
+            exit 1
+          fi
+
+          echo "Matched workflow run ${run_id} (status=${status})"
+          if [ "$status" != "completed" ]; then
+            echo "Build & Test is still ${status}; not starting a duplicate."
+            exit 0
+          fi
+
+          gh run rerun "$run_id" --repo "$REPO"

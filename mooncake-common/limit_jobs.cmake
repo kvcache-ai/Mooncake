@@ -3,6 +3,7 @@
 # Auto-detects available memory and CPU count, calculates safe parallel job
 # limits for compilation and linking separately. With Ninja, creates job pools
 # so compilation uses many cores while memory-heavy linking is restricted.
+# On GitHub-hosted runners both limits are capped at 3 jobs.
 #
 # User overrides (cmake -D...):
 #   PARALLEL_COMPILE_JOBS  — override compile parallelism
@@ -54,6 +55,20 @@ if(_link_jobs LESS 1)
 endif()
 if(_link_jobs GREATER _nproc)
     set(_link_jobs ${_nproc})
+endif()
+
+# GitHub-hosted runners (4 vCPUs, 16 GB) have been killed mid-build with exit
+# code 137 while four heavy translation units compiled at once. Self-hosted
+# runners report RUNNER_ENVIRONMENT=self-hosted and keep the limits above.
+set(_github_hosted_max_jobs 3)
+if("$ENV{RUNNER_ENVIRONMENT}" STREQUAL "github-hosted")
+    foreach(_jobs_var _compile_jobs _link_jobs)
+        if(${_jobs_var} GREATER _github_hosted_max_jobs)
+            set(${_jobs_var} ${_github_hosted_max_jobs})
+        endif()
+    endforeach()
+    message(STATUS "[limit_jobs] GitHub-hosted runner: capping jobs at "
+        "${_github_hosted_max_jobs}")
 endif()
 
 # Use auto-detected values unless user explicitly overrides with -D

@@ -1,0 +1,253 @@
+// Copyright 2026 KVCache.AI
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TENT_TRANSPORT_UB_WORKERS_H_
+#define TENT_TRANSPORT_UB_WORKERS_H_
+
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+#include "tent/common/status.h"
+#include "tent/runtime/segment_manager.h"
+#include "tent/runtime/topology.h"
+#include "tent/transport/ub/buffers.h"
+#include "tent/transport/ub/context.h"
+#include "tent/transport/ub/params.h"
+#include "tent/transport/ub/quota.h"
+#include "tent/transport/ub/rail_monitor.h"
+#include "tent/transport/ub/slice.h"
+#include "tent/transport/ub/urma_adapter.h"
+
+namespace mooncake::tent::ub {
+
+class UbEndpoint;
+
+struct EndpointResolveRequest {
+    UbContextPtr local_context;
+    SegmentID remote_segment_id{LOCAL_SEGMENT_ID};
+    const SegmentDesc* remote_segment{nullptr};
+    Topology::NicID remote_topology_id{-1};
+    uint64_t segment_generation{0};
+};
+
+using EndpointResolver = std::function<Status(const EndpointResolveRequest&,
+                                              std::shared_ptr<UbEndpoint>&)>;
+using EndpointRetirer = std::function<void(const std::shared_ptr<UbEndpoint>&)>;
+using LocalDeviceFailureHandler =
+    std::function<Status(Topology::NicID local_topology_id)>;
+
+// Lexicographic path score. Capacity is a hard preference, topology locality
+// remains the primary policy choice, and live pressure breaks ties before
+// learned bandwidth. The deterministic tail makes concurrent workers agree on
+// an order while retry_order rotates otherwise-equivalent rails on retry.
+struct UbPathSelectionScore {
+    bool quota_available{false};
+    size_t topology_rank{Topology::DevicePriorityRanks};
+    double normalized_inflight{1.0};
+    double normalized_quota_wrs{1.0};
+    uint64_t endpoint_outstanding_wrs{0};
+    uint64_t endpoint_outstanding_bytes{0};
+    bool has_bandwidth_sample{false};
+    double ewma_bandwidth_bytes_per_second{-1.0};
+    size_t retry_order{0};
+    Topology::NicID local_topology_id{-1};
+    int remote_device_id{-1};
+};
+
+[[nodiscard]] inline bool betterUbPathScore(
+    const UbPathSelectionScore& lhs, const UbPathSelectionScore& rhs) noexcept {
+    if (lhs.quota_available != rhs.quota_available) return lhs.quota_available;
+    if (lhs.topology_rank != rhs.topology_rank)
+        return lhs.topology_rank < rhs.topology_rank;
+    if (lhs.normalized_inflight != rhs.normalized_inflight)
+        return lhs.normalized_inflight < rhs.normalized_inflight;
+    if (lhs.normalized_quota_wrs != rhs.normalized_quota_wrs)
+        return lhs.normalized_quota_wrs < rhs.normalized_quota_wrs;
+    if (lhs.endpoint_outstanding_wrs != rhs.endpoint_outstanding_wrs) {
+        return lhs.endpoint_outstanding_wrs < rhs.endpoint_outstanding_wrs;
+    }
+    if (lhs.endpoint_outstanding_bytes != rhs.endpoint_outstanding_bytes) {
+        return lhs.endpoint_outstanding_bytes < rhs.endpoint_outstanding_bytes;
+    }
+    if (lhs.has_bandwidth_sample != rhs.has_bandwidth_sample)
+        return lhs.has_bandwidth_sample;
+    if (lhs.has_bandwidth_sample && lhs.ewma_bandwidth_bytes_per_second !=
+                                        rhs.ewma_bandwidth_bytes_per_second) {
+        return lhs.ewma_bandwidth_bytes_per_second >
+               rhs.ewma_bandwidth_bytes_per_second;
+    }
+    if (lhs.retry_order != rhs.retry_order)
+        return lhs.retry_order < rhs.retry_order;
+    if (lhs.local_topology_id != rhs.local_topology_id)
+        return lhs.local_topology_id < rhs.local_topology_id;
+    return lhs.remote_device_id < rhs.remote_device_id;
+}
+
+// Orders pre-scored rails for lazy endpoint resolution. `local_topology_ids`
+// holds each rail's local device in pre-score order, and the returned values
+// are indices into it.
+//
+// Pass one takes the highest-scoring rail of every local device, so the
+// candidates that actually get resolved span devices instead of piling onto
+// whichever device ranks best. Pass two appends the remaining rails, so a
+// caller that still needs candidates - a single-device topology, or a rail that
+// failed to resolve - can fill its floor without attempting a rail twice.
+[[nodiscard]] inline std::vector<size_t> ubResolutionAttemptOrder(
+    const std::vector<Topology::NicID>& local_topology_ids) {
+    const size_t count = local_topology_ids.size();
+    std::vector<bool> taken(count, false);
+    std::vector<size_t> order;
+    order.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        const auto id = local_topology_ids[index];
+        bool known_device = false;
+        for (size_t earlier : order) {
+            if (local_topology_ids[earlier] == id) {
+                known_device = true;
+                break;
+            }
+        }
+        if (known_device) continue;
+        order.push_back(index);
+        taken[index] = true;
+    }
+    for (size_t index = 0; index < count; ++index) {
+        if (!taken[index]) order.push_back(index);
+    }
+    return order;
+}
+
+// Native UB scheduler. Posting lanes own request selection and URMA post;
+// poller lanes own completion dispatch. A monotonic numeric token, never a raw
+// UbSlice pointer, crosses the adapter boundary.
+class UbWorkers final {
+   public:
+    UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
+              std::vector<UbContextPtr> contexts,
+              std::shared_ptr<Topology> local_topology,
+              SegmentManager* segment_manager, UbBufferManager* buffers,
+              RailMonitor* rail_monitor, QuotaManager* quota, UbParams params,
+              EndpointResolver endpoint_resolver,
+              EndpointRetirer endpoint_retirer = {},
+              LocalDeviceFailureHandler local_device_failure_handler = {});
+    ~UbWorkers();
+
+    UbWorkers(const UbWorkers&) = delete;
+    UbWorkers& operator=(const UbWorkers&) = delete;
+
+    Status start();
+    Status stop();
+    Status submit(const UbTask::Ptr& task, uint64_t device_mask = ~0ULL);
+    Status cancel(const UbTask::Ptr& task);
+
+    [[nodiscard]] bool running() const noexcept {
+        return accepting_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] size_t queuedCount() const;
+    [[nodiscard]] size_t inflightCount() const;
+
+   private:
+    struct PendingSlice {
+        // Keep the task alive until every queued/in-flight slice reaches a
+        // terminal state. Callers may release the sub-batch handle before the
+        // asynchronous data path has drained.
+        UbTask::Ptr task;
+        UbSlice::Ptr slice;
+        uint64_t device_mask{~0ULL};
+        int priority{PRIO_HIGH};
+        SegmentID target_id{LOCAL_SEGMENT_ID};
+        Request::OpCode opcode{Request::READ};
+    };
+    struct Route;
+    struct Inflight;
+    struct LocalDeviceCandidate {
+        Topology::NicID id{-1};
+        size_t topology_rank{Topology::DevicePriorityRanks};
+    };
+
+    void postingLoop(size_t worker_index);
+    void pollingLoop(size_t poller_index);
+    bool popPending(PendingSlice& pending);
+    void enqueueRetry(const PendingSlice& pending);
+    void deferPending(const PendingSlice& pending);
+    void processPending(const PendingSlice& pending, size_t worker_index);
+    Status buildRoute(const PendingSlice& pending, Route& route);
+    Status chooseAndResolveEndpoint(const PendingSlice& pending, Route& route,
+                                    std::shared_ptr<UbEndpoint>& endpoint,
+                                    UbPostPath& path,
+                                    QuotaReservation& reservation);
+    void handleCompletion(const Completion& completion);
+    void handleLocalDeviceFailure(const UbContextPtr& context);
+    void progressLocalDeviceFailure(const UbContextPtr& context);
+    void scanTimeouts();
+    void releaseInflight(const std::shared_ptr<Inflight>& inflight);
+    void resolveInflight(const std::shared_ptr<Inflight>& inflight,
+                         TransferStatusEnum outcome, size_t bytes,
+                         bool retryable);
+    void recordTimeoutOnce(const std::shared_ptr<Inflight>& inflight,
+                           uint64_t now_ns);
+    void rememberEndpointDrain(const std::shared_ptr<UbEndpoint>& endpoint);
+    void forgetEndpointDrain(const std::shared_ptr<UbEndpoint>& endpoint);
+    void failUnposted(const PendingSlice& pending,
+                      TransferStatusEnum outcome = FAILED);
+    uint64_t nextCompletionToken();
+    std::vector<LocalDeviceCandidate> orderedLocalDevices(
+        const PendingSlice& pending) const;
+    static std::vector<Topology::NicID> orderedRemoteDevices(
+        const SegmentDesc& segment, const BufferDesc& buffer);
+
+    std::shared_ptr<UrmaAdapter> adapter_;
+    std::vector<UbContextPtr> contexts_;
+    std::unordered_map<Topology::NicID, UbContextPtr> context_by_topology_id_;
+    std::shared_ptr<Topology> local_topology_;
+    SegmentManager* segment_manager_;
+    UbBufferManager* buffers_;
+    RailMonitor* rail_monitor_;
+    QuotaManager* quota_;
+    const UbParams params_;
+    EndpointResolver endpoint_resolver_;
+    EndpointRetirer endpoint_retirer_;
+    LocalDeviceFailureHandler local_device_failure_handler_;
+    // Serializes endpoint-store retirement progress across JFC pollers. The
+    // handler temporarily moves quarantined endpoints out of the store while
+    // retrying cleanup, so a second poller must not observe a false empty
+    // barrier and reactivate the context early.
+    mutable std::mutex local_device_failure_mutex_;
+
+    mutable std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::array<std::deque<PendingSlice>, PRIO_LOW + 1> queues_;
+
+    mutable std::mutex inflight_mutex_;
+    mutable std::mutex endpoint_drain_mutex_;
+    std::condition_variable inflight_cv_;
+    std::unordered_map<uint64_t, std::shared_ptr<Inflight>> inflight_;
+    // Endpoints whose ERROR transition has not yet reached its native flush
+    // fence remain owned here even if every logical token completes naturally.
+    std::unordered_map<uint64_t, std::shared_ptr<UbEndpoint>>
+        draining_endpoints_;
+
+    std::vector<std::shared_ptr<UbJfc>> all_jfcs_;
+    std::unordered_map<const UbJfc*, UbContextPtr> context_by_jfc_;
+    std::vector<std::thread> posting_threads_;
+    std::vector<std::thread> polling_threads_;
+    std::atomic<bool> accepting_{false};
+    std::atomic<bool> posting_{false};
+    std::atomic<bool> polling_{false};
+    std::atomic<bool> timeout_scans_enabled_{false};
+    std::atomic<uint64_t> next_token_{1};
+};
+
+}  // namespace mooncake::tent::ub
+
+#endif  // TENT_TRANSPORT_UB_WORKERS_H_

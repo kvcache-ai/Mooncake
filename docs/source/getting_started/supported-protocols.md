@@ -16,9 +16,13 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **hip** | AMD ROCm/HIP | AMD GPU communication | ⚠️ Advanced |
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
+| **shm** | None (POSIX shm, same host) | Same-host DRAM copies without NIC loopback | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
+| **hylink** | Hygon DCU + DTK | Hygon DCU HSL fabric communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
+| **xpu** | Intel GPU + oneAPI SYCL | Host staging and same-node XPU P2P/IPC; TCP/RDMA between nodes | ⚠️ Advanced (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
+| **flagcx** | RDMA-capable NIC(s) | Unified P2P transfer through FlagOS FlagCX | ⚠️ Advanced |
 
 ## Commonly Used Protocols (Python API)
 
@@ -68,6 +72,8 @@ export MOONCAKE_PROTOCOL="tcp"
 - NVIDIA GPUDirect RDMA
 - Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
 - Cambricon MLU memory via Neuware (`-DUSE_MLU=ON`)
+- Biren GPU memory via SUPA (`-DUSE_SUPA=ON`)
+- Intel XPU memory via dma-buf (`-DUSE_XPU=ON -DUSE_TENT=ON`)
 
 **Use When:**
 - High-performance networking is required
@@ -77,6 +83,10 @@ export MOONCAKE_PROTOCOL="tcp"
 **Note:** If no RDMA HCA (Host Channel Adapter) is detected on the system, the Transfer Engine will automatically fall back to TCP protocol for compatibility.
 
 **MLU Note:** Cambricon MLU support uses the standard `rdma` data path. There is no separate `mlu` protocol string. To enable MLU memory detection, topology discovery, and DMA-BUF based registration, build Transfer Engine with `-DUSE_MLU=ON` and make Neuware available through `NEUWARE_HOME` or `NEUWARE_ROOT`.
+
+**Intel XPU Note:** Intel XPU support lives in TENT (`-DUSE_XPU=ON -DUSE_TENT=ON`, run with `MC_USE_TENT=1`). On registration, VRAM is exported through Level Zero as a dma-buf and registered with `ibv_reg_dmabuf_mr`, so RDMA reads and writes go to VRAM directly. The direct path is per buffer, not guaranteed: when the NIC or rdma-core lacks dma-buf support, when the export fails for an allocation (for example small foreign USM allocations pooled by the Intel compute runtime, see the build guide), or when `transports/rdma/disable_gpu_direct_rdma` is `true`, the engine transparently stages that VRAM through pinned host memory over the same RDMA or TCP transport. A request hinted to another transport (e.g. `tcp`), or one whose selector policy only admits a DRAM-only transport (e.g. `hp_tcp`), is staged as well. Within one process, VRAM-to-VRAM copies between two XPUs on the same node go directly over PCIe (or Xe Link) when the devices have peer access, and are bounced through host memory otherwise. Across processes on the same node (for example a prefill and a decode worker), registered VRAM is also published with a Level Zero IPC handle; the peer maps it into its own context and the copy runs as a local XPU copy instead of going through the network transport. Opening a peer's handle fetches its dma-buf descriptor with `pidfd_getfd(2)`, which needs ptrace permission over the exporting process: the Level Zero runtime marks its processes `PR_SET_PTRACER_ANY`, so the same user in the same PID namespace suffices under Yama `ptrace_scope` 0 or 1, while `ptrace_scope` 2 needs `CAP_SYS_PTRACE`; when that is refused, or when `transports/xpu/disable_ipc` is `true`, the engine falls back to the network path.
+
+**XPU initiator requirement:** Both direct RDMA and host-staged transfers involving XPU memory currently require an XPU-platform initiator. Staging additionally requires its `XpuTransport` to be enabled; without it, XPU memory is not staged and is routed only over a transport that copies device memory itself, such as TCP. A CPU-platform initiator is not supported even when its local buffer is DRAM and only the remote buffer is XPU memory; it cannot transparently fall back to staging. A `cpu:0` buffer in an XPU-platform process does not exercise this CPU-platform case. Foreign/fallback USM whose dma-buf size exceeds its allocation size is conservatively staged, including ambiguous padding; see the [build guide](build.md).
 
 **Configuration:**
 ```python
@@ -166,7 +176,7 @@ cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON
 - Software-emulated RDMA writes (higher CPU overhead than true RDMA)
 - ~88% of RoCE RDMA throughput
 
-**Documentation:** See [EFA Transport](../design/transfer-engine/efa_transport.md) for build instructions, benchmarks, and tuning.
+**Documentation:** See [EFA Transport](../design/transfer-engine/transport/efa_transport.md) for build instructions, benchmarks, and tuning.
 
 ## Advanced Protocols (C++ Transfer Engine)
 
@@ -198,13 +208,79 @@ The following protocols are available at the C++ Transfer Engine level for speci
 - NVIDIA MNNVL hardware
 - Compiled with `USE_MNNVL=ON`
 
+Mooncake Store providers can use this transport for a default-off,
+EGM-backed DRAM tier. Configure the Python `setup(config)` overload with
+`enable_egm_store_pool=true`, `protocol="nvlink"`,
+and `global_segment_size>0`. `egm_numa_nodes` accepts
+`auto` (the default, using each visible GPU's CUDA
+`CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`) or a comma-separated node list. Consumers
+do not enable the pool; they use the ordinary `nvlink` protocol to access the
+provider's mounted segments. Use `MC_MS_AUTO_DISC=0` for the manual selection
+shown below, for both Providers and Consumers. `MC_FORCE_MNNVL` is not needed
+in this mode. EGM requires a non-TENT Transfer Engine with the `nvlink`
+transport installed.
+
+`local_buffer_size` controls a separate client staging pool and can be zero
+or nonzero. Nonzero buffers use the existing client-buffer allocator, not
+the EGM pool allocator. A storage-only Provider can leave it at zero; a
+Provider that also uses staging APIs such as `put()` or `get_buffer()` needs
+a nonzero buffer.
+
+The requested EGM capacity is rounded down to a multiple of the common
+alignment: the maximum of the Store slab alignment and the selected nodes'
+CUDA allocation granularities. It is distributed across nodes, then split
+into balanced, aligned chunks no larger than `max_mr_size`. This planning
+applies only to EGM pools.
+
 **Configuration:**
 ```bash
-# Set MC_FORCE_MNNVL=true to use MNNVL even when RDMA NICs are present
-export MC_FORCE_MNNVL=true
+# Provider and Consumer: install the requested nvlink transport explicitly.
+export MC_MS_AUTO_DISC=0
 ```
 
-**Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
+```python
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+**Note:** Manual `protocol="nvlink"` selection is supported for both Providers
+and Consumers. If you use `MC_MS_AUTO_DISC=1` instead, set `MC_FORCE_MNNVL=1`
+on hosts with RDMA HCAs so discovery selects MNNVL. EGM setup checks the
+actual engine and fails before allocation unless it is non-TENT and has
+`nvlink` installed.
+
+Drain all application and offload calls before closing a Store. Close is
+terminal, even on error. EGM cleanup is attempted, and resources whose cleanup
+cannot be confirmed are retained until process exit rather than retried by a
+later close. See
+`close()` in the [Python Store API](../api-reference/python/mooncake-store.md)
+for cleanup and failure handling.
+
+**Host memory over NVLink (TENT, EGM):** on Grace-Blackwell systems the GPUs of
+an NVLink domain can also address each other's host DRAM (Extended GPU Memory).
+The TENT `mnnvl` transport exports host buffers this way when
+`transports/mnnvl/egm` is enabled (`MC_MNNVL_EGM=1`, off by default), adding the
+`dram_to_dram` and `gpu_to_dram` capabilities so CPU-resident data (weight or
+KV caches) moves over NVLink instead of the NIC:
+
+```bash
+export MC_ENABLE_MNNVL=1   # select the TENT mnnvl transport
+export MC_MNNVL_EGM=1      # transports/mnnvl/egm
+```
+
+Only buffers allocated with `allocateLocalMemory("cpu:<numa>")` (or any
+`cuMemCreate` allocation with a `HOST_NUMA` location and a fabric handle) are
+exported; other host memory keeps the previous `cudaHostRegister` behaviour and
+is reachable through RDMA/TCP as before. Requires an IMEX domain spanning the
+peers and EGM enabled in the driver.
 
 ### MUSA Transport (musa)
 
@@ -262,7 +338,17 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 
 **Requirements:**
 - NVIDIA NVLink hardware
-- Compiled with `USE_INTRA_NVLINK=ON`
+- Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
+- Registered buffers must be legacy device allocations (`cudaMalloc` / `cuMemAlloc`), because the transport shares them with `cudaIpcGetMemHandle`. Virtual-memory allocations (`cuMemCreate`) have no such handle. In particular, PyTorch tensors allocated with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` cannot be registered: allocate the transfer buffers separately, or disable `expandable_segments` for them.
+- Peers in containers must share the IPC **and** PID namespaces, e.g. `docker run --ipc=host --pid=host` (Kubernetes: `hostIPC` plus `hostPID` or `shareProcessNamespace`). A CUDA IPC handle carries the exporting process's PID. Two containers with separate PID namespaces can hand out the same PID, and the importer then rejects the peer's handle as its own: `cudaIpcOpenMemHandle failed: invalid device context`. A typical symptom is that only the peer pairs with the same worker index fail.
+
+**Configuration:**
+```bash
+# Select the intra-node NVLink transport. Cannot be combined with MC_FORCE_MNNVL.
+export MC_INTRANODE_NVLINK=true
+```
+
+**Note:** On a build without `USE_MNNVL=ON`, leaving `MC_INTRANODE_NVLINK` unset keeps the usual RDMA (or TCP, when no HCA is detected) selection.
 
 ### HIP Transport (hip)
 
@@ -299,6 +385,31 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 **Requirements:**
 - CXL-capable hardware
 
+### SHM Transport (shm)
+
+**Description:** Same-host DRAM copies over POSIX shared memory. Classic Transfer Engine maps the peer's named shm object, relocates the peer virtual address into the local mapping, and `memcpy`s. This is a first-class transport like HIP, not a replacement for `CxlTransport` (DAX offset addressing).
+
+**Use When:**
+- Two processes on the same machine exchange DRAM buffers
+- You want to avoid RDMA/TCP loopback for that path
+
+**Requirements:**
+- Linux POSIX shm (`/dev/shm`), or a writable hugetlbfs mount when allocating with `SharedMemoryOptions.use_hugepage` (2MB / 512MB / 1GB)
+- Buffers allocated with `TransferEngine::allocateSharedMemory` (ordinary `malloc` cannot be exported)
+- Runtime opt-in: `MC_FORCE_SHM=1`, or `installTransport("shm")`. With `-DENABLE_MULTI_PROTOCOL=ON` this adds SHM next to RDMA/TCP (`rdma,shm` / `tcp,shm`); without it, SHM is the only transport.
+- Same-host SHM **and** cross-host RDMA/TCP in one engine: build with `-DENABLE_MULTI_PROTOCOL=ON` (segment protocol becomes `rdma,shm` or `tcp,shm`)
+
+**Limitations:**
+- Same host only. Without `ENABLE_MULTI_PROTOCOL`, `MC_FORCE_SHM=1` (or `installTransport("shm")` after another transport) sets `segment.protocol` to `shm` and replaces RDMA/TCP routing; `installTransport("shm")` logs a WARNING when it overwrites a non-empty protocol. Coexistence needs `-DENABLE_MULTI_PROTOCOL=ON`.
+- `registerLocalMemory` must use the pointer from `allocateSharedMemory` (a shorter prefix is allowed). A sub-range or overflowing range returns an error instead of silently skipping. Ordinary `malloc` is still skipped so TCP/RDMA can register it.
+- Same-UID only: objects are created `0600`. POSIX names are `/mooncake_<pid>_xxxxxxxx`; hugepage files are `<hugetlbfs-mount>/mooncake_<pid>_xxxxxxxx`. Creator and consumer must share a user; a hostname match does not imply a shared `/dev/shm` or hugetlbfs mount (for example Kubernetes `hostNetwork` pods).
+- Crash or `SIGKILL` can leave POSIX objects in `/dev/shm` and hugetlbfs files on the mount. There is no automatic reaper (wiping `mooncake_*` on start would hit live peers on the same mount). POSIX leftovers waste tmpfs until reboot; **hugetlbfs leftovers keep hugepages reserved** until the file is unlinked or the node reboots. After a crash, delete only `mooncake_<pid>_*` whose pid no longer exists, e.g. `rm /dev/hugepages/mooncake_<dead-pid>_*`.
+- Hugepage allocations do not fall back to tmpfs. `length` must be a multiple of the hugepage size; TE does not round up.
+- After `freeSharedMemory` + `allocateSharedMemory`, a peer that still has a cached mapping probes the object name before memcpy. An unlinked object is dropped and the segment descriptor is refetched once; a changed virtual address still requires the initiator to read the new `BufferDesc.addr` (relocate cannot guess a new offset). Background refresh remains optional via `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`.
+- Relocate caches at most 32 mmap'd peer objects per target. An in-flight copy pins its mapping so prune/cap cannot `munmap` it until memcpy returns; the cache may briefly exceed 32 while pins are held.
+- Default off because the path is not NUMA-aware
+- Mooncake Store segments are not shm-backed until a follow-up allocator change
+
 ### Ascend Transport (ascend)
 
 **Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or direct transport.
@@ -312,8 +423,40 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 - HCCL runtime
 
 **Documentation:**
-- [Heterogeneous Ascend](../design/transfer-engine/heterogeneous_ascend.md)
-- [Ascend Transport](../design/transfer-engine/ascend_transport.md)
+- [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
+- [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
+
+### Hylink Transport (hylink)
+
+**Description:** Transfer Engine transport for Hygon DCU memory over HSL
+(Hygon Scale-up Link). HSL connects DCUs directly, including across machines,
+and does not use an IB/RoCE NIC. Peers exchange a DTK VMM fabric handle
+(`hipMemAllocationHandleType` `0x8`, 512 bytes). The same handle works on one
+machine and across machines. An imported fabric address can be granted access
+only once, and only to one device, so each local GPU imports and maps the
+handle, then grants access on its own device. The TENT transport uses the same
+HSL fabric path by default, and remains selectable across machines. Set
+`MC_HYLINK_USE_VMM=0` on both sides of a TENT run to use HIP IPC in
+environments that do not support VMM. IPC cannot cross machines.
+
+**Status:** Select it with `transfer_engine_bench --protocol=hylink`.
+TENT selects it with `transports.hylink.enable=true` or
+`transfer_engine_bench --backend=tent --protocol=hylink`. It is off unless
+that switch is set, so a DTK build keeps using RDMA/TCP by default.
+
+**Use When:**
+- DCU copies on one machine or across machines should use HSL instead of a
+  NIC path. The exporter must register VMM memory (`hipMemCreate`)
+- TENT only: set `MC_HYLINK_USE_VMM=0` in environments that do not support
+  VMM. That path uses same-machine `hipMalloc` buffers and a HIP IPC
+  handle, and cannot cross machines
+
+**Requirements:**
+- Built with `-DUSE_HYLINK=ON` (implies `USE_HIP`)
+- TENT builds also pass `-DUSE_TENT=ON`
+- Hygon DTK runtime
+- Both sides must support DTK VMM fabric
+- TENT IPC does not require VMM and stays on one machine
 
 ### TPU Transport (tpu) — Experimental
 
@@ -348,6 +491,67 @@ planned as a follow-up.
 - DMA-mapped (pinned) staging buffers for true async device DMA are a planned
   performance follow-up.
 
+(intel-xpu-transport)=
+### Intel XPU Transport (xpu)
+
+**Description:** Intel GPU support in TENT through oneAPI SYCL. On the same
+node, the XPU transport copies between XPUs. Within a process, the copy runs
+directly over PCIe (or Xe Link) when the two devices have peer access, and is
+bounced through host memory otherwise. Between processes, it maps the peer's
+buffer through a Level Zero IPC handle when the IPC requirements below are met.
+With `rdma`, registered XPU memory is accessed directly through dma-buf when
+available. Otherwise, the XPU transport performs the local device-to-host and
+host-to-device copies, and an existing TCP/RDMA transport carries the staged
+data between peers. See the Intel XPU notes in the RDMA section above.
+
+**Status:** TENT only. `xpu` is a local transport (host staging and same-node
+XPU copies), not a network protocol to pass to Store setup. Select `tcp` or
+`rdma` for the network hop.
+
+**Use When:**
+- Moving Intel GPU device buffers through TENT
+- Copying between Intel GPUs on one node, including between processes such as
+  prefill and decode workers
+- Reading and writing PyTorch XPU tensors with the C++ Mooncake Store backend
+
+**Requirements:**
+- Built with `-DUSE_XPU=ON -DUSE_TENT=ON` using the Intel oneAPI compilers
+  (`icpx` for C++ is required; the build examples also use `icx` for C)
+- Compatible SYCL and Level Zero runtimes and access to the Intel GPU
+- `MC_USE_TENT=1` before constructing the Store client or compatibility API engine
+- A TCP or RDMA transport for transfers between nodes, or when same-node IPC
+  is unavailable
+
+**Configuration:**
+```bash
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export MC_USE_TENT=1
+```
+
+**Design notes:**
+- Device memory uses `xpu:N` locations. Host/shared USM is treated as host memory.
+- PyTorch XPU device pointers are recognized through the platform default SYCL
+  context. Synchronize producing work before passing a buffer to Mooncake, and
+  keep registered allocations alive until transfers complete.
+- Same-node IPC is used only when the selector policy allows `xpu`; a policy
+  with a non-empty `transports` list must name `"xpu"` ahead of `"rdma"` (see
+  [Transport Selector](../design/tent/transport-selector.md)). Set
+  `transports/xpu/disable_ipc` to `true` to turn IPC off.
+
+**Limitations:**
+- No XPU support in the classic Transfer Engine
+- Transfers involving XPU memory require an XPU-platform initiator (see the
+  RDMA section above)
+- Same-node IPC between processes requires both processes in the same PID
+  namespace, peer access from the copying device to the device that holds the
+  buffer, and ptrace permission over the exporting process: Yama
+  `ptrace_scope` 0 or 1, or `CAP_SYS_PTRACE` for scope 2; scope 3 rejects the
+  import even with that capability. Otherwise the transfer takes the network
+  path (RDMA dma-buf or host staging); see the GPU-Direct note in the
+  [build guide](build.md).
+
+**Build instructions:** See {ref}`build-with-intel-xpu`.
+
 ### MPComm Transport (mpcomm)
 
 **Description:** UCL-MPComm (Unified Communication Library - Memory Pool Communication) is an RDMA
@@ -374,8 +578,57 @@ so it cannot be selected through `MOONCAKE_PROTOCOL` or `transfer_engine_bench -
 { "transports": { "mpcomm": { "enable": true } } }
 ```
 
-See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md) for the full guide,
+See [MPComm Transport](../design/transfer-engine/transport/mpcomm_transport.md) for the full guide,
 including selection via transport policy, tuning environment variables, and troubleshooting.
+
+### FlagOS FlagCX Transport (flagcx)
+
+**Description:** [FlagCX](https://github.com/flagos-ai/FlagCX) is the unified communication library
+in the FlagOS ecosystem for multi-vendor and cross-vendor deployments. Mooncake integrates the
+FlagCX P2P Engine as a classic Transfer Engine transport, allowing the existing Mooncake transfer
+workflow to use the accelerator and network backends provided by the local FlagCX build.
+
+**Use When:**
+- Deploying Mooncake on a platform supported by FlagCX
+- Using FlagCX's P2P Engine for accelerator memory transfers
+- Building a cross-vendor deployment around the FlagOS communication stack
+
+**Build Requirements:**
+```bash
+cmake -S . -B build \
+  -DUSE_FLAGCX=ON \
+  -DFLAGCX_HOME=/path/to/FlagCX/build
+cmake --build build -j
+```
+
+`FLAGCX_HOME` must contain `include/flagcx_p2p.h` and either `lib/libflagcx.so` or
+`lib64/libflagcx.so`. If it is omitted, Mooncake checks `$FLAGCX_HOME` and then
+`$HOME/FlagCX/build`.
+
+**Configuration:**
+```python
+engine.initialize(
+    hostname="node1",
+    metadata_server="P2PHANDSHAKE",
+    protocol="flagcx",
+    device_name=""
+)
+```
+
+```bash
+# Select the interface used for FlagCX bootstrap and endpoint advertisement.
+export FLAGCX_SOCKET_IFNAME="eth0"
+```
+
+**Current Scope:**
+- Available through the classic Transfer Engine; it is not a TENT transport
+- Must be built from source with `USE_FLAGCX=ON`
+- Should be selected as the standalone `flagcx` protocol, not as part of a multi-protocol string
+- Buffers should be registered before the first transfer to a peer and remain registered while
+  that peer connection is active
+
+See [FlagOS FlagCX Transport](../design/transfer-engine/transport/flagcx_transport.md) for dependency,
+build, benchmark, runtime configuration, and troubleshooting details.
 
 ## Configuration Examples
 
@@ -436,7 +689,10 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
+| Intel XPU Clusters | tcp or rdma (TENT) | Build with `-DUSE_XPU=ON -DUSE_TENT=ON` and set `MC_USE_TENT=1`; RDMA uses dma-buf when available, otherwise host staging; same-node XPUs copy over P2P/IPC |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
+| Hygon DCU Clusters | rdma + hylink | Build with `-DUSE_HYLINK=ON`; use hylink for HSL fabric communication |
+| Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |
 
 ## Troubleshooting
 
@@ -479,3 +735,18 @@ If a protocol fails to initialize:
 - [Transfer Engine Benchmark](../design/transfer-engine/transfer-engine-bench-tuning.md) - Performance tuning
 - [Python API Reference](../api-reference/python/transfer-engine.md) - API documentation
 - [Deployment Guide](../deployment/mooncake-store-deployment-guide.md) - Production deployment
+
+:::{toctree}
+:maxdepth: 1
+:hidden:
+
+../design/transfer-engine/transport/efa_transport
+../design/transfer-engine/transport/ascend_direct_transport
+../design/transfer-engine/transport/ascend_transport
+../design/transfer-engine/transport/heterogeneous_ascend
+../design/transfer-engine/transport/kunpeng_ub_transport
+../design/transfer-engine/transport/sunrise_link_transport
+../design/transfer-engine/transport/flagcx_transport
+../design/transfer-engine/transport/mpcomm_transport
+../design/transfer-engine/transport/memfabric_transport
+:::

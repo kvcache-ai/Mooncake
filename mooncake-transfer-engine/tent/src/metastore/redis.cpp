@@ -40,7 +40,19 @@ class RedisReplyGuard {
     redisReply *reply_;
 };
 
-RedisMetaStore::RedisMetaStore() {}
+RedisMetaStore::RedisMetaStore() : connected_(false), client_(nullptr) {}
+
+redisReply *RedisMetaStore::command(const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    redisReply *reply = runCommand(format, ap);
+    va_end(ap);
+    return reply;
+}
+
+redisReply *RedisMetaStore::runCommand(const char *format, va_list ap) {
+    return static_cast<redisReply *>(redisvCommand(client_, format, ap));
+}
 
 RedisMetaStore::~RedisMetaStore() { disconnect(); }
 
@@ -171,13 +183,13 @@ Status RedisMetaStore::handleRedisReply(redisReply *reply,
 }
 
 Status RedisMetaStore::get(const std::string &key, std::string &value) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
     if (!connected_) {
         return Status::MetadataError("Redis connection not available" LOC_MARK);
     }
 
     // Use binary-safe formatting to prevent command injection
-    redisReply *resp =
-        (redisReply *)redisCommand(client_, "GET %b", key.data(), key.size());
+    redisReply *resp = command("GET %b", key.data(), key.size());
     RedisReplyGuard reply_guard(resp);
 
     Status status = handleRedisReply(resp, "GET '" + key + "'");
@@ -189,32 +201,33 @@ Status RedisMetaStore::get(const std::string &key, std::string &value) {
         return Status::InvalidEntry(key);
     }
 
-    value = std::string(resp->str);
+    // Use (str, len): redis values are binary-safe and may contain NULs.
+    value = std::string(resp->str, resp->len);
     return Status::OK();
 }
 
 Status RedisMetaStore::set(const std::string &key, const std::string &value) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
     if (!connected_) {
         return Status::MetadataError("Redis connection not available" LOC_MARK);
     }
 
     // Use binary-safe formatting to prevent command injection
-    redisReply *resp =
-        (redisReply *)redisCommand(client_, "SET %b %b", key.data(), key.size(),
-                                   value.data(), value.size());
+    redisReply *resp = command("SET %b %b", key.data(), key.size(),
+                               value.data(), value.size());
     RedisReplyGuard reply_guard(resp);
 
     return handleRedisReply(resp, "SET '" + key + "'");
 }
 
 Status RedisMetaStore::remove(const std::string &key) {
+    std::lock_guard<std::mutex> lock(client_mutex_);
     if (!connected_) {
         return Status::MetadataError("Redis connection not available" LOC_MARK);
     }
 
     // Use binary-safe formatting to prevent command injection
-    redisReply *resp =
-        (redisReply *)redisCommand(client_, "DEL %b", key.data(), key.size());
+    redisReply *resp = command("DEL %b", key.data(), key.size());
     RedisReplyGuard reply_guard(resp);
 
     return handleRedisReply(resp, "DEL '" + key + "'");

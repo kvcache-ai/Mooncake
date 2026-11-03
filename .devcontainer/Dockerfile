@@ -38,14 +38,6 @@ RUN GO_VERSION="1.23.8" && \
     && tar -C /usr/local -xzf go${GO_VERSION}.linux-${GOARCH}.tar.gz \
     && rm go${GO_VERSION}.linux-${GOARCH}.tar.gz
 
-RUN git clone https://github.com/alibaba/yalantinglibs.git \
-    && cd yalantinglibs \
-    && mkdir -p build \
-    && cd build \
-    && cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF \
-    && cmake --build . -j$(nproc) \
-    && cmake --install .
-
 ENV GOPROXY='https://goproxy.cn'
 ENV PATH=/usr/local/go/bin:$PATH
 

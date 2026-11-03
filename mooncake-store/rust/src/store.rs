@@ -41,6 +41,22 @@ use crate::ffi_dlopen as ffi;
 // ReplicateConfig
 // ---------------------------------------------------------------------------
 
+/// Soft-pin intent of a put operation.
+///
+/// A soft pin guards an object from eviction until a deadline fixed at write
+/// time; reads never extend it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SoftPinAction {
+    /// Keep an existing unexpired soft-pin deadline. The default, so plain
+    /// puts commit ordinary cache.
+    #[default]
+    Preserve = 0,
+    /// Commit a new soft-pin lifetime when the write becomes readable.
+    Enable = 1,
+    /// Remove an existing soft pin when the write becomes readable.
+    Disable = 2,
+}
+
 /// Replication settings for a put operation.
 ///
 /// This is the Rust counterpart of `mooncake_replicate_config_t` from
@@ -49,8 +65,11 @@ use crate::ffi_dlopen as ffi;
 pub struct ReplicateConfig {
     /// Number of replicas to create (0 means use the server default).
     pub replica_num: usize,
-    /// Prefer a replica on the same NUMA node / host ("soft pin").
-    pub with_soft_pin: bool,
+    /// Soft-pin intent for this write.
+    pub soft_pin_action: SoftPinAction,
+    /// Soft-pin TTL override in milliseconds. Only valid with
+    /// [`SoftPinAction::Enable`]; `None` uses the master's default TTL.
+    pub soft_pin_ttl_ms: Option<u64>,
     /// Declare whether the object will never be evicted.
     pub with_hard_pin: bool,
     /// Whitelist of segment names that should host a replica.
@@ -73,6 +92,12 @@ impl ReplicateConfig {
         ),
         StoreError,
     > {
+        if self.soft_pin_ttl_ms.is_some() && self.soft_pin_action != SoftPinAction::Enable {
+            return Err(StoreError::InvalidArgument(
+                "soft_pin_ttl_ms is only valid with SoftPinAction::Enable".to_string(),
+            ));
+        }
+
         let strings: Vec<CString> = self
             .preferred_segments
             .iter()
@@ -83,7 +108,9 @@ impl ReplicateConfig {
 
         let c_config = ffi::mooncake_replicate_config_t {
             replica_num: self.replica_num,
-            with_soft_pin: i32::from(self.with_soft_pin),
+            soft_pin_action: self.soft_pin_action as i32,
+            has_soft_pin_ttl: i32::from(self.soft_pin_ttl_ms.is_some()),
+            soft_pin_ttl_ms: self.soft_pin_ttl_ms.unwrap_or(0),
             with_hard_pin: i32::from(self.with_hard_pin),
             preferred_segments: if ptrs.is_empty() {
                 std::ptr::null_mut()
@@ -540,6 +567,140 @@ impl MooncakeStore {
         Ok(results)
     }
 
+    // -----------------------------------------------------------------------
+    // Multi-buffer batch operations
+    // -----------------------------------------------------------------------
+
+    /// Store one object per key from several registered buffers each: the
+    /// value of `keys[i]` is the bytes of `buffers[i]`'s `(pointer, size)`
+    /// pairs in order (a KV block's per-layer slices, say).
+    ///
+    /// Returns a `Vec<i32>` where each element is the result code for the
+    /// corresponding key (0 = success, non-zero = error).
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as `put_from`: each buffer must be registered.
+    pub unsafe fn batch_put_from_multi_buffers(
+        &self,
+        keys: &[&str],
+        buffers: &[&[(*mut c_void, usize)]],
+        config: Option<&ReplicateConfig>,
+    ) -> Result<Vec<i32>, StoreError> {
+        let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let (_key_strings, key_ptrs, flat, sizes, counts) = Self::flatten(keys, buffers)?;
+
+        let (_c_config, _strings, _ptrs) = Self::prepare_config(config)?;
+        let cfg_ptr = _c_config
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c as *const _);
+
+        let mut results = vec![0i32; count];
+
+        let rc = ffi::mooncake_store_batch_put_from_multi_buffers(
+            self.handle,
+            key_ptrs.as_ptr() as *mut *const libc::c_char,
+            flat.as_ptr() as *mut *mut c_void,
+            sizes.as_ptr(),
+            counts.as_ptr(),
+            count,
+            cfg_ptr,
+            results.as_mut_ptr(),
+        );
+
+        if rc != 0 {
+            return Err(StoreError::OperationFailed(rc));
+        }
+
+        Ok(results)
+    }
+
+    /// Retrieve one object per key into several registered buffers each,
+    /// filled in order; `prefer_alloc_in_same_node` sends the buffers of a
+    /// key that live in one segment as one transfer.
+    ///
+    /// Returns a `Vec<i64>` where each element is the number of bytes written
+    /// for the key (≥ 0, the sum of its buffers' sizes) or an error code
+    /// (< 0).
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as `get_into`: each buffer must be registered
+    /// and writable for its size.
+    pub unsafe fn batch_get_into_multi_buffers(
+        &self,
+        keys: &[&str],
+        buffers: &[&[(*mut c_void, usize)]],
+        prefer_alloc_in_same_node: bool,
+    ) -> Result<Vec<i64>, StoreError> {
+        let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let (_key_strings, key_ptrs, flat, sizes, counts) = Self::flatten(keys, buffers)?;
+
+        let mut results = vec![0i64; count];
+
+        let rc = ffi::mooncake_store_batch_get_into_multi_buffers(
+            self.handle,
+            key_ptrs.as_ptr() as *mut *const libc::c_char,
+            flat.as_ptr() as *mut *mut c_void,
+            sizes.as_ptr(),
+            counts.as_ptr(),
+            count,
+            prefer_alloc_in_same_node as libc::c_int,
+            results.as_mut_ptr(),
+        );
+
+        if rc != 0 {
+            return Err(StoreError::OperationFailed(rc));
+        }
+
+        Ok(results)
+    }
+
+    /// The flat arrays the multi-buffer C functions take: the keys as C
+    /// strings (kept alive by the first element), every key's buffers and
+    /// sizes back to back, and how many each key owns.
+    #[allow(clippy::type_complexity)]
+    fn flatten(
+        keys: &[&str],
+        buffers: &[&[(*mut c_void, usize)]],
+    ) -> Result<
+        (
+            Vec<CString>,
+            Vec<*const libc::c_char>,
+            Vec<*mut c_void>,
+            Vec<usize>,
+            Vec<usize>,
+        ),
+        StoreError,
+    > {
+        if buffers.len() != keys.len() {
+            return Err(StoreError::InvalidArgument(
+                "keys and buffers must have the same length".to_string(),
+            ));
+        }
+        let key_strings: Vec<CString> = keys
+            .iter()
+            .map(|k| CString::new(*k))
+            .collect::<Result<_, _>>()?;
+        let key_ptrs: Vec<*const libc::c_char> = key_strings.iter().map(|s| s.as_ptr()).collect();
+        let flat: Vec<*mut c_void> = buffers
+            .iter()
+            .flat_map(|b| b.iter().map(|&(p, _)| p))
+            .collect();
+        let sizes: Vec<usize> = buffers
+            .iter()
+            .flat_map(|b| b.iter().map(|&(_, n)| n))
+            .collect();
+        let counts: Vec<usize> = buffers.iter().map(|b| b.len()).collect();
+        Ok((key_strings, key_ptrs, flat, sizes, counts))
+    }
+
     /// Batch check existence of multiple keys.
     pub fn batch_is_exist(&self, keys: &[&str]) -> Result<Vec<bool>, StoreError> {
         let count = keys.len();
@@ -626,14 +787,17 @@ mod tests {
     fn replicate_config_to_ffi_empty_segments() {
         let config = ReplicateConfig {
             replica_num: 2,
-            with_soft_pin: true,
+            soft_pin_action: SoftPinAction::Enable,
+            soft_pin_ttl_ms: Some(30000),
             with_hard_pin: false,
             preferred_segments: Vec::new(),
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
         assert_eq!(ffi_cfg.replica_num, 2);
-        assert_eq!(ffi_cfg.with_soft_pin, 1);
+        assert_eq!(ffi_cfg.soft_pin_action, SoftPinAction::Enable as i32);
+        assert_eq!(ffi_cfg.has_soft_pin_ttl, 1);
+        assert_eq!(ffi_cfg.soft_pin_ttl_ms, 30000);
         assert_eq!(ffi_cfg.with_hard_pin, 0);
         assert!(ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 0);
@@ -645,14 +809,17 @@ mod tests {
     fn replicate_config_to_ffi_with_segments() {
         let config = ReplicateConfig {
             replica_num: 3,
-            with_soft_pin: false,
+            soft_pin_action: SoftPinAction::Preserve,
+            soft_pin_ttl_ms: None,
             with_hard_pin: false,
             preferred_segments: vec!["seg-a".to_string(), "seg-b".to_string()],
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
         assert_eq!(ffi_cfg.replica_num, 3);
-        assert_eq!(ffi_cfg.with_soft_pin, 0);
+        assert_eq!(ffi_cfg.soft_pin_action, SoftPinAction::Preserve as i32);
+        assert_eq!(ffi_cfg.has_soft_pin_ttl, 0);
+        assert_eq!(ffi_cfg.soft_pin_ttl_ms, 0);
         assert_eq!(ffi_cfg.with_hard_pin, 0);
         assert!(!ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 2);
@@ -666,10 +833,27 @@ mod tests {
     }
 
     #[test]
+    fn replicate_config_to_ffi_rejects_ttl_without_enable() {
+        let config = ReplicateConfig {
+            replica_num: 1,
+            soft_pin_action: SoftPinAction::Disable,
+            soft_pin_ttl_ms: Some(1000),
+            with_hard_pin: false,
+            preferred_segments: Vec::new(),
+        };
+
+        assert!(matches!(
+            config.to_ffi(),
+            Err(StoreError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
     fn replicate_config_to_ffi_rejects_interior_nul() {
         let config = ReplicateConfig {
             replica_num: 1,
-            with_soft_pin: false,
+            soft_pin_action: SoftPinAction::Preserve,
+            soft_pin_ttl_ms: None,
             with_hard_pin: false,
             preferred_segments: vec!["bad\0segment".to_string()],
         };
@@ -690,7 +874,8 @@ mod tests {
     fn prepare_config_some_preserves_storage_and_values() {
         let config = ReplicateConfig {
             replica_num: 4,
-            with_soft_pin: true,
+            soft_pin_action: SoftPinAction::Enable,
+            soft_pin_ttl_ms: None,
             with_hard_pin: false,
             preferred_segments: vec!["x".to_string(), "y".to_string()],
         };
@@ -699,7 +884,9 @@ mod tests {
             MooncakeStore::prepare_config(Some(&config)).expect("prepare should succeed");
         let cfg_ref = c_cfg.as_ref().expect("expected Some config");
         assert_eq!(cfg_ref.replica_num, 4);
-        assert_eq!(cfg_ref.with_soft_pin, 1);
+        assert_eq!(cfg_ref.soft_pin_action, SoftPinAction::Enable as i32);
+        assert_eq!(cfg_ref.has_soft_pin_ttl, 0);
+        assert_eq!(cfg_ref.soft_pin_ttl_ms, 0);
         assert_eq!(cfg_ref.with_hard_pin, 0);
         assert_eq!(cfg_ref.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);

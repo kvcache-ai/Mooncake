@@ -17,6 +17,8 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -25,6 +27,7 @@
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
+#include "tent/metrics/cached_metric.h"
 #include "tent/metrics/config_loader.h"
 
 // Compile-time metrics enable/disable switch
@@ -56,10 +59,22 @@ constexpr size_t kPrometheusBufferSize = 4096;
  * - Optional periodic logging of metrics summary
  * - Compile-time disable option (TENT_METRICS_ENABLED=0) for zero overhead
  * - Runtime disable option via setEnabled(false) for minimal overhead
+ *
+ * Hot-path counters and histograms record through pre-resolved label cells
+ * (see cached_metric.h): TransportType and Request::OpCode label domains are
+ * small fixed enums, so each label's atomic cell is resolved once and cached,
+ * turning the steady-state update into relaxed atomic adds with no locks.
  */
 class TentMetrics {
    public:
     static TentMetrics& instance();
+
+    // Build-time capability query for embedders and diagnostics. A build with
+    // metrics compiled out has no HTTP endpoint, so this must remain available
+    // in both the enabled implementation and the no-op stub.
+    static constexpr bool isCompiledIn() noexcept {
+        return TENT_METRICS_ENABLED != 0;
+    }
 
     // Initialize with configuration and start HTTP server
     Status initialize(const MetricsConfig& config);
@@ -85,21 +100,31 @@ class TentMetrics {
                               double latency_seconds = 0.0);
     void recordReadFailed(TransportType tp);
     void recordWriteFailed(TransportType tp);
+
+    // Lossless logical-request accounting. A successful start returns true
+    // and must be paired with exactly one finish, even if runtime recording is
+    // disabled while the request is in flight. These methods only touch cells
+    // pre-resolved during initialize(), so the transfer path never allocates
+    // or takes a metrics lock.
+    bool recordLogicalRequestStarted(Request::OpCode operation) noexcept;
+    void recordLogicalRequestFinished(Request::OpCode operation,
+                                      TransferStatusEnum status) noexcept;
     // Failover counter is labeled with both the source and destination
     // transport types so failover flows (e.g. rdma->tcp) are queryable.
     void recordTransportFailover(TransportType from, TransportType to);
 
     // Record physical transport attempts separately from logical requests.
     // "Started" means the engine is about to call submitTransferTasks (or the
-    // staging equivalent). "Finished" records the observed attempt duration
-    // and, for a FAILED status (including synchronous submit failure),
-    // increments the attempt-failure counter.
-    void recordTransportAttemptStarted(TransportType tp,
-                                       Request::OpCode operation);
+    // staging equivalent). "Finished" records exactly one bounded terminal
+    // outcome and the observed attempt duration. FAILED outcomes (including
+    // synchronous submit failures) also increment the compatibility
+    // attempt-failure counter.
+    bool recordTransportAttemptStarted(TransportType tp,
+                                       Request::OpCode operation) noexcept;
     void recordTransportAttemptFinished(TransportType tp,
                                         Request::OpCode operation,
                                         TransferStatusEnum status,
-                                        double latency_us);
+                                        double latency_us) noexcept;
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
     // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
@@ -111,6 +136,37 @@ class TentMetrics {
     // (infeasible window). Recorded into a dedicated counter so it is
     // distinguishable from genuine MLU samples in the histogram above.
     void recordDeadlineInfeasible(TransportType tp);
+
+    // Record a batch abandoned by lazyFreeBatch after repeated failed reclaim
+    // attempts. Such a batch stays on the freelist without further retries and
+    // is only reclaimed at engine teardown, so a nonzero value means resources
+    // are parked until shutdown and the last reclaim error is in the log.
+    void recordBatchQuarantined();
+
+    // Why a task failed. "submit" failures were observed synchronously at
+    // submission (the transport rejected the request); "poll" failures were
+    // observed by polling after the request had been accepted; timeout and
+    // canceled come from the terminal status itself.
+    enum class TaskFailureReason { Submit, Poll, Timeout, Canceled };
+
+    // Record a task-level failure with its reason. Additive to the legacy
+    // read/write_failures_total counters (which stay label-compatible); also
+    // the only failure metric that records TIMEOUT/CANCELED outcomes.
+    void recordTaskFailure(TransportType tp, TaskFailureReason reason);
+
+    // In-flight transport attempts (gauge): incremented when an attempt is
+    // submitted, decremented when it finishes. Reflects how much work is
+    // sitting in the engine right now — a persistently high or stuck value
+    // is the signature of a stalled pipeline. Gauge updates are paired
+    // add/sub operations, so they execute whenever initialized and ignore
+    // setEnabled(): skipping one half of a pair across an enable/disable
+    // transition would permanently corrupt the gauge.
+    void recordInflightAttemptStarted(TransportType tp);
+    void recordInflightAttemptFinished(TransportType tp);
+
+    // Registered buffer bytes per transport (gauge), maintained on
+    // register/unregisterLocalMemory. Same pairing rule as above.
+    void recordRegisteredBufferBytes(TransportType tp, int64_t delta);
 
     enum class Stage {
         QueueWait,
@@ -154,6 +210,30 @@ class TentMetrics {
     std::atomic<uint16_t> bound_http_port_{0};
 
 #if TENT_METRICS_ENABLED
+    friend class TentMetricsTestPeer;
+
+    // Published only after every bounded accounting label has a resolved
+    // cell. initialize() marks initialized_ before registration to serialize
+    // concurrent initializers, so accounting starts need this separate ready
+    // barrier to avoid pairing a dropped early start with a later finish.
+    std::atomic<bool> accounting_ready_{false};
+
+    static constexpr size_t kSerializationFormatCount = 2;
+    static constexpr size_t kPrometheusFormat = 0;
+    static constexpr size_t kJsonFormat = 1;
+
+    // Metrics about the metrics pipeline itself. They deliberately live in
+    // plain atomics instead of the ylt registry so they are always emitted,
+    // including while runtime recording is disabled or before any transfer
+    // metric has received a sample.
+    std::atomic<uint64_t> http_start_failures_{0};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        serialization_attempts_{{0, 0}};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        serialization_failures_{{0, 0}};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        last_serialization_success_timestamp_seconds_{{0, 0}};
+
     // Initialize and start the HTTP server on the configured port. Port
     // assignment is deterministic: co-located ranks are expected to be given
     // distinct ports explicitly (e.g. base_port + local_rank) rather than
@@ -164,6 +244,19 @@ class TentMetrics {
     // Register the /metrics, /metrics/summary, /metrics/json and /health
     // endpoints on the current http_server_ instance.
     void registerHttpHandlers();
+
+    // Build an endpoint response and report whether serialization succeeded.
+    // The public string-returning methods retain their existing API, while the
+    // HTTP handlers use the boolean result to return 5xx on failure.
+    bool tryGetPrometheusMetrics(std::string& result);
+    bool tryGetJsonMetrics(std::string& result);
+
+    // Apply common attempt/failure/last-success accounting around both output
+    // formats. Kept off the transfer hot path; this runs only on scrape or
+    // direct serialization requests.
+    bool serializeWithAccounting(
+        size_t format, std::string& result,
+        const std::function<void(std::string&, uint64_t)>& serializer);
 
     // HTTP server for metrics endpoint
     std::unique_ptr<coro_http::coro_http_server> http_server_;
@@ -187,162 +280,217 @@ class TentMetrics {
                                                                    "to"};
     static inline const std::array<std::string, 2> kAttemptLabels{"transport",
                                                                   "operation"};
+    static inline const std::array<std::string, 1> kOperationLabel{"operation"};
+    static inline const std::array<std::string, 2> kLogicalOutcomeLabels{
+        "operation", "outcome"};
+    static inline const std::array<std::string, 3> kAttemptOutcomeLabels{
+        "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 2> kTaskFailureLabels{
+        "transport", "reason"};
+
+    // Hot-path metrics record through pre-resolved label cells (see
+    // cached_metric.h). Label domain sizes: TransportType has
+    // kNumTransportTypes values; attempt metrics are additionally labeled by
+    // the 2-valued Request::OpCode.
+    static constexpr size_t kTransportDomain =
+        static_cast<size_t>(kNumTransportTypes);
+    static constexpr size_t kOperationDomain = 2;
+    static constexpr size_t kAttemptDomain = kTransportDomain * 2;
+    static constexpr size_t kOutcomeValueDomain = 4;
+    static constexpr size_t kLogicalOutcomeDomain =
+        kOperationDomain * kOutcomeValueDomain;
+    static constexpr size_t kAttemptOutcomeDomain =
+        kAttemptDomain * kOutcomeValueDomain;
+    static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+
+    // Stable slot indices into the cached-cell label domain.
+    static size_t transportSlot(TransportType tp) {
+        return static_cast<size_t>(tp);
+    }
+    static size_t attemptSlot(TransportType tp, Request::OpCode op) {
+        return static_cast<size_t>(tp) * 2 + (op == Request::READ ? 0u : 1u);
+    }
+    static size_t operationSlot(Request::OpCode operation) {
+        return operation == Request::READ ? 0u : 1u;
+    }
+    static size_t outcomeIndex(TransferStatusEnum status) noexcept;
+    static size_t logicalOutcomeSlot(Request::OpCode operation,
+                                     TransferStatusEnum status) noexcept {
+        return operationSlot(operation) * kOutcomeValueDomain +
+               outcomeIndex(status);
+    }
+    static size_t attemptOutcomeSlot(TransportType tp,
+                                     Request::OpCode operation,
+                                     TransferStatusEnum status) noexcept {
+        return attemptSlot(tp, operation) * kOutcomeValueDomain +
+               outcomeIndex(status);
+    }
+    static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
+        return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
 
     // Per-transport counters (label: transport). Values are int64_t.
-    ylt::metric::basic_dynamic_counter<int64_t, 1> read_bytes_total_{
-        "tent_read_bytes_total", "Total bytes read via TENT", kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> write_bytes_total_{
+    metrics::CachedDynamicCounter<1> read_bytes_total_{
+        "tent_read_bytes_total", "Total bytes read via TENT", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<1> write_bytes_total_{
         "tent_write_bytes_total", "Total bytes written via TENT",
-        kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> read_requests_total_{
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> read_requests_total_{
         "tent_read_requests_total", "Total read requests via TENT",
-        kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> write_requests_total_{
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> write_requests_total_{
         "tent_write_requests_total", "Total write requests via TENT",
-        kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> read_failures_total_{
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> read_failures_total_{
         "tent_read_failures_total", "Total read failures via TENT",
-        kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> write_failures_total_{
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> write_failures_total_{
         "tent_write_failures_total", "Total write failures via TENT",
-        kTransportLabel};
-    // Failover counter has two labels (from, to) so failover flows are
-    // queryable as e.g. tent_transport_failover_total{from="rdma",to="tcp"}.
+        kTransportLabel, kTransportDomain};
+    // Failover is a rare event and its label domain is the cross product of
+    // transports, so it stays on the plain locked path.
     ylt::metric::basic_dynamic_counter<int64_t, 2> failover_total_{
         "tent_transport_failover_total",
         "Total cross-transport failover events", kFailoverLabels};
-    ylt::metric::basic_dynamic_counter<int64_t, 2> transport_attempts_total_{
+    metrics::CachedDynamicCounter<2> transport_attempts_total_{
         "tent_transport_attempts_total",
         "Total physical transport attempts submitted for execution",
-        kAttemptLabels};
-    ylt::metric::basic_dynamic_counter<int64_t, 2>
-        transport_attempt_failures_total_{
-            "tent_transport_attempt_failures_total",
-            "Physical transport attempts that terminated with FAILED",
-            kAttemptLabels};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> deadline_infeasible_total_{
+        kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicCounter<2> transport_attempt_failures_total_{
+        "tent_transport_attempt_failures_total",
+        "Physical transport attempts that terminated with FAILED",
+        kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_started_total_{
+        "tent_logical_requests_started_total",
+        "Accepted logical requests by operation", kOperationLabel,
+        kOperationDomain};
+    metrics::CachedDynamicCounter<2> logical_request_outcomes_total_{
+        "tent_logical_request_outcomes_total",
+        "Terminal logical request outcomes", kLogicalOutcomeLabels,
+        kLogicalOutcomeDomain};
+    metrics::CachedDynamicCounter<3> transport_attempt_outcomes_total_{
+        "tent_transport_attempt_outcomes_total",
+        "Terminal physical transport attempt outcomes", kAttemptOutcomeLabels,
+        kAttemptOutcomeDomain};
+    // Task-level failures with a reason label, so Grafana can alert on the
+    // failure signature (submit vs poll vs timeout vs canceled) without log
+    // scraping. Additive to the legacy read/write_failures_total counters.
+    metrics::CachedDynamicCounter<2> task_failures_total_{
+        "tent_task_failures_total",
+        "Task-level failures by terminal transport and failure reason",
+        kTaskFailureLabels, kTaskFailureDomain};
+    metrics::CachedDynamicCounter<1> deadline_infeasible_total_{
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit",
-        kTransportLabel};
+        kTransportLabel, kTransportDomain};
+    // Label-less: quarantine is a batch-lifecycle event, not a per-transport
+    // one (a batch may hold SubBatches on several transports).
+    ylt::metric::counter_t quarantined_batches_total_{
+        "tent_quarantined_batches_total",
+        "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
+        "attempts; reclaimed only at engine teardown"};
 
-    // Histograms - paired with their bucket boundaries in a single vector so
-    // the two cannot drift out of sync (ylt histogram doesn't expose its
-    // boundaries publicly, so we hold them alongside the pointer).
-    // Each entry also carries a parallel counter used to track the per-label
-    // sum, because ylt's basic_dynamic_histogram keeps sum_ private with no
-    // public accessor — without this counter, _sum could only be emitted as 0
-    // in the Prometheus endpoint, breaking _sum / _count queries.
-    // Only N=1 (per-transport) histograms live here; the N=2
-    // transport_attempt_latency_ histogram is serialized separately (see
-    // getPrometheusMetrics / getJsonMetrics) via the same templated helpers.
-    struct HistogramEntry {
-        ylt::metric::basic_dynamic_histogram<int64_t, 1>* h;
-        const std::vector<double>* boundaries;
-        ylt::metric::basic_dynamic_counter<int64_t, 1>* sum;
-    };
-    std::vector<HistogramEntry> histograms_;
+    // Gauges, backed by cached cells and updated with add/sub. Serialized as
+    // Prometheus gauges (current value per label), NOT via the counters_
+    // vector.
+    metrics::CachedDynamicCounter<1> inflight_attempts_{
+        "tent_inflight_attempts",
+        "In-flight transport attempts (submitted, not yet finished)",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_inflight_{
+        "tent_logical_requests_inflight",
+        "Accepted logical requests without a terminal outcome", kOperationLabel,
+        kOperationDomain};
+    metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
+        "tent_registered_buffer_bytes", "Registered local buffer bytes",
+        kTransportLabel, kTransportDomain};
+    std::vector<metrics::CachedDynamicCounter<1>*> gauges_;
 
     // Latency histograms use microseconds (us) as unit
     // Default buckets: 100us, 500us, 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s
     static inline const std::vector<double> kLatencyBuckets{
         100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000};
-    ylt::metric::basic_dynamic_histogram<int64_t, 1> read_latency_{
-        "tent_read_latency_us", "Read latency distribution in microseconds",
-        kLatencyBuckets, kTransportLabel};
-    ylt::metric::basic_dynamic_histogram<int64_t, 1> write_latency_{
-        "tent_write_latency_us", "Write latency distribution in microseconds",
-        kLatencyBuckets, kTransportLabel};
     // Size histograms for request size distribution (in bytes)
     // Default buckets: 1KB, 4KB, 16KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB,
     // 256MB, 1GB
     static inline const std::vector<double> kSizeBuckets{
         1024,    4096,     16384,    65536,     262144,    1048576,
         4194304, 16777216, 67108864, 268435456, 1073741824};
-    ylt::metric::basic_dynamic_histogram<int64_t, 1> read_size_{
-        "tent_read_size_bytes", "Read request size distribution in bytes",
-        kSizeBuckets, kTransportLabel};
-    ylt::metric::basic_dynamic_histogram<int64_t, 1> write_size_{
-        "tent_write_size_bytes", "Write request size distribution in bytes",
-        kSizeBuckets, kTransportLabel};
-
     // Deadline feasibility ratio (MLU) distribution for transfers that carried
     // a deadline. Stored in per-mille (MLU x 1000) so the histogram can use
     // integer observe() like the others; the 1000 boundary is MLU == 1.0, the
     // feasible/infeasible line (< 1000 met the deadline, >= 1000 missed it).
     static inline const std::vector<double> kMluPerMilleBuckets{
         100, 250, 500, 750, 900, 1000, 1250, 1500, 2000, 5000};
-    ylt::metric::basic_dynamic_histogram<int64_t, 1> deadline_mlu_{
-        "tent_deadline_mlu_permille",
-        "Deadline feasibility ratio (MLU x 1000) distribution",
-        kMluPerMilleBuckets, kTransportLabel};
-
     // Causal chain stage latency histograms (microseconds)
     // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
     static inline const std::vector<double> kStageBuckets{
         10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
-    ylt::metric::basic_dynamic_histogram<int64_t, 1> stage_queue_wait_{
+
+    // Histograms are composed of cached-cell counters: one counter per bucket
+    // plus a sum counter. The sum is part of the histogram itself, so no
+    // parallel standalone sum counter is needed.
+    metrics::CachedDynamicHistogram<1> read_latency_{
+        "tent_read_latency_us", "Read latency distribution in microseconds",
+        kLatencyBuckets, kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> write_latency_{
+        "tent_write_latency_us", "Write latency distribution in microseconds",
+        kLatencyBuckets, kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> read_size_{
+        "tent_read_size_bytes", "Read request size distribution in bytes",
+        kSizeBuckets, kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> write_size_{
+        "tent_write_size_bytes", "Write request size distribution in bytes",
+        kSizeBuckets, kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> deadline_mlu_{
+        "tent_deadline_mlu_permille",
+        "Deadline feasibility ratio (MLU x 1000) distribution",
+        kMluPerMilleBuckets, kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> stage_queue_wait_{
         "tent_stage_queue_wait_us",
         "Causal chain: queue wait latency in microseconds", kStageBuckets,
-        kTransportLabel};
-    ylt::metric::basic_dynamic_histogram<int64_t, 1> stage_dispatch_{
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> stage_dispatch_{
         "tent_stage_dispatch_us",
         "Causal chain: dispatch latency in microseconds", kStageBuckets,
-        kTransportLabel};
-    ylt::metric::basic_dynamic_histogram<int64_t, 1> stage_transport_{
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<1> stage_transport_{
         "tent_stage_transport_us",
         "Causal chain: transport execution latency in microseconds",
-        kStageBuckets, kTransportLabel};
-    ylt::metric::basic_dynamic_histogram<int64_t, 2> transport_attempt_latency_{
+        kStageBuckets, kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicHistogram<2> transport_attempt_latency_{
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
-        kLatencyBuckets, kAttemptLabels};
+        kLatencyBuckets, kAttemptLabels, kAttemptDomain};
 
-    // Parallel counters tracking per-label sum for each histogram. ylt's
-    // basic_dynamic_histogram keeps sum_ private with no public accessor, so
-    // we maintain these alongside observe() calls and read them back via
-    // copy() in the Prometheus serializer. Each counter's str_name is the
-    // histogram name suffixed with "_sum" so it emits as <name>_sum{...} in
-    // Prometheus output.
-    ylt::metric::basic_dynamic_counter<int64_t, 1> read_latency_sum_{
-        "tent_read_latency_us_sum",
-        "Sum of read latency observations (microseconds)", kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> write_latency_sum_{
-        "tent_write_latency_us_sum",
-        "Sum of write latency observations (microseconds)", kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> read_size_sum_{
-        "tent_read_size_bytes_sum", "Sum of read request sizes (bytes)",
-        kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> write_size_sum_{
-        "tent_write_size_bytes_sum", "Sum of write request sizes (bytes)",
-        kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> deadline_mlu_sum_{
-        "tent_deadline_mlu_permille_sum",
-        "Sum of deadline MLU (permille) observations", kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> stage_queue_wait_sum_{
-        "tent_stage_queue_wait_us_sum",
-        "Sum of queue wait latency observations (microseconds)",
-        kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> stage_dispatch_sum_{
-        "tent_stage_dispatch_us_sum",
-        "Sum of dispatch latency observations (microseconds)", kTransportLabel};
-    ylt::metric::basic_dynamic_counter<int64_t, 1> stage_transport_sum_{
-        "tent_stage_transport_us_sum",
-        "Sum of transport execution latency observations (microseconds)",
-        kTransportLabel};
-    // Parallel sum counter for the N=2 transport-attempt latency histogram
-    // (labels: transport, operation). Same rationale as the N=1 sum counters
-    // above — ylt keeps the histogram's sum_ private.
-    ylt::metric::basic_dynamic_counter<int64_t, 2>
-        transport_attempt_latency_sum_{"tent_transport_attempt_latency_us_sum",
-                                       "Sum of physical transport attempt "
-                                       "latency observations (microseconds)",
-                                       kAttemptLabels};
+    // Per-transport (N=1) histograms for unified serialization; the N=2
+    // transport_attempt_latency_ histogram is serialized separately (see
+    // getPrometheusMetrics / getJsonMetrics) via the same templated helpers.
+    std::vector<metrics::CachedDynamicHistogram<1>*> histograms_;
+
+    // Serialize a gauge backed by a cached-cell counter: emits the current
+    // value per label with # TYPE ... gauge.
+    void serializeGaugePrometheus(metrics::CachedDynamicCounter<1>& gauge,
+                                  std::string& out) const;
+
+    // Append the fixed single-series metrics-pipeline state plus the
+    // two-valued serialization format series. `prometheus_success_timestamp`
+    // is the timestamp for the scrape currently being built, so the response
+    // reports its own successful serialization rather than lagging one scrape.
+    void appendSelfMetricsPrometheus(
+        std::string& out, uint64_t prometheus_success_timestamp) const;
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
 
-    // Serialize a single histogram in Prometheus text format. Walks the
-    // same get_bucket_counts() / copy() data the JSON path uses, so the two
+    // Resolve the complete bounded label domain before any request can record
+    // accounting. The hot path then consists only of atomic pointer loads and
+    // relaxed additions; a missing cell drops the sample.
+    void preResolveAccountingMetrics();
+
+    // Serialize a single histogram in Prometheus text format. Walks the same
+    // bucket-counter / sum-counter data the JSON path uses, so the two
     // endpoints can never drift. Unlike ylt's serialize(), this never
     // silently drops a histogram that has observed >=1 sample — even when
     // every observation landed in the first bucket (which makes sum_==0
@@ -350,17 +498,11 @@ class TentMetrics {
     // # HELP / # TYPE header with it). Reachable in production when
     // sub-microsecond latencies truncate to 0 under int64_t observation.
     //
-    // `boundaries` is the compile-time bucket boundary vector paired with
-    // the histogram in HistogramEntry. The caller (getPrometheusMetrics)
-    // emits the # HELP / # TYPE header so the format stays identical to ylt.
     // Templated over label arity N so both the per-transport (N=1) histograms
     // and the transport-attempt (N=2) histogram share one implementation.
     template <uint8_t N>
-    void serializeHistogramPrometheus(
-        ylt::metric::basic_dynamic_histogram<int64_t, N>* hist,
-        const std::vector<double>& boundaries,
-        ylt::metric::basic_dynamic_counter<int64_t, N>& sum,
-        std::string& out) const;
+    void serializeHistogramPrometheus(metrics::CachedDynamicHistogram<N>& hist,
+                                      std::string& out) const;
 #endif  // TENT_METRICS_ENABLED
 };
 
@@ -457,6 +599,14 @@ class ScopedLatencyRecorder {
         }                                                                      \
     } while (0)
 
+#define TENT_RECORD_BATCH_QUARANTINED()                   \
+    do {                                                  \
+        if (::mooncake::tent::TentMetrics::isEnabled()) { \
+            ::mooncake::tent::TentMetrics::instance()     \
+                .recordBatchQuarantined();                \
+        }                                                 \
+    } while (0)
+
 #define TENT_SCOPED_READ_LATENCY(tp, bytes)                               \
     ::mooncake::tent::ScopedLatencyRecorder _tent_latency_recorder_(      \
         ::mooncake::tent::ScopedLatencyRecorder::OperationType::Read, tp, \
@@ -491,6 +641,7 @@ class ScopedLatencyRecorder {
 #define TENT_RECORD_READ_FAILED(tp) ((void)0)
 #define TENT_RECORD_WRITE_FAILED(tp) ((void)0)
 #define TENT_RECORD_TRANSPORT_FAILOVER(from, to) ((void)0)
+#define TENT_RECORD_BATCH_QUARANTINED() ((void)0)
 #define TENT_SCOPED_READ_LATENCY(tp, bytes) ((void)0)
 #define TENT_SCOPED_WRITE_LATENCY(tp, bytes) ((void)0)
 #define TENT_RECORD_STAGE_LATENCY(stage, tp, latency_us) ((void)0)

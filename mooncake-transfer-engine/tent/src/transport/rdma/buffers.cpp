@@ -141,6 +141,27 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                 context->registerMemReg((void*)desc.addr, desc.length, access);
         }
     }
+    // The buffer is usable only if every enabled NIC registered it: slice
+    // dispatch may pick any of them. When one NIC refused, release the MRs
+    // the others did create before reporting the failure. Nothing else holds
+    // them -- the entry below is never written, so removeBuffer() could not
+    // find them -- and they would otherwise stay pinned for the life of the
+    // process, one more set per retry of the same registration.
+    std::string failed_devices;
+    for (size_t id = 0; id < context_list_.size(); ++id) {
+        if (!context_list_[id] || mem_reg_list[id]) continue;
+        if (!failed_devices.empty()) failed_devices += ", ";
+        failed_devices += context_list_[id]->name();
+    }
+    if (!failed_devices.empty()) {
+        for (size_t id = 0; id < context_list_.size(); ++id) {
+            if (context_list_[id] && mem_reg_list[id])
+                context_list_[id]->unregisterMemReg(mem_reg_list[id]);
+        }
+        return Status::RdmaError(
+            "Unable to register buffer of local memory segment on " +
+            failed_devices + LOC_MARK);
+    }
     // NicID-keyed like context_list_, not compacted: slice dispatch subscripts
     // these with a dev_id from the topology, so gaps must stay in place.
     // Devices with no context contribute a zero key that is never selected.
@@ -148,10 +169,6 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     desc.rkey.assign(context_list_.size(), 0);
     for (size_t id = 0; id < context_list_.size(); ++id) {
         if (!context_list_[id]) continue;
-        if (!mem_reg_list[id]) {
-            return Status::RdmaError(
-                "Unable to register buffer of local memory segment" LOC_MARK);
-        }
         staging.mem_reg_map[context_list_[id]] = mem_reg_list[id];
         auto keys = context_list_[id]->queryMemRegKey(mem_reg_list[id]);
         desc.lkey[id] = keys.first;
@@ -179,22 +196,34 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
                 return addBufferInternal(*desc_ptr, options, true);
             }));
     }
+    Status first_error = Status::OK();
     for (auto& task : tasks) {
         auto status = task.get();
-        if (!status.ok()) return status;
+        if (!status.ok() && first_error.ok()) first_error = status;
     }
-    return Status::OK();
+    if (first_error.ok()) return Status::OK();
+    // All-or-nothing for the batch. The caller tags none of these descriptors
+    // as RDMA-registered when this fails, so a descriptor that did register
+    // would be tracked here and advertised nowhere.
+    for (auto& desc : desc_list) {
+        if (desc.rkey.empty()) continue;
+        auto status = removeBuffer(desc);
+        if (!status.ok()) LOG(WARNING) << status.ToString();
+    }
+    return first_error;
 }
 
 Status LocalBufferManager::removeBuffer(BufferDesc& desc) {
     RWSpinlock::WriteGuard guard(lock_);
     AddressRange range((void*)desc.addr, desc.length);
-    auto& item = buffer_list_[range];
-    for (auto& elem : item.mem_reg_map) {
+    desc.lkey.clear();
+    desc.rkey.clear();
+    auto iter = buffer_list_.find(range);
+    if (iter == buffer_list_.end()) return Status::OK();
+    for (auto& elem : iter->second.mem_reg_map) {
         elem.first->unregisterMemReg(elem.second);
     }
-    desc.rkey.clear();
-    buffer_list_.erase(range);
+    buffer_list_.erase(iter);
     return Status::OK();
 }
 

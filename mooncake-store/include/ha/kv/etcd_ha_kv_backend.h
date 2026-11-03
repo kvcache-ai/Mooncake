@@ -10,6 +10,8 @@ class EtcdHaKvBackend : public HaKvBackend {
     ErrorCode Put(std::string_view key, std::string_view value) override;
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override;
+    ErrorCode DeleteRange(std::string_view begin_key,
+                          std::string_view end_key) override;
     bool SupportsTxn() const override;
     ErrorCode Txn(const KvTxn& txn) override;
 };

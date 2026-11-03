@@ -1,0 +1,538 @@
+// master_service_test_fixture.h
+//
+// Shared MasterServiceTest fixture used by the master_service test binaries.
+// Business-behavior coverage lives in the scenario DSL; this fixture is the
+// implementation-coupled harness (segment setup, put helpers) shared by the
+// focused behavior-area test files.
+
+#pragma once
+
+#include "master_service.h"
+#include "master_service/master_service_test_peer.h"
+#include "object_test_helpers.h"
+#include "types.h"
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace mooncake::test {
+
+std::vector<ObjectMeta> MakeObjectMetas(const std::vector<std::string>& keys) {
+    std::vector<ObjectMeta> object_metas;
+    object_metas.reserve(keys.size());
+    for (const auto& key : keys) {
+        object_metas.emplace_back(ObjectMeta{key, std::nullopt});
+    }
+    return object_metas;
+}
+
+class MasterServiceTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging("MasterServiceTest");
+        FLAGS_logtostderr = true;
+    }
+
+    struct MountedSegmentContext {
+        UUID segment_id;
+        UUID client_id;
+    };
+
+    static constexpr size_t kDefaultSegmentBase = 0x300000000;
+    static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
+    static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
+
+    void PauseReplicaCleanup(MasterService& service) {
+        MasterServiceTestPeer::ReplicaCleanupWorker(service).Stop();
+    }
+
+    void ResumeReplicaCleanup(MasterService& service) {
+        MasterServiceTestPeer::ReplicaCleanupWorker(service).Start();
+        MasterServiceTestPeer::ReplicaCleanupWorker(service).Schedule();
+    }
+
+    std::shared_ptr<ClientLivenessRecord> FindClientLivenessForTest(
+        MasterService& service, const UUID& client_id) {
+        return MasterServiceTestPeer(service).FindClientRecord(client_id);
+    }
+
+    bool ProcessClientOffboardingForTest(MasterService& service,
+                                         ClientOffboardingJob& job) {
+        return MasterServiceTestPeer(service).ProcessClientOffboardingJob(job);
+    }
+
+    ErrorCode PrepareUnmountSegmentForTest(MasterService& service,
+                                           const UUID& segment_id,
+                                           size_t& metrics_dec_capacity) {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        return access.PrepareUnmountSegment(segment_id, metrics_dec_capacity);
+    }
+
+    ErrorCode CommitUnmountSegmentForTest(MasterService& service,
+                                          const UUID& segment_id,
+                                          const UUID& client_id,
+                                          size_t metrics_dec_capacity) {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        return access.CommitUnmountSegment(segment_id, client_id,
+                                           metrics_dec_capacity);
+    }
+
+    std::chrono::seconds ClientOffboardingRetryDelayForTest(
+        uint64_t retry_count) {
+        return ClientOffboardingWorker::RetryDelay(retry_count);
+    }
+
+    bool ClientOffboardingShouldAlertForTest(uint64_t retry_count) {
+        return ClientOffboardingWorker::ShouldAlert(retry_count);
+    }
+
+    // Run the stale-handle sweep synchronously through the test peer.
+    void ClearInvalidHandlesForTest(MasterService& service) {
+        MasterServiceTestPeer(service).ClearInvalidHandles();
+    }
+
+    void ExpectKeyHiddenFromReadApis(MasterService& service,
+                                     const std::string& key) {
+        auto get = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get.has_value());
+        EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get.error());
+
+        auto exists = service.ExistKey(key, TenantId::Default());
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(*exists);
+
+        auto batch_exists = service.BatchExistKey({key}, TenantId::Default());
+        ASSERT_EQ(1u, batch_exists.size());
+        ASSERT_TRUE(batch_exists[0].has_value());
+        EXPECT_FALSE(*batch_exists[0]);
+
+        auto all_keys = service.GetAllKeys(TenantId::Default());
+        ASSERT_TRUE(all_keys.has_value());
+        EXPECT_EQ(all_keys->end(),
+                  std::find(all_keys->begin(), all_keys->end(), key));
+    }
+
+    std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
+        MasterService& service, const std::string& key,
+        const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
+        auto hold = MasterServiceTestPeer::ReadObject(
+            service,
+            MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
+        if (!hold) {
+            return std::nullopt;
+        }
+        return hold->metadata().GetCommittedSoftPinTimeout();
+    }
+
+    void CleanupExpiredSoftPinsAt(
+        MasterService& service,
+        const std::chrono::system_clock::time_point& now) {
+        MasterServiceTestPeer(service).CleanupExpiredSoftPins(now);
+    }
+
+    std::unique_lock<std::mutex> AcquireWeightGroupOperationLockForTest(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& group_id) {
+        return MasterServiceTestPeer::WeightManager(service).LockGroup(
+            tenant_id, group_id);
+    }
+
+    // The stripe of the tenant's route that `key` lives in.
+    size_t RouteStripeIndex(const std::string& key) {
+        return ObjectRouteTestPeer::StripeIndex(key);
+    }
+
+    // The bucket count of one stripe of the tenant's route; zero when the
+    // tenant has no namespace.
+    size_t RouteStripeBucketCount(
+        MasterService& service, size_t stripe_idx,
+        const TenantId& tenant_id = TenantId::Default()) {
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(tenant_id);
+        return ns == nullptr ? 0
+                             : ObjectRouteTestPeer::StripeBucketCount(
+                                   ns->objects, stripe_idx);
+    }
+
+    void SetSoftPinDeadlineForTest(
+        MasterService& service, const std::string& key,
+        const std::chrono::system_clock::time_point& deadline,
+        const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
+        {
+            auto hold = MasterServiceTestPeer::WriteObject(
+                service,
+                MasterServiceTestPeer::ObjectIdentity{normalized_tenant, key});
+            ASSERT_TRUE(hold.has_value());
+            SpinLocker locker(&hold->metadata().lock);
+            hold->metadata().soft_pin_timeout = deadline;
+        }
+        MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
+            normalized_tenant.MakeScopedKey(key), deadline);
+    }
+
+    size_t SoftPinDeadlineHeapSize(MasterService& service) {
+        return MasterServiceTestPeer(service).SoftPinHeapSize();
+    }
+
+    size_t SoftPinRegistrationCount(MasterService& service) {
+        return MasterServiceTestPeer(service).SoftPinRegistrationCount();
+    }
+
+    std::optional<uint32_t> GetReplicaRefcntBySegmentName(
+        MasterService& service, const std::string& key,
+        const std::string& segment_name) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                key, TenantId::Default()));
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            for (const auto& name : replica.get_segment_names()) {
+                if (name.has_value() && *name == segment_name) {
+                    return replica.get_refcnt();
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Inspect normalized media through the peer's locked metadata accessors.
+    std::optional<std::vector<std::string>> KvMediaForKey(
+        MasterService& service, const std::string& key,
+        const TenantId& tenant_id = TenantId::Default()) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                key, tenant_id));
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+        return MasterServiceTestPeer::KvMediaForMetadata(accessor.Get());
+    }
+
+    std::optional<std::vector<std::string>> KvRemovalMediaForKey(
+        MasterService& service, const std::string& key,
+        const TenantId& tenant_id = TenantId::Default()) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service,
+            MasterServiceTestPeer(service).MakeObjectIdentityForRequest(
+                key, tenant_id));
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+        return MasterServiceTestPeer::KvMediaForRemoval(accessor.Get());
+    }
+
+    void UpsertSoftPinDeadlineIndexForTest(
+        MasterService& service, const std::string& key,
+        const std::chrono::system_clock::time_point& deadline,
+        const std::string& tenant_id = "default") {
+        MasterServiceTestPeer::SoftPinDeadlineIndex(service).Upsert(
+            TenantId(tenant_id).MakeScopedKey(key), deadline);
+    }
+
+    size_t PopExpiredSoftPinDeadlinesForTest(
+        MasterService& service,
+        const std::chrono::system_clock::time_point& now) {
+        return MasterServiceTestPeer::SoftPinDeadlineIndex(service)
+            .PopExpired(now)
+            .size();
+    }
+
+    std::chrono::system_clock::time_point ComputeSoftPinDeadlineForTest(
+        const std::chrono::system_clock::time_point& now,
+        std::chrono::milliseconds ttl) {
+        return MasterServiceTestPeer::ObjectMetadata::ComputeSoftPinDeadline(
+            now, ttl);
+    }
+
+    std::string WriteTenantPolicyFile(
+        const std::map<std::string, uint64_t>& tenant_quotas) {
+        TenantQuotaPolicySnapshot snapshot;
+        snapshot.tenant_quotas = tenant_quotas;
+        auto path =
+            std::filesystem::temp_directory_path() /
+            ("mooncake_master_service_test_" + std::to_string(::getpid()) +
+             "_" + std::to_string(next_policy_file_++) + ".yaml");
+        std::ofstream out(path);
+        out << FormatTenantQuotaPolicyYaml(snapshot);
+        out.close();
+        policy_files_.push_back(path.string());
+        return path.string();
+    }
+
+    MasterServiceConfig MakeStrictTenantConfig(
+        const std::vector<std::string>& tenants) {
+        std::map<std::string, uint64_t> tenant_quotas;
+        for (const auto& tenant : tenants) {
+            tenant_quotas.emplace(tenant, kStrictTenantQuotaBytes);
+        }
+        return MasterServiceConfig::builder()
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile(tenant_quotas))
+            .build();
+    }
+
+    WrappedMasterServiceConfig MakeStrictWrappedConfig(
+        const std::vector<std::string>& tenants) {
+        WrappedMasterServiceConfig config;
+        config.default_kv_lease_ttl = 100;
+        config.enable_metric_reporting = false;
+        config.enable_multi_tenants = true;
+        config.tenant_quota_connector_type = "file";
+        std::map<std::string, uint64_t> tenant_quotas;
+        for (const auto& tenant : tenants) {
+            tenant_quotas.emplace(tenant, kStrictTenantQuotaBytes);
+        }
+        config.tenant_quota_connector_uri =
+            WriteTenantPolicyFile(tenant_quotas);
+        return config;
+    }
+
+    Segment MakeSegment(std::string name = "test_segment",
+                        size_t base = kDefaultSegmentBase,
+                        size_t size = kDefaultSegmentSize,
+                        std::string host_id = "") const {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = std::move(name);
+        segment.base = base;
+        segment.size = size;
+        segment.te_endpoint = segment.name;
+        segment.host_id = std::move(host_id);
+        return segment;
+    }
+
+#ifdef USE_NOF
+    NoFSegment MakeNoFSegment(
+        std::string name = "test_nof_segment",
+        std::string endpoint = "test_nof_segment_endpoint",
+        size_t base = kDefaultSegmentBase + kDefaultSegmentSize,
+        size_t size = kDefaultSegmentSize) const {
+        NoFSegment segment;
+        segment.id = generate_uuid();
+        segment.name = std::move(name);
+        segment.base = base;
+        segment.size = size;
+        segment.te_endpoint = std::move(endpoint);
+        return segment;
+    }
+#endif
+
+    MountedSegmentContext PrepareSimpleSegment(
+        MasterService& service, std::string name = "test_segment",
+        size_t base = kDefaultSegmentBase, size_t size = kDefaultSegmentSize,
+        std::string host_id = "") const {
+        Segment segment =
+            MakeSegment(std::move(name), base, size, std::move(host_id));
+        UUID client_id = generate_uuid();
+        auto mount_result = service.MountSegment(segment, client_id);
+        EXPECT_TRUE(mount_result.has_value());
+        return {.segment_id = segment.id, .client_id = client_id};
+    }
+
+    std::string PutObjectOnSegment(MasterService& service,
+                                   const UUID& client_id,
+                                   const std::string& segment_name,
+                                   size_t slice_length = 1024) const {
+        static std::atomic<uint64_t> counter{0};
+        std::string key =
+            "drain_job_key_" + std::to_string(counter.fetch_add(1));
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segment = segment_name;
+
+        auto put_start = service.PutStart(client_id, key, TenantId::Default(),
+                                          slice_length, config);
+        EXPECT_TRUE(put_start.has_value());
+        EXPECT_TRUE(service
+                        .PutEnd(client_id, key, TenantId::Default(),
+                                ReplicaType::MEMORY)
+                        .has_value());
+        return key;
+    }
+
+    void PutCompletedObject(MasterService& service, const UUID& client_id,
+                            const std::string& key,
+                            const ReplicateConfig& config,
+                            uint64_t slice_length = 1024) const {
+        auto put_start = service.PutStart(client_id, key, TenantId::Default(),
+                                          slice_length, config);
+        ASSERT_TRUE(put_start.has_value())
+            << "PutStart failed for key=" << key
+            << ", error=" << toString(put_start.error());
+        ASSERT_TRUE(service
+                        .PutEnd(client_id, key, TenantId::Default(),
+                                ReplicaType::MEMORY)
+                        .has_value());
+    }
+
+    void PutCompletedObject(MasterService& service, const UUID& client_id,
+                            const std::string& key, const TenantId& tenant_id,
+                            const ReplicateConfig& config,
+                            uint64_t slice_length = 1024) const {
+        auto put_start =
+            service.PutStart(client_id, key, tenant_id, slice_length, config);
+        ASSERT_TRUE(put_start.has_value())
+            << "PutStart failed for key=" << key << ", tenant_id=" << tenant_id
+            << ", error=" << toString(put_start.error());
+        ASSERT_TRUE(
+            service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY)
+                .has_value());
+    }
+
+    bool ExecutePendingMoveTasks(MasterService& service,
+                                 const UUID& client_id) const {
+        auto fetched = service.FetchTasks(client_id, /*batch_size=*/16);
+        EXPECT_TRUE(fetched.has_value());
+        if (!fetched.has_value() || fetched->empty()) {
+            return false;
+        }
+
+        bool processed = false;
+        for (const auto& assignment : *fetched) {
+            if (assignment.type != TaskType::REPLICA_MOVE) {
+                continue;
+            }
+
+            ReplicaMovePayload payload;
+            struct_json::from_json(payload, assignment.payload);
+
+            const TenantId tenant_id(payload.tenant_id);
+            EXPECT_TRUE(tenant_id.IsValid());
+            if (!tenant_id.IsValid()) {
+                return false;
+            }
+            auto move_start =
+                service.MoveStart(client_id, payload.key, tenant_id,
+                                  payload.source, payload.target);
+            EXPECT_TRUE(move_start.has_value());
+            EXPECT_TRUE(
+                service.MoveEnd(client_id, payload.key, tenant_id).has_value());
+
+            TaskCompleteRequest complete_request;
+            complete_request.id = assignment.id;
+            complete_request.status = TaskStatus::SUCCESS;
+            complete_request.message = "move_done";
+            EXPECT_TRUE(service.MarkTaskToComplete(client_id, complete_request)
+                            .has_value());
+            processed = true;
+        }
+        return processed;
+    }
+
+    bool FailPendingMoveTasks(MasterService& service,
+                              const UUID& client_id) const {
+        auto fetched = service.FetchTasks(client_id, /*batch_size=*/16);
+        EXPECT_TRUE(fetched.has_value());
+        if (!fetched.has_value() || fetched->empty()) {
+            return false;
+        }
+
+        bool processed = false;
+        for (const auto& assignment : *fetched) {
+            if (assignment.type != TaskType::REPLICA_MOVE) {
+                continue;
+            }
+
+            TaskCompleteRequest complete_request;
+            complete_request.id = assignment.id;
+            complete_request.status = TaskStatus::FAILED;
+            complete_request.message = "move_failed";
+            EXPECT_TRUE(service.MarkTaskToComplete(client_id, complete_request)
+                            .has_value());
+            processed = true;
+        }
+        return processed;
+    }
+
+    template <typename Predicate>
+    void WaitUntil(
+        Predicate&& predicate,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(4000),
+        std::chrono::milliseconds interval =
+            std::chrono::milliseconds(50)) const {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return;
+            }
+            std::this_thread::sleep_for(interval);
+        }
+        EXPECT_TRUE(predicate());
+    }
+
+    std::vector<Replica::Descriptor> replica_list;
+    std::vector<std::string> policy_files_;
+    size_t next_policy_file_ = 0;
+
+    void TearDown() override {
+        for (const auto& path : policy_files_) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+        google::ShutdownGoogleLogging();
+    }
+
+    std::vector<std::string> GetGroupMemberKeysForTest(
+        MasterService& service, const std::string& group_id,
+        const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
+        // Membership is per tenant, so the group id alone is not enough.
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(
+                normalized_tenant);
+        if (ns == nullptr) {
+            return {};
+        }
+        return ns->objects.GroupMembers(group_id);
+    }
+
+    std::shared_ptr<Lease> GetGroupLeaseForTest(
+        MasterService& service, const std::string& group_id,
+        const std::string& tenant_id = "default") {
+        const TenantId normalized_tenant =
+            MasterServiceTestPeer(service).ResolveRequestTenantId(
+                TenantId(tenant_id));
+        // Every member points at the group's one shared lease.
+        const metadata::Namespace* ns =
+            MasterServiceTestPeer::Namespaces(service).Lookup(
+                normalized_tenant);
+        if (ns == nullptr) {
+            return nullptr;
+        }
+        for (const auto& member_key : ns->objects.GroupMembers(group_id)) {
+            if (auto hold = ns->objects.Read(member_key)) {
+                return hold->metadata().lease_;
+            }
+        }
+        return nullptr;
+    }
+};
+
+}  // namespace mooncake::test

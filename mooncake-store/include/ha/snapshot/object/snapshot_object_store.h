@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,6 +15,11 @@ namespace mooncake {
 enum class SnapshotObjectStoreType {
     LOCAL_FILE = 0,  // Local file system
     S3 = 1           // S3 storage
+};
+
+struct SnapshotObjectInspection {
+    uint64_t stored_size{0};
+    std::optional<uint32_t> crc32c;
 };
 
 // Convert string to SnapshotObjectStoreType
@@ -116,6 +122,15 @@ class SnapshotObjectStore {
      */
     virtual tl::expected<void, std::string> ListObjectsWithPrefix(
         const std::string& prefix, std::vector<std::string>& object_keys) = 0;
+
+    /**
+     * @brief Read stored size and an optional backend-verified CRC32C
+     */
+    virtual tl::expected<SnapshotObjectInspection, std::string> InspectObject(
+        const std::string& key) {
+        return tl::make_unexpected("Object inspection is not supported: " +
+                                   key);
+    }
 
     /**
      * @brief Tell whether an error means the target object is missing

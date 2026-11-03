@@ -33,8 +33,13 @@ import "C"
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +47,8 @@ import (
 
 	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/client/v3/concurrency"
+	"google.golang.org/grpc"
 )
 
 // prefixWatchInfo stores cancel function and callback context for a prefix watch
@@ -54,6 +61,44 @@ type prefixWatchInfo struct {
 	broken bool
 	// brokenNotified prevents duplicate WATCH_BROKEN callbacks from exit races.
 	brokenNotified bool
+}
+
+type maintenanceSession struct {
+	session *concurrency.Session
+	cancel  context.CancelFunc
+}
+
+func (s *maintenanceSession) close() error {
+	err := s.session.Close()
+	s.cancel()
+	return err
+}
+
+var startMaintenanceSession = func(ctx context.Context, cli *clientv3.Client,
+	ttl int) (*concurrency.Session, error) {
+	return concurrency.NewSession(cli, concurrency.WithTTL(ttl), concurrency.WithContext(ctx))
+}
+
+func newMaintenanceSession(cli *clientv3.Client, ttl int,
+	startupTimeout time.Duration) (*maintenanceSession, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	timer := time.AfterFunc(startupTimeout, cancel)
+	session, err := startMaintenanceSession(ctx, cli, ttl)
+	timedOut := !timer.Stop()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if session == nil {
+		cancel()
+		return nil, errors.New("maintenance session creation returned nil")
+	}
+	if timedOut {
+		_ = session.Close()
+		cancel()
+		return nil, context.DeadlineExceeded
+	}
+	return &maintenanceSession{session: session, cancel: cancel}, nil
 }
 
 // Use different etcd client so they are not affected by each other,
@@ -69,6 +114,10 @@ var (
 	// keep alive contexts for store
 	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
 	storeKeepAliveMutex sync.Mutex
+	// maintenance sessions own their keepalive and lease lifecycle in Go.
+	storeMaintenanceSessions   = make(map[int64]*maintenanceSession)
+	storeMaintenanceNextHandle int64
+	storeMaintenanceMutex      sync.Mutex
 	// watch contexts for store
 	storeWatchCtx   = make(map[string]context.CancelFunc)
 	storeWatchMutex sync.Mutex
@@ -89,15 +138,156 @@ const (
 const (
 	storeDialKeepAliveTime    = 10 * time.Second
 	storeDialKeepAliveTimeout = 3 * time.Second
+	maintenanceStartupTimeout = 5 * time.Second
 )
 
-func newStoreClientConfig(validEndpoints []string) clientv3.Config {
+const (
+	mooncakeEtcdCACertEnv     = "MOONCAKE_ETCD_CA_CERT"
+	mooncakeEtcdClientCertEnv = "MOONCAKE_ETCD_CLIENT_CERT"
+	mooncakeEtcdClientKeyEnv  = "MOONCAKE_ETCD_CLIENT_KEY"
+	mooncakeEtcdServerNameEnv = "MOONCAKE_ETCD_SERVER_NAME"
+)
+
+type etcdTLSConfigSpec struct {
+	CACertPath     string
+	ClientCertPath string
+	ClientKeyPath  string
+	ServerName     string
+}
+
+// getenvViaLibc reads an env var directly from libc's `environ`, bypassing
+// the Go runtime's `syscall.envs` snapshot (which is frozen at the moment
+// `goenvs_unix()` runs — typically the first cgo dlopen). Without this,
+// any env var set by the host process AFTER libetcd_wrapper.so is dlopened
+// (e.g. via os.environ in Python, or via libc.setenv) is invisible to
+// Go's os.Getenv, causing TLS config to be silently dropped.
+func getenvViaLibc(name string) string {
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	v := C.getenv(cName)
+	if v == nil {
+		return ""
+	}
+	return C.GoString(v)
+}
+
+func loadEtcdTLSConfigSpecFromEnv() (*etcdTLSConfigSpec, error) {
+	ca := strings.TrimSpace(getenvViaLibc(mooncakeEtcdCACertEnv))
+	cert := strings.TrimSpace(getenvViaLibc(mooncakeEtcdClientCertEnv))
+	key := strings.TrimSpace(getenvViaLibc(mooncakeEtcdClientKeyEnv))
+	serverName := strings.TrimSpace(getenvViaLibc(mooncakeEtcdServerNameEnv))
+
+	if ca == "" && cert == "" && key == "" {
+		if serverName != "" {
+			return nil, fmt.Errorf("%s requires an etcd CA or client certificate", mooncakeEtcdServerNameEnv)
+		}
+		return nil, nil
+	}
+	if (cert == "") != (key == "") {
+		return nil, fmt.Errorf("%s and %s must be set together",
+			mooncakeEtcdClientCertEnv, mooncakeEtcdClientKeyEnv)
+	}
+
+	return &etcdTLSConfigSpec{
+		CACertPath:     ca,
+		ClientCertPath: cert,
+		ClientKeyPath:  key,
+		ServerName:     serverName,
+	}, nil
+}
+
+func validateEtcdTLSFiles(spec *etcdTLSConfigSpec) error {
+	for envName, path := range map[string]string{
+		mooncakeEtcdCACertEnv:     spec.CACertPath,
+		mooncakeEtcdClientCertEnv: spec.ClientCertPath,
+		mooncakeEtcdClientKeyEnv:  spec.ClientKeyPath,
+	} {
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("failed to access %s (%s): %w", envName, path, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("%s points to a directory, expected a file: %s", envName, path)
+		}
+	}
+	return nil
+}
+
+func buildEtcdTLSConfig(spec *etcdTLSConfigSpec) (*tls.Config, error) {
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: spec.ServerName,
+	}
+	if spec.CACertPath != "" {
+		caPEM, err := os.ReadFile(spec.CACertPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read etcd CA certificate file %s: %w", spec.CACertPath, err)
+		}
+		pool := x509.NewCertPool()
+		if ok := pool.AppendCertsFromPEM(caPEM); !ok {
+			return nil, fmt.Errorf("failed to parse etcd CA certificate bundle from %s", spec.CACertPath)
+		}
+		config.RootCAs = pool
+	}
+	if spec.ClientCertPath != "" {
+		cert, err := tls.LoadX509KeyPair(spec.ClientCertPath, spec.ClientKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load etcd client certificate/key (%s, %s): %w",
+				spec.ClientCertPath, spec.ClientKeyPath, err)
+		}
+		config.Certificates = []tls.Certificate{cert}
+	}
+	return config, nil
+}
+
+// buildEtcdClientTLSFromEnv returns (nil, nil) when no TLS env vars are set,
+// so existing deployments retain their endpoint-defined transport behavior.
+// A partial or broken configuration is an error rather than a silent downgrade.
+func buildEtcdClientTLSFromEnv(endpoints []string) (*tls.Config, error) {
+	spec, err := loadEtcdTLSConfigSpecFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if spec == nil {
+		return nil, nil
+	}
+	for _, endpoint := range endpoints {
+		// clientv3 deliberately drops transport credentials for http:// URLs.
+		if strings.HasPrefix(strings.ToLower(endpoint), "http://") {
+			return nil, fmt.Errorf("etcd TLS is configured but endpoint %q uses http://; use https:// or host:port", endpoint)
+		}
+	}
+	if err := validateEtcdTLSFiles(spec); err != nil {
+		return nil, err
+	}
+	return buildEtcdTLSConfig(spec)
+}
+
+func etcdTLSDialOptions(config *tls.Config) []grpc.DialOption {
+	if config == nil || config.ServerName == "" {
+		return nil
+	}
+	// gRPC derives TLS SNI and hostname verification from the connection
+	// authority, which can otherwise override tls.Config.ServerName.
+	return []grpc.DialOption{grpc.WithAuthority(config.ServerName)}
+}
+
+func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		return clientv3.Config{}, err
+	}
 	return clientv3.Config{
 		Endpoints:            validEndpoints,
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
-	}
+		TLS:                  tlsConfig,
+		DialOptions:          etcdTLSDialOptions(tlsConfig),
+	}, nil
 }
 
 func parseEtcdEndpoints(endpoints *C.char) []string {
@@ -145,11 +335,19 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        5 * time.Second,
 		MaxCallSendMsgSize: MaxMsgSize,
 		MaxCallRecvMsgSize: MaxMsgSize,
+		TLS:                tlsConfig,
+		DialOptions:        etcdTLSDialOptions(tlsConfig),
 	})
 
 	if err != nil {
@@ -254,7 +452,13 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	clientConfig, err := newStoreClientConfig(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	cli, err := clientv3.New(clientConfig)
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -273,13 +477,19 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	clientConfig, err := newStoreClientConfig(validEndpoints)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
 
-	cancelAllStoreKeepAlives()
+	cli, err := clientv3.New(clientConfig)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	closeAllStoreMaintenanceSessions()
 	cancelAllStoreWatches()
 	cancelAllStorePrefixWatches()
 
@@ -323,11 +533,19 @@ func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        10 * time.Second,
 		MaxCallSendMsgSize: snapshotMaxMsgSize,
 		MaxCallRecvMsgSize: snapshotMaxMsgSize,
+		TLS:                tlsConfig,
+		DialOptions:        etcdTLSDialOptions(tlsConfig),
 	})
 
 	if err != nil {
@@ -442,6 +660,92 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, 
 	}
 }
 
+//export EtcdStoreAcquireMaintenanceSessionWrapper
+func EtcdStoreAcquireMaintenanceSessionWrapper(key *C.char, keySize C.int, ttl int64,
+	sessionHandle *int64, leaseId *int64, createRevision *int64, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	if ttl <= 0 {
+		*errMsg = C.CString("maintenance session TTL must be positive")
+		return -1
+	}
+
+	session, err := newMaintenanceSession(cli, int(ttl), maintenanceStartupTimeout)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	k := C.GoStringN(key, keySize)
+	id := int64(session.session.Lease())
+	ownerToken := strconv.FormatInt(id, 10)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	resp, err := cli.Txn(ctx).
+		If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
+		Then(clientv3.OpPut(k, ownerToken, clientv3.WithLease(session.session.Lease()))).
+		Commit()
+	cancel()
+	if err != nil {
+		_ = session.close()
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !resp.Succeeded {
+		_ = session.close()
+		*errMsg = C.CString("maintenance lock is already held")
+		return -2
+	}
+
+	storeMaintenanceMutex.Lock()
+	storeMaintenanceNextHandle++
+	handle := storeMaintenanceNextHandle
+	storeMaintenanceSessions[handle] = session
+	storeMaintenanceMutex.Unlock()
+
+	*sessionHandle = handle
+	*leaseId = id
+	*createRevision = resp.Header.Revision
+	return 0
+}
+
+//export EtcdStoreCloseMaintenanceSessionWrapper
+func EtcdStoreCloseMaintenanceSessionWrapper(sessionHandle int64, errMsg **C.char) int {
+	storeMaintenanceMutex.Lock()
+	session, exists := storeMaintenanceSessions[sessionHandle]
+	if exists {
+		delete(storeMaintenanceSessions, sessionHandle)
+	}
+	storeMaintenanceMutex.Unlock()
+	if !exists {
+		return 0
+	}
+	if err := session.close(); err != nil && !errors.Is(err, rpctypes.ErrLeaseNotFound) {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export EtcdStoreMaintenanceSessionAliveWrapper
+func EtcdStoreMaintenanceSessionAliveWrapper(sessionHandle int64, errMsg **C.char) int {
+	storeMaintenanceMutex.Lock()
+	session, exists := storeMaintenanceSessions[sessionHandle]
+	storeMaintenanceMutex.Unlock()
+	if !exists {
+		*errMsg = C.CString("maintenance session handle not found")
+		return -1
+	}
+	select {
+	case <-session.session.Done():
+		return 0
+	default:
+		return 1
+	}
+}
+
 /*
 * @brief First cancel the watch context, then delete it from the map.
 *        Cancel must be called before delete in case this is a new context
@@ -461,17 +765,17 @@ func cancelAndDeleteWatch(k string) int {
 	return -1
 }
 
-func cancelAllStoreKeepAlives() {
-	storeKeepAliveMutex.Lock()
-	cancels := make([]context.CancelFunc, 0, len(storeKeepAliveCtx))
-	for leaseId, cancel := range storeKeepAliveCtx {
-		cancels = append(cancels, cancel)
-		delete(storeKeepAliveCtx, leaseId)
+func closeAllStoreMaintenanceSessions() {
+	storeMaintenanceMutex.Lock()
+	sessions := make([]*maintenanceSession, 0, len(storeMaintenanceSessions))
+	for handle, session := range storeMaintenanceSessions {
+		sessions = append(sessions, session)
+		delete(storeMaintenanceSessions, handle)
 	}
-	storeKeepAliveMutex.Unlock()
+	storeMaintenanceMutex.Unlock()
 
-	for _, cancel := range cancels {
-		cancel()
+	for _, session := range sessions {
+		_ = session.close()
 	}
 }
 
@@ -622,11 +926,24 @@ func hasKeepAliveContext(leaseId int64) bool {
 
 //export EtcdStoreKeepAliveWrapper
 func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
-	cli := getStoreClient()
-	if cli == nil {
+	storeCli := getStoreClient()
+	if storeCli == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
+	// Keep lease traffic separate from Store traffic. A Store client reset or
+	// a busy Store connection must not stop leadership keep-alive.
+	clientConfig, err := newStoreClientConfig(storeCli.Endpoints())
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	cli, err := clientv3.New(clientConfig)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	defer cli.Close()
 
 	// Create a context with cancel function
 	ctx, cancel := context.WithCancel(context.Background())
@@ -792,7 +1109,7 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 }
 
 //export EtcdStoreTxnCompareAndPutWrapper
-func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putPreserveLeases *C.int, putCount C.int, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -809,6 +1126,7 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		compareKindList := (*[1 << 28]C.int)(unsafe.Pointer(compareKinds))[:cmpN:cmpN]
 		compareValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareValues))[:cmpN:cmpN]
 		compareValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareValueSizes))[:cmpN:cmpN]
+		compareRevisionList := (*[1 << 28]int64)(unsafe.Pointer(compareRevisions))[:cmpN:cmpN]
 		for i := 0; i < cmpN; i++ {
 			k := C.GoStringN(compareKeyPtrs[i], compareKeySizeList[i])
 			switch int(compareKindList[i]) {
@@ -817,6 +1135,8 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 				cmps = append(cmps, clientv3.Compare(clientv3.Value(k), "=", v))
 			case 1:
 				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", 0))
+			case 2:
+				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", compareRevisionList[i]))
 			default:
 				*errMsg = C.CString("unsupported compare kind")
 				return -1
@@ -830,10 +1150,15 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
 		putValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putValues))[:putN:putN]
 		putValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(putValueSizes))[:putN:putN]
+		putPreserveLeaseList := (*[1 << 28]C.int)(unsafe.Pointer(putPreserveLeases))[:putN:putN]
 		for i := 0; i < putN; i++ {
 			k := C.GoStringN(putKeyPtrs[i], putKeySizeList[i])
 			v := C.GoStringN(putValuePtrs[i], putValueSizeList[i])
-			ops = append(ops, clientv3.OpPut(k, v))
+			if putPreserveLeaseList[i] != 0 {
+				ops = append(ops, clientv3.OpPut(k, v, clientv3.WithIgnoreLease()))
+			} else {
+				ops = append(ops, clientv3.OpPut(k, v))
+			}
 		}
 	}
 

@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
+from typing import Optional
 
 from ..contracts import (
     ParticipantId,
@@ -47,7 +48,7 @@ class WeightPlacementManifest:
     parts: tuple[WeightPlacementPart, ...]
     tensors: tuple[TensorDescriptor, ...]
     fragments: tuple[PlacementFragment, ...]
-    _digest_cache: str | None = field(init=False, repr=False, compare=False)
+    _digest_cache: Optional[str] = field(init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -58,7 +59,7 @@ class WeightPlacementManifest:
         placement_set_id: PlacementSetId,
         topology: ParallelTopology,
         parts: tuple[WeightPlacementPart, ...],
-        placement_id: PlacementId | None = None,
+        placement_id: Optional[PlacementId] = None,
     ) -> None:
         _require_nonempty_string(resource_id, "resource_id")
         _require_nonempty_string(revision, "revision")
@@ -164,7 +165,7 @@ class WeightPlacementManifest:
         topology: ParallelTopology,
         tensors: Sequence[TensorDescriptor],
         fragments: Sequence[PlacementFragment],
-        placement_id: PlacementId | None = None,
+        placement_id: Optional[PlacementId] = None,
     ) -> WeightPlacementManifest:
         """Group a complete flat fragment inventory by topology participant."""
 
@@ -323,7 +324,10 @@ def _logical_placement_id(
             {
                 "participant_id": part.participant_id,
                 "rank": asdict(part.rank),
-                "fragments": [asdict(fragment) for fragment in part.fragments],
+                "fragments": [
+                    _placement_fragment_identity(fragment)
+                    for fragment in part.fragments
+                ],
             }
             for part in parts
         ],
@@ -339,3 +343,21 @@ def _parallel_axis_identity(axis: object) -> dict[str, object]:
     if isinstance(axis, OwnershipAxis):
         return {"semantics": "ownership", "kind": axis.kind}
     raise ValueError("unsupported parallel axis value")
+
+
+def _placement_fragment_identity(fragment: PlacementFragment) -> dict[str, object]:
+    identity: dict[str, object] = {
+        "placement_fragment_id": fragment.placement_fragment_id,
+        "tensor_id": fragment.tensor_id,
+        "global_offset": fragment.global_offset,
+        "local_shape": fragment.local_shape,
+        "nbytes": fragment.nbytes,
+        "rank": asdict(fragment.rank),
+        "aliases": fragment.aliases,
+    }
+    # Keep the pre-virtual-stage canonical payload byte-for-byte stable. A
+    # stage participates in identity only when a framework explicitly assigns
+    # one, so legacy placements keep their existing placement IDs.
+    if fragment.pipeline_stage_id is not None:
+        identity["pipeline_stage_id"] = fragment.pipeline_stage_id
+    return identity

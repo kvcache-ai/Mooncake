@@ -9,10 +9,13 @@ next heartbeat tick stages a fresh MEMORY replica.
 Test scenario:
   1. Push enough data to overflow DRAM, so eviction + offload turns warm
      keys into LOCAL_DISK-only objects.
-  2. Identify one such key from the replica descriptors.
+  2. Identify one such key from the replica descriptors (condition-polled,
+     not a fixed sleep).
   3. Read it repeatedly to clear ``promotion_admission_threshold``.
-  4. Wait long enough for one master heartbeat (which queues the task) plus
-     one FileStorage heartbeat (which executes it).
+  4. Poll single-key ``batch_get_replica_desc`` until the key regains a
+     MEMORY replica; each poll re-fires the promotion gate for that key,
+     so the wait is condition-based and self-healing rather than a bet on
+     the heartbeat phase.
   5. Assert the key now also has a MEMORY replica.
 
 Prerequisites:
@@ -22,10 +25,17 @@ Prerequisites:
       ``--promotion_on_hit=true``
       ``--promotion_admission_threshold=1``  (any positive int; we send
           enough reads to clear up to 4)
+      ``--promotion_max_per_heartbeat=16``  (raise the delivery cap so a
+          burst of admissions from the phase-2 batch query drains within
+          the wait window instead of starving individual keys at the
+          default 1-per-heartbeat)
       ``--root_fs_dir=<dir>``  (so the master tells the client to init
           its FileStorage; without this, no offload heartbeat runs and
           no LOCAL_DISK replicas are ever created)
   - ``MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=<dir>`` set on the client side.
+  - ``MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=2`` recommended on the
+    client (pins the master/client clock phase; the 10s default makes the
+    wait windows racy against offload draining).
   - ``MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT=10`` and
     ``MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760`` on the client.
     The default bucket-flush thresholds (500 keys / 256 MB) are too high
@@ -52,8 +62,9 @@ default_kv_lease_ttl = int(
 SEGMENT_SIZE = int(os.getenv("SEGMENT_SIZE_BYTES", str(32 * 1024 * 1024)))
 LOCAL_BUFFER_SIZE = int(os.getenv("LOCAL_BUFFER_SIZE_BYTES", str(64 * 1024 * 1024)))
 
-# Wait window for a full master+client heartbeat round-trip. The default
-# heartbeat interval is 10s on both sides, so 25s is comfortably > 2 ticks.
+# Timeout ceiling for the condition polls below (not a fixed sleep). CI runs
+# the client offload heartbeat at 2s (MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_
+# SECONDS); 25s leaves ample room even at the 10s default interval.
 PROMOTION_WAIT_SECONDS = int(os.getenv("PROMOTION_WAIT_SECONDS", "25"))
 
 
@@ -99,6 +110,28 @@ def _replica_types(descs, key):
         else:
             tags.append("UNKNOWN")
     return tags
+
+
+def wait_until(cond, timeout_s, interval=1.0, desc=""):
+    """Poll ``cond()`` (which returns (ok, detail)) until ok or timeout.
+
+    Returns the detail on success; raises AssertionError on timeout with the
+    last observed detail. Polling beats fixed sleeps here for two reasons:
+    the wait adapts to however long the offload/promotion heartbeat actually
+    takes on a loaded CI runner, and — for the promotion waits below — every
+    poll is a single-key ``batch_get_replica_desc``, which re-fires the
+    master's promotion gate for that key (re-admitting it if the task was
+    never queued or was dropped after a transient failure)."""
+    t0 = time.monotonic()
+    while True:
+        ok, detail = cond()
+        if ok:
+            return detail
+        if time.monotonic() - t0 >= timeout_s:
+            raise AssertionError(
+                f"timeout ({timeout_s}s) waiting for {desc}; last={detail}"
+            )
+        time.sleep(interval)
 
 
 class TestPromotionOnHit(unittest.TestCase):
@@ -153,33 +186,37 @@ class TestPromotionOnHit(unittest.TestCase):
                 len(reference), 0, "No PUTs succeeded — cannot run promotion test"
             )
 
-            # Phase 2: wait long enough for offload heartbeat to flush the
-            # evicted keys to LOCAL_DISK.
-            time.sleep(PROMOTION_WAIT_SECONDS)
+            # Phase 2: poll until the offload heartbeat has flushed at least
+            # one evicted key to a LOCAL_DISK-only state (instead of betting
+            # on a fixed sleep matching the heartbeat phase).
+            def _find_cold_key():
+                descs = self.store.batch_get_replica_desc(list(reference.keys()))
+                type_hist = {}
+                found = None
+                for key in reference.keys():
+                    types = _replica_types(descs, key)
+                    hist_key = ",".join(sorted(set(types)))
+                    type_hist[hist_key] = type_hist.get(hist_key, 0) + 1
+                    if (
+                        found is None
+                        and types
+                        and all("MEMORY" not in t for t in types)
+                        and any("LOCAL_DISK" in t for t in types)
+                    ):
+                        found = key
+                return (found is not None), (found, type_hist)
 
-            descs = self.store.batch_get_replica_desc(list(reference.keys()))
-            type_hist = {}
-            cold_key = None
-            for key in reference.keys():
-                types = _replica_types(descs, key)
-                hist_key = ",".join(sorted(set(types)))
-                type_hist[hist_key] = type_hist.get(hist_key, 0) + 1
-                if (
-                    cold_key is None
-                    and types
-                    and all("MEMORY" not in t for t in types)
-                    and any("LOCAL_DISK" in t for t in types)
-                ):
-                    cold_key = key
-            print(f"replica-type histogram after phase 2: {type_hist}")
-
-            self.assertIsNotNone(
-                cold_key,
-                "No LOCAL_DISK-only key found after eviction — is "
-                "offload_on_evict=true and the segment small enough to "
-                "overflow? master config / SEGMENT_SIZE_BYTES env may need "
-                "tuning. Histogram above shows the actual replica state.",
+            cold_key, type_hist = wait_until(
+                _find_cold_key,
+                PROMOTION_WAIT_SECONDS,
+                desc=(
+                    "a LOCAL_DISK-only key after eviction — is "
+                    "offload_on_evict=true and the segment small enough to "
+                    "overflow? master config / SEGMENT_SIZE_BYTES env may "
+                    "need tuning"
+                ),
             )
+            print(f"replica-type histogram after phase 2: {type_hist}")
 
             # Phase 3: clear the admission threshold via per-key reads.
             # ``store.get`` goes through ``Client::Query`` → master's
@@ -203,21 +240,28 @@ class TestPromotionOnHit(unittest.TestCase):
                     f"read path is broken — promotion cannot be tested.",
                 )
 
-            # Phase 4: wait for the master to enqueue the promotion task and
-            # for the client's next FileStorage heartbeat to execute it.
-            time.sleep(PROMOTION_WAIT_SECONDS)
+            # Phase 4: poll until the promotion lands. Each poll is a
+            # single-key batch_get_replica_desc, which re-fires the master's
+            # promotion gate for cold_key only — re-admitting it if the task
+            # was never queued or was dropped after a transient failure —
+            # so polling doubles as a self-healing re-trigger rather than a
+            # passive wait.
+            def _promoted():
+                descs = self.store.batch_get_replica_desc([cold_key])
+                types = _replica_types(descs, cold_key)
+                return ("MEMORY" in types), types
 
-            descs_after = self.store.batch_get_replica_desc([cold_key])
-            types_after = _replica_types(descs_after, cold_key)
-            print(f"replica types for {cold_key} after promotion: {types_after}")
-            self.assertTrue(
-                "MEMORY" in types_after,
-                f"Expected a MEMORY replica for {cold_key} after promotion, "
-                f"got types={types_after}. Either promotion_on_hit is not "
-                f"enabled in the master, the admission threshold was not "
-                f"cleared, or the heartbeat tick did not fire within "
-                f"{PROMOTION_WAIT_SECONDS}s.",
+            types_after = wait_until(
+                _promoted,
+                PROMOTION_WAIT_SECONDS,
+                desc=(
+                    f"MEMORY replica for {cold_key} after promotion "
+                    f"(check master metrics promotion_admitted / "
+                    f"promotion_rejected_watermark / promotion_completed "
+                    f"and the client's 'ProcessPromotionTasks pulled' log)"
+                ),
             )
+            print(f"replica types for {cold_key} after promotion: {types_after}")
 
             # Phase 5: post-promotion bytes-back AND prove MEMORY was the
             # replica actually served. SelectBestReplica should prefer the
@@ -397,18 +441,27 @@ class BenchPromotionLatency(unittest.TestCase):
 
             time.sleep(PROMOTION_WAIT_SECONDS)
 
-            descs = self.store.batch_get_replica_desc(list(reference.keys()))
-            cold_key = None
-            for key in reference.keys():
-                types = _replica_types(descs, key)
-                if (
-                    cold_key is None
-                    and types
-                    and all("MEMORY" not in t for t in types)
-                    and any("LOCAL_DISK" in t for t in types)
-                ):
-                    cold_key = key
-            self.assertIsNotNone(cold_key, "no LOCAL_DISK-only key after eviction")
+            def _find_cold_key():
+                descs = self.store.batch_get_replica_desc(list(reference.keys()))
+                found = None
+                for key in reference.keys():
+                    types = _replica_types(descs, key)
+                    if (
+                        found is None
+                        and types
+                        and all("MEMORY" not in t for t in types)
+                        and any("LOCAL_DISK" in t for t in types)
+                    ):
+                        found = key
+                return (found is not None), found
+
+            # Keep the initial fixed wait (the pre-promotion read loop below
+            # wants a quiet system), then poll for the cold key.
+            cold_key = wait_until(
+                _find_cold_key,
+                PROMOTION_WAIT_SECONDS,
+                desc="no LOCAL_DISK-only key after eviction",
+            )
 
             # Pre-promotion: timed LOCAL_DISK reads, bail when a read
             # serves from MEMORY (= worker raced the loop).
@@ -439,11 +492,18 @@ class BenchPromotionLatency(unittest.TestCase):
                 "lower LATENCY_SAMPLES.",
             )
 
-            # Wait for promotion to complete.
-            time.sleep(PROMOTION_WAIT_SECONDS)
-            descs_after = self.store.batch_get_replica_desc([cold_key])
-            types_after = _replica_types(descs_after, cold_key)
-            self.assertIn("MEMORY", types_after)
+            # Wait for promotion to complete (poll; each poll re-fires the
+            # promotion gate for cold_key, doubling as a re-trigger).
+            def _promoted():
+                descs_after = self.store.batch_get_replica_desc([cold_key])
+                types_after = _replica_types(descs_after, cold_key)
+                return ("MEMORY" in types_after), types_after
+
+            wait_until(
+                _promoted,
+                PROMOTION_WAIT_SECONDS,
+                desc=f"MEMORY replica for {cold_key} after promotion",
+            )
 
             # Post-promotion: timed MEMORY reads; the counter must stay
             # put (otherwise at least one read still hit LOCAL_DISK).

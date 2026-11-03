@@ -13,7 +13,7 @@
 #include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 
@@ -28,13 +28,33 @@ struct RpcNameTraits<&WrappedMasterService::ExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ProbeKey> {
+    static constexpr const char* value = "ProbeKey";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
     static constexpr const char* value = "BatchExistKey";
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchProbeKey> {
+    static constexpr const char* value = "BatchProbeKey";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListForAdmin> {
+    static constexpr const char* value = "GetReplicaListForAdmin";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaListForAdmin> {
+    static constexpr const char* value = "BatchGetReplicaListForAdmin";
 };
 
 template <>
@@ -218,6 +238,11 @@ struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::UnmountLocalDiskSegment> {
+    static constexpr const char* value = "UnmountLocalDiskSegment";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
     static constexpr const char* value = "OffloadObjectHeartbeat";
 };
@@ -240,6 +265,11 @@ struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
     static constexpr const char* value = "PromotionAllocStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterPrefetchTask> {
+    static constexpr const char* value = "RegisterPrefetchTask";
 };
 
 template <>
@@ -325,6 +355,11 @@ struct RpcNameTraits<&WrappedMasterService::EvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::EvictDiskReplicaIfCurrent> {
+    static constexpr const char* value = "EvictDiskReplicaIfCurrent";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
     static constexpr const char* value = "BatchEvictDiskReplica";
 };
@@ -334,10 +369,34 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
 
-template <auto ServiceMethod, typename ReturnType, typename... Args>
-tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
-    auto pool = client_accessor_.GetClientPool();
+#define DEFINE_WEIGHT_RPC_NAME(method)                    \
+    template <>                                           \
+    struct RpcNameTraits<&WrappedMasterService::method> { \
+        static constexpr const char* value = #method;     \
+    }
 
+DEFINE_WEIGHT_RPC_NAME(BeginWeightImport);
+DEFINE_WEIGHT_RPC_NAME(CommitWeightImport);
+DEFINE_WEIGHT_RPC_NAME(AbortWeightImport);
+DEFINE_WEIGHT_RPC_NAME(GetWeightRevision);
+DEFINE_WEIGHT_RPC_NAME(ListWeightRevisions);
+DEFINE_WEIGHT_RPC_NAME(AcquireWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(RenewWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(ReleaseWeightRevisionLease);
+DEFINE_WEIGHT_RPC_NAME(StartWeightResidencyOperation);
+DEFINE_WEIGHT_RPC_NAME(QueryWeightOperation);
+DEFINE_WEIGHT_RPC_NAME(DeleteWeightRevision);
+
+#undef DEFINE_WEIGHT_RPC_NAME
+
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
+    const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
+    Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     // Increment RPC counter
     if (metrics_) {
         metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
@@ -346,7 +405,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto start_time = std::chrono::steady_clock::now();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
-            auto ret = co_await pool->send_request(
+            auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
                     return client.send_request<ServiceMethod>(
@@ -377,9 +436,27 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
         }());
 }
 
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_pool(
+    RpcClientPool& client_accessor, Args&&... args) {
+    return invoke_rpc_with_client_pool<ServiceMethod, ReturnType>(
+        client_accessor.GetClientPool(), std::forward<Args>(args)...);
+}
+
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
+    return invoke_rpc_with_pool<ServiceMethod, ReturnType>(
+        client_accessor_, std::forward<Args>(args)...);
+}
+
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<ResultType, ErrorCode>>(
+            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
     auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
@@ -428,21 +505,84 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         }());
 }
 
-MasterClient::~MasterClient() = default;
+MasterClient::~MasterClient() {
+    // Never release the pool under a suspended request coroutine (#3909).
+    // 30s is generous: every request carries its own RPC timeout.
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "MasterClient teardown: RPCs still in flight after "
+                      "30s drain; releasing the pool regardless";
+    }
+}
+
+void MasterClient::EnableHaConnectionPolicy() {
+    MutexLocker lock(&connect_mutex_);
+    if (!client_addr_param_.empty()) {
+        ha_control_client_accessor_.GetOrCreateClientPool(client_addr_param_);
+    }
+    ha_connection_policy_enabled_.store(true, std::memory_order_release);
+}
+
+#define DEFINE_WEIGHT_CLIENT_METHOD(method, request_type, result_type)       \
+    WeightRpcResult<result_type> MasterClient::method(                       \
+        const request_type& request) {                                       \
+        return invoke_rpc<&WrappedMasterService::method,                     \
+                          tl::expected<result_type, WeightManagementError>>( \
+            request, tenant_id_.value());                                    \
+    }
+
+DEFINE_WEIGHT_CLIENT_METHOD(BeginWeightImport, BeginWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(CommitWeightImport, CommitWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(AbortWeightImport, AbortWeightImportRequest,
+                            WeightRevisionMetadata)
+DEFINE_WEIGHT_CLIENT_METHOD(GetWeightRevision, GetWeightRevisionRequest,
+                            WeightRevisionView)
+DEFINE_WEIGHT_CLIENT_METHOD(ListWeightRevisions, ListWeightRevisionsRequest,
+                            ListWeightRevisionsResponse)
+DEFINE_WEIGHT_CLIENT_METHOD(AcquireWeightRevisionLease,
+                            AcquireWeightRevisionLeaseRequest,
+                            WeightRevisionLease)
+DEFINE_WEIGHT_CLIENT_METHOD(RenewWeightRevisionLease,
+                            RenewWeightRevisionLeaseRequest,
+                            WeightRevisionLease)
+DEFINE_WEIGHT_CLIENT_METHOD(StartWeightResidencyOperation,
+                            StartWeightResidencyOperationRequest,
+                            WeightResidencyOperation)
+DEFINE_WEIGHT_CLIENT_METHOD(QueryWeightOperation, QueryWeightOperationRequest,
+                            WeightResidencyOperation)
+DEFINE_WEIGHT_CLIENT_METHOD(DeleteWeightRevision, DeleteWeightRevisionRequest,
+                            WeightRevisionMetadata)
+
+#undef DEFINE_WEIGHT_CLIENT_METHOD
+
+WeightRpcResult<void> MasterClient::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request) {
+    return invoke_rpc<&WrappedMasterService::ReleaseWeightRevisionLease,
+                      tl::expected<void, WeightManagementError>>(
+        request, tenant_id_.value());
+}
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 
     MutexLocker lock(&connect_mutex_);
-    if (client_addr_param_ != master_addr) {
+    const bool use_ha_control_pool =
+        ha_connection_policy_enabled_.load(std::memory_order_acquire);
+    if (use_ha_control_pool) {
+        ha_probe_client_accessor_.GetOrCreateClientPool(master_addr);
+    } else {
         client_accessor_.GetOrCreateClientPool(master_addr);
-        client_addr_param_ = master_addr;
     }
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     auto result =
-        invoke_rpc<&WrappedMasterService::ServiceReady, std::string>();
+        use_ha_control_pool
+            ? invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
+                                   std::string>(ha_probe_client_accessor_)
+            : invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
+                                   std::string>(client_accessor_);
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
         return result.error();
@@ -456,6 +596,13 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
         return ErrorCode::INVALID_VERSION;
     }
+    if (use_ha_control_pool) {
+        // Only move foreground traffic after the fast control-plane probe has
+        // established that the new leader is ready and version-compatible.
+        client_accessor_.GetOrCreateClientPool(master_addr);
+        ha_control_client_accessor_.GetOrCreateClientPool(master_addr);
+    }
+    client_addr_param_ = master_addr;
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
@@ -478,6 +625,29 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
         object_keys.size(), object_keys, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " keys");
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::ProbeKey(
+    const std::string& object_key) {
+    ScopedVLogTimer timer(1, "MasterClient::ProbeKey");
+    timer.LogRequest("object_key=", object_key);
+
+    auto result = invoke_rpc<&WrappedMasterService::ProbeKey, bool>(
+        object_key, tenant_id_.value());
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchProbeKey(
+    const std::vector<std::string>& object_keys,
+    const GrantLeasePolicy& policy) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchProbeKey");
+    timer.LogRequest("keys_count=", object_keys.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchProbeKey, bool>(
+        object_keys.size(), policy, object_keys, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " keys");
     return result;
 }
@@ -513,8 +683,8 @@ MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
                      ", client_id=", client_id,
                      ", segment_name=", segment_name);
     auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
-                             std::vector<std::string>>(object_keys, client_id,
-                                                       segment_name);
+                             std::vector<std::string>>(
+        object_keys, client_id, segment_name, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -565,6 +735,44 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys,
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(
         object_keys.size(), object_keys, tenant_id);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListReadOnly(const std::string& object_key) {
+    return GetReplicaListReadOnly(object_key, tenant_id_.value());
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+MasterClient::GetReplicaListReadOnly(const std::string& object_key,
+                                     const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaListReadOnly");
+    timer.LogRequest("object_key=", object_key, ", tenant_id=", tenant_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaListForAdmin,
+                             GetReplicaListResponse>(object_key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListReadOnly(
+    const std::vector<std::string>& object_keys) {
+    return BatchGetReplicaListReadOnly(object_keys, tenant_id_.value());
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaListReadOnly(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaListReadOnly");
+    timer.LogRequest("keys_count=", object_keys.size(),
+                     ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaListForAdmin,
+                         GetReplicaListResponse>(object_keys.size(),
+                                                 object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -904,8 +1112,17 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
     timer.LogRequest("client_id=", client_id_);
 
+    std::shared_ptr<RpcClientPool::ClientPool> ping_pool;
+    {
+        MutexLocker lock(&connect_mutex_);
+        ping_pool =
+            ha_connection_policy_enabled_.load(std::memory_order_acquire)
+                ? ha_control_client_accessor_.GetClientPool()
+                : client_accessor_.GetClientPool();
+    }
     auto result =
-        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id_);
+        invoke_rpc_with_client_pool<&WrappedMasterService::Ping, PingResponse>(
+            ping_pool, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -950,6 +1167,18 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     auto result =
         invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
             client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UnmountLocalDiskSegment(
+    const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountLocalDiskSegment");
+    timer.LogRequest("client_id=", client_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::UnmountLocalDiskSegment, void>(
+            client_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1083,6 +1312,17 @@ MasterClient::PromotionAllocStart(
 tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
     const UUID& client_id, const std::string& key) {
     return NotifyPromotionSuccess(client_id, key, tenant_id_.value());
+}
+
+tl::expected<void, ErrorCode> MasterClient::RegisterPrefetchTask(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::RegisterPrefetchTask");
+    timer.LogRequest("client_id=", client_id, ", key=", key);
+    auto result = invoke_rpc<&WrappedMasterService::RegisterPrefetchTask, void>(
+        client_id, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
@@ -1316,6 +1556,21 @@ tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
 
     auto result = invoke_rpc<&WrappedMasterService::EvictDiskReplica, void>(
         client_id_, key, tenant_id, replica_type);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::EvictDiskReplicaIfCurrent(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    ScopedVLogTimer timer(1, "MasterClient::EvictDiskReplicaIfCurrent");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                     ", replica_type=", replica_type,
+                     ", expected_replica_id=", expected_replica_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::EvictDiskReplicaIfCurrent, bool>(
+            client_id_, key, tenant_id, replica_type, expected_replica_id);
     timer.LogResponseExpected(result);
     return result;
 }

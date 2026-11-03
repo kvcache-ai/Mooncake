@@ -1,144 +1,148 @@
 # EngramStore Backend
 
-Mooncake provides EngramStore as the storage backend for Engram embedding tables.
+EngramStore reads immutable tables of opaque byte rows. Models own hashing,
+quantization, scales, projections and distributed communication.
 
-The scope is intentionally narrow:
+This implementation supports local CPU and CUDA lookup only. The table/row
+contract is designed to accommodate future remote backends, but remote
+Mooncake Store execution is not supported yet.
 
-- the caller defines the physical table layout
-- the caller uploads one table per head
-- the caller provides precomputed row ids with shape `[B, L, H]`
-- Mooncake returns the selected rows as `[B, L, H, D]`
+## Table API
 
-Mooncake does not implement tokenizer compression, N-gram hashing, query logic,
-or any other model-side Engram algorithm.
+The table API adds no public configuration or lookup-handle class. Import
+`EngramStore` from `mooncake.engram`, or from `mooncake.store` with the C++ Store
+backend.
 
-## Current Backend Boundary
+```python
+import numpy as np
+from mooncake.engram import EngramStore
 
-The current implementation is intentionally conservative. It keeps EngramStore
-on top of the existing Store interfaces and does not depend on:
-
-- transfer scatter read
-- grouped transfer task
-- `get_into_range`
-- `batch_query`
-- local direct mapping
-- query cache
-- remote gather control-plane changes
-
-Those optimizations are deferred to follow-up PRs so that the EngramStore backend can
-land first as a small, reviewable unit.
-
-## Configuration
-
-`EngramStoreConfig` contains the physical layout for one EngramStore layer:
-
-- `table_vocab_sizes`: per-head table sizes `[N_0, N_1, ..., N_{H-1}]`
-- `embedding_dim`: row width `D`
-
-For `layer_id`, Mooncake generates one store key per head:
-
-```text
-engram:l{layer_id}:h{head_idx}
+specs = {"layer1/head0": {"num_rows": 17, "row_bytes": 264}}
+store = EngramStore(tables=specs, namespace="model-revision/layout-v1",
+                    local_dir="/dev/shm/engram")
+rows = np.zeros((17, 264), dtype=np.uint8)
+store.populate("layer1/head0", rows)
+ids = np.array([[0], [16]], dtype=np.int64)
+output = np.empty((2, 1, 264), dtype=np.uint8)
+store.lookup(["layer1/head0"], ids, output)
+store.close()
 ```
 
-Each key stores a `float32` table with shape `[N_h, D]`.
+- `EngramStore(*, tables, namespace, local_dir=None, store_client=None, persistent=True)`:
+  use `local_dir` for local storage. `store_client` is reserved for a future
+  remote backend and currently raises `NotImplementedError`. Each table has a
+  nonnegative `num_rows` and positive `row_bytes`. The namespace identifies immutable
+  weights and their physical layout, including any rank-specific sharding.
+- `populate(table_id, rows)`: copies contiguous CPU `uint8 [N,R]`
+  data. Local publication is create-only, locked across processes and atomic.
+  The input can be released after return. Existing tables are never overwritten.
+- `lookup(table_ids, row_ids, output, *, stream=None, offsets=None)`: reads IDs
+  `[T,K]` into caller-owned `uint8 [T,K,R]` output. The K table names may repeat,
+  and all selected rows have width R. CPU IDs are NumPy arrays or CPU tensors
+  of int32/int64; CUDA IDs and output are CUDA tensors on the current device.
+- `get_table_spec(table_id)`: returns a copy of the two-field layout.
+- `close()`: waits for outstanding local CUDA work and releases mappings.
+  Idempotent; also available through the context-manager protocol.
+- `remove(table_id)`: explicitly removes a published table. Close all readers
+  first, then remove through a separate instance that has not mapped the table.
 
-## Public Interface
+`offsets` contains one nonnegative int64 offset per selected table. A valid ID
+is converted to a physical row by subtracting that offset. ID -1 is handled
+first and leaves the corresponding output bytes untouched. Every other ID must
+lie in the selected table's range. CPU bounds errors are raised before writes;
+CUDA bounds errors are reported asynchronously as device errors, and output is
+invalid. Do not use invalid IDs to request zero padding: initialize output and
+use -1 instead.
 
-Python:
+Row bytes must be contiguous. Nonoverlapping positive outer strides support
+both token-major and head-major output; strided ID matrices are also accepted.
+IDs and output must not overlap. Empty token batches are supported.
 
-- `EngramStore(layer_id, config, store=None)`
-- `populate(embedding_buffers)`
-- `lookup(row_ids)`
-- `remove_from_store(force=False)`
-- `get_table_vocab_sizes()`
-- `get_store_keys()`
-- `get_num_heads()`
-- `get_embedding_dim()`
+## Local CUDA execution
 
-The Python `store` argument accepts the existing `MooncakeDistributedStore`
-wrapper, or `None` for metadata-only construction.
+Build with `USE_CUDA=ON` (for wheel builds, pass
+`-Ccmake.define.USE_CUDA=ON` to pip). The private CUDA extension has no PyTorch
+build dependency. Local tables are memory mapped and registered as portable
+CUDA host memory. The device gather kernel reads requested rows directly from
+host memory and writes output on the supplied stream.
 
-C++:
-
-- constructor `EngramStore(int layer_id, const EngramStoreConfig&, std::shared_ptr<PyClient>)`
-- `populate(...)`
-- `lookup_rows(...)`
-- `lookup_rows_contiguous(...)`
-- `remove_from_store(...)`
-- metadata getters matching the Python surface
-
-## Data Contract
-
-Populate expects one NumPy `float32` array per head:
-
-```text
-embedding_buffers[h].shape == [N_h, D]
+```bash
+pip install '.[engram]' -Ccmake.define.USE_CUDA=ON
 ```
 
-Lookup accepts either:
+```python
+import torch
 
-- nested Python lists with logical shape `[B, L, H]`, or
-- a contiguous NumPy `int64` array with shape `[B, L, H]`
-
-Lookup returns:
-
-```text
-output.shape == [B, L, H, D]
+ids = torch.tensor([[0], [16]], dtype=torch.int64, device="cuda")
+output = torch.empty((2, 1, 264), dtype=torch.uint8, device="cuda")
+store = EngramStore(tables=specs, namespace="model-revision/layout-v1",
+                    local_dir="/dev/shm/engram")
+stream = torch.cuda.current_stream()
+store.lookup(["layer1/head0"], ids, output, stream=stream.cuda_stream)
+# Subsequent work on this stream sees complete rows.
+stream.synchronize()
+store.close()
 ```
 
-## Populate Flow
+The CPU overload is synchronous. Supplying a CUDA stream enqueues the complete
+lookup and returns `None`; consumers use ordinary stream ordering or CUDA
+events. Keep IDs, output, and the Store alive until completion. Warm up each
+(table names, offsets, device) combination before capturing a CUDA graph, and
+destroy all graphs referring to a Store before closing it. Replays read current
+IDs from the captured tensor addresses.
 
-Populate follows the existing Store write path:
+With the default `persistent=True`, local files survive close and can be reopened using the same namespace and
+layout. Reopening checks the stored layout and file length. Host RAM must fit
+all registered table pages, even when the directory is on disk. This initial
+implementation pins entire selected tables and does not implement a page cache.
 
-1. validate that exactly one table is provided for each head
-2. validate that every table matches `[N_h, D]`
-3. verify that the target head-table keys do not already exist
-4. register each embedding table buffer
-5. upload all head tables with `batch_put_from(...)`
-6. unregister the staging buffers
+For worker-private tables, pass `persistent=False` with `local_dir`. Population
+creates an anonymous file mapping on that filesystem; it has no named file to
+leave behind after a worker is killed. These tables are isolated per Store
+instance, cannot be reopened by namespace, and are released by `close()` or
+process exit. `remove()` is not needed or supported in this mode.
 
-`populate(...)` is defined as a create-only operation for one EngramStore layer. To
-reuse a `layer_id`, first remove the old tables with `remove_from_store(...)`.
+## Future remote backends
 
-If upload fails after some head tables have already been written, or if publish
-finishes but post-write buffer cleanup fails, the backend best-effort removes
-the keys written by the failed populate attempt before returning an error.
+`lookup(table_ids, row_ids, output, *, stream=None, offsets=None)` describes
+requested rows and caller-owned output without exposing table addresses or a
+transport. A future remote implementation can use the same contract, including
+the requirement that consumers on the supplied CUDA stream observe complete
+output. This does not promise CUDA graph support for every future backend.
 
-## Lookup Flow
+Remote CPU and CUDA execution, transport selection and remote benchmarks are
+not implemented here. Passing `store_client` fails explicitly rather than
+falling back to local storage.
 
-Each lookup follows the same simplified backend flow:
+## Model coverage
 
-1. validate the `row_ids` shape and bounds
-2. build per-head byte ranges for the requested rows
-3. issue one `get_into_ranges(...)` call to materialize those rows into the output buffer
+The same interface represents N-gram/hash embeddings and direct token-indexed
+per-layer embeddings. Models keep hashing, quantization interpretation, scales,
+projections, request history and distributed communication in their own code.
 
-For NumPy `row_ids`, the binding uses a contiguous fast path and builds ranges
-directly from the input tensor without first converting the entire input into a
-nested C++ container.
+| Model family | Stored rows | Model-side interpretation |
+| --- | --- | --- |
+| DeepSeek V4.1 | FP8 weights and E8M0 scales packed per row | Block dequantization and TP/DP/CP communication |
+| Qwen4-Exp / Qwen3.8-Flash-Next | N-gram / PLE rows | Table scale, short convolution and request history |
+| LongCat Ngram | Over-embedding rows | Hashing, projection and token history |
+| Gemma3n / Gemma4 | Per-layer input embedding rows | Direct token indexing, scaling, projection and gating |
 
-## Validation
+The table/row contract keeps model-side interpretation separate from storage.
+The current local implementation supports CPU and CUDA lookup; remote lookup
+is future work.
 
-The backend enforces these invariants:
+## Verification
 
-- `table_vocab_sizes` is non-empty and every entry is positive
-- `embedding_dim` is positive
-- `populate(...)` receives exactly one table per head
-- every populated table matches `[N_h, D]`
-- `lookup(...)` receives a non-empty `[B, L, H]` input
-- every row id satisfies `0 <= row_ids[..., h] < N_h`
+Run `pytest -q scripts/test_engram_tables.py` for local table contracts and CUDA
+graph replay, and verifies that remote backend selection is rejected.
+`scripts/bench_engram_store_27b.py` benchmarks the same API against local storage.
 
-## Validation Status
-
-This backend is covered by:
-
-- correctness tests in `scripts/test_engram_store.py`
-- benchmark coverage in `scripts/bench_engram_store_27b.py`
-
-`scripts/test_engram_store.py` can run against an existing Mooncake deployment through
-`MOONCAKE_CONFIG_PATH` / `MOONCAKE_MASTER`, or it can start a local
-`mooncake_master` instance automatically for a self-contained TCP test run.
-
-By default, the benchmark exercises `engram_store.populate(...)` directly. Its
-fallback populate paths are gated behind `ENGRAM_ALLOW_POPULATE_FALLBACK=1` so
-they do not silently mask regressions in the current implementation.
+The SGLang integration was tested end to end with real weights for all five
+checkpoints in the four families above. Under matched controlled configurations,
+all 30 request outputs matched the native implementation exactly, including
+output token logprobs. CUDA graph decode was exercised on every checkpoint.
+Gemma3n and Qwen used deterministic inference; DeepSeek, Qwen and LongCat used
+fixed KV capacity and serialized requests. These are functional correctness
+checks for local storage, not a performance benchmark or remote validation.
+See [the companion SGLang PR](https://github.com/sgl-project/sglang/pull/44521)
+for the complete test configuration.

@@ -24,12 +24,14 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <utility>
 #include <fcntl.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <memory>
+#include <atomic>
 
 #include "tent/transfer_engine.h"
 #include "tent/common/utils/random.h"
@@ -88,6 +90,10 @@ class TENTBenchRunner : public BenchRunner {
     }
 
     size_t getTargetCount() const;
+
+    size_t getTargetIndex(int thread_id) const {
+        return targetIndex(thread_id);
+    }
 
     uint64_t getTargetSegmentId(int thread_id) const;
 
@@ -166,17 +172,35 @@ class TENTBenchRunner : public BenchRunner {
                           "target address");
     }
 
+    // Returns elapsed microseconds on success, or a negative value if the
+    // transfer failed. Never calls exit() — workers set g_tent_running so
+    // main can join threads and stop the engine first.
     double runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                              uint64_t target_addr, uint64_t block_size,
                              uint64_t batch_size, OpCode opcode,
                              uint64_t deadline_ns, IntentType intent_type);
 
    private:
+    // Tests register their own buffers on an engine with a fake transport.
+    friend class TENTBenchRunnerTestPeer;
+    explicit TENTBenchRunner(std::unique_ptr<TransferEngine> engine)
+        : engine_(std::move(engine)) {}
+
     int allocateBuffers();
 
     int freeBuffers();
 
     int runner(int thread_id);
+
+    void noteTransferFailed();
+
+    // Polls batch_id until it is terminal. A stop (failed worker, SIGINT,
+    // SIGTERM) does not end the wait early: the transports may still be
+    // writing into the local buffers. Returns with status PENDING only if the
+    // batch did not finish within the drain timeout after the stop; the batch
+    // is then counted in abandoned_batches_.
+    Status waitForBatch(BatchID batch_id, TransferStatus& status,
+                        uint64_t& polls);
 
     size_t targetIndex(int thread_id) const;
 
@@ -203,6 +227,10 @@ class TENTBenchRunner : public BenchRunner {
     std::condition_variable cv_task_;
     std::condition_variable cv_done_;
     int pending_ = 0;
+    // Batches that may still be in flight (see waitForBatch); while non-zero
+    // teardown retains both the engine and its local buffers until process
+    // exit.
+    std::atomic<uint64_t> abandoned_batches_{0};
 };
 
 }  // namespace tent

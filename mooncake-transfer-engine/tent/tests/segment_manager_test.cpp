@@ -186,6 +186,123 @@ TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
     EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
 }
 
+TEST(SegmentTrackerTest, FailedBatchHandsOffLastReferenceOutsideWriterLock) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = makeBuffer(0x30000, 0x1000);
+    buffer.transports = {HP_TCP};
+    buffer.transport_attrs[HP_TCP] = "old-registration";
+    buffer.lkey = {7};
+    auto ok = [](std::vector<BufferDesc>&) -> Status { return Status::OK(); };
+    std::vector<BufferDesc> first{buffer};
+    ASSERT_TRUE(tracker.addInBatch(first, ok).ok());
+
+    int owner_removals = 0;
+    int rollback_removals = 0;
+    const auto failure = Status::InternalError("injected transport failure");
+    // Both duplicate pins must be released; only the last one hands off.
+    std::vector<BufferDesc> duplicates{buffer, buffer};
+    auto status = tracker.addInBatch(
+        duplicates,
+        [&](std::vector<BufferDesc>&) -> Status {
+            EXPECT_TRUE(tracker
+                            .remove(buffer.addr, buffer.length,
+                                    [&](BufferDesc&) -> Status {
+                                        owner_removals++;
+                                        return Status::OK();
+                                    })
+                            .ok());
+            EXPECT_EQ(owner_removals, 0);
+            return failure;
+        },
+        [&](BufferDesc& removed) {
+            rollback_removals++;
+            EXPECT_EQ(removed.addr, buffer.addr);
+            EXPECT_EQ(removed.length, buffer.length);
+            EXPECT_EQ(removed.location, buffer.location);
+            EXPECT_EQ(removed.transports, buffer.transports);
+            EXPECT_EQ(removed.transport_attrs, buffer.transport_attrs);
+            EXPECT_EQ(removed.lkey, buffer.lkey);
+            EXPECT_EQ(removed.ref_count, 0);
+            EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+            // A writer can publish from the callback: the lock is released.
+            EXPECT_TRUE(manager
+                            ->updateLocal([](SegmentDesc& desc) -> Status {
+                                desc.name = "cleanup_callback";
+                                return Status::OK();
+                            })
+                            .ok());
+            return Status::OK();
+        });
+    EXPECT_EQ(status.code(), failure.code());
+    EXPECT_EQ(status.message(), failure.message());
+    EXPECT_EQ(rollback_removals, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+    EXPECT_EQ(manager->getLocal()->name, "cleanup_callback");
+}
+
+TEST(SegmentTrackerTest,
+     FailedRemovalPreservesRemainingTransportsAndReference) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = makeBuffer(0x40000, 0x1000);
+    buffer.transports = {TCP, MLU};
+    std::vector<BufferDesc> descriptors{buffer};
+    ASSERT_TRUE(
+        tracker.addInBatch(descriptors, [](auto&) { return Status::OK(); })
+            .ok());
+    EXPECT_FALSE(tracker
+                     .remove(buffer.addr, buffer.length,
+                             [](BufferDesc& desc) {
+                                 desc.transports = {MLU};
+                                 return Status::InternalError(
+                                     "injected drain failure");
+                             })
+                     .ok());
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 1u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 1);
+    EXPECT_EQ(buffersOf(snapshot)[0].transports,
+              std::vector<TransportType>{MLU});
+    EXPECT_TRUE(tracker
+                    .remove(buffer.addr, buffer.length,
+                            [](BufferDesc& desc) {
+                                EXPECT_EQ(desc.transports,
+                                          std::vector<TransportType>{MLU});
+                                return Status::OK();
+                            })
+                    .ok());
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, FailedBatchRollbackRetainsFailedRemoval) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = makeBuffer(0x50000, 0x1000);
+    auto ok = [](auto&) { return Status::OK(); };
+    std::vector<BufferDesc> descriptors{buffer};
+    ASSERT_TRUE(tracker.addInBatch(descriptors, ok).ok());
+    std::vector<BufferDesc> duplicate{buffer};
+    EXPECT_FALSE(
+        tracker
+            .addInBatch(
+                duplicate,
+                [&](auto&) {
+                    EXPECT_TRUE(
+                        tracker.remove(buffer.addr, buffer.length, ok).ok());
+                    return Status::InternalError(
+                        "injected registration failure");
+                },
+                [](BufferDesc&) {
+                    return Status::InternalError("injected drain failure");
+                })
+            .ok());
+    auto snapshot = manager->getLocal();
+    ASSERT_EQ(buffersOf(snapshot).size(), 1u);
+    EXPECT_EQ(buffersOf(snapshot)[0].ref_count, 1);
+    EXPECT_TRUE(tracker.remove(buffer.addr, buffer.length, ok).ok());
+}
+
 TEST(SegmentTrackerTest, AddProbesRealMemoryAndRefCounts) {
     auto manager = makeManager();
     SegmentTracker tracker(*manager);

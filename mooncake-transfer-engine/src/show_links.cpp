@@ -16,7 +16,8 @@
 
 #include <json/json.h>
 
-#include <algorithm>
+#include "ib_link_speed.h"
+
 #include <sstream>
 
 #include "transfer_engine_impl.h"
@@ -64,64 +65,9 @@ static bool hasTransportDetails(const NicDiagInfo& nic) {
     return nic.gid_index >= 0;
 }
 
+// Truncated to whole Gbps so the diagnostic output keeps its integer shape.
 static int computeSpeedGbps(int active_speed, int active_width) {
-    if (active_width <= 0) return 0;
-
-    int lane_gbps = 0;
-    switch (active_speed) {
-        case 1:
-            lane_gbps = 2;
-            break;
-        case 2:
-            lane_gbps = 5;
-            break;
-        case 4:
-            lane_gbps = 10;
-            break;
-        case 8:
-            lane_gbps = 10;
-            break;
-        case 16:
-            lane_gbps = 14;
-            break;
-        case 32:
-            lane_gbps = 25;
-            break;
-        case 64:
-            lane_gbps = 50;
-            break;
-        case 128:
-            lane_gbps = 100;
-            break;
-        case 256:
-            lane_gbps = 200;
-            break;
-        default:
-            lane_gbps = std::max(0, active_speed);
-            break;
-    }
-    int lanes = 1;
-    switch (active_width) {
-        case 1:
-            lanes = 1;
-            break;
-        case 2:
-            lanes = 4;
-            break;
-        case 4:
-            lanes = 8;
-            break;
-        case 8:
-            lanes = 12;
-            break;
-        case 16:
-            lanes = 2;
-            break;
-        default:
-            lanes = 1;
-            break;
-    }
-    return lane_gbps * lanes;
+    return static_cast<int>(ibLinkSpeedGbps(active_speed, active_width));
 }
 
 std::string buildShowLinksJson(TransferEngineImpl* impl) {

@@ -14,7 +14,7 @@ set(TENT_CUDA_PLUGIN_SOURCES
 add_library(tent_cuda_plugin SHARED ${TENT_CUDA_PLUGIN_SOURCES})
 
 target_link_libraries(tent_cuda_plugin
-    PRIVATE CUDA::cudart tent_plugin
+    PRIVATE CUDA::cudart CUDA::cuda_driver tent_plugin
 )
 
 set_target_properties(tent_cuda_plugin PROPERTIES

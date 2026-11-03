@@ -1,20 +1,16 @@
 #include "file_storage.h"
 
-#include <cmath>
-#include <locale>
+#include <algorithm>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.h"
-#include "bool_parser.h"
-#include "environ.h"
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
 #include "file_interface.h"
@@ -23,47 +19,6 @@
 namespace mooncake {
 
 namespace {
-
-double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
-    if (raw_value.empty()) {
-        return default_value;
-    }
-
-    std::istringstream stream(raw_value);
-    stream.imbue(std::locale::classic());
-
-    double value = 0.0;
-    stream >> value;
-    if (stream.fail()) {
-        return default_value;
-    }
-    if (!stream.eof() || !std::isfinite(value) || value <= 0.0 || value > 1.0) {
-        return default_value;
-    }
-    return value;
-}
-
-double GetEnvRatioOr(const char* name, double default_value) {
-    const auto raw_value = Environ::GetString(name, "");
-    return ParseEnvRatioOr(raw_value, default_value);
-}
-
-double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
-                     double default_value) {
-    const auto preferred_value = Environ::GetString(preferred_name, "");
-    if (!preferred_value.empty()) {
-        return ParseEnvRatioOr(preferred_value, default_value);
-    }
-    return GetEnvRatioOr(fallback_name, default_value);
-}
-
-bool GetEnvBoolStringOr(const char* name, bool default_value) {
-    const auto raw_value =
-        Environ::GetString(name, default_value ? "true" : "false");
-    return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
-                                    .trim_ascii_whitespace = false})
-        .value_or(default_value);
-}
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -83,188 +38,6 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 
 }  // namespace
 
-FileStorageConfig FileStorageConfig::FromEnvironment() {
-    FileStorageConfig config;
-
-    auto storage_backend_descriptor =
-        Environ::GetString("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                           "bucket_storage_backend");
-
-    if (storage_backend_descriptor == "bucket_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kBucket;
-    } else if (storage_backend_descriptor == "file_per_key_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kFilePerKey;
-    } else if (storage_backend_descriptor ==
-               "offset_allocator_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    } else if (storage_backend_descriptor == "distributed_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kDistributed;
-        config.enable_dfs = true;
-    } else if (storage_backend_descriptor == "nvme_kv_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kNvmeKv;
-    } else {
-        LOG(ERROR) << "Unknown storage backend.";
-    }
-
-    config.storage_filepath = Environ::GetString(
-        "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
-
-    config.local_buffer_size = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
-
-    config.pinned_restore_arena_size =
-        Environ::GetInt64("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
-                          config.pinned_restore_arena_size);
-
-    config.scanmeta_iterator_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
-        Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
-                          config.scanmeta_iterator_keys_limit));
-
-    config.total_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
-
-    config.total_size_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
-
-    config.heartbeat_interval_seconds =
-        Environ::GetUInt32("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
-                           config.heartbeat_interval_seconds);
-    config.client_buffer_gc_interval_seconds =
-        Environ::GetUInt32("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
-                           config.client_buffer_gc_interval_seconds);
-
-    config.client_buffer_gc_ttl_ms =
-        Environ::GetUInt64("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
-                           config.client_buffer_gc_ttl_ms);
-
-    config.enable_disk_watermark_eviction =
-        GetEnvBoolStringOr("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION",
-                           config.enable_disk_watermark_eviction);
-    config.disk_eviction_high_watermark_ratio =
-        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO",
-                      "MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO",
-                      config.disk_eviction_high_watermark_ratio);
-    config.disk_eviction_low_watermark_ratio =
-        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO",
-                      "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
-                      config.disk_eviction_low_watermark_ratio);
-
-    const auto use_uring_str =
-        Environ::GetString("MOONCAKE_OFFLOAD_USE_URING",
-                           Environ::GetString("MOONCAKE_USE_URING", "false"));
-    config.use_uring =
-        TryParseBool(use_uring_str, {.token_set = BoolTokenSet::kTrueFalse,
-                                     .trim_ascii_whitespace = false})
-            .value_or(false);
-
-    return config;
-}
-
-bool FileStorageConfig::ValidatePath(std::string path) const {
-    if (path.empty()) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
-        return false;
-    }
-    namespace fs = std::filesystem;
-    // 1. Must be an absolute path
-    if (!fs::path(path).is_absolute()) {
-        LOG(ERROR)
-            << "FileStorageConfig: storage_filepath must be an absolute path: "
-            << path;
-        return false;
-    }
-
-    // 2. Check if the path contains ".." components that could lead to path
-    // traversal (static check)
-    fs::path p(path);
-    for (const auto& component : p) {
-        if (component == "..") {
-            LOG(ERROR) << "FileStorageConfig: path traversal is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    struct stat stat_buf;
-
-    // 3. Use stat() to check if the path exists
-    if (::stat(path.c_str(), &stat_buf) != 0) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath does not exist: "
-                   << path;
-        return false;
-    }
-    // Path exists — check if it is a directory
-    if (!S_ISDIR(stat_buf.st_mode)) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is not a directory: "
-                   << path;
-        return false;
-    }
-
-    // (Optional) Check write permission
-    if (::access(path.c_str(), W_OK) != 0) {
-        LOG(ERROR) << "FileStorageConfig: no write permission on directory: "
-                   << path;
-        return false;
-    }
-
-    // 4. Additional security: prevent symlink bypass (optional)
-    // Use lstat to avoid automatic dereferencing of symbolic links
-    struct stat lstat_buf;
-    if (::lstat(path.c_str(), &lstat_buf) == 0) {
-        if (S_ISLNK(lstat_buf.st_mode)) {
-            LOG(ERROR) << "FileStorageConfig: symbolic link is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
-    }
-    if (total_keys_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
-        return false;
-    }
-    if (total_size_limit == 0) {
-        LOG(ERROR) << "FileStorageConfig: total_size_limit should not be zero";
-        return false;
-    }
-    if (pinned_restore_arena_size < 0) {
-        LOG(ERROR) << "FileStorageConfig: pinned_restore_arena_size must be "
-                      "non-negative";
-        return false;
-    }
-    if (heartbeat_interval_seconds <= 0) {
-        LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
-        return false;
-    }
-    if (disk_eviction_low_watermark_ratio <= 0.0 ||
-        disk_eviction_low_watermark_ratio > 1.0) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_low_watermark_ratio must be in (0, 1]";
-        return false;
-    }
-    if (disk_eviction_high_watermark_ratio <= 0.0 ||
-        disk_eviction_high_watermark_ratio > 1.0) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_high_watermark_ratio must be in (0, 1]";
-        return false;
-    }
-    if (disk_eviction_low_watermark_ratio >=
-        disk_eviction_high_watermark_ratio) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_low_watermark_ratio must be lower than "
-                   << "disk_eviction_high_watermark_ratio";
-        return false;
-    }
-    return true;
-}
-
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
                          const std::string& local_rpc_addr,
@@ -276,10 +49,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
-    if (config_.storage_backend_type == StorageBackendType::kDistributed) {
-        config_.enable_dfs = true;
-    }
-    if (!config.Validate()) {
+    if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
@@ -316,7 +86,9 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
-        if (client_) {
+        config_.enable_dfs = !distributed_backend->UsesObjectStorage() ||
+                             distributed_backend->UsesKvcs();
+        if (config_.enable_dfs && client_) {
             client_->SetDfsStorageBackend(distributed_backend);
         }
     }
@@ -515,6 +287,56 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     return batch_result;
 }
 
+void FileStorage::PartitionUnbucketedTasks(
+    const std::unordered_map<std::string, OffloadTaskItem>& task_by_storage_key,
+    const std::unordered_set<std::string>& all_bucket_keys,
+    const std::vector<std::string>& deferred_keys,
+    const std::unordered_map<std::string, OffloadTaskItem>& previously_carried,
+    const std::unordered_set<std::string>& redrained_carried_keys,
+    std::vector<OffloadTaskItem>& failed_tasks,
+    std::unordered_map<std::string, OffloadTaskItem>& carried_tasks) {
+    for (const auto& storage_key : deferred_keys) {
+        auto it = task_by_storage_key.find(storage_key);
+        if (it != task_by_storage_key.end()) {
+            carried_tasks.emplace(storage_key, it->second);
+        } else {
+            // A deferred key with no known task can be neither carried nor
+            // NACKed; the pool will re-emit it and it will be dropped — the
+            // pre-fix behavior. Unreachable while the invariant holds
+            // (deferred keys are a subset of this cycle's effective input);
+            // logged at WARNING so a caller change that breaks the contract
+            // is observable rather than a silent regression.
+            LOG(WARNING) << "[OFFLOAD] deferred key has no known task and "
+                            "cannot be carried; it will be dropped on "
+                            "re-emission (broken caller invariant?): "
+                         << storage_key;
+        }
+    }
+    // Retain previously carried keys the backend did not emit this cycle:
+    // their pooled copies are still waiting (the pool only moves on a call
+    // with non-empty input), so their tasks must stay alive. Keys re-drained
+    // this cycle are excluded: the caller dropped their pooled copies on
+    // collision, so nothing is waiting for them and the fresh task — already
+    // in task_by_storage_key — is the only live one. Retaining a stale task
+    // here would both strand it forever and suppress the fresh task's NACK
+    // in the sweep below when the backend skipped the key outright.
+    for (const auto& [storage_key, task] : previously_carried) {
+        if (redrained_carried_keys.find(storage_key) !=
+            redrained_carried_keys.end()) {
+            continue;
+        }
+        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+            carried_tasks.emplace(storage_key, task);
+        }
+    }
+    for (const auto& [storage_key, task] : task_by_storage_key) {
+        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end() &&
+            carried_tasks.find(storage_key) == carried_tasks.end()) {
+            failed_tasks.push_back(task);
+        }
+    }
+}
+
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
 FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
@@ -549,11 +371,41 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         task_by_storage_key.emplace(storage_key, task);
     }
 
+    auto bucket_backend =
+        std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+
+    // Merge in tasks carried across a bucket deferral (see
+    // deferred_task_by_storage_key_): the backend's ungrouped pool will
+    // re-emit those keys in a bucket this call, and they need their original
+    // tasks to be queried, stored and success-notified. Collision (a carried
+    // key re-drained before re-emission, i.e. re-PUT while deferred): the
+    // fresh drain wins entirely -- drop the pooled copy so the key flows
+    // through grouping as new input with its current size, under its fresh
+    // task. Without this the fresh task would win the task map while the
+    // pooled stale size won the packing accounting. Collided keys are recorded
+    // so the partition below does not also retain their stale carried tasks —
+    // nothing is waiting for a key whose pooled copy we just dropped.
+    std::unordered_set<std::string> redrained_carried_keys;
+    for (const auto& [storage_key, task] : deferred_task_by_storage_key_) {
+        if (storage_object_sizes.find(storage_key) !=
+            storage_object_sizes.end()) {
+            if (bucket_backend) {
+                bucket_backend->RemoveUngroupedOffloadingObject(storage_key);
+            }
+            redrained_carried_keys.insert(storage_key);
+            VLOG(1) << "Deferred offload key re-drained before re-emission; "
+                       "fresh task and size supersede the pooled copy: "
+                    << storage_key;
+            continue;
+        }
+        task_by_storage_key.emplace(storage_key, task);
+    }
+
     std::vector<std::vector<std::string>> buckets_keys;
-    if (auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+    std::vector<std::string> deferred_keys;
+    if (bucket_backend) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys);
+            storage_object_sizes, buckets_keys, &deferred_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -597,7 +449,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     // Collect keys drained from master queue but not actually offloaded.
     // Report them back with data_size=-1 sentinel so the master can clean up
-    // orphaned offloading_tasks and release source replica refcounts.
+    // orphaned offloading tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
     // Set when a whole-cycle error aborts the bucket loop early. We still fall
@@ -697,11 +549,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
 
         auto offload_start = std::chrono::steady_clock::now();
+        std::unordered_set<std::string> reported_keys;
+        reported_keys.reserve(host_batch_object.size());
         auto bucket_complete_handler =
-            [this, offload_start, complete_handler](
+            [this, offload_start, complete_handler, &reported_keys](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
             auto res = complete_handler(keys, metadatas);
+            if (res == ErrorCode::OK) {
+                reported_keys.insert(keys.begin(), keys.end());
+            }
             if (res == ErrorCode::OK && ssd_metric_) {
                 auto elapsed_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -732,6 +589,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         for (auto& buf : staging_bufs) {
             pinned_buffer_pool_->Release(std::move(buf));
         }
+        if (offload_res) {
+            // A successful batch may skip duplicates or individual writes.
+            // Only the completion callback's keys were reported to Master;
+            // NACK the rest to release their tasks and source replica refs.
+            for (const auto& [key, _] : host_batch_object) {
+                if (reported_keys.find(key) == reported_keys.end()) {
+                    failed_tasks.push_back(task_by_storage_key.at(key));
+                }
+            }
+        }
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
@@ -761,13 +628,35 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     }
 
-    // Keys skipped by GroupOffloadingKeysByBucket don't appear in any bucket,
-    // so they never reach BatchOffload or complete_handler.
-    for (const auto& [storage_key, task] : task_by_storage_key) {
-        if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
+    // Keys absent from every bucket are either (a) deliberately skipped by
+    // GroupOffloadingKeysByBucket (size over bucket limit / already on disk)
+    // — NACK those so the master releases task + refcount — or (b) DEFERRED
+    // to the backend's ungrouped pool for the next cycle. Deferred keys must
+    // keep their tasks alive across the deferral instead of being NACKed:
+    // the pool carries only key+size, and a re-emitted key without a task
+    // was silently dropped above — the deferred-tail leak (upstream #3006).
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    PartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
+                             deferred_keys, deferred_task_by_storage_key_,
+                             redrained_carried_keys, failed_tasks,
+                             carried_tasks);
+    if (abort_error == ErrorCode::KEYS_ULTRA_LIMIT) {
+        // Offloading is now disabled, so no later heartbeat can consume the
+        // deferred tail. Release its tasks along with the failed buckets and
+        // discard the corresponding pooled keys to keep both states in sync.
+        for (const auto& [_, task] : carried_tasks) {
             failed_tasks.push_back(task);
         }
+        carried_tasks.clear();
+        if (bucket_backend) {
+            bucket_backend->ClearUngroupedOffloadingObjects();
+        }
     }
+    if (!carried_tasks.empty()) {
+        VLOG(1) << "Carrying " << carried_tasks.size()
+                << " deferred offload task(s) to the next cycle";
+    }
+    deferred_task_by_storage_key_ = std::move(carried_tasks);
 
     if (!failed_tasks.empty()) {
         std::vector<StorageObjectMetadata> failed_metadatas;
@@ -879,6 +768,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // A drain deregistered the disk tier on purpose. Skipping the whole tick
+    // matters for the SEGMENT_NOT_FOUND branch below, which would re-mount the
+    // segment and re-register every object; there is also no point taking new
+    // offload work for a store that is leaving. The client TTL is renewed by
+    // Ping on the storage heartbeat thread, not here, so the client stays
+    // alive for its memory segments.
+    if (draining_.load()) {
+        return {};
+    }
+
     // Join previous rescan if completed
     if (rescan_future_.valid() && rescan_future_.wait_for(std::chrono::seconds(
                                       0)) == std::future_status::ready) {
@@ -905,6 +804,14 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // === STEP 1: Send heartbeat and get offloading decisions ===
     {
         MutexLocker locker(&offloading_mutex_);
+        // Re-checked under the lock: the entry check above is only a fast
+        // path. A drain (which latches and deregisters under this same
+        // mutex) may have completed while this tick was parked on it; going
+        // on would hit SEGMENT_NOT_FOUND below and re-mount the segment the
+        // drain just deregistered.
+        if (draining_.load()) {
+            return {};
+        }
         auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
             return client_->OffloadObjectHeartbeat(enable_offloading_,
                                                    offloading_objects);
@@ -972,13 +879,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    // === STEP 2: Poll whether master requested a full SSD clear ===
-    auto remove_all_result = client_->PollRemoveAll();
-    if (remove_all_result && remove_all_result.value()) {
-        RemoveAll();
-    }
-
-    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
+    // Generic removal reclaims files through metadata-checked eviction, not a
+    // backend-wide wipe that could remove managed objects or another tenant.
+    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
     if (!offloading_objects.empty()) {
         auto offload_result = OffloadObjects(offloading_objects);
         if (!offload_result) {
@@ -1008,18 +911,274 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 }
 
 void FileStorage::RemoveAll() {
-    // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
-    // storage directory. Storage backends store physical files without a
-    // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
-    // signals this client will also delete tenant_B's SSD files here, while
-    // master still holds valid metadata for tenant_B (subsequent reads get
-    // OBJECT_NOT_FOUND on this node). Safe for the global RemoveAll(force) and
-    // for single-tenant / shared-nothing deployments. Proper per-tenant
-    // physical isolation needs backend-level tenant-scoped layout (follow-up).
+    // Explicit physical reset: this bypasses per-object metadata protection
+    // and clears every tenant sharing the backend. Generic Client::RemoveAll
+    // must not request it; callers must ensure no live object depends on the
+    // files being removed.
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
     LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
+}
+
+tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
+    uint64_t grace_period_ms) {
+    if (client_ == nullptr) {
+        LOG(ERROR) << "client is nullptr";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Latch and deregister under offloading_mutex_, the lock Heartbeat holds
+    // across its master RPCs and the SEGMENT_NOT_FOUND re-mount. The latch
+    // alone is not enough: a heartbeat that read draining_ == false before
+    // this store() and was then scheduled out would, on resume, see
+    // SEGMENT_NOT_FOUND from the deregistration below and re-mount the
+    // segment. Under the mutex, such a tick is either still parked on the
+    // lock (it re-checks draining_ once it gets it and skips) or it already
+    // finished its RPCs before we latched (anything it mounted or registered
+    // is deregistered again right here, and the master refuses registrations
+    // that arrive after this call returns -- see
+    // MasterService::NotifyOffloadSuccess).
+    {
+        MutexLocker locker(&offloading_mutex_);
+        draining_.store(true);
+
+        auto result = client_->UnmountLocalDiskSegment();
+        if (!result) {
+            LOG(ERROR) << "action=drain_local_disk_segment, error="
+                       << result.error();
+            draining_.store(false);
+            return result;
+        }
+    }
+
+    LOG(INFO) << "action=drain_local_disk_segment, grace_period_ms="
+              << grace_period_ms;
+    if (grace_period_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(grace_period_ms));
+    }
+    return {};
+}
+
+namespace {
+
+// RAII guard for master-side promotion state: unless dismissed, the
+// destructor notifies the master that promotion failed so the staged
+// PROCESSING replica and the in-flight slot are released eagerly instead of
+// waiting for the reaper TTL. NotifyPromotionFailure is idempotent and
+// best-effort - the reaper is the long-stop.
+class PromotionStateGuard {
+   public:
+    PromotionStateGuard(Client* client, std::string key, std::string tenant_id)
+        : client_(client),
+          key_(std::move(key)),
+          tenant_id_(std::move(tenant_id)) {}
+
+    ~PromotionStateGuard() {
+        if (dismissed_ || client_ == nullptr) {
+            return;
+        }
+        auto release = client_->NotifyPromotionFailure(key_, tenant_id_);
+        if (!release) {
+            VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                    << key_ << ", error=" << release.error()
+                    << "; master reaper will reclaim on TTL expiry";
+        }
+    }
+
+    void Dismiss() { dismissed_ = true; }
+
+    PromotionStateGuard(const PromotionStateGuard&) = delete;
+    PromotionStateGuard& operator=(const PromotionStateGuard&) = delete;
+
+   private:
+    Client* client_;
+    std::string key_;
+    std::string tenant_id_;
+    bool dismissed_{false};
+};
+
+}  // namespace
+
+tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
+    const std::string& key, const std::string& tenant_id, int64_t size,
+    bool* dram_pressure) {
+    const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
+    if (size <= 0) {
+        LOG(WARNING) << "Promotion: skipping key=" << key
+                     << " with non-positive size=" << size;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // No segment preference from the client: let master pick from any
+    // DRAM segment.
+    const std::vector<std::string> preferred_segments;
+
+    auto alloc_result = client_->PromotionAllocStart(
+        key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
+    if (!alloc_result) {
+        // AllocStart failed (typically NO_AVAILABLE_HANDLE under
+        // DRAM pressure). No staged buffer to release, but the
+        // task entry already claimed a promotion_in_flight_ slot
+        // at admission. Notify the master to release it
+        // immediately; otherwise the slot stays pinned for the
+        // reaper TTL (~10 min default), turning transient DRAM
+        // pressure into a sustained outage of promotion_queue_limit_.
+        // Notify is idempotent and handles alloc_id == 0 correctly.
+        VLOG(1) << "PromotionAllocStart failed for key=" << key
+                << ", error=" << alloc_result.error()
+                << " (likely no free DRAM); releasing master slot";
+        if (dram_pressure != nullptr &&
+            alloc_result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+            *dram_pressure = true;
+        }
+        auto release = client_->NotifyPromotionFailure(key, tenant_id);
+        if (!release) {
+            VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                    << key << ", error=" << release.error()
+                    << "; master reaper will reclaim on TTL expiry";
+        }
+        return tl::make_unexpected(alloc_result.error());
+    }
+
+    // Every failure path past this point has a master-side staged
+    // PROCESSING MEMORY buffer and an incremented in-flight slot.
+    // The guard eagerly notifies the master on failure so the buffer is
+    // reclaimed and the slot is freed; otherwise transient SSD
+    // throttling or RDMA flakes saturate promotion_queue_limit_
+    // for the full reaper TTL.
+    PromotionStateGuard guard(client_.get(), key, tenant_id);
+
+    // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
+    // from the local SSD backend into it. AllocateBatch returns a
+    // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
+    // staging space when the local goes out of scope.
+    std::vector<std::string> single_key{storage_key};
+    std::vector<int64_t> single_size{size};
+    auto allocate_res =
+        AllocateBatch(single_key, single_size, *client_buffer_allocator_);
+    if (!allocate_res) {
+        LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
+                     << ", error=" << allocate_res.error();
+        return tl::make_unexpected(allocate_res.error());
+    }
+    auto staging = allocate_res.value();
+    auto load_res = BatchLoad(staging->slices);
+    if (!load_res) {
+        LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
+                     << ", error=" << load_res.error();
+        return tl::make_unexpected(load_res.error());
+    }
+
+    // (b) TE-write from the staging slice into the freshly-allocated
+    // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
+    // correction in BatchLoad, so re-read it from the slice map.
+    auto slice_it = staging->slices.find(storage_key);
+    if (slice_it == staging->slices.end()) {
+        LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    std::vector<Slice> tx_slices{slice_it->second};
+    ErrorCode write_err = client_->PromotionWrite(
+        alloc_result.value().memory_descriptor, tx_slices);
+    if (write_err != ErrorCode::OK) {
+        LOG(WARNING) << "Promotion: TransferWrite failed for key=" << key
+                     << ", error=" << write_err;
+        return tl::make_unexpected(write_err);
+    }
+
+    // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
+    // becomes visible to readers.
+    auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
+    if (!notify_res) {
+        // The write landed but the commit failed. We can't retry the
+        // commit (the success path is one-shot via alloc_id), and we
+        // don't know whether the failure was transient or structural.
+        // Release the master-side state so the slot is reusable; the
+        // bytes we wrote become stranded under a soon-to-be-erased
+        // PROCESSING replica, which is harmless.
+        LOG(WARNING) << "Promotion: NotifyPromotionSuccess failed for key="
+                     << key << ", error=" << notify_res.error();
+        return tl::make_unexpected(notify_res.error());
+    }
+
+    guard.Dismiss();
+    VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    bool* dram_pressure, PrefetchKeyCallback on_key_done,
+    const std::string& tenant_id) {
+    if (client_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (keys.size() != sizes.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Default (empty) means the holder's own tenant; a delegated prefetch
+    // carries the requester's tenant explicitly.
+    const std::string effective_tenant =
+        tenant_id.empty() ? client_->tenant_id() : tenant_id;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& key = keys[i];
+        const int64_t size = sizes[i];
+        bool key_dram_pressure = false;
+        auto result = PromoteOneKeyFromLocalDisk(key, effective_tenant, size,
+                                                 &key_dram_pressure);
+        if (key_dram_pressure && dram_pressure != nullptr) {
+            *dram_pressure = true;
+        }
+        if (ssd_metric_ != nullptr) {
+            if (result) {
+                ssd_metric_->prefetch_complete_total.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else {
+                ssd_metric_->prefetch_fail_total.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+        if (on_key_done) {
+            on_key_done(key, result.has_value());
+        }
+        if (key_dram_pressure) {
+            // DRAM saturated: stop the batch here. Each further key would
+            // burn the same doomed alloc round-trip while eviction fights
+            // for the same memory; the caller enters cooldown instead.
+            VLOG(1) << "PrefetchKeys: DRAM pressure at key=" << key
+                    << ", skipping " << (keys.size() - i - 1)
+                    << " remaining keys";
+            break;
+        }
+    }
+    return {};
+}
+
+std::optional<int64_t> FileStorage::LookupLocalObjectSize(
+    const std::string& key, const std::string& tenant_id) const {
+    if (!storage_backend_) {
+        return std::nullopt;
+    }
+    if (auto size = storage_backend_->GetObjectDataSize(key);
+        size && *size > 0) {
+        return size;
+    }
+    // Tenant-scoped fallback: bucket keys are stored scoped by tenant.
+    const std::string& lookup_tenant = tenant_id.empty() && client_ != nullptr
+                                           ? client_->tenant_id()
+                                           : tenant_id;
+    if (!lookup_tenant.empty()) {
+        const auto scoped = TenantId(lookup_tenant).MakeScopedKey(key);
+        if (scoped != key) {
+            if (auto size = storage_backend_->GetObjectDataSize(scoped);
+                size && *size > 0) {
+                return size;
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
@@ -1048,10 +1207,6 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
             << " promotion candidate(s) from master";
 
-    // No segment preference from the client: let master pick from any
-    // DRAM segment.
-    const std::vector<std::string> preferred_segments;
-
     // The master caps per-heartbeat work via PromotionObjectHeartbeat,
     // returning at most one task per call so the heartbeat thread stays
     // within the client-liveness window even for large objects. Leftover
@@ -1059,114 +1214,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     // returned on subsequent heartbeats; we process whatever we received
     // here without a second client-side cap.
     for (const auto& task : promotion_objects) {
-        const auto& key = task.key;
-        const auto& tenant_id = task.tenant_id;
-        const int64_t size = task.size;
-        const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
-        if (size <= 0) {
-            LOG(WARNING) << "Skipping promotion for key=" << key
-                         << " with non-positive size=" << size;
-            continue;
-        }
-
-        auto alloc_result = client_->PromotionAllocStart(
-            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
-        if (!alloc_result) {
-            // AllocStart failed (typically NO_AVAILABLE_HANDLE under
-            // DRAM pressure). No staged buffer to release, but the
-            // task entry already claimed a promotion_in_flight_ slot
-            // at admission. Notify the master to release it
-            // immediately; otherwise the slot stays pinned for the
-            // reaper TTL (~10 min default), turning transient DRAM
-            // pressure into a sustained outage of promotion_queue_limit_.
-            // Notify is idempotent and handles alloc_id == 0 correctly.
-            VLOG(1) << "PromotionAllocStart failed for key=" << key
-                    << ", error=" << alloc_result.error()
-                    << " (likely no free DRAM); releasing master slot";
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
-            if (!release) {
-                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                        << key << ", error=" << release.error()
-                        << "; master reaper will reclaim on TTL expiry";
-            }
-            continue;
-        }
-
-        // Every failure path past this point has a master-side staged
-        // PROCESSING MEMORY buffer and an incremented in-flight slot.
-        // Eagerly notify the master on failure so the buffer is
-        // reclaimed and the slot is freed; otherwise transient SSD
-        // throttling or RDMA flakes saturate promotion_queue_limit_
-        // for the full reaper TTL. NotifyPromotionFailure is
-        // idempotent and best-effort — the reaper is the long-stop.
-        auto release_master_state = [this, &key, &tenant_id]() {
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
-            if (!release) {
-                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                        << key << ", error=" << release.error()
-                        << "; master reaper will reclaim on TTL expiry";
-            }
-        };
-
-        // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
-        // from the local SSD backend into it. AllocateBatch returns a
-        // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
-        // staging space when the local goes out of scope.
-        std::vector<std::string> single_key{storage_key};
-        std::vector<int64_t> single_size{size};
-        auto allocate_res =
-            AllocateBatch(single_key, single_size, *client_buffer_allocator_);
-        if (!allocate_res) {
-            LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
-                         << ", error=" << allocate_res.error();
-            release_master_state();
-            continue;
-        }
-        auto staging = allocate_res.value();
-        auto load_res = BatchLoad(staging->slices);
-        if (!load_res) {
-            LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
-                         << ", error=" << load_res.error();
-            release_master_state();
-            continue;
-        }
-
-        // (b) TE-write from the staging slice into the freshly-allocated
-        // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
-        // correction in BatchLoad, so re-read it from the slice map.
-        auto slice_it = staging->slices.find(storage_key);
-        if (slice_it == staging->slices.end()) {
-            LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
-            release_master_state();
-            continue;
-        }
-        std::vector<Slice> tx_slices{slice_it->second};
-        ErrorCode write_err = client_->PromotionWrite(
-            alloc_result.value().memory_descriptor, tx_slices);
-        if (write_err != ErrorCode::OK) {
-            LOG(WARNING) << "Promotion: TransferWrite failed for key=" << key
-                         << ", error=" << write_err;
-            release_master_state();
-            continue;
-        }
-
-        // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
-        // becomes visible to readers.
-        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
-        if (!notify_res) {
-            // The write landed but the commit failed. We can't retry the
-            // commit (the success path is one-shot via alloc_id), and we
-            // don't know whether the failure was transient or structural.
-            // Release the master-side state so the slot is reusable; the
-            // bytes we wrote become stranded under a soon-to-be-erased
-            // PROCESSING replica, which is harmless.
-            LOG(WARNING) << "Promotion: NotifyPromotionSuccess failed for key="
-                         << key << ", error=" << notify_res.error();
-            release_master_state();
-            continue;
-        }
-
-        VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+        PromoteOneKeyFromLocalDisk(task.key, task.tenant_id, task.size,
+                                   nullptr);
     }
 
     return {};
@@ -1272,13 +1321,14 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        // Allocate oversized buffer for O_DIRECT alignment:
-        //   +4096 for aligning the ptr to 4096 boundary
-        //   +4096 for aligned read tail padding (actual_offset may not be
-        //   aligned)
         size_t data_size = static_cast<size_t>(sizes[i]);
-        size_t alloc_size =
-            align_up(data_size, kDirectIOAlignment) + 2 * kDirectIOAlignment;
+        size_t alloc_size = std::max<size_t>(data_size, 1);
+        if (config_.use_uring) {
+            // O_DIRECT reads need room to align the pointer and to round an
+            // unaligned file range out to full pages.
+            alloc_size = align_up(data_size, kDirectIOAlignment) +
+                         2 * kDirectIOAlignment;
+        }
 
         auto alloc_result = allocator.allocate(alloc_size);
         if (!alloc_result && !gc_triggered &&
@@ -1302,19 +1352,19 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
 
-        // Align ptr to 4096 boundary for O_DIRECT
-        void* raw_ptr = alloc_result->ptr();
-        void* aligned_ptr = reinterpret_cast<void*>(
-            (reinterpret_cast<uintptr_t>(raw_ptr) + kDirectIOAlignment - 1) &
-            ~(kDirectIOAlignment - 1));
+        void* data_ptr = alloc_result->ptr();
+        if (config_.use_uring) {
+            data_ptr =
+                reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(data_ptr) +
+                                         kDirectIOAlignment - 1) &
+                                        ~(kDirectIOAlignment - 1));
+        }
 
         total_size += data_size;
-        // Slice records data_size; the buffer behind aligned_ptr is oversized
-        // to accommodate aligned reads
-        result->slices.emplace(keys[i], Slice{aligned_ptr, data_size});
+        result->slices.emplace(keys[i], Slice{data_ptr, data_size});
         // pointers will be adjusted after BatchLoad (offset_in_buffer
         // correction)
-        result->pointers.emplace_back(reinterpret_cast<uintptr_t>(aligned_ptr));
+        result->pointers.emplace_back(reinterpret_cast<uintptr_t>(data_ptr));
         result->handles.emplace_back(std::move(alloc_result.value()));
         result->lease_timeout = lease_timeout;
     }
@@ -1345,6 +1395,14 @@ void FileStorage::ClientBufferGCThreadFunc() {
             std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
+}
+
+tl::expected<bool, ErrorCode> FileStorage::Exists(const std::string& key) {
+    if (!storage_backend_) {
+        LOG(ERROR) << "Storage backend is not initialized. Call Init() first.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return storage_backend_->IsExist(key);
 }
 
 bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
@@ -1379,6 +1437,17 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
             [this, &total_keys, &total_batches, &total_failures](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) {
+                // A rescan can be mid-flight when a drain deregisters the
+                // disk tier; every batch it would register from here on
+                // re-advertises the departing store. The master refuses such
+                // registrations anyway (the segment entry is gone), so this
+                // stops the scan on the first batch instead of on a refused
+                // RPC.
+                if (draining_.load()) {
+                    LOG(INFO) << "ReRegisterOffloadedObjects: aborting scan, "
+                              << "the disk tier is draining";
+                    return ErrorCode::SEGMENT_NOT_FOUND;
+                }
                 total_batches++;
                 total_keys += keys.size();
                 for (auto& metadata : metadatas) {

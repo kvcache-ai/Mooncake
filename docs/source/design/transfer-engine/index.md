@@ -11,7 +11,7 @@ Mooncake Transfer Engine is a high-performance, zero-copy data transfer library 
 
 As shown in the diagram, each specific client corresponds to a `TransferEngine`, which not only includes a RAM Segment but also integrates management for high-speed transfers across multiple threads and network cards. The RAM Segment, in principle, corresponds to the entire virtual address space of this `TransferEngine`, but in reality, only parts of it (known as a `Buffer`) are registered for (GPUDirect) RDMA Read/Write. Each Buffer can have separate permissions (corresponding to RDMA `rkey`, etc.) and network card affinity (e.g., preferred NICs for different types of memory).
 
-Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport`, `NVMeoFTransport`, `NvlinkTransport`, `IntraNodeNvlinkTransport`, and `HipTransport`.
+Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport`, `NVMeoFTransport`, `NvlinkTransport`, `IntraNodeNvlinkTransport`, `HipTransport`, and `ShmTransport`.
 
 (segment)=
 ### Segment
@@ -29,6 +29,13 @@ In addition, Transfer Engine also supports registering some **local DRAM areas**
 #### 2. NVMeof Segment
 Transfer Engine also leverages the NVMeof protocol to support direct data transfer from files on NVMe to DRAM/VRAM via PCIe, without going through the CPU and achieving zero-copy. Users need to follow the instructions to mount remote storage nodes locally and use the `openSegment` interface for reference to complete data read/write operations.
 
+For direct `NVMeoFTransport::submitTransfer` calls, each request must have a
+nonzero length and fit entirely within the concatenated NVMe-oF buffers. Requests
+may span adjacent buffers. A missing or incompatible segment, an overflowing
+segment length, or an invalid request range returns `InvalidArgument` before any
+request in that call is prepared or submitted; existing batch tasks are unchanged.
+This validation does not make subsequent I/O execution atomic.
+
 (batchtransfer)=
 ### BatchTransfer
 
@@ -41,6 +48,7 @@ With the help of Transfer Engine, Mooncake Store can achieve local DRAM/VRAM rea
 | NVMe-of          | ✓    | ✓    |
 
 - Local memcpy: If the target Segment is actually in the local DRAM/VRAM, direct data copy interfaces such as memcpy, cudaMemcpy are used.
+- SHM: Same-host DRAM transfers of POSIX shm-backed buffers (`MC_FORCE_SHM=1`). With `-DENABLE_MULTI_PROTOCOL=ON` this installs SHM alongside RDMA/TCP; without it, SHM is the only transport. Objects are `0600` (same UID). Same hostname does not imply a shared `/dev/shm`. In-flight copies pin the cached mmap so prune/cap cannot unmap it.
 - TCP: Supports data transfer between local DRAM and remote DRAM.
 - RDMA: Supports data transfer between local DRAM/VRAM and remote DRAM. It supports multi-network card pooling and retry functions in implementation.
 - HIP: Supports intra-node data transfers between GPU VRAM and GPU VRAM, as well as between GPU VRAM and CPU DRAM, using IPC handles or Shareable handles for ROCm.
@@ -159,7 +167,7 @@ The following video shows a normal run as described above, with the Target on th
 ![transfer-engine-running](../../image/transfer-engine-running.gif)
 
 ## Transfer Engine C/C++ API
-Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
+Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), `HipTransport` (for AMD GPUs), and `ShmTransport` (POSIX shm for same-host DRAM).
 
 For a complete C++ API reference, see [Transfer Engine C++ API Reference](../../api-reference/cpp/transfer-engine.md).
 
@@ -246,6 +254,7 @@ Value = {
 ```
 </details>
 
+(http-metadata-server)=
 ### HTTP Metadata Server
 
 The HTTP server should implement three following RESTful APIs, while the metadata server configured to `http://host:port/metadata` as an example:
@@ -446,7 +455,17 @@ To support the operational needs of P2P Store, Transfer Engine provides a Golang
 When compiling the project, enable the `-DWITH_P2P_STORE=ON` option to compile the P2P Store example program at the same time.
 
 ### Using Rust Interface
-Under `mooncake-transfer-engine/rust`, the Rust interface implementation of TransferEngine is provided, and a Rust version of the benchmark is implemented based on the interface, similar to [transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp). To compile the rust example, you need to install the Rust SDK and add `-DWITH_RUST_EXAMPLE=ON` in the cmake command.
+`mooncake-transfer-engine/rust` ships `transfer_engine_rust`, a library crate
+that wraps the Transfer Engine C API (`transfer_engine_c.h`). Hot-path types
+(`TransferRequest`, `BufferEntry`, `TransferStatus`) match the C ABI so
+`submit_transfer` is a zero-copy FFI call. A throughput benchmark example
+(`examples/transfer_engine_bench.rs`) mirrors
+[transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp).
+
+To build the library and example, install a Rust toolchain and libclang, then
+configure CMake with `-DWITH_RUST_EXAMPLE=ON`. See the
+[Transfer Engine Rust API](../../api-reference/rust/transfer-engine.md) for
+signatures and the crate `README.md` for Cargo-only builds.
 
 ## Advanced Runtime Options
 For advanced users, TransferEngine provides the following advanced runtime options, all of which can be passed in through **environment variables**.
@@ -459,16 +478,18 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_IB_PCI_RELAXED_ORDERING` Controls PCIe Relaxed Ordering (RO) for RDMA memory regions. `0`: disabled, `1`: enabled if supported by hardware (default), `2`: auto. Requires `ibv_reg_mr_iova2` (libibverbs ≥ 1.8); falls back to strict ordering if unavailable.
 - `MC_MLX5_QP_UDP_SPORTS` Comma-separated list of UDP source ports (0-65535) used to override the RoCEv2 UDP source port of each QP, for spreading traffic across different ECMP/LAG paths. QP at index *i* uses `list[i % size]`. Default empty (driver chooses). **Requires** an mlx5 NIC + RoCEv2, and the binary built with `-DUSE_MLX5DV=ON`. Recommend ports in the dynamic range 49152-65535. Example: `MC_MLX5_QP_UDP_SPORTS="49152,49153,49154,49155"`
 - `MC_MLX5_QP_LAG_PORT_BALANCE` Set to `1` or `true` to enable automatic LAG port balancing across bonded physical ports. QP at index *i* is pinned to port `(i % num_lag_ports) + 1`; the number of LAG ports is queried from hardware via `mlx5dv_query_device` at startup and printed in the device log. If the device is not in LAG mode the setting is a no-op. Default: disabled. **Requires** the binary built with `-DUSE_MLX5DV=ON`. Example: `MC_MLX5_QP_LAG_PORT_BALANCE=1`
-- `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
+- `MC_GID_INDEX` The GID index used per device instance. Unset (the default): automatic selection — the engine ranks the device's GID table and picks the best candidate, preferring an entry with a network device. Set to `0` or higher to pin a specific GID index. When `MC_GID_INDEX` is unset, `NCCL_IB_GID_INDEX` is read as a fallback. On nodes where several pods share one RDMA device the GID table holds entries for the interfaces of all pods on the node, so pinning a fixed index (for example 3) can select another pod's interface — leave it unset to let the engine pick per instance
 - `MC_PKEY_INDEX` The QP `pkey_index` (partition key table index) used when transitioning the QP to the INIT state. Valid range: 0 to 65535. Default value 0. Set this when the partition key required for your fabric is not at index 0 of the HCA's pkey table
 - `MC_MAX_CQE_PER_CTX` The CQ buffer size per device instance, default value 4096
 - `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 65536. **Note:** For versions prior to 0.3.7.post1, the default value is 256, and it cannot be manually set to 65536. The maximum supported value is 65535!
 - `MC_NUM_QP_PER_EP` The number of QPs per EndPoint, the more the number, the better the fine-grained I/O performance, default value 2
 - `MC_MAX_SGE` The maximum number of SGEs supported per QP, default value 4 (or the highest value supported by the platform)
 - `MC_MAX_WR` The maximum number of Work Request supported per QP, default value 256 (or the highest value supported by the platform). **On EFA this should be left unset:** the transport derives the depth from the libfabric provider's transmit queue (a per-device attribute, so no fixed value is right on every instance type), and an override that exceeds it is clamped. See the EFA transport page.
+- `MC_RDMA_SIGNAL_INTERVAL` How often classic RDMA posts a signaled WR. Default 1 (every WR produces a CQE, the historical path). Values greater than 1 post unsignaled WRs and complete them from a per-QP FIFO when a signaled CQE arrives; the last WR of each `ibv_post_send` chain is always signaled so the SQ cannot fill with only unsignaled WRs. Unsignaled WRs occupy SQ slots until that CQE, so large intervals may need a larger `MC_MAX_WR`. Interval `>1` also requires that failed and flushed WRs still generate CQEs without `IBV_SEND_SIGNALED` (InfiniBand RC). Providers that omit those CQEs must keep the default of 1. Invalid values are ignored. This option applies to classic `RdmaTransport` only.
 - `MC_MAX_INLINE` The maximum Inline write data volume (bytes) supported per QP, default value 64 (or the highest value supported by the platform)
 - `MC_MTU` The MTU length used per device instance, can be 512, 1024, 2048, 4096, default value 4096 (or the maximum length supported by the platform)
 - `MC_WORKERS_PER_CTX` The number of asynchronous worker threads corresponding to each device instance
+- `MC_RDMA_WORKER_IDLE_SPIN_US` How long (in microseconds) an RDMA worker thread keeps busy-polling after its device instance becomes idle before it sleeps, default value 100000 (100 ms), range 0-10000000. Each polling worker occupies a whole CPU core, so a lower value saves CPU when transfers are intermittent, at the cost of a thread wake-up when the next transfer arrives. 0 sleeps as soon as the device instance is idle
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine
 - `MC_TE_FILTERS` Restrict which RDMA NICs the engine discovers and uses, as a comma-separated allow-list of device names (e.g. `mlx5_bond_0,mlx5_bond_1`). Only the listed NICs are kept; all others are ignored. Unset (default) discovers all NICs. This is the **same env var and semantics as the legacy Transfer Engine's device whitelist** (see below), so a single variable scopes NICs across both engines. Useful on multi-NIC / multi-NUMA hosts to keep the engine (and its rail selection) off NICs that are not routable to the peer.
@@ -487,30 +508,136 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
 - `MC_TRACK_RDMA_POSTED_SLICES` Enable RDMA posted-slice tracking for timeout diagnostics. When enabled, CQ timeout logs include stuck transfer groups by peer NIC path, slice count, bytes, oldest post age, and sample addresses. This adds synchronization on the RDMA post and poll hot paths, so it is disabled by default and should be enabled only while diagnosing stuck completions.
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
-- `MC_MAX_CONCURRENT_REG_MR` Cap on how many buffers `registerLocalMemoryBatch` registers concurrently (EFA transport). The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
-- `MC_EFA_NIC_SELECTION` Which NICs the EFA transport registers a buffer on. `all` (the default) registers every buffer on every NIC. `local` restricts **device** memory to the NICs the topology reports as closest to that GPU, which on p5.48xlarge is the 4 EFA devices sharing the GPU's PCIe root complex. Because EFA charges device-memory registration in proportion to the device bytes already registered on the same libfabric domain, narrowing the NIC set cuts registration time by close to the fan-out ratio. Set it when registering many GPU buffers is a startup bottleneck; it is opt-in because fewer NICs can serve a transfer touching that buffer, so a job whose working set sits behind a single GPU is capped at that rail group's bandwidth rather than the node's. Host memory is unaffected. Combine with `MC_MAX_CONCURRENT_REG_MR`, which bounds a different variable: this reduces the cost per registration, that one reduces how many run at once.
+- `MC_MAX_CONCURRENT_REG_MR` Cap how many buffers the EFA and RDMA transports process concurrently in `registerLocalMemoryBatch` and `unregisterLocalMemoryBatch`. The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
+- `MC_EFA_NIC_SELECTION` Which NICs the EFA transport registers a buffer on. `local` (the default) restricts **device** memory to the NICs the topology reports as closest to that GPU — 2 EFA devices per GPU on p6-b300.48xlarge, 4 on p5.48xlarge. Those are the NICs `Topology::selectDevice()` picks for that buffer on every first attempt, so narrowing the registration does not change steady-state bandwidth, while EFA charges device-memory registration in proportion to the device bytes already registered on the same libfabric domain, so it cuts registration time by close to the fan-out ratio (p6-b300.48xlarge with vLLM TP8: slowest rank 274 s → 9 s). `all` registers every buffer on every NIC; set it only if a device buffer must be able to retry over a non-local NIC. Host memory is unaffected. Combine with `MC_MAX_CONCURRENT_REG_MR`, which bounds a different variable: this reduces the cost per registration, that one reduces how many run at once.
 - `MC_EFA_CQ_THREADS` Cap on the number of CQ polling threads in the EFA transport, default value 1 (which already reaches ~99.9% of peak throughput). Pollers busy-wait, so each extra thread costs a full core. Set 0 to lift the cap (one poller per EFA device). Values above the device count are ignored
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
 - `MC_FORCE_MUSA` (MUSA only) Force the `musa` GPU IPC transport even when RDMA devices are installed. `MC_FORCE_MNNVL` remains accepted as a compatibility alias in MUSA builds.
 - `MC_INTRA_NVLINK` Enable intra-node NVLINK transport, and cannot be used together with MC_FORCE_MNNVL.
+- `MC_USE_NVLINK_IPC` How GPU memory is shared over NVLink. `0` uses fabric (MNNVL) memory where every visible GPU supports it; any other value uses CUDA IPC. Unset keeps each component's default: the NVLink transport and HOST_NUMA allocations use fabric memory when supported, while the Device API P2P transport, Mooncake PG and the HIP transport use IPC.
 - `MC_MUSA_IPC_OPEN_DEVICE` (`musa` transport only) Select the device context used to open imported IPC memory. The default `current` preserves the caller's context; `metadata` is an opt-in that uses the runtime-visible logical ordinal advertised by the remote buffer. With `metadata`, every peer must map each logical ordinal to the same physical GPU. `MTHREADS_VISIBLE_DEVICES` is a container-toolkit setting and is not used by Mooncake to infer this mapping.
 - `MC_MUSA_COPY_API` (`musa` transport only) Select `auto` (default), `transfer_batch`, or `default`. On MUSA SDK 5.2 or newer, `auto` uses `muMemoryTransferBatchAsync` when every copy in a batch meets `MC_MUSA_TRANSFER_BATCH_MIN_BYTES`; `default` uses per-slice CUDA-compatible copies.
 - `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` (`musa` transport only) Minimum copy size selected by `MC_MUSA_COPY_API=auto`. The default is 1048576 (1 MiB).
-- `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
+- `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed. Takes precedence over `MC_FORCE_SHM`.
+- `MC_FORCE_SHM` Opt in to POSIX SHM (or hugetlbfs-backed SHM via `allocateSharedMemory(..., SharedMemoryOptions)`) for same-host DRAM copies of buffers allocated with `allocateSharedMemory`. Default off. With `-DENABLE_MULTI_PROTOCOL=ON`, SHM is installed alongside RDMA/TCP (`rdma,shm` / `tcp,shm`). Without multi-protocol, SHM is the only transport (skip RDMA/TCP auto-install), like `MC_FORCE_TCP`. `MC_FORCE_TCP` is handled first in `init` and returns before SHM install. Alternative: `installTransport("shm")`, which logs a WARNING if it overwrites a non-empty rdma/tcp protocol. Objects are created `0600` (same UID). `freeSharedMemory` unlinks the object; `SIGKILL` leftovers in `/dev/shm` or on the hugetlbfs mount are not reaped (hugetlbfs files continue to reserve hugepages — do not wipe all `mooncake_*` on start). A peer `free`+`allocate` that reuses the same virtual address is remapped after the name disappears; a new address still needs a fresh `BufferDesc` (see `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`).
 - `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
 - `MC_TE_FILTERS` Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
-- `WITH_NVIDIA_PEERMEM` When set to `1`, `ON`, or `TRUE`, Mooncake uses `ibv_reg_mr()` directly for GPU memory registration (requires the `nvidia-peermem` kernel module). By default (unset or `0`), Mooncake uses the DMA-BUF path which does not require `nvidia-peermem`.
+- `WITH_NVIDIA_PEERMEM` Set to `1`, `ON`, or `TRUE` to register GPU memory with `ibv_reg_mr()` directly (requires the `nvidia-peermem` kernel module), or to `0` to use the DMA-BUF path without it. When unset, Mooncake uses `ibv_reg_mr()` if a peer-memory module (`nvidia-peermem` or `nv_peer_mem`) is loaded and DMA-BUF otherwise. `MC_RDMA_DATA_DIRECT=1` takes precedence for the classic RDMA transport.
+- `MC_RDMA_DATA_DIRECT` Set to `1` to enable NVIDIA Data Direct for CUDA device memory in the classic RDMA transport (default: disabled). Overrides `WITH_NVIDIA_PEERMEM`. Requires a [supported platform](https://docs.nvidia.com/multi-node-nvlink-systems/grace-blackwell-cx8-gpudirect-rdma-guide/platform_software_and_configuration.html), compatible runtime `libmlx5`, and compatible NICs selected with `MC_TE_FILTERS` or custom topology. Unsupported configurations fail without fallback.
+- `MC_RDMA_DATA_DIRECT_PAIRING` Set to `1` (with `MC_RDMA_DATA_DIRECT=1`) to pair each GPU with the NICs whose Data Direct function shares the GPU's PCI root and to keep all other NICs out of that GPU's HCA list. Fail-closed: topology discovery is rejected when any NIC reports no Data Direct function or any GPU has no paired NIC, instead of falling back to PCIe distance (default: disabled).
+- `MC_HIP_KFD_PIN_FIX` ROCm only. amdgpu drivers before amdgpu-dkms 6.19.14 charge a NIC's dma-buf pin of HIP device memory to the free VRAM that `hipMemGetInfo` reports and new allocations draw from, so registering a large buffer can leave too little for kernel loads. With `1` (the default), the first HIP registration probes the driver by pinning one page of a private 64 MiB allocation through dma-buf, and if it miscounts, Mooncake holds one page-sized `ibv_reg_mr()` MR per registered allocation (needs the amdgpu peer-memory client) to keep free VRAM exact. `force` holds them without probing; `0` disables the workaround. Cost: each registered HIP allocation takes one extra MR, always on the first NIC that accepts it rather than spread across NICs, until its last registered buffer is released. A few large KV allocations add a few entries, but many distinct `hipMalloc` allocations can fill a small MR table (for example on Ionic NICs); once that `ibv_reg_mr()` fails, anchors are turned off for the process and the double charge returns.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
-- `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
+- `MC_TCP_ENABLE_CONNECTION_POOL` Reuse TCP connections across transfers to the same peer. Enabled by default: instead of opening a fresh socket per transfer, work for one peer runs over a bounded set of connection lanes (`MC_TCP_LANES_PER_PEER`, default 4), which keeps high-concurrency TCP traffic from exhausting the initiator's ephemeral port range. A lane's socket is reused only after a cleanly completed exchange; a connection whose protocol stream went dirty is closed and re-established. Set to `0` (or `false`/`no`) to restore one connection per transfer.
+- `MC_TCP_MAX_QUEUED_BYTES_PER_PEER` Optional byte limit for work waiting in each TCP connection group's transfer queue or pending admission. Active lanes are excluded because their count is already bounded by `MC_TCP_LANES_PER_PEER`. Endpoint refresh may keep retiring groups alive alongside the current group, so this is not a single aggregate limit across endpoint generations. Exceeding the limit fails the new transfer with `QUEUE_FULL`; confirm the caller's retry and failure behavior before enabling it, because frameworks may escalate this terminal transfer failure to a request or peer-session failure. Admission is per transfer item rather than atomic across a multi-request batch: a later rejection does not roll back earlier admitted items. Callers that use synchronous batch APIs must not treat a nonzero return as proof that no destination bytes changed or that every source buffer is immediately reusable. Unset or `0` disables the byte limit.
 - `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
 - `MC_TCP_PROTO` When set to `1`, TCP initiators use the legacy unacknowledged framing even against servers that support acknowledged framing (protocol v2). Under v2 (the default against v2-capable servers), a WRITE completes only after the receiver confirms the payload has been applied to destination memory, and server-side rejections surface as failed transfers instead of silent data loss. Use this variable only as a rollback escape hatch during mixed-version upgrades.
+- `MC_TE_METRIC` Enable Transfer Engine metrics (`1`, `true`, `yes`, `on`). Disabled by default. Turns on the periodic latency/throughput log line and the [Prometheus metrics](#metrics).
+- `MC_TE_METRIC_INTERVAL_SECONDS` Interval in seconds for the periodic metrics log line. Default value 5. Must be positive.
+- `MC_TE_METRIC_HTTP_PORT` Port for the metrics HTTP server. Default value 0, which disables the server.
+- `MC_TE_METRIC_HTTP_HOST` Bind address for the metrics HTTP server. Default value `0.0.0.0`.
+- `MC_TE_METRIC_HTTP_THREADS` Number of metrics HTTP server threads. Default value 1.
 
 ## C++ API Reference
 
 For the complete C++ API reference, see [Transfer Engine C++ API](../../api-reference/cpp/index).
+
+(metrics)=
+## Metrics
+
+The Classic Transfer Engine can export Prometheus metrics on the same
+endpoints, in the same formats, as TENT:
+
+| Endpoint | Content |
+|----------|---------|
+| `/metrics` | Prometheus text format |
+| `/metrics/summary` | One-line summary |
+| `/metrics/json` | JSON |
+| `/health` | `OK` |
+
+The exporter is part of `WITH_METRICS` (on by default) and ships in the
+release wheels. Nothing is collected or served until you set `MC_TE_METRIC=1`
+to collect and `MC_TE_METRIC_HTTP_PORT` to serve. `USE_TENT` is not required.
+
+The metrics follow TENT's read/write split, units and buckets, under a
+`mooncake_te_` prefix:
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `mooncake_te_{read,write}_bytes_total` | Counter | Bytes transferred by completed tasks |
+| `mooncake_te_{read,write}_requests_total` | Counter | Tasks that completed, failed, were canceled or timed out |
+| `mooncake_te_{read,write}_failures_total` | Counter | Tasks that failed or were canceled |
+| `mooncake_te_{read,write}_timeouts_total` | Counter | Tasks that timed out (separate from failures) |
+| `mooncake_te_{read,write}_latency_us` | Histogram | Latency of completed tasks, in microseconds |
+| `mooncake_te_{read,write}_size_bytes` | Histogram | Size of completed tasks, in bytes |
+
+### What is recorded
+
+The metrics count engine tasks (one `TransferRequest` or one grouped scatter
+task). An eligible task is recorded once when the shared status-query or
+batch-free path first observes it `COMPLETED`, `FAILED`, `CANCELED` or
+`TIMEOUT`.
+Timeouts increment requests and timeouts, but not failures. A later completion
+does not change the recorded outcome or add successful bytes or latency.
+A timeout does not stop in-flight work or make transfer buffers safe to reclaim.
+Queries may come from application task or batch polling,
+`freeBatchID()`, or the deferred batch cleanup worker. Successful-task latency
+runs from submission to that observation, so it includes observation delay,
+potentially including the cleanup worker's 100 ms wait between passes. With
+`USE_EVENT_DRIVEN_COMPLETION`, the completion callback saves the completion
+timestamp and outcome, and latency ends at that timestamp whenever the
+callback has already stamped the task, whether a poll or a free records it.
+The task is counted once a later status poll, `freeBatchID()` call, or
+cleanup-worker pass observes it finished, not when the callback runs.
+Counting does not require the batch to be freed: a free attempt records the
+finished tasks it walks even if another task or an unwinding callback keeps
+the batch busy.
+
+Not every submitted task is recorded. A task is missed if no status call,
+`freeBatchID()` call, or cleanup pass sees it finish, or if the transport
+refuses it before creating any slice. Cleanup may record tasks after the
+application stops polling, but it does not guarantee coverage of every
+abandoned task. Failure ratios cover recorded tasks only. Include both
+failures and timeouts when computing the overall unsuccessful-task ratio.
+
+### Caveats
+
+- If the port cannot be bound, the error is logged and metrics are still
+  collected in-process. The bind is not retried.
+- Each shared object that embeds `libtransfer_engine` has its own registry. If
+  a process loads both `mooncake.engine` and `mooncake.store`, only the first
+  to start serves the port.
+
+### Example
+
+With [`transfer_engine_bench`](#example-transfer-engine-bench) over TCP and an
+[HTTP metadata server](#http-metadata-server) on `:8080`:
+
+```bash
+META=http://127.0.0.1:8080/metadata
+
+# Target
+MC_TE_METRIC=1 ./transfer_engine_bench --mode=target --protocol=tcp \
+  --metadata_server=$META --local_server_name=127.0.0.1:12345
+
+# Initiator
+MC_TE_METRIC=1 MC_TE_METRIC_HTTP_PORT=9201 \
+  ./transfer_engine_bench --mode=initiator --protocol=tcp \
+    --metadata_server=$META --local_server_name=127.0.0.1:12346 \
+    --segment_id=127.0.0.1:12345 --operation=read --duration=30
+
+# While the initiator runs
+curl -s http://127.0.0.1:9201/metrics | grep '^mooncake_te_read_'
+```
+
+Per-transfer throughput over a window (the latency sum is in microseconds):
+
+```promql
+increase(mooncake_te_read_size_bytes_sum[2m])
+  / (increase(mooncake_te_read_latency_us_sum[2m]) / 1e6)
+```
 
 ## Supported Protocols
 
@@ -519,41 +646,6 @@ For the complete C++ API reference, see [Transfer Engine C++ API](../../api-refe
 
 ../../getting_started/supported-protocols
 :::
-
-## EFA Transport (AWS)
-
-:::{toctree}
-:maxdepth: 1
-
-efa_transport
-:::
-
-## Ascend Transport Component
-
-:::{toctree}
-:maxdepth: 1
-
-ascend_direct_transport
-ascend_transport
-heterogeneous_ascend
-:::
-
-## Sunrise Link Transport Component
-
-:::{toctree}
-:maxdepth: 1
-
-kunpeng_ub_transport
-sunrise_link_transport
-:::
-
-## MPComm Transport Component
-
-::::{toctree}
-:maxdepth: 1
-
-mpcomm_transport
-::::
 
 ## Benchmark and Tuning Guide
 

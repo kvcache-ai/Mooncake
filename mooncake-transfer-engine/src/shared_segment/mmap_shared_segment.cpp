@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <glog/logging.h>
 
 #include <cerrno>
-#include <cstdio>
+#include <cstdint>
 #include <cstring>
-#include <fcntl.h>
-#include <random>
 #include <string>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
+#include "shared_segment/host_memfd.h"
 #include "shared_segment_internal.h"
 
 #if defined(USE_ASCEND_DIRECT)
@@ -33,84 +35,6 @@
 namespace mooncake {
 namespace {
 constexpr uint16_t kMmapBackendId = 3;
-constexpr uint64_t kFallbackPageSize = 4096;
-// Matches the common PMD THP size when sysfs is unavailable.
-constexpr uint64_t kFallbackHugePageSize = 2ULL * 1024 * 1024;
-constexpr const char* kThpPmdSizePath =
-    "/sys/kernel/mm/transparent_hugepage/hpage_pmd_size";
-constexpr const char* kShmemThpEnabledPath =
-    "/sys/kernel/mm/transparent_hugepage/shmem_enabled";
-
-uint64_t BasePageSize() {
-    long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) {
-        return kFallbackPageSize;
-    }
-    return static_cast<uint64_t>(page);
-}
-
-// mmap uses shm_open (tmpfs/shmem), so only shmem THP matters. Sysfs looks like
-// "always within_size [advise] never deny force"; the active mode is bracketed.
-bool ShmemThpEnabled() {
-    static const bool kEnabled = []() -> bool {
-        FILE* fp = std::fopen(kShmemThpEnabledPath, "r");
-        if (fp == nullptr) {
-            return false;
-        }
-        char buf[256];
-        const char* line = std::fgets(buf, sizeof(buf), fp);
-        std::fclose(fp);
-        if (line == nullptr) {
-            return false;
-        }
-        const char* open = std::strchr(buf, '[');
-        if (open == nullptr) {
-            return false;
-        }
-        const char* close = std::strchr(open + 1, ']');
-        if (close == nullptr || close <= open + 1) {
-            return false;
-        }
-        const std::string mode(open + 1, close);
-        return mode != "never" && mode != "deny";
-    }();
-    return kEnabled;
-}
-
-uint64_t HugePageSize() {
-    static const uint64_t kSize = []() -> uint64_t {
-        FILE* fp = std::fopen(kThpPmdSizePath, "r");
-        if (fp != nullptr) {
-            unsigned long long value = 0;
-            const int matched = std::fscanf(fp, "%llu", &value);
-            std::fclose(fp);
-            if (matched == 1 && value > 0 && (value & (value - 1)) == 0) {
-                return static_cast<uint64_t>(value);
-            }
-        }
-        return kFallbackHugePageSize;
-    }();
-    return kSize;
-}
-
-// Hint only when shmem THP is on; failure must not abort the segment.
-void AdviseTransparentHugePages(void* addr, uint64_t size) {
-    if (!ShmemThpEnabled()) {
-        return;
-    }
-#ifdef MADV_HUGEPAGE
-    if (addr == nullptr || size == 0) {
-        return;
-    }
-    if (madvise(addr, size, MADV_HUGEPAGE) != 0) {
-        VLOG(1) << "madvise(MADV_HUGEPAGE) failed for shared segment mmap: "
-                << std::strerror(errno);
-    }
-#else
-    (void)addr;
-    (void)size;
-#endif
-}
 
 Status HostRegister(void* addr, uint64_t size, int32_t device_id,
                     void** ascend_dev_ptr) {
@@ -157,28 +81,15 @@ void HostUnregister(void* addr, void* /*ascend_dev_ptr*/) {
 #endif
 }
 
-// POSIX shm names are limited to NAME_MAX and must start with a slash. The pid
-// separates owners that live on one host at the same time; the random suffix
-// covers pid reuse after a crash left a name behind.
-std::string MakeShmName() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    char name[48];
-    std::snprintf(name, sizeof(name), "/mcss_%d_%016llx",
-                  static_cast<int>(getpid()),
-                  static_cast<unsigned long long>(rng()));
-    return name;
-}
-
 class MmapSharedSegmentBackend : public SharedSegmentBackend {
    public:
     ~MmapSharedSegmentBackend() override { Release(); }
 
     uint64_t Granularity(
         const SharedSegmentOptions& /*options*/) const override {
-        if (ShmemThpEnabled()) {
-            return HugePageSize();
-        }
-        return BasePageSize();
+        // Align length to the THP PMD size so MADV_HUGEPAGE can use 2MiB
+        // pages. 4KiB fallback still accepts a PMD-aligned length.
+        return host_memfd::Granularity();
     }
 
     Status CreateOwner(uint64_t size, const SharedSegmentOptions& options,
@@ -198,16 +109,13 @@ class MmapSharedSegmentBackend : public SharedSegmentBackend {
     }
 
    private:
-    Status MapShared(const std::string& shm_name, uint64_t size, bool create,
-                     void*& addr);
     Status RegisterMapped(const SharedSegmentOptions& options);
     void Release();
 
     void* addr_ = nullptr;
     uint64_t size_ = 0;
+    int memfd_ = -1;
     bool registered_ = false;
-    bool unlink_on_release_ = false;
-    std::string shm_name_;
     void* ascend_dev_ptr_ = nullptr;
 };
 
@@ -225,61 +133,28 @@ Status MmapSharedSegmentBackend::RegisterMapped(
     return Status::OK();
 }
 
-Status MmapSharedSegmentBackend::MapShared(const std::string& shm_name,
-                                           uint64_t size, bool create,
-                                           void*& addr) {
-    int flags = create ? (O_CREAT | O_EXCL | O_RDWR) : O_RDWR;
-    int fd = shm_open(shm_name.c_str(), flags, 0600);
-    if (fd < 0) {
-        return Status::Memory(std::string("shm_open failed: ") +
-                              std::strerror(errno));
-    }
-    if (create && ftruncate(fd, static_cast<off_t>(size)) != 0) {
-        const int err = errno;
-        close(fd);
-        shm_unlink(shm_name.c_str());
-        return Status::Memory(std::string("ftruncate failed: ") +
-                              std::strerror(err));
-    }
-
-    int map_flags = MAP_SHARED;
-    void* hint = addr;
-    if (hint != nullptr) {
-        map_flags |= MAP_FIXED;
-    }
-    void* mapped = mmap(hint, size, PROT_READ | PROT_WRITE, map_flags, fd, 0);
-    const int map_err = errno;
-    close(fd);
-    if (mapped == MAP_FAILED) {
-        if (create) {
-            shm_unlink(shm_name.c_str());
-        }
-        return Status::Memory(std::string("mmap failed: ") +
-                              std::strerror(map_err));
-    }
-    AdviseTransparentHugePages(mapped, size);
-    addr = mapped;
-    return Status::OK();
-}
-
 Status MmapSharedSegmentBackend::CreateOwner(
     uint64_t size, const SharedSegmentOptions& options, uintptr_t& base_addr,
     std::vector<uint8_t>& handle) {
-    const std::string name = MakeShmName();
+    int fd = -1;
     void* mapped = nullptr;
-    auto status = MapShared(name, size, /*create=*/true, mapped);
-    if (!status.ok()) {
-        return status;
+    std::string error;
+    if (!host_memfd::Create(size, fd, mapped, error)) {
+        return Status::Memory(error);
     }
+    LOG(INFO) << "Shared segment mmap: unnamed memfd + THP hint (no HugeTLB), "
+              << "size " << size << ", shmem_thp="
+              << (host_memfd::ShmemThpEnabled() ? "on" : "off");
+
     addr_ = mapped;
     size_ = size;
-    unlink_on_release_ = true;
-    shm_name_ = name;
-    status = RegisterMapped(options);
+    memfd_ = fd;
+    auto status = RegisterMapped(options);
     if (!status.ok()) {
         return status;
     }
     base_addr = reinterpret_cast<uintptr_t>(addr_);
+    const std::string name = host_memfd::ExportHandle(memfd_);
     handle.assign(name.begin(), name.end());
     return Status::OK();
 }
@@ -288,7 +163,7 @@ Status MmapSharedSegmentBackend::ReserveLocal(
     uint64_t size, const SharedSegmentOptions& /*options*/,
     uintptr_t& base_addr) {
     void* reserved =
-        mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        host_memfd::ReserveAlignedWindow(size, host_memfd::Granularity());
     if (reserved == MAP_FAILED) {
         return Status::Memory(std::string("mmap reserve failed: ") +
                               std::strerror(errno));
@@ -315,19 +190,16 @@ Status MmapSharedSegmentBackend::ImportAndMap(
             "Shared segment owner handle has an unexpected length");
     }
     const std::string name(handle.begin(), handle.end());
-    if (name.empty() || name[0] != '/') {
+    if (!host_memfd::IsHandle(name)) {
         return Status::InvalidArgument(
-            "Shared segment owner handle is not a POSIX shm name");
+            "Shared segment owner handle is not a memfd /proc/<pid>/fd path");
     }
 
-    void* mapped = addr_;
-    auto status = MapShared(name, size, /*create=*/false, mapped);
-    if (!status.ok()) {
-        return status;
+    std::string error;
+    if (!host_memfd::Import(name, size, addr_, error)) {
+        return Status::Memory("Shared segment import failed: " + error);
     }
-    addr_ = mapped;
-    shm_name_ = name;
-    status = RegisterMapped(options);
+    auto status = RegisterMapped(options);
     if (!status.ok()) {
         return status;
     }
@@ -344,18 +216,17 @@ void MmapSharedSegmentBackend::Release() {
         (void)munmap(addr_, size_);
         addr_ = nullptr;
     }
-    if (unlink_on_release_ && !shm_name_.empty()) {
-        (void)shm_unlink(shm_name_.c_str());
-        unlink_on_release_ = false;
+    if (memfd_ >= 0) {
+        close(memfd_);
+        memfd_ = -1;
     }
-    shm_name_.clear();
     size_ = 0;
 }
 }  // namespace
 
 std::unique_ptr<SharedSegmentBackend> CreateMmapSharedSegmentBackend() {
-    // POSIX shm + mmap is always available. HostRegister is optional and is
-    // checked when SharedSegmentOptions::host_register is set.
+    // Anonymous memfd + mmap is always available. HostRegister is optional and
+    // is checked when SharedSegmentOptions::host_register is set.
     return std::make_unique<MmapSharedSegmentBackend>();
 }
 

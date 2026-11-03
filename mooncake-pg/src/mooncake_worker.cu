@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <type_traits>
+#include <transport/device/device_ops.cuh>
 
 #ifdef __MUSA__
 #include <musa_bf16.h>
@@ -20,7 +21,9 @@ __global__ void enqueueTaskKernel(int opType, size_t dataSize,
                                   uint64_t submitSequence,
                                   int32_t* failedRanksHint,
                                   bool resetFailedRanksHint, void* meta,
-                                  Task* tasks, size_t taskId) {
+                                  bool* activeRanks, int32_t* activeRanksMirror,
+                                  size_t activeRanksCount, Task* tasks,
+                                  size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
     tasks[taskId].dataSize = dataSize;
@@ -38,6 +41,20 @@ __global__ void enqueueTaskKernel(int opType, size_t dataSize,
     // Spin-wait until CPU proxy sets DONE
     while (tasks[taskId].active) {
         __threadfence_system();
+    }
+
+    const uint64_t mirrorUpdateGeneration = device::mc_ld_acquire_u64(
+        &tasks[taskId].activeRanksMirrorRequestGeneration);
+    const uint64_t appliedMirrorUpdateGeneration = device::mc_ld_acquire_u64(
+        &tasks[taskId].activeRanksMirrorAppliedGeneration);
+    if (activeRanksMirror &&
+        mirrorUpdateGeneration != appliedMirrorUpdateGeneration) {
+        for (size_t rank = 0; rank < activeRanksCount; ++rank) {
+            activeRanksMirror[rank] = activeRanks[rank] ? 1 : 0;
+        }
+        device::mc_st_release_u64(
+            &tasks[taskId].activeRanksMirrorAppliedGeneration,
+            mirrorUpdateGeneration);
     }
 }
 
@@ -137,11 +154,14 @@ namespace mooncake {
 void launchEnqueueTaskKernel(int opType, size_t dataSize, int64_t broadcastRoot,
                              int bufferOffset, uint64_t submitSequence,
                              int32_t* failedRanksHint,
-                             bool resetFailedRanksHint, void* meta, Task* tasks,
+                             bool resetFailedRanksHint, void* meta,
+                             bool* activeRanks, int32_t* activeRanksMirror,
+                             size_t activeRanksCount, Task* tasks,
                              size_t taskId, cudaStream_t stream) {
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
         opType, dataSize, broadcastRoot, bufferOffset, submitSequence,
-        failedRanksHint, resetFailedRanksHint, meta, tasks, taskId);
+        failedRanksHint, resetFailedRanksHint, meta, activeRanks,
+        activeRanksMirror, activeRanksCount, tasks, taskId);
 }
 
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \

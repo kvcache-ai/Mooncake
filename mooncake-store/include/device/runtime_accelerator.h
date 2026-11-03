@@ -23,6 +23,10 @@ class RuntimeAccelerator {
 
     bool CopyFromHost(void* dst, const void* src, size_t size) const;
 
+    // Copy between two pointers that may each be host or device resident;
+    // falls back to memcpy when neither side is on a known accelerator.
+    bool CopyAuto(void* dst, const void* src, size_t size) const;
+
    private:
     std::vector<const AcceleratorDevice*> devices_;
 };

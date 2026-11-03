@@ -15,16 +15,18 @@
 #ifndef TENT_RAIL_MONITOR_H
 #define TENT_RAIL_MONITOR_H
 
+#include <cstdint>
+#include <mutex>
+
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
 
 namespace mooncake {
 namespace tent {
-// Not thread-safe. Each RDMA worker owns its own RailMonitor via
-// WorkerContext::rails, so markFailed / markRecovered / available / load
-// all execute on a single worker thread. Do not share across threads
-// without adding external synchronization.
+// Each RDMA worker owns its own RailMonitor via WorkerContext::rails. Endpoint
+// teardown may cancel probes from the monitor thread, so rail state is guarded
+// for that lifecycle path.
 class RailMonitor {
     const static size_t kMaxNuma = 16;
 
@@ -41,6 +43,8 @@ class RailMonitor {
         "transports/rdma/rail_error_window_secs";
     static constexpr const char *kCfgCooldownSecs =
         "transports/rdma/rail_cooldown_secs";
+    static constexpr const char *kCfgProbeIntervalSecs =
+        "transports/rdma/rail_probe_interval_secs";
 
    public:
     RailMonitor() = default;
@@ -51,25 +55,66 @@ class RailMonitor {
     RailMonitor &operator=(const RailMonitor &) = delete;
 
    public:
+    // The shared topology references keep segment snapshots alive while rail
+    // failure handling uses their derived mappings.
     // rail_topo_json: optional JSON string describing rail topology.
     // conf: optional Config pointer; when non-null, overrides the default
     //   error_threshold / error_window_secs / cooldown_secs values via
     //   kCfgErrorThreshold / kCfgErrorWindowSecs / kCfgCooldownSecs.
-    Status load(const Topology *local, const Topology *remote,
+    // A later call with the same NIC/memory layout only refreshes the pins
+    // (segment COW snapshots); it does not rebuild rail_states_ or reprint
+    // the config banner.
+    Status load(std::shared_ptr<const Topology> local,
+                std::shared_ptr<const Topology> remote,
                 const std::string &rail_topo_json = "",
                 const Config *conf = nullptr);
 
-    bool ready() { return ready_; }
+    bool ready() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return ready_;
+    }
 
-    bool available(int local_nic, int remote_nic);
+    bool isAvailable(int local_nic, int remote_nic) const;
 
-    void markFailed(int local_nic, int remote_nic);
+    // Static compatibility only: a configured pair must reach an RDMA NIC in
+    // the target memory entry. Paused rails remain candidates so worker-side
+    // admit() can probe recovery; this query never arms or consumes a probe.
+    // Same-host same-NIC loopback remains legal, as in worker fallback.
+    uint64_t localDeviceMask(const Topology::MemEntry &remote_memory,
+                             bool same_machine = false) const;
 
-    void markRecovered(int local_nic, int remote_nic);
+    // Mutating admit: the ONLY path that arms a probe/trial. Returns true when
+    // a transfer may use this rail -- Closed (no-op), or an exploratory probe /
+    // Half-Open trial. Sets probe_in_flight for paused rails so a second probe
+    // cannot race the first while it is on the wire. Callers that select a rail
+    // but fail to post must cancelProbe() with the returned token to clear
+    // only the probe it admitted. The output is always written: healthy rails
+    // and rejected admissions return token 0; admitted probes/trials return a
+    // nonzero token.
+    //
+    // The check-then-set is serialized with teardown cancellation by mutex_.
+    bool admit(int local_nic, int remote_nic, uint64_t &probe_token);
+
+    // Pass the token returned by admit() for a probe/trial completion; pass 0
+    // for an ordinary transfer completion.
+    void markFailed(int local_nic, int remote_nic, uint64_t probe_token);
+
+    // Uses the same token contract as markFailed().
+    void markRecovered(int local_nic, int remote_nic, uint64_t probe_token);
+
+    void cancelProbe(int local_nic, int remote_nic, uint64_t probe_token);
 
     int findBestRemoteDevice(int local_nic, int remote_numa);
 
-    const Topology *remote() { return remote_; }
+    const Topology *local() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return local_.get();
+    }
+
+    const Topology *remote() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return remote_.get();
+    }
 
    private:
     Status loadFromJson(const std::string &rail_topo_json);
@@ -78,10 +123,15 @@ class RailMonitor {
 
     void updateBestMapping();
 
+    bool isAvailableUnlocked(int local_nic, int remote_nic) const;
+
+    uint64_t allocateProbeToken();
+
    private:
+    mutable std::mutex mutex_;
     bool ready_{false};
-    const Topology *local_{nullptr};
-    const Topology *remote_{nullptr};
+    std::shared_ptr<const Topology> local_;
+    std::shared_ptr<const Topology> remote_;
 
     struct PairHash {
         std::size_t operator()(const std::pair<int, int> &p) const noexcept {
@@ -95,20 +145,27 @@ class RailMonitor {
         std::chrono::seconds cooldown{0};
         std::chrono::steady_clock::time_point last_error{};
         std::chrono::steady_clock::time_point resume_time{};
+        std::chrono::steady_clock::time_point last_probe_time{};
+        bool half_open = false;
+        bool probe_in_flight = false;
+        uint64_t active_probe_token = 0;
 
-        // Derived: a rail is paused iff a resume_time has been armed.
         bool paused() const {
             return resume_time != std::chrono::steady_clock::time_point{};
         }
     };
 
     std::unordered_map<std::pair<int, int>, RailState, PairHash> rail_states_;
+    // Tokens are monitor-wide so a topology reload cannot make an old slice's
+    // token collide with a new probe on a rebuilt RailState.
+    uint64_t next_probe_token_{1};
     std::unordered_map<int, int> direct_rails_;  // keep static after loaded
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
 
     int error_threshold_ = 3;
     std::chrono::seconds error_window_{10};
     std::chrono::seconds cooldown_{30};
+    std::chrono::seconds probe_interval_{1};
 };
 
 }  // namespace tent

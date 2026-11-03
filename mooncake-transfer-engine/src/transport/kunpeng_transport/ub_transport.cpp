@@ -31,7 +31,10 @@ UbTransport::~UbTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
+    // Contexts hold URMA resources and need the module alive; release them
+    // before pairing the urma_init() done in init().
     context_list_.clear();
+    uninit(this);
 }
 
 int UbTransport::install(std::string& local_server_name,
@@ -342,9 +345,13 @@ Status UbTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the preceding byte updates.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = FAILED;
@@ -498,6 +505,7 @@ int UbTransport::init(UbTransport* transport) {
             LOG(ERROR) << "UrmaContext init failed";
             return -1;
         }
+        transport->urma_initialized_ = true;
     } else if (transport->endpoint_type_ == OBMM_ENDPOINT) {
         LOG(ERROR) << "ObmmContext not support now.";
         return -1;
@@ -510,6 +518,10 @@ int UbTransport::init(UbTransport* transport) {
 
 void UbTransport::uninit(UbTransport* transport) {
     if (transport->endpoint_type_ == URMA_ENDPOINT) {
+        // Idempotent: install() failure paths and the destructor both land
+        // here, while urma_init() happens exactly once per transport.
+        if (!transport->urma_initialized_) return;
+        transport->urma_initialized_ = false;
         if (!UrmaContext::uninit()) {
             LOG(ERROR) << "UrmaContext uninit failed";
         }

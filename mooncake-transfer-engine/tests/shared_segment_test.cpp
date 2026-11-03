@@ -15,10 +15,19 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
 #include "shared_segment/shared_segment.h"
 #include "shared_segment_internal.h"
+
+#if defined(USE_ASCEND_DIRECT)
+#include <acl/acl.h>
+#endif
 
 namespace mooncake {
 namespace {
@@ -239,9 +248,7 @@ TEST(SharedSegmentMmapTest, TwoRanksSharePagesInOneProcess) {
     std::shared_ptr<SharedSegment> peer;
     auto status = SharedSegment::Create("mmap-tp", kSegmentSize, owner_opts,
                                         owner, owner_blob);
-    if (!status.ok()) {
-        GTEST_SKIP() << "HostRegister unavailable: " << status.ToString();
-    }
+    ASSERT_TRUE(status.ok()) << status.ToString();
     ASSERT_TRUE(SharedSegment::Create("mmap-tp", kSegmentSize, peer_opts, peer,
                                       peer_blob)
                     .ok());
@@ -256,7 +263,7 @@ TEST(SharedSegmentMmapTest, TwoRanksSharePagesInOneProcess) {
     owner_bytes[4095] = 0xCD;
     EXPECT_EQ(peer_bytes[0], 0xAB);
     EXPECT_EQ(peer_bytes[4095], 0xCD);
-    // Rank-local VAs need not match.
+    // Rank-local virtual addresses need not match.
     EXPECT_NE(owner->base_addr(), peer->base_addr());
 }
 
@@ -272,7 +279,8 @@ TEST(SharedSegmentMmapTest, RejectsMixedBackendBlobs) {
     auto status = SharedSegment::Create("mmap-mix", kSegmentSize, mmap_opts,
                                         mmap_segment, mmap_blob);
     if (!status.ok()) {
-        GTEST_SKIP() << "HostRegister unavailable: " << status.ToString();
+        GTEST_SKIP() << "mmap shared segment unavailable: "
+                     << status.ToString();
     }
 
     // Forge a peer blob that claims a different backend id.
@@ -284,5 +292,152 @@ TEST(SharedSegmentMmapTest, RejectsMixedBackendBlobs) {
     ASSERT_TRUE(EncodeSegmentBlob(header, handle, forged).ok());
     EXPECT_TRUE(mmap_segment->Complete({forged}).IsInvalidArgument());
 }
+
+TEST(SharedSegmentMmapTest, OwnerHandleIsProcFd) {
+    if (!SharedSegment::Supported(/*mmap=*/true)) {
+        GTEST_SKIP() << "mmap shared segment unavailable";
+    }
+    SharedSegmentOptions options = KvOptions(0, 1);
+    options.mmap = true;
+
+    std::string blob;
+    std::shared_ptr<SharedSegment> segment;
+    auto status =
+        SharedSegment::Create("mmap-fd", kSegmentSize, options, segment, blob);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    SegmentBlobHeader header{};
+    std::vector<uint8_t> handle;
+    ASSERT_TRUE(DecodeSegmentBlob(blob, header, handle).ok());
+    const std::string path(handle.begin(), handle.end());
+    int pid = -1;
+    int fd = -1;
+    ASSERT_EQ(std::sscanf(path.c_str(), "/proc/%d/fd/%d", &pid, &fd), 2);
+    EXPECT_EQ(pid, static_cast<int>(getpid()));
+    EXPECT_GE(fd, 0);
+}
+
+TEST(SharedSegmentMmapTest, TwoProcessesSharePages) {
+    if (!SharedSegment::Supported(/*mmap=*/true)) {
+        GTEST_SKIP() << "mmap shared segment unavailable";
+    }
+
+    int to_peer[2];
+    int to_owner[2];
+    ASSERT_EQ(pipe(to_peer), 0);
+    ASSERT_EQ(pipe(to_owner), 0);
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(to_peer[1]);
+        close(to_owner[0]);
+        SharedSegmentOptions peer_opts = KvOptions(1, 2);
+        peer_opts.mmap = true;
+        std::string peer_blob;
+        std::shared_ptr<SharedSegment> peer;
+        auto status = SharedSegment::Create("mmap-fork", kSegmentSize,
+                                            peer_opts, peer, peer_blob);
+        if (!status.ok() ||
+            write(to_owner[1], peer_blob.data(), peer_blob.size()) !=
+                static_cast<ssize_t>(peer_blob.size())) {
+            _exit(2);
+        }
+        std::string owner_blob(kSegmentBlobBytes, '\0');
+        if (read(to_peer[0], owner_blob.data(), owner_blob.size()) !=
+            static_cast<ssize_t>(owner_blob.size())) {
+            _exit(3);
+        }
+        const std::vector<std::string> blobs = {owner_blob, peer_blob};
+        if (!peer->Complete(blobs).ok()) {
+            _exit(4);
+        }
+        uint8_t ready = 1;
+        if (write(to_owner[1], &ready, 1) != 1) {
+            _exit(5);
+        }
+        if (read(to_peer[0], &ready, 1) != 1) {
+            _exit(6);
+        }
+        auto* bytes = reinterpret_cast<uint8_t*>(peer->base_addr());
+        const int ok = (bytes[0] == 0xA5 && bytes[4095] == 0x5A) ? 0 : 7;
+        _exit(ok);
+    }
+
+    close(to_peer[0]);
+    close(to_owner[1]);
+    SharedSegmentOptions owner_opts = KvOptions(0, 2);
+    owner_opts.mmap = true;
+    std::string owner_blob;
+    std::shared_ptr<SharedSegment> owner;
+    auto status = SharedSegment::Create("mmap-fork", kSegmentSize, owner_opts,
+                                        owner, owner_blob);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    ASSERT_EQ(write(to_peer[1], owner_blob.data(), owner_blob.size()),
+              static_cast<ssize_t>(owner_blob.size()));
+
+    std::string peer_blob(kSegmentBlobBytes, '\0');
+    ASSERT_EQ(read(to_owner[0], peer_blob.data(), peer_blob.size()),
+              static_cast<ssize_t>(peer_blob.size()));
+    const std::vector<std::string> blobs = {owner_blob, peer_blob};
+    ASSERT_TRUE(owner->Complete(blobs).ok());
+
+    uint8_t ready = 0;
+    ASSERT_EQ(read(to_owner[0], &ready, 1), 1);
+    auto* bytes = reinterpret_cast<uint8_t*>(owner->base_addr());
+    bytes[0] = 0xA5;
+    bytes[4095] = 0x5A;
+    ASSERT_EQ(write(to_peer[1], &ready, 1), 1);
+
+    int wstatus = 0;
+    ASSERT_EQ(waitpid(child, &wstatus, 0), child);
+    ASSERT_TRUE(WIFEXITED(wstatus));
+    EXPECT_EQ(WEXITSTATUS(wstatus), 0);
+}
+
+#if defined(USE_ASCEND_DIRECT)
+TEST(SharedSegmentMmapTest, HostRegisterTwoRanksSharePages) {
+    if (!SharedSegment::Supported(/*mmap=*/true, /*host_register=*/true)) {
+        GTEST_SKIP() << "HostRegister unavailable in this build";
+    }
+    if (aclInit(nullptr) != ACL_ERROR_NONE ||
+        aclrtSetDevice(0) != ACL_ERROR_NONE) {
+        GTEST_SKIP() << "aclrtSetDevice(0) unavailable";
+    }
+    SharedSegmentOptions owner_opts = KvOptions(0, 2);
+    owner_opts.mmap = true;
+    owner_opts.host_register = true;
+    owner_opts.device_id = 0;
+    SharedSegmentOptions peer_opts = owner_opts;
+    peer_opts.rank_id = 1;
+
+    std::string owner_blob;
+    std::string peer_blob;
+    std::shared_ptr<SharedSegment> owner;
+    std::shared_ptr<SharedSegment> peer;
+    auto status = SharedSegment::Create("mmap-hr-tp", kSegmentSize, owner_opts,
+                                        owner, owner_blob);
+    if (!status.ok()) {
+        GTEST_SKIP() << "HostRegister create failed: " << status.ToString();
+    }
+    status = SharedSegment::Create("mmap-hr-tp", kSegmentSize, peer_opts, peer,
+                                   peer_blob);
+    if (!status.ok()) {
+        GTEST_SKIP() << "peer HostRegister failed: " << status.ToString();
+    }
+    const std::vector<std::string> blobs = {owner_blob, peer_blob};
+    ASSERT_TRUE(owner->Complete(blobs).ok()) << "owner complete";
+    ASSERT_TRUE(peer->Complete(blobs).ok()) << "peer complete";
+    ASSERT_NE(owner->device_addr(), 0u);
+    ASSERT_NE(peer->device_addr(), 0u);
+
+    auto* owner_bytes = reinterpret_cast<uint8_t*>(owner->base_addr());
+    auto* peer_bytes = reinterpret_cast<uint8_t*>(peer->base_addr());
+    owner_bytes[0] = 0x11;
+    owner_bytes[4095] = 0x22;
+    EXPECT_EQ(peer_bytes[0], 0x11);
+    EXPECT_EQ(peer_bytes[4095], 0x22);
+}
+#endif
 
 }  // namespace mooncake

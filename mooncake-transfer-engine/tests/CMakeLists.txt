@@ -1,5 +1,51 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  add_executable(adaptive_congestion_control_test
+                 ${WORKSPACE}/adaptive_congestion_control_test.cpp)
+  target_link_libraries(
+    adaptive_congestion_control_test PRIVATE adaptive_congestion_control_core
+                                             gtest gtest_main)
+  add_test(NAME adaptive_congestion_control_test
+           COMMAND adaptive_congestion_control_test)
+
+  add_executable(rdma_error_classifier_test
+                 ${WORKSPACE}/rdma_error_classifier_test.cpp)
+  target_link_libraries(
+    rdma_error_classifier_test PRIVATE adaptive_congestion_control_core gtest
+                                       gtest_main)
+  add_test(NAME rdma_error_classifier_test COMMAND rdma_error_classifier_test)
+
+  add_executable(adaptive_congestion_control_config_test
+                 ${WORKSPACE}/adaptive_congestion_control_config_test.cpp)
+  target_link_libraries(
+    adaptive_congestion_control_config_test
+    PRIVATE adaptive_congestion_control_core gtest gtest_main)
+  add_test(NAME adaptive_congestion_control_config_test
+           COMMAND adaptive_congestion_control_config_test)
+
+  add_executable(adaptive_congestion_control_benchmark
+                 ${WORKSPACE}/adaptive_congestion_control_benchmark.cpp)
+  target_link_libraries(adaptive_congestion_control_benchmark
+                        PRIVATE adaptive_congestion_control_core)
+
+  add_executable(classic_rdma_congestion_control_test
+                 ${WORKSPACE}/classic_rdma_congestion_control_test.cpp)
+  target_link_libraries(classic_rdma_congestion_control_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  add_test(NAME classic_rdma_congestion_control_test
+           COMMAND classic_rdma_congestion_control_test)
+endif()
+
+configure_file(installed_congestion_control_header_test.cmake.in
+               installed_congestion_control_header_test.cmake @ONLY)
+add_test(
+  NAME installed_congestion_control_header_test
+  COMMAND
+    ${CMAKE_COMMAND} -DTRANSFER_ENGINE_LIBRARY=$<TARGET_FILE:transfer_engine>
+    -P
+    ${CMAKE_CURRENT_BINARY_DIR}/installed_congestion_control_header_test.cmake)
+
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
   hipify_files(TEST_SOURCES)
@@ -17,7 +63,49 @@ target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest
                                                  gtest_main)
+if(USE_TENT)
+  # Match the compatibility shim public class definition and enable the
+  # MC_USE_TENT regression cases in transport_uint_test.cpp.
+  target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
+  add_test(
+    NAME tent_compat_notify_test
+    COMMAND
+      transport_uint_test
+      --gtest_filter=TransferEngineTentCompatibilityTest.NotifyByNamePreservesOpenSegment
+  )
+endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
+
+# Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
+# the device's advertised limits; no RDMA device required.
+add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
+target_link_libraries(rdma_atomic_cap_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+add_test(NAME rdma_atomic_cap_test COMMAND rdma_atomic_cap_test)
+
+# Hardware-free tests for FlagCX transport range and descriptor validation.
+add_executable(flagcx_transport_internal_test
+               ${WORKSPACE}/flagcx_transport_internal_test.cpp)
+target_include_directories(
+  flagcx_transport_internal_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/transport/flagcx_transport)
+target_link_libraries(flagcx_transport_internal_test PUBLIC gtest gtest_main)
+add_test(NAME flagcx_transport_internal_test
+         COMMAND flagcx_transport_internal_test)
+
+if(WITH_METRICS)
+  add_executable(transfer_engine_metrics_test
+                 ${WORKSPACE}/transfer_engine_metrics_test.cpp)
+  target_link_libraries(transfer_engine_metrics_test PUBLIC transfer_engine
+                                                            gtest gtest_main)
+  add_test(NAME transfer_engine_metrics_test
+           COMMAND transfer_engine_metrics_test)
+
+  add_executable(metrics_exporter_test ${WORKSPACE}/metrics_exporter_test.cpp)
+  target_link_libraries(metrics_exporter_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+  add_test(NAME metrics_exporter_test COMMAND metrics_exporter_test)
+endif()
 
 add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
@@ -27,10 +115,12 @@ add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 # Fingerprint, blob and option checks run without a VMM backend.
 add_executable(shared_segment_test ${WORKSPACE}/shared_segment_test.cpp)
 target_include_directories(
-  shared_segment_test
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/shared_segment)
+  shared_segment_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/shared_segment)
 target_link_libraries(shared_segment_test PUBLIC transfer_engine gtest
                                                  gtest_main)
+if(USE_ASCEND_DIRECT)
+  target_link_libraries(shared_segment_test PUBLIC ascendcl)
+endif()
 add_test(NAME shared_segment_test COMMAND shared_segment_test)
 
 add_executable(rdma_endpoint_state_test
@@ -39,14 +129,32 @@ target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
-# Regression test for the reconnect storm of issue #3299: repeated local
-# completion faults toward one peer RNIC must pause that path instead of
-# re-handshaking it forever. The rail monitor is plain per-worker-pool state,
-# so this runs on every CI runner without an RDMA device.
+add_executable(rdma_posted_fifo_test ${WORKSPACE}/rdma_posted_fifo_test.cpp)
+target_link_libraries(rdma_posted_fifo_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME rdma_posted_fifo_test COMMAND rdma_posted_fifo_test)
+
+# Hardware-free regression tests for peer-rail pausing and the local-WC context
+# breaker. Both are plain per-worker-pool state, so this runs on every CI runner
+# without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Control GID I/O and port-state queries so event recovery can be exercised
+  # without an RDMA device.
+  if(BUILD_SHARED_LIBS)
+    # --wrap only rewrites calls in objects linked into this executable.
+    target_sources(worker_pool_rail_state_test
+                   PRIVATE $<TARGET_OBJECTS:rdma_transport>)
+  endif()
+  target_link_options(
+    worker_pool_rail_state_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
+    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state")
+endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
 # Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips
@@ -77,6 +185,13 @@ target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest
 # add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA
 # dev + metadata server
 
+if(USE_HIP)
+  # Needs an AMD GPU, an RDMA NIC and the amdgpu peer-memory client.
+  add_executable(rdma_hip_kfd_pin_test ${WORKSPACE}/rdma_hip_kfd_pin_test.cpp)
+  target_link_libraries(rdma_hip_kfd_pin_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+endif()
+
 # Ctrl frame codec + sender credit ledger unit tests (no RDMA device required).
 add_executable(ctrl_frame_test ${WORKSPACE}/ctrl_frame_test.cpp)
 target_link_libraries(ctrl_frame_test PUBLIC transfer_engine gtest gtest_main)
@@ -87,6 +202,21 @@ target_link_libraries(sender_credit_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME sender_credit_test COMMAND sender_credit_test)
 
+# Ordinary RDMA notifications; independent of the CtrlChannel tests below.
+add_executable(rdma_native_notify_test ${WORKSPACE}/rdma_native_notify_test.cpp)
+target_link_libraries(rdma_native_notify_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_native_notify_test COMMAND rdma_native_notify_test)
+set_tests_properties(rdma_native_notify_test PROPERTIES LABELS "rdma" TIMEOUT
+                                                        120)
+
+# CtrlChannel RDMA notify correctness. Self-skips without RDMA.
+add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)
+target_link_libraries(rdma_notify_test PUBLIC transfer_engine gflags::gflags
+                                              glog::glog gtest)
+add_test(NAME rdma_notify_test COMMAND rdma_notify_test)
+set_tests_properties(rdma_notify_test PROPERTIES LABELS "rdma")
+
 # This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test
                ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
@@ -95,7 +225,8 @@ target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine
 if(UNIX AND NOT APPLE)
   target_link_options(
     rdma_endpoint_reestablish_test PRIVATE "-Wl,--wrap=ibv_modify_qp"
-    "-Wl,--wrap=ibv_query_gid" "-Wl,--wrap=_ibv_query_gid_ex")
+    "-Wl,--wrap=ibv_query_qp" "-Wl,--wrap=ibv_query_gid"
+    "-Wl,--wrap=_ibv_query_gid_ex")
 endif()
 add_test(NAME rdma_endpoint_reestablish_test
          COMMAND rdma_endpoint_reestablish_test)
@@ -124,7 +255,25 @@ if(USE_CXL)
   add_test(NAME cxl_transport_test COMMAND cxl_transport_test)
 endif()
 
+add_executable(shm_transport_test ${WORKSPACE}/shm_transport_test.cpp)
+target_link_libraries(shm_transport_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+add_test(NAME shm_transport_test COMMAND shm_transport_test)
+
+if(USE_TCP)
+  add_executable(shm_transport_e2e_test ${WORKSPACE}/shm_transport_e2e_test.cpp)
+  target_link_libraries(shm_transport_e2e_test PUBLIC transfer_engine gtest
+                                                      gtest_main)
+  add_test(NAME shm_transport_e2e_test COMMAND shm_transport_e2e_test)
+endif()
+
 if(USE_NVMEOF)
+  # cuFile entry points are faked by the executable; no GPU or SSD is needed.
+  add_executable(nvmeof_request_test ${WORKSPACE}/nvmeof_request_test.cpp)
+  target_link_libraries(nvmeof_request_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+  add_test(NAME nvmeof_request_test COMMAND nvmeof_request_test)
+
   add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
                                                   gtest_main)
@@ -149,6 +298,17 @@ if(USE_TCP)
   target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
                                                          gtest_main)
   add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
+
+  if(USE_CUDA)
+    add_executable(tcp_cuda_staging_test ${WORKSPACE}/tcp_cuda_staging_test.cpp)
+    target_compile_definitions(tcp_cuda_staging_test
+                               PRIVATE MOONCAKE_TCP_TRANSPORT_TEST_HOOKS)
+    target_include_directories(tcp_cuda_staging_test
+                               PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(tcp_cuda_staging_test PUBLIC transfer_engine gtest
+                                                       gtest_main CUDA::cudart)
+    add_test(NAME tcp_cuda_staging_test COMMAND tcp_cuda_staging_test)
+  endif()
 endif()
 
 add_executable(tcp_address_validation_test
@@ -172,12 +332,45 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
+if(USE_CUDA AND NOT USE_HIP)
+  # GPU sub-range export test (skipped at runtime without a CUDA device).
+  # On a host with a peer-memory module loaded the default is ibv_reg_mr;
+  # WITH_NVIDIA_PEERMEM=0 selects the DMA-BUF export under test either way.
+  target_include_directories(dmabuf_export_test
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(dmabuf_export_test PUBLIC CUDA::cudart)
+  set_tests_properties(dmabuf_export_test PROPERTIES ENVIRONMENT
+                                                     "WITH_NVIDIA_PEERMEM=0")
+endif()
 
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
-  add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+  add_test(NAME nvlink_transport_test
+           COMMAND ${CMAKE_COMMAND} -E env GTEST_FILTER=NvlinkTransportTest.*
+                   $<TARGET_FILE:nvlink_transport_test>)
+  set_tests_properties(nvlink_transport_test PROPERTIES LABELS "nvlink_gpu")
+
+  if(USE_CUDA AND NOT USE_HIP)
+    add_test(
+      NAME nvlink_host_numa_registration_test
+      COMMAND
+        ${CMAKE_COMMAND} -E env --unset=MC_USE_NVLINK_IPC
+        GTEST_FILTER=NvlinkHostNumaRegistrationTest.*
+        $<TARGET_FILE:nvlink_transport_test>)
+    set_tests_properties(nvlink_host_numa_registration_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+
+    add_executable(nvlink_host_numa_allocation_test
+                   ${WORKSPACE}/nvlink_host_numa_allocation_test.cpp)
+    target_link_libraries(nvlink_host_numa_allocation_test
+                          PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME nvlink_host_numa_allocation_test
+             COMMAND nvlink_host_numa_allocation_test)
+    set_tests_properties(nvlink_host_numa_allocation_test
+                         PROPERTIES LABELS "nvlink_vmm_unit")
+  endif()
 endif()
 
 if(USE_HIP)
@@ -200,9 +393,50 @@ if(USE_EFA)
                                                   gtest_main)
   add_test(NAME efa_transport_test COMMAND efa_transport_test)
 
+  add_executable(efa_select_device_test ${WORKSPACE}/efa_select_device_test.cpp)
+  target_link_libraries(efa_select_device_test PUBLIC transfer_engine gtest
+                                                      gtest_main)
+  add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
+
+  add_executable(efa_discovery_test ${WORKSPACE}/efa_discovery_test.cpp)
+  target_link_libraries(efa_discovery_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+  add_test(NAME efa_discovery_test COMMAND efa_discovery_test)
+
+  add_executable(efa_stale_segment_desc_test
+                 ${WORKSPACE}/efa_stale_segment_desc_test.cpp)
+  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
+  add_test(NAME efa_stale_segment_desc_test COMMAND efa_stale_segment_desc_test)
+
+  # Compiles the real EfaEndPoint source against the test-only
+  # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed
+  # efa_context.h via -iquote), so the endpoint locking and generation logic
+  # runs without an EFA device. Bounded: a locking regression must fail, not
+  # hang the test runner.
+  add_executable(
+    efa_endpoint_handshake_test
+    ${WORKSPACE}/efa_endpoint_handshake_test.cpp
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/src/transport/efa_transport/efa_endpoint.cpp
+  )
+  target_compile_options(
+    efa_endpoint_handshake_test
+    PRIVATE -iquote${WORKSPACE}/efa_endpoint_handshake_fakes)
+  target_link_libraries(
+    efa_endpoint_handshake_test PUBLIC glog::glog gflags::gflags gtest
+                                       gtest_main pthread)
+  add_test(NAME efa_endpoint_handshake_test COMMAND efa_endpoint_handshake_test)
+  set_tests_properties(efa_endpoint_handshake_test PROPERTIES TIMEOUT 120)
+
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
   target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
   add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
+
+  add_executable(efa_remote_accessible_test
+                 ${WORKSPACE}/efa_remote_accessible_test.cpp)
+  target_link_libraries(efa_remote_accessible_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+  add_test(NAME efa_remote_accessible_test COMMAND efa_remote_accessible_test)
 
   add_executable(efa_single_nic_large_mr_test
                  ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
@@ -337,6 +571,12 @@ add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
 
+add_executable(glog_preinitialized_test
+               ${WORKSPACE}/glog_preinitialized_test.cpp)
+target_link_libraries(glog_preinitialized_test PUBLIC transfer_engine gtest
+                                                      gtest_main glog::glog)
+add_test(NAME glog_preinitialized_test COMMAND glog_preinitialized_test)
+
 add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
 target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest
                                                  gtest_main)
@@ -355,12 +595,41 @@ target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
+add_executable(rdma_unregister_retry_test
+               ${WORKSPACE}/rdma_unregister_retry_test.cpp)
+target_link_libraries(rdma_unregister_retry_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+add_test(NAME rdma_unregister_retry_test COMMAND rdma_unregister_retry_test)
+
+add_executable(rdma_memory_location_test
+               ${WORKSPACE}/rdma_memory_location_test.cpp)
+target_link_libraries(rdma_memory_location_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+add_test(NAME rdma_memory_location_test COMMAND rdma_memory_location_test)
+
 add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
                                                              gtest gtest_main)
 add_test(NAME rdma_transport_submit_task_test
          COMMAND rdma_transport_submit_task_test)
+
+add_executable(rdma_buffer_range_index_test
+               ${WORKSPACE}/rdma_buffer_range_index_test.cpp)
+target_link_libraries(rdma_buffer_range_index_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME rdma_buffer_range_index_test COMMAND rdma_buffer_range_index_test)
+
+add_executable(rdma_batch_reuse_test ${WORKSPACE}/rdma_batch_reuse_test.cpp)
+target_link_libraries(rdma_batch_reuse_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME rdma_batch_reuse_test COMMAND rdma_batch_reuse_test)
+
+add_executable(multi_transport_batch_test
+               ${WORKSPACE}/multi_transport_batch_test.cpp)
+target_link_libraries(multi_transport_batch_test PUBLIC transfer_engine gtest
+                                                        gtest_main)
+add_test(NAME multi_transport_batch_test COMMAND multi_transport_batch_test)
 
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
@@ -390,8 +659,8 @@ if(USE_ASCEND_DIRECT)
            COMMAND ascend_direct_transport_test)
 endif()
 
-# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
-if(ENABLE_MULTI_PROTOCOL)
+# This multi-protocol test directly uses CxlTransport and requires its backend.
+if(ENABLE_MULTI_PROTOCOL AND USE_CXL)
   add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
   target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main)
@@ -441,3 +710,8 @@ if(USE_NCCL_DEVICE AND NOT USE_CXI)
     endif()
   endif()
 endif()
+
+add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
+target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)

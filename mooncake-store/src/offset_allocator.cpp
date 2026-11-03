@@ -6,9 +6,13 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 
+#include <fmt/format.h>
+
+#include "common/byte_size.h"
 #include "mutex.h"
-#include "utils.h"
 
 #ifdef DEBUG
 #include <assert.h>
@@ -481,7 +485,7 @@ OffsetAllocStorageReportFull __Allocator::storageReportFull() const {
 
 // OffsetAllocationHandle implementation
 OffsetAllocationHandle::OffsetAllocationHandle(
-    std::shared_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
+    std::weak_ptr<OffsetAllocator> allocator, OffsetAllocation allocation,
     uint64_t base, uint64_t size)
     : m_allocator(std::move(allocator)),
       m_allocation(allocation),
@@ -562,21 +566,6 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
         std::memory_order_relaxed);
 }
 
-OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
-                                 uint64_t multiplier_bits,
-                                 std::unique_ptr<__Allocator> allocator)
-    : m_allocator(std::move(allocator)),
-      m_base(base),
-      m_multiplier_bits(multiplier_bits),
-      m_capacity(size) {
-    const uint64_t largest_free_region =
-        m_allocator->storageReport().largestFreeRegion << m_multiplier_bits;
-    m_largest_free_region.store(largest_free_region, std::memory_order_relaxed);
-    const uint64_t allocator_capacity =
-        static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits;
-    m_largest_free_region_tightened = largest_free_region < allocator_capacity;
-}
-
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     if (size == 0) {
         return std::nullopt;
@@ -628,9 +617,11 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         m_base + (allocation.getOffset() << m_multiplier_bits);
     guard.unlock();
 
-    // Handle construction and shared_ptr reference-counting do not access
+    // Handle construction and weak_ptr reference-counting do not access
     // allocator state and should not extend the serialized critical section.
-    return OffsetAllocationHandle(shared_from_this(), allocation, real_base,
+    // The handle keeps only a weak reference; weak_from_this() avoids taking
+    // and dropping a strong one.
+    return OffsetAllocationHandle(weak_from_this(), allocation, real_base,
                                   size);
 }
 
@@ -793,7 +784,7 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
     }
 
     OffsetAllocation allocation(node.dataOffset, node_index);
-    return OffsetAllocationHandle(shared_from_this(), allocation, real_offset,
+    return OffsetAllocationHandle(weak_from_this(), allocation, real_offset,
                                   requested_size);
 }
 

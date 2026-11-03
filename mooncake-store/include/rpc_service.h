@@ -21,6 +21,20 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    void SetBatchOpLogTerminalCallback(
+        OrderedOpLogWriter::TerminalCallback callback);
+    void StopBatchOpLogWriter();
+    void StopHttpMetadataCleanup();
+    // Restore lifecycle hooks (RFC #4700, slice 1). Serving means "committed
+    // to normal operation, restore refused from here on", not "already
+    // reachable": the non-HA path and EmbeddedMaster both run
+    // MarkReadyForServing + ActivateServing before registering the RPC
+    // service, while the HA supervisor's ActivateServingState takes the
+    // Ready -> Serving edge after readiness is published, on a per-term
+    // instance that is destroyed rather than reused if publication fails.
+    void MarkReadyForServing();
+    void ActivateServing();
+    MasterService::RestoreLifecycleState GetRestoreLifecycleState() const;
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).
@@ -37,11 +51,21 @@ class WrappedMasterService {
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
 
+    // Point-in-time existence check: shares the ExistKey lookup path but
+    // grants no read lease, so a `true` result does not protect the object
+    // from eviction.
+    tl::expected<bool, ErrorCode> ProbeKey(
+        const std::string& key, const std::string& tenant_id = "default");
+
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys,
+        const std::string& tenant_id = "default");
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
+        const GrantLeasePolicy& policy, const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
     tl::expected<
@@ -51,7 +75,8 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
         const std::vector<std::string>& object_keys, const UUID& client_id,
-        const std::string& segment_name);
+        const std::string& segment_name,
+        const std::string& tenant_id = "default");
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -147,6 +172,10 @@ class WrappedMasterService {
     long RemoveAll(bool force = false,
                    const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<void, ErrorCode>> BatchUpdateSoftPin(
+        const std::vector<std::string>& keys, uint64_t ttl_ms,
+        const std::string& tenant_id = "default");
+
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false,
         const std::string& tenant_id = "default");
@@ -187,6 +216,8 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+
     tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
     ListTenantQuotaSnapshots();
     tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(
@@ -210,6 +241,9 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
 
+    tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
+        const UUID& client_id);
+
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
@@ -226,6 +260,15 @@ class WrappedMasterService {
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
+    // SSD prefetch RPC. Registers a promotion task without the
+    // promotion-on-hit admission gates and without the holder's heartbeat
+    // mailbox; the caller drives the execution chain itself. Best-effort:
+    // PROMOTION_ALREADY_EXISTS is a normal "skip" outcome. Additive RPC —
+    // older masters reject it and prefetch degrades to a no-op.
+    tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id, uint64_t size,
@@ -239,6 +282,11 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
 
+    // Admin-only, grow-only DFS capacity management. Existing placements remain
+    // valid.
+    tl::expected<int, ErrorCode> GetDfsShardCount() const;
+    tl::expected<int, ErrorCode> ExpandDfsShards(int shard_count);
+
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
@@ -250,13 +298,61 @@ class WrappedMasterService {
         const std::string& segment_name);
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+    tl::expected<void, ErrorCode> SetSegmentStatus(
+        const std::string& segment_name, SegmentStatus status);
+
+    WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<ListWeightRevisionsResponse>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request,
+                        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation>
+    StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request,
+        const std::string& tenant_id = "default");
+    WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request,
+        const std::string& tenant_id = "default");
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
     tl::expected<void, ErrorCode> RestoreFromStandby(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const WeightMetadataSnapshot& weight_metadata = {});
+    // Copies objects out of the handoff; the caller keeps ownership.
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        const BatchOpLogPromotionHandoff& handoff,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        const StandbyMetadataStore& metadata_store,
+        DurablePrefix applied_cursor,
+        const std::vector<StandbySegmentInfo>& segments,
+        ReplicaID max_replica_id,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
@@ -321,6 +417,14 @@ class WrappedMasterService {
                                                    const std::string& tenant_id,
                                                    ReplicaType replica_type);
 
+    // Conditional variant: evicts only when the current record still carries
+    // the replica id the caller failed on. Returns false when the replica was
+    // replaced in the meantime; the replacement is left untouched.
+    tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, ReplicaType replica_type,
+        ReplicaID expected_replica_id);
+
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
@@ -332,7 +436,13 @@ class WrappedMasterService {
     MasterService master_service_;
 };
 
+class RpcWorkerPool;
+
+// With a worker pool, every handler except Ping and ServiceReady runs on its
+// worker threads; those two stay on the io threads, which the pool keeps
+// free. Without one, every handler runs inline on the io threads.
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
-                        mooncake::WrappedMasterService& wrapped_master_service);
+                        mooncake::WrappedMasterService& wrapped_master_service,
+                        RpcWorkerPool* worker_pool = nullptr);
 
 }  // namespace mooncake

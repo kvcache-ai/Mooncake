@@ -24,12 +24,32 @@ extern "C" {
 
 typedef void *mooncake_store_t;
 
+/*
+ * Soft-pin intent for mooncake_replicate_config_t::soft_pin_action.
+ * A soft pin guards an object from eviction until a deadline fixed at
+ * write time; reads never extend it. Zero-initialized configs default
+ * to MOONCAKE_SOFT_PIN_PRESERVE without a TTL.
+ */
+enum mooncake_soft_pin_action {
+    MOONCAKE_SOFT_PIN_PRESERVE = 0, /* keep an existing unexpired deadline */
+    MOONCAKE_SOFT_PIN_ENABLE = 1,   /* commit a new soft pin on publish */
+    MOONCAKE_SOFT_PIN_DISABLE = 2   /* remove an existing soft pin */
+};
+
 struct mooncake_replicate_config {
     size_t replica_num;
-    int with_soft_pin;
     int with_hard_pin;
     const char **preferred_segments;
     size_t preferred_segments_count;
+    /* One of enum mooncake_soft_pin_action; put functions return -1
+     * for any other value. */
+    int soft_pin_action;
+    /* TTL override in milliseconds; meaningful only with
+     * MOONCAKE_SOFT_PIN_ENABLE. When unset, the master default TTL
+     * applies. The master rejects TTLs on other actions and values
+     * above its configured maximum. */
+    int has_soft_pin_ttl;
+    uint64_t soft_pin_ttl_ms;
 };
 typedef struct mooncake_replicate_config mooncake_replicate_config_t;
 
@@ -92,6 +112,31 @@ int mooncake_store_batch_get_into(mooncake_store_t store, const char **keys,
                                   size_t count, int64_t *results_out);
 
 // ---------------------------------------------------------------------------
+// Multi-buffer batch operations
+// ---------------------------------------------------------------------------
+//
+// An object spread over several registered buffers (a KV block's per-layer
+// slices, say): its value is their bytes in order. `buffers` and `sizes` are
+// flat over all keys, key i owning the `counts[i]` entries after key i-1's,
+// so there are sum(counts) of each for `count` keys. Every buffer must
+// resolve to Store-managed registered memory, as for the single-buffer
+// batch functions. Results are per key: 0 or an error code for a put, the
+// bytes read (the sum of the key's sizes) or a negative error code for a
+// get.
+
+int mooncake_store_batch_put_from_multi_buffers(
+    mooncake_store_t store, const char **keys, void **buffers,
+    const size_t *sizes, const size_t *counts, size_t count,
+    const mooncake_replicate_config_t *config, int *results_out);
+
+// prefer_alloc_in_same_node: when non-zero, the slices of a key that live in
+// one segment go out as one transfer.
+int mooncake_store_batch_get_into_multi_buffers(
+    mooncake_store_t store, const char **keys, void **buffers,
+    const size_t *sizes, const size_t *counts, size_t count,
+    int prefer_alloc_in_same_node, int64_t *results_out);
+
+// ---------------------------------------------------------------------------
 // Existence / size / hostname
 // ---------------------------------------------------------------------------
 
@@ -99,6 +144,23 @@ int mooncake_store_is_exist(mooncake_store_t store, const char *key);
 
 int mooncake_store_batch_is_exist(mooncake_store_t store, const char **keys,
                                   size_t count, int *results_out);
+
+// Options for the *_with_options existence checks. All-zero means the
+// legacy behavior.
+struct mooncake_exist_options {
+    // Best-effort SSD->DRAM promotion for SSD-only keys. Requires the client
+    // to be configured with enable_ssd_prefetch; otherwise ignored.
+    int prefetch_to_memory;
+};
+typedef struct mooncake_exist_options mooncake_exist_options_t;
+
+int mooncake_store_is_exist_with_options(
+    mooncake_store_t store, const char *key,
+    const mooncake_exist_options_t *options);
+
+int mooncake_store_batch_is_exist_with_options(
+    mooncake_store_t store, const char **keys, size_t count, int *results_out,
+    const mooncake_exist_options_t *options);
 
 int64_t mooncake_store_get_size(mooncake_store_t store, const char *key);
 

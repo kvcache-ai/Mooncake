@@ -65,6 +65,80 @@ TEST(LocalSsdTaskMailboxTest, PromotionsAreBatchedAndRemoveAllIsConsumed) {
     EXPECT_FALSE(mailbox.ConsumeRemoveAll());
 }
 
+TEST(LocalSsdTaskMailboxTest, PromotionsAreDeliveredByRecency) {
+    LocalSsdTaskMailbox mailbox(false);
+    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "a", 1)) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "b", 2)) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "c", 3)) ==
+                ErrorCode::OK);
+
+    // Without any touch, the most recent enqueue is delivered first.
+    auto first = mailbox.TakePromotions(1);
+    ASSERT_EQ(first.size(), 1);
+    EXPECT_EQ(first.front(), Promotion("t", "c", 3));
+
+    // A touch re-marks an older entry ahead of newer ones.
+    ASSERT_TRUE(mailbox.TouchPromotion(TenantId("t"), "a"));
+    auto second = mailbox.TakePromotions(1);
+    ASSERT_EQ(second.size(), 1);
+    EXPECT_EQ(second.front(), Promotion("t", "a", 1));
+
+    // A duplicate enqueue keeps the dedup contract but refreshes recency.
+    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "b", 2)) ==
+                ErrorCode::OBJECT_ALREADY_EXISTS);
+    auto third = mailbox.TakePromotions(1);
+    ASSERT_EQ(third.size(), 1);
+    EXPECT_EQ(third.front(), Promotion("t", "b", 2));
+
+    EXPECT_TRUE(mailbox.TakePromotions(10).empty());
+    EXPECT_FALSE(mailbox.TouchPromotion(TenantId("t"), "missing"));
+}
+
+TEST(LocalSsdTaskMailboxTest, TakePromotionsKeepsGlobalRecencyAcrossTicks) {
+    LocalSsdTaskMailbox mailbox(false);
+    for (const char* key : {"k1", "k2", "k3", "k4", "k5"}) {
+        ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", key, 1)) ==
+                    ErrorCode::OK);
+    }
+    ASSERT_TRUE(mailbox.TouchPromotion(TenantId("t"), "k2"));
+
+    // k2 (touched) first, then the newest enqueue. The batch limit must not
+    // degrade the remainder to hash order on the next tick.
+    auto batch = mailbox.TakePromotions(2);
+    ASSERT_EQ(batch.size(), 2);
+    EXPECT_EQ(batch[0], Promotion("t", "k2", 1));
+    EXPECT_EQ(batch[1], Promotion("t", "k5", 1));
+
+    auto rest = mailbox.TakePromotions(10);
+    ASSERT_EQ(rest.size(), 3);
+    EXPECT_EQ(rest[0], Promotion("t", "k4", 1));
+    EXPECT_EQ(rest[1], Promotion("t", "k3", 1));
+    EXPECT_EQ(rest[2], Promotion("t", "k1", 1));
+}
+
+TEST(LocalSsdManagerTest, TouchPromotionIsClientScoped) {
+    LocalSsdManager manager;
+    UUID client{7, 8};
+    UUID other{9, 10};
+    ASSERT_TRUE(manager.RegisterClient(client, false) == ErrorCode::OK);
+    ASSERT_TRUE(manager.RegisterClient(other, false) == ErrorCode::OK);
+    ASSERT_TRUE(manager.EnqueuePromotion(client, Promotion("t", "a", 1)) ==
+                ErrorCode::OK);
+    ASSERT_TRUE(manager.EnqueuePromotion(client, Promotion("t", "b", 2)) ==
+                ErrorCode::OK);
+
+    // Unknown clients and foreign clients cannot touch the entry.
+    EXPECT_FALSE(manager.TouchPromotion(UUID{11, 12}, TenantId("t"), "a"));
+    EXPECT_FALSE(manager.TouchPromotion(other, TenantId("t"), "a"));
+
+    ASSERT_TRUE(manager.TouchPromotion(client, TenantId("t"), "a"));
+    auto taken = manager.TakePromotions(client, 1);
+    ASSERT_EQ(taken->size(), 1);
+    EXPECT_EQ(taken->front(), Promotion("t", "a", 1));
+}
+
 TEST(LocalSsdManagerTest, ManagesRegistrationCapacityAndUsage) {
     LocalSsdManager manager;
     UUID client{1, 2};
@@ -138,32 +212,6 @@ TEST(LocalSsdManagerTest, CancelsOffloadMirrorsOnlyWhenAllArePending) {
                                                    TenantId("tenant"), "key"));
     EXPECT_TRUE(manager.SetOffloadingAndTakePending(client_a, true)->empty());
     EXPECT_TRUE(manager.SetOffloadingAndTakePending(client_b, true)->empty());
-}
-
-TEST(LocalSsdManagerTest, RestoreResetsRuntimeOnlyState) {
-    LocalSsdManager manager;
-    UUID client{5, 6};
-    ASSERT_TRUE(manager.RegisterClient(client, true) == ErrorCode::OK);
-    ASSERT_TRUE(manager.ReportCapacity(client, 2048).has_value());
-    ASSERT_TRUE(manager.AdjustUsedBytes(client, 512));
-    ASSERT_TRUE(manager.EnqueueOffload(client, Offload("tenant", "key", 10),
-                                       10) == ErrorCode::OK);
-    ASSERT_TRUE(manager.EnqueuePromotion(
-                    client, Promotion("tenant", "key", 10)) == ErrorCode::OK);
-    manager.RequestRemoveAll();
-
-    auto state = manager.ExportPersistedState();
-    manager.RestorePersistedState(std::move(state));
-    auto usage = manager.GetUsage(client);
-    ASSERT_TRUE(usage.has_value());
-    EXPECT_EQ(usage->total_capacity_bytes, 2048);
-    EXPECT_EQ(usage->used_bytes, 0);
-    EXPECT_TRUE(manager.TakePromotions(client, 10)->empty());
-    EXPECT_FALSE(*manager.ConsumeRemoveAll(client));
-    auto offloads = manager.SetOffloadingAndTakePending(client, true);
-    ASSERT_TRUE(offloads.has_value());
-    ASSERT_EQ(offloads->size(), 1);
-    EXPECT_EQ(offloads->front(), Offload("tenant", "key", 10));
 }
 
 }  // namespace

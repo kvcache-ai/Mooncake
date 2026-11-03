@@ -8,7 +8,7 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "http_metadata_server.h"
-#include "utils.h"
+#include "common/network.h"
 
 namespace mooncake::testing {
 

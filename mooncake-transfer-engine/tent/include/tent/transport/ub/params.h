@@ -40,6 +40,7 @@ struct UbParams {
     uint32_t jetty_per_endpoint = 6;
     uint32_t max_endpoints = 65536;
     size_t slice_size = 64 * 1024;
+    size_t max_slices_per_task = 64 * 1024;
     uint32_t max_retries = 8;
     uint32_t slice_timeout_ms = 5000;
     uint32_t endpoint_cooldown_ms = 1000;
@@ -77,6 +78,15 @@ struct UbParams {
                 "transports/ub/slice_size exceeds the URMA SGE length limit");
         }
         parsed.slice_size = static_cast<size_t>(slice_size);
+
+        uint64_t max_slices_per_task = parsed.max_slices_per_task;
+        CHECK_STATUS(readPositive(config, "transports/ub/max_slices_per_task",
+                                  max_slices_per_task, max_slices_per_task));
+        if (max_slices_per_task > std::numeric_limits<size_t>::max()) {
+            return Status::InvalidArgument(
+                "transports/ub/max_slices_per_task exceeds size_t");
+        }
+        parsed.max_slices_per_task = static_cast<size_t>(max_slices_per_task);
 
         CHECK_STATUS(readNonNegative(config, "transports/ub/max_retries",
                                      parsed.max_retries, parsed.max_retries));

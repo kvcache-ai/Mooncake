@@ -12,7 +12,7 @@ namespace mooncake {
 HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
     : port_(port),
       host_(host),
-      server_(std::make_unique<coro_http::coro_http_server>(4, port)),
+      server_(std::make_unique<coro_http::coro_http_server>(4, port, host_)),
       running_(false) {
     init_server();
 }
@@ -122,6 +122,7 @@ bool HttpMetadataServer::start() {
                    << port_;
         return false;
     }
+    port_ = server_->port();
     running_ = true;
     LOG(INFO) << "HTTP metadata server started on " << host_ << ":" << port_;
     return true;

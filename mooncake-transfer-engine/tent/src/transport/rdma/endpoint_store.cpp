@@ -119,6 +119,31 @@ void FIFOEndpointStore::evictOne() {
     LOG(INFO) << victim << " evicted from FIFOEndpointStore";
 }
 
+void FIFOEndpointStore::evictAll() {
+    std::vector<std::shared_ptr<RdmaEndPoint>> to_evict;
+    {
+        RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+        to_evict.reserve(endpoint_map_.size());
+        for (auto& entry : endpoint_map_) {
+            to_evict.push_back(entry.second);
+            // Publish into waiting_list_ under the same lock: reclaim()
+            // iterates waiting_list_ under endpoint_map_lock_, so inserting
+            // here avoids an unsynchronized read/write on the unordered_set.
+            waiting_list_.insert(entry.second);
+        }
+        endpoint_map_.clear();
+        fifo_list_.clear();
+        fifo_map_.clear();
+    }
+    // beginDestroy() may call back into reclaim() (which takes
+    // endpoint_map_lock_), so it must run after the lock is released.
+    for (auto& ep : to_evict) {
+        ep->beginDestroy();
+    }
+    LOG(INFO) << "FIFOEndpointStore: evicted all " << to_evict.size()
+              << " endpoints on port recovery";
+}
+
 void FIFOEndpointStore::reclaim() {
     std::vector<std::shared_ptr<RdmaEndPoint>> candidates;
     {
@@ -298,6 +323,31 @@ void SIEVEEndpointStore::evictOne() {
     endpoint_map_.erase(victim);
     LOG(INFO) << "Endpoint " << victim << " has been evicted";
     return;
+}
+
+void SIEVEEndpointStore::evictAll() {
+    std::vector<std::shared_ptr<RdmaEndPoint>> to_evict;
+    {
+        RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+        to_evict.reserve(endpoint_map_.size());
+        for (auto& entry : endpoint_map_) {
+            to_evict.push_back(entry.second.first);
+            // Publish into waiting_list_ under the same lock: reclaim()
+            // iterates waiting_list_ under endpoint_map_lock_, so inserting
+            // here avoids an unsynchronized read/write on the unordered_set.
+            waiting_list_.insert(entry.second.first);
+            waiting_list_len_.fetch_add(1, std::memory_order_relaxed);
+        }
+        endpoint_map_.clear();
+        fifo_list_.clear();
+        fifo_map_.clear();
+        hand_ = std::nullopt;
+    }
+    for (auto& ep : to_evict) {
+        ep->beginDestroy();
+    }
+    LOG(INFO) << "SIEVEEndpointStore: evicted all " << to_evict.size()
+              << " endpoints on port recovery";
 }
 
 void SIEVEEndpointStore::reclaim() {

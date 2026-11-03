@@ -29,11 +29,31 @@ from source, enable the EP/PG extensions with:
 cmake .. -DWITH_EP=ON
 ```
 
-The extensions are compiled against a specific PyTorch version. At import time,
-`mooncake.pg` and `mooncake.ep` load version-suffixed extension modules that
-match the active `torch.__version__`. If the current PyTorch version does not
-match a built extension, import will fail with a message such as
-`Mooncake PG was not built against torch==...`.
+`mooncake.pg` compiles its Torch-facing adapter at first import and caches the
+result locally. The wheel provides the native PG core/device libraries and the
+adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
+with `nvcc`, and Ninja.
+
+On Intel XPU, Mooncake EP is built natively with the oneAPI DPC++ compiler
+(TENT and Mooncake PG are not needed). It supports ranks on one node; see
+{ref}`Intel XPU <mooncake-ep-intel-xpu>` in the EP design notes:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-xpu -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+  -DUSE_XPU=ON -DWITH_EP=ON -DUSE_CUDA=OFF -DWITH_STORE=OFF \
+  -DWITH_STORE_RUST=OFF
+```
+
+The module runs on PyTorch's SYCL queues and uses the SYCL runtime that
+PyTorch XPU installs, so build it with a oneAPI release that ships the same
+runtime major version (`libsycl.so.N`). For example, PyTorch 2.14+xpu ships
+`libsycl.so.9`, from oneAPI 2026.
+
+PG symbols are exposed through `mooncake.pg`; `mooncake.ep` is the EP entry point
+and no longer re-exports PG symbols. Existing callers should move imports such
+as `MooncakeBackendOptions` and `set_host_ip` from `mooncake.ep` to
+`mooncake.pg`.
 
 ## Mooncake PG quick start
 
@@ -138,7 +158,7 @@ Arguments:
 
 | Function | Purpose | Notes |
 | --- | --- | --- |
-| `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. |
+| `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. Single-node (`MASTER_ADDR` unset or loopback, including the whole `127.0.0.0/8` range such as Debian/Ubuntu `127.0.1.1`) keeps the default `127.0.0.1`. On multi-node jobs (`MASTER_ADDR` is a non-loopback host or hostname) Mooncake PG derives a routable address toward `MASTER_ADDR` (hostname fallback only when that result is also non-loopback); if derivation fails, call `set_host_ip(<node IP>)` or `set_transfer_engine(...)` or initialization fails fast instead of hanging on rank 0. |
 | `pg.set_device_filter(filters)` | Restrict NIC/HCA selection. | Call before `init_process_group()`. |
 | `pg.set_transfer_engine(engine)` | Reuse an external `TransferEngine`. | The engine must outlive all process groups. |
 | `pg.get_active_ranks(backend)` | Return the backend active-rank tensor. | Used by EP fallback and recovery paths. |
@@ -320,12 +340,26 @@ Returns the workspace size in bytes for the EP buffer. Use the maximum number of
 tokens a rank may dispatch in one step. Underestimating this value can cause
 buffer overflow or incorrect dispatch results.
 
-### `Buffer(group, num_ep_buffer_bytes=0)`
+### `Buffer(group, num_ep_buffer_bytes)`
 
 Creates the EP runtime for a Mooncake process group. The constructor exchanges
 RDMA and IPC metadata through the group, initializes fast-path transports when
 available, and falls back to the Python implementation if the fast path is not
 usable.
+
+`num_ep_buffer_bytes` is required and must be positive. Use
+`Buffer.get_ep_buffer_size_hint(...)` with the maximum dispatch shape to
+calculate a suitable size before constructing the buffer:
+
+```python
+num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
+    num_max_dispatch_tokens_per_rank,
+    hidden,
+    num_ranks,
+    num_experts,
+)
+buffer = Buffer(group, num_ep_buffer_bytes)
+```
 
 ### `Buffer.dispatch(...)`
 
@@ -340,6 +374,7 @@ recv_x, recv_count, handle, event, hook = buffer.dispatch(
     use_fp8=True,
     async_finish=False,
     return_recv_hook=False,
+    topk_weights=None,
 )
 ```
 
@@ -360,6 +395,11 @@ Arguments:
   event for stream-lifetime management.
 - `return_recv_hook`: when `True`, call the returned `hook()` to complete receive
   synchronization; otherwise use `event.current_stream_wait()`.
+- `topk_weights`: optional FP32 tensor shaped like `topk_idx`, holding the
+  weights the matching `combine()` will be called with. Every rank must pass it
+  or none. On Intel XPU, combine then sums each token's rows on the expert side
+  with these weights and ignores its own `topk_weights`. Other backends ignore
+  this argument.
 
 Returns:
 
@@ -412,6 +452,96 @@ matching dispatch `handle` and pass the resulting tensor back to `combine()` wit
 Reconnects EP peers after backend membership changes. Call it after PG recovery
 updates rank activeness so EP transport metadata and QPs can be refreshed.
 
+## Default NCCL backend for `ElasticBuffer`
+
+`mooncake.mooncake_elastic_buffer.ElasticBuffer` now defaults to
+`transport="auto"`. Auto mode uses NCCL when the extension was built with the
+NCCL Device API and the inferred EP topology is supported by the compiled NCCL
+kernels. Existing constructor calls require no changes. If NCCL cannot be
+used, auto mode falls back to IPC + IBGDA and retains the previous backend
+behavior. As before, the requested workload must have a compiled elastic kernel
+shape.
+
+NCCL support is opt-in. Build with
+`-DWITH_EP=ON -DUSE_CUDA=ON -DUSE_NCCL_DEVICE=ON`; the option defaults to
+`OFF`. NCCL-enabled EP extensions currently link directly to `libnccl`, so
+importing `mooncake.ep` requires a matching NCCL runtime even when the NCCL
+transport is not selected. Keep the option disabled for deployments that must
+remain compatible with older NCCL runtimes.
+
+No application-side communicator bootstrap is required. Auto mode creates one
+NCCL unique ID on process-group rank zero and broadcasts it to the group:
+
+```python
+import torch.distributed as dist
+
+from mooncake.mooncake_elastic_buffer import ElasticBuffer
+
+# Run this program with torchrun so rank metadata is available.
+dist.init_process_group(backend="nccl")
+buffer = ElasticBuffer(
+    dist.group.WORLD,
+    num_max_tokens_per_rank=128,
+    hidden=4096,
+    num_topk=8,
+)
+print(f"Mooncake EP selected {buffer.transport}")
+
+try:
+    # Call buffer.dispatch(...) and buffer.combine(...).
+    pass
+finally:
+    # Deterministic collective cleanup is recommended when NCCL was selected.
+    buffer.destroy()
+
+dist.destroy_process_group()
+```
+
+For a controlled rollout, pass `transport="ibgda"` or set
+`MOONCAKE_EP_TRANSPORT=ibgda`. Explicit `transport="nccl"` disables automatic
+fallback and reports an error if NCCL support is unavailable. The
+`explicitly_destroy` argument remains optional for compatibility with the
+DeepEP API; calling `destroy()` collectively is still the most predictable way
+to release NCCL symmetric windows before destroying the process group.
+
+The NCCL backend currently has the following constraints:
+
+- It requires NCCL 2.30.4 or newer with Device API and GIN support. The NCCL
+  headers used to build Mooncake must exactly match the loaded `libnccl`.
+  Rebuild Mooncake after an NCCL upgrade. If PyTorch would load another NCCL
+  first, configure or preload the matching runtime before initializing the
+  process group.
+- Process-group ranks must form contiguous, equal-sized NCCL LSA teams. The
+  compiled kernels support one team of two or eight GPUs (`1x2` or `1x8`), two
+  teams of four or eight GPUs (`2x4` or `2x8`), and four teams of four GPUs
+  (`4x4`). Cross-team communication uses hybrid mode and rail GIN. Auto mode
+  selects IPC + IBGDA for other shapes.
+- Groups with more than one rank request GIN resources, including runs whose
+  data path remains inside one LSA team.
+- Logical membership remains fixed. After every process observes that Mooncake
+  PG has restored every original logical rank slot, rebuild between EP
+  iterations. Each surviving process
+  calls `update_ep_member()` on its existing buffer while each replacement
+  process constructs an `ElasticBuffer` with the same arguments. Healthy
+  reconfiguration, with no replaced process, calls `update_ep_member()` on
+  every rank. These calls are one coordinated operation; do not start a new EP
+  operation until all calls return.
+- Reconfiguration rebuilds the host and device communicators, GIN resources,
+  symmetric window, and buffer allocation while preserving survivor Python
+  buffer objects. The recovered placement must still match a supported
+  topology. All dispatch handles and views created before the update are
+  invalid and must not be reused. Until the replacement is ready, the update
+  temporarily owns two complete NCCL generations: communicators, symmetric
+  windows, EP buffer allocations, and exclusive GIN contexts. Deployments near
+  memory, GIN-context, or QP limits must reserve capacity for both generations.
+- `update_ep_member()` does not complete an operation interrupted by failure or
+  run with missing logical ranks. Retry interrupted work after PG recovery.
+- A rank-local failure before the internal status collective is established
+  (for example, mismatched configuration/runtime or failure to allocate its
+  minimal CUDA control resources) is not recoverable in place and may require
+  restarting the process group. Use identical NCCL/CUDA configuration on every
+  rank.
+
 ## Active-rank tensors: PG vs EP
 
 There are two active-rank tensors in the API surface:
@@ -432,8 +562,22 @@ capacity consistent when propagating committed PG membership into EP.
 - PG collectives: `mooncake-pg/tests/test_pg_collectives.py`
 - PG elastic recovery and subgroup extension: `mooncake-pg/tests/test_pg_elastic.py`
 - PG benchmark harness: `mooncake-pg/benchmark/README.md`
-- EP correctness and failure simulation: `mooncake-ep/tests/test_ep_grid.py`
-- Wheel-level EP example: `mooncake-wheel/tests/test_mooncake_ep.py`
+- EP correctness and failure simulation: `python/tests/ep/test_ep_grid.py`
+- EP wrapper example: `python/tests/ep/test_mooncake_ep.py`
+- NCCL EP rank-replacement recovery: `python/tests/ep/test_elastic_buffer_recovery.py`
+
+Run the NCCL EP recovery tests from the repository root with two visible CUDA
+devices and NCCL-enabled EP/PG extensions:
+
+```bash
+python -m pytest -q python/tests/ep/test_elastic_buffer_recovery.py
+```
+
+These tests check dispatch/combine before and after worker replacement, reject
+stale EP handles, and cover reserved PG capacity and a `mooncake-cpu` control
+group. The EP data path remains on the GPUs when the control group uses CPU
+tensors. The tests reuse the PG worker harness and honor
+`MOONCAKE_PGTEST_DEVICE_FILTERS` for NIC selection.
 
 See [PG/EP troubleshooting](../../troubleshooting/pg-ep-troubleshooting.md) for
 common setup and runtime issues.

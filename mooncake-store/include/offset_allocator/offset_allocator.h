@@ -5,12 +5,14 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <string>
+#include <type_traits>
 #include <vector>
 #include <algorithm>
 #include <glog/logging.h>
+#include <ylt/util/tl/expected.hpp>
 
 #include "mutex.h"
-#include "serialize/serializer.h"
 
 namespace mooncake::offset_allocator {
 typedef unsigned char uint8;
@@ -44,7 +46,6 @@ struct OffsetAllocation {
     bool isNoSpace() const { return offset == NO_SPACE; }
 
     friend class __Allocator;
-    friend class Serializer<OffsetAllocationHandle>;
     friend class OffsetAllocator;  // for createHandleAtNode during recovery
 };
 
@@ -72,7 +73,7 @@ class OffsetAllocationHandle {
           requested_size(0) {}
 
     // Constructor for valid allocation
-    OffsetAllocationHandle(std::shared_ptr<OffsetAllocator> allocator,
+    OffsetAllocationHandle(std::weak_ptr<OffsetAllocator> allocator,
                            OffsetAllocation allocation, uint64_t base,
                            uint64_t size);
 
@@ -109,7 +110,6 @@ class OffsetAllocationHandle {
     uint64_t requested_size;
 
     friend class OffsetAllocatorTest;  // for unit tests
-    friend class Serializer<OffsetAllocationHandle>;
 };
 
 struct OffsetAllocatorMetrics {
@@ -200,7 +200,6 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
    private:
     friend class OffsetAllocationHandle;
-    friend class Serializer<OffsetAllocator>;
 
     // Internal method for Handle to free allocation (thread-safe)
     void freeAllocation(const OffsetAllocation& allocation, uint64_t size);
@@ -229,12 +228,6 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
                     uint32 max_capacity);
 
-    // Private constructor for creating from saved state with pre-constructed
-    // allocator This constructor is used during deserialization when we already
-    // have a reconstructed
-    OffsetAllocator(uint64_t base, size_t size, uint64_t multiplier_bits,
-                    std::unique_ptr<__Allocator> allocator);
-
     // Private constructor - initialize from serialized data
     template <typename T>
     OffsetAllocator(T& serializer);
@@ -245,7 +238,10 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 class __Allocator {
    public:
     __Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity);
+    // Excludes __Allocator itself, so copy construction never resolves to this
+    // serializer overload instead of the copy constructor.
     template <typename T>
+        requires(!std::is_same_v<std::remove_cvref_t<T>, __Allocator>)
     __Allocator(T& serializer) noexcept(false);
     __Allocator(__Allocator&& other);
     ~__Allocator() = default;
@@ -294,7 +290,6 @@ class __Allocator {
     uint32 m_freeOffset;
 
     friend class OffsetAllocatorTest;  // for unit tests
-    friend class mooncake::Serializer<__Allocator>;
     friend class OffsetAllocator;  // for visit_used_nodes / createHandleAtNode
 };
 
@@ -381,6 +376,7 @@ void __Allocator::serialize_to(T& serializer) const {
 }
 
 template <typename T>
+    requires(!std::is_same_v<std::remove_cvref_t<T>, __Allocator>)
 __Allocator::__Allocator(T& serializer) {
     // serializer.read() will throw an exception if the buffer is corrupted.
     try {
