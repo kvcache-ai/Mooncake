@@ -10,7 +10,7 @@ Mooncake 旨在通过在高速互联的 DRAM/SSD 资源上构建一个多级缓�
 - 支持动态增删缓存资源
 
 ## 架构概览
-![architecture](../../image/mooncake-store.png)
+![architecture](../image/mooncake-store.png)
 - Mooncake 对外提供对象（Object）级别的 Get/Put/List/Del 等操作，同时支持按用户要求动态调整复制策略等（Replicate 操作）；
 - Mooncake 支持基于 VRAM/DRAM/NVMe SSD 等存储介质的数据传输，同时尽可能实现零拷贝和多网卡池化数据传输。相应逻辑已抽象为 Transfer Engine 子系统，目前已完全开源；
 - Master 节点集中管理对象（Object）到 VRAM/DRAM/NVM 缓冲区（Buffer）的映射关系及空间管理策略。同时，Master 节点通过调用 Transfer Engine 的相关接口，驱动 Managed Pool Buffer 节点实现数据传输；
