@@ -1550,6 +1550,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
 
 tl::expected<void, ErrorCode> FileStorage::BatchLoadSpans(
     std::unordered_map<std::string, StorageValueSpan>& spans) {
+    if (disk_fenced_) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     auto start_time = std::chrono::steady_clock::now();
     auto result = storage_backend_->BatchLoadSpans(spans);
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(

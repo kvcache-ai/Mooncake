@@ -92,6 +92,13 @@ class FailingReadBackend : public BucketStorageBackend {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>&) override {
+        ++span_loads;
+        observer_(read_errno_, "preadv");
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch,
         std::function<ErrorCode(const std::vector<std::string>&,
@@ -104,6 +111,7 @@ class FailingReadBackend : public BucketStorageBackend {
     }
 
     int loads = 0;
+    int span_loads = 0;
     int offloads = 0;
 
    private:
@@ -803,6 +811,7 @@ class FileStorageTest : public ::testing::Test {
         bool offload_released = false;  // queued offload task, after them
         int64_t fenced_gauge = -1;
         bool fenced_offload_reached_backend = false;
+        bool fenced_span_load_reached_backend = false;
         size_t carried_before_fence = 0;  // carry_before_fence only
         size_t carried_after_fence = 0;   // carried tasks + pooled keys
     };
@@ -931,6 +940,14 @@ class FileStorageTest : public ::testing::Test {
                                  .size = static_cast<int64_t>(value.size())}});
             EXPECT_FALSE(offload.has_value());
             out.fenced_offload_reached_backend = backend->offloads > 0;
+            // Neither may a byte-window read.
+            std::string span_buffer(64, '\0');
+            std::unordered_map<std::string, StorageValueSpan> spans{
+                {"key", StorageValueSpan{
+                            0, span_buffer.size(),
+                            Slice{span_buffer.data(), span_buffer.size()}}}};
+            EXPECT_FALSE(file_storage.BatchLoadSpans(spans).has_value());
+            out.fenced_span_load_reached_backend = backend->span_loads > 0;
         }
         allocator.deallocate(buffer, value.size());
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
@@ -2320,6 +2337,7 @@ TEST_F(FileStorageTest, DiskFenceEioOnDeadFilesystemFencesDiskTier) {
     EXPECT_TRUE(out.offload_released);
     EXPECT_EQ(out.fenced_gauge, 1);
     EXPECT_FALSE(out.fenced_offload_reached_backend);
+    EXPECT_FALSE(out.fenced_span_load_reached_backend);
 }
 
 // EIO while the filesystem is alive (real fstat on the live directory): one
