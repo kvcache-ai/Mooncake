@@ -2132,6 +2132,26 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
     return {};
 }
 
+namespace {
+// Shared selector for bucket direct-write implementations. The aligned layout
+// will be added separately; do not silently treat it as packed or buffered.
+tl::expected<bool, ErrorCode> ReadPackedBucketDirectWrite() {
+    const auto setting = Environ::ReadOr(
+        BucketBackendEnvironmentVariables::MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE,
+        std::string{"0"});
+    if (setting == "0" || setting == "false") return false;
+    if (setting == "packed" || setting == "true" || setting == "1") return true;
+    if (setting == "aligned") {
+        LOG(ERROR) << "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=aligned is not yet "
+                      "supported by this build";
+    } else {
+        LOG(ERROR) << "Invalid MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE='"
+                   << setting << "'; expected 0/false or packed/true/1";
+    }
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+}
+}  // namespace
+
 tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
     namespace fs = std::filesystem;
     try {
@@ -2139,6 +2159,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+
+        const auto direct_write = ReadPackedBucketDirectWrite();
+        if (!direct_write) return tl::make_unexpected(direct_write.error());
 
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
@@ -4024,12 +4047,12 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     // Data buckets can use the existing aligned io_uring write path.
     // Keep protobuf metadata buffered: padding .meta changes its encoding.
     // Opt in explicitly so deployments can roll back by configuration.
-    const auto direct_write_setting = Environ::ReadOr(
-        BucketBackendEnvironmentVariables::MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE,
-        std::string{"false"});
-    const bool direct_write =
-        mode == FileMode::Write && path.ends_with(BUCKET_DATA_FILE_SUFFIX) &&
-        (direct_write_setting == "true" || direct_write_setting == "1");
+    bool direct_write = false;
+    if (mode == FileMode::Write && path.ends_with(BUCKET_DATA_FILE_SUFFIX)) {
+        const auto packed = ReadPackedBucketDirectWrite();
+        if (!packed) return tl::make_unexpected(packed.error());
+        direct_write = packed.value();
+    }
     const bool use_direct = file_storage_config_.use_uring &&
                             (mode == FileMode::Read || direct_write);
     if (use_direct) {

@@ -52,9 +52,13 @@ struct WriteMode {
 };
 
 std::vector<WriteMode> WriteModes() {
-    std::vector<WriteMode> modes{{"true", "8", false}};
+    const char* direct_settings[] = {nullptr,  "0",    "false",
+                                     "packed", "true", "1"};
+    std::vector<WriteMode> modes;
+    for (const char* direct : direct_settings) {
+        modes.push_back({direct, "8", false});
+    }
 #ifdef USE_URING
-    const char* direct_settings[] = {nullptr, "false", "true", "1"};
     for (const char* threads : {"1", "4", "8"}) {
         for (const char* direct : direct_settings) {
             modes.push_back({direct, threads, true});
@@ -64,7 +68,6 @@ std::vector<WriteMode> WriteModes() {
     for (const char* threads : {"0", "-2", "9", "invalid"}) {
         modes.push_back({"true", threads, true});
     }
-    modes.push_back({"invalid", "8", true});
     modes.push_back({"true", nullptr, true});
 #endif
     return modes;
@@ -102,6 +105,7 @@ class BucketDirectWriteTest : public ::testing::TestWithParam<WriteMode> {
         const auto mode = GetParam();
         return mode.use_uring && mode.direct &&
                (std::string(mode.direct) == "true" ||
+                std::string(mode.direct) == "packed" ||
                 std::string(mode.direct) == "1");
     }
 
@@ -203,6 +207,27 @@ class BucketDirectWriteTest : public ::testing::TestWithParam<WriteMode> {
             << ".meta must have its exact protobuf length";
     }
 };
+
+TEST(BucketDirectWriteConfigTest, RejectsUnsupportedModesBeforeCreatingFiles) {
+    char directory[] = "/tmp/mooncake-bucket-mode-XXXXXX";
+    ASSERT_NE(mkdtemp(directory), nullptr);
+    const std::filesystem::path path = directory;
+    FileStorageConfig file_config;
+    file_config.storage_filepath = path.string();
+    BucketBackendConfig bucket_config;
+    for (const char* setting : {"aligned", "invalid", "PACKED", ""}) {
+        SCOPED_TRACE(setting);
+        ScopedEnvVar env("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE", setting);
+        BucketStorageBackend backend(file_config, bucket_config);
+        const auto result = backend.Init();
+        EXPECT_FALSE(result);
+        if (!result) {
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
+        EXPECT_TRUE(std::filesystem::is_empty(path));
+    }
+    std::filesystem::remove_all(path);
+}
 
 TEST_P(BucketDirectWriteTest, LayoutRollbackAndRestartReadback) {
     Values all_values;
