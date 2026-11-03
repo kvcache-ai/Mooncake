@@ -28,6 +28,76 @@ using mooncake::test::MockMetadataStore;
 
 namespace mooncake::test {
 
+// The checksum-aware wire shapes before residency affinity was appended.
+struct ChecksumMetadataPayload {
+    UUID client_id{0, 0};
+    uint64_t size{0};
+    std::vector<Replica::Descriptor> replicas;
+    struct_pack::compatible<std::string, 1> group_id;
+    struct_pack::compatible<ObjectDataType, 1> data_type;
+    struct_pack::compatible<bool, 1> hard_pinned;
+    struct_pack::compatible<std::string, 2> session_id;
+    struct_pack::compatible<uint64_t, 3> object_checksum;
+    YLT_REFL(ChecksumMetadataPayload, client_id, size, replicas, group_id,
+             data_type, hard_pinned, session_id, object_checksum);
+};
+
+struct ChecksumStandbyMetadata {
+    UUID client_id{0, 0};
+    uint64_t size{0};
+    std::vector<Replica::Descriptor> replicas;
+    std::string group_id;
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    struct_pack::compatible<bool, 1> hard_pinned;
+    struct_pack::compatible<std::string, 2> session_id;
+    struct_pack::compatible<uint64_t, 3> object_checksum;
+    YLT_REFL(ChecksumStandbyMetadata, client_id, size, replicas, group_id,
+             data_type, hard_pinned, session_id, object_checksum);
+};
+
+template <typename Current, typename Previous>
+void CheckAffinityWireCompatibility() {
+    EXPECT_EQ(struct_pack::get_type_code<Current>(),
+              struct_pack::get_type_code<Previous>());
+    for (uint64_t checksum : {0, 0x1234}) {
+        Previous old;
+        old.session_id = "session";
+        old.object_checksum = checksum;
+        auto current =
+            struct_pack::deserialize<Current>(struct_pack::serialize(old));
+        ASSERT_TRUE(current);
+        EXPECT_FALSE(current->residency_affinity_id);
+        EXPECT_EQ(checksum, current->object_checksum.value());
+        EXPECT_EQ("session", current->session_id.value());
+        current->residency_affinity_id = "affinity";
+        auto old_reader = struct_pack::deserialize<Previous>(
+            struct_pack::serialize(*current));
+        ASSERT_TRUE(old_reader);
+        EXPECT_EQ(checksum, old_reader->object_checksum.value());
+        EXPECT_EQ("session", old_reader->session_id.value());
+        auto roundtrip =
+            struct_pack::deserialize<Current>(struct_pack::serialize(*current));
+        ASSERT_TRUE(roundtrip);
+        EXPECT_EQ("affinity", roundtrip->residency_affinity_id.value());
+        EXPECT_EQ(checksum, roundtrip->object_checksum.value());
+        current->residency_affinity_id = "";
+        roundtrip =
+            struct_pack::deserialize<Current>(struct_pack::serialize(*current));
+        ASSERT_TRUE(roundtrip);
+        ASSERT_TRUE(roundtrip->residency_affinity_id);
+        EXPECT_TRUE(roundtrip->residency_affinity_id->empty());
+    }
+}
+
+TEST(ResidencyAffinityWireTest, ChecksumPayloadRemainsCompatible) {
+    CheckAffinityWireCompatibility<MetadataPayload, ChecksumMetadataPayload>();
+}
+
+TEST(ResidencyAffinityWireTest, ChecksumSnapshotRemainsCompatible) {
+    CheckAffinityWireCompatibility<StandbyObjectMetadata,
+                                   ChecksumStandbyMetadata>();
+}
+
 class ReplayDiagnosticSink : public google::LogSink {
    public:
     ReplayDiagnosticSink() { google::AddLogSink(this); }
@@ -923,6 +993,25 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidPayload) {
     EXPECT_EQ(2u, meta->client_id.second);
     EXPECT_EQ(2048u, meta->size);
     EXPECT_FALSE(meta->hard_pinned.value_or(false));
+}
+
+TEST_F(OpLogApplierTest, TestApplyPutEndPreservesResidencyAffinity) {
+    MetadataPayload payload;
+    payload.client_id = {1, 2};
+    payload.size = 1024;
+    payload.session_id = "session";
+    payload.object_checksum = 0;
+    payload.residency_affinity_id = "opaque-affinity";
+    const auto bytes = struct_pack::serialize(payload);
+    auto entry = MakeEntry(1, OpType::PUT_END, "affinity-key",
+                           std::string(bytes.begin(), bytes.end()));
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(entry));
+    auto stored = mock_metadata_store_->GetMetadata("affinity-key");
+    ASSERT_TRUE(stored);
+    EXPECT_EQ("opaque-affinity", stored->residency_affinity_id.value_or(""));
+    EXPECT_EQ("session", stored->session_id.value_or(""));
+    ASSERT_TRUE(stored->object_checksum);
+    EXPECT_EQ(0u, stored->object_checksum.value());
 }
 
 TEST_F(OpLogApplierTest, TestApplyPutEnd_PreservesHardPinned) {
