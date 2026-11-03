@@ -200,6 +200,7 @@ class EtcdHelper {
      * @param end_key: End key (exclusive).
      * @param end_key_size: Size in bytes.
      * @param limit: Maximum number of kvs to return (0 means no limit).
+     * @param serializable: Serve the read locally without a Raft quorum read.
      * @param json: Output JSON string, format: [{"key":"...","value":"..."}]
      * @param revision_id: Output etcd revision of this read
      * (resp.Header.Revision).
@@ -209,7 +210,8 @@ class EtcdHelper {
                                     const char* end_key,
                                     const size_t end_key_size, size_t limit,
                                     std::string& json,
-                                    EtcdRevisionId& revision_id);
+                                    EtcdRevisionId& revision_id,
+                                    bool serializable = false);
 
     /*
      * @brief Get the first key with a given prefix (sorted by key).

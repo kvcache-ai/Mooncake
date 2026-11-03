@@ -1112,16 +1112,29 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     auto err = reader->SetBaselineCursor(baseline);
     if (err != ErrorCode::OK) return err;
     // Recheck the floor and durable suffix after restoring the candidate.
+    const auto catch_up_poll_interval =
+        std::chrono::milliseconds(std::max(config_.oplog_poll_interval_ms, 1));
     OpLogBatchStandbyPollResult poll;
-    do {
+    for (;;) {
         if (!replication_loop_running_.load(std::memory_order_acquire)) {
             return ErrorCode::ETCD_CTX_CANCELLED;
         }
         poll = reader->PollOnce(config_.oplog_standby_max_batches_per_poll);
         if (poll.error != ErrorCode::OK) return poll.error;
-    } while (poll.durable_prefix_present &&
-             applier->GetExpectedSequenceId() - 1 <
-                 poll.durable_prefix.last_seq);
+        if (!poll.durable_prefix_present ||
+            applier->GetExpectedSequenceId() - 1 >=
+                poll.durable_prefix.last_seq) {
+            break;
+        }
+        if (poll.has_more_pages) continue;
+
+        std::unique_lock<std::mutex> wait_lock(replication_loop_mutex_);
+        replication_loop_cv_.wait_for(
+            wait_lock, catch_up_poll_interval, [this] {
+                return !replication_loop_running_.load(
+                    std::memory_order_acquire);
+            });
+    }
     auto cursor = reader->GetLastAppliedDurablePrefix();
     if (!poll.durable_prefix_present || !cursor ||
         *cursor != poll.durable_prefix ||

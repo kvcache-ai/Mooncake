@@ -1,6 +1,5 @@
 #include "ha/oplog/oplog_batch_standby_reader.h"
 
-#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -150,13 +149,8 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
     last_observed_prefix_ = prefix;
     if (prefix.batch_id <= last_applied_batch_id_) {
         TestFailPoint::Wait("standby_prefix_read_before_batch");
-        OpLogBatchRecord target_batch;
-        err = storage_.ReadBatch(prefix.batch_id, target_batch);
-        if (err != ErrorCode::OK) {
-            SetPollError(result, err, IsRetryableBackendError(err));
-            return result;
-        }
-        if (target_batch.last_seq != prefix.last_seq) {
+        if (prefix.batch_id != last_applied_batch_id_ ||
+            last_scanned_batch_last_seq_ != prefix.last_seq) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }
@@ -171,30 +165,20 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
 
     std::vector<OpLogBatchRecord> batches;
     TestFailPoint::Wait("standby_prefix_read_before_batch");
-    err =
-        storage_.ReadBatchesAfter(last_applied_batch_id_, max_batches, batches);
+    err = storage_.ReadBatchesAfter(last_applied_batch_id_, max_batches,
+                                    batches, /*serializable=*/true);
     if (err != ErrorCode::OK) {
         SetPollError(result, err, IsRetryableBackendError(err));
         return result;
     }
-    const bool target_batch_in_page = std::any_of(
-        batches.begin(), batches.end(), [&](const auto& batch) {
-            return batch.batch_id == prefix.batch_id;
-        });
-    if (!target_batch_in_page &&
-        (max_batches == 0 || batches.size() < max_batches)) {
-        OpLogBatchRecord target_batch;
-        err = storage_.ReadBatch(prefix.batch_id, target_batch);
-        if (err != ErrorCode::OK) {
-            SetPollError(result, err, IsRetryableBackendError(err));
-            return result;
+    for (const auto& batch : batches) {
+        if (batch.batch_id > prefix.batch_id) {
+            break;
         }
-        if (target_batch.last_seq != prefix.last_seq) {
+        if (batch.last_seq > prefix.last_seq) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
             return result;
         }
-    }
-    for (const auto& batch : batches) {
         if (last_applied_batch_id_ == UINT64_MAX ||
             (last_applied_batch_id_ != 0 &&
              batch.batch_id != last_applied_batch_id_ + 1) ||
@@ -244,6 +228,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
         ++result.applied_batches;
         last_applied_batch_id_ = batch.batch_id;
         last_scanned_batch_last_seq_ = batch.last_seq;
+        last_applied_durable_prefix_ = {
+            .batch_id = batch.batch_id,
+            .last_seq = batch.last_seq,
+        };
         if (last_applied_batch_id_ >= prefix.batch_id) {
             break;
         }
@@ -251,6 +239,12 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
     result.has_more_pages = max_batches != 0 &&
                             batches.size() >= max_batches &&
                             last_applied_batch_id_ < prefix.batch_id;
+    if (!result.has_more_pages && last_applied_batch_id_ < prefix.batch_id) {
+        // A local serializable Range may trail the linearizable durable prefix.
+        // Keep the cursor at the last contiguous batch and wait for a later
+        // poll to observe the immutable suffix; never skip a batch or fail HA.
+        return result;
+    }
     if (!result.has_more_pages &&
         IsSequenceOlderOrEqual(applier_.GetExpectedSequenceId(),
                                prefix.last_seq)) {

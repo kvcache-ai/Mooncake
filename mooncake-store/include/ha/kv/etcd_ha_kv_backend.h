@@ -12,6 +12,9 @@ class EtcdHaKvBackend : public HaKvBackend {
                                 std::string_view value) override;
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override;
+    ErrorCode RangeSerializable(std::string_view begin_key,
+                                std::string_view end_key, size_t limit,
+                                std::vector<KvPair>& kvs) override;
     ErrorCode DeleteRange(std::string_view begin_key,
                           std::string_view end_key) override;
     KvWriteResult DeleteRangeWithResult(std::string_view begin_key,
