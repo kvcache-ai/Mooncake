@@ -441,7 +441,8 @@ std::string PrefixCacheTable::RemoveEngine(const EngineMutation& mutation) {
             } else if (mutation.tier == StorageTier::kCpuLocal) {
                 if (prefix == mutation.prefixes.back()) {
                     auto& ends = block->second.vllm_cpu_chunk_end_refs;
-                    if (auto end = ends.find(mutation.owner); end != ends.end()) {
+                    if (auto end = ends.find(mutation.owner);
+                        end != ends.end()) {
                         if (--end->second == 0) {
                             ends.erase(end);
                         }
@@ -523,9 +524,10 @@ std::string PrefixCacheTable::StoreShared(const SharedMutation& mutation) {
             std::erase_if(presence.cpu_local_refs, [&](const auto& ref) {
                 return !presence.cpu_local_owners.contains(ref.first);
             });
-            std::erase_if(presence.vllm_cpu_chunk_end_refs, [&](const auto& ref) {
-                return !presence.cpu_local_owners.contains(ref.first);
-            });
+            std::erase_if(
+                presence.vllm_cpu_chunk_end_refs, [&](const auto& ref) {
+                    return !presence.cpu_local_owners.contains(ref.first);
+                });
         } else {
             presence.disk_owners.insert(mutation.owner);
         }
@@ -773,14 +775,14 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
                        engine_present(block.cpu_local_owners);
             };
             auto chunk_end_present = [&](const BlockPresence& block) {
-                return std::any_of(
-                    block.vllm_cpu_chunk_end_refs.begin(),
-                    block.vllm_cpu_chunk_end_refs.end(),
-                    [&](const auto& entry) {
-                        const auto& owner = entry.first;
-                        return owner.instance_id == instance_id &&
-                               owner.dp_rank == rank;
-                    });
+                return std::any_of(block.vllm_cpu_chunk_end_refs.begin(),
+                                   block.vllm_cpu_chunk_end_refs.end(),
+                                   [&](const auto& entry) {
+                                       const auto& owner = entry.first;
+                                       return owner.instance_id ==
+                                                  instance_id &&
+                                              owner.dp_rank == rank;
+                                   });
             };
             const bool vllm_rank =
                 state->instance_publishers.at(instance_id).at(rank) ==
@@ -819,7 +821,8 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
 
             if (!partial_local_chunk) {
                 advance_cursor(cursor, [&](const BlockPresence& block) {
-                    return shared_present(block) || accessible(block.disk_owners);
+                    return shared_present(block) ||
+                           accessible(block.disk_owners);
                 });
             }
             rank_match.disk =

@@ -1258,11 +1258,12 @@ TEST(Mutations, VllmCpuLocalOverlappingChunksSurviveOneChunkEviction) {
     EXPECT_EQ(b_hit(), RankMatch(0, 128, 128, 128));
     // A prompt that ends two blocks into A's second chunk can load only the
     // first complete chunk, even though every announced block is resident.
-    EXPECT_EQ(table.Query(TestContext(),
-                          std::span<const int32_t>(tokens_a.data(), 96))
-                  .at("instance-a")
-                  .rank_matches.at(0),
-              RankMatch(0, 64, 64, 64));
+    EXPECT_EQ(
+        table
+            .Query(TestContext(), std::span<const int32_t>(tokens_a.data(), 96))
+            .at("instance-a")
+            .rank_matches.at(0),
+        RankMatch(0, 64, 64, 64));
 
     // vLLM evicts A's second chunk: BlockRemoved for ha[4..7]. Both of B's
     // chunks are still in vLLM's CPU tier, so all of B's prompt can still be
