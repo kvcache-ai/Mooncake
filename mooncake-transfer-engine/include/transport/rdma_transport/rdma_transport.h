@@ -191,6 +191,30 @@ class RdmaTransport : public Transport {
     std::mutex chunk_map_mutex_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
 
+    // A registration of HugeTLB host memory that does not cover whole huge
+    // pages is widened outward to the enclosing huge pages before ibv_reg_mr
+    // is called (see registerLocalMemoryInternal): the kernel refuses to split
+    // a hugetlb VMA when ibv_fork_init() makes the registration madvise() it.
+    // Such an MR is registered under a base the caller never sees, while the
+    // published BufferDesc keeps the caller's range. Two things are tracked:
+    //
+    // hugetlb_registered_regions_ holds the range of every live hugetlb-backed
+    // MR (widened or not), keyed by MR base. Overlap is what has to be refused,
+    // not just a shared base: RdmaContext's MR map would silently drop an MR
+    // registered at a duplicate base, and unregisterMemoryRegion() madvises
+    // MADV_DOFORK over the whole MR range (issue #3639), which must not be
+    // re-opened while a second MR still covers part of it. Overlapping the
+    // interior of a larger registration has exactly that effect, so every
+    // hugetlb-backed registration is claimed and checked against the live
+    // ranges rather than their bases.
+    //
+    // hugepage_widen_aliases_ maps a widened registration's caller-visible
+    // address to the base its MR actually lives at, so unregisterLocalMemory
+    // (which only receives the caller's address) can deregister it.
+    std::mutex hugetlb_registry_mutex_;
+    std::map<uint64_t, size_t> hugetlb_registered_regions_;
+    std::unordered_map<uint64_t, uint64_t> hugepage_widen_aliases_;
+
     // Single-buffer counterpart of chunk_map_'s pending bookkeeping: base
     // addresses whose metadata was removed but whose MR deregistration has
     // not completed. Gates the metadata-missing fall-through so only a known

@@ -8,10 +8,11 @@
 // active after ibv_fork_init() — fails with EINVAL when the kernel has to
 // split the hugetlb VMA at a non-hugepage-aligned boundary.
 //
-// Sub-range registrations are deliberately NOT special-cased: they register
-// the logical range exactly as passed. On RDMA a misaligned range may fail
-// with EINVAL depending on the environment's fork-protection behavior; the
-// invariant is that the range is never silently widened.
+// Sub-range registrations are not special-cased at this layer: the logical
+// range is passed through exactly as given. The RDMA transport then widens a
+// misaligned HugeTLB sub-range to its enclosing huge pages itself (see
+// RdmaTransport::registerLocalMemoryInternal), so such a range also registers
+// on a fork-protected stack, where it used to fail with EINVAL.
 //
 // Protocol/device are taken from the PROTOCOL / DEVICE_NAME environment
 // variables (tcp|rdma, same convention as pybind_client_test). With
@@ -308,16 +309,18 @@ TEST_F(RealClientHugepageRegisterTest, SubHugepageMaxMrSizeIsRejected) {
     EXPECT_EQ(ShmHelper::getInstance()->free(base), 0);
 }
 
-// Sub-range registrations are not special-cased: an interior pointer is
-// registered exactly as passed. On RDMA (ibv_fork_init active) a misaligned
-// interior sub-range of a hugetlb VMA fails with EINVAL; on TCP there is no
-// ibv_reg_mr and the exact registration succeeds.
+// Sub-range registrations are not special-cased at the store layer: an
+// interior pointer is passed through exactly as given. Widening to whole huge
+// pages is done by RdmaTransport::registerLocalMemoryInternal, which covers an
+// interior pointer just as well as a segment base, so on RDMA (ibv_fork_init
+// active) a misaligned interior sub-range of a hugetlb VMA now registers
+// instead of failing with EINVAL; on TCP there is no ibv_reg_mr and the exact
+// registration succeeds either way.
 //
-// This test is intentionally the LAST in the suite: the deliberately failed
-// ibv_reg_mr leaves residue in libibverbs' process-global fork-protection
-// bookkeeping (rdma-core does not roll back the DONTFORK state on failure),
-// which can poison the first registration of the following test. Keeping it
-// last isolates that upstream artifact from the other tests.
+// The test accepts both outcomes so it still runs meaningfully against a
+// transport stack that does not widen (e.g. TCP only, or an environment that
+// sets IBV_FORK_UNNEEDED / RDMAV_HUGEPAGES_SAFE=1 where ibv_reg_mr never fails
+// on a misaligned hugetlb range).
 TEST_F(RealClientHugepageRegisterTest,
        MisalignedInteriorSubRangeRegistersExactly) {
     const size_t kSegmentSize = 8 * 1024 * 1024;
@@ -329,12 +332,13 @@ TEST_F(RealClientHugepageRegisterTest,
     void* sub = static_cast<char*>(base) + kOffset;
 
     const int rc = client_->register_buffer(sub, kLength);
-    // The interior pointer is registered exactly as passed: widening only
-    // applies to the segment base (buffer == shm->base_addr), so it never
-    // triggers here. Whether ibv_reg_mr then rejects the misaligned range
-    // depends on the environment's fork-protection behavior (e.g.
-    // IBV_FORK_UNNEEDED, or RDMAV_HUGEPAGES_SAFE=1), so accept both outcomes
-    // and only require that a successful registration unregisters cleanly.
+    // The store passes the interior pointer through untouched; the RDMA
+    // transport widens it to the enclosing huge pages, independently of
+    // fork-protection settings. A failure here means the widening did not
+    // happen.
+    EXPECT_EQ(rc, 0) << "an interior sub-range of a HugeTLB segment must "
+                        "register once the transport widens it to whole huge "
+                        "pages";
     if (rc == 0) {
         EXPECT_EQ(client_->unregister_buffer(sub), 0);
     }
