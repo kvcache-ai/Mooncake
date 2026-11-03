@@ -32,7 +32,6 @@
 #include "p2p/client/data_manager/v2/block_pool.h"
 #include "p2p/client/data_manager/v2/block_registry.h"
 #include "p2p/client/data_manager/v2/event_center.h"
-#include "p2p/client/data_manager/v2/eviction_index.h"
 #include "p2p/client/data_manager/v2/v2_common.h"
 #include "p2p/common/p2p_types.h"
 
@@ -71,9 +70,8 @@ struct TilerConfig {
             return offload_high_watermark.value_or(fallback);
         }
     } placement_policy;
-    /** Which cold/hot ordering this tier's evict engine selects victims from.
-     */
-    EvictionIndexConfig eviction;
+    /** nullopt inherits the global BlockIndex configuration. */
+    std::optional<BlockIndexConfig> block_index_override;
 };
 
 /**
@@ -81,16 +79,10 @@ struct TilerConfig {
  */
 class TilerManager {
    public:
-    /**
-     * @param eviction_config Defaulted so a component test that does not care
-     *        about victim ordering does not have to supply one. Production
-     *        always passes the parsed configuration, validated at Init.
-     */
     TilerManager(const LogicalTilerConfig& logical_config,
-                 const BlockIndexConfig& index_config,
+                 std::unique_ptr<BlockIndex> block_index,
                  std::shared_ptr<BlockPool> block_pool,
                  BlockRegistry block_registry, EventPublisher event_publisher,
-                 const EvictionIndexConfig& eviction_config = {},
                  double offload_high_watermark =
                      TilerConfig::kDefaultOffloadHighWatermark);
 
@@ -159,35 +151,8 @@ class TilerManager {
     void NotifyDeleted(const BlockRegistrationHandle& registration,
                        const BlockId& block_id, size_t size_bytes) const;
 
-    /**
-     * @brief This tier's cold/hot ordering.
-     *
-     * Non-authoritative and never a substitute for the BlockIndex: it answers
-     * "what would I give up first", and every candidate it names is re-checked
-     * here before anything is removed. Owned by the tiler because the two are
-     * updated in the same mutation -- an ordering that can silently lose a
-     * committed block leaks that block's bytes for the process lifetime, since
-     * nothing else offers victims.
-     */
-    EvictionIndex* Eviction() const { return eviction_index_.get(); }
-
-    /**
-     * @brief A BlockIndex snapshot of one shard, as eviction-index tokens.
-     *
-     * Names the shard it covers and when it was taken, because Reconcile
-     * treats a snapshot as proof of absence: without that scope it would drop
-     * every entry outside this shard, and a block the ordering has forgotten
-     * is one nothing will ever offer as a victim.
-     */
-    BlockIndexSnapshot SnapshotTokens(size_t shard_id) const;
-
-    /**
-     * @brief The same over every shard, still one shard lock at a time.
-     *
-     * The only form that can clear the eviction index's needs_reconcile flag:
-     * a per-shard snapshot proves nothing about the shards it did not read.
-     */
-    BlockIndexSnapshot SnapshotAllTokens() const;
+    /** The injected visibility and victim-ordering backend. */
+    BlockIndex* Index() const { return block_index_.get(); }
 
     /** Detach every entry. Returns the detached entries for outside release. */
     std::vector<BlockEntryPtr> DrainAll();
@@ -212,7 +177,6 @@ class TilerManager {
     void SetReplicaObserver(ReplicaObserver observer) {
         replica_observer_ = std::move(observer);
     }
-    void ReconcileEviction(const Clock& clock, Clock::time_point deadline);
     size_t FreeBytes() const;
     BlockIndexStats IndexStats() const;
 
@@ -238,10 +202,6 @@ class TilerManager {
         CompletedBlock&& block, const BlockRegistrationHandle& registration,
         bool defer_notify);
 
-    /** Fill in what the snapshot covers, before anything is read. */
-    void OpenSnapshot(BlockIndexSnapshot& snapshot) const;
-    void AppendShardTokens(size_t shard_id, BlockIndexSnapshot& snapshot) const;
-
     UUID tiler_id_;
     MemoryType memory_type_;
     int32_t priority_ = 0;
@@ -249,15 +209,12 @@ class TilerManager {
     std::vector<std::string> tags_;
     std::shared_ptr<BlockPool> block_pool_;
     std::unique_ptr<BlockIndex> block_index_;
-    std::unique_ptr<EvictionIndex> eviction_index_;
     BlockRegistry block_registry_;
     EventPublisher event_publisher_;
     std::atomic<bool> stopped_{false};
     ReplicaObserver replica_observer_;
     // DrainAll must observe additions/removals after their lifecycle hooks.
     mutable std::shared_mutex replica_mutation_mu_;
-    std::mutex reconcile_mu_;
-    size_t reconcile_cursor_ = 0;
 };
 
 /**

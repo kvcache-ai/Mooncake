@@ -288,7 +288,14 @@ class LocalCopyEngineTest : public ::testing::Test {
         logical.tiler_id = generate_uuid();
         logical.memory_type = MemoryType::DRAM;
         logical.priority = priority;
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(logical, std::move(index.value()),
                                               std::move(pool.value()),
                                               registry_, EventPublisher());
     }
@@ -309,7 +316,14 @@ class LocalCopyEngineTest : public ::testing::Test {
         logical.tiler_id = generate_uuid();
         logical.memory_type = MemoryType::NVME;
         logical.priority = priority;
-        return std::make_unique<TilerManager>(logical, BlockIndexConfig{},
+        auto index = CreateBlockIndex(BlockIndexConfig{}, logical.tiler_id,
+                                      (*pool)->Capacity());
+        if (!index) {
+            ADD_FAILURE() << "CreateBlockIndex failed: "
+                          << toString(index.error());
+            return nullptr;
+        }
+        return std::make_unique<TilerManager>(logical, std::move(index.value()),
                                               std::move(pool.value()),
                                               registry_, EventPublisher());
     }

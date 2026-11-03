@@ -30,6 +30,58 @@ size_t ParseByteSize(const Json::Value& value) {
     return static_cast<size_t>(value.asUInt64());
 }
 
+/** Apply only fields present in one global or per-tier JSON object. */
+tl::expected<void, ErrorCode> ApplyBlockIndexConfig(const Json::Value& node,
+                                                    BlockIndexConfig& config,
+                                                    std::string_view path) {
+    if (!node.isObject()) {
+        LOG(ERROR) << path << " must be an object";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (node.isMember("type") && !node["type"].isString()) {
+        LOG(ERROR) << path << ".type must be a string";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (node.isMember("max_load_factor") &&
+        !node["max_load_factor"].isNumeric()) {
+        LOG(ERROR) << path << ".max_load_factor must be numeric";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (const char* field : {"shard_count", "max_victim_candidates",
+                              "sketch_capacity", "band_warm_threshold",
+                              "band_hot_threshold", "band_veryhot_threshold"}) {
+        if (node.isMember(field) && !node[field].isUInt64()) {
+            LOG(ERROR) << path << "." << field
+                       << " must be an unsigned integer";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    if (node.isMember("type")) config.type = node["type"].asString();
+    if (node.isMember("shard_count")) {
+        config.shard_count = node["shard_count"].asUInt64();
+    }
+    if (node.isMember("max_load_factor")) {
+        config.max_load_factor = node["max_load_factor"].asFloat();
+    }
+    if (node.isMember("max_victim_candidates")) {
+        config.max_victim_candidates = node["max_victim_candidates"].asUInt64();
+    }
+    if (node.isMember("sketch_capacity")) {
+        config.sketch_capacity = node["sketch_capacity"].asUInt64();
+    }
+    if (node.isMember("band_warm_threshold")) {
+        config.band_warm_threshold = node["band_warm_threshold"].asUInt64();
+    }
+    if (node.isMember("band_hot_threshold")) {
+        config.band_hot_threshold = node["band_hot_threshold"].asUInt64();
+    }
+    if (node.isMember("band_veryhot_threshold")) {
+        config.band_veryhot_threshold =
+            node["band_veryhot_threshold"].asUInt64();
+    }
+    return {};
+}
+
 tl::expected<size_t, ErrorCode> TotalSliceSize(
     const std::vector<Slice>& slices) {
     size_t total = 0;
@@ -187,21 +239,16 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         config.tilers.push_back(std::move(tiler));
     }
 
-    // Eviction ordering defaults are shared unless a per-tier override is
-    // added in the future. Offload watermarks are tier-specific.
-    EvictionIndexConfig default_eviction;
-
     if (tier_config.isMember("v2")) {
         const auto& v2 = tier_config["v2"];
+        if (v2.isMember("eviction_index")) {
+            LOG(ERROR) << "v2.eviction_index moved to v2.block_index";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         if (v2.isMember("block_index")) {
-            const auto& node = v2["block_index"];
-            if (node.isMember("shard_count")) {
-                config.block_index.shard_count = node["shard_count"].asUInt64();
-            }
-            if (node.isMember("max_load_factor")) {
-                config.block_index.max_load_factor =
-                    node["max_load_factor"].asFloat();
-            }
+            auto parsed = ApplyBlockIndexConfig(
+                v2["block_index"], config.block_index, "v2.block_index");
+            if (!parsed) return tl::make_unexpected(parsed.error());
         }
         if (v2.isMember("block_registry") &&
             v2["block_registry"].isMember("shard_count")) {
@@ -232,8 +279,7 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         }
         if (v2.isMember("placement_policy")) {
             // Keep the global offload threshold as the default for tiers with
-            // no local override. Other policy keys retain their established
-            // JSON locations and are copied into the components that use them.
+            // no local override.
             const auto& node = v2["placement_policy"];
             if (node.isMember("offload_high_watermark")) {
                 config.movement.offload_high_watermark =
@@ -244,23 +290,14 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
                 config.movement.onboard_min_read_heat =
                     node["onboard_min_frequency"].asDouble();
             }
-            // The band thresholds and the sketch belong to the per-tier
-            // eviction ordering, which has its own block.
-            if (node.isMember("sketch_capacity")) {
-                default_eviction.sketch_capacity =
-                    node["sketch_capacity"].asUInt64();
-            }
-            if (node.isMember("band_warm_threshold")) {
-                default_eviction.band_warm_threshold =
-                    node["band_warm_threshold"].asUInt64();
-            }
-            if (node.isMember("band_hot_threshold")) {
-                default_eviction.band_hot_threshold =
-                    node["band_hot_threshold"].asUInt64();
-            }
-            if (node.isMember("band_veryhot_threshold")) {
-                default_eviction.band_veryhot_threshold =
-                    node["band_veryhot_threshold"].asUInt64();
+            for (const char* field :
+                 {"sketch_capacity", "band_warm_threshold",
+                  "band_hot_threshold", "band_veryhot_threshold"}) {
+                if (node.isMember(field)) {
+                    LOG(ERROR) << "v2.placement_policy." << field
+                               << " moved to v2.block_index." << field;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
             }
         }
         if (v2.isMember("tier_placement")) {
@@ -290,20 +327,6 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
             if (node.isMember("copy_timeout_ms")) {
                 config.copier.copy_timeout = std::chrono::milliseconds(
                     node["copy_timeout_ms"].asInt64());
-            }
-        }
-        if (v2.isMember("eviction_index")) {
-            const auto& node = v2["eviction_index"];
-            if (node.isMember("type")) {
-                default_eviction.type = node["type"].asString();
-            }
-            if (node.isMember("max_victim_candidates")) {
-                default_eviction.max_victim_candidates =
-                    node["max_victim_candidates"].asUInt64();
-            }
-            if (node.isMember("sketch_capacity")) {
-                default_eviction.sketch_capacity =
-                    node["sketch_capacity"].asUInt64();
             }
         }
         if (v2.isMember("max_registration_retry")) {
@@ -343,8 +366,20 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         }
     }
 
-    for (auto& tiler : config.tilers) {
-        tiler.eviction = default_eviction;
+    // Resolve fieldwise JSON overrides only after the global defaults have
+    // been parsed. C++ overrides are complete effective configurations.
+    for (Json::ArrayIndex i = 0; i < tier_config["tiers"].size(); ++i) {
+        auto& tiler = config.tilers[i];
+        const auto& entry = tier_config["tiers"][i];
+        if (entry.isMember("block_index")) {
+            BlockIndexConfig effective = config.block_index;
+            const std::string path =
+                "tiers[" + std::to_string(i) + "].block_index";
+            auto parsed =
+                ApplyBlockIndexConfig(entry["block_index"], effective, path);
+            if (!parsed) return tl::make_unexpected(parsed.error());
+            tiler.block_index_override = std::move(effective);
+        }
         if (!tiler.placement_policy.offload_high_watermark) {
             tiler.placement_policy.offload_high_watermark =
                 config.movement.offload_high_watermark;
@@ -392,8 +427,11 @@ tl::expected<void, ErrorCode> ValidateDataManagerV2Config(
                        << " offload_high_watermark must be in (0, 1)";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        auto eviction_valid = ValidateEvictionIndexConfig(tiler.eviction);
-        if (!eviction_valid) return eviction_valid;
+        if (tiler.block_index_override) {
+            auto tier_index_valid =
+                ValidateBlockIndexConfig(*tiler.block_index_override);
+            if (!tier_index_valid) return tier_index_valid;
+        }
         if (tiler.allocation_failure_override) {
             auto allocation_valid = ValidateAllocationFailurePolicy(
                 *tiler.allocation_failure_override);
@@ -535,9 +573,22 @@ tl::expected<void, ErrorCode> DataManagerV2::Init() {
                        << ", error=" << toString(pool.error());
             return tl::make_unexpected(pool.error());
         }
+        const BlockIndexConfig& index_config =
+            tiler_config.block_index_override
+                ? *tiler_config.block_index_override
+                : config_.block_index;
+        auto index =
+            CreateBlockIndex(index_config, tiler_config.logical.tiler_id,
+                             pool.value()->Capacity());
+        if (!index) {
+            LOG(ERROR) << "Failed to create the block index for tiler "
+                       << tiler_config.logical.tiler_id
+                       << ", error=" << toString(index.error());
+            return tl::make_unexpected(index.error());
+        }
         tilers_.by_priority.push_back(std::make_unique<TilerManager>(
-            tiler_config.logical, config_.block_index, std::move(pool.value()),
-            block_registry_, EventPublisher(), tiler_config.eviction,
+            tiler_config.logical, std::move(index.value()),
+            std::move(pool.value()), block_registry_, EventPublisher(),
             tiler_config.placement_policy.EffectiveOffloadHighWatermark(
                 config_.movement.offload_high_watermark)));
     }
@@ -715,8 +766,6 @@ void DataManagerV2::ObserveReplica(const BlockRegistrationHandle& registration,
 
 void DataManagerV2::MaintainTiers() {
     for (const auto& tiler : tilers_.by_priority) {
-        tiler->ReconcileEviction(*clock_,
-                                 clock_->Now() + std::chrono::milliseconds(5));
         BlockEvent event;
         event.type = EventType::kCommit;
         event.tiler_id = tiler->Id();
@@ -1455,10 +1504,6 @@ tl::expected<long, ErrorCode> DataManagerV2::RemoveAll() {
             handle.MarkAbsent(tiler->Id());
         }
     }
-
-    // Nothing to forget separately: TilerManager::DrainAll clears that tier's
-    // eviction index in the same call that empties its BlockIndex, so the two
-    // cannot disagree about what the drain removed.
 
     for (const auto& [key, tier] : removed) {
         frequency_tracker_->Remove(key);

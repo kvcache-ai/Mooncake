@@ -33,13 +33,23 @@
                 "max_evict_rounds": 1,
                 "evict_timeout_ms": 50,
                 "reclaim_margin_bytes": "0B"
+            },
+            "block_index": {
+                "type": "lru",
+                "max_victim_candidates": 128
             }
         }
     ],
     "v2": {
         "block_index": {
+            "type": "tinylfu_lru",
             "shard_count": 64,
-            "max_load_factor": 0.875
+            "max_load_factor": 0.875,
+            "max_victim_candidates": 256,
+            "sketch_capacity": 0,
+            "band_warm_threshold": 0,
+            "band_hot_threshold": 0,
+            "band_veryhot_threshold": 0
         },
         "block_registry": {
             "shard_count": 64
@@ -58,20 +68,11 @@
         },
         "placement_policy": {
             "offload_high_watermark": 0.90,
-            "onboard_min_frequency": 8.0,
-            "sketch_capacity": 0,
-            "band_warm_threshold": 0,
-            "band_hot_threshold": 0,
-            "band_veryhot_threshold": 0
+            "onboard_min_frequency": 8.0
         },
         "copier": {
             "staging_buffer_bytes": "4MB",
             "copy_timeout_ms": 0
-        },
-        "eviction_index": {
-            "type": "tinylfu_lru",
-            "max_victim_candidates": 256,
-            "sketch_capacity": 0
         },
         "max_registration_retry": 8,
         "stop_drain_timeout_ms": 5000,

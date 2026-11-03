@@ -92,10 +92,12 @@ class LeaseManagerTest : public ::testing::Test {
         ASSERT_TRUE(pool_->Init().has_value());
 
         registry_ = BlockRegistry(BlockRegistryConfig{});
-        index_ =
-            std::make_unique<BlockIndex>(generate_uuid(), BlockIndexConfig{});
-        replica_index_ =
-            std::make_unique<BlockIndex>(generate_uuid(), BlockIndexConfig{});
+        index_ = CreateBlockIndex(BlockIndexConfig{}, generate_uuid(),
+                                  pool_->Capacity())
+                     .value();
+        replica_index_ = CreateBlockIndex(BlockIndexConfig{}, generate_uuid(),
+                                          pool_->Capacity())
+                             .value();
         leases_ = std::make_unique<LeaseManager>(Config(), clock_,
                                                  /*shard_count=*/8);
     }

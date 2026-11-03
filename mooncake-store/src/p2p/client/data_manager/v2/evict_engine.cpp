@@ -40,18 +40,6 @@ EvictEngine::EvictOutcome EvictEngine::EvictVictim(TilerManager& tiler,
         if (!current || !(current->Id() == victim.block_id)) {
             // The token named a block that has since been replaced; removing
             // the current one on its behalf would drop live data.
-            //
-            // Repair the ordering here, where both facts are in hand. Dropping
-            // the dead token alone would lose the replacement's only record --
-            // the index is keyed by registration -- and a block with no record
-            // is never offered as a victim again, so its bytes are stranded
-            // for as long as the tier lives.
-            if (current) {
-                BlockToken live = victim;
-                live.block_id = current->Id();
-                live.size_bytes = current->Size();
-                tiler.Eviction()->OnCommit(live);
-            }
             return {};
         }
         size_bytes = current->Size();
@@ -120,13 +108,9 @@ tl::expected<ReclaimResult, ErrorCode> EvictEngine::ReclaimOneRound(
     ReclaimResult result;
     result.free_bytes_before = tiler->FreeBytes();
 
-    // From the tier's own ordering, not from the placement policy. Victim
-    // selection is a property of one tier's contents, and keeping it beside
-    // that tier's BlockIndex is what lets both be updated in a single
-    // mutation instead of drifting apart.
-    tiler->ReconcileEviction(*clock_, request.deadline);
+    // The unified backend supplies candidates from the live entries.
     const auto victims =
-        tiler->Eviction()->SelectVictims(request.reclaim_target_bytes);
+        tiler->Index()->SelectVictims(request.reclaim_target_bytes);
     // Every eviction is now a plain removal, so every one of them has to be
     // reported to Master. orphaned_keys is the subset whose last replica went
     // with it, which is what the access tracker needs to hear about.
@@ -144,12 +128,6 @@ tl::expected<ReclaimResult, ErrorCode> EvictEngine::ReclaimOneRound(
         ++result.candidates_examined;
         const EvictOutcome outcome = EvictVictim(*tiler, victim);
         if (outcome.bytes == 0) {
-            // The candidate named a block the index no longer has, so the
-            // ordering has to forget it too -- otherwise the same dead token
-            // is offered first on every subsequent round and the tier stops
-            // making progress. Token-scoped, so a newer block for the same
-            // registration keeps its record.
-            tiler->Eviction()->OnDelete(victim);
             std::lock_guard<std::mutex> lock(stats_mu_);
             ++stats_.victims_stale;
             continue;
@@ -157,10 +135,6 @@ tl::expected<ReclaimResult, ErrorCode> EvictEngine::ReclaimOneRound(
         result.logically_detached_bytes += outcome.bytes;
         removed_keys.push_back(victim.key);
         if (outcome.was_sole_replica) orphaned_keys.push_back(victim.key);
-        // No separate bookkeeping call: TilerManager::Delete already removed
-        // the record from this tier's eviction index, in the same mutation
-        // that removed it from the BlockIndex, so a later round in this same
-        // call cannot be offered a victim this one already reclaimed.
         if (result.logically_detached_bytes >= request.reclaim_target_bytes) {
             break;
         }
