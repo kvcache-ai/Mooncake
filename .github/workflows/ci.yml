@@ -838,6 +838,9 @@ jobs:
           --output-on-failure \
           --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml" \
           "${ctest_args[@]}"
+        cd "$GITHUB_WORKSPACE"
+        python3 scripts/ci/check_test_reports.py --allow-skipped \
+          build-tent/test-results/ctest.xml
       shell: bash
 
     - name: Preserve TENT CTest diagnostics

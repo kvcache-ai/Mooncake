@@ -57,70 +57,18 @@ def hardware_step(name):
 
 ROCM = load_script("verify_rocm_wheel", "scripts/e2e/python/verify_rocm_wheel.py")
 with patch.dict(sys.modules, {"verify_rocm_wheel": ROCM}):
-    VERIFY = load_script("verify_xpu_wheel", "scripts/e2e/python/verify_xpu_wheel.py")
+    VERIFY = load_script("verify_xpu_ci", "scripts/e2e/python/verify_xpu_ci.py")
 
 
 class HostReportTest(unittest.TestCase):
-    def test_requires_nonempty_completed_non_skipped_cases(self):
-        with tempfile.TemporaryDirectory() as directory:
-            reports = Path(directory) / "xpu-ci-output/reports"
-            reports.mkdir(parents=True)
-            code = (
-                workflow_step("Run host-side unit tests")
-                .split("python - <<'PY'\n", 1)[1]
-                .rsplit("\nPY", 1)[0]
-            )
-            passed = '<testcase status="run" result="completed"/>'
-            for body, count, valid in (
-                (passed, 1, True),
-                (passed, 20, True),
-                ("", 1, False),
-                ('<testcase status="notrun" result="suppressed"/>', 1, False),
-                (
-                    '<testcase status="run" result="skipped"><skipped/></testcase>',
-                    1,
-                    False,
-                ),
-                (
-                    '<testcase status="run" result="completed"><failure/></testcase>',
-                    1,
-                    False,
-                ),
-                (
-                    '<testcase status="run" result="completed"><error/></testcase>',
-                    1,
-                    False,
-                ),
-                (
-                    passed
-                    + '<testcase status="run" result="skipped"><skipped/></testcase>',
-                    1,
-                    False,
-                ),
-            ):
-                with self.subTest(body=body, count=count):
-                    for name in ("config", "ep", "crc32c"):
-                        (reports / f"{name}.xml").write_text(
-                            f"<testsuites><testsuite>{body * count}</testsuite></testsuites>"
-                        )
-                    result = subprocess.run(
-                        [sys.executable, "-c", code],
-                        cwd=directory,
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    self.assertEqual(result.returncode == 0, valid, result.stderr)
-            (reports / "ep.xml").unlink()
-            self.assertNotEqual(
-                subprocess.run(
-                    [sys.executable, "-c", code],
-                    cwd=directory,
-                    capture_output=True,
-                    timeout=10,
-                ).returncode,
-                0,
-            )
+    def test_workflow_uses_strict_shared_report_validation(self):
+        script = workflow_step("Run host-side unit tests")
+        self.assertIn(
+            "python scripts/ci/check_test_reports.py --require-gtest-status", script
+        )
+        self.assertNotIn("--allow-skipped", script)
+        for name in ("config", "ep", "crc32c"):
+            self.assertIn(f"xpu-ci-output/reports/{name}.xml", script)
 
 
 class BuildDirectoryTest(unittest.TestCase):
@@ -619,7 +567,7 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
 class CommandLineTest(unittest.TestCase):
     def test_no_arguments_preserve_host_only_wheel_checks(self):
         with (
-            patch.object(sys, "argv", ["verify_xpu_wheel.py"]),
+            patch.object(sys, "argv", ["verify_xpu_ci.py"]),
             patch.object(VERIFY, "main") as verify,
         ):
             VERIFY.cli()
@@ -656,12 +604,12 @@ class CommandLineTest(unittest.TestCase):
         ):
             with (
                 self.subTest(arguments=arguments),
-                patch.object(sys, "argv", ["verify_xpu_wheel.py", *arguments]),
+                patch.object(sys, "argv", ["verify_xpu_ci.py", *arguments]),
                 patch.object(VERIFY, callback) as command,
             ):
                 VERIFY.cli()
                 command.assert_called_once_with(*expected)
-        with patch.object(sys, "argv", ["verify_xpu_wheel.py", "unknown"]):
+        with patch.object(sys, "argv", ["verify_xpu_ci.py", "unknown"]):
             with self.assertRaisesRegex(RuntimeError, "Unknown XPU verification"):
                 VERIFY.cli()
 
@@ -1109,6 +1057,9 @@ class ReportTest(unittest.TestCase):
                     with (
                         patch.object(VERIFY, "preflight"),
                         patch.object(VERIFY, "command", side_effect=run_command),
+                        patch.object(
+                            VERIFY, "validate_report", wraps=VERIFY.validate_report
+                        ) as validate,
                         patch.object(VERIFY.socket, "create_connection"),
                         patch.object(VERIFY.subprocess, "Popen") as process,
                         patch.object(
@@ -1123,6 +1074,10 @@ class ReportTest(unittest.TestCase):
                         process.return_value.__enter__.return_value.poll.return_value = None
                         if valid:
                             VERIFY.suite(root, ROOT, root)
+                            self.assertTrue(validate.called)
+                            for call in validate.call_args_list:
+                                self.assertTrue(call.kwargs["require_gtest_status"])
+                                self.assertTrue(call.args[1])
                             result = json.loads((root / "result.json").read_text())
                             self.assertEqual(result["cpp_cases"], 149)
                             self.assertEqual(result["ep_rounds"], rounds)
@@ -1132,42 +1087,6 @@ class ReportTest(unittest.TestCase):
                             with self.assertRaises((RuntimeError, FileNotFoundError)):
                                 VERIFY.suite(root, ROOT, root)
                             self.assertFalse((root / "result.json").exists())
-
-    def test_exact_case_identity_count_and_no_skips_or_failures(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            report = Path(temporary) / "report.xml"
-            for attributes, child, valid in (
-                ({"status": "run", "result": "completed"}, None, True),
-                ({"status": "notrun", "result": "suppressed"}, None, False),
-                ({"status": "run", "result": "skipped"}, "skipped", False),
-                ({"status": "run", "result": "completed"}, "failure", False),
-                ({"status": "run", "result": "completed"}, "error", False),
-            ):
-                root = ET.Element("testsuites")
-                suite = ET.SubElement(root, "testsuite")
-                case = ET.SubElement(
-                    suite, "testcase", classname="Suite", name="Case", **attributes
-                )
-                if child:
-                    ET.SubElement(case, child)
-                ET.ElementTree(root).write(report)
-                with self.subTest(attributes=attributes, child=child):
-                    if valid:
-                        VERIFY.validate_report(report, {"Suite.Case"})
-                        for expected in (
-                            set(),
-                            {"Suite.Other"},
-                            {"Suite.Case", "Suite.Missing"},
-                        ):
-                            with self.assertRaises(RuntimeError):
-                                VERIFY.validate_report(report, expected)
-                        suite.append(ET.fromstring(ET.tostring(case)))
-                        ET.ElementTree(root).write(report)
-                        with self.assertRaises(RuntimeError):
-                            VERIFY.validate_report(report, {"Suite.Case"})
-                    else:
-                        with self.assertRaises(RuntimeError):
-                            VERIFY.validate_report(report, {"Suite.Case"})
 
     def test_inventory_parser(self):
         self.assertEqual(
@@ -1315,7 +1234,7 @@ class ShellLifecycleTest(unittest.TestCase):
         for name in ("run_xpu_core.sh", "xpu_core.py"):
             self.assertFalse((ROOT / "scripts/ci" / name).exists())
         self.assertIn(
-            "scripts/e2e/python/verify_xpu_wheel.py unpack",
+            "scripts/e2e/python/verify_xpu_ci.py unpack",
             hardware_step("Download exact build artifact"),
         )
 
@@ -1384,7 +1303,7 @@ echo container-id
                 self.assertEqual(args[args.index(variable) - 1], "--env")
             self.assertNotIn("--privileged", args)
             self.assertIn(
-                "python3 /control/e2e/python/verify_xpu_wheel.py run /bundle /source /output",
+                "python3 /control/e2e/python/verify_xpu_ci.py run /bundle /source /output",
                 "\n".join(args),
             )
 

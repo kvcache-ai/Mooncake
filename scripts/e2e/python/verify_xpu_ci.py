@@ -1,4 +1,4 @@
-"""Verify XPU wheels and hardware suites; no arguments run host-only checks."""
+"""Verify XPU CI artifacts and hardware suites; no arguments check the wheel."""
 
 from collections import deque
 import hashlib
@@ -22,6 +22,9 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from verify_rocm_wheel import find_extension_record, record_digest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ci"))
+validate_report = importlib.import_module("check_test_reports").validate_report
 
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -404,23 +407,6 @@ def parse_inventory(text: str) -> set[str]:
     return set(names)
 
 
-def validate_report(path: Path, expected: set[str]) -> None:
-    cases = ET.parse(path).findall(".//testcase")
-    identities = [f"{case.get('classname')}.{case.get('name')}" for case in cases]
-    require(
-        len(identities) == len(expected) and set(identities) == expected,
-        f"Test identity mismatch: {path}",
-    )
-    for case in cases:
-        require(
-            (case.get("status"), case.get("result")) == ("run", "completed")
-            and not any(
-                case.find(tag) is not None for tag in ("failure", "error", "skipped")
-            ),
-            f"Test failed, disabled or skipped: {case.attrib}",
-        )
-
-
 def command(args: list[str], log: Path, timeout: int = 600) -> str:
     try:
         with log.open("w") as stream:
@@ -517,7 +503,9 @@ def store_test(source: Path, report: Path) -> None:
     if not result.wasSuccessful() or result.skipped or result.testsRun != 1:
         ET.SubElement(case, "failure").text = repr(result.__dict__)
     ET.ElementTree(root).write(report)
-    validate_report(report, {"StorePython.test_xpu_local_copy_paths"})
+    validate_report(
+        report, {"StorePython.test_xpu_local_copy_paths"}, require_gtest_status=True
+    )
 
 
 def run(bundle: Path, source: Path, output: Path) -> None:
@@ -615,7 +603,7 @@ def suite(native: Path, source: Path, output: Path) -> None:
             output / f"{name}.log",
             timeout=1200,
         )
-        validate_report(report, selected)
+        validate_report(report, selected, require_gtest_status=True)
 
     package = Path(
         metadata.distribution("mooncake-transfer-engine-xpu").locate_file("mooncake")
@@ -647,7 +635,9 @@ def suite(native: Path, source: Path, output: Path) -> None:
                 output / "store-python.log",
             )
             validate_report(
-                output / "store-python.xml", {"StorePython.test_xpu_local_copy_paths"}
+                output / "store-python.xml",
+                {"StorePython.test_xpu_local_copy_paths"},
+                require_gtest_status=True,
             )
         finally:
             master.terminate()

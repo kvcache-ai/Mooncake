@@ -136,18 +136,10 @@ jobs:
             --gtest_output=xml:xpu-ci-output/reports/ep.xml
           "$BUILD_DIR/mooncake-store/tests/crc32c_test" \
             --gtest_output=xml:xpu-ci-output/reports/crc32c.xml
-          python - <<'PY'
-          import xml.etree.ElementTree as ET
-          for name in ("config", "ep", "crc32c"):
-              cases = ET.parse(f"xpu-ci-output/reports/{name}.xml").findall(".//testcase")
-              if not cases:
-                  raise RuntimeError(f"{name}: no tests executed")
-              for case in cases:
-                  if (case.get("status"), case.get("result")) != ("run", "completed") or any(
-                      case.find(tag) is not None for tag in ("failure", "error", "skipped")
-                  ):
-                      raise RuntimeError(f"{name}: test did not pass: {case.attrib}")
-          PY
+          python scripts/ci/check_test_reports.py --require-gtest-status \
+            xpu-ci-output/reports/config.xml \
+            xpu-ci-output/reports/ep.xml \
+            xpu-ci-output/reports/crc32c.xml
 
       - name: Apply wheel version override
         if: inputs.version_override != ''
@@ -178,7 +170,7 @@ jobs:
           "$smoke_venv/bin/python" -m pip install xpu-ci-output/*.whl
           # Do not expose build libraries or the source package to the check.
           cd "$RUNNER_TEMP"
-          "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/e2e/python/verify_xpu_wheel.py"
+          "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/e2e/python/verify_xpu_ci.py"
 
       - name: Package Python dependencies for hardware
         run: |
