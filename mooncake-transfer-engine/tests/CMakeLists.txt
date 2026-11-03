@@ -422,6 +422,12 @@ if(USE_EFA)
   target_compile_options(
     efa_endpoint_handshake_test
     PRIVATE -iquote${WORKSPACE}/efa_endpoint_handshake_fakes)
+  # The test builds efa_endpoint.cpp against fake EFA headers and does not link
+  # transfer_engine, so it does not inherit the include path of the generated
+  # mooncake_te_build_config.h, which transport.h includes.
+  target_include_directories(
+    efa_endpoint_handshake_test
+    PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>)
   target_link_libraries(
     efa_endpoint_handshake_test PUBLIC glog::glog gflags::gflags gtest
                                        gtest_main pthread)
