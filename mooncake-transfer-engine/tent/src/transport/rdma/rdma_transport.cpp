@@ -35,6 +35,9 @@
 #include "tent/common/status.h"
 #include "tent/common/utils/ip.h"
 #include "tent/transport/rdma/buffers.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "tent/transport/rdma/congestion_control.h"
+#endif
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
 #include "tent/common/utils/string_builder.h"
@@ -390,6 +393,11 @@ Status RdmaTransport::install(std::string& local_segment_name,
         return Status::DeviceNotFound(std::string(error_message) + LOC_MARK);
     }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    rdma_congestion_control_ =
+        std::make_unique<TentRdmaCongestionControl>(context_set_.size());
+#endif
+
     if (conf_->get("verbose", false)) {
         local_topology_->print();
     }
@@ -459,8 +467,13 @@ Status RdmaTransport::uninstall() {
         // Workers joined: nothing can name an orphan any more.
         {
             std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
-            for (auto& orphan : orphan_slices_)
+            for (auto& orphan : orphan_slices_) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                if (rdma_congestion_control_)
+                    rdma_congestion_control_->releaseUnposted(orphan.slice);
+#endif
                 RdmaSliceStorage::Get().deallocate(orphan.slice);
+            }
             orphan_slices_.clear();
             orphans_pending_.store(false, std::memory_order_release);
         }
@@ -470,6 +483,9 @@ Status RdmaTransport::uninstall() {
         context_name_lookup_.clear();
         installed_ = false;
     }
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    rdma_congestion_control_.reset();
+#endif
     return Status::OK();
 }
 
@@ -511,6 +527,10 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
                 slice->next = nullptr;  // it leaves the chain behind
                 orphans.push_back({slice, 0});
             } else {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                if (rdma_congestion_control_)
+                    rdma_congestion_control_->releaseUnposted(slice);
+#endif
                 RdmaSliceStorage::Get().deallocate(slice);
             }
             slice = next;
@@ -664,6 +684,10 @@ void RdmaTransport::reapOrphanSlices(bool on_tick) {
         const int owed =
             slice->completions_owed.load(std::memory_order_acquire);
         if (owed == 0 || slice->ep_weak_ptr.expired()) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            if (rdma_congestion_control_)
+                rdma_congestion_control_->releaseUnposted(slice);
+#endif
             RdmaSliceStorage::Get().deallocate(slice);
             continue;
         }
