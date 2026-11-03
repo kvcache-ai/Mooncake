@@ -58,6 +58,15 @@ class RdmaTransportTestPeer {
 
 class RdmaContextTestPeer {
    public:
+    static void setTransferWorkerCount(RdmaContext &context, int count) {
+        context.transfer_worker_count_ = count;
+    }
+
+    static void bindWorkerPool(RdmaContext &context,
+                               std::shared_ptr<WorkerPool> pool) {
+        context.worker_pool_ = std::move(pool);
+    }
+
     static void bindProtectionDomain(RdmaContext &context, ibv_pd *pd) {
         context.pd_ = pd;
     }
@@ -88,6 +97,21 @@ class RdmaContextTestPeer {
 
     static void disableContextForTeardown(RdmaContext &context) {
         context.context_ = nullptr;
+    }
+
+    // Inserts a synthetic memory region (typically backed by a fake ibv_mr)
+    // so deregistration paths can be exercised without RDMA hardware.
+    static void seedMemoryRegion(RdmaContext &context, void *addr,
+                                 size_t length, ibv_mr *mr) {
+        RWSpinlock::WriteGuard guard(context.memory_regions_lock_);
+        context.memory_region_map_[reinterpret_cast<uintptr_t>(addr)] =
+            MemoryRegionMeta{addr, length, mr};
+    }
+
+    static bool hasMemoryRegion(RdmaContext &context, void *addr) {
+        RWSpinlock::ReadGuard guard(context.memory_regions_lock_);
+        return context.findMemoryRegionContaining(reinterpret_cast<uintptr_t>(
+                   addr)) != context.memory_region_map_.end();
     }
 };
 

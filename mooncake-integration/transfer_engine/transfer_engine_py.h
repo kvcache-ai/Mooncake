@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <memory>
 #include <stack>
+#include <string>
 #include <vector>
 
 #include "common/base/status.h"
@@ -31,6 +32,14 @@
 #include "transport/transport.h"
 
 using namespace mooncake;
+
+#ifdef USE_CUDA
+// NVLink submits call CUDA APIs synchronously, which a CUDA host function
+// cannot do safely on the driver's callback thread.
+inline bool isCudaHostFuncUnsupportedProtocol(const std::string &protocol) {
+    return protocol == "nvlink_intra";
+}
+#endif
 
 class ScatterTransferTicket;
 

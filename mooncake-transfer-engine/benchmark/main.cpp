@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <random>
 #include <thread>
 
 using namespace mooncake::tent;
@@ -39,6 +40,14 @@ uint64_t steadyClockNs() {
 double gbPerSecond(uint64_t bytes, double duration_us) {
     if (duration_us <= 0.0) return 0.0;
     return static_cast<double>(bytes) / (1000.0 * duration_us);
+}
+
+// A random slot in [0, slots) other than prev, so consecutive operations never
+// rewrite the same blocks. prev == slots means no previous slot. slots >= 2.
+uint64_t pickTargetSlot(std::mt19937_64& rng, uint64_t slots, uint64_t prev) {
+    if (prev == slots) return rng() % slots;
+    const uint64_t slot = rng() % (slots - 1);
+    return slot >= prev ? slot + 1 : slot;
 }
 
 int processBatchSizes(
@@ -71,6 +80,30 @@ int processBatchSizes(
     } else {
         LOG(ERROR) << "Invalid args: workload only support "
                       "read|write|mix|write_seed|read_verify";
+        exit(EXIT_FAILURE);
+    }
+    const std::string& target_access = XferBenchConfig::target_access;
+    const bool random_access = target_access == "random";
+    if (!random_access && target_access != "fixed") {
+        LOG(ERROR) << "Invalid args: --target_access only supports "
+                      "fixed|random";
+        exit(EXIT_FAILURE);
+    }
+    if (!random_access && XferBenchConfig::target_window_size != 0) {
+        LOG(ERROR) << "--target_window_size requires --target_access=random";
+        exit(EXIT_FAILURE);
+    }
+    // The window is also the per-thread stride, and file targets are opened
+    // with O_DIRECT, which needs aligned offsets.
+    if (XferBenchConfig::target_window_size % 4096 != 0) {
+        LOG(ERROR) << "--target_window_size must be a multiple of 4096";
+        exit(EXIT_FAILURE);
+    }
+    // Seeded data is checked at the offset it was written to, which a moving
+    // offset in a separate write_seed run would not revisit.
+    if (random_access && (write_seed || read_verify)) {
+        LOG(ERROR) << "--target_access=" << target_access
+                   << " cannot be combined with write_seed/read_verify";
         exit(EXIT_FAILURE);
     }
 
@@ -107,6 +140,16 @@ int processBatchSizes(
                                     "workload address stride"));
         }
     }
+    const size_t target_window_bytes = XferBenchConfig::target_window_size != 0
+                                           ? XferBenchConfig::target_window_size
+                                           : address_stride_bytes;
+    if (target_window_bytes < address_stride_bytes) {
+        LOG(ERROR) << "--target_window_size (" << target_window_bytes
+                   << ") must be at least the largest operation size, "
+                      "max_block_size x max_batch_size ("
+                   << address_stride_bytes << ")";
+        exit(EXIT_FAILURE);
+    }
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
         auto local_gpu_offset = std::max(0, XferBenchConfig::local_gpu_id);
@@ -117,7 +160,7 @@ int processBatchSizes(
         uint64_t local_addr = runner.getLocalBufferBase(
             local_gpu_offset + thread_id, address_stride_bytes, 1);
         uint64_t target_addr = runner.getTargetBufferBase(
-            target_thread_id, address_stride_bytes, 1);
+            target_thread_id, target_window_bytes, 1);
         uint64_t target_id = runner.getTargetSegmentId(target_thread_id);
         const size_t target_index = runner.getTargetIndex(target_thread_id);
         const bool qos_enabled = !qos_classes.empty();
@@ -131,6 +174,17 @@ int processBatchSizes(
             workload ? workload->batch_size : batch_size;
         const IntentType intent_type =
             workload ? workload->intent_type : IntentType::INTENT_UNSPEC;
+        const uint64_t op_bytes = checkedMul(
+            thread_block_size, thread_batch_size, "operation payload size");
+        const uint64_t target_slots = target_window_bytes / op_bytes;
+        uint64_t prev_slot = target_slots;  // none yet
+        std::mt19937_64 rng(thread_id + 1);
+        // A window holding a single operation stays at a fixed offset.
+        auto nextTargetAddr = [&]() -> uint64_t {
+            if (!random_access || target_slots < 2) return target_addr;
+            prev_slot = pickTargetSlot(rng, target_slots, prev_slot);
+            return target_addr + prev_slot * op_bytes;
+        };
         const bool tight = XferBenchConfig::deadline_us > 0 &&
                            thread_id < XferBenchConfig::deadline_tight_threads;
         auto deadlineNs = [&]() -> uint64_t {
@@ -153,7 +207,7 @@ int processBatchSizes(
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
             if (runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
+                    local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
                 return failTask();
             }
@@ -179,9 +233,11 @@ int processBatchSizes(
                 uint8_t pattern = 0;
                 if (XferBenchConfig::check_consistency)
                     pattern = fillData((void*)local_addr, bytes);
+                // Read back from where this iteration wrote.
+                const uint64_t op_target_addr = nextTargetAddr();
                 paceRequest();
                 auto val = runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
+                    local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
@@ -190,7 +246,7 @@ int processBatchSizes(
                 fillData((void*)local_addr, bytes);
                 paceRequest();
                 val = runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
+                    local_addr, target_id, op_target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(
@@ -215,7 +271,7 @@ int processBatchSizes(
                 }
                 paceRequest();
                 auto val = runner.runSingleTransfer(
-                    local_addr, target_id, target_addr, thread_block_size,
+                    local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
                 if (val < 0) return failTask();
                 thread_instant_bandwidth.push_back(

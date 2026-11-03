@@ -535,6 +535,35 @@ TEST(ObjectRouteTest, KeptSlotIsReusedByTheNextPublication) {
     EXPECT_TRUE(route.Contains("k1"));
 }
 
+TEST(ObjectRouteTest, AStripeGivesItsBucketsBackAsItsSlotsGo) {
+    ObjectRoute route;
+    // Keys that all land in one stripe, enough to grow its map past the shrink
+    // floor.
+    const size_t stripe = ObjectRouteTestPeer::StripeIndex("shrink_0");
+    std::vector<std::string> keys;
+    for (size_t i = 0; keys.size() < 2 * kShrinkMinBucketCount; ++i) {
+        std::string key = "shrink_" + std::to_string(i);
+        if (ObjectRouteTestPeer::StripeIndex(key) == stripe) {
+            keys.push_back(std::move(key));
+        }
+    }
+    for (const auto& key : keys) {
+        ASSERT_NE(PublishObject(route, key), 0u);
+    }
+    const size_t high_water =
+        ObjectRouteTestPeer::StripeBucketCount(route, stripe);
+    ASSERT_GT(high_water, kShrinkMinBucketCount);
+
+    // Tearing the objects down is all it takes, whichever path does it: no
+    // caller has to ask for the shrink.
+    for (size_t i = 1; i < keys.size(); ++i) {
+        ASSERT_TRUE(TearDownKey(route, keys[i]));
+    }
+    EXPECT_LT(ObjectRouteTestPeer::StripeBucketCount(route, stripe),
+              high_water / 2);
+    EXPECT_TRUE(route.Contains(keys.front()));
+}
+
 // --- Cursors -----------------------------------------------------------------
 
 TEST(ObjectRouteTest, ReadCursorVisitsEveryObjectOnce) {

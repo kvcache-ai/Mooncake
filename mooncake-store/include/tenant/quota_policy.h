@@ -20,7 +20,9 @@
 //     charge stays until the new write settles.
 //
 // Growth is the one thing the core asks for up front (OnGrow), so a write the
-// account cannot take fails before anything is allocated.
+// account cannot take fails before anything is allocated. The first growth
+// asked under a write lock also begins a write on the account, which ends as
+// that lock is released; the tenant cannot be deleted in between.
 
 #include <chrono>
 #include <cstdint>
@@ -39,6 +41,10 @@
 #include "types.h"
 
 namespace mooncake {
+
+namespace test {
+class MasterServiceTestPeer;
+}  // namespace test
 
 class TenantQuotaPolicy final : public NamespacePolicy {
    public:
@@ -72,8 +78,8 @@ class TenantQuotaPolicy final : public NamespacePolicy {
         const TenantId& tenant_id) const;
     tl::expected<TenantQuotaSnapshot, ErrorCode> UpsertPolicy(
         const TenantId& tenant_id, uint64_t requested_quota_bytes);
-    // TENANT_NOT_EMPTY while the tenant still charges anything or holds an
-    // object.
+    // TENANT_NOT_EMPTY while the tenant still charges anything, has a write
+    // in flight, or holds an object.
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode> DeletePolicy(
         const TenantId& tenant_id);
     uint64_t AllocatableCapacityBytes() const;
@@ -99,6 +105,8 @@ class TenantQuotaPolicy final : public NamespacePolicy {
     void OnMaintenance() override;
 
    private:
+    friend class test::MasterServiceTestPeer;
+
     static TenantQuotaAccount& AccountOf(const PolicyContext& ctx);
 
     StoreControl& store_;

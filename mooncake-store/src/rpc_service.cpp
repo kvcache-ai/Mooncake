@@ -76,6 +76,31 @@ auto WithWriteTenant(std::string_view raw, bool enable_multi_tenants, Fn&& fn) {
     return std::invoke(std::forward<Fn>(fn), tenant_id.value());
 }
 
+template <typename Request>
+void BindWeightRequestTenant(Request& request, const TenantId& tenant_id) {
+    if constexpr (requires { request.identity.tenant_id; }) {
+        request.identity.tenant_id = tenant_id.value();
+    } else {
+        request.tenant_id = tenant_id.value();
+    }
+}
+
+template <typename Request, typename Fn>
+auto WithWeightRequestTenant(Request request, std::string_view raw,
+                             bool enable_multi_tenants, bool write, Fn&& fn) {
+    using Result = std::invoke_result_t<Fn, const Request&>;
+    auto tenant_id =
+        write ? ResolveTenantIdForWrite(raw, enable_multi_tenants)
+              : ResolveRequestTenantId(
+                    enable_multi_tenants ? raw : TenantId::kDefaultValue);
+    if (!tenant_id) {
+        return Result(
+            tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT));
+    }
+    BindWeightRequestTenant(request, *tenant_id);
+    return std::invoke(std::forward<Fn>(fn), request);
+}
+
 }  // namespace
 
 WrappedMasterService::WrappedMasterService(
@@ -102,6 +127,23 @@ void WrappedMasterService::SetBatchOpLogTerminalCallback(
 
 void WrappedMasterService::StopBatchOpLogWriter() {
     master_service_.StopBatchOpLogWriter();
+}
+
+void WrappedMasterService::StopHttpMetadataCleanup() {
+    master_service_.StopHttpMetadataCleanup();
+}
+
+void WrappedMasterService::MarkReadyForServing() {
+    master_service_.MarkReadyForServing();
+}
+
+void WrappedMasterService::ActivateServing() {
+    master_service_.ActivateServing();
+}
+
+MasterService::RestoreLifecycleState
+WrappedMasterService::GetRestoreLifecycleState() const {
+    return master_service_.GetRestoreLifecycleState();
 }
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
@@ -523,11 +565,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (!config.ValidSessionIds(keys.size())) {
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (config.group_ids.has_value() &&
-               config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchPutStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
+    } else if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR) << "BatchPutStart: per-key hint count does not match keys";
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (!resolved_tenant_id) {
@@ -782,11 +821,9 @@ WrappedMasterService::BatchUpsertStart(
     } else if (!config.ValidSessionIds(keys.size())) {
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (config.group_ids.has_value() &&
-               config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchUpsertStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
+    } else if (!config.HasValidKeyHints(keys.size())) {
+        LOG(ERROR)
+            << "BatchUpsertStart: per-key hint count does not match keys";
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     } else if (auto resolved_tenant_id = ResolveTenantIdForWrite(
@@ -968,6 +1005,19 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     long result = master_service_.RemoveAll(*resolved_tenant_id, force);
     timer.LogResponse("items_removed=", result);
     return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
+                                         uint64_t ttl_ms,
+                                         const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchUpdateSoftPin(keys, resolved_tenant_id,
+                                                      ttl_ms);
+        });
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
@@ -1577,23 +1627,24 @@ TieredStorageUsageSnapshot WrappedMasterService::GetStorageUsageSnapshot()
 
 tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
 WrappedMasterService::ListTenantQuotaSnapshots() {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    return master_service_.ListTenantQuotaSnapshots();
+    return quota->ListSnapshots();
 }
 
 tl::expected<TenantQuotaSnapshot, ErrorCode>
 WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     return WithRequestTenant(
         tenant_id,
         [&](const TenantId& resolved_tenant_id)
             -> tl::expected<TenantQuotaSnapshot, ErrorCode> {
-            auto snapshot =
-                master_service_.GetTenantQuotaSnapshot(resolved_tenant_id);
+            auto snapshot = quota->GetSnapshot(resolved_tenant_id);
             if (!snapshot.has_value()) {
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             }
@@ -1604,7 +1655,8 @@ WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
 tl::expected<TenantQuotaSnapshot, ErrorCode>
 WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
                                               uint64_t requested_quota_bytes) {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     if (tenant_id.empty()) {
@@ -1614,13 +1666,13 @@ WrappedMasterService::UpsertTenantQuotaPolicy(const std::string& tenant_id,
     if (!resolved_tenant_id.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return master_service_.UpsertTenantQuotaPolicy(resolved_tenant_id,
-                                                   requested_quota_bytes);
+    return quota->UpsertPolicy(resolved_tenant_id, requested_quota_bytes);
 }
 
 tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
 WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     if (tenant_id.empty()) {
@@ -1630,15 +1682,16 @@ WrappedMasterService::DeleteTenantQuotaPolicy(const std::string& tenant_id) {
     if (!resolved_tenant_id.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return master_service_.DeleteTenantQuotaPolicy(resolved_tenant_id);
+    return quota->DeletePolicy(resolved_tenant_id);
 }
 
 tl::expected<uint64_t, ErrorCode>
 WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
-    if (!master_service_.IsTenantQuotaEnabled()) {
+    const TenantQuotaPolicy* quota = master_service_.tenant_quota_policy();
+    if (quota == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    return master_service_.GetTenantQuotaAllocatableCapacityBytes();
+    return quota->AllocatableCapacityBytes();
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
@@ -1748,6 +1801,22 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     return master_service_.PromotionObjectHeartbeat(client_id);
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::RegisterPrefetchTask(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "RegisterPrefetchTask");
+    timer.LogRequest("action=register_prefetch_task");
+    auto result = WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.RegisterPrefetchTask(client_id, key,
+                                                        resolved_tenant_id);
+        });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
@@ -1833,6 +1902,120 @@ WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
 tl::expected<void, ErrorCode> WrappedMasterService::SetSegmentStatus(
     const std::string& segment_name, SegmentStatus status) {
     return master_service_.SetSegmentStatus(segment_name, status);
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::BeginWeightImport(const BeginWeightImportRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.BeginWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::CommitWeightImport(
+    const CommitWeightImportRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.CommitWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::AbortWeightImport(const AbortWeightImportRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.AbortWeightImport(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionView>
+WrappedMasterService::GetWeightRevision(const GetWeightRevisionRequest& request,
+                                        const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.GetWeightRevision(bound);
+        });
+}
+
+WeightMetadataStore::Result<ListWeightRevisionsResponse>
+WrappedMasterService::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.ListWeightRevisions(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+WrappedMasterService::AcquireWeightRevisionLease(
+    const AcquireWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.AcquireWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionLease>
+WrappedMasterService::RenewWeightRevisionLease(
+    const RenewWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.RenewWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<void>
+WrappedMasterService::ReleaseWeightRevisionLease(
+    const ReleaseWeightRevisionLeaseRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.ReleaseWeightRevisionLease(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WrappedMasterService::StartWeightResidencyOperation(
+    const StartWeightResidencyOperationRequest& request,
+    const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.StartWeightResidencyOperation(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightResidencyOperation>
+WrappedMasterService::QueryWeightOperation(
+    const QueryWeightOperationRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), false,
+        [this](const auto& bound) {
+            return master_service_.QueryWeightOperation(bound);
+        });
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WrappedMasterService::DeleteWeightRevision(
+    const DeleteWeightRevisionRequest& request, const std::string& tenant_id) {
+    return WithWeightRequestTenant(
+        request, tenant_id, master_service_.IsTenantQuotaEnabled(), true,
+        [this](const auto& bound) {
+            return master_service_.DeleteWeightRevision(bound);
+        });
 }
 
 bool WrappedMasterService::KvEventsEnabled() const {
@@ -1946,8 +2129,31 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::CreateCopyTask,
         &WrappedMasterService::CreateMoveTask, &WrappedMasterService::QueryTask,
         &WrappedMasterService::FetchTasks,
-        &WrappedMasterService::MarkTaskToComplete>(
+        &WrappedMasterService::MarkTaskToComplete,
+        &WrappedMasterService::BeginWeightImport,
+        &WrappedMasterService::CommitWeightImport,
+        &WrappedMasterService::AbortWeightImport,
+        &WrappedMasterService::GetWeightRevision,
+        &WrappedMasterService::ListWeightRevisions,
+        &WrappedMasterService::AcquireWeightRevisionLease,
+        &WrappedMasterService::RenewWeightRevisionLease,
+        &WrappedMasterService::ReleaseWeightRevisionLease,
+        &WrappedMasterService::StartWeightResidencyOperation,
+        &WrappedMasterService::QueryWeightOperation,
+        &WrappedMasterService::DeleteWeightRevision>(
         server, wrapped_master_service, worker_pool);
+    // The prefetch additions stay individual registrations on top of the
+    // pool: read-only replica queries (no lease, no promotion-on-hit, no
+    // metrics) and the prefetch task RPC. Purely additive for old peers.
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetReplicaListForAdmin>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RegisterPrefetchTask>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

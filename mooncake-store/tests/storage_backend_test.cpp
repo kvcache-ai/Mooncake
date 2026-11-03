@@ -2768,6 +2768,57 @@ TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadWithMixedBuckets) {
     EXPECT_EQ(std::string(readB2.get(), valueB2.size()), valueB2);
 }
 
+TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadSpanReadsWindow) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    const std::string key = "layer_object";
+    std::string value(4096, '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>(i & 0xff);
+    }
+    {
+        auto buf = std::make_unique<char[]>(value.size());
+        std::memcpy(buf.get(), value.data(), value.size());
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+        auto stored = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(stored.has_value());
+    }
+
+    constexpr uint64_t kOffset = 1000;
+    constexpr size_t kLength = 144;
+    auto window = std::make_unique<char[]>(kLength);
+    std::memset(window.get(), 0x5a, kLength);
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.emplace(key, StorageValueSpan{kOffset, value.size(),
+                                        Slice{window.get(), kLength}});
+    ASSERT_TRUE(storage_backend.BatchLoadSpans(spans));
+    EXPECT_EQ(std::string(static_cast<char*>(spans.at(key).slice.ptr), kLength),
+              value.substr(kOffset, kLength));
+
+    auto past_end = std::make_unique<char[]>(8);
+    std::unordered_map<std::string, StorageValueSpan> overflow;
+    overflow.emplace(key, StorageValueSpan{value.size() - 4, value.size(),
+                                           Slice{past_end.get(), 8}});
+    auto rejected = storage_backend.BatchLoadSpans(overflow);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::INVALID_PARAMS);
+
+    auto wrong = std::make_unique<char[]>(value.size() - 1);
+    std::unordered_map<std::string, Slice> full;
+    full.emplace(key, Slice{wrong.get(), value.size() - 1});
+    auto mismatch = storage_backend.BatchLoad(full);
+    ASSERT_FALSE(mismatch.has_value());
+    EXPECT_EQ(mismatch.error(), ErrorCode::INVALID_PARAMS);
+}
+
 //-----------------------------------------------------------------------------
 // DeleteBucket Tests
 //-----------------------------------------------------------------------------
@@ -3314,6 +3365,101 @@ TEST_F(StorageBackendTest,
     EXPECT_FALSE(std::filesystem::exists(test_dir + "/f1"));
     EXPECT_FALSE(std::filesystem::exists(test_dir + "/f2"));
     EXPECT_TRUE(std::filesystem::exists(test_dir + "/f3"));
+}
+
+TEST_F(StorageBackendTest, WatermarkPerFileRetryRollsBackOnTransportFailure) {
+    const auto test_dir = data_path + "/watermark_retry_failure";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    for (const auto& key : {"key_1", "key_2", "key_3"}) {
+        ASSERT_TRUE(backend.StoreObject(test_dir + "/" + key, data, key));
+    }
+
+    auto result = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            if (keys.size() > 1) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            if (keys.front() == "key_1") return {};
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::RPC_FAIL, result.error());
+    for (const auto& key : {"key_1", "key_2", "key_3"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+
+    // The restored queue remains usable after a partially acknowledged RPC.
+    auto retry = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return {};
+        });
+    ASSERT_TRUE(retry);
+    EXPECT_EQ((std::vector<std::string>{"key_1", "key_2"}), *retry);
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/key_1"));
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/key_2"));
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/key_3"));
+}
+
+TEST_F(StorageBackendTest, WatermarkPerFileRetryRetainsAnonymousFiles) {
+    const auto test_dir = data_path + "/watermark_retry_anonymous";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/anonymous", data, ""));
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/managed", data, "managed"));
+    ASSERT_TRUE(backend.StoreObject(test_dir + "/newest", data, "newest"));
+    auto result = backend.EvictAboveDiskWatermark(
+        0.70, 0.40,
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    for (const auto& key : {"anonymous", "managed", "newest"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+}
+
+TEST_F(StorageBackendTest, WatermarkProtectedPrefixRotatesBehindOrdinaryFiles) {
+    const auto test_dir = data_path + "/watermark_protected_prefix";
+    std::filesystem::create_directories(test_dir);
+    StorageBackend backend(test_dir, "", true);
+    ASSERT_TRUE(backend.Init(4096));
+    const std::string data(1024, 'r');
+    for (const auto& key : {"managed", "ordinary", "newest"}) {
+        ASSERT_TRUE(backend.StoreObject(test_dir + "/" + key, data, key));
+    }
+    auto authorize = [](const std::vector<std::string>& keys)
+        -> tl::expected<void, ErrorCode> {
+        for (const auto& key : keys) {
+            if (key == "managed") {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+        return {};
+    };
+    auto refused = backend.EvictAboveDiskWatermark(0.70, 0.60, authorize);
+    ASSERT_FALSE(refused);
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, refused.error());
+    for (const auto& key : {"managed", "ordinary", "newest"}) {
+        EXPECT_TRUE(std::filesystem::exists(test_dir + "/" + key));
+    }
+    auto retry = backend.EvictAboveDiskWatermark(0.70, 0.60, authorize);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ((std::vector<std::string>{"ordinary"}), *retry);
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/managed"));
+    EXPECT_FALSE(std::filesystem::exists(test_dir + "/ordinary"));
+    EXPECT_TRUE(std::filesystem::exists(test_dir + "/newest"));
 }
 
 TEST_F(StorageBackendTest, StoreObjectRejectsOverwriteDuringFailedEviction) {
