@@ -205,13 +205,16 @@ int processBatchSizes(
         };
 
         XferBenchTimer timer;
+        setSplitWarmup(true);
         while (timer.lap_us(false) < 1000000ull) {
             if (runner.runSingleTransfer(
                     local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
+                setSplitWarmup(false);
                 return failTask();
             }
         }
+        setSplitWarmup(false);
         if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
             num_threads) {
             measurement_started.store(true, std::memory_order_release);
@@ -243,7 +246,11 @@ int processBatchSizes(
                 thread_instant_bandwidth.push_back(
                     gbPerSecond(batch_bytes, val));
                 transfer_duration.push_back(val);
-                fillData((void*)local_addr, bytes);
+                // Clobber the local copy so the READ must bring the data
+                // back; a value distinct from pattern keeps a no-op READ
+                // from passing verification.
+                if (XferBenchConfig::check_consistency)
+                    fillData((void*)local_addr, bytes, pattern ^ 0xFF);
                 paceRequest();
                 val = runner.runSingleTransfer(
                     local_addr, target_id, op_target_addr, thread_block_size,

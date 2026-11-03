@@ -878,19 +878,20 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         releaseUnfinishedBatch();
         return fail("Failed to submit transfer", submitted);
     }
-    const uint64_t submit_us = timer.lap_us(false);
+    const uint64_t submit_ns = splitOutputEnabled() ? timer.lap_ns(false) : 0;
     uint64_t polls = 0;
     mooncake::TransferStatus overall_status;
     auto polled = waitForBatch(batch_id, overall_status, polls);
     if (!polled.ok()) return fail("Failed to poll transfer", polled);
     if (overall_status.s == TransferStatusEnum::COMPLETED) {
-        const uint64_t total_us = timer.lap_us(false);
+        const uint64_t total_ns = timer.lap_ns(false);
         if (splitOutputEnabled()) {
-            logSplitXfer({batch_size, submit_us, total_us - submit_us, polls});
+            logSplitXfer({block_size, batch_size, splitWarmup(), submit_ns,
+                          total_ns - submit_ns, polls});
         }
         auto released = releaseFinishedBatch(*engine_, batch_id);
         if (!released.ok()) return fail("Failed to free batch", released);
-        return static_cast<double>(total_us);
+        return static_cast<double>(total_ns) / 1000.0;
     }
     if (overall_status.s == TransferStatusEnum::PENDING) {
         // Abandoned after a stop; waitForBatch() already counted it.

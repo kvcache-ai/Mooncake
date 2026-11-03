@@ -172,12 +172,14 @@ class XferBenchTimer {
 
     void reset() { start_ts_ = getCurrentTimeNs(); }
 
-    uint64_t lap_us(bool reset = true) {
+    uint64_t lap_ns(bool reset = true) {
         auto now_ts = getCurrentTimeNs();
         auto duration = now_ts - start_ts_;
         if (reset) start_ts_ = now_ts;
-        return duration / 1000;
+        return duration;
     }
+
+    uint64_t lap_us(bool reset = true) { return lap_ns(reset) / 1000; }
 
    private:
     inline uint64_t getCurrentTimeNs() {
