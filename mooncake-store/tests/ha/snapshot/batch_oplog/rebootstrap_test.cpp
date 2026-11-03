@@ -251,6 +251,29 @@ TEST_F(RebootstrapTest, SnapshotBootstrapWithoutSuffixSetsAppliedMetric) {
     EXPECT_EQ(1u, metrics.get_snapshot_runtime().applied_batch);
 }
 
+TEST_F(RebootstrapTest, RebootstrapWithoutSuffixSetsAppliedMetric) {
+    // The snapshot covers batch 4, so the swap installs it with no suffix to
+    // replay and ApplyOpLogEntry never runs on the candidate.
+    auto& metrics = HAMetricManager::instance();
+    Publish(4, "new", false);
+    metrics.set_oplog_applied_sequence_id(0);
+    Compact();
+    ASSERT_TRUE(WaitUntil([&] {
+        return service_->GetLatestAppliedSequenceId() == 4 &&
+               !service_->GetSyncStatus().is_recovering;
+    }));
+    EXPECT_EQ(0u, metrics.get_snapshot_runtime().suffix_batches);
+    EXPECT_EQ(4u, metrics.get_snapshot_runtime().applied_batch);
+    EXPECT_EQ(4, metrics.get_oplog_applied_sequence_id());
+    EXPECT_EQ(4u, service_->GetSyncStatus().applied_seq_id);
+    EXPECT_TRUE(service_->IsReadyForPromotion());
+    auto handoff = service_->PromoteAndDetachBatchOpLogStore();
+    ASSERT_TRUE(handoff);
+    EXPECT_EQ(4u, handoff->applied_cursor.last_seq);
+    ASSERT_EQ(1u, handoff->segments.size());
+    EXPECT_EQ("new", handoff->segments[0].segment_name);
+}
+
 TEST_F(RebootstrapTest, CorruptLatestUsesFallbackAndReplaysSuffix) {
     auto& metrics = HAMetricManager::instance();
     const auto before = metrics.get_snapshot_operation(
