@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -85,9 +86,10 @@ struct XpuSubBatch : public Transport::SubBatch {
 //    whenever such a mapping may exist (mayMapRemoteBuffer) and imports only
 //    once XPU is actually selected; if the import fails, the request is
 //    planned again without it and keeps the RDMA dma-buf route or host
-//    staging. Once the peer stops publishing the buffer or the segment is
-//    closed, the mapping is closed after the last copy through it, so the
-//    exporter can reclaim the memory.
+//    staging. Once the peer stops publishing the buffer, the segment is
+//    closed or the exporting process exits, the mapping is closed after the
+//    last copy through it, so the memory can be reclaimed (a mapping keeps
+//    the allocation alive even after its exporter is gone).
 // Cross-node VRAM traffic bypasses this transport entirely when RdmaTransport
 // registered both ends through dma-buf (GPUDirect-style, see
 // xpuDirectRdmaReady); staging remains the fallback for hosts or buffers
@@ -180,8 +182,17 @@ class XpuTransport : public Transport {
     std::shared_ptr<void> relocate(SegmentID target_id, int source_device,
                                    uint64_t &addr, uint64_t length);
 
+    // Watch process `pid`, whose buffer was just mapped, so that its
+    // mappings are closed once it exits (see watchExporters). Returns false
+    // when it has already gone. Called with imports_lock_ held.
+    bool watchExporterLocked(pid_t pid);
+    // Body of watcher_: waits on the pidfds in exporters_ and drops the
+    // mappings of every exporter that exits.
+    void watchExporters();
+
     struct ImportEntry {
         std::string attr;  // exporter attribute the mapping was made from
+        pid_t pid;         // exporter process
         uint64_t base;     // peer address of the allocation
         uint64_t size;
         uint64_t generation;  // from `attr`, see addMemoryBuffer
@@ -234,6 +245,14 @@ class XpuTransport : public Transport {
 
     std::mutex imports_lock_;
     std::unordered_map<SegmentID, SegmentImports> imports_;
+    // Exit watch over the peer processes mapped from: pidfd per exporter pid
+    // (under imports_lock_), plus an eventfd that wakes watcher_ to pick up
+    // new pidfds or stop. watcher_ starts with the first cross-process
+    // import.
+    std::unordered_map<pid_t, int> exporters_;
+    bool stop_watcher_ = false;
+    int watcher_wakeup_fd_ = -1;
+    std::thread watcher_;
 };
 
 }  // namespace tent
