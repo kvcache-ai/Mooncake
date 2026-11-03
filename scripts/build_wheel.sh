@@ -104,6 +104,14 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
 fi
 
+# Copy TENT artifacts for the memfabric wheel.
+if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Copying TENT libraries and Python extension..."
+    cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so" mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/metrics/libtent_metrics.so" mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}"/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so mooncake-wheel/mooncake/
+fi
+
 # Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
 if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
     echo "Copying ascend_transport.so..."
@@ -298,7 +306,7 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD MEMFABRIC_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -351,6 +359,18 @@ elif [ "$NPU_BUILD" = "1" ]; then
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-npu"
+elif [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Modifying package name for memfabric build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-memfabric"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (memfabric version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "memfabric"]/' pyproject.toml
+    sed -i 's/^requires-python = ">=3.10"$/requires-python = ">=3.9"/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-memfabric"
 elif [ "$EFA_BUILD" = "1" ]; then
     echo "Modifying package name for AWS EFA build (CUDA)"
     # Backup original pyproject.toml
@@ -453,6 +473,17 @@ fi
 if [ "$NPU_BUILD" = "1" ]; then
     echo "Pre-setting RPATH=\$ORIGIN on NPU ELF files..."
     find "$WHEEL_PACKAGE_DIR" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
+fi
+
+# Prioritize the package directory for sibling-library lookup while preserving
+# build-time dependency paths needed by auditwheel.
+if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Prioritizing package-local RPATH for memfabric ELF files..."
+    while IFS= read -r -d '' elf_file; do
+        existing_rpath=$(patchelf --print-rpath "$elf_file")
+        patchelf --set-rpath "\$ORIGIN${existing_rpath:+:$existing_rpath}" "$elf_file"
+    done < <(find "$WHEEL_PACKAGE_DIR" -type f \
+        -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0)
 fi
 
 # Create directory for repaired wheels
