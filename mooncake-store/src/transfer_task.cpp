@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include "config/transfer_submitter_config.h"
+#include "config.h"
 #include "config/nof_debug_config.h"
 #include "config/fileread_worker_pool_config.h"
 #include "config/nof_worker_pool_config.h"
@@ -957,8 +958,12 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr int64_t timeout_milliseconds = 60 * 1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    // TENT batches do not use the classic transport BatchDesc layout.
-    if (!engine_.isUsingTent()) {
+    // TENT batches do not use the classic transport BatchDesc layout. Mixed
+    // and legacy batches need foreground polling to make progress, and a
+    // positive slice_timeout needs the polling path that enforces it.
+    if (!engine_.isUsingTent() &&
+        Transport::toBatchDesc(batch_id_).counter_eligible &&
+        globalConfig().slice_timeout <= 0) {
         VLOG(1) << "Waiting for transfer engine completion for batch "
                 << batch_id_;
         // Wait directly on BatchDesc's condition variable.
