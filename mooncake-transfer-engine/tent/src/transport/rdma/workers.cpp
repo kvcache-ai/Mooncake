@@ -1813,8 +1813,8 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     if (GdrReachability::hasAnyExclusion()) {
         int src_gpu = -1, dst_gpu = -1;
         LocationParser s(source.location), d(target.location);
-        if (s.type() == "cuda") src_gpu = s.index();
-        if (d.type() == "cuda") dst_gpu = d.index();
+        if (s.type() == "cuda" || s.type() == "mlu") src_gpu = s.index();
+        if (d.type() == "cuda" || d.type() == "mlu") dst_gpu = d.index();
         gdr_excluded = gdrPairExcluded(source, target, slice->source_dev_id,
                                        slice->target_dev_id, src_gpu, dst_gpu);
     }
@@ -1886,8 +1886,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
     int src_gpu = -1, dst_gpu = -1;
     if (gdr_learned) {
         LocationParser s(source.location), d(target.location);
-        if (s.type() == "cuda") src_gpu = s.index();
-        if (d.type() == "cuda") dst_gpu = d.index();
+        if (s.type() == "cuda" || s.type() == "mlu") src_gpu = s.index();
+        if (d.type() == "cuda" || d.type() == "mlu") dst_gpu = d.index();
     }
 
     size_t src_total = 0;
@@ -2012,8 +2012,10 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     // handling may happen after the segment publishes a replacement snapshot.
     {
         LocationParser s(source.location), d(target.location);
-        slice->source_gpu_ordinal = (s.type() == "cuda") ? s.index() : -1;
-        slice->target_gpu_ordinal = (d.type() == "cuda") ? d.index() : -1;
+        slice->source_gpu_ordinal =
+            (s.type() == "cuda" || s.type() == "mlu") ? s.index() : -1;
+        slice->target_gpu_ordinal =
+            (d.type() == "cuda" || d.type() == "mlu") ? d.index() : -1;
         const auto* lnic = source.topo->getNicEntry(slice->source_dev_id);
         const auto* rnic = target.topo->getNicEntry(slice->target_dev_id);
         slice->source_nic_name = lnic ? lnic->name : "";

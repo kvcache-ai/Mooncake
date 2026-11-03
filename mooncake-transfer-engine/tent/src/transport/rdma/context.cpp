@@ -540,8 +540,8 @@ int RdmaContext::resume() {
                : -1;
 }
 
-RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
-                                                int access) {
+RdmaContext::MemReg RdmaContext::registerMemReg(
+    void* addr, size_t length, int access, const DmabufExport* shared_export) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
@@ -610,11 +610,18 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     // the memory-type check below prevents an MLU pointer from reaching
     // ibv_reg_mr if export is unavailable. Any other export failure, or a
     // failed ibv_reg_dmabuf_mr, leaves the buffer to the staging route.
+    if (shared_export && shared_export->fd >= 0 && !supportsDmabuf())
+        return nullptr;
     if (verbs_.ibv_reg_dmabuf_mr) {
         DmabufExport handle;
-        Status s = dmabuf_exporter_ ? dmabuf_exporter_(addr, length, handle)
-                                    : Platform::getLoader().exportDmabuf(
-                                          addr, length, handle);
+        Status s = Status::NotImplemented("No shared dma-buf export");
+        if (shared_export) {
+            handle = *shared_export;
+            handle.close_fd = false;
+            if (handle.fd >= 0) s = Status::OK();
+        } else {
+            s = exportDmabuf(addr, length, handle);
+        }
         struct ExportGuard {
             DmabufExport& handle;
             ~ExportGuard() {
@@ -626,9 +633,9 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
             ibv_mr* entry = verbs_.ibv_reg_dmabuf_mr(
                 native_pd_, handle.offset, length,
                 reinterpret_cast<uint64_t>(addr), handle.fd, access);
-            // The MR takes its own reference to the dma-buf. The guard closes
-            // a caller-owned CNDrv fd after registration and leaves borrowed
-            // Level Zero descriptors open.
+            // The MR takes its own reference to the dma-buf. Shared exports
+            // and Level Zero descriptors are borrowed; only a private,
+            // caller-owned export is closed by this guard.
             if (!entry) {
                 const void* end = static_cast<const char*>(addr) + length;
                 PLOG(ERROR)
