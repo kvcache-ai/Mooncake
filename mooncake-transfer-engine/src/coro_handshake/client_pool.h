@@ -120,6 +120,7 @@ class HandshakeClientPool {
     int max_active_per_peer_ = 128;
     int timeout_seconds_ = 60;
     int connect_timeout_seconds_ = 5;
+    uint64_t max_frame_ = 1ull << 20;
     std::atomic<int> idle_ttl_seconds_{60};
     std::thread sweeper_;
     std::mutex sweep_mu_;

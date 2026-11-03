@@ -64,6 +64,7 @@ uint64_t ParseHandshakeUint64(const char *text, uint64_t fallback) {
 HandshakeLimits LoadHandshakeLimits() {
     constexpr int kDefaultThreads = 2;
     constexpr int kDefaultConcurrency = 256;
+    constexpr int kDefaultConnections = 256;
     constexpr int kDefaultPools = 1024;
     constexpr int kDefaultMaxIdlePerPeer = 128;
     constexpr int kDefaultMaxActivePerPeer = 128;
@@ -74,6 +75,8 @@ HandshakeLimits LoadHandshakeLimits() {
     limits.threads = ReadInt("MC_HANDSHAKE_RPC_THREADS", kDefaultThreads, 1, 8);
     limits.max_concurrency =
         ReadInt("MC_HANDSHAKE_MAX_CONCURRENCY", kDefaultConcurrency, 1, 1024);
+    limits.max_connections = ReadInt("MC_HANDSHAKE_MAX_CONNECTIONS",
+                                     kDefaultConnections, 1, 1000000);
     limits.max_pools =
         ReadInt("MC_HANDSHAKE_MAX_POOLS", kDefaultPools, 1, 1000000);
     limits.max_idle_per_peer = ReadInt("MC_HANDSHAKE_MAX_IDLE_PER_PEER",

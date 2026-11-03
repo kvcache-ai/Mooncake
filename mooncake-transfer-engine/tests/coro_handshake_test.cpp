@@ -748,6 +748,19 @@ TEST(CoroHandshake, UnresolvedHostIsDnsError) {
               ERR_DNS);
 }
 
+TEST(CoroHandshake, ConnectionCapClosesTheExtraSocket) {
+    RestoreEnv connections("MC_HANDSHAKE_MAX_CONNECTIONS", "1");
+    CoroServer server;
+    server.Start();
+    auto first = mooncake::CreateCoroHandshakePlugin();
+    Json::Value response;
+    ASSERT_EQ(first->sendProbe("127.0.0.1", server.port(), Object(), response),
+              0);
+    auto second = mooncake::CreateCoroHandshakePlugin();
+    EXPECT_EQ(second->sendProbe("127.0.0.1", server.port(), Object(), response),
+              ERR_SOCKET);
+}
+
 TEST(CoroHandshake, RefusedConnectStaysASocketError) {
     uint16_t port = 0;
     int fd = ListenLoopback(port);

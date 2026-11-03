@@ -85,6 +85,8 @@ class HandshakeRpc {
     void LeaveHandler();
     bool TryPermit();
     void ReleasePermit();
+    bool AdmitConnection();
+    void ReleaseConnection();
 
     struct Permit {
         explicit Permit(HandshakeRpc *rpc) : rpc_(rpc) {}
@@ -109,6 +111,7 @@ class HandshakeRpc {
     std::condition_variable lifecycle_cv_;
     int inflight_ = 0;
     std::atomic<int> inflight_offload_{0};
+    std::atomic<int> live_connections_{0};
 
     std::mutex callback_mu_;
     std::unordered_map<int, HandShakePlugin::OnReceiveCallBack> callbacks_;

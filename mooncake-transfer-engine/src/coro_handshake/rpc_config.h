@@ -25,6 +25,7 @@ constexpr uint64_t kHandshakeEnvelopeBytes = 64;
 struct HandshakeLimits {
     int threads = 2;
     int max_concurrency = 256;
+    int max_connections = 256;
     int max_pools = 1024;
     int max_idle_per_peer = 128;
     int max_active_per_peer = 128;

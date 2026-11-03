@@ -42,6 +42,7 @@ void HandshakeClientPool::UpdateLimits(const HandshakeLimits &limits) {
     max_active_per_peer_ = limits.max_active_per_peer;
     timeout_seconds_ = limits.timeout_seconds;
     connect_timeout_seconds_ = limits.connect_timeout_seconds;
+    max_frame_ = limits.max_frame;
     idle_ttl_seconds_.store(limits.idle_ttl_seconds);
 }
 
@@ -122,6 +123,11 @@ coro_rpc::coro_rpc_client::config HandshakeClientPool::ClientConfig() {
     config.connect_timeout_duration =
         std::chrono::seconds(connect_timeout_seconds_);
     config.request_timeout_duration = std::chrono::seconds(timeout_seconds_);
+    // Checked inside coro_rpc before it resizes the response buffer. The
+    // upstream API limits body and attachment separately; the handshake
+    // payload is the attachment, and the body is only the status word.
+    config.max_response_body_bytes = max_frame_;
+    config.max_response_attachment_bytes = max_frame_;
     return config;
 }
 

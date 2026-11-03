@@ -104,7 +104,8 @@ struct HandshakeRpcProtocol : coro_rpc::protocol::coro_rpc_protocol {
     template <typename Socket>
     static async_simple::coro::Lazy<std::error_code> read_payload(
         Socket &socket, req_header &req_head, std::string &buffer,
-        coro_io::heterogeneous_buffer &attachment) {
+        coro_io::heterogeneous_buffer &attachment,
+        coro_rpc::context_info_t<HandshakeRpcProtocol> *) {
         const uint64_t body = req_head.length;
         const uint64_t attach = req_head.attach_length;
         const PayloadDecision decision =
@@ -314,6 +315,10 @@ int HandshakeRpc::Start(uint16_t port, int sockfd, bool *fd_consumed) {
         listen->server = new HandshakeServer(config, std::move(acceptors));
     }
     listen->server->register_handler<&HandshakeRpc::process>(this);
+    // Before async_start. A rejected socket is closed without a connection
+    // object, and its close callback is not invoked.
+    listen->server->connection_admission([this] { return AdmitConnection(); },
+                                         [this] { ReleaseConnection(); });
     listen->server->async_start();
     const auto err = listen->server->get_errc();
     if (bound != nullptr && bound->consumed() && fd_consumed != nullptr) {
@@ -332,7 +337,8 @@ int HandshakeRpc::Start(uint16_t port, int sockfd, bool *fd_consumed) {
               << " threads=" << limits_.threads
               << " offload_threads=" << OffloadPool::kThreads
               << " max_inflight_bytes=" << limits_.max_bytes
-              << " max_frame=" << limits_.max_frame;
+              << " max_frame=" << limits_.max_frame
+              << " max_connections=" << limits_.max_connections;
     return 0;
 }
 
@@ -398,6 +404,21 @@ bool HandshakeRpc::TryPermit() {
 
 void HandshakeRpc::ReleasePermit() {
     inflight_offload_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+bool HandshakeRpc::AdmitConnection() {
+    int current = live_connections_.load(std::memory_order_relaxed);
+    while (current < limits_.max_connections) {
+        if (live_connections_.compare_exchange_weak(
+                current, current + 1, std::memory_order_acq_rel)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void HandshakeRpc::ReleaseConnection() {
+    live_connections_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 async_simple::coro::Lazy<int32_t> HandshakeRpc::process(int func_id) {
