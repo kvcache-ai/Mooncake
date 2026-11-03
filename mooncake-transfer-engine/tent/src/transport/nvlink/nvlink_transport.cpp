@@ -319,6 +319,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                 LOG(ERROR) << "NVLinkTransport: cudaGetDevice/cudaSetDevice "
                               "failed for sync copy: "
                            << cudaGetErrorString(dev_err);
+                (void)cudaGetLastError();
                 task->status_word = TransferStatusEnum::FAILED;
                 return;
             }
@@ -334,6 +335,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
         } else {
             LOG(ERROR) << "NVLinkTransport: synchronous cudaMemcpy failed: "
                        << cudaGetErrorString(err);
+            (void)cudaGetLastError();
             task->status_word = TransferStatusEnum::FAILED;
         }
         return;
@@ -402,6 +404,9 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     }
 
     if (err != cudaSuccess) {
+        // The failed tasks carry the error; clear it so the caller's next
+        // CUDA error check does not pick it up again.
+        (void)cudaGetLastError();
         for (auto* task : tasks) {
             if (task->status_word == TransferStatusEnum::PENDING)
                 task->status_word = TransferStatusEnum::FAILED;
@@ -416,6 +421,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
         if (err != cudaSuccess) {
             LOG(ERROR) << "NVLinkTransport: cudaGetDevice failed: "
                        << cudaGetErrorString(err);
+            (void)cudaGetLastError();
             for (auto* task : tasks)
                 task->status_word = TransferStatusEnum::FAILED;
             return;
@@ -425,6 +431,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
             if (err != cudaSuccess) {
                 LOG(ERROR) << "NVLinkTransport: cudaSetDevice failed: "
                            << cudaGetErrorString(err);
+                (void)cudaGetLastError();
                 for (auto* task : tasks)
                     task->status_word = TransferStatusEnum::FAILED;
                 return;
@@ -437,6 +444,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     if (event_err != cudaSuccess) {
         LOG(ERROR) << "NVLinkTransport: cudaEventCreateWithFlags failed: "
                    << cudaGetErrorString(event_err);
+        (void)cudaGetLastError();
         // Restore device before returning
         if (saved_device >= 0 && saved_device != batch->stream_device_id) {
             cudaSetDevice(saved_device);
@@ -448,6 +456,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
     if (record_err != cudaSuccess) {
         LOG(ERROR) << "NVLinkTransport: cudaEventRecord failed: "
                    << cudaGetErrorString(record_err);
+        (void)cudaGetLastError();
         cudaEventDestroy(event);
         // Restore device before returning
         if (saved_device >= 0 && saved_device != batch->stream_device_id) {
@@ -479,6 +488,7 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
             task.transferred_bytes = task.request.length;
             task.status_word = TransferStatusEnum::COMPLETED;
         } else if (err != cudaErrorNotReady) {
+            (void)cudaGetLastError();
             task.status_word = TransferStatusEnum::FAILED;
         }
     }
@@ -557,6 +567,7 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
                        << (uint64_t)base_ptr << std::dec << ", device "
                        << location.index() << ": "
                        << cudaGetErrorString(cuda_err);
+            (void)cudaGetLastError();
             return Status::InternalError(
                 std::string("cudaIpcGetMemHandle(&handle, (void*)base_ptr): ") +
                 cudaGetErrorString(cuda_err) + LOC_MARK);
