@@ -9,7 +9,9 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <new>
 #include <optional>
 #include <ranges>
@@ -797,6 +799,219 @@ TEST_F(StorageBackendTest, MissingBucketDataFileCleanup) {
         });
     ASSERT_TRUE(scan_result.has_value());
     EXPECT_TRUE(recovered_keys.empty());
+}
+
+class BucketRecoveryOwnershipTest : public StorageBackendTest {
+   protected:
+    static tl::expected<int64_t, ErrorCode> Offload(
+        BucketStorageBackend& backend, const std::string& key,
+        std::string& value,
+        StorageBackendInterface::EvictionHandler evict = nullptr) {
+        return backend.BatchOffload(
+            {{key, {Slice{value.data(), value.size()}}}},
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; },
+            evict);
+    }
+
+    static void ExpectValue(BucketStorageBackend& backend,
+                            const std::string& key, const std::string& value) {
+        std::string buffer(value.size(), '\0');
+        std::unordered_map<std::string, Slice> slices = {
+            {key, Slice{buffer.data(), buffer.size()}}};
+        ASSERT_TRUE(backend.BatchLoad(slices));
+        EXPECT_EQ(std::string(static_cast<char*>(slices.at(key).ptr),
+                              slices.at(key).size),
+                  value);
+    }
+
+    static std::string ReadBytes(const fs::path& path) {
+        std::ifstream file(path, std::ios::binary);
+        EXPECT_TRUE(file.is_open()) << path;
+        return {std::istreambuf_iterator<char>(file),
+                std::istreambuf_iterator<char>()};
+    }
+
+    static std::map<fs::path, std::string> Snapshot(const fs::path& dir) {
+        std::map<fs::path, std::string> files;
+        for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+            if (entry.path().extension() == ".bucket" ||
+                entry.path().extension() == ".meta") {
+                files.emplace(entry.path(), ReadBytes(entry.path()));
+            }
+        }
+        return files;
+    }
+
+    static void ExpectUnchanged(const std::map<fs::path, std::string>& files) {
+        for (const auto& [path, bytes] : files) {
+            EXPECT_TRUE(fs::exists(path)) << path;
+            EXPECT_EQ(ReadBytes(path), bytes) << path;
+        }
+    }
+};
+
+TEST_F(BucketRecoveryOwnershipTest,
+       NestedFilesSurviveInitializationAndCleanup) {
+    FileStorageConfig child_config;
+    child_config.storage_filepath = data_path + "/rank_0";
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend child(child_config, bucket_config);
+    ASSERT_TRUE(child.Init());
+    std::string value(1024, 'F');
+    auto id = Offload(child, "foreign", value);
+    ASSERT_TRUE(id);
+
+    // Keep rank_0's owner alive. The parent lock does not cover child paths.
+    // Copying the pair also gives rank_1 exactly the same ID, without timing.
+    const fs::path rank1 = fs::path(data_path) / "rank_1";
+    fs::create_directory(rank1);
+    for (const auto& [path, bytes] : Snapshot(child_config.storage_filepath)) {
+        fs::copy_file(path, rank1 / path.filename());
+    }
+    std::ofstream(rank1 / "17.meta", std::ios::binary) << "invalid metadata";
+    std::ofstream(rank1 / "17.bucket", std::ios::binary) << "foreign data";
+    fs::copy_file(rank1 / (std::to_string(*id) + ".meta"), rank1 / "18.meta");
+    std::ofstream(rank1 / "19.bucket", std::ios::binary) << "foreign orphan";
+    const auto foreign_files = Snapshot(data_path);
+
+    FileStorageConfig root_config;
+    root_config.storage_filepath = data_path;
+    for (int round = 0; round < 2; ++round) {
+        SCOPED_TRACE(round);
+        // Owned crash residue must still be reclaimed, unlike nested files.
+        std::ofstream(fs::path(data_path) / "20.bucket") << "owned orphan";
+        std::ofstream(fs::path(data_path) / "21.meta") << "invalid metadata";
+        std::ofstream(fs::path(data_path) / "21.bucket") << "owned corrupt";
+        BucketStorageBackend root(root_config, bucket_config);
+        ASSERT_TRUE(root.Init());
+        auto metadata = root.GetStoreMetadata();
+        ASSERT_TRUE(metadata);
+        EXPECT_EQ(metadata->total_keys, 0u);
+        EXPECT_EQ(metadata->total_size, 0);
+        auto removed = root.DeleteBucket(*id);
+        ASSERT_FALSE(removed);
+        EXPECT_EQ(removed.error(), ErrorCode::BUCKET_NOT_FOUND);
+        root.RemoveAll();
+        ExpectUnchanged(foreign_files);
+        ExpectValue(child, "foreign", value);
+        EXPECT_FALSE(fs::exists(fs::path(data_path) / "20.bucket"));
+        EXPECT_FALSE(fs::exists(fs::path(data_path) / "21.meta"));
+        EXPECT_FALSE(fs::exists(fs::path(data_path) / "21.bucket"));
+    }
+    // The nested directory is recoverable by its own backend, not the parent.
+    FileStorageConfig rank1_config;
+    rank1_config.storage_filepath = rank1.string();
+    BucketStorageBackend restarted_child(rank1_config, bucket_config);
+    ASSERT_TRUE(restarted_child.Init());
+    ExpectValue(restarted_child, "foreign", value);
+}
+
+TEST_F(BucketRecoveryOwnershipTest, LocalIdentityIgnoresNestedDuplicateIds) {
+    FileStorageConfig root_config;
+    root_config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    std::string local_value(1024, 'L');
+    int64_t local_id = 0;
+    {
+        BucketStorageBackend root(root_config, bucket_config);
+        ASSERT_TRUE(root.Init());
+        auto id = Offload(root, "local", local_value);
+        ASSERT_TRUE(id);
+        local_id = *id;
+    }
+    FileStorageConfig child_config;
+    child_config.storage_filepath = data_path + "/rank_0";
+    std::string foreign_value(1024, 'F');
+    {
+        BucketStorageBackend child(child_config, bucket_config);
+        ASSERT_TRUE(child.Init());
+        auto id = Offload(child, "foreign", foreign_value);
+        ASSERT_TRUE(id);
+        // IDs are filenames, not serialized metadata: force an exact collision.
+        for (const auto* suffix : {".bucket", ".meta"}) {
+            if (*id != local_id) {
+                fs::rename(fs::path(child_config.storage_filepath) /
+                               (std::to_string(*id) + suffix),
+                           fs::path(child_config.storage_filepath) /
+                               (std::to_string(local_id) + suffix));
+            }
+        }
+    }
+    const auto foreign_files = Snapshot(child_config.storage_filepath);
+    for (int round = 0; round < 2; ++round) {
+        SCOPED_TRACE(round);
+        BucketStorageBackend root(root_config, bucket_config);
+        ASSERT_TRUE(root.Init());
+        ExpectValue(root, "local", local_value);
+        auto foreign = root.IsExist("foreign");
+        ASSERT_TRUE(foreign);
+        EXPECT_FALSE(*foreign);
+        auto metadata = root.GetStoreMetadata();
+        ASSERT_TRUE(metadata);
+        EXPECT_EQ(metadata->total_keys, 1u);
+        ExpectUnchanged(foreign_files);
+        if (round == 1) {
+            ASSERT_TRUE(root.DeleteBucket(local_id));
+            EXPECT_FALSE(fs::exists(fs::path(data_path) /
+                                    (std::to_string(local_id) + ".bucket")));
+            ExpectUnchanged(foreign_files);
+        }
+    }
+    BucketStorageBackend child(child_config, bucket_config);
+    ASSERT_TRUE(child.Init());
+    ExpectValue(child, "foreign", foreign_value);
+}
+
+TEST_F(BucketRecoveryOwnershipTest, EvictionAndRemovalLeaveNestedFilesIntact) {
+    for (auto policy :
+         {BucketEvictionPolicy::FIFO, BucketEvictionPolicy::LRU}) {
+        SCOPED_TRACE(static_cast<int>(policy));
+        const auto root_path =
+            fs::path(data_path) / std::to_string(static_cast<int>(policy));
+        FileStorageConfig child_config;
+        child_config.storage_filepath = (root_path / "rank_0").string();
+        BucketBackendConfig bucket_config;
+        std::string value(6 * 1024, 'V');
+        {
+            BucketStorageBackend child(child_config, bucket_config);
+            ASSERT_TRUE(child.Init());
+            ASSERT_TRUE(Offload(child, "foreign", value));
+        }
+        const auto foreign_files = Snapshot(child_config.storage_filepath);
+        FileStorageConfig root_config;
+        root_config.storage_filepath = root_path.string();
+        bucket_config.max_total_size = 16 * 1024;
+        bucket_config.eviction_policy = policy;
+        std::vector<std::string> evicted_keys;
+        auto evict = [&](const std::vector<std::string>& keys) {
+            evicted_keys.insert(evicted_keys.end(), keys.begin(), keys.end());
+            return tl::expected<void, ErrorCode>{};
+        };
+        {
+            BucketStorageBackend root(root_config, bucket_config);
+            ASSERT_TRUE(root.Init());
+            for (const auto* key : {"local_0", "local_1", "local_2"}) {
+                ASSERT_TRUE(Offload(root, key, value, evict));
+            }
+            EXPECT_EQ(evicted_keys, (std::vector<std::string>{"local_0"}));
+            ExpectValue(root, "local_2", value);
+            ASSERT_TRUE(root.EvictAboveDiskWatermark(0.5, 0.25, evict));
+            EXPECT_GT(evicted_keys.size(), 1u);
+            for (const auto& key : evicted_keys) {
+                EXPECT_NE(key, "foreign");
+            }
+            ASSERT_TRUE(Offload(root, "local_3", value, evict));
+            root.RemoveAll();
+            auto local = root.IsExist("local_3");
+            ASSERT_TRUE(local);
+            EXPECT_FALSE(*local);
+            ExpectUnchanged(foreign_files);
+        }
+        BucketStorageBackend child(child_config, bucket_config);
+        ASSERT_TRUE(child.Init());
+        ExpectValue(child, "foreign", value);
+    }
 }
 
 TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
