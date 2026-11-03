@@ -138,18 +138,27 @@ after failure or cancellation.
 CPU-only regression validation:
 
 ```sh
-python3 -m unittest scripts.ci.tests.test_xpu_ci -v
+python3 -m unittest scripts.ci.tests.test_xpu_ci \
+  scripts.ci.tests.test_run_ctest -v
 ```
 
-All XPU CI regressions share this one test module and common workflow/module
-loaders; they validate packaging and orchestration contracts, not actual B60
-behavior. Docker launch, device mapping, traps and cleanup are inline in
+XPU CI regressions share one test module and common workflow/module loaders;
+they validate packaging and orchestration contracts, not actual B60 behavior.
+Shared XML report validation lives in `scripts/ci/check_test_reports.py`.
+Both the hosted XPU tests and hardware suites require GoogleTest's explicit
+`run`/`completed` status and reject skipped cases. Hardware suites additionally
+pass their expected case identities to the same validator. The shared CTest
+action and TENT CI also use it for JUnit reports, preserving CTest's existing
+skip policy via `--allow-skipped`. Targeted CTest steps without XML reports
+retain their native exit-code and `--no-tests=error` checks.
+
+Docker launch, device mapping, traps and cleanup are inline in
 `.github/workflows/integration-test-xpu.yml`. A temporary cleanup helper is
 created from that trusted workflow in the host run directory and shared by
 the exit trap and the `always()` cleanup recheck; it is not mounted into the
 test container.
 
-`scripts/e2e/python/verify_xpu_wheel.py` is the single verification entry point:
+`scripts/e2e/python/verify_xpu_ci.py` is the single verification entry point:
 no arguments retain the hosted wheel smoke checks; `unpack` verifies the
 downloaded artifact, `seccomp` prepares the pinned profile, and `run` installs
 the wheel offline and launches the `suite`/`store` hardware checks. There are
