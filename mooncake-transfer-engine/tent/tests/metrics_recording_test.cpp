@@ -211,12 +211,15 @@ class FakeSubBatch : public Transport::SubBatch {
 class FakeTransport : public Transport {
    public:
     explicit FakeTransport(TransportType self_type, bool force_fail = false,
-                           bool force_submit_fail = false)
+                           bool force_submit_fail = false,
+                           int allocate_failures = 0)
         : self_type_(self_type),
           force_fail_(force_fail),
-          force_submit_fail_(force_submit_fail) {
+          force_submit_fail_(force_submit_fail),
+          allocate_failures_(allocate_failures) {
         caps.dram_to_dram = true;
     }
+    std::atomic<int> allocate_calls{0};
     std::atomic<int> submit_calls{0};
 
     Status install(std::string&, std::shared_ptr<ControlService>,
@@ -226,6 +229,11 @@ class FakeTransport : public Transport {
     }
 
     Status allocateSubBatch(SubBatchRef& batch, size_t) override {
+        ++allocate_calls;
+        if (allocate_failures_ > 0) {
+            --allocate_failures_;
+            return Status::InternalError("forced allocation failure" LOC_MARK);
+        }
         batch = new FakeSubBatch();
         return Status::OK();
     }
@@ -309,6 +317,7 @@ class FakeTransport : public Transport {
     TransportType self_type_;
     bool force_fail_;
     bool force_submit_fail_;
+    int allocate_failures_;
 };
 
 std::shared_ptr<Config> makeMetricsTestConfig() {
@@ -396,8 +405,9 @@ class MetricsRecordingTest : public ::testing::Test {
 
 // Lock the public Prometheus contract: every documented family has a stable
 // name and type, and every self-observability family is emitted even before a
-// transfer records traffic. Representative samples instantiate ylt's dynamic
-// business metrics, which intentionally omit never-observed label series.
+// transfer records traffic. Lossless-accounting series are pre-resolved;
+// representative samples instantiate the remaining ylt dynamic families,
+// which may omit never-observed label series.
 TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     auto& metrics = TentMetrics::instance();
     ASSERT_TRUE(TentMetrics::isCompiledIn());
@@ -423,7 +433,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordReadFailed(RDMA);
     metrics.recordWriteFailed(TCP);
     metrics.recordTransportFailover(RDMA, TCP);
-    metrics.recordTransportAttemptStarted(RDMA, Request::READ);
+    ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::READ));
+    metrics.recordLogicalRequestFinished(Request::READ, COMPLETED);
+    ASSERT_TRUE(metrics.recordTransportAttemptStarted(RDMA, Request::READ));
     metrics.recordTransportAttemptFinished(RDMA, Request::READ, FAILED, 42.0);
     metrics.recordDeadlineMLU(RDMA, 0.8);
     metrics.recordDeadlineInfeasible(TCP);
@@ -438,7 +450,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 30>
+    const std::array<std::pair<std::string_view, std::string_view>, 34>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -449,10 +461,14 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_transport_failover_total", "counter"},
             {"tent_transport_attempts_total", "counter"},
             {"tent_transport_attempt_failures_total", "counter"},
+            {"tent_logical_requests_started_total", "counter"},
+            {"tent_logical_request_outcomes_total", "counter"},
+            {"tent_transport_attempt_outcomes_total", "counter"},
             {"tent_task_failures_total", "counter"},
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
+            {"tent_logical_requests_inflight", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_read_latency_us", "histogram"},
             {"tent_write_latency_us", "histogram"},
@@ -579,9 +595,168 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
     EXPECT_EQ(after.histogramCount("tent_transport_attempt_latency_us") -
                   before.histogramCount("tent_transport_attempt_latency_us"),
               1);
+    EXPECT_EQ(
+        after.series("tent_logical_requests_started_total{operation=\""
+                     "write\"}") -
+            before.series(
+                "tent_logical_requests_started_total{operation=\"write\"}"),
+        1);
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"success\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(
+        after.series("tent_transport_attempt_outcomes_total{transport=\""
+                     "rdma\",operation=\"write\",outcome=\"success\"}") -
+            before.series(
+                "tent_transport_attempt_outcomes_total{transport=\"rdma\","
+                "operation=\"write\",outcome=\"success\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_logical_requests_inflight{operation=\"write\"}") -
+            before.series(
+                "tent_logical_requests_inflight{operation=\"write\"}"),
+        0);
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// A pre-attempt allocation failure is terminal for that logical request. It
+// must not leave a PENDING task with a concrete transport but no SubBatch, and
+// it must not prevent later requests in the same batch from being polled.
+TEST_F(MetricsRecordingTest,
+       AllocateSubBatchFailureSettlesRequestAndDoesNotBlockBatch) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/false,
+                                                /*force_submit_fail=*/false,
+                                                /*allocate_failures=*/1);
+    auto fallback = std::make_shared<FakeTransport>(TCP);
+    installFakeRdma(engine, fake);
+    installFakeTcp(engine, fallback);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(2 * kLen, 0xBC);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto failed_request = makeLocalWrite(buf.data(), kLen);
+    failed_request.transport_hint = UNSPEC;
+    const auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch, {failed_request,
+                                    makeLocalWrite(buf.data() + kLen, kLen)})
+            .ok());
+
+    // The first task failed before publication. Cancel must be harmless, and
+    // the batch status query must still reach the second, successful task.
+    EXPECT_TRUE(engine.cancelTransfer(batch, 0).ok());
+    TransferStatus overall_status{PENDING, 0};
+    ASSERT_TRUE(engine.getTransferStatus(batch, overall_status).ok());
+    EXPECT_EQ(overall_status.s, FAILED);
+
+    std::vector<TransferStatus> statuses;
+    ASSERT_TRUE(engine.getTransferStatus(batch, statuses).ok());
+    ASSERT_EQ(statuses.size(), 2);
+    EXPECT_EQ(statuses[0].s, FAILED);
+    EXPECT_EQ(statuses[1].s, COMPLETED);
+
+    const auto after = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(fake->allocate_calls.load(), 2);
+    EXPECT_EQ(fake->submit_calls.load(), 1);
+    EXPECT_EQ(fallback->allocate_calls.load(), 0);
+    EXPECT_EQ(fallback->submit_calls.load(), 0);
+    EXPECT_EQ(
+        after.series(
+            "tent_logical_requests_started_total{operation=\"write\"}") -
+            before.series(
+                "tent_logical_requests_started_total{operation=\"write\"}"),
+        2);
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"failed\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"failed\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"success\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(
+        after.series("tent_logical_requests_inflight{operation=\"write\"}") -
+            before.series(
+                "tent_logical_requests_inflight{operation=\"write\"}"),
+        0);
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              1);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              0);
+    EXPECT_EQ(after.series("tent_task_failures_total{transport=\"rdma\",reason="
+                           "\"submit\"}") -
+                  before.series(
+                      "tent_task_failures_total{transport=\"rdma\",reason=\""
+                      "submit\"}"),
+              1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+TEST_F(MetricsRecordingTest,
+       CanceledUnroutableRequestRemainsCanceledAcrossPolls) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBD);
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto request = makeLocalWrite(buf.data(), kLen);
+    request.transport_hint = UNSPEC;
+    const auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    ASSERT_TRUE(engine.cancelTransfer(batch, 0).ok());
+
+    for (int poll = 0; poll < 2; ++poll) {
+        TransferStatus status{PENDING, 0};
+        ASSERT_TRUE(engine.getTransferStatus(batch, 0, status).ok());
+        EXPECT_EQ(status.s, CANCELED);
+    }
+
+    const auto after = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"canceled\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"canceled\"}"),
+              1);
+    EXPECT_EQ(after.series("tent_logical_request_outcomes_total{operation=\""
+                           "write\",outcome=\"failed\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"failed\"}"),
+              0);
+    EXPECT_EQ(
+        after.series("tent_logical_requests_inflight{operation=\"write\"}") -
+            before.series(
+                "tent_logical_requests_inflight{operation=\"write\"}"),
+        0);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +812,24 @@ TEST_F(MetricsRecordingTest, RecoveredFailoverRecordsDistinctAttempts) {
     EXPECT_EQ(after.series(rdma_attempts) - before.series(rdma_attempts), 1);
     EXPECT_EQ(after.series(tcp_attempts) - before.series(tcp_attempts), 1);
     EXPECT_EQ(after.series(rdma_failures) - before.series(rdma_failures), 1);
+
+    const std::string logical_success =
+        "tent_logical_request_outcomes_total{operation=\"write\",outcome=\""
+        "success\"}";
+    const std::string rdma_attempt_failed =
+        "tent_transport_attempt_outcomes_total{transport=\"rdma\",operation=\""
+        "write\",outcome=\"failed\"}";
+    const std::string tcp_attempt_success =
+        "tent_transport_attempt_outcomes_total{transport=\"tcp\",operation=\""
+        "write\",outcome=\"success\"}";
+    EXPECT_EQ(after.series(logical_success) - before.series(logical_success),
+              1);
+    EXPECT_EQ(
+        after.series(rdma_attempt_failed) - before.series(rdma_attempt_failed),
+        1);
+    EXPECT_EQ(
+        after.series(tcp_attempt_success) - before.series(tcp_attempt_success),
+        1);
 
     // Logical compatibility: the recovered request completes once and does not
     // become a terminal request failure.
@@ -1465,6 +1658,113 @@ TEST_F(MetricsRecordingTest, InflightGaugeSurvivesEnableToggle) {
               0);
     EXPECT_EQ(after.series("tent_inflight_attempts{transport=\"rdma\"}") -
                   before.series("tent_inflight_attempts{transport=\"rdma\"}"),
+              0);
+}
+
+// Accounting uses a start token instead of consulting the runtime switch at
+// finish time. A pair that starts enabled must close even if recording is
+// disabled in flight; a request that starts disabled must not create an
+// unmatched outcome when recording is enabled later.
+TEST_F(MetricsRecordingTest, AccountingPairsSurviveRuntimeEnableToggle) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    TentMetrics::setEnabled(true);
+    ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::WRITE));
+    ASSERT_TRUE(metrics.recordTransportAttemptStarted(RDMA, Request::WRITE));
+    TentMetrics::setEnabled(false);
+    metrics.recordTransportAttemptFinished(RDMA, Request::WRITE, COMPLETED,
+                                           10.0);
+    metrics.recordLogicalRequestFinished(Request::WRITE, COMPLETED);
+
+    TentMetrics::setEnabled(true);
+    const auto after_closed_pair = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after_closed_pair.series(
+            "tent_logical_requests_started_total{operation=\"write\"}") -
+            before.series(
+                "tent_logical_requests_started_total{operation=\"write\"}"),
+        1);
+    EXPECT_EQ(after_closed_pair.series(
+                  "tent_logical_request_outcomes_total{operation=\"write\","
+                  "outcome=\"success\"}") -
+                  before.series(
+                      "tent_logical_request_outcomes_total{operation=\"write\","
+                      "outcome=\"success\"}"),
+              1);
+    EXPECT_EQ(
+        after_closed_pair.series(
+            "tent_transport_attempt_outcomes_total{transport=\"rdma\","
+            "operation=\"write\",outcome=\"success\"}") -
+            before.series(
+                "tent_transport_attempt_outcomes_total{transport=\"rdma\","
+                "operation=\"write\",outcome=\"success\"}"),
+        1);
+    EXPECT_EQ(after_closed_pair.series(
+                  "tent_logical_requests_inflight{operation=\"write\"}") -
+                  before.series(
+                      "tent_logical_requests_inflight{operation=\"write\"}"),
+              0);
+    EXPECT_EQ(
+        after_closed_pair.series("tent_inflight_attempts{transport=\"rdma\"}") -
+            before.series("tent_inflight_attempts{transport=\"rdma\"}"),
+        0);
+
+    TentMetrics::setEnabled(false);
+    EXPECT_FALSE(metrics.recordLogicalRequestStarted(Request::READ));
+    EXPECT_FALSE(metrics.recordTransportAttemptStarted(TCP, Request::READ));
+    TentMetrics::setEnabled(true);
+    const auto after_disabled_start = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after_disabled_start.counter("tent_logical_requests_started_total") -
+            after_closed_pair.counter("tent_logical_requests_started_total"),
+        0);
+    EXPECT_EQ(after_disabled_start.counter("tent_transport_attempts_total") -
+                  after_closed_pair.counter("tent_transport_attempts_total"),
+              0);
+}
+
+TEST_F(MetricsRecordingTest, AccountingUsesBoundedTerminalOutcomes) {
+    struct OutcomeCase {
+        TransferStatusEnum status;
+        const char* label;
+    };
+    constexpr std::array<OutcomeCase, 4> cases{{
+        {COMPLETED, "success"},
+        {FAILED, "failed"},
+        {TIMEOUT, "timeout"},
+        {CANCELED, "canceled"},
+    }};
+
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+    for (const auto& outcome : cases) {
+        ASSERT_TRUE(metrics.recordLogicalRequestStarted(Request::READ));
+        ASSERT_TRUE(metrics.recordTransportAttemptStarted(TCP, Request::READ));
+        metrics.recordTransportAttemptFinished(TCP, Request::READ,
+                                               outcome.status, 1.0);
+        metrics.recordLogicalRequestFinished(Request::READ, outcome.status);
+    }
+    const auto after = MetricsSnapshot(metrics);
+
+    for (const auto& outcome : cases) {
+        const std::string logical =
+            "tent_logical_request_outcomes_total{operation=\"read\",outcome="
+            "\"" +
+            std::string(outcome.label) + "\"}";
+        const std::string attempt =
+            "tent_transport_attempt_outcomes_total{transport=\"tcp\",operation="
+            "\"read\",outcome=\"" +
+            std::string(outcome.label) + "\"}";
+        EXPECT_EQ(after.series(logical) - before.series(logical), 1);
+        EXPECT_EQ(after.series(attempt) - before.series(attempt), 1);
+    }
+    EXPECT_EQ(
+        after.series("tent_logical_requests_inflight{operation=\"read\"}") -
+            before.series("tent_logical_requests_inflight{operation=\"read\"}"),
+        0);
+    EXPECT_EQ(after.series("tent_inflight_attempts{transport=\"tcp\"}") -
+                  before.series("tent_inflight_attempts{transport=\"tcp\"}"),
               0);
 }
 

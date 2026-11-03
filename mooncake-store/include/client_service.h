@@ -1048,6 +1048,9 @@ class Client {
      * endpoints are dropped, and an empty list issues no RPC.
      */
     void ReportUnreachableNoFTargets(std::vector<std::string> te_endpoints);
+    void ReconcileMissingKvcsReplica(
+        const std::string& key, const QueryResult& query_result,
+        const Replica::Descriptor& replica_descriptor);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
