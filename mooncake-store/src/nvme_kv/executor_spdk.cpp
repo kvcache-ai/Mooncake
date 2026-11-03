@@ -1,11 +1,13 @@
 #include "nvme_kv/executor.h"
 
-#if defined(USE_NOF) && defined(MOONCAKE_HAVE_SPDK_NVME_KV)
-
-#include "nof/nof_runtime.h"
-#include "nof/spdk_initiator.h"
+#include "nof/dma_buffer_allocator.h"
+#include "nof/nvmeof_initiator.h"
+#include "nvme_kv/config/executor_config.h"
 #include "nvme_kv/executor_util.h"
-#include "nvme_kv/object_layout.h"
+
+#if defined(USE_NOF) && defined(MOONCAKE_HAVE_SPDK_NVME_KV)
+#include "nof/nof_runtime.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +17,6 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -26,13 +27,13 @@
 namespace mooncake {
 namespace {
 
-struct SpdkDmaBufferDeleter {
+struct DmaBufferDeleter {
     std::shared_ptr<DmaBufferAllocator> allocator;
 
     void operator()(void *ptr) const { allocator->Free(ptr); }
 };
 
-using SpdkDmaBuffer = std::shared_ptr<void>;
+using DmaBuffer = std::shared_ptr<void>;
 
 struct CompletionState {
     std::atomic<bool> done{false};
@@ -42,15 +43,13 @@ struct CompletionState {
 };
 
 struct CompletionCallbackContext {
-    std::shared_ptr<CompletionState> completion;
-    std::shared_ptr<void> keep_alive;
+    CompletionState *completion = nullptr;
     NofKvAdaptor adaptor;
 };
 
 void KvCommandComplete(void *ctx, const NofKvCompletion &result) {
-    std::unique_ptr<CompletionCallbackContext> callback_context(
-        static_cast<CompletionCallbackContext *>(ctx));
-    auto &completion = callback_context->completion;
+    auto *callback_context = static_cast<CompletionCallbackContext *>(ctx);
+    auto *completion = callback_context->completion;
     completion->status_code_type = result.status_code_type;
     completion->status_code = result.status_code;
     completion->result = result.result;
@@ -68,7 +67,7 @@ ErrorCode MapSpdkSubmitError(int ret, bool is_write) {
 
 class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
    public:
-    NvmeKvSpdkExecutor(std::shared_ptr<SpdkInitiator> initiator,
+    NvmeKvSpdkExecutor(std::shared_ptr<NVMeoFInitiator> initiator,
                        std::shared_ptr<DmaBufferAllocator> allocator,
                        NofSegmentHandle *segment, Capabilities capabilities)
         : initiator_(std::move(initiator)),
@@ -91,7 +90,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
             return;
         }
 
-        std::vector<SpdkDmaBuffer> dma_buffers(requests.size());
+        std::vector<DmaBuffer> dma_buffers(requests.size());
         std::vector<const void *> submit_buffers(requests.size(), nullptr);
         std::vector<uint32_t> submit_sizes(requests.size(), 0);
 
@@ -124,7 +123,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                             0, submission_bytes - request.value.size());
             }
             dma_buffers[index] =
-                SpdkDmaBuffer(buffer, SpdkDmaBufferDeleter{allocator_});
+                DmaBuffer(buffer, DmaBufferDeleter{allocator_});
             submit_buffers[index] = buffer;
         }
 
@@ -132,7 +131,6 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
             requests.size(), true,
             [&](size_t index) { return submit_buffers[index] != nullptr; },
             [&](size_t index, CompletionCallbackContext *ctx) {
-                ctx->keep_alive = dma_buffers[index];
                 const int ret = initiator_->SubmitKvStore(
                     segment_, requests[index].key.data(),
                     static_cast<uint8_t>(requests[index].key.size()),
@@ -269,8 +267,8 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
     void SubmitBatch(size_t count, bool is_write, ReadyFn ready,
                      SubmitFn submit, CompleteFn complete) const {
         struct BatchContext {
-            std::shared_ptr<CompletionState> completion =
-                std::make_shared<CompletionState>();
+            CompletionState completion;
+            CompletionCallbackContext callback;
             bool submitted = false;
             bool reported = false;
         };
@@ -281,8 +279,8 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
         size_t inflight = 0;
         const size_t queue_depth =
             std::max<uint32_t>(1, capabilities_.queue_depth);
-        const uint32_t timeout_ms = ParseNvmeKvU32EnvOr(
-            "MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS", 30000);
+        const uint32_t timeout_ms =
+            NvmeKvExecutorConfig::ReadSpdkCompletionTimeoutMsFromEnvironment();
         auto last_progress = std::chrono::steady_clock::now();
 
         for (size_t index = 0; index < count; ++index) {
@@ -307,7 +305,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
             for (size_t index = 0; index < count; ++index) {
                 auto &ctx = contexts[index];
                 if (!ctx.submitted || ctx.reported ||
-                    !ctx.completion->done.load(std::memory_order_acquire)) {
+                    !ctx.completion.done.load(std::memory_order_acquire)) {
                     continue;
                 }
                 ctx.reported = true;
@@ -316,9 +314,9 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                 ++observed;
                 complete(index,
                          MapNvmeKvCompletionStatus(
-                             ctx.completion->status_code_type,
-                             ctx.completion->status_code, is_write),
-                         ctx.completion->result);
+                             ctx.completion.status_code_type,
+                             ctx.completion.status_code, is_write),
+                         ctx.completion.result);
             }
             return observed;
         };
@@ -331,20 +329,9 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                     ++next;
                     continue;
                 }
-                auto *callback_context =
-                    new (std::nothrow) CompletionCallbackContext{
-                        .completion = ctx.completion, .keep_alive = {}};
-                if (callback_context == nullptr) {
-                    ctx.reported = true;
-                    complete(next, ErrorCode::BUFFER_OVERFLOW, 0);
-                    ++completed;
-                    ++next;
-                    continue;
-                }
-                callback_context->adaptor = {KvCommandComplete,
-                                             callback_context};
-                if (!submit(next, callback_context)) {
-                    delete callback_context;
+                ctx.callback.completion = &ctx.completion;
+                ctx.callback.adaptor = {KvCommandComplete, &ctx.callback};
+                if (!submit(next, &ctx.callback)) {
                     ctx.reported = true;
                     ++completed;
                     ++next;
@@ -395,7 +382,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
 
     void RetrieveBufferBatchOnce(std::vector<RetrieveBufferRequest> &requests,
                                  bool force_effective_max_value_size) const {
-        std::vector<SpdkDmaBuffer> dma_buffers(requests.size());
+        std::vector<DmaBuffer> dma_buffers(requests.size());
         std::vector<uint32_t> request_bytes(requests.size(), 0);
 
         for (size_t index = 0; index < requests.size(); ++index) {
@@ -418,7 +405,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                 continue;
             }
             dma_buffers[index] =
-                SpdkDmaBuffer(buffer, SpdkDmaBufferDeleter{allocator_});
+                DmaBuffer(buffer, DmaBufferDeleter{allocator_});
             request_bytes[index] = bytes;
         }
 
@@ -426,7 +413,6 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
             requests.size(), false,
             [&](size_t index) { return dma_buffers[index] != nullptr; },
             [&](size_t index, CompletionCallbackContext *ctx) {
-                ctx->keep_alive = dma_buffers[index];
                 const int ret = initiator_->SubmitKvRetrieve(
                     segment_, requests[index].key.data(),
                     static_cast<uint8_t>(requests[index].key.size()),
@@ -469,20 +455,34 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
             });
     }
 
-    std::shared_ptr<SpdkInitiator> initiator_;
+    std::shared_ptr<NVMeoFInitiator> initiator_;
     std::shared_ptr<DmaBufferAllocator> allocator_;
     NofSegmentHandle *segment_ = nullptr;
     Capabilities capabilities_;
     mutable std::mutex batch_mutex_;
 };
 
+#if defined(MOONCAKE_ENABLE_NVME_KV_TEST_STUB)
+NvmeKvExecutorResult CreateNvmeKvSpdkExecutorForTesting(
+    std::shared_ptr<NVMeoFInitiator> initiator,
+    std::shared_ptr<DmaBufferAllocator> allocator, NofSegmentHandle *segment,
+    NvmeKvCommandExecutor::Capabilities capabilities) {
+    if (!initiator || !allocator || segment == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return std::make_unique<NvmeKvSpdkExecutor>(std::move(initiator),
+                                                std::move(allocator), segment,
+                                                std::move(capabilities));
+}
+#endif
+
+#if defined(USE_NOF) && defined(MOONCAKE_HAVE_SPDK_NVME_KV)
 NvmeKvExecutorResult CreateNvmeKvSpdkExecutor(std::string transport_id,
                                               uint32_t nsid,
                                               uint32_t queue_depth,
                                               uint32_t runtime_transfer_limit) {
     auto runtime = CreateNofRuntime();
-    auto initiator =
-        std::dynamic_pointer_cast<SpdkInitiator>(runtime.initiator);
+    auto initiator = runtime.initiator;
     if (!initiator || !runtime.dma_allocator) {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
@@ -506,7 +506,6 @@ NvmeKvExecutorResult CreateNvmeKvSpdkExecutor(std::string transport_id,
         std::move(initiator), std::move(runtime.dma_allocator), segment,
         std::move(capabilities));
 }
+#endif
 
 }  // namespace mooncake
-
-#endif

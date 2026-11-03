@@ -13,6 +13,8 @@ For implementation details, see [NVMe KV Backend Design](../../design/store/nvme
 - Read and write permission on the configured device for the Mooncake real client process.
 - An existing writable directory for `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, as required by the common `FileStorage` configuration.
 - `liburing` headers and library when the io_uring executor is required.
+- SPDK 26.05 or newer and a reachable NVMe-oF KV namespace when the SPDK
+  executor is required.
 
 ## Build Support
 
@@ -25,6 +27,8 @@ io_uring: NVMe uring command support enabled
 ```
 
 If this support is unavailable, the backend can still use the ioctl executor.
+Build with `-DUSE_NOF=ON` after running
+`sudo bash dependencies.sh --with-spdk` to enable the SPDK executor.
 
 ## Topology
 
@@ -36,8 +40,8 @@ flowchart TD
     FileStorage["FileStorage"]
     Backend["NvmeKvStorageBackend"]
     Connector["NvmeKvConnector"]
-    Executor["io_uring or ioctl executor"]
-    Device["Local NVMe KV namespace"]
+    Executor["io_uring, ioctl, or SPDK executor"]
+    Device["NVMe KV namespace"]
 
     App <-->|"metadata and offload coordination"| Master
     App <-->|"object RPC and data transfer"| Client
@@ -66,19 +70,20 @@ The directory configured by `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must already ex
 |----------------------|---------|-------------|
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Set to `nvme_kv_storage_backend`. |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Existing writable directory required by the common `FileStorage` configuration. |
-| `MOONCAKE_NVME_KV_DEVICE_PATH` | None | Namespace block-device path or NVMe generic character-device path. io_uring resolves namespace block paths to the matching `/dev/ng*` device. |
+| `MOONCAKE_NVME_KV_DEVICE_PATH` | None | Local namespace device path for io_uring/ioctl, or an SPDK transport ID for `spdk`. io_uring and NVMe-oF endpoint resolution prefer the matching `/dev/ng*` generic character device. |
 
 ### Transport and command settings
 
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
-| `MOONCAKE_NVME_KV_TRANSPORT` | `auto` | `auto`, `io_uring`, or `ioctl`. `auto` tries io_uring first and falls back to ioctl only when io_uring initialization fails. |
+| `MOONCAKE_NVME_KV_TRANSPORT` | `auto` | `auto`, `io_uring`, `ioctl`, or `spdk`. `auto` tries io_uring first and falls back to ioctl only when io_uring initialization fails. |
 | `MOONCAKE_NVME_KV_NSID` | `1` | Namespace ID encoded in NVMe KV commands. |
-| `MOONCAKE_NVME_KV_QUEUE_DEPTH` | `256` | io_uring queue depth and executor capability exposed to the backend. |
+| `MOONCAKE_NVME_KV_QUEUE_DEPTH` | `256` | io_uring/SPDK queue depth and executor capability exposed to the backend. |
 | `MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT` | `270336` | Runtime upper bound for one NVMe KV value transfer, in bytes. |
 | `MOONCAKE_NVME_KV_PROTOCOL_MAX_VALUE_SIZE` | `524288` | Protocol or device value-size ceiling. |
 | `MOONCAKE_NVME_KV_TRANSFER_ALIGNMENT_BYTES` | `4096` | DMA buffer and transfer-length alignment. |
 | `MOONCAKE_NVME_KV_VALUE_BLOCK_UNIT_BYTES` | `512` | Unit used to encode the NVMe KV value block count. |
+| `MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS` | `30000` | Maximum time without SPDK completion progress before aborting the KV queue. Set to `0` to disable the timeout. |
 
 The effective maximum value size is the smaller of the runtime transfer limit and protocol maximum, rounded down to the configured transfer alignment.
 
@@ -107,7 +112,25 @@ Use this mode to require io_uring. Mooncake accepts either a namespace block-dev
 
 ### `ioctl`
 
-Use this mode to require Linux NVMe passthrough ioctl. Configure the namespace block-device path. Each command is synchronous within one backend worker, and the backend worker pool supplies parallelism.
+Use this mode to require Linux NVMe passthrough ioctl. Configure either the
+namespace block-device path or its `/dev/ng*` generic character-device path.
+Each command is synchronous within one backend worker, and the backend worker
+pool supplies parallelism.
+
+### `spdk`
+
+Use this mode for an NVMe-oF KV namespace through SPDK. Build with `USE_NOF`
+and SPDK 26.05+, then configure an SPDK transport ID rather than a Linux device
+node:
+
+```bash
+export MOONCAKE_NVME_KV_TRANSPORT=spdk
+export MOONCAKE_NVME_KV_DEVICE_PATH='trtype:RDMA traddr:192.0.2.10 trsvcid:4420 subnqn:nqn.2016-06.io.spdk:cnode1'
+export MOONCAKE_NVME_KV_NSID=1
+```
+
+The executor batches asynchronous commands up to the configured queue depth
+and polls completions on the submitting worker thread.
 
 ## Start Mooncake
 

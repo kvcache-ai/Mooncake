@@ -468,9 +468,9 @@ if [ "$INSTALL_SPDK" = true ]; then
     check_success "Failed to change to SPDK directory"
 
     # Checkout specific version
-    echo "Checking out SPDK version v23.01.1..."
-    git checkout v23.01.1
-    check_success "Failed to checkout SPDK version v23.01.1"
+    echo "Checking out SPDK version v26.05..."
+    git checkout v26.05
+    check_success "Failed to checkout SPDK version v26.05"
 
     # Initialize submodules
     echo "Initializing SPDK submodules..."
@@ -481,6 +481,13 @@ if [ "$INSTALL_SPDK" = true ]; then
     echo "Installing SPDK dependencies..."
     ./scripts/pkgdep.sh --rdma
     check_success "Failed to install SPDK RDMA dependencies"
+
+    # SPDK v26.05 uses uv to install its Python package as part of
+    # `make install`, but pkgdep.sh does not install uv itself.
+    if ! command -v uv >/dev/null 2>&1; then
+        python3 -m pip install uv
+        check_success "Failed to install uv for SPDK"
+    fi
 
     # Configure SPDK with RDMA support
     echo "Configuring SPDK with RDMA support..."
@@ -519,7 +526,7 @@ echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} Git submodules"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
-    echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
+    echo -e "  ${GREEN}✓${NC} SPDK (v26.05)"
 fi
 echo
 echo -e "You can now build and run Mooncake."

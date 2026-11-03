@@ -29,7 +29,7 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
 
     tl::expected<void, ErrorCode> Init() {
         auto resolved_path = ResolveNvmeKvDevicePath(
-            device_path_, NvmeKvDevicePathType::kBlockNamespace, nsid_);
+            device_path_, NvmeKvDevicePathType::kIoctl, nsid_);
         if (!resolved_path.has_value()) {
             return tl::make_unexpected(resolved_path.error());
         }

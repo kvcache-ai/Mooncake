@@ -96,7 +96,6 @@ TEST_F(NvmeKvStorageBackendTest, ResolvesNofEndpointToKernelDevices) {
               "trtype=rdma,traddr=192.168.65.56,trsvcid=4420,adrfam=ipv4\n");
     WriteFile(controller_path / "subsysnqn", "nqn.2016-06.io.spdk:cnode1\n");
     WriteFile(namespace_path / "nsid", "3\n");
-    WriteFile(dev_root / "nvme7n3", "");
     WriteFile(dev_root / "ng7n3", "");
 
     const std::string sysfs_root_string = sysfs_root.string();
@@ -109,11 +108,11 @@ TEST_F(NvmeKvStorageBackendTest, ResolvesNofEndpointToKernelDevices) {
         "traddr:192.168.65.56 trsvcid:4420 "
         "subnqn:nqn.2016-06.io.spdk:cnode1 trtype:RDMA adrfam:IPv4 ns:3";
 
-    auto block_path = ResolveNvmeKvDevicePath(
-        endpoint, NvmeKvDevicePathType::kBlockNamespace, 1);
-    ASSERT_TRUE(block_path.has_value());
-    EXPECT_EQ((dev_root / "nvme7n3").string(), block_path->path);
-    EXPECT_EQ(3, block_path->nsid);
+    auto ioctl_path =
+        ResolveNvmeKvDevicePath(endpoint, NvmeKvDevicePathType::kIoctl, 1);
+    ASSERT_TRUE(ioctl_path.has_value());
+    EXPECT_EQ((dev_root / "ng7n3").string(), ioctl_path->path);
+    EXPECT_EQ(3, ioctl_path->nsid);
 
     auto generic_path = ResolveNvmeKvDevicePath(
         endpoint, NvmeKvDevicePathType::kGenericCharacter, 1);

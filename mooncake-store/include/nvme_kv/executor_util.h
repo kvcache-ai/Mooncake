@@ -31,7 +31,7 @@ constexpr uint8_t kNvmeKvRetrieveOpcode = 0x02;
 constexpr uint8_t kNvmeKvDeleteOpcode = 0x10;
 
 enum class NvmeKvDevicePathType {
-    kBlockNamespace,
+    kIoctl,
     kGenericCharacter,
 };
 

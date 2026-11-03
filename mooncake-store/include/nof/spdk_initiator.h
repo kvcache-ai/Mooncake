@@ -8,19 +8,6 @@
 
 namespace mooncake {
 
-struct NofKvCompletion {
-    uint32_t status_code_type = 0;
-    uint32_t status_code = 0;
-    uint32_t result = 0;
-};
-
-using NofKvCallback = void (*)(void* ctx, const NofKvCompletion& completion);
-
-struct NofKvAdaptor {
-    NofKvCallback cb = nullptr;
-    void* ctx = nullptr;
-};
-
 // Concrete SPDK-backed initiator. All SPDK headers and types are confined
 // to the .cpp (pimpl). Construction is cheap; the SPDK environment is
 // acquired lazily on first OpenSegment / ProbeSegment.
@@ -45,18 +32,18 @@ class SpdkInitiator : public NVMeoFInitiator {
     ErrorCode UnregisterMemory(void* ptr) override;
     NofCapabilities GetCapabilities() const override;
 
-    NofSegmentHandle* OpenKvSegment(const std::string& transport_str);
-    void CloseKvSegment(NofSegmentHandle* handle);
-    void AbortKvSegment(NofSegmentHandle* handle);
-    bool IsKvNamespace(const NofSegmentHandle* handle) const;
+    NofSegmentHandle* OpenKvSegment(const std::string& transport_str) override;
+    void CloseKvSegment(NofSegmentHandle* handle) override;
+    void AbortKvSegment(NofSegmentHandle* handle) override;
+    bool IsKvNamespace(const NofSegmentHandle* handle) const override;
     int SubmitKvStore(NofSegmentHandle* handle, const void* key,
                       uint8_t key_len, const void* value, uint32_t value_len,
-                      bool create_only, NofKvAdaptor* adaptor);
+                      bool create_only, NofKvAdaptor* adaptor) override;
     int SubmitKvRetrieve(NofSegmentHandle* handle, const void* key,
                          uint8_t key_len, void* value, uint32_t value_len,
-                         NofKvAdaptor* adaptor);
+                         NofKvAdaptor* adaptor) override;
     int SubmitKvDelete(NofSegmentHandle* handle, const void* key,
-                       uint8_t key_len, NofKvAdaptor* adaptor);
+                       uint8_t key_len, NofKvAdaptor* adaptor) override;
 
    private:
     class Impl;

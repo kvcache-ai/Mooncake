@@ -209,14 +209,18 @@ std::optional<NvmeKvResolvedDevicePath> ResolveNofEndpoint(
             NamespaceDeviceName(controller_path, effective_nsid);
         if (!namespace_name.has_value()) continue;
 
-        std::string device_name = *namespace_name;
-        if (type == NvmeKvDevicePathType::kGenericCharacter) {
-            device_name = "ng" + device_name.substr(4);
-        }
-        const std::filesystem::path device_path = dev_root / device_name;
-        if (FileExists(device_path)) {
-            return NvmeKvResolvedDevicePath{device_path.string(),
+        const std::string generic_name = "ng" + namespace_name->substr(4);
+        const std::filesystem::path generic_path = dev_root / generic_name;
+        if (FileExists(generic_path)) {
+            return NvmeKvResolvedDevicePath{generic_path.string(),
                                             effective_nsid};
+        }
+        if (type == NvmeKvDevicePathType::kIoctl) {
+            const std::filesystem::path block_path = dev_root / *namespace_name;
+            if (FileExists(block_path)) {
+                return NvmeKvResolvedDevicePath{block_path.string(),
+                                                effective_nsid};
+            }
         }
     }
     return std::nullopt;

@@ -31,11 +31,12 @@ class NvmeKvExecutorConfigTest : public ::testing::Test {
         }
     }
 
-    inline static constexpr std::array<const char*, 4> variables_ = {
+    inline static constexpr std::array<const char*, 5> variables_ = {
         "MOONCAKE_NVME_KV_TRANSFER_ALIGNMENT_BYTES",
         "MOONCAKE_NVME_KV_VALUE_BLOCK_UNIT_BYTES",
         "MOONCAKE_NVME_KV_PROTOCOL_MAX_VALUE_SIZE",
-        "MOONCAKE_NVME_KV_READ_PLAN_BATCH_SIZE"};
+        "MOONCAKE_NVME_KV_READ_PLAN_BATCH_SIZE",
+        "MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS"};
     std::array<std::optional<std::string>, variables_.size()> original_;
 };
 
@@ -45,6 +46,7 @@ TEST_F(NvmeKvExecutorConfigTest, UsesDefaultsWhenUnset) {
     EXPECT_EQ(config.value_block_unit_bytes, 512u);
     EXPECT_EQ(config.protocol_max_value_size, 512u * 1024u);
     EXPECT_EQ(config.read_plan_batch_size, 8u);
+    EXPECT_EQ(config.spdk_completion_timeout_ms, 30000u);
 }
 
 TEST_F(NvmeKvExecutorConfigTest, PreservesNvmeUnsignedSyntax) {
@@ -54,12 +56,15 @@ TEST_F(NvmeKvExecutorConfigTest, PreservesNvmeUnsignedSyntax) {
     ASSERT_EQ(setenv("MOONCAKE_NVME_KV_PROTOCOL_MAX_VALUE_SIZE", " 65536", 1),
               0);
     ASSERT_EQ(setenv("MOONCAKE_NVME_KV_READ_PLAN_BATCH_SIZE", "0x20", 1), 0);
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS", "0x7d0", 1),
+              0);
 
     const auto config = NvmeKvExecutorConfig::FromEnvironment();
     EXPECT_EQ(config.transfer_alignment_bytes, 8192u);
     EXPECT_EQ(config.value_block_unit_bytes, 1024u);
     EXPECT_EQ(config.protocol_max_value_size, 65536u);
     EXPECT_EQ(config.read_plan_batch_size, 32u);
+    EXPECT_EQ(config.spdk_completion_timeout_ms, 2000u);
 }
 
 TEST_F(NvmeKvExecutorConfigTest, InvalidValuesUseDefaultsSilently) {
@@ -68,12 +73,15 @@ TEST_F(NvmeKvExecutorConfigTest, InvalidValuesUseDefaultsSilently) {
     ASSERT_EQ(
         setenv("MOONCAKE_NVME_KV_PROTOCOL_MAX_VALUE_SIZE", "4294967296", 1), 0);
     ASSERT_EQ(setenv("MOONCAKE_NVME_KV_READ_PLAN_BATCH_SIZE", "0", 1), 0);
+    ASSERT_EQ(setenv("MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS", "-1", 1),
+              0);
 
     const auto config = NvmeKvExecutorConfig::FromEnvironment();
     EXPECT_EQ(config.transfer_alignment_bytes, 4096u);
     EXPECT_EQ(config.value_block_unit_bytes, 512u);
     EXPECT_EQ(config.protocol_max_value_size, 512u * 1024u);
     EXPECT_EQ(config.read_plan_batch_size, 8u);
+    EXPECT_EQ(config.spdk_completion_timeout_ms, 30000u);
 }
 
 TEST_F(NvmeKvExecutorConfigTest, CapsReadPlanBatchSize) {

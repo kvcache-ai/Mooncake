@@ -4,16 +4,16 @@
 
 The NVMe KV backend extends Mooncake Store's node-local SSD offload path with an NVMe Key-Value namespace. It preserves Mooncake's logical object API while translating variable-length logical keys and values into fixed-size NVMe KV keys and bounded device values.
 
-The implementation separates object semantics from command transport. `NvmeKvStorageBackend` owns logical object layout, integrity validation, key-conflict handling, and batched I/O orchestration. `NvmeKvConnector` binds one configured device to one executor. `NvmeKvCommandExecutor` submits Store, Retrieve, and Delete commands through io_uring or ioctl.
+The implementation separates object semantics from command transport. `NvmeKvStorageBackend` owns logical object layout, integrity validation, key-conflict handling, and batched I/O orchestration. `NvmeKvConnector` binds one configured namespace to one executor. `NvmeKvCommandExecutor` submits Store, Retrieve, and Delete commands through io_uring, ioctl, or SPDK.
 
 ## Design Goals
 
-- Integrate one node-local NVMe KV namespace with the existing SSD offload flow.
+- Integrate one local or NVMe-oF NVMe KV namespace with the existing SSD offload flow.
 - Preserve object identity and integrity with placement validation and checksums.
 - Support logical objects larger than one device value.
 - Use store-if-not-exists for idempotent writes and explicit hash-collision handling.
 - Overlap object preparation, chunk submission, and root submission with bounded concurrency.
-- Use io_uring when available and ioctl as an initialization fallback.
+- Use io_uring when available and ioctl as an initialization fallback, with an explicit SPDK mode for NVMe-oF.
 
 ## Architecture
 
@@ -34,8 +34,8 @@ flowchart TB
         FileStorage["FileStorage"]
         Backend["NvmeKvStorageBackend"]
         Connector["NvmeKvConnector"]
-        Executor["io_uring or ioctl executor"]
-        Device["Local NVMe KV namespace"]
+        Executor["io_uring, ioctl, or SPDK executor"]
+        Device["NVMe KV namespace"]
 
         RealClient --> FileStorage --> Backend --> Connector --> Executor --> Device
     end
@@ -45,7 +45,7 @@ flowchart TB
     RequestClient <-->|"object RPC and Transfer Engine data movement"| RealClient
 ```
 
-The master records the object as a `LOCAL_DISK` replica owned by a real client. NVMe KV commands remain local to that client.
+The master records the object as a `LOCAL_DISK` replica owned by a real client. That client issues all NVMe KV commands directly; the command data path does not pass through the master.
 
 ## Layer Responsibilities
 
@@ -55,7 +55,7 @@ The master records the object as a `LOCAL_DISK` replica owned by a real client. 
 | `NvmeKvStorageBackend` | Builds object layouts, applies key-conflict policy, coordinates bounded batch I/O, and verifies data returned by the device. |
 | `NvmeKvConnector` | Resolves the configured device, selects one executor during initialization, and forwards commands. |
 | `NvmeKvCommandExecutor` | Encodes and submits NVMe KV Store, Retrieve, and Delete commands while owning transport-specific buffers and completion handling. |
-| NVMe KV namespace | Executes commands submitted through the Linux device node. |
+| NVMe KV namespace | Executes commands submitted through a Linux device node or an SPDK NVMe-oF queue pair. |
 
 ## Physical Keys and Conflicts
 
@@ -152,14 +152,21 @@ Batch submission maintains a bounded number of commands in flight, drains availa
 
 The ioctl executor builds the same command fields in `nvme_passthru_cmd` and submits them through `NVME_IOCTL_IO_CMD`. Calls are synchronous within one backend worker, while the backend worker pool provides parallelism across requests.
 
+### SPDK
+
+The SPDK executor opens a private NVMe-oF queue pair for the configured transport ID and verifies that the selected namespace exposes the KV command set. Store and Retrieve values use the shared NoF DMA allocator. Batch submission keeps at most the configured queue depth in flight and polls completions on the submitting worker thread.
+
+Polling failures and periods without completion progress abort the queue pair before the synchronous batch boundary returns. `MOONCAKE_NVME_KV_SPDK_COMPLETION_TIMEOUT_MS` controls that progress timeout and can disable it with `0`.
+
 ### Selection
 
-`auto` tries io_uring first when compiled in and falls back to ioctl only if io_uring initialization fails. Runtime command failures are returned without changing transports. Explicit `io_uring` and `ioctl` modes fail initialization when the requested executor cannot be created.
+`auto` tries io_uring first when compiled in and falls back to ioctl only if io_uring initialization fails. Runtime command failures are returned without changing transports. Explicit `io_uring`, `ioctl`, and `spdk` modes fail initialization when the requested executor cannot be created. SPDK is never selected implicitly.
 
 ## Concurrency and Ownership
 
 - Backend worker pools bound object preparation, chunk submission, root submission, and fallback I/O.
 - io_uring rings are thread-local, avoiding a shared hot-path ring lock.
+- Each SPDK executor owns one private queue pair and serializes batches at that queue pair.
 - Batch APIs are synchronous at their boundary, so request arrays and DMA buffers outlive all command completions.
 - Direct reads verify checksums in the destination buffer after completion.
 - Root submission for a chunked object occurs only after its chunks finish successfully.
@@ -175,4 +182,5 @@ The ioctl executor builds the same command fields in `nvme_passthru_cmd` and sub
 | Partial chunk write | Best-effort cleanup of keys created by the failed attempt. |
 | io_uring submission or completion anomaly | Drain accepted commands, reset the thread-local ring, and fail the operation. |
 | io_uring initialization failure in `auto` mode | Try ioctl. |
+| SPDK polling failure or completion timeout | Abort the queue pair and fail every unfinished command. |
 | Runtime device I/O failure | Return the mapped error without transport fallback. |
