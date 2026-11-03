@@ -2670,6 +2670,7 @@ void Client::healDanglingLocalDiskBatchStarts(
     }
     const auto retry_config =
         config.group_ids || config.session_ids ||
+                config.residency_affinity_ids ||
                 config.per_key_preferred_hca_names
             ? std::make_optional(config.ForKeySubset(retry_config_indices))
             : std::nullopt;
@@ -2745,6 +2746,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             AttachBatchHcaAffinity(base_config, ops, active_indices);
     } else if (active_indices.size() != ops.size() &&
                (base_config.group_ids || base_config.session_ids ||
+                base_config.residency_affinity_ids ||
                 base_config.per_key_preferred_hca_names)) {
         active_config = base_config.ForKeySubset(active_indices);
     }
@@ -2854,6 +2856,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
             AttachBatchHcaAffinity(base_config, ops, active_indices);
     } else if (active_indices.size() != ops.size() &&
                (base_config.group_ids || base_config.session_ids ||
+                base_config.residency_affinity_ids ||
                 base_config.per_key_preferred_hca_names)) {
         active_config = base_config.ForKeySubset(active_indices);
     }
@@ -5312,6 +5315,112 @@ void Client::ReconcileMissingKvcsReplica(
         VLOG(1) << "KVCS replica was replaced before miss reconciliation, key="
                 << key << ", replica_id=" << replica_descriptor.id;
     }
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchReadFileReplicaRanges(
+    const std::vector<std::string>& keys,
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::vector<Slice>& windows,
+    const std::vector<uint64_t>& value_offsets) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != replicas.size() || keys.size() != windows.size() ||
+        keys.size() != value_offsets.size()) {
+        LOG(ERROR) << "BatchReadFileReplicaRanges size mismatch";
+        return results;
+    }
+
+    std::vector<DfsReadRequest> dfs_requests;
+    std::vector<size_t> dfs_indexes;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (windows[i].size >
+            static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+            continue;
+        }
+        if (replicas[i].is_disk_replica()) {
+            if (!storage_backend_) {
+                LOG(ERROR) << "Storage backend is not initialized";
+                results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                continue;
+            }
+            if (value_offsets[i] >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                continue;
+            }
+            std::vector<Slice> slices{windows[i]};
+            auto loaded = storage_backend_->LoadObject(
+                replicas[i].get_disk_descriptor().file_path, slices,
+                static_cast<int64_t>(windows[i].size),
+                static_cast<int64_t>(value_offsets[i]));
+            results[i] = loaded ? tl::expected<void, ErrorCode>{}
+                                : tl::unexpected(loaded.error());
+            continue;
+        }
+        if (!replicas[i].is_dfs_replica()) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        if (!dfs_storage_backend_) {
+            LOG(ERROR) << "DFS backend is not initialized";
+            results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            if (auto* dfs_metric = GetDfsMetricPtr()) {
+                dfs_metric->RecordReadErrors(
+                    toString(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+            }
+            continue;
+        }
+        dfs_requests.push_back(DfsReadRequest{keys[i],
+                                              replicas[i].get_dfs_descriptor(),
+                                              {windows[i]},
+                                              value_offsets[i],
+                                              true});
+        dfs_indexes.push_back(i);
+        results[i] = {};
+    }
+
+    if (dfs_requests.empty()) return results;
+
+    // Same counters as Get/BatchGet. Bytes are the window that was read,
+    // not the full object: a layer transfers only that window.
+    auto* dfs_metric = GetDfsMetricPtr();
+    const auto dfs_read_start = std::chrono::steady_clock::now();
+    auto dfs_results = dfs_storage_backend_->BatchRead(dfs_requests);
+    const auto dfs_read_latency_us = elapsed_us_since(dfs_read_start);
+    if (dfs_results.size() != dfs_requests.size()) {
+        LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
+                   << dfs_requests.size() << ", got " << dfs_results.size();
+        for (size_t index : dfs_indexes) {
+            results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        if (dfs_metric) {
+            dfs_metric->RecordReadErrors(
+                toString(ErrorCode::INTERNAL_ERROR),
+                static_cast<int64_t>(dfs_indexes.size()));
+        }
+        return results;
+    }
+
+    int64_t dfs_success_keys = 0;
+    int64_t dfs_success_bytes = 0;
+    for (size_t j = 0; j < dfs_results.size(); ++j) {
+        const size_t index = dfs_indexes[j];
+        if (!dfs_results[j]) {
+            LOG(ERROR) << "DFS range read failed, action=range_read, key="
+                       << keys[index] << ", error=" << dfs_results[j].error();
+            results[index] = tl::unexpected(dfs_results[j].error());
+            if (dfs_metric) {
+                dfs_metric->RecordReadErrors(toString(dfs_results[j].error()));
+            }
+            continue;
+        }
+        ++dfs_success_keys;
+        dfs_success_bytes += static_cast<int64_t>(windows[index].size);
+    }
+    if (dfs_metric && dfs_success_keys > 0) {
+        dfs_metric->ObserveRead(dfs_success_keys, dfs_success_bytes,
+                                dfs_read_latency_us);
+    }
+    return results;
 }
 
 ErrorCode Client::TransferReadRange(

@@ -48,6 +48,7 @@ add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
+add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
@@ -570,3 +571,14 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+# Compile the production resource manager against a USRBIO test double, even
+# when USE_3FS is disabled. Keep it separate from mooncake_store's real client.
+add_executable(
+  hf3fs_resource_manager_test hf3fs_resource_manager_test.cpp
+                              ../src/hf3fs/hf3fs_resource_manager.cpp)
+target_include_directories(hf3fs_resource_manager_test BEFORE
+                           PRIVATE hf3fs_stub ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
+                                                          pthread)
+add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
