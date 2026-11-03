@@ -150,16 +150,19 @@ fn compiler_candidates() -> Vec<String> {
 
 fn compiler_runtime_library(file_name: &str) -> Option<PathBuf> {
     for tool in compiler_candidates() {
-        let output = Command::new(&tool)
+        // A candidate that cannot be run (e.g. CC="ccache gcc", or gcc not
+        // installed) must not end the search: fall through to the next one.
+        let output = match Command::new(&tool)
             .arg(format!("-print-file-name={file_name}"))
             .output()
-            .ok()?;
+        {
+            Ok(output) if output.status.success() => output,
+            _ => continue,
+        };
 
-        if !output.status.success() {
+        let Ok(path) = String::from_utf8(output.stdout) else {
             continue;
-        }
-
-        let path = String::from_utf8(output.stdout).ok()?;
+        };
         let path = PathBuf::from(path.trim());
         if path.as_os_str().is_empty() || path == PathBuf::from(file_name) || !path.exists() {
             continue;
