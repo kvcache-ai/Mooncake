@@ -213,7 +213,7 @@ std::unique_ptr<ManagerEnv> MakeManager(DataManagerVersion version,
     config.v1_lock_shard_count = 64;
     config.local_transfer.mode = mode;
     // Deterministic: run the copy on the Wait() caller thread.
-    config.local_transfer.local_memcpy_async_worker_num = 0;
+    config.local_transfer.local_io_worker_num = 0;
     config.local_transfer.te_async_poll_worker_num = 0;
     config.key_lease.duration_ms = lease_duration_ms;
     // The TransferEngine below is constructed but never init()ed, which is all

@@ -329,7 +329,7 @@ TEST(DataManagerFactoryConfigTest, TheTierFileSetsTheStopDrainTimeout) {
     config.register_tiers_with_transfer_engine = false;
     // Keep Put deferred until Wait(), so its guard is still held at Stop().
     config.local_transfer.mode = LocalTransferMode::MEMCPY;
-    config.local_transfer.local_memcpy_async_worker_num = 0;
+    config.local_transfer.local_io_worker_num = 0;
     config.local_transfer.te_async_poll_worker_num = 0;
     // Deliberately left unset -- that is what "the file decides" looks like.
     ASSERT_FALSE(config.stop_drain_timeout.has_value());

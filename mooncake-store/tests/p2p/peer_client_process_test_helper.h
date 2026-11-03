@@ -222,7 +222,7 @@ class PeerClientRpcServerStack {
 
         LocalTransferConfig local_transfer_config;
         local_transfer_config.mode = LocalTransferMode::MEMCPY;
-        local_transfer_config.local_memcpy_async_worker_num = 32;
+        local_transfer_config.local_io_worker_num = 32;
         data_manager_ = std::make_unique<DataManagerV1>(
             std::move(tiered_backend), transfer_engine_,
             /*lock_shard_count=*/1024, local_transfer_config);

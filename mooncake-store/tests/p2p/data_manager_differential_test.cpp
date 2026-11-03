@@ -140,7 +140,7 @@ class Replay {
         config.tier_config = tier_config;
         config.v1_lock_shard_count = 64;
         config.local_transfer.mode = LocalTransferMode::MEMCPY;
-        config.local_transfer.local_memcpy_async_worker_num = 0;
+        config.local_transfer.local_io_worker_num = 0;
         config.local_transfer.te_async_poll_worker_num = 0;
         config.register_tiers_with_transfer_engine = false;
         config.stop_drain_timeout = std::chrono::milliseconds(300);

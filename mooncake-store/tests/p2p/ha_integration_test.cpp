@@ -282,7 +282,7 @@ class HAIntegrationTest : public ::testing::Test {
             /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
             /*route_cache_ttl_ms=*/60 * 1000,
             /*local_transfer_mode=*/"memcpy",
-            /*local_memcpy_async_worker_num=*/32, http_port,
+            /*local_io_worker_num=*/32, http_port,
             /*enable_http_server=*/true,
             /*labels=*/{}, async_sender_thread_count);
 
@@ -2267,7 +2267,7 @@ TEST_F(HAIntegrationTest, HeartbeatRepairsMissingTierSegment) {
         config.master_server_entry = endpoint.Address();
         config.data_manager_version = version;
         config.te_async_poll_worker_num = 1;
-        config.local_memcpy_async_worker_num = 1;
+        config.local_io_worker_num = 1;
         config.tiered_backend_config["tiers"][0]["capacity"] = 8u << 20;
         auto second_tier = config.tiered_backend_config["tiers"][0];
         second_tier["priority"] = 10;

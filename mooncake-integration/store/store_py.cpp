@@ -1562,8 +1562,8 @@ void BindP2PMethods(StoreBinding& store) {
                size_t route_cache_max_memory = 300 * 1024 * 1024,
                uint64_t route_cache_ttl_ms = 60 * 1000,
                const std::string& local_transfer_mode = "te",
-               size_t local_memcpy_async_worker_num = 32,
-               uint16_t http_port = 9003, bool enable_http_server = true,
+               size_t local_io_worker_num = 32, uint16_t http_port = 9003,
+               bool enable_http_server = true,
                size_t async_sender_thread_count = 4,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
@@ -1575,7 +1575,8 @@ void BindP2PMethods(StoreBinding& store) {
                bool enable_metric_collection = true,
                uint64_t metric_report_interval_seconds = 60,
                uint16_t heartbeat_rpc_port = 0, bool start_local_only = false,
-               size_t te_async_poll_worker_num = 32) {
+               size_t te_async_poll_worker_num = 32,
+               size_t business_coro_worker_num = 32) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1593,15 +1594,15 @@ void BindP2PMethods(StoreBinding& store) {
                     local_buffer_size, transfer_engine, "", client_rpc_port,
                     client_rpc_thread_num, lock_shard_count,
                     route_cache_max_memory, route_cache_ttl_ms,
-                    local_transfer_mode, local_memcpy_async_worker_num,
-                    http_port, enable_http_server, {},
-                    async_sender_thread_count, async_max_batch_size,
-                    async_route_queue_size, p2p_key_lease_duration_ms,
-                    p2p_key_lease_scan_interval_ms, p2p_transfer_direction_mode,
-                    runtime_config, enable_metric_collection,
-                    metric_report_interval_seconds, DEFAULT_CLUSTER_ID, "", 0,
-                    4, 1, "", heartbeat_rpc_port, te_async_poll_worker_num,
-                    start_local_only);
+                    local_transfer_mode, local_io_worker_num, http_port,
+                    enable_http_server, {}, async_sender_thread_count,
+                    async_max_batch_size, async_route_queue_size,
+                    p2p_key_lease_duration_ms, p2p_key_lease_scan_interval_ms,
+                    p2p_transfer_direction_mode, runtime_config,
+                    enable_metric_collection, metric_report_interval_seconds,
+                    DEFAULT_CLUSTER_ID, "", 0, 4, 1, "", heartbeat_rpc_port,
+                    te_async_poll_worker_num, start_local_only,
+                    business_coro_worker_num);
 
                 auto ret = real_client->setup(config);
                 return ret;
@@ -1615,8 +1616,8 @@ void BindP2PMethods(StoreBinding& store) {
             py::arg("route_cache_max_memory") = 300 * 1024 * 1024,
             py::arg("route_cache_ttl_ms") = 60 * 1000,
             py::arg("local_transfer_mode") = "te",
-            py::arg("local_memcpy_async_worker_num") = 32,
-            py::arg("http_port") = 9003, py::arg("enable_http_server") = true,
+            py::arg("local_io_worker_num") = 32, py::arg("http_port") = 9003,
+            py::arg("enable_http_server") = true,
             py::arg("async_sender_thread_count") = 4,
             py::arg("async_max_batch_size") = 2000,
             py::arg("async_route_queue_size") = 0,
@@ -1629,6 +1630,7 @@ void BindP2PMethods(StoreBinding& store) {
             py::arg("heartbeat_rpc_port") = 0,
             py::arg("start_local_only") = false,
             py::arg("te_async_poll_worker_num") = 32,
+            py::arg("business_coro_worker_num") = 32,
             "Setup the store in P2P architecture. start_local_only skips "
             "Master "
             "connection and heartbeat until an explicit POST /register.")
@@ -1669,10 +1671,14 @@ void BindP2PMethods(StoreBinding& store) {
             "  route_cache_ttl_ms: Route cache TTL in ms.\n"
             "  local_transfer_mode: Local transfer mode, 'te' or 'memcpy' "
             "(default 'te').\n"
-            "  local_memcpy_async_worker_num: Async memcpy worker count "
-            "(default 32).\n"
+            "  local_io_worker_num: Local I/O worker count "
+            "(default 32; 0 = deferred until Wait; V2: both modes; "
+            "V1: memcpy only).\n"
             "  te_async_poll_worker_num: TE batch poll worker count "
             "(default 32; 0 = sync TE wait).\n"
+            "  business_coro_worker_num: Business coroutine worker count "
+            "(default 32; 0 = hardware_concurrency, minimum 1; independent of "
+            "TE polling).\n"
             "  async_sender_thread_count: Async route sender thread count "
             "(default 4).\n"
             "  async_max_batch_size: Async route max batch size (default "

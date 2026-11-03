@@ -204,9 +204,9 @@ DataManagerV1::DataManagerV1(std::unique_ptr<TieredBackend> tiered_backend,
     }
 
     if (local_transfer_config_.mode == LocalTransferMode::MEMCPY &&
-        local_transfer_config_.local_memcpy_async_worker_num > 0) {
+        local_transfer_config_.local_io_worker_num > 0) {
         async_memcpy_executor_ = std::make_unique<AsyncMemcpyExecutor>(
-            local_transfer_config_.local_memcpy_async_worker_num);
+            local_transfer_config_.local_io_worker_num);
     }
     if (local_transfer_config_.te_async_poll_worker_num > 0) {
         unsigned wait_threads = static_cast<unsigned>(
@@ -215,8 +215,7 @@ DataManagerV1::DataManagerV1(std::unique_ptr<TieredBackend> tiered_backend,
             std::make_shared<coro_io::io_context_pool>(wait_threads);
         std::thread([pool = te_wait_pool_]() { pool->run(); }).detach();
     }
-    unsigned coro_threads =
-        static_cast<unsigned>(local_transfer_config_.te_async_poll_worker_num);
+    size_t coro_threads = local_transfer_config_.business_coro_worker_num;
     if (coro_threads == 0) {
         coro_threads = std::thread::hardware_concurrency();
     }
@@ -242,8 +241,8 @@ DataManagerV1::DataManagerV1(std::unique_ptr<TieredBackend> tiered_backend,
                       ? "TE"
                       : "MEMCPY")
               << ", te_endpoint=" << local_transfer_config_.te_endpoint
-              << ", memcpy_async_workers="
-              << local_transfer_config_.local_memcpy_async_worker_num
+              << ", local_io_workers="
+              << local_transfer_config_.local_io_worker_num
               << ", te_async_poll_workers="
               << local_transfer_config_.te_async_poll_worker_num
               << ", coro_executor_threads=" << coro_threads

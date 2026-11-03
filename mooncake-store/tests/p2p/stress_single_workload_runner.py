@@ -18,12 +18,12 @@ Usage:
 
 # P2P only, sweep async worker counts (memcpy mode):
   python3 stress_single_workload_runner.py --threads 8 --value_size 1048576 \
-      --p2p_local_transfer_mode memcpy --local_memcpy_async_worker_num 32
+      --p2p_local_transfer_mode memcpy --local_io_worker_num 32
 
 # Matrix sweep: all combinations of threads/value_size/batch/transfer-mode, save to CSV:
   python3 stress_single_workload_runner.py --matrix --rounds 10 --ops 200 --rpc_threads 32 --ram_buffer_size_gb 70 \
       --threads 16 --batch 1,4,16,32 --value_size 1048576,4194304,8388608 \
-      --p2p_local_transfer_mode te,memcpy --local_memcpy_async_worker_num 32 \
+      --p2p_local_transfer_mode te,memcpy --local_io_worker_num 32 \
       --output results.csv
 Arguments:
 ----------
@@ -38,7 +38,7 @@ Arguments:
 --matrix:            Enable matrix sweep mode (Cartesian product over all list-valued arguments)
 
 --p2p_local_transfer_mode:      Local transfer mode: te|memcpy, supports lists like "te,memcpy" (default: te)
---local_memcpy_async_worker_num:  Async memcpy worker threads, supports lists like "4,16,32" (default: 32, memcpy mode only)
+--local_io_worker_num:  Local I/O workers, supports lists like "4,16,32" (default: 32; this V1 benchmark uses it in memcpy mode)
 """
 
 import subprocess
@@ -161,7 +161,7 @@ def parse_metrics(output):
 
 def run_benchmark_config(rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
                          batch=1, p2p_local_transfer_mode="te",
-                         local_memcpy_async_worker_num=32,
+                         local_io_worker_num=32,
                          route_cache_max_memory_mb=300, route_cache_ttl_ms=60000):
     """Run a specific P2P configuration."""
     master_cmd = (
@@ -184,7 +184,7 @@ def run_benchmark_config(rounds, threads, value_size, ops, rpc_threads, ram_buff
             )
             if p2p_local_transfer_mode == "memcpy":
                 test_cmd += (
-                    f" --local_memcpy_async_worker_num={local_memcpy_async_worker_num}"
+                    f" --local_io_worker_num={local_io_worker_num}"
                 )
 
             output = run_command(test_cmd)
@@ -248,8 +248,8 @@ def main():
     # P2P Specific parameters
     parser.add_argument("--p2p_local_transfer_mode", type=str, default="te",
                         help="P2P local transfer mode: te|memcpy (list: te,memcpy)")
-    parser.add_argument("--local_memcpy_async_worker_num", type=str, default="32",
-                        help="Async memcpy worker threads (memcpy mode only, list: 4,16,32)")
+    parser.add_argument("--local_io_worker_num", type=str, default="32",
+                        help="Local I/O workers (V1 memcpy mode, list: 4,16,32)")
     parser.add_argument("--route_cache_max_memory_mb", type=str, default="300",
                         help="Max memory for RouteCache in MB (P2P mode, list: 100,300,600)")
     parser.add_argument("--route_cache_ttl_ms", type=str, default="60000",
@@ -277,9 +277,9 @@ def main():
         "batch": parse_list_arg(args.batch),
     }
 
-    # P2P specific sweep dims — local_memcpy_async_worker_num only applies to memcpy mode.
+    # This benchmark uses V1, whose local I/O pool only serves memcpy mode.
     transfer_modes = parse_list_arg(args.p2p_local_transfer_mode, type_fn=str)
-    worker_nums = parse_list_arg(args.local_memcpy_async_worker_num)
+    worker_nums = parse_list_arg(args.local_io_worker_num)
     route_cache_mems = parse_list_arg(args.route_cache_max_memory_mb)
     route_cache_ttls = parse_list_arg(args.route_cache_ttl_ms)
 
@@ -288,7 +288,7 @@ def main():
         if transfer_mode == "te":
             p2p_combinations.append({
                 "p2p_local_transfer_mode": transfer_mode,
-                "local_memcpy_async_worker_num": None,
+                "local_io_worker_num": None,
                 "route_cache_max_memory_mb": rc_mem,
                 "route_cache_ttl_ms": rc_ttl,
             })
@@ -296,7 +296,7 @@ def main():
             for wk in worker_nums:
                 p2p_combinations.append({
                     "p2p_local_transfer_mode": transfer_mode,
-                    "local_memcpy_async_worker_num": wk,
+                    "local_io_worker_num": wk,
                     "route_cache_max_memory_mb": rc_mem,
                     "route_cache_ttl_ms": rc_ttl,
                 })
@@ -319,7 +319,7 @@ def main():
         for p2p_cfg in p2p_combinations:
             current += 1
             transfer_mode = p2p_cfg["p2p_local_transfer_mode"]
-            wk = p2p_cfg["local_memcpy_async_worker_num"]
+            wk = p2p_cfg["local_io_worker_num"]
             rc_mem = p2p_cfg["route_cache_max_memory_mb"]
             rc_ttl = p2p_cfg["route_cache_ttl_ms"]
 
@@ -327,12 +327,12 @@ def main():
             print(f"    threads={th}, batch={batch}, val={v_size/1024/1024:.1f}MB, rpc_threads={r_th}, ops={ops}, ram={r_buf_gb}GB")
             extra = f"p2p_local_transfer_mode={transfer_mode}, route_cache={rc_mem}MB/{rc_ttl}ms"
             if transfer_mode == "memcpy":
-                extra += f", local_memcpy_async_worker_num={wk}"
+                extra += f", local_io_worker_num={wk}"
             print(f"    {extra}")
 
             avg = run_benchmark_config(args.rounds, th, v_size, ops, r_th, r_buf_gb,
                                        batch=batch, p2p_local_transfer_mode=transfer_mode,
-                                       local_memcpy_async_worker_num=wk,
+                                       local_io_worker_num=wk,
                                        route_cache_max_memory_mb=rc_mem,
                                        route_cache_ttl_ms=rc_ttl)
             if avg:
@@ -374,7 +374,7 @@ def print_matrix_summary(results):
         put_lat = f"{r['put_p50']:<6.1f} {r['put_p90']:<6.1f} {r['put_p99']:<6.1f}"
         get_lat = f"{r['get_p50']:<6.1f} {r['get_p90']:<6.1f} {r['get_p99']:<6.1f}"
         transfer_mode = str(r.get('p2p_local_transfer_mode', '-'))
-        wk_val = r.get('local_memcpy_async_worker_num')
+        wk_val = r.get('local_io_worker_num')
         wk = '-' if wk_val is None else str(wk_val)
         bad = str(r.get('bad_round_count', 0))
         print(f"{r['mode']:<15} | {r['threads']:<3} | {r.get('batch', 1):<4} | {r['value_size']/1024/1024:<7.1f} | {r['rpc_threads']:<3} | {r['ops']:<5} | {r['ram_buffer_size_gb']:<3} | "

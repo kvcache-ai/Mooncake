@@ -65,7 +65,7 @@ class ReviewRegressionTest : public ::testing::Test {
                LocalTransferMode mode = LocalTransferMode::MEMCPY) {
         LocalTransferConfig local;
         local.mode = mode;
-        local.local_memcpy_async_worker_num = workers;
+        local.local_io_worker_num = workers;
         local.te_async_poll_worker_num =
             mode == LocalTransferMode::TE ? workers : 0;
         auto config =
@@ -200,7 +200,7 @@ TEST_F(ReviewRegressionTest, AsyncCopyRunsAwayFromTheCaller) {
     EXPECT_EQ(out, std::string(4096, 'a'));
 }
 
-TEST_F(ReviewRegressionTest, TeWorkerConfigurationAlsoDispatchesLocalIo) {
+TEST_F(ReviewRegressionTest, LocalIoWorkersDispatchInTeMode) {
     std::promise<std::thread::id> committed;
     MetadataCallbacks callbacks;
     callbacks.add_replica = [&](std::string_view, const UUID&,
@@ -209,7 +209,7 @@ TEST_F(ReviewRegressionTest, TeWorkerConfigurationAlsoDispatchesLocalIo) {
         return {};
     };
     // This local-only fixture has no TE endpoint, so the copier falls back to
-    // CPU memory; dispatch must still honour TE's configured worker count.
+    // CPU memory; dispatch must honour the configured local I/O worker count.
     Build(1, std::move(callbacks), LocalTransferMode::TE);
     const auto caller = std::this_thread::get_id();
     ASSERT_TRUE(Put("te-workers", std::string(4096, 't')));
@@ -289,7 +289,7 @@ TEST_F(ReviewRegressionTest,
         config.tier_config = Tiers();
         config.tier_config["tiers"].resize(1);
         config.local_transfer.mode = LocalTransferMode::MEMCPY;
-        config.local_transfer.local_memcpy_async_worker_num = 0;
+        config.local_transfer.local_io_worker_num = 0;
         config.local_transfer.te_async_poll_worker_num = 0;
         config.register_tiers_with_transfer_engine = false;
         auto metric = std::make_shared<TierMetric>();
