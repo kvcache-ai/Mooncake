@@ -17,7 +17,7 @@ Engine's registration of PyTorch XPU tensors (``register_buffer`` on the KV
 cache) and the store client's XPU host-staging copies (``batch_put_from`` /
 ``batch_get_into`` on device pointers).
 
-Two small in-process shims work around vLLM (0.29 to 0.31) connector code that is
+Two small in-process shims work around vLLM (0.29 to 0.33) connector code that is
 CUDA-specific rather than Mooncake-specific (see the comments in ``main()`` and
 ``_patch_vllm_kv_address_math()``); drop them once vLLM is device-generic there.
 
