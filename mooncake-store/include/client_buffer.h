@@ -7,7 +7,7 @@
 #include <string>
 #include <ylt/util/tl/expected.hpp>
 
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "common_types.h"
 
 namespace mooncake {

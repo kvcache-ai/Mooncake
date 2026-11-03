@@ -9,7 +9,7 @@
 #include <string>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "common_types.h"
 #include <ylt/reflection/user_reflect_macro.hpp>
 

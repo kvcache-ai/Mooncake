@@ -14,7 +14,7 @@
 #else
 #include "rpc_types.h"
 #endif
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 
 namespace mooncake {
 

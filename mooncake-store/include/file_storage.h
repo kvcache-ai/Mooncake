@@ -2,7 +2,7 @@
 
 #include "client_service.h"
 #include "mutex.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "storage_backend.h"
 
 namespace mooncake {

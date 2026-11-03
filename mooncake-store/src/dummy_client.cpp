@@ -12,7 +12,7 @@
 #include "real_client.h"
 #include "dummy_client.h"
 #include "utils.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "types.h"
 #include "default_config.h"
 

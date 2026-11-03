@@ -30,7 +30,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <ylt/util/tl/expected.hpp>
 
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "p2p/client/client_rpc_types.h"
 #include "p2p/client/data_manager_types.h"
 #include "p2p/client/task_handle.h"

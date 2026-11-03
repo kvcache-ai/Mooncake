@@ -19,7 +19,7 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_io/coro_io.hpp>
 
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 
 namespace mooncake {
 

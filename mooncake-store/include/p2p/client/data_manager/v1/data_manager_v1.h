@@ -34,7 +34,7 @@
 #include <ylt/coro_io/io_context_pool.hpp>
 #include <ylt/util/tl/expected.hpp>
 #include "p2p/client/async_memcpy_executor.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "client_config_builder.h"
 #include "p2p/client/data_manager.h"
 #include "p2p/client/data_manager_test_hook.h"

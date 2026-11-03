@@ -9,7 +9,7 @@
 #include <json/json.h>
 #endif
 
-#include "utils/base64.h"
+#include "common/base64.h"
 
 namespace mooncake {
 

@@ -14,7 +14,7 @@
 #include <optional>
 #include <utility>
 #include "p2p/common/p2p_types.h"
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "mutex.h"
 
 namespace mooncake {
