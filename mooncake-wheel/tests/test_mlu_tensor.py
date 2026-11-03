@@ -95,17 +95,25 @@ def process_roundtrip(mode, prefix):
         tensors = [value.to("mlu") for value in expected]
         torch.mlu.synchronize()
         if mode == "write":
-            assert store.batch_put_tensor(keys, tensors) == [0] * len(keys)
+            results = store.batch_put_tensor(keys, tensors)
+            if results != [0] * len(keys):
+                raise RuntimeError(f"batch_put_tensor failed: {results}")
         else:
             for tensor in tensors:
                 tensor.zero_()
             torch.mlu.synchronize()
             with registered(store, *tensors):
-                assert store.batch_get_tensor_into_cuda(keys, tensors) == [
-                    tensor_bytes(value) for value in expected
-                ]
+                results = store.batch_get_tensor_into_cuda(keys, tensors)
+                expected_sizes = [tensor_bytes(value) for value in expected]
+                if results != expected_sizes:
+                    raise RuntimeError(
+                        f"batch_get_tensor_into_cuda returned {results}, "
+                        f"expected {expected_sizes}"
+                    )
                 torch.mlu.synchronize()
-                assert all(torch.equal(a.cpu(), b) for a, b in zip(tensors, expected))
+                for key, actual, value in zip(keys, tensors, expected):
+                    if not torch.equal(actual.cpu(), value):
+                        raise RuntimeError(f"Tensor data mismatch for key {key}")
     finally:
         store.close()
     print(f"MLU_PROCESS_{mode.upper()}_OK", flush=True)
