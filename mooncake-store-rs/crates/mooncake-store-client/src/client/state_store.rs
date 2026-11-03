@@ -613,6 +613,168 @@ mod state_store_tests {
     }
 
     #[test]
+    fn clock_reuses_slots_after_mixed_replica_and_key_removal() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+        let mut route = test_route("multi", &runtime);
+        let mut second = route.replicas[0].clone();
+        second.segment_offset = 1024;
+        route.replicas.push(second);
+        clock.track_route(&route, &runtime);
+        let id = clock.entries[0].as_ref().unwrap().id.clone();
+        clock.remove_id(&id);
+        clock.remove_id(&id);
+        clock.remove_key(&route.key);
+        clock.remove_key(&route.key);
+        assert_eq!(clock.free_slots.len(), 2);
+        clock.track_route(&test_route("new-a", &runtime), &runtime);
+        clock.track_route(&test_route("new-b", &runtime), &runtime);
+        assert_eq!(clock.entries.len(), 2);
+        assert!(clock.free_slots.is_empty());
+        assert_eq!(clock.by_id.len(), 2);
+        assert_eq!(clock.by_key.len(), 2);
+        assert!(clock.entries.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn clock_slot_reuse_preserves_live_indexes_during_churn() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+        let mut live = BTreeSet::new();
+        let mut seed = 7u64;
+        for _ in 0..4096 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let route = test_route(&format!("key-{}", (seed >> 32) % 64), &runtime);
+            if seed & 1 == 0 {
+                clock.sync_route(&route, &runtime);
+                live.insert(route.key.clone());
+            } else {
+                clock.untrack_route(&route, &runtime);
+                live.remove(&route.key);
+            }
+            let vacant = clock.free_slots.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(vacant.len(), clock.free_slots.len());
+            assert_eq!(clock.by_key.keys().cloned().collect::<BTreeSet<_>>(), live);
+            assert_eq!(clock.by_id.len(), live.len());
+            for (index, entry) in clock.entries.iter().enumerate() {
+                match entry {
+                    Some(entry) => {
+                        assert!(!vacant.contains(&index));
+                        assert_eq!(clock.by_id.get(&entry.id), Some(&index));
+                        assert!(clock.by_key[&entry.id.route_key].contains(&index));
+                    }
+                    None => assert!(vacant.contains(&index)),
+                }
+            }
+        }
+        assert!(clock.entries.len() <= 64);
+    }
+
+    #[test]
+    fn clock_reused_slots_reset_heat_without_resetting_scan_cursors() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+        let hot = test_route("hot", &runtime);
+        let removed_hot = test_route("removed-hot", &runtime);
+        let removed_fresh = test_route("removed-fresh", &runtime);
+        clock.track_route(&hot, &runtime);
+        clock.track_route(&removed_hot, &runtime);
+        clock.track_fresh_route(&removed_fresh, &runtime);
+        clock.mark_hot_keys(&[hot.key.clone(), removed_hot.key.clone()]);
+        clock.hand = 2;
+        clock.stale_reclaim_hand = 1;
+        clock.remove_key(&removed_hot.key);
+        clock.untrack_route(&removed_fresh, &runtime);
+
+        let cold = test_route("new-cold", &runtime);
+        let fresh = test_route("new-fresh", &runtime);
+        clock.track_route(&cold, &runtime);
+        clock.track_fresh_route(&fresh, &runtime);
+        assert_eq!(clock.entries.len(), 3);
+        assert_eq!((clock.hand, clock.stale_reclaim_hand), (2, 1));
+        let cold_entry = clock.entries[clock.by_key[&cold.key][0]].as_ref().unwrap();
+        assert!(!cold_entry.hot && !cold_entry.fresh_write);
+        assert_eq!(cold_entry.hot_credit, 0);
+        let hot_entry = clock.entries[clock.by_key[&hot.key][0]].as_ref().unwrap();
+        assert_eq!(hot_entry.hot_credit, StorageClockState::READ_HOT_CLOCK_CREDIT);
+
+        // Reuse may change the order of equally cold entries, but must not
+        // transfer a removed entry's heat or bypass the fresh-write grace.
+        let victim = clock.pick_victim_clock(None).unwrap();
+        assert_eq!(victim.route_key, cold.key);
+        clock.remove_id(&victim);
+        let victim = clock.pick_victim_clock(None).unwrap();
+        assert_eq!(victim.route_key, fresh.key);
+        clock.remove_id(&victim);
+        let victim = clock.pick_victim_clock(None).unwrap();
+        assert_eq!(victim.route_key, hot.key);
+        clock.remove_id(&victim);
+        assert!(clock.pick_victim_clock(None).is_none());
+        assert!(clock.reclaim_candidate_keys(None, 3).is_empty());
+    }
+
+    #[test]
+    fn clock_nof_resync_reuses_slots_and_removes_stale_targets() {
+        let runtime = test_runtime();
+        let mut route = test_route("nof-reuse", &runtime);
+        route.replicas.clear();
+        route.nof_backing = Some(mooncake_store_core::NofBackingRoute {
+            owner: runtime.clone(),
+            target_id: "primary".to_string(),
+            object_locator: "primary-locator".to_string(),
+            length: 1024,
+            checksum: None,
+            state: mooncake_store_core::ColdBackingState::Materialized,
+            replicas: vec![mooncake_store_core::NofBackingReplica {
+                owner: runtime.clone(),
+                target_id: "secondary".to_string(),
+                object_locator: "secondary-locator".to_string(),
+            }],
+        });
+        let mut clock = StorageClockState::default();
+        clock.sync_nof_route(&route, &runtime, true);
+        for _ in 0..8 {
+            clock.sync_nof_route(&route, &runtime, false);
+            assert_eq!(clock.entries.len(), 2);
+            assert_eq!(clock.by_id.len(), 2);
+            assert!(clock.free_slots.is_empty());
+        }
+        route.nof_backing.as_mut().unwrap().replicas.clear();
+        clock.sync_nof_route(&route, &runtime, false);
+        assert_eq!(clock.free_slots.len(), 1);
+        assert!(clock
+            .pick_victim_clock(Some(&nof_backing_clock_segment("secondary")))
+            .is_none());
+        let victim = clock
+            .pick_victim_clock(Some(&nof_backing_clock_segment("primary")))
+            .unwrap();
+        assert_eq!(victim.route_key, route.key);
+        clock.remove_id(&victim);
+        clock.remove_key(&route.key);
+        assert_eq!(clock.free_slots.len(), 2);
+        assert!(clock.by_id.is_empty() && clock.by_key.is_empty());
+    }
+
+    #[test]
+    fn clock_rebuild_discards_old_vacancies() {
+        let runtime = test_runtime();
+        let tracker = HotReplicaTracker::default();
+        for key in ["old-a", "old-b", "old-c"] {
+            tracker.track_route(&test_route(key, &runtime), &runtime);
+        }
+        tracker.remove_key(&ObjectKey::new("old-c"));
+        assert_eq!(tracker.clock.lock().free_slots, vec![2]);
+
+        tracker.rebuild(&[test_route("rebuilt", &runtime)], &runtime);
+        assert!(tracker.clock.lock().free_slots.is_empty());
+        tracker.track_route(&test_route("after-rebuild", &runtime), &runtime);
+        let clock = tracker.clock.lock();
+        assert_eq!(clock.entries.len(), 2);
+        assert_eq!(clock.by_id.len(), 2);
+        assert!(clock.entries.iter().all(Option::is_some));
+    }
+
+    #[test]
     fn pending_hot_keys_accumulates_without_bound() {
         let runtime = test_runtime();
         let mut clock = StorageClockState::default();
@@ -1822,11 +1984,9 @@ impl StorageClockState {
             hot_credit,
             fresh_write: fresh_write && hot_credit == 0,
         };
-        let index = self
-            .entries
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(self.entries.len());
+        // Vacancies are recorded when an entry is removed. Searching entries
+        // here makes a hole-free fill quadratic in the resident replica count.
+        let index = self.free_slots.pop().unwrap_or(self.entries.len());
         if index == self.entries.len() {
             self.entries.push(Some(entry));
         } else {
@@ -1841,6 +2001,7 @@ impl StorageClockState {
         for index in indices {
             if let Some(entry) = self.entries.get_mut(index).and_then(Option::take) {
                 self.by_id.remove(&entry.id);
+                self.free_slots.push(index);
             }
         }
     }
@@ -1850,6 +2011,7 @@ impl StorageClockState {
             return;
         };
         self.entries[index] = None;
+        self.free_slots.push(index);
         if let Some(indices) = self.by_key.get_mut(&id.route_key) {
             indices.retain(|candidate| *candidate != index);
             if indices.is_empty() {

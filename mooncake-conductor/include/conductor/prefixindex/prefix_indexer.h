@@ -26,6 +26,11 @@ struct RegistrationResult {
 struct BlockPresence {
     std::set<EngineOwner> device_owners;
     std::set<EngineOwner> cpu_local_owners;
+    // vLLM CPU-tier store announcements per owner. vLLM's offloading
+    // connector re-announces a hash once per chunk that contains it and fans a
+    // chunk eviction out to all of the chunk's hashes, so an owner leaves
+    // cpu_local_owners only when its last announcement is removed.
+    std::map<EngineOwner, uint32_t> cpu_local_refs;
     std::set<SharedObjectOwner> cpu_share_owners;
     std::set<TierOwner> disk_owners;
 
@@ -51,6 +56,8 @@ struct ContextState {
     mutable std::shared_mutex mutex;
     const HashProfile profile;
     std::map<std::string, std::set<int64_t>> instance_ranks;
+    std::map<std::string, std::map<int64_t, common::PublisherKind>>
+        instance_publishers;
     std::unordered_map<ProjectedPrefix, BlockPresence> blocks;
 
     // Store order: newest prefix at the front, oldest at the back. Query does

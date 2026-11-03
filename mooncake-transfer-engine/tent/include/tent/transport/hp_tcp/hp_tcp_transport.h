@@ -95,6 +95,10 @@ class HighPerformanceTcpTransport final : public Transport {
     // peer so periodic fan-out cannot pin a peer to one lane or rail.
     std::mutex lane_sequence_mutex_;
     std::map<SegmentID, uint64_t> next_lane_sequence_;
+    // per target: outstanding operations per lane, so a submit can pick the
+    // least-loaded lane
+    std::map<SegmentID, std::shared_ptr<std::vector<std::atomic<int32_t>>>>
+        lane_load_;
     std::atomic<bool> installed_{false};
     std::atomic<bool> stopping_{false};
     mutable std::mutex lifecycle_mutex_;
