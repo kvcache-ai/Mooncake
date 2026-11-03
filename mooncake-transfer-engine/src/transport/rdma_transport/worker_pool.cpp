@@ -25,6 +25,7 @@
 #include <future>
 #include <queue>
 #include <thread>
+#include <utility>
 
 #include "config.h"
 #include "memory_location.h"
@@ -56,6 +57,79 @@ struct ClassicRdmaCongestionControl::RouteState {
     std::atomic<uint64_t> endpoint_generation{1};
     std::mutex endpoint_mutex;
 };
+
+namespace {
+
+std::optional<size_t> congestionSliceId(Transport::Slice *slice) {
+    if (!slice || !slice->task) return std::nullopt;
+    return slice->rdma_congestion_control_slice_ordinal;
+}
+
+std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+congestionObservation(Transport::TransferTask *task) {
+    auto current = std::atomic_load_explicit(&task->congestion_observation,
+                                             std::memory_order_acquire);
+    if (!current) {
+        auto created = std::make_shared<
+            adaptive_congestion_control::TaskCongestionObservation>(
+            __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE), 1);
+        if (std::atomic_compare_exchange_strong_explicit(
+                &task->congestion_observation, &current, created,
+                std::memory_order_release, std::memory_order_acquire))
+            current = std::move(created);
+    }
+    // A lazy publisher may have captured the count before a later submit flush.
+    current->extendAttempt(
+        1, __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE));
+    return current;
+}
+
+void resolveCongestion(Transport::Slice *slice) {
+    if (!slice || !slice->task ||
+        !slice->rdma_congestion_control_observed_blocked.load(
+            std::memory_order_acquire) ||
+        !slice->rdma_congestion_control_observed_blocked.exchange(
+            false, std::memory_order_acq_rel))
+        return;
+    auto observation = std::atomic_load_explicit(
+        &slice->task->congestion_observation, std::memory_order_acquire);
+    if (!observation) return;
+    auto slice_id = congestionSliceId(slice);
+    if (slice_id) observation->resolve(*slice_id, 1);
+}
+
+adaptive_congestion_control::TaskCongestionEvidence congestionEvidence(
+    const std::string &path, adaptive_congestion_control::Snapshot snapshot,
+    TaskCongestionReason reason) {
+    adaptive_congestion_control::TaskCongestionEvidence evidence;
+    evidence.reason = reason;
+    evidence.path = path;
+    evidence.observed_at_ns = getCurrentTimeInNano();
+    evidence.controller_mode =
+        snapshot.mode == adaptive_congestion_control::Mode::kEnforce
+            ? TaskCongestionControllerMode::kEnforce
+            : TaskCongestionControllerMode::kObserve;
+    evidence.controller_generation = snapshot.generation;
+    evidence.window_bytes = snapshot.window_bytes;
+    evidence.inflight_bytes = snapshot.inflight_bytes;
+    return evidence;
+}
+
+void recordCongestion(
+    Transport::Slice *slice, adaptive_congestion_control::Snapshot snapshot,
+    const std::string &path, TaskCongestionReason reason,
+    std::optional<TaskCongestionFailureScope> scope = std::nullopt) {
+    auto slice_id = congestionSliceId(slice);
+    if (!slice_id) return;
+    auto observation = congestionObservation(slice->task);
+    auto evidence = congestionEvidence(path, snapshot, reason);
+    evidence.failure_scope = scope;
+    if (observation->defer(*slice_id, 1, evidence))
+        slice->rdma_congestion_control_observed_blocked.store(
+            true, std::memory_order_release);
+}
+
+}  // namespace
 
 ClassicRdmaCongestionControl::ClassicRdmaCongestionControl(
     adaptive_congestion_control::Config config)
@@ -166,8 +240,10 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
             device_.get(), &state->domain,
             adaptive_congestion_control::generation(*device_),
             adaptive_congestion_control::generation(state->domain)};
+        adaptive_congestion_control::AdmissionEvidence evidence;
         const auto decision = adaptive_congestion_control::tryAcquire(
-            path, slice->length, slice->rdma_congestion_control_permit);
+            path, slice->length, slice->rdma_congestion_control_permit,
+            &evidence);
         if (decision == adaptive_congestion_control::Decision::kAllow) {
             slice->rdma_congestion_control_endpoint =
                 state->endpoint.load(std::memory_order_acquire);
@@ -175,6 +251,17 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
                 state->endpoint_generation.load(std::memory_order_acquire);
             std::swap(queued[admitted_count++], queued[cursor++]);
         } else {
+            if (evidence.reason ==
+                adaptive_congestion_control::AdmissionReason::kWindow)
+                recordCongestion(slice, evidence.snapshot, state->peer_nic_path,
+                                 TaskCongestionReason::kByteWindow,
+                                 evidence.domain ==
+                                         adaptive_congestion_control::
+                                             AdmissionDomain::kDevice
+                                     ? TaskCongestionFailureScope::kDevice
+                                     : TaskCongestionFailureScope::kRoute);
+            // A generation race is retried on the owner queue. It is not
+            // evidence that the legacy health gate considers the path failed.
             ++cursor;
         }
     }
@@ -194,12 +281,42 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
                 bytes = 0;
             }
         }
-        for (size_t i = retained; i < admitted_count; ++i)
+        for (size_t i = retained; i < admitted_count; ++i) {
             releaseUnposted(queued[i]);
+            recordCongestion(
+                queued[i],
+                adaptive_congestion_control::snapshot(first_route->domain),
+                first_route->peer_nic_path, TaskCongestionReason::kByteWindow,
+                TaskCongestionFailureScope::kRoute);
+        }
+    }
+    for (size_t i = 0; i < retained; ++i) {
+        if (queued[i]->rdma_congestion_control_route)
+            resolveCongestion(queued[i]);
     }
     return retained;
 }
 
+void ClassicRdmaCongestionControl::observeUnavailable(
+    Transport::Slice *slice, const std::string &peer_nic_path,
+    TaskCongestionFailureScope scope, std::optional<uint64_t> retry_after_ns) {
+    if (!enabled()) return;
+    const auto slice_id = congestionSliceId(slice);
+    if (!slice_id) return;
+    adaptive_congestion_control::TaskCongestionEvidence evidence;
+    evidence.reason = TaskCongestionReason::kPathQuarantined;
+    evidence.path = peer_nic_path;
+    evidence.observed_at_ns = getCurrentTimeInNano();
+    evidence.controller_mode =
+        mode_ == adaptive_congestion_control::Mode::kEnforce
+            ? TaskCongestionControllerMode::kEnforce
+            : TaskCongestionControllerMode::kObserve;
+    evidence.failure_scope = scope;
+    evidence.retry_after_ns = retry_after_ns;
+    if (congestionObservation(slice->task)->avoid(*slice_id, 1, evidence))
+        slice->rdma_congestion_control_observed_blocked.store(
+            true, std::memory_order_release);
+}
 void ClassicRdmaCongestionControl::complete(Transport::Slice *slice,
                                             ibv_wc_status status,
                                             uint32_t vendor_error) {
@@ -220,8 +337,51 @@ void ClassicRdmaCongestionControl::complete(Transport::Slice *slice,
                   adaptive_congestion_control::OutcomeClass::kDerivedFlush,
                   adaptive_congestion_control::FailureScope::kOperation, false,
                   vendor_error};
-    adaptive_congestion_control::complete(slice->rdma_congestion_control_permit,
-                                          result.outcome, result.scope);
+    bool relevant_feedback =
+        current_endpoint && status != IBV_WC_SUCCESS &&
+        (result.outcome ==
+             adaptive_congestion_control::OutcomeClass::kCongestion ||
+         result.outcome ==
+             adaptive_congestion_control::OutcomeClass::kReceiverPressure ||
+         result.outcome ==
+             adaptive_congestion_control::OutcomeClass::kRouteTimeout) &&
+        adaptive_congestion_control::isCurrentGeneration(
+            slice->rdma_congestion_control_permit);
+    const auto device_before =
+        relevant_feedback ? adaptive_congestion_control::snapshot(*device_)
+                          : adaptive_congestion_control::Snapshot{};
+    const auto route_before =
+        relevant_feedback ? adaptive_congestion_control::snapshot(state->domain)
+                          : adaptive_congestion_control::Snapshot{};
+    if (relevant_feedback)
+        relevant_feedback = adaptive_congestion_control::isCurrentGeneration(
+            slice->rdma_congestion_control_permit);
+    const bool completed = adaptive_congestion_control::complete(
+        slice->rdma_congestion_control_permit, result.outcome, result.scope);
+    if (completed && relevant_feedback &&
+        slice->rdma_congestion_control_endpoint ==
+            state->endpoint.load(std::memory_order_acquire) &&
+        slice->rdma_congestion_control_endpoint_generation ==
+            state->endpoint_generation.load(std::memory_order_acquire)) {
+        const auto route_after =
+            adaptive_congestion_control::snapshot(state->domain);
+        const auto device_after =
+            adaptive_congestion_control::snapshot(*device_);
+        if (route_before.generation == route_after.generation &&
+            device_before.generation == device_after.generation) {
+            TaskCongestionReason reason =
+                TaskCongestionReason::kCongestionFeedback;
+            if (result.outcome ==
+                adaptive_congestion_control::OutcomeClass::kReceiverPressure)
+                reason = TaskCongestionReason::kReceiverPressure;
+            else if (result.outcome ==
+                     adaptive_congestion_control::OutcomeClass::kRouteTimeout)
+                reason = TaskCongestionReason::kRouteTimeout;
+            recordCongestion(
+                slice, route_after, state->peer_nic_path, reason,
+                static_cast<TaskCongestionFailureScope>(result.scope));
+        }
+    }
 }
 
 void ClassicRdmaCongestionControl::releaseUnposted(Transport::Slice *slice) {
@@ -465,6 +625,10 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
       adaptive_congestion_control_(loadClassicCongestionControlConfig())
 #endif
 {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    context_.engine().recordClassicCongestionControlMode(
+        adaptive_congestion_control_.mode());
+#endif
     collective_slice_queue_.resize(worker_count_);
     for (int i = 0; i < worker_count_; ++i)
         worker_thread_.emplace_back(
@@ -829,8 +993,14 @@ void WorkerPool::performPostSend(int thread_id) {
     if (!context_.active()) {
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
-        for (auto &entry : local_slice_queue_clone)
+        for (auto &entry : local_slice_queue_clone) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            for (auto *slice : entry.second)
+                adaptive_congestion_control_.observeUnavailable(
+                    slice, entry.first, TaskCongestionFailureScope::kDevice);
+#endif
             redispatch(entry.second, thread_id, true);
+        }
         return;
     }
 
@@ -874,8 +1044,21 @@ void WorkerPool::performPostSend(int thread_id) {
         // delete the endpoint, and refresh the pause without attempting a
         // connection. Keeping the check here gives the pause a hard retry
         // deadline; only a genuine connection/QP failure can arm or extend it.
-        if (!isRailAvailable(entry.first) ||
+        RailHealthSnapshot *health_output = nullptr;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        RailHealthSnapshot health;
+        if (adaptive_congestion_control_.enabled()) health_output = &health;
+#endif
+        if (!isRailAvailable(entry.first, health_output) ||
             context_.isConnectPaused(entry.first)) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            for (auto *slice : entry.second)
+                adaptive_congestion_control_.observeUnavailable(
+                    slice, entry.first, TaskCongestionFailureScope::kRoute,
+                    health.paused
+                        ? std::optional<uint64_t>(health.retry_after_ns)
+                        : std::nullopt);
+#endif
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
@@ -2045,7 +2228,9 @@ void WorkerPool::markRailFailed(const std::string &peer_nic_path,
     }
 }
 
-bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
+bool WorkerPool::isRailAvailable(const std::string &peer_nic_path,
+                                 RailHealthSnapshot *health) {
+    if (health) *health = {};
     if (paused_rail_count_.load(std::memory_order_acquire) == 0) return true;
     std::lock_guard<std::mutex> lock(rail_state_lock_);
     // Drop every expired pause while the lock is already held. Otherwise a
@@ -2066,6 +2251,11 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
 
     auto it = rail_states_.find(peer_nic_path);
     if (it == rail_states_.end()) return true;
+    if (health) {
+        health->paused = it->second.pause_until_ns != 0;
+        health->retry_after_ns =
+            health->paused ? it->second.pause_until_ns - now : 0;
+    }
     return it->second.pause_until_ns == 0;
 }
 

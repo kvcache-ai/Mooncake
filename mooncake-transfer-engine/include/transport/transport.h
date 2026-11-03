@@ -36,6 +36,7 @@
 #include "transfer_metadata.h"
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 #include "adaptive_congestion_control.h"
+#include "task_congestion_observation.h"
 #endif
 
 namespace mooncake {
@@ -212,6 +213,8 @@ class Transport {
         CleanupCallback cleanup_callback = nullptr;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
         adaptive_congestion_control::Permit rdma_congestion_control_permit;
+        size_t rdma_congestion_control_slice_ordinal = 0;
+        std::atomic<bool> rdma_congestion_control_observed_blocked{false};
         void *rdma_congestion_control_route = nullptr;
         RdmaEndPoint *rdma_congestion_control_endpoint = nullptr;
         uint64_t rdma_congestion_control_endpoint_generation = 0;
@@ -474,6 +477,10 @@ class Transport {
             slice->rdma_congestion_control_route = nullptr;
             slice->rdma_congestion_control_endpoint = nullptr;
             slice->rdma_congestion_control_endpoint_generation = 0;
+            if (slice->rdma_congestion_control_observed_blocked.load(
+                    std::memory_order_relaxed))
+                slice->rdma_congestion_control_observed_blocked.store(
+                    false, std::memory_order_relaxed);
 #endif
 
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
@@ -512,6 +519,15 @@ class Transport {
         // transport-specific completion polling (e.g., CUDA stream
         // query for NVLink async transfers) in getTransferStatus().
         Transport *transport_ = nullptr;
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        // Allocated only when RDMA admission or feedback reports an anomaly.
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+            congestion_observation;
+        // Captured once per logical task from its actual Classic RDMA workers.
+        TaskCongestionObserved<TaskCongestionControllerMode>
+            rdma_congestion_control_mode;
+#endif
 
 #ifdef WITH_METRICS
         // Stamped once at submit and never cleared; zero means not stamped.
