@@ -94,16 +94,14 @@ class HighPerformanceTcpClient::Lane
             queue_.push_back(std::move(operation));
         } catch (const std::exception& error) {
 #if TENT_METRICS_ENABLED
-            finishQueuedOperation(operation,
-                                  TentMetrics::StreamEvent::IoError);
+            finishQueuedOperation(operation, TentMetrics::StreamEvent::IoError);
 #endif
             LOG(ERROR) << "HP TCP lane enqueue failed: " << error.what();
             completeStandalone(std::move(operation), FAILED, 0);
             return;
         } catch (...) {
 #if TENT_METRICS_ENABLED
-            finishQueuedOperation(operation,
-                                  TentMetrics::StreamEvent::IoError);
+            finishQueuedOperation(operation, TentMetrics::StreamEvent::IoError);
 #endif
             LOG(ERROR) << "HP TCP lane enqueue failed";
             completeStandalone(std::move(operation), FAILED, 0);
@@ -118,10 +116,10 @@ class HighPerformanceTcpClient::Lane
             Operation operation = std::move(queue_.front());
             queue_.pop_front();
 #if TENT_METRICS_ENABLED
-            finishQueuedOperation(
-                operation, terminal == TIMEOUT
-                               ? TentMetrics::StreamEvent::Timeout
-                               : TentMetrics::StreamEvent::Canceled);
+            finishQueuedOperation(operation,
+                                  terminal == TIMEOUT
+                                      ? TentMetrics::StreamEvent::Timeout
+                                      : TentMetrics::StreamEvent::Canceled);
 #endif
             completeStandalone(std::move(operation), terminal, 0);
         }

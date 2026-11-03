@@ -431,12 +431,9 @@ void TentMetrics::registerMetrics() {
     };
 
     gauges_ = {
-        &inflight_attempts_,
-        &logical_requests_inflight_,
-        &stream_queue_depth_,
-        &stream_busy_workers_,
-        &stream_admitted_tasks_,
-        &stream_admitted_bytes_,
+        &inflight_attempts_,       &logical_requests_inflight_,
+        &stream_queue_depth_,      &stream_busy_workers_,
+        &stream_admitted_tasks_,   &stream_admitted_bytes_,
         &registered_buffer_bytes_,
     };
 

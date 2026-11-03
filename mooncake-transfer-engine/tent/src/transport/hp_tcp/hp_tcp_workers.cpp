@@ -16,16 +16,15 @@ namespace {
 void RecordCommandQueued(HighPerformanceTcpWorkers::Command& command) {
     if (!command.metrics_operation.has_value()) return;
     command.enqueue_time = std::chrono::steady_clock::now();
-    TentMetrics::instance().recordStreamEvent(
-        TransportType::HP_TCP, *command.metrics_operation,
-        TentMetrics::StreamEvent::Queued);
+    TentMetrics::instance().recordStreamEvent(TransportType::HP_TCP,
+                                              *command.metrics_operation,
+                                              TentMetrics::StreamEvent::Queued);
     TentMetrics::instance().recordStreamQueueDepth(TransportType::HP_TCP, 1);
 }
 
-void FinishQueueAccounting(
-    const std::optional<Request::OpCode>& operation,
-    HighPerformanceTcpWorkers::QueueTime enqueue_time,
-    TentMetrics::StreamEvent terminal_event) {
+void FinishQueueAccounting(const std::optional<Request::OpCode>& operation,
+                           HighPerformanceTcpWorkers::QueueTime enqueue_time,
+                           TentMetrics::StreamEvent terminal_event) {
     if (!operation.has_value() ||
         enqueue_time == HighPerformanceTcpWorkers::QueueTime{}) {
         return;
@@ -36,8 +35,8 @@ void FinishQueueAccounting(
         std::chrono::duration<double, std::micro>(
             std::chrono::steady_clock::now() - enqueue_time)
             .count());
-    TentMetrics::instance().recordStreamEvent(
-        TransportType::HP_TCP, *operation, terminal_event);
+    TentMetrics::instance().recordStreamEvent(TransportType::HP_TCP, *operation,
+                                              terminal_event);
 }
 
 void FinishCommandQueue(HighPerformanceTcpWorkers::Command& command,
@@ -301,8 +300,7 @@ Status HighPerformanceTcpWorkers::tryCommitBatch(
             for (++i; i < commands.size(); ++i) {
                 auto& pending = commands[i];
 #if TENT_METRICS_ENABLED
-                FinishCommandQueue(pending,
-                                   TentMetrics::StreamEvent::Canceled);
+                FinishCommandQueue(pending, TentMetrics::StreamEvent::Canceled);
 #endif
                 if (pending.cancel) pending.cancel();
             }
@@ -320,8 +318,7 @@ void HighPerformanceTcpWorkers::runCommand(Command command) {
             const QueueDisposition disposition =
                 command.run(owner, command.enqueue_time);
             if (disposition == QueueDisposition::Settled) {
-                FinishCommandQueue(command,
-                                   TentMetrics::StreamEvent::Canceled);
+                FinishCommandQueue(command, TentMetrics::StreamEvent::Canceled);
             }
 #else
             (void)command.run(owner, QueueTime{});

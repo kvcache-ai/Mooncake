@@ -106,17 +106,18 @@ class Runtime {
                 ? Request::READ
                 : Request::WRITE;
 #endif
-        command.run = [this, owner, operation = std::move(operation)](
-                          size_t, HighPerformanceTcpWorkers::QueueTime queued_at)
-            mutable {
+        command.run =
+            [this, owner, operation = std::move(operation)](
+                size_t,
+                HighPerformanceTcpWorkers::QueueTime queued_at) mutable {
 #if TENT_METRICS_ENABLED
-            operation.enqueue_time = queued_at;
+                operation.enqueue_time = queued_at;
 #else
-            (void)queued_at;
+                (void)queued_at;
 #endif
-            client.enqueueOnOwner(owner, std::move(operation));
-            return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
-        };
+                client.enqueueOnOwner(owner, std::move(operation));
+                return HighPerformanceTcpWorkers::QueueDisposition::Transferred;
+            };
         commands.push_back(std::move(command));
         return workers.tryCommitBatch(commands, nullptr, 0, 0, [] {});
     }
@@ -225,7 +226,9 @@ TEST(HighPerformanceTcpSocketTest,
     std::atomic<bool> release_blocker{false};
     struct WorkerReleaseGuard {
         std::atomic<bool>& release;
-        ~WorkerReleaseGuard() { release.store(true, std::memory_order_release); }
+        ~WorkerReleaseGuard() {
+            release.store(true, std::memory_order_release);
+        }
     } release_guard{release_blocker};
     asio::post(runtime.workers.ioContext(owner), [&] {
         blocker_entered.store(true, std::memory_order_release);
@@ -238,14 +241,13 @@ TEST(HighPerformanceTcpSocketTest,
 
     const std::string before = metrics.getPrometheusMetrics();
     Completion completion;
-    ASSERT_TRUE(
-        runtime
-            .submit(Operation(source.data(), source.size(),
-                              reinterpret_cast<uint64_t>(remote.data()),
-                              registration, 100,
-                              HighPerformanceTcpOpcode::kWrite, &completion,
-                              runtime.port))
-            .ok());
+    ASSERT_TRUE(runtime
+                    .submit(Operation(source.data(), source.size(),
+                                      reinterpret_cast<uint64_t>(remote.data()),
+                                      registration, 100,
+                                      HighPerformanceTcpOpcode::kWrite,
+                                      &completion, runtime.port))
+                    .ok());
 
     const std::string blocked = metrics.getPrometheusMetrics();
     const std::string queue_depth =
