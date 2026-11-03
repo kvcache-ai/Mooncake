@@ -361,6 +361,10 @@ std::string PrefixCacheTable::Unregister(const ContextKey& context,
         std::erase_if(presence.cpu_local_owners, [&](const EngineOwner& owner) {
             return owner.instance_id == instance_id && owner.dp_rank == dp_rank;
         });
+        std::erase_if(presence.cpu_local_refs, [&](const auto& ref) {
+            return ref.first.instance_id == instance_id &&
+                   ref.first.dp_rank == dp_rank;
+        });
         std::erase_if(presence.disk_owners, matches_engine);
     }
     EraseEmptyBlocks(*state);
@@ -399,6 +403,9 @@ std::string PrefixCacheTable::StoreEngine(const EngineMutation& mutation) {
             presence.device_owners.insert(mutation.owner);
         } else if (mutation.tier == StorageTier::kCpuLocal) {
             presence.cpu_local_owners.insert(mutation.owner);
+            if (vllm_local) {
+                ++presence.cpu_local_refs[mutation.owner];
+            }
         } else {
             presence.disk_owners.insert(mutation.owner);
         }
@@ -425,6 +432,13 @@ std::string PrefixCacheTable::RemoveEngine(const EngineMutation& mutation) {
             if (mutation.tier == StorageTier::kDevice) {
                 block->second.device_owners.erase(mutation.owner);
             } else if (mutation.tier == StorageTier::kCpuLocal) {
+                auto& refs = block->second.cpu_local_refs;
+                if (auto ref = refs.find(mutation.owner); ref != refs.end()) {
+                    if (--ref->second > 0) {
+                        continue;  // another resident chunk still holds it
+                    }
+                    refs.erase(ref);
+                }
                 block->second.cpu_local_owners.erase(mutation.owner);
             } else {
                 block->second.disk_owners.erase(mutation.owner);
@@ -455,6 +469,7 @@ std::string PrefixCacheTable::ClearEngine(const EngineClear& clear) {
         }
         if (!clear.tier || *clear.tier == StorageTier::kCpuLocal) {
             presence.cpu_local_owners.erase(clear.owner);
+            presence.cpu_local_refs.erase(clear.owner);
         }
         if (!clear.tier || *clear.tier == StorageTier::kDisk) {
             presence.disk_owners.erase(clear.owner);
@@ -489,6 +504,9 @@ std::string PrefixCacheTable::StoreShared(const SharedMutation& mutation) {
                     return rank != instance->second.end() &&
                            rank->second == common::PublisherKind::kVllm;
                 });
+            std::erase_if(presence.cpu_local_refs, [&](const auto& ref) {
+                return !presence.cpu_local_owners.contains(ref.first);
+            });
         } else {
             presence.disk_owners.insert(mutation.owner);
         }
