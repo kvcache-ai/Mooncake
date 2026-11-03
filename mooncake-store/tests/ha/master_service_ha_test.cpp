@@ -7504,7 +7504,12 @@ TEST_F(MasterServiceHATest,
                       .set_enable_oplog(true)
                       .set_weight_management_oplog_capability_confirmed(true)
                       .set_cluster_id(cluster_id)
-                      .set_oplog_batch_max_entries(1)
+                      // UnmountSegment below queues one stale-handle cleanup
+                      // per object plus SEGMENT_UNMOUNT back to back, before
+                      // the writer thread can take the previous entry. With
+                      // a single slot those Reserve() calls race the writer
+                      // and fail with TASK_PENDING_LIMIT_EXCEEDED.
+                      .set_oplog_batch_max_entries(16)
                       .build();
     MasterService service(config);
     auto* writer = InstallGatedWriter(service, backend);
@@ -7541,7 +7546,7 @@ TEST_F(MasterServiceHATest,
                                      replicate));
         ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
                                    ReplicaType::MEMORY));
-        // PutEnd returns before durability; drain the single-entry writer.
+        // PutEnd returns before durability; wait for this entry to land.
         ASSERT_TRUE(writer->RunCallbacksThrough(put_sequence++));
     }
     const auto ready = service.CommitWeightImport({
