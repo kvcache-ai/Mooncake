@@ -1,4 +1,8 @@
 import unittest
+import json
+import subprocess
+import sys
+import textwrap
 import os
 import ctypes
 from mooncake.engine import TransferEngine
@@ -525,6 +529,59 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             0,
             "send_probe to unknown peer unexpectedly succeeded",
         )
+
+
+class TestTransferEngineInitialization(unittest.TestCase):
+    def initialize(self, connections):
+        # Keep a fatal native regression from killing the test runner.
+        code = textwrap.dedent("""
+            import json
+            import resource
+            import sys
+            from mooncake.engine import TransferEngine
+
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            engine = TransferEngine()
+            results = [
+                engine.initialize("127.0.0.1", connection, "tcp", "")
+                for connection in sys.argv[1:]
+            ]
+            del engine
+            print(json.dumps(results), flush=True)
+        """)
+        environment = {**os.environ, "MC_FORCE_TCP": "1"}
+        environment.pop("MC_USE_TENT", None)
+        environment.pop("MC_USE_TEV1", None)
+        process = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", code, *connections],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            process.returncode,
+            0,
+            f"child return code: {process.returncode}\n{process.stdout}\n"
+            f"{process.stderr}",
+        )
+        return json.loads(process.stdout.splitlines()[-1]), process.stderr
+
+    def test_unsupported_plugin_returns_error(self):
+        results, diagnostics = self.initialize(["unsupported://127.0.0.1:1"])
+        self.assertEqual(results, [-1])
+        self.assertIn("Unable to find metadata storage plugin", diagnostics)
+
+    def test_can_initialize_p2p_after_rejected_configuration(self):
+        results, _ = self.initialize(["unsupported://127.0.0.1:1", "P2PHANDSHAKE"])
+        self.assertEqual(results, [-1, 0])
+
+    def test_http_metadata_initialization(self):
+        connection = os.environ.get("MC_METADATA_SERVER", "")
+        if not connection.startswith(("http://", "https://")):
+            self.skipTest("Set MC_METADATA_SERVER to a running HTTP metadata server")
+        results, _ = self.initialize([connection])
+        self.assertEqual(results, [0])
 
 
 if __name__ == "__main__":

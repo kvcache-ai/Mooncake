@@ -20,6 +20,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -31,11 +33,15 @@
 #include <cstdlib>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "common.h"
 #include "config.h"
+#include "error.h"
+#include "transfer_engine.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
@@ -1386,6 +1392,83 @@ TEST_F(TransferMetadataStaleSegmentInvalidationTest,
             << " opaque failures";
     }
 }
+
+namespace {
+
+int openDescriptorCount() {
+    DIR *directory = opendir("/proc/self/fd");
+    if (!directory) return -1;
+    int count = 0;
+    while (readdir(directory)) ++count;
+    closedir(directory);
+    return count;
+}
+
+int rejectUnavailablePlugin(const std::string &connection) {
+    const rlimit limit{0, 0};
+    setrlimit(RLIMIT_CORE, &limit);
+    unsetenv("MC_USE_TENT");
+    unsetenv("MC_USE_TEV1");
+    if (MetadataStoragePlugin::Create(connection)) return 1;
+    try {
+        TransferMetadata metadata(connection);
+        return 2;
+    } catch (const std::invalid_argument &) {
+    }
+
+    TransferEngine engine(false);
+    const int before = openDescriptorCount();
+    if (before < 0) return 3;
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        if (engine.init(connection, "127.0.0.1:12345") != ERR_INVALID_ARGUMENT)
+            return 4;
+    }
+    if (openDescriptorCount() != before) return 5;
+    return 0;
+}
+
+std::vector<std::string> unavailableConnections() {
+    std::vector<std::string> connections{"unsupported://127.0.0.1:1"};
+#ifndef USE_ETCD
+    connections.emplace_back("etcd://127.0.0.1:1");
+    // A connection string without a scheme intentionally defaults to etcd.
+    connections.emplace_back("127.0.0.1:1");
+#endif
+#ifndef USE_REDIS
+    connections.emplace_back("redis://127.0.0.1:1");
+#endif
+#ifndef USE_HTTP
+    connections.emplace_back("http://127.0.0.1:1/metadata");
+    connections.emplace_back("https://127.0.0.1:1/metadata");
+#endif
+    return connections;
+}
+
+class MetadataPluginInitDeathTest
+    : public ::testing::TestWithParam<std::string> {};
+
+TEST_P(MetadataPluginInitDeathTest, ReturnsErrorWithoutAbortingOrLeaking) {
+    // Run in a subprocess: the regression used to abort inside LOG(FATAL).
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(_exit(rejectUnavailablePlugin(GetParam())),
+                ::testing::ExitedWithCode(0),
+                "Unable to find metadata storage plugin");
+}
+
+INSTANTIATE_TEST_SUITE_P(Unavailable, MetadataPluginInitDeathTest,
+                         ::testing::ValuesIn(unavailableConnections()));
+
+TEST(MetadataPluginInitTest, EnabledHttpPluginCanBeConstructed) {
+#ifdef USE_HTTP
+    EXPECT_NE(MetadataStoragePlugin::Create("http://127.0.0.1:1/metadata"),
+              nullptr);
+    EXPECT_NO_THROW(TransferMetadata("http://127.0.0.1:1/metadata"));
+#else
+    GTEST_SKIP() << "HTTP metadata support is not enabled";
+#endif
+}
+
+}  // namespace
 
 }  // namespace mooncake
 
