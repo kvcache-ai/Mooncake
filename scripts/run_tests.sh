@@ -121,6 +121,7 @@ esac
 
 echo "Running transfer_engine tests..."
 cd mooncake-wheel/tests
+python test_session_refresh_cpu.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_target.py &
 TARGET_PID=$!
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_initiator_test.py
