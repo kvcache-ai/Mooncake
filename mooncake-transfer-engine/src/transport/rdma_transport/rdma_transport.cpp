@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <thread>
@@ -534,30 +535,208 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         alignment = getpagesize();
     }
 #endif
+    // A HugeTLB registration must cover whole huge pages. ibv_fork_init() makes
+    // ibv_reg_mr() run MADV_DONTFORK over the range it is handed, and the
+    // kernel refuses to split a hugetlb VMA at a boundary that falls inside a
+    // huge page, so registering a sub-range of a hugepage-backed mapping — any
+    // caller that hands over a view of a larger allocation instead of the
+    // mapping itself — fails with EINVAL before the request reaches the HCA.
+    // Widen such a registration outward to the enclosing huge pages.
+    //
+    // Both widened ends are hugepage boundaries, and a hugetlb VMA is a whole
+    // number of those, so a request that lies inside its mapping stays inside
+    // it after widening. (A request that runs past its own mapping — which the
+    // caller has no business making — can widen a little past it too; the
+    // registration was never bounds-checked against the mapping and is not
+    // here either.) The caller-visible range is left untouched: the MR is
+    // registered at the widened base (so lkey()/rkey() still resolve every
+    // address the caller owns, and unregisterMemoryRegion() rebuilds its
+    // MADV_DOFORK range from the MR itself), while the BufferDesc published
+    // below keeps the requested addr/length so peers cannot reach the padding.
+    //
+    // Host memory only: a dma_buf export carries its own offset and size, and
+    // device mappings report the base page size anyway. A zero-length request
+    // is left alone as well — widening it would turn a request that has always
+    // been rejected into a successful whole-page registration.
+    const bool hugetlb_backed =
+        dmabuf_exp.method == DmabufExport::Method::kHostReg &&
+        buffer_page_size > base_page_size;
+    void *reg_addr = addr;
+    size_t reg_len = length;
+    const bool hugetlb_widened =
+        hugetlb_backed && length > 0 &&
+        ((reinterpret_cast<uintptr_t>(addr) % buffer_page_size) != 0 ||
+         ((reinterpret_cast<uintptr_t>(addr) + length) % buffer_page_size) !=
+             0);
+    if (hugetlb_widened) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+        const uintptr_t widened_begin = begin - begin % buffer_page_size;
+        const uintptr_t widened_end = (begin + length + buffer_page_size - 1) /
+                                      buffer_page_size * buffer_page_size;
+        reg_addr = reinterpret_cast<void *>(widened_begin);
+        reg_len = widened_end - widened_begin;
+    }
+
     std::vector<std::pair<void *, size_t>> chunks;
     if (chunk_limit > 0) {
         size_t offset = 0;
         do {
-            auto *chunk_addr = static_cast<char *>(addr) + offset;
+            auto *chunk_addr = static_cast<char *>(reg_addr) + offset;
             const size_t prefix = (uintptr_t)chunk_addr % alignment;
             if (prefix >= chunk_limit) {
                 LOG(ERROR)
                     << "Data Direct alignment prefix exceeds max_mr_size";
                 return ERR_INVALID_ARGUMENT;
             }
-            size_t chunk_len = std::min(chunk_limit - prefix, length - offset);
+            size_t chunk_len = std::min(chunk_limit - prefix, reg_len - offset);
             chunks.emplace_back(chunk_addr, chunk_len);
             offset += chunk_len;
-        } while (offset < length);
+        } while (offset < reg_len);
         if (chunks.size() > 1) {
-            LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
-                         << " bytes) into " << chunks.size()
+            LOG(WARNING) << "Auto-splitting buffer " << reg_addr << " ("
+                         << reg_len << " bytes) into " << chunks.size()
                          << " chunks of <= " << chunk_limit
                          << " bytes each (device max_mr_size; Mooncake#2017)";
         }
     } else {
-        chunks.emplace_back(addr, length);
+        chunks.emplace_back(reg_addr, reg_len);
     }
+
+    // A widened registration is published under the caller's own range and
+    // deregistered through a single alias, which only holds while it stays one
+    // MR. A buffer large enough to need chunking would have to publish its
+    // padded chunks instead, making the alignment padding addressable by peers.
+    // Such a request failed with EINVAL before this widening existed, so refuse
+    // it rather than weaken that guarantee; registering the mapping itself —
+    // which is hugepage-aligned and needs no widening — always works.
+    if (hugetlb_widened && chunks.size() > 1) {
+        LOG(ERROR) << "HugeTLB registration at " << addr << " (" << length
+                   << " bytes) widens to " << reg_addr << " (" << reg_len
+                   << " bytes), which exceeds the max_mr_size chunk limit. "
+                      "Register the hugepage-aligned mapping itself instead of "
+                      "a sub-view larger than max_mr_size.";
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    // RdmaContext keys its MR map by base address and overwrites on a duplicate
+    // key, so re-registering a base drops the earlier MR (and the lkey/rkey it
+    // holds) without ever deregistering it. A widened base is one the caller
+    // never sees, so a caller aiming at a huge page that is already registered
+    // would hit that collision blind: that is a registration which failed with
+    // EINVAL before this widening existed, so refuse it with an error the
+    // caller can act on instead of leaking the live MR.
+    //
+    // EVERY hugetlb-backed registration claims its range here, not only a
+    // widened one. Recording only the widened ones would leave the check blind
+    // to an aligned range that owns the very pages a later view widens onto, in
+    // both directions, and would let the two orders disagree.
+    //
+    // The check and the claim have to be one atomic step: a batch registration
+    // runs one worker per buffer, so two views of the same huge page would
+    // otherwise both pass the check before either of them records its range.
+    std::vector<uint64_t> reserved_bases;
+    if (hugetlb_backed) {
+        std::lock_guard<std::mutex> lock(hugetlb_registry_mutex_);
+        for (auto &chunk : chunks) {
+            const uint64_t begin = (uint64_t)chunk.first;
+            const size_t len = chunk.second;
+            auto next = hugetlb_registered_regions_.upper_bound(begin);
+            bool overlaps = next != hugetlb_registered_regions_.end() &&
+                            next->first < begin + len;
+            if (!overlaps && next != hugetlb_registered_regions_.begin()) {
+                auto prev = std::prev(next);
+                overlaps = prev->first + prev->second > begin;
+            }
+            if (overlaps) {
+                LOG(ERROR) << "HugeTLB registration at " << addr << " ("
+                           << length << " bytes) covers [" << chunk.first
+                           << ", " << chunk.second
+                           << " bytes), which overlaps a registration that is "
+                              "already live. A hugepage-backed mapping can be "
+                              "registered only once: register the mapping "
+                              "itself rather than several views of it, or "
+                              "unregister the earlier registration first.";
+                return ERR_ADDRESS_OVERLAPPED;
+            }
+        }
+        for (auto &chunk : chunks) {
+            hugetlb_registered_regions_[(uint64_t)chunk.first] = chunk.second;
+            reserved_bases.push_back((uint64_t)chunk.first);
+        }
+    }
+    // Bases whose MR survived a failed rollback: the claim has to stay for
+    // those, because a live MR still owns its base and handing it back would
+    // let the next registration overwrite it in RdmaContext's map. It must NOT
+    // stay for the other bases of the same registration — dropping all of them
+    // because one chunk failed would strand the huge pages that did roll back.
+    std::set<uint64_t> retained_bases;
+
+    std::vector<uint64_t> all_chunk_addrs;
+    all_chunk_addrs.reserve(chunks.size());
+    for (auto &chunk : chunks) all_chunk_addrs.push_back((uint64_t)chunk.first);
+
+    // Releases the remaining claims on every failure path below; the success
+    // path commits them by recording the bookkeeping at the end of the
+    // function.
+    //
+    // A claim this cannot release — its MR survived the rollback and is still
+    // live — would otherwise be permanent: with no metadata entry, no
+    // chunk_map_ entry and no alias, a later unregisterLocalMemory() cannot
+    // find that MR and every registration of those huge pages is refused for
+    // the rest of the process. Publish the bookkeeping a successful
+    // registration would have published, so the cleanup stays reachable from
+    // the caller's address.
+    struct BaseReservationGuard {
+        RdmaTransport *transport;
+        std::vector<uint64_t> &bases;
+        std::set<uint64_t> &retained;
+        bool hugetlb;
+        bool widened;
+        uint64_t caller_addr;
+        void *widened_base;
+        std::vector<uint64_t> &chunk_addrs;
+        bool committed = false;
+        ~BaseReservationGuard() {
+            if (committed) return;
+            // A chunked registration that could not roll back completely stays
+            // claimed as a whole. Its chunk_map_ entry is published below and
+            // names every chunk, and the chunked unregister path deregisters
+            // whatever that entry names without an ownership check, so the
+            // chunks that did roll back have to keep their claim: releasing
+            // them would let a later registration take those bases, which the
+            // cleanup would then tear down as if they were its own. Retrying
+            // the registration is blocked by the chunk that failed either way,
+            // since a retry covers the whole range.
+            const bool retain_all = !retained.empty() && chunk_addrs.size() > 1;
+            {
+                std::lock_guard<std::mutex> lock(
+                    transport->hugetlb_registry_mutex_);
+                for (uint64_t base : bases)
+                    if (!retain_all && !retained.contains(base))
+                        transport->hugetlb_registered_regions_.erase(base);
+            }
+            if (!hugetlb || retained.empty()) return;
+            if (chunk_addrs.size() > 1) {
+                // A chunked buffer is re-enumerated through chunk_map_, which
+                // unregister consults before any bookkeeping keyed by address.
+                std::lock_guard<std::mutex> lock(transport->chunk_map_mutex_);
+                transport->chunk_map_[caller_addr] = chunk_addrs;
+                return;
+            }
+            // The single-buffer path deregisters by the caller's address, which
+            // only resolves to the widened MR through the alias.
+            if (widened) {
+                std::lock_guard<std::mutex> lock(
+                    transport->hugetlb_registry_mutex_);
+                transport->hugepage_widen_aliases_[caller_addr] =
+                    (uint64_t)widened_base;
+            }
+            std::lock_guard<std::mutex> lock(transport->pending_dereg_mutex_);
+            transport->pending_dereg_.insert(caller_addr);
+        }
+    } base_reservation{this,           reserved_bases,  retained_bases,
+                       hugetlb_backed, hugetlb_widened, (uint64_t)addr,
+                       reg_addr,       all_chunk_addrs};
 
     // Best-effort unregister of ONE chunk's MRs across all contexts. Used to
     // clean up a chunk whose registration failed part-way (some contexts
@@ -567,10 +746,22 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     auto unregisterChunkMRs = [&](void *chunk_addr) {
         for (auto &context : context_list_) {
             int ret = context->unregisterMemoryRegion(chunk_addr);
-            if (ret)
+            if (ret) {
                 LOG(WARNING) << "Rollback: failed to unregister chunk MR at "
                              << chunk_addr << " (ret=" << ret << ")";
+                retained_bases.insert((uint64_t)chunk_addr);
+            }
         }
+    };
+
+    // The metadata entry of a widened single-chunk registration sits at the
+    // caller's address, not at the MR base (see buffer_desc.addr below); every
+    // other registration keys its entries by chunk address. Rollback has to
+    // remove by the key the entry was added under, or it leaves a descriptor
+    // behind that the republish below then advertises with deregistered keys.
+    auto metadataKeyForChunk = [&](size_t ci) -> void * {
+        return (hugetlb_widened && chunks.size() == 1) ? addr
+                                                       : chunks[ci].first;
     };
 
     // Best-effort rollback of the first `committed` FULLY-committed chunks
@@ -582,12 +773,13 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     auto rollbackChunks = [&](size_t committed) {
         size_t n = std::min(committed, chunks.size());
         for (size_t ri = 0; ri < n; ++ri) {
+            void *metadata_key = metadataKeyForChunk(ri);
             int rc = metadata_->removeLocalMemoryBuffer(
-                chunks[ri].first, /*update_metadata=*/false);
+                metadata_key, /*update_metadata=*/false);
             if (rc)
                 LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
                                 "at "
-                             << chunks[ri].first << " (ret=" << rc << ")";
+                             << metadata_key << " (ret=" << rc << ")";
             unregisterChunkMRs(chunks[ri].first);
         }
         if (n > 0 && update_metadata) metadata_->updateLocalSegmentDesc();
@@ -611,8 +803,10 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void *chunk_addr = chunks[ci].first;
         size_t chunk_len = chunks[ci].second;
+        // Relative to the registration base, not the caller's address: a
+        // widened registration starts before it.
         const uint64_t chunk_offset = reinterpret_cast<uintptr_t>(chunk_addr) -
-                                      reinterpret_cast<uintptr_t>(addr);
+                                      reinterpret_cast<uintptr_t>(reg_addr);
         DmabufExport chunk_dmabuf_exp = dmabuf_exp;
         if (chunk_dmabuf_exp.method == DmabufExport::Method::kDmabufReg)
             chunk_dmabuf_exp.offset += chunk_offset;
@@ -719,8 +913,18 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                 buffer_desc.rkey.push_back(context->rkey(chunk_addr));
         }
         buffer_desc.name = resolved_name;
-        buffer_desc.addr = (uint64_t)chunk_addr;
-        buffer_desc.length = chunk_len;
+        // A widened registration publishes the range the caller asked for, not
+        // the padded one: the MR covers the alignment padding so that it can
+        // exist at all, but peers have no business reaching it. Only the
+        // single-chunk case can do this — a chunked buffer is re-enumerated
+        // through chunk_map_ at unregister time, so each chunk's desc has to
+        // carry the address it was added under.
+        const bool publish_requested_range =
+            hugetlb_widened && chunks.size() == 1;
+        buffer_desc.addr =
+            (uint64_t)(publish_requested_range ? (uintptr_t)addr
+                                               : (uintptr_t)chunk_addr);
+        buffer_desc.length = publish_requested_range ? length : chunk_len;
 #ifdef ENABLE_MULTI_PROTOCOL
         buffer_desc.protocol = "rdma";
 #endif
@@ -752,10 +956,19 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // gets the base addr) can clean up every chunk.
     if (chunks.size() > 1) {
         std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-        std::vector<uint64_t> chunk_addrs;
-        chunk_addrs.reserve(chunks.size());
-        for (auto &c : chunks) chunk_addrs.push_back((uint64_t)c.first);
-        chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
+        chunk_map_[(uint64_t)addr] = all_chunk_addrs;
+    }
+
+    // The ranges were already claimed up front (see the reservation block
+    // above), so committing is just a matter of keeping them; only the alias
+    // still has to be recorded, and only once the MR it points at really
+    // exists. The guard releases the claim on every failure path, so a failed
+    // registration never leaves a stale entry behind for a later retry to trip
+    // over.
+    base_reservation.committed = true;
+    if (hugetlb_widened) {
+        std::lock_guard<std::mutex> lock(hugetlb_registry_mutex_);
+        hugepage_widen_aliases_[(uint64_t)addr] = (uint64_t)reg_addr;
     }
     kfd_pin_anchor.held = false;
     return 0;
@@ -779,6 +992,22 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             // Copy, but keep the entry until the whole unregister succeeds:
             // a retry re-enumerates the chunks through this map.
             chunk_addrs = it->second;
+        }
+    }
+    // A HugeTLB sub-view registration is widened to whole huge pages before
+    // ibv_reg_mr(), so its MR lives at a base the caller never sees. Deregister
+    // through that base; the metadata entry still sits at the caller's address,
+    // which is what removeLocalMemoryBuffer() matches on. A chunked buffer does
+    // not need it — chunk_map_ already holds the (already widened) chunk
+    // addresses — but the alias entry still has to be released below.
+    uint64_t widened_base = 0;
+    bool widened = false;
+    {
+        std::lock_guard<std::mutex> lock(hugetlb_registry_mutex_);
+        auto it = hugepage_widen_aliases_.find((uint64_t)addr);
+        if (it != hugepage_widen_aliases_.end()) {
+            widened = true;
+            widened_base = it->second;
         }
     }
     if (!chunk_addrs.empty()) {
@@ -842,14 +1071,44 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         if (!mr_err) releaseKfdPinAnchor(addr);
         if (!first_err) first_err = mr_err;
 
+        // The chunk addresses are the MR bases (widening happens before
+        // chunking), so they are what registerLocalMemoryInternal recorded.
+        // Erasing an absent key is a no-op, which keeps a non-hugetlb buffer's
+        // unregister on the same path.
+        //
+        // Gated on the dereg outcome rather than on first_err: the republish
+        // below can still fail, and returning with every MR gone but the claims
+        // still held would refuse every later view of those huge pages.
+        //
+        // The chunk_map_ entry goes with the claims, not with first_err: an
+        // entry that outlived its claims would name bases a later registration
+        // is free to take, and a retry of this cleanup would then deregister
+        // that registration's live MRs as if they were ours. On a partial dereg
+        // failure both are kept, so a retry redoes the whole cleanup.
+        if (!mr_err) {
+            {
+                std::lock_guard<std::mutex> registry_lock(
+                    hugetlb_registry_mutex_);
+                for (uint64_t ca : chunk_addrs)
+                    hugetlb_registered_regions_.erase(ca);
+                if (widened) hugepage_widen_aliases_.erase((uint64_t)addr);
+            }
+            std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+            chunk_map_.erase((uint64_t)addr);
+        }
+
         // Single metadata publish covering all removed chunks.
         if (update_metadata) {
             int rc = metadata_->updateLocalSegmentDesc();
             if (rc && !first_err) first_err = rc;
         }
-        if (!first_err) {
-            std::lock_guard<std::mutex> lock(chunk_map_mutex_);
-            chunk_map_.erase((uint64_t)addr);
+        if (!mr_err && first_err) {
+            // Every MR is gone and the chunk_map_ entry with it, so a retry
+            // cannot tell this buffer was ever chunked: seed the record the
+            // single-buffer path needs to finish whatever failed — a republish,
+            // or a metadata removal that left an entry behind.
+            std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+            pending_dereg_.insert((uint64_t)addr);
         }
         return first_err;
     }
@@ -864,7 +1123,10 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     const bool metadata_missing = (rc == ERR_ADDRESS_NOT_REGISTERED);
     if (metadata_missing) {
         std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
-        if (!pending_dereg_.contains((uint64_t)addr)) {
+        // A widened registration (aliased below) proves a live MR of ours still
+        // sits at the caller's address even when no pending record was seeded,
+        // so finish the cleanup rather than stranding the alias and the MR.
+        if (!pending_dereg_.contains((uint64_t)addr) && !widened) {
             return ERR_ADDRESS_NOT_REGISTERED;
         }
     } else if (rc) {
@@ -884,6 +1146,9 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
     }
 
+    // The MR of a widened HugeTLB registration is keyed by its widened base.
+    void *mr_addr = widened ? reinterpret_cast<void *>(widened_base) : addr;
+
     int dereg_err = 0;
     if (use_parallel_unreg) {
         std::vector<std::thread> unreg_threads;
@@ -891,8 +1156,9 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         std::vector<int> ret_codes(context_list_.size(), 0);
 
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            unreg_threads.emplace_back([this, &ret_codes, i, addr]() {
-                ret_codes[i] = context_list_[i]->unregisterMemoryRegion(addr);
+            unreg_threads.emplace_back([this, &ret_codes, i, mr_addr]() {
+                ret_codes[i] =
+                    context_list_[i]->unregisterMemoryRegion(mr_addr);
             });
         }
 
@@ -905,7 +1171,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
     } else {
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            int ret = context_list_[i]->unregisterMemoryRegion(addr);
+            int ret = context_list_[i]->unregisterMemoryRegion(mr_addr);
             if (ret && !dereg_err) dereg_err = ret;
         }
     }
@@ -922,6 +1188,18 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
     }
     releaseKfdPinAnchor(addr);
 
+    {
+        // Every MR is gone at this point, so the registry entries describing
+        // them have to go now — the republish below can still fail and return,
+        // and a stranded entry would refuse every later view of that huge
+        // page. Released before the dereg_err return above on purpose: there
+        // the MR may still be live and a retry has to find the widened base it
+        // must deregister.
+        std::lock_guard<std::mutex> lock(hugetlb_registry_mutex_);
+        hugetlb_registered_regions_.erase((uint64_t)mr_addr);
+        if (widened) hugepage_widen_aliases_.erase((uint64_t)addr);
+    }
+
     // Confirmed cleanup: report success so the engine erases its region
     // record and the same range can be registered again.
     if (metadata_missing) {
@@ -933,7 +1211,17 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             // pending record is kept: a later retry re-runs this path (the
             // MR cleanup above is then a no-op) and publishes again.
             int pub_rc = metadata_->updateLocalSegmentDesc();
-            if (pub_rc) return pub_rc;
+            if (pub_rc) {
+                // A widened registration has already dropped its alias above,
+                // so a retry cannot recognise it as ours on its own; seed the
+                // pending record the gate at the top of this function needs to
+                // reach this block again.
+                if (widened) {
+                    std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
+                    pending_dereg_.insert((uint64_t)addr);
+                }
+                return pub_rc;
+            }
         }
         std::lock_guard<std::mutex> lock(pending_dereg_mutex_);
         pending_dereg_.erase((uint64_t)addr);

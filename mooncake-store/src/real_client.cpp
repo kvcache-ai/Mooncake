@@ -4760,8 +4760,11 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     // segment. ShmHelper::allocate rounds the mapping up to hugepage
     // granularity, so the MR bounds must coincide with the mapping bounds;
     // otherwise madvise(MADV_DONTFORK) (active after ibv_fork_init) fails
-    // with EINVAL when the kernel has to split the hugetlb VMA. Sub-range
-    // registrations are not special-cased and behave exactly as before.
+    // with EINVAL when the kernel has to split the hugetlb VMA. An interior
+    // sub-range is passed through as given: the RDMA transport widens it to its
+    // enclosing huge pages itself (see
+    // RdmaTransport::registerLocalMemoryInternal), which also covers callers
+    // that never go through this function.
     // A zero-length request is left untouched so it keeps hitting the
     // existing length==0 rejection instead of being widened to the segment.
     size_t registration_size = size;

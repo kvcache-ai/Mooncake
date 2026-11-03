@@ -185,6 +185,15 @@ target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest
 # add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA
 # dev + metadata server
 
+# Registering a sub-view of a HugeTLB mapping through RdmaTransport: the
+# registration is widened to whole huge pages instead of failing with EINVAL.
+# Self-skips without an RDMA device or reserved hugepages.
+add_executable(rdma_hugetlb_subview_test
+               ${WORKSPACE}/rdma_hugetlb_subview_test.cpp)
+target_link_libraries(rdma_hugetlb_subview_test PUBLIC transfer_engine gtest)
+add_test(NAME rdma_hugetlb_subview_test COMMAND rdma_hugetlb_subview_test)
+set_tests_properties(rdma_hugetlb_subview_test PROPERTIES LABELS "rdma")
+
 if(USE_HIP)
   # Needs an AMD GPU, an RDMA NIC and the amdgpu peer-memory client.
   add_executable(rdma_hip_kfd_pin_test ${WORKSPACE}/rdma_hip_kfd_pin_test.cpp)
