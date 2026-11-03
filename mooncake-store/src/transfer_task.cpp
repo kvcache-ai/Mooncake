@@ -725,24 +725,23 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
     queue_cv_.notify_one();
 }
 
-namespace {
-
-// True when some op writes bytes that another op of the task reads or
-// writes, so the ops must run one after another. Zero-length ops touch
-// nothing. An op whose own source and destination overlap counts too, which
-// is conservative.
 bool MemcpyOperationsOverlap(const std::vector<MemcpyOperation>& operations) {
     struct Range {
         uintptr_t begin;
         uintptr_t end;
         bool written;
     };
+    constexpr uintptr_t kMaxAddress = std::numeric_limits<uintptr_t>::max();
     std::vector<Range> ranges;
     ranges.reserve(operations.size() * 2);
     for (const auto& op : operations) {
         if (op.size == 0) continue;
         const auto src = reinterpret_cast<uintptr_t>(op.src);
         const auto dst = reinterpret_cast<uintptr_t>(op.dest);
+        // A wrapped end would sort below its begin and hide an overlap, so
+        // such a range is never batched.
+        if (op.size > kMaxAddress - src || op.size > kMaxAddress - dst)
+            return true;
         ranges.push_back({src, src + op.size, false});
         ranges.push_back({dst, dst + op.size, true});
     }
@@ -762,8 +761,6 @@ bool MemcpyOperationsOverlap(const std::vector<MemcpyOperation>& operations) {
     }
     return false;
 }
-
-}  // namespace
 
 void MemcpyWorkerPool::workerThread() {
     VLOG(2) << "MemcpyWorkerPool worker thread started";
