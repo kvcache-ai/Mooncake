@@ -179,18 +179,18 @@ class LocalDiskRangedDiskLeaseTest
         std::filesystem::create_directories(tmp_dir_ / "master");
         std::filesystem::create_directories(tmp_dir_ / "offload");
 
-        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
-                                      .set_root_fs_dir((tmp_dir_ / "master").string())
-                                      .set_enable_offload(true)
-                                      .build()));
+        ASSERT_TRUE(
+            master_.Start(InProcMasterConfigBuilder()
+                              .set_root_fs_dir((tmp_dir_ / "master").string())
+                              .set_enable_offload(true)
+                              .build()));
         master_address_ = master_.master_address();
 
         client_ = RealClient::create();
-        ASSERT_EQ(client_->setup_real("localhost:17832", "P2PHANDSHAKE",
-                                      16 * 1024 * 1024, 16 * 1024 * 1024,
-                                      FLAGS_protocol, "", master_address_,
-                                      nullptr, "", true,
-                                      (tmp_dir_ / "offload").string()),
+        ASSERT_EQ(client_->setup_real(
+                      "localhost:17832", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                      16 * 1024 * 1024, FLAGS_protocol, "", master_address_,
+                      nullptr, "", true, (tmp_dir_ / "offload").string()),
                   0);
     }
 
