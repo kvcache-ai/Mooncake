@@ -28,7 +28,23 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
                  ${WORKSPACE}/adaptive_congestion_control_benchmark.cpp)
   target_link_libraries(adaptive_congestion_control_benchmark
                         PRIVATE adaptive_congestion_control_core)
+
+  add_executable(classic_rdma_congestion_control_test
+                 ${WORKSPACE}/classic_rdma_congestion_control_test.cpp)
+  target_link_libraries(classic_rdma_congestion_control_test
+                        PRIVATE transfer_engine gtest gtest_main)
+  add_test(NAME classic_rdma_congestion_control_test
+           COMMAND classic_rdma_congestion_control_test)
 endif()
+
+configure_file(installed_congestion_control_header_test.cmake.in
+               installed_congestion_control_header_test.cmake @ONLY)
+add_test(
+  NAME installed_congestion_control_header_test
+  COMMAND
+    ${CMAKE_COMMAND} -DTRANSFER_ENGINE_LIBRARY=$<TARGET_FILE:transfer_engine>
+    -P
+    ${CMAKE_CURRENT_BINARY_DIR}/installed_congestion_control_header_test.cmake)
 
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
@@ -77,6 +93,20 @@ target_link_libraries(flagcx_transport_internal_test PUBLIC gtest gtest_main)
 add_test(NAME flagcx_transport_internal_test
          COMMAND flagcx_transport_internal_test)
 
+if(WITH_METRICS)
+  add_executable(transfer_engine_metrics_test
+                 ${WORKSPACE}/transfer_engine_metrics_test.cpp)
+  target_link_libraries(transfer_engine_metrics_test PUBLIC transfer_engine
+                                                            gtest gtest_main)
+  add_test(NAME transfer_engine_metrics_test
+           COMMAND transfer_engine_metrics_test)
+
+  add_executable(metrics_exporter_test ${WORKSPACE}/metrics_exporter_test.cpp)
+  target_link_libraries(metrics_exporter_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+  add_test(NAME metrics_exporter_test COMMAND metrics_exporter_test)
+endif()
+
 add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
@@ -114,12 +144,16 @@ target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Control GID I/O and port-state queries so event recovery can be exercised
   # without an RDMA device.
+  if(BUILD_SHARED_LIBS)
+    # --wrap only rewrites calls in objects linked into this executable.
+    target_sources(worker_pool_rail_state_test
+                   PRIVATE $<TARGET_OBJECTS:rdma_transport>)
+  endif()
   target_link_options(
     worker_pool_rail_state_test
     PRIVATE
     "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
-    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state"
-  )
+    "-Wl,--wrap=_ZNK8mooncake11RdmaContext14queryPortStateEP14ibv_port_state")
 endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
@@ -150,6 +184,13 @@ target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 # add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA
 # dev + metadata server
+
+if(USE_HIP)
+  # Needs an AMD GPU, an RDMA NIC and the amdgpu peer-memory client.
+  add_executable(rdma_hip_kfd_pin_test ${WORKSPACE}/rdma_hip_kfd_pin_test.cpp)
+  target_link_libraries(rdma_hip_kfd_pin_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+endif()
 
 # Ctrl frame codec + sender credit ledger unit tests (no RDMA device required).
 add_executable(ctrl_frame_test ${WORKSPACE}/ctrl_frame_test.cpp)
@@ -227,6 +268,12 @@ if(USE_TCP)
 endif()
 
 if(USE_NVMEOF)
+  # cuFile entry points are faked by the executable; no GPU or SSD is needed.
+  add_executable(nvmeof_request_test ${WORKSPACE}/nvmeof_request_test.cpp)
+  target_link_libraries(nvmeof_request_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+  add_test(NAME nvmeof_request_test COMMAND nvmeof_request_test)
+
   add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
                                                   gtest_main)
@@ -287,8 +334,8 @@ target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 if(USE_CUDA AND NOT USE_HIP)
   # GPU sub-range export test (skipped at runtime without a CUDA device).
-  # WITH_NVIDIA_PEERMEM defaults to true, which selects ibv_reg_mr instead of
-  # the DMA-BUF export under test.
+  # On a host with a peer-memory module loaded the default is ibv_reg_mr;
+  # WITH_NVIDIA_PEERMEM=0 selects the DMA-BUF export under test either way.
   target_include_directories(dmabuf_export_test
                              PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(dmabuf_export_test PUBLIC CUDA::cudart)
@@ -351,6 +398,17 @@ if(USE_EFA)
                                                       gtest_main)
   add_test(NAME efa_select_device_test COMMAND efa_select_device_test)
 
+  add_executable(efa_discovery_test ${WORKSPACE}/efa_discovery_test.cpp)
+  target_link_libraries(efa_discovery_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+  add_test(NAME efa_discovery_test COMMAND efa_discovery_test)
+
+  add_executable(efa_stale_segment_desc_test
+                 ${WORKSPACE}/efa_stale_segment_desc_test.cpp)
+  target_link_libraries(efa_stale_segment_desc_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
+  add_test(NAME efa_stale_segment_desc_test COMMAND efa_stale_segment_desc_test)
+
   # Compiles the real EfaEndPoint source against the test-only
   # RPC/address-vector fakes in efa_endpoint_handshake_fakes/ (shadowed
   # efa_context.h via -iquote), so the endpoint locking and generation logic
@@ -373,6 +431,12 @@ if(USE_EFA)
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
   target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
   add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
+
+  add_executable(efa_remote_accessible_test
+                 ${WORKSPACE}/efa_remote_accessible_test.cpp)
+  target_link_libraries(efa_remote_accessible_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+  add_test(NAME efa_remote_accessible_test COMMAND efa_remote_accessible_test)
 
   add_executable(efa_single_nic_large_mr_test
                  ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
@@ -595,8 +659,8 @@ if(USE_ASCEND_DIRECT)
            COMMAND ascend_direct_transport_test)
 endif()
 
-# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
-if(ENABLE_MULTI_PROTOCOL)
+# This multi-protocol test directly uses CxlTransport and requires its backend.
+if(ENABLE_MULTI_PROTOCOL AND USE_CXL)
   add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
   target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main)

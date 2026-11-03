@@ -59,6 +59,7 @@
 #include <boost/intrusive/list.hpp>
 #include <glog/logging.h>
 
+#include "common/shrink_buckets.h"
 #include "common/transparent_string_hash.h"
 #include "metadata/group_index.h"
 #include "metadata/object_state.h"
@@ -252,6 +253,12 @@ inline void SlotHandle::reset() noexcept {
     std::unique_lock<std::shared_mutex> lock(stripe->lock);
     if (slot->state_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         stripe->slots.erase(stripe->slots.find(slot->key()));
+        // erase() never gives bucket memory back, so a stripe that once held
+        // far more slots than it does now would keep its high-water buckets
+        // for good. Rehashing moves no node, so the slots guards point at stay
+        // put; only map iterators, which a cursor holds under the shared
+        // stripe lock, are invalidated.
+        ShrinkBucketsIfSparse(stripe->slots);
     }
 }
 

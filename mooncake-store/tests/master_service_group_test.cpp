@@ -1,4 +1,5 @@
 #include "master_service_test_fixture.h"
+#include "metadata_store.h"
 #include "rpc_service.h"
 
 #include <glog/logging.h>
@@ -11,6 +12,132 @@
 #include <vector>
 
 namespace mooncake::test {
+
+TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPutAndUpsert) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    const std::string key = "affinity-upsert";
+    ReplicateConfig config;
+    config.residency_affinity_ids = std::vector<std::string>{"opaque-unit"};
+    config.session_ids = std::vector<std::string>{"write-session"};
+    ASSERT_TRUE(service.PutStart(context.client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(service.PutEnd(context.client_id, ObjectMeta{key, 0x1234},
+                               tenant, ReplicaType::MEMORY));
+    auto check = [&](uint64_t size) {
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_TRUE(accessor.Exists());
+        const auto& metadata = accessor.Get();
+        EXPECT_EQ("opaque-unit", metadata.residency_affinity_id);
+        EXPECT_EQ("write-session", metadata.session_id);
+        for (const auto& encoded :
+             {MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
+                  service, metadata),
+              MasterServiceTestPeer::
+                  SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
+                      service, metadata, {})}) {
+            auto payload = struct_pack::deserialize<MetadataPayload>(encoded);
+            ASSERT_TRUE(payload);
+            EXPECT_EQ(size, payload->size);
+            EXPECT_EQ("opaque-unit",
+                      payload->residency_affinity_id.value_or(""));
+            EXPECT_EQ("write-session", payload->session_id.value_or(""));
+            EXPECT_EQ(std::optional<uint64_t>(0x1234),
+                      payload->object_checksum);
+        }
+    };
+    check(1024);
+    for (uint64_t size : {1024, 2048}) {
+        auto conflicting = config;
+        conflicting.residency_affinity_ids =
+            std::vector<std::string>{"different-unit"};
+        auto rejected = service.UpsertStart(context.client_id, key, tenant,
+                                            size, conflicting);
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, rejected.error());
+        config.residency_affinity_ids.reset();
+        ASSERT_TRUE(
+            service.UpsertStart(context.client_id, key, tenant, size, config));
+        ASSERT_TRUE(service.UpsertEnd(context.client_id,
+                                      ObjectMeta{key, 0x1234}, tenant,
+                                      ReplicaType::MEMORY));
+        check(size);
+    }
+}
+
+TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPreemptedUpsertRetry) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    const std::string key = "affinity-upsert-retry";
+    ReplicateConfig config;
+    config.residency_affinity_ids = std::vector<std::string>{"opaque-unit"};
+    ASSERT_TRUE(service.PutStart(context.client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(
+        service.PutEnd(context.client_id, key, tenant, ReplicaType::MEMORY));
+    config.residency_affinity_ids.reset();
+    ASSERT_TRUE(
+        service.UpsertStart(context.client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(
+        service.UpsertStart(context.client_id, key, tenant, 1024, config));
+    ASSERT_TRUE(
+        service.UpsertEnd(context.client_id, key, tenant, ReplicaType::MEMORY));
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+    ASSERT_TRUE(accessor.Exists());
+    EXPECT_EQ("opaque-unit", accessor.Get().residency_affinity_id);
+}
+
+TEST_F(MasterServiceTest, ResidencyAffinityBatchOrderAndInvalidCounts) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto tenant = TenantId::Default();
+    const std::vector<std::string> keys{"affinity-a", "affinity-b"};
+    ReplicateConfig config;
+    config.residency_affinity_ids = std::vector<std::string>{"unit-a", ""};
+    auto starts = service.BatchUpsertStart(context.client_id, keys, tenant,
+                                           {1024, 1024}, config);
+    ASSERT_EQ(2u, starts.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(starts[i]);
+        ASSERT_TRUE(service.PutEnd(context.client_id, keys[i], tenant,
+                                   ReplicaType::MEMORY));
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant, keys[i]});
+        ASSERT_TRUE(accessor.Exists());
+        EXPECT_EQ(config.residency_affinity_ids->at(i),
+                  accessor.Get().residency_affinity_id);
+    }
+    auto upserts = service.BatchUpsertStart(context.client_id, keys, tenant,
+                                            {2048, 2048}, config);
+    ASSERT_EQ(2u, upserts.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(upserts[i]);
+        ASSERT_TRUE(service.UpsertEnd(context.client_id, keys[i], tenant,
+                                      ReplicaType::MEMORY));
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            &service, MasterServiceTestPeer::ObjectIdentity{tenant, keys[i]});
+        ASSERT_TRUE(accessor.Exists());
+        EXPECT_EQ(config.residency_affinity_ids->at(i),
+                  accessor.Get().residency_affinity_id);
+    }
+    config.residency_affinity_ids = std::vector<std::string>{"one"};
+    for (const auto& result : service.BatchUpsertStart(
+             context.client_id, keys, tenant, {1024, 1024}, config)) {
+        ASSERT_FALSE(result);
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    }
+    config.residency_affinity_ids = std::vector<std::string>{};
+    auto put = service.PutStart(context.client_id, "invalid-affinity", tenant,
+                                1024, config);
+    ASSERT_FALSE(put);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put.error());
+    auto upsert =
+        service.UpsertStart(context.client_id, keys[0], tenant, 1024, config);
+    ASSERT_FALSE(upsert);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert.error());
+}
 
 TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
     MasterService service;
@@ -106,7 +233,7 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
 
     const std::string key_a = "lease_group_key_a";
     const std::string key_b = "lease_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config_a;
     config_a.replica_num = 1;
@@ -147,7 +274,7 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
 
     const std::string safe_key = "grouped_mixed_safe_key";
     const std::string hard_pinned_key = "grouped_mixed_hard_pinned_key";
-    const std::string group_id = FindGroupIdOnDifferentShard(safe_key);
+    const std::string group_id = safe_key + "_group";
 
     ReplicateConfig safe_config;
     safe_config.replica_num = 1;
@@ -307,8 +434,9 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(keys[0]), "",
-                                 FindGroupIdOnDifferentShard(keys[2])};
+        std::vector<std::string>{keys[0] + "_group", "", keys[2] + "_group"};
+    config.residency_affinity_ids =
+        std::vector<std::string>{"unit-a", "", "unit-b"};
 
     auto results = service_.BatchPutStart(client_id, keys, sizes, config);
     ASSERT_EQ(results.size(), keys.size());
@@ -343,6 +471,15 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     ASSERT_EQ(invalid_size_results.size(), keys.size());
     for (const auto& result : invalid_size_results) {
         ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    }
+    invalid_config = config;
+    invalid_config.residency_affinity_ids = std::vector<std::string>{"one"};
+    auto invalid_affinity_results =
+        service_.BatchPutStart(client_id, keys, sizes, invalid_config);
+    ASSERT_EQ(invalid_affinity_results.size(), keys.size());
+    for (const auto& result : invalid_affinity_results) {
+        ASSERT_FALSE(result);
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
     }
 }
@@ -440,62 +577,6 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithLeaseActive) {
     ASSERT_TRUE(exist_result.value()) << "Key should still exist";
 }
 
-TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
-    // Route-decoupling invariant: object routing is a pure function of
-    // (tenant, key); the group_id is only a lifecycle annotation and never
-    // affects which metadata shard an object lands in. The group domain is
-    // keyed by scoped(tenant, group_id) and stores only the member key list.
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    // Two member keys that hash to different metadata shards, sharing one
-    // group whose id hashes to yet another shard. The default-tenant route is
-    // hash(key) % kNumShards (mirrors MasterService::getShardIndex).
-    constexpr size_t kMetadataShardCountForTest = 1024;
-    const std::string key_a = "route_decouple_key_a";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
-    std::string key_b = "route_decouple_key_b";
-    const size_t shard_a =
-        std::hash<std::string>{}(key_a) % kMetadataShardCountForTest;
-    size_t shard_b =
-        std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
-    for (int i = 0; i < 10000 && shard_b == shard_a; ++i) {
-        key_b = "route_decouple_key_b_" + std::to_string(i);
-        shard_b = std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
-    }
-    ASSERT_NE(shard_a, shard_b);  // members span metadata shards
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.group_ids = std::vector<std::string>{group_id};
-    PutCompletedObject(*service_, client_id, key_a, config);
-    PutCompletedObject(*service_, client_id, key_b, config);
-
-    // Both members are reachable purely through hash(tenant, key) routing,
-    // which is decoupled from the group domain.
-    EXPECT_TRUE(service_->ExistKey(key_a, TenantId::Default()).value_or(false));
-    EXPECT_TRUE(service_->ExistKey(key_b, TenantId::Default()).value_or(false));
-    EXPECT_TRUE(
-        service_->GetReplicaList(key_a, TenantId::Default()).has_value());
-    EXPECT_TRUE(
-        service_->GetReplicaList(key_b, TenantId::Default()).has_value());
-
-    // The group table still sees both members: group state is a separate,
-    // key-list-only domain.
-    auto members = GetGroupMemberKeysForTest(*service_, group_id);
-    EXPECT_EQ(2u, members.size());
-
-    // Route stability: the object route is hash(tenant, key) alone — grouping
-    // does not change it (identical to the ungrouped route computed before the
-    // objects existed), so a later ungrouped put of the same key would land on
-    // the same shard.
-    EXPECT_EQ(shard_a,
-              std::hash<std::string>{}(key_a) % kMetadataShardCountForTest);
-    EXPECT_EQ(shard_b,
-              std::hash<std::string>{}(key_b) % kMetadataShardCountForTest);
-}
-
 TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(200).build();
@@ -505,7 +586,7 @@ TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
 
     const std::string key_a = "lease_group_key_a";
     const std::string key_b = "lease_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config_a;
     config_a.replica_num = 1;
@@ -554,7 +635,7 @@ TEST_F(MasterServiceTest, GroupedMembershipChangeStillSharesGroupLeaseOnRead) {
 
     const std::string key_a = "lease_group_dirty_key_a";
     const std::string key_b = "lease_group_dirty_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -632,7 +713,7 @@ TEST_F(MasterServiceTest, GroupLeaseIsSharedAndExtendsOnMemberRead) {
 
     const std::string key_a = "group_lease_member_a";
     const std::string key_b = "group_lease_member_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = key_a + "_group";
 
     ReplicateConfig config;
     config.replica_num = 1;

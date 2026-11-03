@@ -73,14 +73,10 @@ class WeightReconciliationTest : public MasterServiceTest {
     void AssertStaleGroupMember(MasterService& service, const std::string& key,
                                 const std::string& group_id) {
         const auto tenant = TenantId::Default();
-        MasterServiceTestPeer::MetadataShardAccessorRO shard(
-            &service,
-            MasterServiceTestPeer(service).getShardIndex(tenant, key));
-        const auto tenant_it = shard->tenants.find(tenant);
-        ASSERT_NE(tenant_it, shard->tenants.end());
-        const auto member = tenant_it->second.metadata.find(key);
-        ASSERT_NE(member, tenant_it->second.metadata.end());
-        const auto& metadata = member->second.metadata;
+        const auto member = MasterServiceTestPeer::ReadObject(
+            service, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+        ASSERT_TRUE(member.has_value());
+        const auto& metadata = member->metadata();
         ASSERT_EQ(group_id, metadata.group_id);
         ASSERT_TRUE(metadata.HasReplica([](const Replica& replica) {
             return replica.is_memory_replica();

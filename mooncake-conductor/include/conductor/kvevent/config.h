@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,12 @@ namespace mooncake::conductor::kvevent {
 //  - *rpc_server_port is set from the file's rpc_server_port field;
 //    an absent field keeps the caller's incoming value (an explicit 0
 //    disables the RPC channel).
-std::vector<common::ServiceConfig> ParseConfig(int* http_server_port,
-                                               int* rpc_server_port);
+//  - *max_blocks_per_context (when non-null) is set from the file's
+//    max_blocks_per_context field; an absent field keeps the caller's
+//    incoming value, 0 disables capacity eviction, and a negative or
+//    non-integer value logs an error and exits(1).
+std::vector<common::ServiceConfig> ParseConfig(
+    int* http_server_port, int* rpc_server_port,
+    size_t* max_blocks_per_context = nullptr);
 
 }  // namespace mooncake::conductor::kvevent

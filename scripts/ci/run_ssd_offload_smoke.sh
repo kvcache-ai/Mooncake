@@ -16,8 +16,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Loopback only: the smoke's clients are colocated, and the server refuses an
+# unauthenticated non-loopback bind.
 ci_start_service metadata "$RUNNER_TEMP/mooncake-metadata.log" \
-  mooncake_http_metadata_server --port 8080
+  mooncake_http_metadata_server --host 127.0.0.1 --port 8080
 ci_wait_service metadata 8080
 
 mkdir -p /tmp/mooncake_ci_ssd_offload

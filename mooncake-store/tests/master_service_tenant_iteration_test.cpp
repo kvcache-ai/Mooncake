@@ -1,6 +1,6 @@
-// The tenant iteration primitives: VisitTenants names the tenants that hold
-// objects, a tenant cursor walks one tenant's objects, and the removes are
-// built on both.
+// The tenant iteration primitives: VisitNamespaces names the namespaces that
+// hold objects, a cursor of a namespace's route walks one tenant's objects,
+// and the removes are built on both.
 
 #include "master_service_test_fixture.h"
 
@@ -62,15 +62,30 @@ class TenantIterationTest : public MasterServiceTest {
         }
     }
 
+    // The tenant's namespace; null when it was never written to.
+    static const metadata::Namespace* NamespaceOf(MasterService& service,
+                                                  const TenantId& tenant_id) {
+        return MasterServiceTestPeer::Namespaces(service).Lookup(tenant_id);
+    }
+
     std::set<std::string> KeysOf(MasterService& service,
                                  const TenantId& tenant_id) {
         std::set<std::string> keys;
-        for (auto object :
-             MasterServiceTestPeer(service).ReadCursor(tenant_id)) {
+        const metadata::Namespace* ns = NamespaceOf(service, tenant_id);
+        if (ns == nullptr) {
+            return keys;
+        }
+        for (auto object : ns->objects.ReadCursor()) {
             EXPECT_TRUE(keys.insert(object.key()).second)
                 << "visited twice: " << object.key();
         }
         return keys;
+    }
+
+    std::vector<std::string> InFlightKeysOf(MasterService& service,
+                                            const TenantId& tenant_id) {
+        const metadata::Namespace* ns = NamespaceOf(service, tenant_id);
+        return ns == nullptr ? std::vector<std::string>{} : ns->InFlightKeys();
     }
 
     std::filesystem::path policy_path_;
@@ -78,7 +93,7 @@ class TenantIterationTest : public MasterServiceTest {
 
 }  // namespace
 
-TEST_F(TenantIterationTest, VisitTenantsNamesTenantsHoldingObjects) {
+TEST_F(TenantIterationTest, VisitNamespacesNamesTenantsHoldingObjects) {
     MasterService service(MultiTenantConfig());
     const auto context = PrepareSimpleSegment(service);
     PutKeys(service, context.client_id, kTenantA, "a", 3);
@@ -88,11 +103,12 @@ TEST_F(TenantIterationTest, VisitTenantsNamesTenantsHoldingObjects) {
     ASSERT_TRUE(service.Remove("c0", kTenantC).has_value());
 
     std::vector<TenantId> visited;
-    MasterServiceTestPeer(service).VisitTenants([&](const TenantId& tenant_id) {
-        visited.push_back(tenant_id);
-        // No lock is held: a write to the tenant's own keys goes through.
-        EXPECT_EQ(service.RemoveAll(tenant_id, /*force=*/true), 3);
-    });
+    MasterServiceTestPeer(service).VisitNamespaces(
+        [&](const TenantId& tenant_id, metadata::Namespace&) {
+            visited.push_back(tenant_id);
+            // No lock is held: a write to the tenant's own keys goes through.
+            EXPECT_EQ(service.RemoveAll(tenant_id, /*force=*/true), 3);
+        });
 
     EXPECT_EQ(std::set<TenantId>(visited.begin(), visited.end()),
               (std::set<TenantId>{kTenantA, kTenantB}));
@@ -114,72 +130,31 @@ TEST_F(TenantIterationTest, ReadCursorVisitsEachObjectOfItsTenantOnce) {
     EXPECT_TRUE(KeysOf(service, kTenantC).empty());
 
     // A ref taken by the walk names the publication it saw.
-    for (auto object : MasterServiceTestPeer(service).ReadCursor(kTenantA)) {
+    for (auto object : NamespaceOf(service, kTenantA)->objects.ReadCursor()) {
         EXPECT_EQ(object.ref().key, object.key());
         EXPECT_EQ(object.ref().generation, object.generation());
         EXPECT_EQ(object.metadata().user_key, object.key());
     }
 }
 
-TEST_F(TenantIterationTest, CursorSlicesTogetherVisitEachObjectOnce) {
-    MasterService service(MultiTenantConfig());
-    const auto context = PrepareSimpleSegment(service);
-    PutKeys(service, context.client_id, kTenantA, "a", 200);
-    PutKeys(service, context.client_id, kTenantB, "b", 5);
-
-    MasterServiceTestPeer peer(service);
-    for (const size_t count : {1, 3, 16}) {
-        std::set<std::string> keys;
-        for (size_t index = 0; index < count; ++index) {
-            for (auto object : peer.ReadCursor(
-                     kTenantA,
-                     MasterServiceTestPeer::CursorSlice{index, count})) {
-                EXPECT_TRUE(keys.insert(object.key()).second)
-                    << "visited twice: " << object.key();
-            }
-        }
-        EXPECT_EQ(keys, KeysOf(service, kTenantA)) << "count=" << count;
-    }
-}
-
-TEST_F(TenantIterationTest, LeavingACursorEarlyReleasesItsShard) {
+TEST_F(TenantIterationTest, LeavingACursorEarlyReleasesItsStripe) {
     MasterService service(MultiTenantConfig());
     const auto context = PrepareSimpleSegment(service);
     PutKeys(service, context.client_id, kTenantA, "a", 16);
 
     int seen = 0;
-    for (auto object : MasterServiceTestPeer(service).ReadCursor(kTenantA)) {
+    for (auto object : NamespaceOf(service, kTenantA)->objects.ReadCursor()) {
         (void)object;
         if (++seen == 3) {
             break;
         }
     }
     EXPECT_EQ(seen, 3);
-    // Every shard is free again, so writes to every key go through.
+    // Every stripe is free again, so writes to every key go through.
     for (int i = 0; i < 16; ++i) {
         EXPECT_TRUE(service.Remove("a" + std::to_string(i), kTenantA, true)
                         .has_value());
     }
-}
-
-TEST_F(TenantIterationTest, WriteCursorChangesStateInPlace) {
-    MasterService service(MultiTenantConfig());
-    const auto context = PrepareSimpleSegment(service);
-    PutKeys(service, context.client_id, kTenantA, "a", 8);
-
-    for (auto object : MasterServiceTestPeer(service).WriteCursor(kTenantA)) {
-        object.state().is_processing = true;
-    }
-    int processing = 0;
-    for (auto object : MasterServiceTestPeer(service).ReadCursor(kTenantA)) {
-        processing += object.state().is_processing ? 1 : 0;
-    }
-    EXPECT_EQ(processing, 8);
-
-    for (auto object : MasterServiceTestPeer(service).WriteCursor(kTenantA)) {
-        object.state().is_processing = false;
-    }
-    EXPECT_EQ(service.RemoveAll(kTenantA, /*force=*/true), 8);
 }
 
 TEST_F(TenantIterationTest, RemoveByRegexStaysInItsTenant) {
@@ -205,8 +180,10 @@ TEST_F(TenantIterationTest, RemoveAllWalksEveryTenant) {
 
     EXPECT_EQ(service.RemoveAll(/*force=*/true), 12);
     std::vector<TenantId> left;
-    MasterServiceTestPeer(service).VisitTenants(
-        [&](const TenantId& tenant_id) { left.push_back(tenant_id); });
+    MasterServiceTestPeer(service).VisitNamespaces(
+        [&](const TenantId& tenant_id, metadata::Namespace&) {
+            left.push_back(tenant_id);
+        });
     EXPECT_TRUE(left.empty());
 }
 
@@ -238,23 +215,23 @@ TEST_F(TenantIterationTest, InFlightKeysNameOnlyKeysWithWorkInFlight) {
     }
 
     MasterServiceTestPeer peer(service);
-    EXPECT_EQ(peer.InFlightKeys(kTenantA),
+    EXPECT_EQ(InFlightKeysOf(service, kTenantA),
               std::vector<std::string>{"pending_a"});
-    EXPECT_EQ(peer.InFlightKeys(kTenantB),
+    EXPECT_EQ(InFlightKeysOf(service, kTenantB),
               std::vector<std::string>{"pending_b"});
-    EXPECT_TRUE(peer.InFlightKeys(kTenantC).empty());
+    EXPECT_TRUE(InFlightKeysOf(service, kTenantC).empty());
 
     // The expiry sweep of one tenant leaves the others' writes alone.
     peer.DiscardExpiredProcessingReplicas(
         kTenantA, std::chrono::system_clock::time_point::max());
-    EXPECT_TRUE(peer.InFlightKeys(kTenantA).empty());
+    EXPECT_TRUE(InFlightKeysOf(service, kTenantA).empty());
     EXPECT_EQ(KeysOf(service, kTenantA),
               (std::set<std::string>{"done_0", "done_1", "done_2"}));
-    EXPECT_EQ(peer.InFlightKeys(kTenantB),
+    EXPECT_EQ(InFlightKeysOf(service, kTenantB),
               std::vector<std::string>{"pending_b"});
 }
 
-TEST_F(TenantIterationTest, MemoryEvictionCensusCoversEveryTenant) {
+TEST_F(TenantIterationTest, MemoryEvictionCoversEveryTenant) {
     auto config = MultiTenantConfig();
     config.default_kv_lease_ttl = 1;
     MasterService service(config);

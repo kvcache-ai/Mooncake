@@ -7,9 +7,9 @@
 namespace mooncake {
 namespace eviction {
 
-// Eviction counters in MasterMetricManager: success or failure of each
-// pool-wide run that had anything filed, and the bytes each tenant's runs
-// released.
+// Eviction counters in MasterMetricManager: the bytes each tenant's runs
+// released. A pool-wide run's success or failure is counted by its caller,
+// which may also have freed memory outside the run.
 class MetricsObserver final : public EvictionObserver {
    public:
     void OnRunEnd(const Scope& scope, const Report& report) override;

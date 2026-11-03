@@ -9,7 +9,7 @@
 // then comes back to the objects the policy deferred while the namespace is
 // short of its share of the minimum. What one namespace cannot give up is not
 // made up by another, so each namespace's outcome is told by its own objects
-// alone. With one namespace this is BatchEvict's order today.
+// alone.
 //
 // The evictor runs the loop and keeps its invariants; what varies is
 // injected:
@@ -24,8 +24,9 @@
 // run out, is left alone; a group, which the index hands out as one entry,
 // goes by its shared lease, its members judged one at a time under their own
 // locks; an object reclaiming left with nothing valid is torn down under the
-// lock it was reclaimed under. The fallback comes back to each deferred object
-// on its own.
+// lock it was reclaimed under. The fallback comes back to the objects one
+// entry deferred together and asks whether the goal is met only between
+// entries, so it never stops halfway through a group's deferred members.
 //
 // Locks: the evictor holds at most one key lock at a time and no lock of its
 // own, and frees the replicas it took only once that key lock is let go. What

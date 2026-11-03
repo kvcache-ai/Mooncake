@@ -16,6 +16,7 @@
 #ifndef TRANSFER_EXECUTOR_BASE_H
 #define TRANSFER_EXECUTOR_BASE_H
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -78,6 +79,10 @@ class TransferExecutorBase {
         const std::vector<Transport::Slice*>& slice_list) = 0;
 
     void processSliceList(const std::vector<Transport::Slice*>& slice_list);
+
+    // Forwards to LocalCopyEngine::SetTaskRunner.
+    void setLocalCopyTaskRunner(
+        std::function<void(std::function<void()>)> runner);
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
                     bool use_buffer_pool, bool remote_accessible);

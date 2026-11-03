@@ -186,6 +186,9 @@ class RealClient : public PyClient {
      * @param all_buffers Vector of vectors of pointers to the pre-allocated
      * buffers
      * @param all_sizes Vector of vectors of sizes of the buffers
+     * @param prefer_alloc_in_same_node Group exact-size memory replicas on
+     * one segment into one transfer. A size mismatch stays on the per-key
+     * path. Ascend and ascend_direct group even when this flag is false.
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
      * @note The buffer addresses must resolve to Store-managed registered
@@ -196,7 +199,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -767,7 +770,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_alloc_in_same_node);
 
     // Demand-side kick, shared by all get paths: a get headed for LOCAL_DISK
     // fires one promotion attempt for those keys (best-effort, non-blocking,
@@ -925,6 +928,13 @@ class RealClient : public PyClient {
     batch_get_offload_object(const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
 
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_offload_object_ranges(const std::vector<std::string> &keys,
+                                    const std::vector<int64_t> &offsets,
+                                    const std::vector<int64_t> &sizes,
+                                    const std::vector<int64_t> &object_sizes);
+
     /**
      * @brief Releases buffer associated with a specific batch_id.
      * Called by remote client after transfer completion.
@@ -967,7 +977,7 @@ class RealClient : public PyClient {
      */
     struct OffloadReadRange {
         uint64_t source_offset;
-        int64_t restore_size;
+        int64_t object_size;
     };
 
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
@@ -989,7 +999,9 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<int64_t> &restore_sizes,
         const std::unordered_map<std::string, std::vector<Slice>> &objects,
-        bool allow_pinned = true);
+        bool allow_pinned = true,
+        const std::vector<int64_t> *value_offsets = nullptr,
+        const std::vector<int64_t> *object_sizes = nullptr);
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -1366,6 +1378,8 @@ class RealClient : public PyClient {
         std::vector<std::string> object_keys;
         std::vector<QueryResult> cached_query_results;
         std::unordered_map<std::string, std::vector<Slice>> object_slices;
+        std::unordered_map<std::string, uint64_t> window_offsets;
+        std::unordered_map<std::string, uint64_t> window_lengths;
     };
 
     bool validate_session_range_batch_arguments(
@@ -1409,12 +1423,12 @@ class RealClient : public PyClient {
         std::vector<int> &results);
 
     tl::expected<void, ErrorCode> scatter_session_range_read(
-        const SessionRangeReadRequest &request,
-        const void *staging_buffer) const;
+        const SessionRangeReadRequest &request, const void *staging_buffer,
+        uint64_t window_offset) const;
 
     void complete_staged_session_range_read(
         const SessionRangeReadRequest &request, const void *staging_buffer,
-        std::vector<int> &results);
+        uint64_t window_offset, std::vector<int> &results);
 
     bool invalidate_expired_get_session(const SessionRangeReadRequest &request,
                                         std::vector<int> &results);
@@ -1441,6 +1455,7 @@ class RealClient : public PyClient {
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;
+    friend class RangedDiskLeaseTest;
 
     bool can_use_direct_memory_read(const Replica::Descriptor &replica,
                                     void *buffer, size_t size) const;
