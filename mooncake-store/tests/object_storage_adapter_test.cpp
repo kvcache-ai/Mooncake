@@ -229,7 +229,7 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     EXPECT_EQ(adapter->init_calls, 1);
 }
 
-TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRejectsDfsRequests) {
+TEST_F(ObjectStorageAdapterTest, ObjectStorageModeValidatesDfsRequests) {
     FakeObjectStorageAdapter* adapter = nullptr;
     auto backend = MakeObjectStorageBackend(adapter);
     ASSERT_TRUE(backend->Init());
@@ -237,12 +237,12 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRejectsDfsRequests) {
     auto write_results = backend->BatchWrite({DfsWriteRequest{}});
     ASSERT_EQ(write_results.size(), 1);
     ASSERT_FALSE(write_results.front());
-    EXPECT_EQ(write_results.front().error(), ErrorCode::NOT_SUPPORTED);
+    EXPECT_EQ(write_results.front().error(), ErrorCode::INVALID_PARAMS);
 
     auto read_results = backend->BatchRead({DfsReadRequest{}});
     ASSERT_EQ(read_results.size(), 1);
     ASSERT_FALSE(read_results.front());
-    EXPECT_EQ(read_results.front().error(), ErrorCode::NOT_SUPPORTED);
+    EXPECT_EQ(read_results.front().error(), ErrorCode::INVALID_PARAMS);
 }
 
 TEST_F(ObjectStorageAdapterTest, ObjectStorageModeRunsEnabledHealthCheck) {
