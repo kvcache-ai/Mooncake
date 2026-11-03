@@ -130,9 +130,9 @@ Status NVLinkTransport::install(std::string& local_segment_name,
     conf_ = conf;
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
     installed_ = true;
-    // Copies below this size run as a blocking cudaMemcpy instead of the
-    // async stream + completion-event pipeline (see startTransfer). KiB
-    // units; 0 disables the sync fast path.
+    // Copies below this size are waited for with a stream synchronize instead
+    // of the completion-event pipeline (see startTransfer). KiB units; 0
+    // disables the sync fast path.
     async_memcpy_threshold_ =
         conf_->get("transports/nvlink/async_memcpy_threshold", 2048) * 1024;
     host_register_ = conf_->get("transports/nvlink/host_register", false);
@@ -286,10 +286,10 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                                     NVLinkSubBatch* batch) {
     if (tasks.empty()) return;
 
-    // A single small copy completes faster with a blocking cudaMemcpy than
-    // with the async stream + completion-event pipeline: the sync call
-    // returns already-completed and saves the fixed event record/poll
-    // notification latency, while the copy itself runs at the same speed.
+    // A single small copy completes faster when it is waited for in place
+    // than through the completion-event pipeline: synchronizing the stream
+    // saves the fixed event record/poll notification latency, while the copy
+    // itself runs at the same speed.
     // Only single-task batches take this path: batched submissions amortize
     // the per-copy submit cost across tasks, and blocking copies serialize
     // inside the driver under concurrency, so multi-task batches and sizes
@@ -323,8 +323,28 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                 return;
             }
         }
-        auto err =
-            cudaMemcpy(dst, src, task->request.length, cudaMemcpyDefault);
+        // Copy on the batch's own non-blocking stream and wait for that
+        // stream. A plain cudaMemcpy would also run on the legacy default
+        // stream, but for device-to-device copies it returns before the copy
+        // has run. The event recorded on the legacy stream keeps the
+        // ordering that cudaMemcpy gave: the copy still starts after the
+        // work already queued on the legacy stream and on every blocking
+        // stream of this device, e.g. a producer that wrote the source.
+        cudaStream_t stream = batch->async_stream.get();
+        int copy_device = 0;
+        auto err = cudaGetDevice(&copy_device);
+        cudaEvent_t queued = nullptr;
+        if (err == cudaSuccess) {
+            queued = tl_caller_sync_events.getOrCreate(copy_device);
+            if (!queued) err = cudaErrorMemoryAllocation;
+        }
+        if (err == cudaSuccess) err = cudaEventRecord(queued, cudaStreamLegacy);
+        if (err == cudaSuccess) err = cudaStreamWaitEvent(stream, queued, 0);
+        if (err == cudaSuccess) {
+            err = cudaMemcpyAsync(dst, src, task->request.length,
+                                  cudaMemcpyDefault, stream);
+        }
+        if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
         if (saved_device >= 0 && saved_device != batch->stream_device_id) {
             cudaSetDevice(saved_device);
         }
@@ -332,7 +352,7 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
             task->transferred_bytes = task->request.length;
             task->status_word = TransferStatusEnum::COMPLETED;
         } else {
-            LOG(ERROR) << "NVLinkTransport: synchronous cudaMemcpy failed: "
+            LOG(ERROR) << "NVLinkTransport: synchronous copy failed: "
                        << cudaGetErrorString(err);
             task->status_word = TransferStatusEnum::FAILED;
         }
