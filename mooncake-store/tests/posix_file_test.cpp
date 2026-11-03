@@ -5,6 +5,8 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
@@ -22,6 +24,7 @@
 #include <vector>
 #include "file_interface.h"
 #include "../src/uring_submit.h"
+#include "../src/uring_test_hooks.h"
 #ifdef USE_URING
 #include <liburing.h>
 #endif
@@ -665,6 +668,84 @@ TEST_F(PosixFileTest, UringReregistrationAtSameAddressReachesNewPages) {
     EXPECT_TRUE(ok) << "the read must land in the new pages";
     EXPECT_TRUE(fixed) << "the worker should re-clone the new registration";
     UringFile::unregister_global_buffer();
+}
+
+// A ring replaced by I/O error recovery must clone the current registration
+// again, not stay on unfixed I/O because the old ring already tried it.
+TEST_F(PosixFileTest, UringResetRingReclonesTheRegistration) {
+    if (!uringCanCloneBuffers()) {
+        GTEST_SKIP() << "io_uring cannot clone buffers here";
+    }
+    if (UringRemappableBuffer::memlockTooSmall()) {
+        GTEST_SKIP() << "RLIMIT_MEMLOCK too small to pin "
+                     << UringRemappableBuffer::kLen << " bytes";
+    }
+    writeBlocks(test_fd, "AB");
+    UringRemappableBuffer buffer;
+    ASSERT_TRUE(buffer.map());
+    ASSERT_TRUE(UringFile::register_global_buffer(buffer.base(),
+                                                  UringRemappableBuffer::kLen));
+
+    RingWorker worker;
+    bool ok = false, fixed = false;
+    worker.run([&] {
+        ok = uringReadBlock(test_fd, test_filename, buffer.base(), 0, 'A',
+                            &fixed);
+    });
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(fixed);
+
+    worker.run([&] {
+        uring_testing::reset_thread_ring();
+        ok = uringReadBlock(test_fd, test_filename,
+                            buffer.base() + UringRemappableBuffer::kBlock, 1,
+                            'B', &fixed);
+    });
+    EXPECT_TRUE(ok);
+    EXPECT_TRUE(fixed) << "the replacement ring should clone the buffer again";
+    UringFile::unregister_global_buffer();
+}
+
+// An unregister that races with a thread exiting must not return while that
+// thread's clone still pins the buffer. The hook holds the exiting ring at the
+// point where a concurrent unregister can reach it.
+TEST_F(PosixFileTest, UringUnregisterWaitsForAnExitingThreadsClone) {
+    if (!uringCanCloneBuffers()) {
+        GTEST_SKIP() << "io_uring cannot clone buffers here";
+    }
+    if (UringRemappableBuffer::memlockTooSmall()) {
+        GTEST_SKIP() << "RLIMIT_MEMLOCK too small to pin "
+                     << UringRemappableBuffer::kLen << " bytes";
+    }
+    writeBlocks(test_fd, "A");
+    UringRemappableBuffer buffer;
+    ASSERT_TRUE(buffer.map());
+    const long pinned_before = pinnedKib();
+    ASSERT_TRUE(UringFile::register_global_buffer(buffer.base(),
+                                                  UringRemappableBuffer::kLen));
+
+    std::atomic<bool> exiting{false};
+    std::atomic<bool> hooked{false};
+    uring_testing::set_ring_exit_hook([&] {
+        if (hooked.exchange(true)) return;
+        exiting = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    bool ok = false, fixed = false;
+    std::thread reader([&] {
+        ok = uringReadBlock(test_fd, test_filename, buffer.base(), 0, 'A',
+                            &fixed);
+    });
+    while (!exiting) std::this_thread::yield();
+    UringFile::unregister_global_buffer();
+    const long pinned_after = pinnedKib();
+    reader.join();
+    uring_testing::set_ring_exit_hook(nullptr);
+
+    EXPECT_TRUE(ok);
+    EXPECT_TRUE(fixed);
+    EXPECT_LE(pinned_after, pinned_before)
+        << "unregister returned while the exiting thread's clone was pinned";
 }
 
 TEST_F(PosixFileTest, UringBatchReadReportsShortReadPerRequest) {

@@ -7,6 +7,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -22,6 +23,7 @@
 
 #include "file_interface.h"
 #include "uring_submit.h"
+#include "uring_test_hooks.h"
 
 namespace mooncake {
 
@@ -79,6 +81,10 @@ struct RingRegistry {
 static RingRegistry& ring_registry() {
     static auto* registry = new RingRegistry;
     return *registry;
+}
+static std::function<void()>& ring_exit_hook() {
+    static auto* hook = new std::function<void()>;
+    return *hook;
 }
 static void revoke_cloned_buffers_locked();
 
@@ -345,6 +351,8 @@ class SharedUringRing {
     }
 
    private:
+    friend void uring_testing::reset_thread_ring();
+
     // -----------------------------------------------------------------
     // Construction / destruction
     // -----------------------------------------------------------------
@@ -357,7 +365,18 @@ class SharedUringRing {
     }
 
     ~SharedUringRing() {
+        // Drop the clone and leave the registry in one step under the source
+        // lock. A concurrent release_source_registration() then either finds
+        // the ring and revokes the clone itself, or runs after the clone is
+        // gone, so an unregister never returns while an exiting thread's
+        // clone still pins the buffer.
         {
+            std::lock_guard<std::mutex> source_lock(g_buf.source_mu);
+            if (auto& hook = ring_exit_hook(); hook) hook();
+            if (clone_live_) {
+                io_uring_unregister_buffers(&ring_);
+                clone_live_ = false;
+            }
             auto& registry = ring_registry();
             std::lock_guard<std::mutex> lock(registry.mu);
             registry.rings.erase(this);
@@ -411,6 +430,9 @@ class SharedUringRing {
 
     void reset_ring() {
         shutdown_ring();
+        // The new ring has no buffer table yet, so let it clone the current
+        // registration instead of treating it as already tried.
+        attempted_generation_ = UINT64_MAX;
         if (!initialize_ring()) {
             LOG(ERROR) << "[SharedUringRing] failed to recover io_uring";
         }
@@ -756,6 +778,13 @@ class SharedUringRing {
     // another thread.
     bool clone_live_ = false;
 };
+
+namespace uring_testing {
+void reset_thread_ring() { SharedUringRing::instance().reset_ring(); }
+void set_ring_exit_hook(std::function<void()> hook) {
+    ring_exit_hook() = std::move(hook);
+}
+}  // namespace uring_testing
 
 static void revoke_cloned_buffers_locked() {
     auto& registry = ring_registry();
