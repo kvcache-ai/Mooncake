@@ -662,7 +662,7 @@ jobs:
 
   build-wheel-xpu:
     needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.xpu == 'true'
+    if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_xpu.yml
 
   tent-ci:
@@ -1053,6 +1053,7 @@ jobs:
             ${{ needs.build-wheel-cu13-arm64.result }}
             ${{ needs.build-wheel-efa.result }}
             ${{ needs.build-wheel-rocm.result }}
+            ${{ needs.build-wheel-xpu.result }}
         run: |
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1
