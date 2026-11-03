@@ -80,6 +80,17 @@ if(BUILD_UNIT_TESTS)
     target_include_directories(tebench_tent_config_test
                                PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME tebench_tent_config_test COMMAND tebench_tent_config_test)
+
+    add_executable(
+      tebench_tent_teardown_test tests/tent_teardown_test.cpp tent_backend.cpp
+                                 split_output.cpp utils.cpp)
+    target_link_libraries(
+      tebench_tent_teardown_test
+      PRIVATE $<TARGET_PROPERTY:tebench,LINK_LIBRARIES> gtest gtest_main)
+    target_include_directories(tebench_tent_teardown_test
+                               PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tebench_tent_teardown_test COMMAND tebench_tent_teardown_test)
+    set_tests_properties(tebench_tent_teardown_test PROPERTIES TIMEOUT 30)
   endif()
 
   if(USE_MLU)
@@ -95,9 +106,9 @@ if(BUILD_UNIT_TESTS)
 
   if(USE_XPU)
     add_executable(tebench_xpu_data_test tests/xpu_data_test.cpp utils.cpp)
-    target_link_libraries(tebench_xpu_data_test PRIVATE transfer_engine
-                                                        tent_link_group gtest
-                                                        gtest_main)
+    target_link_libraries(
+      tebench_xpu_data_test PRIVATE transfer_engine tent_link_group gtest
+                                    gtest_main)
     target_include_directories(tebench_xpu_data_test
                                PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME tebench_xpu_data_test COMMAND tebench_xpu_data_test)
