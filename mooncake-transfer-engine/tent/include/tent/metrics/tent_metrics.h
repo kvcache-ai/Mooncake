@@ -17,6 +17,8 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -67,6 +69,13 @@ class TentMetrics {
    public:
     static TentMetrics& instance();
 
+    // Build-time capability query for embedders and diagnostics. A build with
+    // metrics compiled out has no HTTP endpoint, so this must remain available
+    // in both the enabled implementation and the no-op stub.
+    static constexpr bool isCompiledIn() noexcept {
+        return TENT_METRICS_ENABLED != 0;
+    }
+
     // Initialize with configuration and start HTTP server
     Status initialize(const MetricsConfig& config);
 
@@ -91,21 +100,31 @@ class TentMetrics {
                               double latency_seconds = 0.0);
     void recordReadFailed(TransportType tp);
     void recordWriteFailed(TransportType tp);
+
+    // Lossless logical-request accounting. A successful start returns true
+    // and must be paired with exactly one finish, even if runtime recording is
+    // disabled while the request is in flight. These methods only touch cells
+    // pre-resolved during initialize(), so the transfer path never allocates
+    // or takes a metrics lock.
+    bool recordLogicalRequestStarted(Request::OpCode operation) noexcept;
+    void recordLogicalRequestFinished(Request::OpCode operation,
+                                      TransferStatusEnum status) noexcept;
     // Failover counter is labeled with both the source and destination
     // transport types so failover flows (e.g. rdma->tcp) are queryable.
     void recordTransportFailover(TransportType from, TransportType to);
 
     // Record physical transport attempts separately from logical requests.
     // "Started" means the engine is about to call submitTransferTasks (or the
-    // staging equivalent). "Finished" records the observed attempt duration
-    // and, for a FAILED status (including synchronous submit failure),
-    // increments the attempt-failure counter.
-    void recordTransportAttemptStarted(TransportType tp,
-                                       Request::OpCode operation);
+    // staging equivalent). "Finished" records exactly one bounded terminal
+    // outcome and the observed attempt duration. FAILED outcomes (including
+    // synchronous submit failures) also increment the compatibility
+    // attempt-failure counter.
+    bool recordTransportAttemptStarted(TransportType tp,
+                                       Request::OpCode operation) noexcept;
     void recordTransportAttemptFinished(TransportType tp,
                                         Request::OpCode operation,
                                         TransferStatusEnum status,
-                                        double latency_us);
+                                        double latency_us) noexcept;
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
     // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
@@ -191,6 +210,30 @@ class TentMetrics {
     std::atomic<uint16_t> bound_http_port_{0};
 
 #if TENT_METRICS_ENABLED
+    friend class TentMetricsTestPeer;
+
+    // Published only after every bounded accounting label has a resolved
+    // cell. initialize() marks initialized_ before registration to serialize
+    // concurrent initializers, so accounting starts need this separate ready
+    // barrier to avoid pairing a dropped early start with a later finish.
+    std::atomic<bool> accounting_ready_{false};
+
+    static constexpr size_t kSerializationFormatCount = 2;
+    static constexpr size_t kPrometheusFormat = 0;
+    static constexpr size_t kJsonFormat = 1;
+
+    // Metrics about the metrics pipeline itself. They deliberately live in
+    // plain atomics instead of the ylt registry so they are always emitted,
+    // including while runtime recording is disabled or before any transfer
+    // metric has received a sample.
+    std::atomic<uint64_t> http_start_failures_{0};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        serialization_attempts_{{0, 0}};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        serialization_failures_{{0, 0}};
+    std::array<std::atomic<uint64_t>, kSerializationFormatCount>
+        last_serialization_success_timestamp_seconds_{{0, 0}};
+
     // Initialize and start the HTTP server on the configured port. Port
     // assignment is deterministic: co-located ranks are expected to be given
     // distinct ports explicitly (e.g. base_port + local_rank) rather than
@@ -201,6 +244,19 @@ class TentMetrics {
     // Register the /metrics, /metrics/summary, /metrics/json and /health
     // endpoints on the current http_server_ instance.
     void registerHttpHandlers();
+
+    // Build an endpoint response and report whether serialization succeeded.
+    // The public string-returning methods retain their existing API, while the
+    // HTTP handlers use the boolean result to return 5xx on failure.
+    bool tryGetPrometheusMetrics(std::string& result);
+    bool tryGetJsonMetrics(std::string& result);
+
+    // Apply common attempt/failure/last-success accounting around both output
+    // formats. Kept off the transfer hot path; this runs only on scrape or
+    // direct serialization requests.
+    bool serializeWithAccounting(
+        size_t format, std::string& result,
+        const std::function<void(std::string&, uint64_t)>& serializer);
 
     // HTTP server for metrics endpoint
     std::unique_ptr<coro_http::coro_http_server> http_server_;
@@ -224,6 +280,11 @@ class TentMetrics {
                                                                    "to"};
     static inline const std::array<std::string, 2> kAttemptLabels{"transport",
                                                                   "operation"};
+    static inline const std::array<std::string, 1> kOperationLabel{"operation"};
+    static inline const std::array<std::string, 2> kLogicalOutcomeLabels{
+        "operation", "outcome"};
+    static inline const std::array<std::string, 3> kAttemptOutcomeLabels{
+        "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
 
@@ -233,7 +294,13 @@ class TentMetrics {
     // the 2-valued Request::OpCode.
     static constexpr size_t kTransportDomain =
         static_cast<size_t>(kNumTransportTypes);
+    static constexpr size_t kOperationDomain = 2;
     static constexpr size_t kAttemptDomain = kTransportDomain * 2;
+    static constexpr size_t kOutcomeValueDomain = 4;
+    static constexpr size_t kLogicalOutcomeDomain =
+        kOperationDomain * kOutcomeValueDomain;
+    static constexpr size_t kAttemptOutcomeDomain =
+        kAttemptDomain * kOutcomeValueDomain;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
 
     // Stable slot indices into the cached-cell label domain.
@@ -242,6 +309,21 @@ class TentMetrics {
     }
     static size_t attemptSlot(TransportType tp, Request::OpCode op) {
         return static_cast<size_t>(tp) * 2 + (op == Request::READ ? 0u : 1u);
+    }
+    static size_t operationSlot(Request::OpCode operation) {
+        return operation == Request::READ ? 0u : 1u;
+    }
+    static size_t outcomeIndex(TransferStatusEnum status) noexcept;
+    static size_t logicalOutcomeSlot(Request::OpCode operation,
+                                     TransferStatusEnum status) noexcept {
+        return operationSlot(operation) * kOutcomeValueDomain +
+               outcomeIndex(status);
+    }
+    static size_t attemptOutcomeSlot(TransportType tp,
+                                     Request::OpCode operation,
+                                     TransferStatusEnum status) noexcept {
+        return attemptSlot(tp, operation) * kOutcomeValueDomain +
+               outcomeIndex(status);
     }
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
@@ -279,6 +361,18 @@ class TentMetrics {
         "tent_transport_attempt_failures_total",
         "Physical transport attempts that terminated with FAILED",
         kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_started_total_{
+        "tent_logical_requests_started_total",
+        "Accepted logical requests by operation", kOperationLabel,
+        kOperationDomain};
+    metrics::CachedDynamicCounter<2> logical_request_outcomes_total_{
+        "tent_logical_request_outcomes_total",
+        "Terminal logical request outcomes", kLogicalOutcomeLabels,
+        kLogicalOutcomeDomain};
+    metrics::CachedDynamicCounter<3> transport_attempt_outcomes_total_{
+        "tent_transport_attempt_outcomes_total",
+        "Terminal physical transport attempt outcomes", kAttemptOutcomeLabels,
+        kAttemptOutcomeDomain};
     // Task-level failures with a reason label, so Grafana can alert on the
     // failure signature (submit vs poll vs timeout vs canceled) without log
     // scraping. Additive to the legacy read/write_failures_total counters.
@@ -304,6 +398,10 @@ class TentMetrics {
         "tent_inflight_attempts",
         "In-flight transport attempts (submitted, not yet finished)",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> logical_requests_inflight_{
+        "tent_logical_requests_inflight",
+        "Accepted logical requests without a terminal outcome", kOperationLabel,
+        kOperationDomain};
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
@@ -376,8 +474,20 @@ class TentMetrics {
     void serializeGaugePrometheus(metrics::CachedDynamicCounter<1>& gauge,
                                   std::string& out) const;
 
+    // Append the fixed single-series metrics-pipeline state plus the
+    // two-valued serialization format series. `prometheus_success_timestamp`
+    // is the timestamp for the scrape currently being built, so the response
+    // reports its own successful serialization rather than lagging one scrape.
+    void appendSelfMetricsPrometheus(
+        std::string& out, uint64_t prometheus_success_timestamp) const;
+
     // Helper to register all metrics to the vectors
     void registerMetrics();
+
+    // Resolve the complete bounded label domain before any request can record
+    // accounting. The hot path then consists only of atomic pointer loads and
+    // relaxed additions; a missing cell drops the sample.
+    void preResolveAccountingMetrics();
 
     // Serialize a single histogram in Prometheus text format. Walks the same
     // bucket-counter / sum-counter data the JSON path uses, so the two

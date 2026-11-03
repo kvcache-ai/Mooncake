@@ -123,6 +123,10 @@ option(
   USE_XPU
   "option for enabling Intel XPU (oneAPI SYCL) staging support in TENT; this is a direct-link (native) build that requires USE_TENT and the Intel DPC++ compiler (icpx / IntelLLVM) at build time -- there is no dlopen shim"
   OFF)
+option(
+  USE_XPU_GDS
+  "GDS on Intel XPU through a cuFile-compatible library (cufile.h + libcufile.so)"
+  OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
 option(USE_FABRIC
@@ -155,9 +159,36 @@ if(USE_EFA)
 
   include_directories(${LIBFABRIC_INCLUDE_DIR})
   add_compile_definitions(USE_EFA)
+
+  # AWS Neuron device memory needs both the FI_HMEM_NEURON enumerator and
+  # fi_mr_attr::device.neuron, which arrive together and are absent from older
+  # libfabric -- including distro packages such as Ubuntu 22.04's libfabric-dev.
+  # Probed rather than gated on a version so that a build against any libfabric
+  # keeps working; when it is missing, efa_neuron.cpp reports Neuron as
+  # unsupported instead of registering its HBM as host memory.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${LIBFABRIC_INCLUDE_DIR})
+  check_cxx_source_compiles(
+    "
+    #include <rdma/fabric.h>
+    #include <rdma/fi_domain.h>
+    int main() {
+      struct fi_mr_attr attr = {};
+      attr.iface = FI_HMEM_NEURON;
+      attr.device.neuron = 0;
+      return 0;
+    }
+    "
+    MOONCAKE_HAVE_FI_HMEM_NEURON)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(MOONCAKE_HAVE_FI_HMEM_NEURON)
+    add_compile_definitions(MOONCAKE_HAVE_FI_HMEM_NEURON)
+  endif()
+
   message(STATUS "AWS EFA (libfabric) transport is enabled")
   message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
   message(STATUS "  libfabric is loaded at runtime (dlopen)")
+  message(STATUS "  Neuron (FI_HMEM_NEURON): ${MOONCAKE_HAVE_FI_HMEM_NEURON}")
 endif()
 if(USE_CXI)
   # Find libfabric headers and library; default to AWS EFA installer path
@@ -327,13 +358,15 @@ if(USE_TPU)
 endif()
 
 if(USE_XPU)
-  # Every XPU source file lives under mooncake-transfer-engine/tent, which is
-  # only added when USE_TENT is ON. Without this guard -DUSE_XPU=ON configures
-  # and builds cleanly while compiling no XPU code at all.
-  if(NOT USE_TENT)
+  # XPU sources live under mooncake-transfer-engine/tent and mooncake-ep, which
+  # are only added when USE_TENT or WITH_EP is ON. Without this guard
+  # -DUSE_XPU=ON configures and builds cleanly while compiling no XPU code. An
+  # EP build without TENT must also leave out the Store; the top-level
+  # CMakeLists.txt checks that once WITH_STORE is defined.
+  if(NOT USE_TENT AND NOT WITH_EP)
     message(
       FATAL_ERROR
-        "USE_XPU=ON requires USE_TENT=ON: all XPU support lives in TENT. Re-run cmake with -DUSE_TENT=ON."
+        "USE_XPU=ON requires USE_TENT=ON (Transfer Engine) or WITH_EP=ON (Mooncake EP). Re-run cmake with either."
     )
   endif()
   # The XPU platform links oneAPI SYCL directly (native / direct-link): its
@@ -352,6 +385,26 @@ if(USE_XPU)
   add_compile_definitions(USE_XPU)
   message(
     STATUS "Intel XPU (oneAPI SYCL, direct-link) staging support is enabled")
+endif()
+
+if(USE_XPU_GDS)
+  # The GDS transport links libcufile.so; with USE_XPU_GDS it must come from a
+  # cuFile-compatible library for Intel XPU (for example Intel xFile) instead of
+  # NVIDIA GDS. A process can load only one libcufile.so, so the two GDS
+  # flavours are mutually exclusive.
+  if(NOT USE_XPU)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON requires USE_XPU=ON (and therefore USE_TENT=ON).")
+  endif()
+  if(USE_CUDA)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON cannot be combined with USE_CUDA=ON: both resolve "
+        "libcufile.so, and a process can load only one of them.")
+  endif()
+  add_compile_definitions(USE_XPU_GDS)
+  message(STATUS "Intel XPU GDS (cuFile-compatible library) is enabled")
 endif()
 
 if(NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")

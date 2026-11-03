@@ -104,6 +104,14 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
 fi
 
+# Copy TENT artifacts for the memfabric wheel.
+if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Copying TENT libraries and Python extension..."
+    cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so" mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/metrics/libtent_metrics.so" mooncake-wheel/mooncake/
+    cp "${BUILD_DIR}"/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so mooncake-wheel/mooncake/
+fi
+
 # Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
 if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
     echo "Copying ascend_transport.so..."
@@ -155,6 +163,9 @@ fi
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 
+# Kernel header tree the CUDA EP JIT compiles against at runtime.
+CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
+
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
@@ -164,6 +175,11 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
         cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
         echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            cp -r "$CUDA_EP_JIT_DIR" "$CUDA_EP_STAGING_TEMP/"
+            CUDA_EP_JIT_DIR="${CUDA_EP_STAGING_TEMP}/mooncake_ep_jit"
+            echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
+        fi
     fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf "${BUILD_DIR}/"
@@ -173,16 +189,46 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     fi
 fi
 
+# Release builds still compile with -g (ENABLE_DEBUG_SYMBOLS defaults to ON),
+# and DWARF made up most of each wheel, pushing the CUDA wheels past the
+# 100 MiB per-file upload limit of PyPI/TestPyPI. The CI wheel profiles pass
+# -DENABLE_DEBUG_SYMBOLS=OFF, so this strip is the safety net for callers that
+# still build with -g. It runs before auditwheel: patchelf has to run after
+# strip, never before. --strip-debug keeps .symtab, so stack traces still
+# resolve function names. The CUDA device libraries injected after repair are
+# not touched.
+#
+# Strip by default in CI only: local developer builds keep the line tables
+# ENABLE_DEBUG_SYMBOLS=ON compiled in. KEEP_DEBUG_SYMBOLS=1 opts out
+# everywhere (including the NPU --strip-unneeded pass); STRIP overrides the
+# tool for cross/container toolchains.
+WHEEL_PACKAGE_DIR="$(pwd)/mooncake-wheel/mooncake"
+if [ "${KEEP_DEBUG_SYMBOLS:-0}" != "1" ] && [ "${CI:-false}" = "true" ]; then
+    STRIP="${STRIP:-strip}"
+    if ! command -v "$STRIP" >/dev/null 2>&1; then
+        echo "Error: '$STRIP' not found; install binutils or set STRIP to the target strip tool"
+        exit 1
+    fi
+    if [ "$NPU_BUILD" = "1" ]; then
+        echo "Stripping staged shared libraries to reduce wheel size (set KEEP_DEBUG_SYMBOLS=1 to keep them)..."
+        find "$WHEEL_PACKAGE_DIR" -type f -name "*.so" -exec "$STRIP" --strip-unneeded {} +
+    else
+        if ! command -v file >/dev/null 2>&1; then
+            echo "Error: 'file' not found; it is needed to detect staged ELF files"
+            exit 1
+        fi
+        echo "Stripping debug info from staged ELF files (set KEEP_DEBUG_SYMBOLS=1 to keep it)..."
+        find "$WHEEL_PACKAGE_DIR" -type f \( -name '*.so*' -o -perm -111 \) \
+            -exec sh -c 'file "$1" | grep -q ELF' _ {} \; \
+            -exec "$STRIP" --strip-debug {} +
+    fi
+else
+    echo "Keeping debug symbols in staged files (KEEP_DEBUG_SYMBOLS=${KEEP_DEBUG_SYMBOLS:-0}, CI=${CI:-false})"
+fi
+
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
 export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
-
-if [ "$NPU_BUILD" = "1" ]; then
-    echo "Stripping shared libraries to reduce wheel size..."
-    find mooncake-wheel/mooncake -name "*.so" -exec strip --strip-unneeded {} \;
-    echo "Pre-setting RPATH=\$ORIGIN on project ELF files so auditwheel resolves NEEDED from wheel-internal copies..."
-    find mooncake-wheel/mooncake -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
-fi
 
 echo "Building wheel package..."
 # Stage migrated root Python modules and the legacy Reshard package for the
@@ -194,7 +240,10 @@ STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
 MIGRATED_PYTHON_INIT_BACKUP=""
 MIGRATED_PYTHON_MODULES=(
     __init__.py
+    py.typed
+    engine.pyi
     structured_object_store.py
+    _structured_ranges.py
     _fast_copy.c
     http_metadata_server.py
     _launcher.py
@@ -257,7 +306,7 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD MEMFABRIC_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -310,6 +359,18 @@ elif [ "$NPU_BUILD" = "1" ]; then
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-npu"
+elif [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Modifying package name for memfabric build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-memfabric"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (memfabric version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "memfabric"]/' pyproject.toml
+    sed -i 's/^requires-python = ">=3.10"$/requires-python = ">=3.9"/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-memfabric"
 elif [ "$EFA_BUILD" = "1" ]; then
     echo "Modifying package name for AWS EFA build (CUDA)"
     # Backup original pyproject.toml
@@ -404,6 +465,27 @@ else
     exit 1
 fi
 
+# Keep the existing NPU repair layout. Other builds must retain their build-time
+# RPATH until auditwheel resolves external dependencies, including Conda's
+# libyaml-cpp.so.0.7 in the manylinux CUDA images. Replacing it with only $ORIGIN
+# makes those libraries undiscoverable. Strip debug info without changing RPATH.
+# Run after installing patchelf above so the supported version is used.
+if [ "$NPU_BUILD" = "1" ]; then
+    echo "Pre-setting RPATH=\$ORIGIN on NPU ELF files..."
+    find "$WHEEL_PACKAGE_DIR" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
+fi
+
+# Prioritize the package directory for sibling-library lookup while preserving
+# build-time dependency paths needed by auditwheel.
+if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+    echo "Prioritizing package-local RPATH for memfabric ELF files..."
+    while IFS= read -r -d '' elf_file; do
+        existing_rpath=$(patchelf --print-rpath "$elf_file")
+        patchelf --set-rpath "\$ORIGIN${existing_rpath:+:$existing_rpath}" "$elf_file"
+    done < <(find "$WHEEL_PACKAGE_DIR" -type f \
+        -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0)
+fi
+
 # Create directory for repaired wheels
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
@@ -484,7 +566,18 @@ fi
 # libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
 # (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
 # corruption risk the EP/PG extensions are kept away from below.
+#
+# The SYCL, Level Zero and Intel compiler runtimes of an XPU build are
+# excluded too: the XPU EP runs on PyTorch's own sycl::queue, so it must share
+# the one SYCL runtime that PyTorch XPU installs (intel-sycl-rt,
+# intel-cmplr-lib-rt) rather than carry a second copy.
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
+    --exclude libsycl.so* \
+    --exclude libze_loader.so* \
+    --exclude libsvml.so* \
+    --exclude libimf.so* \
+    --exclude libirng.so* \
+    --exclude libintlc.so* \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
@@ -596,6 +689,11 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
                 cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
             fi
         done
+        # Kernel headers for the EP JIT (runtime nvcc).
+        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+            echo "  Adding EP JIT header tree"
+            cp -r "$CUDA_EP_JIT_DIR" "$UNPACKED_PKG_DIR/mooncake/"
+        fi
         # The host EP extension is repaired before the device library is
         # injected.  auditwheel therefore only adds its vendored .libs path;
         # add the package directory as well so the sibling device library is
@@ -655,6 +753,32 @@ fi
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl
 mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
+
+# PyPI and TestPyPI reject files above 100 MiB by default. Gate here, next to
+# OUTPUT_DIR, so every caller of this script is covered (CI, nightly,
+# pre-release and release; CUDA, EFA, NPU, MUSA and ROCm alike) instead of
+# only the _build-wheel.yaml workflow. Only CI builds fail: local and Docker
+# builds may intentionally exceed the limit (e.g. KEEP_DEBUG_SYMBOLS=1) and
+# never upload to an index.
+wheels=("${OUTPUT_DIR}"/*.whl)
+if [ ! -e "${wheels[0]}" ]; then
+    echo "Error: no wheel found in ${OUTPUT_DIR}/ after auditwheel repair"
+    exit 1
+fi
+size_limit=$((100 * 1024 * 1024))
+for wheel in "${wheels[@]}"; do
+    size=$(stat -c %s "$wheel")
+    size_mib=$(awk -v size="$size" 'BEGIN { printf "%.1f", size / 1048576 }')
+    echo "$(basename "$wheel"): ${size_mib} MiB"
+    if [ "$size" -gt "$size_limit" ]; then
+        message="$(basename "$wheel") is ${size_mib} MiB, above the 100 MiB per-file upload limit of PyPI/TestPyPI"
+        if [ "${CI:-false}" = "true" ]; then
+            echo "Error: $message"
+            exit 1
+        fi
+        echo "Warning: $message (not enforced outside CI)"
+    fi
+done
 
 cd ..
 

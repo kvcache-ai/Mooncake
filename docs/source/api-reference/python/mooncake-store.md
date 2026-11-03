@@ -1154,9 +1154,15 @@ store.setup({
 
 `enable_egm_store_pool` defaults to `false`; `egm_numa_nodes` defaults to
 `auto`. These controls apply only to this dictionary overload. The EGM pool
-requires a `USE_MNNVL=ON` build, a non-TENT Transfer Engine, and the exact
-`nvlink`/nonzero-global/zero-local combination shown above. With `auto`, nodes
-come from the visible GPUs' CUDA `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` values.
+requires a `USE_MNNVL=ON` build, a non-TENT Transfer Engine, and
+`protocol="nvlink"` with `global_segment_size>0`. With `auto`, nodes come from
+the visible GPUs' CUDA `CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID` values.
+
+`local_buffer_size` is independent of the EGM pool. A nonzero value uses the
+existing client-buffer allocator for local staging; it does not add EGM
+capacity. Keep it nonzero when the Provider also uses APIs such as `put()` or
+`get_buffer()` that allocate staging buffers. A storage-only Provider can use
+zero, as shown above.
 
 EGM capacity is rounded down to a multiple of the common alignment: the
 maximum of the Store slab alignment and the selected nodes' CUDA allocation
@@ -3159,7 +3165,9 @@ reserve object space via Master `BatchPutStart` and finalize with
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
 `batch_put_session_end` finalizes MEMORY and revokes the unused NoF reservation.
-Reliable multi-replica NoF configs are rejected at session start. `end` / `revoke`
+Reliable multi-replica NoF configs are rejected at session start. DFS configs
+(`dfs_replica_num > 0`, including DFS-only) are also rejected at session start with
+`INVALID_PARAMS`; use `put` / `batch_put_from` for DFS placement. `end` / `revoke`
 seal the session (no further range writes) and wait for in-flight range transfers
 before talking to Master.
 

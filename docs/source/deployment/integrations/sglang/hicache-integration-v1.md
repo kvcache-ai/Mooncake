@@ -68,8 +68,10 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 **Launch Mooncake `metadata service` (Optional):**
 
 ```bash
-python -m mooncake.http_metadata_server
+python -m mooncake.http_metadata_server --host 127.0.0.1
 ```
+
+This single-server example binds the service to loopback. Multi-host deployments should set `MC_METADATA_HTTP_TOKEN` on the metadata service and every engine, or explicitly opt into the legacy open behavior with `MC_METADATA_HTTP_ALLOW_INSECURE=1` on a trusted network.
 
 This service is responsible for centralized metadata management including internal connection status and related metadata.
 

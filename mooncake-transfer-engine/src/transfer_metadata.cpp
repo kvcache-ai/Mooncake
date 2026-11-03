@@ -216,6 +216,8 @@ struct TransferHandshakeUtil {
         root["qp_num"] = qpNums;
         if (desc.ready_ack_supported || desc.ready_ack)
             root["ready_ack"] = desc.ready_ack;
+        if (!desc.auto_gid_reprobe_from.empty())
+            root["auto_gid_reprobe_from"] = desc.auto_gid_reprobe_from;
         if (desc.notify_qp_num != 0 || desc.ctrl_channel) {
             root["notify_qp_num"] = Json::UInt(desc.notify_qp_num);
             root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
@@ -264,6 +266,13 @@ struct TransferHandshakeUtil {
             desc.ready_ack = root["ready_ack"].asBool();
         } else {
             desc.ready_ack = false;
+        }
+        if (root.isMember("auto_gid_reprobe_from") &&
+            root["auto_gid_reprobe_from"].isString()) {
+            desc.auto_gid_reprobe_from =
+                root["auto_gid_reprobe_from"].asString();
+        } else {
+            desc.auto_gid_reprobe_from.clear();
         }
         desc.notify_qp_num = 0;
         desc.notify_rq_depth = 0;
@@ -698,6 +707,11 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             bufferJSON["device_id"] = buffer.device_id;
+            // Host memfd handle (ASCEND_USE_SHMEM). Emitted only when the
+            // buffer is shareable, so a peer built without this field keeps
+            // parsing the descriptor unchanged.
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -1260,6 +1274,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;
+            }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
             }
             desc->buffers.push_back(buffer);
         }

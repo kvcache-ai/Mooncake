@@ -68,8 +68,8 @@ std::vector<std::string> HeartbeatKeys(size_t begin, size_t end) {
 }  // namespace
 
 TEST(MasterServiceOffloadScenarioTest, HeartbeatReturnsObjectsPutSinceEnable) {
-    // Spread enough keys across the metadata shards that the heartbeat sweep
-    // covers all of them, as the direct test did with 3000 keys per phase.
+    // Enough keys that the heartbeat sweep covers every route stripe, as the
+    // direct test did with 3000 keys per phase.
     constexpr size_t kBatch = 3000;
     MasterScenario scenario(
         "the heartbeat hands back objects put while offloading was enabled",
