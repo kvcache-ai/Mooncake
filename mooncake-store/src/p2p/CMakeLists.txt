@@ -11,7 +11,7 @@ set(MOONCAKE_P2P_MASTER_SOURCES
     master/p2p_master.cpp
     master/p2p_client_meta.cpp
     master/p2p_client_manager.cpp
-    client/client_metrics_aggregator.cpp
+    master/client_metrics_aggregator.cpp
     util/metric_util.cpp
     ha/oplog/oplog_manager.cpp
     ha/oplog/oplog_serializer.cpp

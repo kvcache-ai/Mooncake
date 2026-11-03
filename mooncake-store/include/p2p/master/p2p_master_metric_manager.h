@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-#include "p2p/client/client_metrics_aggregator.h"
+#include "p2p/master/client_metrics_aggregator.h"
 
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
