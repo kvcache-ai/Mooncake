@@ -371,7 +371,8 @@ def case_names(suite: str, names: str, count: int = 0) -> set[str]:
 PLATFORM = case_names(
     "XpuPlatformTest",
     """TypeString ProbeRegistersOneMemEntryPerDevice ProbeDoesNotDuplicateGpusAcrossAdapters
-    DeviceAllocCopyFreeRoundTrip HostPointerClassifiesAsCpu ForeignUsmClassifiesAsXpuAndCopies
+    DeviceAllocCopyFreeRoundTrip ConcurrentHostDeviceCopiesKeepTheirData
+    HostPointerClassifiesAsCpu ForeignUsmClassifiesAsXpuAndCopies
     InteriorPointerClassifiesAsXpu BareXpuLocationAllocatesDeviceZero MalformedXpuOrdinalIsRejected
     HostPointerIsNotExportable DeviceAllocationExportsAsDmabuf SeparateAllocationsExportDistinctDmabufs
     DeviceToDeviceCopyOnSameDevice DeviceToDeviceCopyAcrossDevices CopyRejectsRangePastAllocationEnd

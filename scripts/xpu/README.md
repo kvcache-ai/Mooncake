@@ -114,7 +114,7 @@ XPU wheel on CPU. After provisioning the runners, set the repository variable
 Alternatively select `run_xpu_integration` when manually dispatching Nightly
 Build & Test. The same selection enables **both** jobs:
 
-- `xpu-nightly-core`: all 149 non-RDMA C++ cases, Python Store, and expanded
+- `xpu-nightly-core`: all 150 non-RDMA C++ cases, Python Store, and expanded
   two-rank native EP. EP uses 128 maximum tokens, hidden size 4096, 16 experts,
   top-k 4, and 24 fixed-seed rounds, plus the existing empty-rank, overlap,
   duplicate-expert, handle, stream, and fallback checks. PR core retains its
@@ -201,8 +201,8 @@ diagnostics fail the job while host cleanup records remain available.
 
 Core executes sequentially:
 
-- 19 platform cases, including foreign/interior USM, dma-buf export, and
-  same-/cross-device IPC and copies.
+- 20 platform cases, including foreign/interior USM, dma-buf export,
+  concurrent host/device copies, and same-/cross-device IPC and copies.
 - 7 XPU transport cases.
 - 114 engine cases: local copies, TCP/HP-TCP staging (tests explicitly disable
   IPC for those paths), retry/routing, IPC lifetime/policies, and io_uring.
@@ -216,7 +216,7 @@ Core executes sequentially:
   The existing script asserts native selection and must print its exact final
   completion record; missing rounds or zero-test execution fail.
 
-The **149 C++ cases** require exact GoogleTest identities and completed XML
+The **150 C++ cases** require exact GoogleTest identities and completed XML
 results. Ten parameter combinations that unconditionally skip because they
 are inapplicable are excluded *before* execution, with reasons in
 `selection.json`. No runtime skips are allowed. The eight direct-RDMA

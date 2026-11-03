@@ -1128,7 +1128,7 @@ class ReportTest(unittest.TestCase):
                                 self.assertTrue(call.kwargs["require_gtest_status"])
                                 self.assertTrue(call.args[1])
                             result = json.loads((root / "result.json").read_text())
-                            self.assertEqual(result["cpp_cases"], 149)
+                            self.assertEqual(result["cpp_cases"], 150)
                             self.assertEqual(result["ep_rounds"], rounds)
                             self.assertEqual(result["ep_hidden"], hidden)
                             self.assertEqual(result["suite"], selected_suite)
@@ -1172,7 +1172,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(len(VERIFY.ENGINE), 124)
         self.assertEqual(len(VERIFY.INAPPLICABLE), 10)
         self.assertEqual(
-            sum(len(selected) for _, selected in VERIFY.SUITES.values()), 149
+            sum(len(selected) for _, selected in VERIFY.SUITES.values()), 150
         )
         selected_engine = VERIFY.SUITES["tent_xpu_engine_test"][1]
         self.assertFalse(selected_engine & VERIFY.RDMA)
