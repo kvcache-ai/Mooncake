@@ -470,8 +470,7 @@ DataManagerV2::DataManagerV2(const DataManagerV2Config& config,
 
     // GetCoroExecutor() must never return null, including after Stop(), so the
     // pool is created up front and only stopped (never released) on shutdown.
-    unsigned coro_threads =
-        static_cast<unsigned>(config_.local_transfer.te_async_poll_worker_num);
+    size_t coro_threads = config_.local_transfer.business_coro_worker_num;
     if (coro_threads == 0) coro_threads = std::thread::hardware_concurrency();
     if (coro_threads == 0) coro_threads = 1;
     coro_executor_pool_ =
@@ -487,10 +486,7 @@ DataManagerV2::DataManagerV2(const DataManagerV2Config& config,
         std::thread([pool = te_wait_pool_]() { pool->run(); }).detach();
     }
 
-    const size_t local_workers =
-        config_.local_transfer.mode == LocalTransferMode::MEMCPY
-            ? config_.local_transfer.local_memcpy_async_worker_num
-            : config_.local_transfer.te_async_poll_worker_num;
+    const size_t local_workers = config_.local_transfer.local_io_worker_num;
     if (local_workers > 0) {
         local_io_executor_ =
             std::make_unique<AsyncMemcpyExecutor>(local_workers);

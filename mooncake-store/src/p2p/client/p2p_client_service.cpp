@@ -557,10 +557,9 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
     dm_config.local_transfer.te_endpoint = get_te_endpoint();
     dm_config.local_transfer.te_async_poll_worker_num =
         config.te_async_poll_worker_num;
-    if (config.local_transfer_mode == LocalTransferMode::MEMCPY) {
-        dm_config.local_transfer.local_memcpy_async_worker_num =
-            config.local_memcpy_async_worker_num;
-    }
+    dm_config.local_transfer.business_coro_worker_num =
+        config.business_coro_worker_num;
+    dm_config.local_transfer.local_io_worker_num = config.local_io_worker_num;
     dm_config.key_lease.duration_ms = config.p2p_key_lease_duration_ms;
     dm_config.key_lease.scan_interval_ms =
         config.p2p_key_lease_scan_interval_ms;

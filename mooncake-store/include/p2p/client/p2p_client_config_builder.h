@@ -83,15 +83,19 @@ struct P2PClientConfig : RealClientConfigBase {
     // - TE: transfer through local TransferEngine path
     LocalTransferMode local_transfer_mode = LocalTransferMode::TE;
 
-    // When local_transfer_mode == MEMCPY, the following parameter is used:
-    // 0 means forbid async memcpy (fall back to synchronous).
-    size_t local_memcpy_async_worker_num = 32;
+    // Local I/O workers: both modes in V2, MEMCPY only in V1.
+    // 0 defers local I/O until the caller waits on the task.
+    size_t local_io_worker_num = 32;
 
     // Size of the dedicated coro_io pool for TE wait coroutines
     // (poll getTransferStatus, yield via sleep_for) in DataManager: local TE
     // Put/Get and remote forward TE (co_await) paths. Independent of
     // local_transfer_mode. 0 means synchronous TE wait on the caller thread.
     size_t te_async_poll_worker_num = 32;
+
+    // Business coroutine pool, independent of TE polling.
+    // 0 selects hardware_concurrency(), with a minimum of one worker.
+    size_t business_coro_worker_num = 32;
 
     // PreWrite / PinKey key lease: maximum time (ms) a key may stay in
     // intermediate (lease-protected) state before expiring.
@@ -128,7 +132,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
         uint64_t route_cache_ttl_ms = 60 * 1000,
         const std::string& local_transfer_mode = "te",
-        size_t local_memcpy_async_worker_num = 32, uint16_t http_port = 9003,
+        size_t local_io_worker_num = 32, uint16_t http_port = 9003,
         bool enable_http_server = true,
         const std::map<std::string, std::string>& labels = {},
         size_t async_sender_thread_count = 4,
@@ -143,7 +147,8 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         const std::string& redis_password = "", int redis_db_index = 0,
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
         const std::string& redis_username = "", uint16_t heartbeat_rpc_port = 0,
-        size_t te_async_poll_worker_num = 32, bool start_local_only = false) {
+        size_t te_async_poll_worker_num = 32, bool start_local_only = false,
+        size_t business_coro_worker_num = 32) {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -181,11 +186,9 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         config.route_cache_ttl_ms = route_cache_ttl_ms;
         config.local_transfer_mode =
             parse_p2p_local_transfer_mode(local_transfer_mode);
-        if (config.local_transfer_mode == LocalTransferMode::MEMCPY) {
-            config.local_memcpy_async_worker_num =
-                local_memcpy_async_worker_num;
-        }
+        config.local_io_worker_num = local_io_worker_num;
         config.te_async_poll_worker_num = te_async_poll_worker_num;
+        config.business_coro_worker_num = business_coro_worker_num;
         config.start_local_only = start_local_only;
         config.async_sender_thread_count = async_sender_thread_count;
         config.async_max_batch_size = async_max_batch_size;
@@ -263,12 +266,15 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         std::string local_transfer_mode =
             get_config_str(config, DictP2P::kLocalTransferMode,
                            DictP2P::kDefaultLocalTransferMode);
-        size_t memcpy_async_worker_num =
-            get_config_size(config, DictP2P::kLocalMemcpyAsyncWorkerNum,
-                            DictP2P::kDefaultLocalMemcpyAsyncWorkerNum);
+        size_t local_io_worker_num =
+            get_config_size(config, DictP2P::kLocalIoWorkerNum,
+                            DictP2P::kDefaultLocalIoWorkerNum);
         size_t te_async_poll_worker_num =
             get_config_size(config, DictP2P::kTeAsyncPollWorkerNum,
                             DictP2P::kDefaultTeAsyncPollWorkerNum);
+        size_t business_coro_worker_num =
+            get_config_size(config, DictP2P::kBusinessCoroWorkerNum,
+                            DictP2P::kDefaultBusinessCoroWorkerNum);
         size_t async_sender_thread_count =
             get_config_size(config, DictP2P::kAsyncSenderThreadCount,
                             DictP2P::kDefaultAsyncSenderThreadCount);
@@ -296,7 +302,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             master_server_addr, tiered_backend_config, local_buffer_size,
             nullptr, ipc_socket_path, client_rpc_port, rpc_thread_num,
             lock_shard_count, route_cache_max_memory, route_cache_ttl_ms,
-            local_transfer_mode, memcpy_async_worker_num, 9003, true, {},
+            local_transfer_mode, local_io_worker_num, 9003, true, {},
             async_sender_thread_count, async_max_batch_size,
             async_route_queue_size, 0, 0, "reverse", runtime_config,
             enable_metric_collection, metric_report_interval_seconds,
@@ -304,7 +310,8 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             redis_config.db_index, redis_config.master_view_ttl_sec,
             redis_config.heartbeat_interval_sec, redis_config.username,
             heartbeat_rpc_port, te_async_poll_worker_num,
-            get_config_bool(config, DictP2P::kStartLocalOnly, false));
+            get_config_bool(config, DictP2P::kStartLocalOnly, false),
+            business_coro_worker_num);
     }
 
    private:
@@ -329,10 +336,11 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             "route_cache_max_memory_bytes";
         static constexpr const char* kRouteCacheTtlMs = "route_cache_ttl_ms";
         static constexpr const char* kLocalTransferMode = "local_transfer_mode";
-        static constexpr const char* kLocalMemcpyAsyncWorkerNum =
-            "local_memcpy_async_worker_num";
+        static constexpr const char* kLocalIoWorkerNum = "local_io_worker_num";
         static constexpr const char* kTeAsyncPollWorkerNum =
             "te_async_poll_worker_num";
+        static constexpr const char* kBusinessCoroWorkerNum =
+            "business_coro_worker_num";
         static constexpr const char* kAsyncSenderThreadCount =
             "async_sender_thread_count";
         static constexpr const char* kAsyncMaxBatchSize =
@@ -347,8 +355,9 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
             300ULL * 1024 * 1024;
         static constexpr uint64_t kDefaultRouteCacheTtlMs = 1ULL * 60 * 1000;
         static constexpr const char* kDefaultLocalTransferMode = "te";
-        static constexpr size_t kDefaultLocalMemcpyAsyncWorkerNum = 32;
+        static constexpr size_t kDefaultLocalIoWorkerNum = 32;
         static constexpr size_t kDefaultTeAsyncPollWorkerNum = 32;
+        static constexpr size_t kDefaultBusinessCoroWorkerNum = 32;
         static constexpr size_t kDefaultAsyncSenderThreadCount = 4;
         static constexpr size_t kDefaultAsyncMaxBatchSize = 2000;
         static constexpr size_t kDefaultAsyncRouteQueueSize = 0;

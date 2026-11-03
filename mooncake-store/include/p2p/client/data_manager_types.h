@@ -62,14 +62,18 @@ struct LocalTransferConfig {
     // When mode == TE, the following parameters are used:
     std::string te_endpoint;
 
-    // When mode == MEMCPY, the following parameters are used:
-    // 0 means forbid async memcpy (fall back to synchronous).
-    size_t local_memcpy_async_worker_num = 32;
+    // Local I/O workers: both modes in V2, MEMCPY only in V1.
+    // 0 defers local I/O until the caller waits on the task.
+    size_t local_io_worker_num = 32;
 
     // Dedicated coro_io pool for TE wait coroutines (poll getTransferStatus,
     // then co_await sleep_for). Independent of `mode`. 0 keeps synchronous TE
     // wait on the caller thread.
     size_t te_async_poll_worker_num = 32;
+
+    // Business coroutine pool, independent of TE polling.
+    // 0 selects hardware_concurrency(), with a minimum of one worker.
+    size_t business_coro_worker_num = 32;
 };
 
 /**

@@ -40,8 +40,7 @@ ClientTestWrapper::CreateClientWrapper(
         /*lock_shard_count=*/1024,
         /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
         /*route_cache_ttl_ms=*/60 * 1000, p2p_local_transfer_mode,
-        /*local_memcpy_async_worker_num=*/32, /*http_port=*/9003,
-        enable_http_server);
+        /*local_io_worker_num=*/32, /*http_port=*/9003, enable_http_server);
     if (!redis_cluster_id.empty()) {
         config.redis_cluster_id = redis_cluster_id;
     }

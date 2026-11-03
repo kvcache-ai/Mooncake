@@ -88,7 +88,7 @@ class V2MetricsTest : public ::testing::Test {
             ParseJson(tiers_json), LocalTransferConfig{}, KeyLeaseConfig{});
         ASSERT_TRUE(config.has_value()) << toString(config.error());
         config->register_tiers_with_transfer_engine = false;
-        config->local_transfer.local_memcpy_async_worker_num = 0;
+        config->local_transfer.local_io_worker_num = 0;
         config->local_transfer.te_async_poll_worker_num = 0;
         config->stop_drain_timeout = stop_timeout;
 

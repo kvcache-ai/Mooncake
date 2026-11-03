@@ -149,7 +149,7 @@ class DataManagerTransferTest : public ::testing::TestWithParam<LeaseState> {
         auto config = ParseDataManagerV2Config(tiers, LocalTransferConfig{},
                                                KeyLeaseConfig{});
         ASSERT_TRUE(config.has_value());
-        config->local_transfer.local_memcpy_async_worker_num = 0;
+        config->local_transfer.local_io_worker_num = 1;
         config->local_transfer.te_async_poll_worker_num = 1;
         config->stop_drain_timeout = 20ms;
         config->key_lease.duration_ms = 1000;

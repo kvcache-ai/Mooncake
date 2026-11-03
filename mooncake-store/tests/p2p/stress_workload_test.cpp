@@ -42,9 +42,8 @@ DEFINE_string(metadata_connection_string, "P2PHANDSHAKE",
               "Metadata connection string");
 DEFINE_string(p2p_local_transfer_mode, "te",
               "Local transfer mode for P2P local Get/Put path: memcpy|te");
-DEFINE_uint64(local_memcpy_async_worker_num, 32,
-              "If set p2p_local_transfer_mode=memcpy, Worker number for async "
-              "local memcpy executor (P2P)");
+DEFINE_uint64(local_io_worker_num, 32,
+              "Local I/O worker count (V1: memcpy only; V2: both modes)");
 DEFINE_uint64(route_cache_max_memory_mb, 300,
               "Max memory for RouteCache in MB (P2P mode)");
 DEFINE_uint64(route_cache_ttl_ms, 60000,
@@ -116,7 +115,7 @@ bool initialize_client() {
         /*route_cache_max_memory_bytes=*/FLAGS_route_cache_max_memory_mb *
             1024 * 1024,
         /*route_cache_ttl_ms=*/FLAGS_route_cache_ttl_ms,
-        FLAGS_p2p_local_transfer_mode, FLAGS_local_memcpy_async_worker_num);
+        FLAGS_p2p_local_transfer_mode, FLAGS_local_io_worker_num);
     auto client_opt = P2PClientService::Create(config);
 
     if (!client_opt.has_value()) {

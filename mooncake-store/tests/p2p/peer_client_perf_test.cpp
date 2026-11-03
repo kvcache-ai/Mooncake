@@ -76,7 +76,7 @@ class PeerClientPerfTest : public ::testing::Test {
 
         LocalTransferConfig local_transfer_config;
         local_transfer_config.mode = LocalTransferMode::MEMCPY;
-        local_transfer_config.local_memcpy_async_worker_num = 32;
+        local_transfer_config.local_io_worker_num = 32;
         data_manager_ = std::make_unique<DataManagerV1>(
             std::move(tiered_backend_), transfer_engine_, 1024,
             local_transfer_config);
@@ -536,7 +536,7 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
 
         LocalTransferConfig local_transfer_config;
         local_transfer_config.mode = LocalTransferMode::MEMCPY;
-        local_transfer_config.local_memcpy_async_worker_num = 32;
+        local_transfer_config.local_io_worker_num = 32;
         data_manager_ = std::make_unique<DataManagerV1>(
             std::move(tiered_backend_), transfer_engine_, 1024,
             local_transfer_config);

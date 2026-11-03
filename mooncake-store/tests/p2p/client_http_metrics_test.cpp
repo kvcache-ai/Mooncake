@@ -59,7 +59,7 @@ class ClientHttpMetricsTest : public ::testing::Test {
         config.async_sender_thread_count = 0;
         config.route_cache_max_memory_bytes = 0;
         config.local_transfer_mode = LocalTransferMode::MEMCPY;
-        config.local_memcpy_async_worker_num = 1;
+        config.local_io_worker_num = 1;
         config.te_async_poll_worker_num = 1;
         auto created = P2PClientService::Create(config);
         if (!created) return false;

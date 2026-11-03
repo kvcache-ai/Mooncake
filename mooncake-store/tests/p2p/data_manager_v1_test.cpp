@@ -89,7 +89,7 @@ class DataManagerTest : public ::testing::Test {
         // Create DataManagerV1 in MEMCPY mode so Put/Get work without RDMA.
         LocalTransferConfig transfer_config;
         transfer_config.mode = LocalTransferMode::MEMCPY;
-        transfer_config.local_memcpy_async_worker_num = 32;
+        transfer_config.local_io_worker_num = 32;
 
         // Save raw pointer before move for tests that need direct backend
         // access
@@ -2197,7 +2197,8 @@ tl::expected<void, ErrorCode> AwaitVoidExpectedFuture(
 }
 
 std::unique_ptr<DataManagerV1> MakeDataManagerForTePollTest(
-    std::shared_ptr<TransferEngine> te, size_t te_async_poll_worker_num) {
+    std::shared_ptr<TransferEngine> te, size_t te_async_poll_worker_num,
+    size_t business_coro_worker_num = 32) {
     std::string json_config_str = R"({
         "tiers": [
             {
@@ -2222,6 +2223,7 @@ std::unique_ptr<DataManagerV1> MakeDataManagerForTePollTest(
     LocalTransferConfig transfer_config;
     transfer_config.mode = LocalTransferMode::TE;
     transfer_config.te_async_poll_worker_num = te_async_poll_worker_num;
+    transfer_config.business_coro_worker_num = business_coro_worker_num;
     return std::make_unique<DataManagerV1>(std::move(backend), std::move(te),
                                            1024, transfer_config);
 }
@@ -2249,6 +2251,33 @@ TEST_F(DataManagerTest, WaitAllTransferBatchesAsyncEmptySucceedsWithPollPool) {
 
     auto result = AwaitVoidExpectedFuture(dm->WaitAllTransferBatchesAsync({}));
     ASSERT_TRUE(result.has_value());
+}
+
+TEST_F(DataManagerTest, BusinessPoolSizeIsIndependentOfTePolling) {
+    for (size_t poll_workers : {0u, 2u, 4u}) {
+        SCOPED_TRACE(poll_workers);
+        auto dm = MakeDataManagerForTePollTest(transfer_engine_, poll_workers,
+                                               /*business_workers=*/3);
+        ASSERT_NE(dm, nullptr);
+        ASSERT_NE(dm->coro_executor_pool_, nullptr);
+        EXPECT_EQ(dm->coro_executor_pool_->pool_size(), 3u);
+        if (poll_workers == 0) {
+            EXPECT_EQ(dm->te_wait_pool_, nullptr);
+        } else {
+            ASSERT_NE(dm->te_wait_pool_, nullptr);
+            EXPECT_EQ(dm->te_wait_pool_->pool_size(), poll_workers);
+        }
+    }
+}
+
+TEST_F(DataManagerTest, ZeroBusinessWorkersUseHardwareConcurrency) {
+    auto dm = MakeDataManagerForTePollTest(transfer_engine_, 0, 0);
+    ASSERT_NE(dm, nullptr);
+    ASSERT_NE(dm->coro_executor_pool_, nullptr);
+    const auto hardware_threads = std::thread::hardware_concurrency();
+    EXPECT_EQ(dm->coro_executor_pool_->pool_size(),
+              hardware_threads == 0 ? 1u : hardware_threads);
+    EXPECT_EQ(dm->te_wait_pool_, nullptr);
 }
 
 TEST_F(DataManagerTest,
@@ -2390,7 +2419,7 @@ std::optional<TieredDataManagerFixture> MakeDramPlusStorageDataManager(
     fixture.backend = backend.get();
     LocalTransferConfig transfer_config;
     transfer_config.mode = LocalTransferMode::MEMCPY;
-    transfer_config.local_memcpy_async_worker_num = 0;
+    transfer_config.local_io_worker_num = 0;
     transfer_config.te_async_poll_worker_num = 0;
     fixture.data_manager = std::make_unique<DataManagerV1>(
         std::move(backend), std::move(te), 64, transfer_config);

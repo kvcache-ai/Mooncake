@@ -60,8 +60,9 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
     EXPECT_FALSE(config.tiered_backend_config.isNull());
     EXPECT_TRUE(config.tiered_backend_config.isMember("tiers"));
     EXPECT_EQ(config.tiered_backend_config["tiers"].size(), 1u);
-    EXPECT_EQ(config.local_memcpy_async_worker_num, 32u);
+    EXPECT_EQ(config.local_io_worker_num, 32u);
     EXPECT_EQ(config.te_async_poll_worker_num, 32u);
+    EXPECT_EQ(config.business_coro_worker_num, 32u);
     EXPECT_EQ(config.local_transfer_mode, LocalTransferMode::TE);
     EXPECT_EQ(config.p2p_key_lease_duration_ms,
               P2PClientConfig::kP2pDefaultKeyLeaseDurationMs);
@@ -205,7 +206,7 @@ TEST(ClientConfigBuilderTest,
         std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr, "",
         12345, 8, 2048, 512 * 1024 * 1024, 120000, "memcpy", 3);
 
-    EXPECT_EQ(config.local_memcpy_async_worker_num, 3u);
+    EXPECT_EQ(config.local_io_worker_num, 3u);
     EXPECT_EQ(config.local_transfer_mode, LocalTransferMode::MEMCPY);
     EXPECT_EQ(config.te_async_poll_worker_num, 32u);
 }
@@ -220,7 +221,7 @@ TEST(ClientConfigBuilderTest, BuildP2PTeModePassesTeAsyncPollWorkerArg) {
     EXPECT_TRUE(config.start_local_only);
     EXPECT_EQ(config.local_transfer_mode, LocalTransferMode::TE);
     EXPECT_EQ(config.te_async_poll_worker_num, 18u);
-    EXPECT_EQ(config.local_memcpy_async_worker_num, 32u);
+    EXPECT_EQ(config.local_io_worker_num, 5u);
 }
 
 TEST(ClientConfigBuilderTest, BuildP2PMemcpyModePassesTeAsyncPollWorkerArg) {
@@ -231,7 +232,7 @@ TEST(ClientConfigBuilderTest, BuildP2PMemcpyModePassesTeAsyncPollWorkerArg) {
         {}, 0, 2000, 0, 0, 0, "reverse", "", true, 60, DEFAULT_CLUSTER_ID, "",
         0, 5, 2, "", 0, 99);
     EXPECT_EQ(config.local_transfer_mode, LocalTransferMode::MEMCPY);
-    EXPECT_EQ(config.local_memcpy_async_worker_num, 5u);
+    EXPECT_EQ(config.local_io_worker_num, 5u);
     EXPECT_EQ(config.te_async_poll_worker_num, 99u);
 }
 
@@ -243,8 +244,19 @@ TEST(ClientConfigBuilderTest, BuildP2PDictConfigPassesTeAsyncPollWorkerNum) {
         {"tiered_backend_config", kTieredConfigJson},
         {"local_transfer_mode", "te"},
         {"te_async_poll_worker_num", "7"},
+        {"business_coro_worker_num", "3"},
+        {"local_io_worker_num", "5"},
     };
     auto config = P2PClientConfigBuilder::build_p2p_real_client(raw_config);
+    EXPECT_EQ(config.te_async_poll_worker_num, 7u);
+    EXPECT_EQ(config.business_coro_worker_num, 3u);
+    EXPECT_EQ(config.local_io_worker_num, 5u);
+
+    raw_config["business_coro_worker_num"] = "0";
+    raw_config["local_io_worker_num"] = "0";
+    config = P2PClientConfigBuilder::build_p2p_real_client(raw_config);
+    EXPECT_EQ(config.business_coro_worker_num, 0u);
+    EXPECT_EQ(config.local_io_worker_num, 0u);
     EXPECT_EQ(config.te_async_poll_worker_num, 7u);
 }
 

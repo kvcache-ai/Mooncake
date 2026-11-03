@@ -59,12 +59,16 @@ DEFINE_string(p2p_local_transfer_mode, "te",
               "Local transfer mode for P2P local Get/Put path: memcpy|te");
 DEFINE_string(p2p_transfer_direction_mode, "reverse",
               "Cross-node transfer direction for P2P: reverse|forward");
-DEFINE_uint64(local_memcpy_async_worker_num, 32,
-              "If set p2p_local_transfer_mode=memcpy, Worker number for async "
-              "local memcpy executor (P2P), 0 means forbid async memcpy");
+DEFINE_uint64(local_io_worker_num, 32,
+              "Local I/O worker count (V2: both modes; V1: memcpy only), "
+              "0 defers work until Wait");
 DEFINE_uint64(te_async_poll_worker_num, 32,
               "Worker number for async TE batch polling in DataManager (P2P), "
               "0 means synchronous TE wait");
+DEFINE_uint64(
+    business_coro_worker_num, 32,
+    "Business coroutine worker count (P2P), independent of TE polling; "
+    "0 selects hardware_concurrency with a minimum of 1");
 DEFINE_uint32(http_port, 9003, "Port for client HTTP server");
 DEFINE_bool(enable_http_server, true, "Enable client HTTP server");
 DEFINE_uint32(
@@ -116,7 +120,7 @@ int main(int argc, char* argv[]) {
         static_cast<uint32_t>(FLAGS_rpc_thread_num), FLAGS_lock_shard_count,
         string_to_byte_size(FLAGS_route_cache_max_memory),
         FLAGS_route_cache_ttl_ms, FLAGS_p2p_local_transfer_mode,
-        static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
+        static_cast<size_t>(FLAGS_local_io_worker_num),
         static_cast<uint16_t>(FLAGS_http_port), FLAGS_enable_http_server,
         {},  // labels
         FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
@@ -128,7 +132,8 @@ int main(int argc, char* argv[]) {
         FLAGS_redis_master_view_ttl_sec, FLAGS_redis_heartbeat_interval_sec,
         FLAGS_redis_username, static_cast<uint16_t>(FLAGS_heartbeat_rpc_port),
         static_cast<size_t>(FLAGS_te_async_poll_worker_num),
-        FLAGS_p2p_start_local_only);
+        FLAGS_p2p_start_local_only,
+        static_cast<size_t>(FLAGS_business_coro_worker_num));
 
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(
