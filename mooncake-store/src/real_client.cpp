@@ -13,6 +13,7 @@
 #include <cstring>
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <functional>
 #include <limits>
@@ -4930,6 +4931,23 @@ bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
     return region.has_value() && size <= region->size - region->offset;
 }
 
+bool RealClient::can_use_direct_dfs_read(
+    const Replica::Descriptor &replica,
+    const std::vector<void *> &buffers) const {
+    if (!client_ || !client_->CanReadDfsReplicaIntoHostMemory(replica)) {
+        return false;
+    }
+    // Each destination becomes one iovec, and preadv() rejects more than
+    // IOV_MAX of them; the contiguous staging buffer has no such limit.
+    if (buffers.size() > static_cast<size_t>(IOV_MAX)) return false;
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (void *buffer : buffers) {
+        if (runtime_accelerator.FindDeviceForPointer(buffer)) return false;
+    }
+    return true;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache,
@@ -5002,6 +5020,24 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 if (!checksum_result) {
                     return tl::unexpected(checksum_result.error());
                 }
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
+        if (replica.is_dfs_replica() &&
+            can_use_direct_dfs_read(
+                replica, {static_cast<char *>(buffer) + dst_offset})) {
+            // DFS into host memory: the adapter reads into the destination.
+            std::vector<mooncake::Slice> slices;
+            allocateSlices(slices, replica,
+                           static_cast<char *>(buffer) + dst_offset);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
+            auto get_result = client_->Get(key, filtered_qr, slices);
+            if (!get_result) {
+                LOG(ERROR) << "DFS Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
             }
             return static_cast<int64_t>(total_size);
         }
@@ -5149,22 +5185,32 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
         const char *replica_type = replica.is_dfs_replica() ? "DFS" : "DISK";
-        auto result = partial_disk_read(
-            [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
-                auto read_results = client_->BatchReadFileReplicaRanges(
-                    {key}, {replica}, {Slice{tmp_buf, size}}, {src_offset});
-                if (read_results.size() != 1) {
-                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-                }
-                if (!read_results[0]) {
-                    LOG(ERROR)
-                        << replica_type << " range read failed for key: " << key
-                        << " with error: " << toString(read_results[0].error());
-                    return tl::unexpected(read_results[0].error());
-                }
-                return {};
-            },
-            size);
+        auto read_window =
+            [&](void *read_buf) -> tl::expected<void, ErrorCode> {
+            auto read_results = client_->BatchReadFileReplicaRanges(
+                {key}, {replica}, {Slice{read_buf, size}}, {src_offset});
+            if (read_results.size() != 1) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (!read_results[0]) {
+                LOG(ERROR) << replica_type
+                           << " range read failed for key: " << key
+                           << " with error: "
+                           << toString(read_results[0].error());
+                return tl::unexpected(read_results[0].error());
+            }
+            return {};
+        };
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        tl::expected<int64_t, ErrorCode> result;
+        if (replica.is_dfs_replica() &&
+            can_use_direct_dfs_read(replica, {dst})) {
+            auto read_result = read_window(dst);
+            if (!read_result) return tl::unexpected(read_result.error());
+            result = static_cast<int64_t>(size);
+        } else {
+            result = partial_disk_read(read_window, size);
+        }
         if (!result) return result;
         // Same contract as Client::Get: the window may finish transferring
         // after the QueryResult lease deadline. Reject after the successful
@@ -6845,9 +6891,11 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-            // File-backed replicas cannot safely read directly into arbitrary
-            // user buffers. Use a contiguous temp buffer, then scatter.
+        if (replica.is_disk_replica() ||
+            (replica.is_dfs_replica() &&
+             !can_use_direct_dfs_read(replica, {buffers[i]}))) {
+            // DISK replicas, and DFS replicas that cannot be read directly
+            // into the destination, use a contiguous temp buffer, then scatter.
             disk_operations.emplace_back(
                 DiskKeyInfo{.key = key,
                             .original_index = i,
@@ -6858,7 +6906,8 @@ RealClient::batch_get_into_internal(
             results[i] = static_cast<int64_t>(total_size);
             continue;
         }
-        // MEMORY / NOF: RDMA directly to user buffer.
+        // MEMORY / NOF: RDMA directly to user buffer. DFS into host memory:
+        // the fs adapter reads directly to user buffer.
         std::vector<Slice> key_slices;
         allocateSlices(key_slices, replica, buffers[i]);
         valid_operations.push_back(
@@ -8627,8 +8676,11 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica() || replica.is_nof_replica()) {
-            // MEMORY / NOF: RDMA directly to the user buffers.
+        if (replica.is_memory_replica() || replica.is_nof_replica() ||
+            (replica.is_dfs_replica() &&
+             can_use_direct_dfs_read(replica, buffers))) {
+            // MEMORY / NOF: RDMA directly to the user buffers. DFS into host
+            // memory: the fs adapter reads directly to the user buffers.
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }
