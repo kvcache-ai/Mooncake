@@ -15,10 +15,17 @@ class RunCTestTest(unittest.TestCase):
         self.root = Path(self.directory.name).resolve()
         (self.root / "build").mkdir()
 
-    def run_suite(self, **overrides):
+    def run_suite(self, report="passed", **overrides):
+        body = {
+            "passed": '<testcase name="case" status="run"/>',
+            "empty": "",
+            "failure": '<testcase name="case" status="fail"><failure/></testcase>',
+            "skipped": '<testcase name="case" status="notrun"><skipped/></testcase>',
+        }[report]
         env = {
             **os.environ,
             "SCRIPT": str(SCRIPT),
+            "GITHUB_ACTION_PATH": str(SCRIPT.parent),
             "SUITE_TMP": str(self.root),
             "GITHUB_WORKSPACE": str(self.root),
             "RESERVE_RPC_PORT": "false",
@@ -26,6 +33,7 @@ class RunCTestTest(unittest.TestCase):
             "LD_LIBRARY_PATH": "/test/lib",
             "EXISTING_PORTS": "",
             "CTEST_STATUS": "0",
+            "CTEST_REPORT_XML": f"<testsuite>{body}</testsuite>",
         }
         # An inherited workflow setting must not affect the unset-value case.
         env.pop("CTEST_LABEL_EXCLUDE", None)
@@ -48,6 +56,13 @@ ctest() {
   printf '%s\\0' "$@" > "$SUITE_TMP/ctest.args"
   printf '%s\\0' "$PWD" "$LD_LIBRARY_PATH" "$MC_METADATA_SERVER" \\
     "$DEFAULT_KV_LEASE_TTL" > "$SUITE_TMP/ctest.env"
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --output-junit ]; then
+      printf '%s' "$CTEST_REPORT_XML" > "$2"
+      break
+    fi
+    shift
+  done
   return "$CTEST_STATUS"
 }
 source "$SCRIPT"
@@ -70,7 +85,13 @@ source "$SCRIPT"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(
                     self.recorded("ctest.args"),
-                    ["--parallel", "6", "--output-on-failure"],
+                    [
+                        "--parallel",
+                        "6",
+                        "--output-on-failure",
+                        "--output-junit",
+                        str(self.root / "build/test-results/ctest.xml"),
+                    ],
                 )
                 self.assertEqual(
                     self.recorded("ctest.env"),
@@ -90,7 +111,15 @@ source "$SCRIPT"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.recorded("ctest.args"),
-            ["--parallel", "6", "--output-on-failure", "--label-exclude", regex],
+            [
+                "--parallel",
+                "6",
+                "--output-on-failure",
+                "--label-exclude",
+                regex,
+                "--output-junit",
+                str(self.root / "build/test-results/ctest.xml"),
+            ],
         )
 
     def test_junit_report_and_filter_coexist(self):
@@ -105,6 +134,17 @@ source "$SCRIPT"
         )
         self.assertEqual(args[args.index("--label-exclude") + 1], "^nvlink_gpu$")
         self.assertTrue((self.root / report).parent.is_dir())
+
+    def test_ctest_report_must_contain_successful_cases(self):
+        for report in ("empty", "failure"):
+            with self.subTest(report=report):
+                result = self.run_suite(report=report)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("ctest.xml", result.stderr)
+
+    def test_ctest_report_allows_skipped_cases(self):
+        result = self.run_suite(report="skipped")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_port_reservation_preserves_existing_ports(self):
         for existing in ("", "12345,23456-23460"):
