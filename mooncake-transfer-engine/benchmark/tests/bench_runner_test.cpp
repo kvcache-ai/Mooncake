@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -84,19 +85,33 @@ TEST(BenchRunnerTest, WaitsForEveryWorkerAfterAFailure) {
     FakeRunner runner;
     constexpr int kWorkers = 4;
     ASSERT_EQ(runner.startInitiator(kWorkers), 0);
-    std::atomic<int> finished_after_failure{0};
-    const int rc = runner.runInitiatorTasks([&](int thread_id) {
-        if (thread_id == 0) {
-            runner.failTransfer();
-            return -1;
-        }
-        // Still busy when the failure is reported.
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        finished_after_failure.fetch_add(1);
-        return 0;
+    // Workers 1..3 stay blocked until `release`, so they are guaranteed to be
+    // busy when worker 0 reports the failure, whatever the scheduling order.
+    std::promise<void> failed, release;
+    std::shared_future<void> released = release.get_future().share();
+    std::atomic<int> finished{0};
+    auto run = std::async(std::launch::async, [&] {
+        return runner.runInitiatorTasks([&](int thread_id) {
+            if (thread_id == 0) {
+                runner.failTransfer();
+                failed.set_value();
+                return -1;
+            }
+            released.wait();
+            finished.fetch_add(1);
+            return 0;
+        });
     });
-    EXPECT_EQ(rc, -1);
-    EXPECT_EQ(finished_after_failure.load(), kWorkers - 1);
+    failed.get_future().wait();
+    // A correct pool cannot return here: three workers are still blocked. The
+    // old pool returned as soon as the failure was reported.
+    EXPECT_EQ(run.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::timeout)
+        << "runInitiatorTasks() returned while workers were still running";
+    EXPECT_EQ(finished.load(), 0);
+    release.set_value();
+    EXPECT_EQ(run.get(), -1);
+    EXPECT_EQ(finished.load(), kWorkers - 1);
     EXPECT_FALSE(runner.isRunning());
     runner.stopInitiator();
 }
