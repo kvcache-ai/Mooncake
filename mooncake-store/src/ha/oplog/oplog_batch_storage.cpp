@@ -503,15 +503,44 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     return ErrorCode::OK;
 }
 
-ErrorCode OpLogBatchStorage::DeleteBatchesThrough(uint64_t batch_id) {
+ErrorCode OpLogBatchStorage::FindOldestBatchId(
+    std::optional<uint64_t>& batch_id) {
+    batch_id.reset();
     if (!IsValidClusterId()) {
         return ErrorCode::INVALID_PARAMS;
     }
-    // The suffix range starts immediately after the inclusive cutoff, and
-    // already handles UINT64_MAX without overflowing the batch ID.
-    const auto suffix = BuildBatchRecordRange(cluster_id_, batch_id);
-    return backend_.DeleteRange(BuildBatchRecordKey(cluster_id_, 0),
-                                suffix.begin_key);
+
+    const auto range = BuildBatchRecordRange(cluster_id_, 0);
+    std::vector<KvPair> kvs;
+    ErrorCode err = backend_.Range(range.begin_key, range.end_key, 1, kvs);
+    if (err != ErrorCode::OK || kvs.empty()) {
+        return err;
+    }
+    std::string expected_prefix = BuildBatchRecordKey(cluster_id_, 0);
+    expected_prefix.resize(expected_prefix.size() - kOpLogBatchIdWidth);
+    uint64_t parsed_batch_id = 0;
+    if (kvs.front().key.size() !=
+            expected_prefix.size() + kOpLogBatchIdWidth ||
+        kvs.front().key.compare(0, expected_prefix.size(), expected_prefix) !=
+            0 ||
+        !TryParseBatchIdFromKey(kvs.front().key, parsed_batch_id) ||
+        parsed_batch_id == 0) {
+        LOG(ERROR) << "Invalid oldest OpLog batch key: cluster=" << cluster_id_
+                   << ", key=" << kvs.front().key;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    batch_id = parsed_batch_id;
+    return ErrorCode::OK;
+}
+
+ErrorCode OpLogBatchStorage::DeleteBatchesInRange(uint64_t first_id,
+                                                  uint64_t last_id) {
+    if (!IsValidClusterId() || first_id == 0 || first_id > last_id) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto end = BuildBatchRecordRange(cluster_id_, last_id);
+    return backend_.DeleteRange(BuildBatchRecordKey(cluster_id_, first_id),
+                                end.begin_key);
 }
 
 bool OpLogBatchStorage::IsValidClusterId() const { return cluster_id_valid_; }

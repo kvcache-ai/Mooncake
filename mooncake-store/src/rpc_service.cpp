@@ -125,6 +125,20 @@ void WrappedMasterService::SetBatchOpLogTerminalCallback(
     master_service_.SetBatchOpLogTerminalCallback(std::move(callback));
 }
 
+ErrorCode WrappedMasterService::StartBatchOpLogPruningWorker(
+    uint64_t chunk_batch_count, uint64_t max_batches_per_second) {
+    return master_service_.StartBatchOpLogPruningWorker(
+        chunk_batch_count, max_batches_per_second);
+}
+
+void WrappedMasterService::RequestStopBatchOpLogPruningWorker() {
+    master_service_.RequestStopBatchOpLogPruningWorker();
+}
+
+void WrappedMasterService::StopBatchOpLogPruningWorker() {
+    master_service_.StopBatchOpLogPruningWorker();
+}
+
 void WrappedMasterService::StopBatchOpLogWriter() {
     master_service_.StopBatchOpLogWriter();
 }

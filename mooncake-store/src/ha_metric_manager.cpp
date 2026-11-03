@@ -61,6 +61,36 @@ void HAMetricManager::record_snapshot_operation(
     stats.elapsed_us += elapsed;
 }
 
+void HAMetricManager::reset_batch_oplog_pruner_runtime() {
+    std::lock_guard<std::mutex> lock(batch_oplog_pruner_mutex_);
+    batch_oplog_pruner_runtime_ = {};
+}
+
+void HAMetricManager::update_batch_oplog_pruner_state(
+    bool active, uint64_t cursor_batch_id, uint64_t observed_floor_batch_id) {
+    std::lock_guard<std::mutex> lock(batch_oplog_pruner_mutex_);
+    batch_oplog_pruner_runtime_.active = active;
+    batch_oplog_pruner_runtime_.cursor_batch_id = cursor_batch_id;
+    batch_oplog_pruner_runtime_.observed_floor_batch_id =
+        observed_floor_batch_id;
+}
+
+void HAMetricManager::inc_batch_oplog_pruner_chunks_deleted(uint64_t count) {
+    std::lock_guard<std::mutex> lock(batch_oplog_pruner_mutex_);
+    batch_oplog_pruner_runtime_.chunks_deleted_total += count;
+}
+
+void HAMetricManager::inc_batch_oplog_pruner_batch_ids_advanced(
+    uint64_t count) {
+    std::lock_guard<std::mutex> lock(batch_oplog_pruner_mutex_);
+    batch_oplog_pruner_runtime_.batch_ids_advanced_total += count;
+}
+
+void HAMetricManager::inc_batch_oplog_pruner_errors(uint64_t count) {
+    std::lock_guard<std::mutex> lock(batch_oplog_pruner_mutex_);
+    batch_oplog_pruner_runtime_.errors_total += count;
+}
+
 uint64_t HAMetricManager::activate_writer_runtime(
     const WriterRuntimeSnapshot& snapshot) {
     std::lock_guard<std::mutex> lock(writer_runtime_mutex_);
@@ -493,6 +523,35 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(batch_record_retry_total_);
 #endif
     serialize_metric(state_transitions_total_);
+
+    BatchOpLogPrunerRuntime pruner;
+    {
+        std::lock_guard<std::mutex> lock(batch_oplog_pruner_mutex_);
+        pruner = batch_oplog_pruner_runtime_;
+    }
+    const uint64_t pruning_floor_lag =
+        pruner.observed_floor_batch_id > pruner.cursor_batch_id
+            ? pruner.observed_floor_batch_id - pruner.cursor_batch_id
+            : 0;
+    ss << "# TYPE mooncake_ha_batch_oplog_pruner_active gauge\n"
+       << "mooncake_ha_batch_oplog_pruner_active " << (pruner.active ? 1 : 0)
+       << "\n"
+       << "# TYPE mooncake_ha_batch_oplog_pruner_cursor_batch_id gauge\n"
+       << "mooncake_ha_batch_oplog_pruner_cursor_batch_id "
+       << pruner.cursor_batch_id << "\n"
+       << "# TYPE mooncake_ha_batch_oplog_pruner_floor_lag_batch_ids gauge\n"
+       << "mooncake_ha_batch_oplog_pruner_floor_lag_batch_ids "
+       << pruning_floor_lag << "\n"
+       << "# TYPE mooncake_ha_batch_oplog_pruner_chunks_deleted_total counter\n"
+       << "mooncake_ha_batch_oplog_pruner_chunks_deleted_total "
+       << pruner.chunks_deleted_total << "\n"
+       << "# TYPE mooncake_ha_batch_oplog_pruner_batch_ids_advanced_total "
+          "counter\n"
+       << "mooncake_ha_batch_oplog_pruner_batch_ids_advanced_total "
+       << pruner.batch_ids_advanced_total << "\n"
+       << "# TYPE mooncake_ha_batch_oplog_pruner_errors_total counter\n"
+       << "mooncake_ha_batch_oplog_pruner_errors_total "
+       << pruner.errors_total << "\n";
 
     {
         SnapshotRuntime snapshot;

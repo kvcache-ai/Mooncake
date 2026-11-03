@@ -10,6 +10,8 @@
 
 #include "crc32c.h"
 #include "ha/kv/ha_kv_backend.h"
+#include "ha/oplog/batch_oplog_pruning_worker.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
@@ -260,7 +262,7 @@ TEST_F(PruningTest, MissingWeightArtifactDoesNotAdvanceFloorOrDeleteLog) {
     }
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ("10", backend.values.at(floor_key));
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, FirstSnapshotDoesNotPublishFloor) {
@@ -273,15 +275,15 @@ TEST_F(PruningTest, FirstSnapshotDoesNotPublishFloor) {
     EXPECT_EQ(0u, backend.delete_count);
 }
 
-TEST_F(PruningTest, PublishesFloorBeforeDeletionAndRotates) {
-    backend.before_delete = [&] { EXPECT_EQ("10", backend.values[floor_key]); };
+TEST_F(PruningTest, PublishesFloorAndLeavesPhysicalDeletionToWorker) {
     ASSERT_EQ(ErrorCode::OK, Run());
-    EXPECT_EQ(1u, backend.delete_count);
-    backend.before_delete = [&] { EXPECT_EQ("20", backend.values[floor_key]); };
+    EXPECT_EQ("10", backend.values[floor_key]);
+    EXPECT_EQ(0u, backend.delete_count);
     ASSERT_EQ(ErrorCode::OK, BatchOpLogSnapshotPublisher(backend, "cluster")
                                  .Publish(*lease, AddSnapshot(store, 30)));
     ASSERT_EQ(ErrorCode::OK, Run());
-    EXPECT_EQ(2u, backend.delete_count);
+    EXPECT_EQ("20", backend.values[floor_key]);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, RequiresIndependentOrderedSnapshots) {
@@ -357,7 +359,7 @@ TEST_F(PruningTest, UnsupportedChecksumNeverDownloadsChunkBodies) {
     store.checksums = false;
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ(0u, store.buffer_downloads);
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, CasFencesPointersLeaseAndRawFloor) {
@@ -388,7 +390,7 @@ TEST_F(PruningTest, FailedOrUnknownTxnDoesNotDelete) {
     }
 }
 
-TEST_F(PruningTest, DeleteFailureKeepsFloorAndRetries) {
+TEST_F(PruningTest, FloorPublicationDoesNotPerformPhysicalDeletion) {
     auto& metrics = HAMetricManager::instance();
     const auto before = metrics.get_snapshot_runtime().floor_advances_total;
     const auto errors =
@@ -396,22 +398,22 @@ TEST_F(PruningTest, DeleteFailureKeepsFloorAndRetries) {
             .get_snapshot_operation(HAMetricManager::SnapshotOperation::Prune)
             .errors;
     backend.delete_error = ErrorCode::ETCD_OPERATION_ERROR;
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, Run());
+    EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ("10", backend.values[floor_key]);
     EXPECT_EQ(10u, metrics.get_snapshot_runtime().compaction_floor);
     EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
-    EXPECT_EQ(errors + 1, metrics
+    EXPECT_EQ(errors, metrics
                               .get_snapshot_operation(
                                   HAMetricManager::SnapshotOperation::Prune)
                               .errors);
     backend.delete_error = ErrorCode::OK;
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
-    EXPECT_EQ(errors + 1, metrics
+    EXPECT_EQ(errors, metrics
                               .get_snapshot_operation(
                                   HAMetricManager::SnapshotOperation::Prune)
                               .errors);
-    EXPECT_EQ(2u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
     EXPECT_EQ("10", backend.values[floor_key]);
 }
 
@@ -423,7 +425,7 @@ TEST_F(PruningTest, CrashAfterCasLeavesReaderVisibleFloorForRetry) {
     EXPECT_EQ(0u, backend.delete_count);
     backend.after_txn = {};
     EXPECT_EQ(ErrorCode::OK, Run());
-    EXPECT_EQ(1u, backend.delete_count);
+    EXPECT_EQ(0u, backend.delete_count);
 }
 
 TEST_F(PruningTest, FloorNeverRegressesAndParsingIsStrict) {
@@ -451,7 +453,7 @@ TEST_F(PruningTest, CancelledOrReleasedLeaseDoesNotDelete) {
 }
 
 #ifdef STORE_USE_ETCD
-TEST(PruningRealEtcdTest, FloorPrecedesInclusiveDeleteAndProtectsControlKeys) {
+TEST(PruningRealEtcdTest, FloorPrecedesBoundedDeleteAndProtectsControlKeys) {
     constexpr char endpoints[] = "127.0.0.1:2379";
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::ConnectToEtcdStoreClient(endpoints));
     const std::string cluster = "n12-test-" + std::to_string(getpid());
@@ -472,7 +474,7 @@ TEST(PruningRealEtcdTest, FloorPrecedesInclusiveDeleteAndProtectsControlKeys) {
     ASSERT_EQ(
         ErrorCode::OK,
         publisher.Publish(lease, AddSnapshot(store, 20, lease.lease_id())));
-    for (uint64_t id : {0, 1, 10, 11, 20, 21})
+    for (uint64_t id : {1, 10, 11, 20, 21})
         ASSERT_EQ(ErrorCode::OK,
                   backend.Put(BuildBatchRecordKey(cluster, id), "batch"));
     ASSERT_EQ(ErrorCode::OK,
@@ -485,7 +487,12 @@ TEST(PruningRealEtcdTest, FloorPrecedesInclusiveDeleteAndProtectsControlKeys) {
         backend.Get(ha::BuildBatchOpLogSnapshotCompactionFloorKey(cluster),
                     ignored));
     EXPECT_EQ("10", ignored);
-    for (uint64_t id : {0, 1, 10})
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, 10, 50);
+    bool deleted_chunk = false;
+    ASSERT_EQ(ErrorCode::OK, worker.RunOneChunk(deleted_chunk));
+    ASSERT_TRUE(deleted_chunk);
+    for (uint64_t id : {1, 10})
         EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
                   backend.Get(BuildBatchRecordKey(cluster, id), ignored));
     for (const auto& key :

@@ -393,7 +393,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest,
 
 class SnapshotMaintenanceTest : public ::testing::TestWithParam<int> {};
 
-TEST_P(SnapshotMaintenanceTest, PublishesAndPrunesDespiteGcFailure) {
+TEST_P(SnapshotMaintenanceTest, PublishesFloorAndAdvancesDespiteGcFailure) {
     auto backend = std::make_shared<RecordingBackend>();
     ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey("cluster", 1),
                                           EncodeOpLogBatchRecord(MakeBatch())));
@@ -473,7 +473,7 @@ TEST_P(SnapshotMaintenanceTest, PublishesAndPrunesDespiteGcFailure) {
     ASSERT_EQ(2u, standby.GetLastAppliedBatchOpLogSnapshotPrefix()->batch_id);
     ASSERT_EQ(ErrorCode::OK, coordinator.RunOnce());
     EXPECT_EQ(2u, coordinator.GetStatus().attempts);
-    EXPECT_EQ(1u, backend->delete_count);
+    EXPECT_EQ(0u, backend->delete_count);
     const auto runtime = metrics.get_snapshot_runtime();
     EXPECT_TRUE(runtime.latest_created_at_ms.has_value());
     EXPECT_TRUE(runtime.fallback_created_at_ms.has_value());
@@ -490,7 +490,7 @@ TEST_P(SnapshotMaintenanceTest, PublishesAndPrunesDespiteGcFailure) {
               metrics.get_snapshot_operation(Operation::Gc).errors);
     EXPECT_EQ(prune_before.errors,
               metrics.get_snapshot_operation(Operation::Prune).errors);
-    EXPECT_FALSE(backend->Contains(BuildBatchRecordKey("cluster", 1)));
+    EXPECT_TRUE(backend->Contains(BuildBatchRecordKey("cluster", 1)));
     EXPECT_TRUE(backend->Contains(BuildBatchRecordKey("cluster", 2)));
     standby.Stop();
 }

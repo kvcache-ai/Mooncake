@@ -6,7 +6,6 @@
 
 #include "crc32c.h"
 #include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_storage.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
@@ -190,14 +189,7 @@ ErrorCode BatchOpLogPruningCoordinator::Run(
             std::max(metrics.compaction_floor, candidate);
         metrics.floor_advances_total += candidate > floor;
     });
-    // Even if the lease is lost now, this range has already been advertised to
-    // readers. A crash or failed delete leaves the floor in place; a later
-    // successful publication can safely repeat this bounded deletion.
-    if (stopped()) return metric_timer.Success(ErrorCode::OK);
-    const auto delete_error = OpLogBatchStorage(cluster_id_, backend_)
-                                  .DeleteBatchesThrough(candidate);
-    metric_timer.error = static_cast<int64_t>(delete_error);
-    return delete_error;
+    return metric_timer.Success(ErrorCode::OK);
 }
 
 }  // namespace mooncake

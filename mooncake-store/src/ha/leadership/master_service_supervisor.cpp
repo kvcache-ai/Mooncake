@@ -759,6 +759,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             [&](std::unique_ptr<LeadershipMonitorHandle>& monitor) {
                 worker_pool.reset();
                 StopLeadershipMonitor(monitor);
+                wrapped_master_service->RequestStopBatchOpLogPruningWorker();
+                wrapped_master_service->StopBatchOpLogPruningWorker();
                 wrapped_master_service->StopBatchOpLogWriter();
                 DeactivateServingState(admin_server, label_reconciler);
                 // Local cleanup requests finish or time out before the lease
@@ -785,6 +787,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                << toString(state.error);
                     DeactivateServingState(admin_server, label_reconciler);
                     SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
+                    wrapped_master_service
+                        ->RequestStopBatchOpLogPruningWorker();
                     server.stop();
                 });
             });
@@ -873,6 +877,33 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
+        if (config.enable_oplog_snapshot) {
+            const ErrorCode pruning_error =
+                wrapped_master_service->StartBatchOpLogPruningWorker(
+                    config.oplog_prune_chunk_batch_count,
+                    config.oplog_prune_max_batches_per_second);
+            if (pruning_error != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to start batch OpLog pruning worker: "
+                           << toString(pruning_error);
+                wrapped_master_service->StopBatchOpLogPruningWorker();
+                release_service();
+                DeactivateServingState(admin_server, label_reconciler);
+                return_to_standby(leadership_session->view);
+                if (HandleLeadershipPhaseError(
+                        "batch OpLog pruning worker startup failure",
+                        "start batch OpLog pruning worker",
+                        release_term("pruning_start"), pruning_error,
+                        spec.type)) {
+                    return -1;
+                }
+                continue;
+            }
+            LOG(INFO) << "Batch OpLog pruning worker started, chunk_batches="
+                      << config.oplog_prune_chunk_batch_count
+                      << ", max_batches_per_second="
+                      << config.oplog_prune_max_batches_per_second;
+        }
+
         worker_pool = std::make_unique<RpcWorkerPool>(
             config.handler_worker_thread_num != 0
                 ? config.handler_worker_thread_num
@@ -882,13 +913,16 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
             *leadership_session, [&server, &admin_server, &serving_state,
-                                  &label_reconciler](auto reason) {
+                                  &label_reconciler,
+                                  &wrapped_master_service](auto reason) {
                 serving_state.RequestShutdown([&]() {
                     admin_server.SetServiceAvailable(false);
                     label_reconciler.SetLeader(false);
                     SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
                     LOG(INFO) << "Trying to stop server, reason="
                               << LeadershipLossReasonToString(reason);
+                    wrapped_master_service
+                        ->RequestStopBatchOpLogPruningWorker();
                     server.stop();
                 });
             });
@@ -1025,6 +1059,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);
+        wrapped_master_service->RequestStopBatchOpLogPruningWorker();
+        wrapped_master_service->StopBatchOpLogPruningWorker();
         wrapped_master_service->StopBatchOpLogWriter();
         DeactivateServingState(admin_server, label_reconciler);
         wrapped_master_service->StopHttpMetadataCleanup();

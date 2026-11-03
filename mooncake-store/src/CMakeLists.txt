@@ -92,6 +92,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
     ha/oplog/oplog_batch_storage.cpp
+    ha/oplog/batch_oplog_pruning_worker.cpp
     ha/oplog/oplog_batch_standby_reader.cpp
     ha/oplog/oplog_batch_types.cpp
     ha/oplog/ordered_oplog_writer.cpp
