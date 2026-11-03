@@ -552,7 +552,6 @@ jobs:
       src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
       tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
       store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
-      xpu: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.xpu }}
       docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@v4
@@ -606,19 +605,6 @@ jobs:
             docs:
               - 'docs/**'
               - '.github/workflows/ci.yml'
-            xpu:
-              - 'mooncake-*/**'
-              - 'python/**'
-              - 'extern/**'
-              - 'cmake/**'
-              - 'CMakeLists.txt'
-              - 'dependencies.sh'
-              - '.gitmodules'
-              - 'scripts/**'
-              - '.github/actions/**'
-              - '.github/workflows/ci.yml'
-              - '.github/workflows/ci_xpu.yml'
-              - '.github/workflows/nightly.yml'
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
@@ -662,7 +648,7 @@ jobs:
 
   build-wheel-xpu:
     needs: [spell-check, clang-format, check-paths]
-    if: needs.check-paths.outputs.xpu == 'true'
+    if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_xpu.yml
 
   tent-ci:
@@ -1053,16 +1039,11 @@ jobs:
             ${{ needs.build-wheel-cu13-arm64.result }}
             ${{ needs.build-wheel-efa.result }}
             ${{ needs.build-wheel-rocm.result }}
+            ${{ needs.build-wheel-xpu.result }}
         run: |
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1
           done
-
-      - name: Check XPU build and packaging
-        env:
-          EXPECTED: ${{ needs.check-paths.outputs.xpu == 'true' && 'success' || 'skipped' }}
-          RESULT: ${{ needs.build-wheel-xpu.result }}
-        run: test "$RESULT" = "$EXPECTED"
 
       - name: Check TENT jobs
         env:
