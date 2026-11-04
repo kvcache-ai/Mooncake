@@ -470,6 +470,34 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
     EXPECT_EQ(ErrorCode::OK, status.last_error);
 }
 
+// polled_once must go false -> true only once a poll has updated the lag
+// inputs, so a reader that sees it also sees a lag from that poll.
+TEST_F(HotStandbyServiceTest, TestGetSyncStatus_PolledOnceFollowsFirstPoll) {
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 5);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    EXPECT_FALSE(service_->GetSyncStatus().polled_once);
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+
+    bool saw_polled = false;
+    for (int i = 0; i < 2000 && !saw_polled; ++i) {
+        const StandbySyncStatus status = service_->GetSyncStatus();
+        if (status.polled_once) {
+            saw_polled = true;
+            // The first poll applied the whole batch, so the durable head is
+            // known and the standby is at it.
+            EXPECT_GE(status.primary_seq_id, 5u);
+            EXPECT_GE(status.applied_seq_id, 5u);
+            EXPECT_EQ(0u, status.lag_entries);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(saw_polled);
+}
+
 // ========== 6.1.4 Promotion tests ==========
 
 TEST_F(HotStandbyServiceTest, TestPromote_WhenNotReady) {

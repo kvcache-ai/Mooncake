@@ -33,6 +33,10 @@ namespace ha {
 namespace {
 
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
+// How long a standby that is far behind the OpLog (a cold replacement pod)
+// stays out of an election that a warm standby can win. After this it competes
+// anyway, so a cluster with no warm standby still elects a leader.
+constexpr auto kFarBehindElectionHoldback = std::chrono::seconds(10);
 constexpr auto kRenewCheckInterval = std::chrono::seconds(1);
 constexpr auto kSupervisorRetryInterval = std::chrono::seconds(1);
 constexpr auto kLabelReconcileRetryInterval = std::chrono::seconds(1);
@@ -477,6 +481,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
     // Result of the ordinary release that ended the previous term, for a
     // request observed before the next standby check.
     std::optional<ErrorCode> released_last_term;
+    // When the view was first seen empty, for the far-behind holdback below.
+    // It lives outside the per-pass coordinator so a transient coordinator
+    // error does not restart the holdback. Reset when a leader holds the view
+    // or this master wins an election.
+    std::optional<std::chrono::steady_clock::time_point> empty_view_since;
 
     if (ShutdownObserved(shutdown_requested)) {
         return shutdown_exit("starting", ShutdownLease{});
@@ -524,9 +533,45 @@ int RunSupervisorLoop(const HABackendSpec& spec,
 
             UpdateObservedLeader(admin_server, *standby_controller,
                                  current_view.value());
+            if (current_view.value().has_value()) {
+                empty_view_since.reset();
+            }
             if (!current_view.value().has_value()) {
                 if (ShutdownObserved(shutdown_requested)) {
                     return shutdown_exit("candidate", ShutdownLease{});
+                }
+                // A cold standby (empty state, millions of OpLog entries
+                // behind) that wins the election cannot catch up and fails the
+                // promotion after about 30 s, while a warm standby that lost by
+                // milliseconds waits. Stay out of the election for a bounded
+                // time so the warm standby takes it.
+                if (standby_controller->IsFarBehind()) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!empty_view_since.has_value()) {
+                        empty_view_since = now;
+                        LOG(INFO) << "Leader view is empty and this standby is "
+                                  << "far behind the OpLog; holding back from "
+                                  << "the election for up to "
+                                  << kFarBehindElectionHoldback.count() << " s";
+                    }
+                    if (now - *empty_view_since < kFarBehindElectionHoldback) {
+                        auto held = leader_coordinator.WaitForViewChange(
+                            std::nullopt, kAcquireRetryInterval);
+                        if (!held) {
+                            if (HandleSupervisorError(
+                                    "wait for leader view change", held.error(),
+                                    spec.type)) {
+                                return -1;
+                            }
+                            break;
+                        }
+                        ApplyCurrentView(admin_server, *standby_controller,
+                                         *held);
+                        if (held->current_view.has_value()) {
+                            empty_view_since.reset();
+                        }
+                        continue;
+                    }
                 }
                 auto acquire = leader_coordinator.TryAcquireLeadership(
                     config.local_hostname);
@@ -547,11 +592,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 if (acquire->observed_view.has_value()) {
                     UpdateObservedLeader(admin_server, *standby_controller,
                                          acquire->observed_view);
+                    empty_view_since.reset();
                 }
 
                 if (acquire->status == AcquireLeadershipStatus::ACQUIRED &&
                     acquire->session.has_value()) {
                     leadership_session = *acquire->session;
+                    empty_view_since.reset();
                     admin_server.SetObservedLeader(leadership_session->view);
                     break;
                 }
@@ -576,6 +623,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     break;
                 }
                 ApplyCurrentView(admin_server, *standby_controller, *wait);
+                if (wait->current_view.has_value()) {
+                    empty_view_since.reset();
+                }
                 continue;
             }
 

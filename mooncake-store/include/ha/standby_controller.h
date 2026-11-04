@@ -9,6 +9,7 @@
 
 #include "ha/ha_types.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
+#include "hot_standby_service.h"
 #include "master_config.h"
 #include "metadata_store.h"
 #include "types.h"
@@ -36,6 +37,12 @@ struct PromotionContext {
     ViewVersionId producer_view_version{0};
     ReplicaID max_replica_id{0};
 };
+
+// True when a standby is too far behind the OpLog to win an election usefully:
+// it is still bootstrapping or recovering, has not completed one OpLog poll
+// (so its lag is unknown), or lags by more than max_lag_entries.
+bool IsStandbyFarBehind(const StandbySyncStatus& status,
+                        uint64_t max_lag_entries);
 
 class StandbyController {
    public:
@@ -66,6 +73,12 @@ class StandbyController {
         const std::optional<MasterView>& observed_leader) = 0;
 
     virtual MasterRuntimeState GetStandbyRuntimeState() const = 0;
+
+    // True while this standby is too far behind the leader's OpLog to be a
+    // useful successor: still bootstrapping or recovering, or replaying with a
+    // lag above the readiness threshold. The supervisor holds back from the
+    // election for a bounded time while this is true, so a warm standby wins.
+    virtual bool IsFarBehind() const { return false; }
 
     virtual void SetStandbyRuntimeStateCallback(
         RuntimeStateCallback callback) = 0;
