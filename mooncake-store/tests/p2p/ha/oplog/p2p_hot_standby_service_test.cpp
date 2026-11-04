@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <xxhash.h>
 
@@ -346,6 +348,91 @@ TEST_F(P2PHotStandbyServiceTest,
     EXPECT_EQ(chunk.objects.front().key, "before-snapshot");
     EXPECT_EQ(snapshot.EndSnapshot({begin.session_id}), toInt(ErrorCode::OK));
 }
+
+TEST_F(P2PHotStandbyServiceTest, PrimarySnapshotSourceServesCurrentMetadata) {
+    P2PMasterService master(MakeMasterConfig());
+    const UUID client_id{23, 23};
+    const UUID segment_id{24, 24};
+    RegisterClient(master, client_id, MakeSegment(segment_id));
+    PublishRoute(master, "primary-snapshot-key", client_id, segment_id, 16384);
+
+    P2PStandbySnapshotService::Source source =
+        MakeP2PPrimarySnapshotSource(kClusterId, &master);
+    P2PStandbySnapshotService snapshot(std::move(source));
+    auto begin = snapshot.BeginSnapshot({kClusterId});
+    ASSERT_EQ(fromInt(begin.error_code), ErrorCode::OK);
+    EXPECT_EQ(begin.baseline_sequence_id, 2);
+    EXPECT_EQ(begin.object_count, 1);
+    EXPECT_EQ(begin.client_count, 1);
+
+    auto chunk = snapshot.GetSnapshotChunk(
+        {begin.session_id, /*object_offset=*/0, /*client_offset=*/0,
+         /*limit=*/1});
+    ASSERT_EQ(fromInt(chunk.error_code), ErrorCode::OK);
+    ASSERT_TRUE(chunk.done);
+    ASSERT_EQ(chunk.clients.size(), 1);
+    EXPECT_EQ(chunk.clients.front().client_id, client_id);
+    EXPECT_EQ(chunk.clients.front().info.ip_address, "127.0.0.1");
+    EXPECT_EQ(chunk.clients.front().info.rpc_port, 50051);
+    ASSERT_EQ(chunk.clients.front().info.segments.size(), 1);
+    EXPECT_EQ(chunk.clients.front().info.segments.front().id, segment_id);
+
+    ASSERT_EQ(chunk.objects.size(), 1);
+    EXPECT_EQ(chunk.objects.front().key, "primary-snapshot-key");
+    EXPECT_EQ(chunk.objects.front().route.object_size, 16384);
+    ASSERT_EQ(chunk.objects.front().route.locations.size(), 1);
+    EXPECT_EQ(chunk.objects.front().route.locations.front().client_id,
+              client_id);
+    EXPECT_EQ(chunk.objects.front().route.locations.front().segment_id,
+              segment_id);
+}
+
+#ifdef STORE_USE_REDIS
+TEST_F(P2PHotStandbyServiceTest,
+       SelectSnapshotSourcesPrefersStandbyAndFallsBackToPrimary) {
+    auto make_source = [](std::string instance_id, std::string role,
+                          bool snapshot_ready, uint64_t applied_sequence_id,
+                          std::string snapshot_endpoint) {
+        RedisMasterRegistryEntry entry;
+        entry.instance_id = std::move(instance_id);
+        entry.snapshot_endpoint = std::move(snapshot_endpoint);
+        entry.role = std::move(role);
+        entry.snapshot_ready = snapshot_ready;
+        entry.applied_sequence_id = applied_sequence_id;
+        return entry;
+    };
+
+    auto standby_selection = SelectP2PSnapshotSources(
+        {make_source("primary-high", "primary", false, 900, "primary:52051"),
+         make_source("standby-low", "standby", true, 300, "standby-low:52051"),
+         make_source("standby-high", "standby", true, 500,
+                     "standby-high:52051"),
+         make_source("self", "standby", true, 700, "self:52051"),
+         make_source("standby-not-ready", "standby", false, 800,
+                     "not-ready:52051"),
+         make_source("standby-stale", "standby", true, 99, "stale:52051")},
+        "self", 100);
+    EXPECT_FALSE(standby_selection.used_primary_fallback);
+    EXPECT_EQ(
+        standby_selection.endpoints,
+        (std::vector<std::string>{"standby-high:52051", "standby-low:52051"}));
+
+    auto primary_selection = SelectP2PSnapshotSources(
+        {make_source("primary-low", "primary", false, 200, "primary-low:52051"),
+         make_source("primary-high", "primary", false, 600,
+                     "primary-high:52051"),
+         make_source("self", "primary", false, 800, "self:52051"),
+         make_source("standby-not-ready", "standby", false, 900,
+                     "not-ready:52051"),
+         make_source("standby-no-endpoint", "standby", true, 1000, ""),
+         make_source("standby-stale", "standby", true, 99, "stale:52051")},
+        "self", 100);
+    EXPECT_TRUE(primary_selection.used_primary_fallback);
+    EXPECT_EQ(
+        primary_selection.endpoints,
+        (std::vector<std::string>{"primary-high:52051", "primary-low:52051"}));
+}
+#endif
 
 TEST_F(P2PHotStandbyServiceTest,
        SnapshotRejectsInvalidChunksAndLimitsSessions) {

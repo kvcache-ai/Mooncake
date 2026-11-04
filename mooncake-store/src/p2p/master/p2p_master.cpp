@@ -356,9 +356,62 @@ int P2PMaster::RunWithHA() {
             }
         }
 
+        std::unique_ptr<P2PStandbySnapshotService> primary_snapshot_service;
+        std::unique_ptr<coro_rpc::coro_rpc_server> primary_snapshot_server;
 #ifdef STORE_USE_REDIS
-        auto mark_primary = [&master_registry_heartbeat] {
+        const bool redis_election =
+            config_.ha.election_backend == ElectionBackend::REDIS;
+        const bool dedicated_heartbeat = config_.rpc.heartbeat_port > 0;
+        const bool invalid_snapshot_port =
+            config_.ha.snapshot_service_port == config_.rpc.port ||
+            (dedicated_heartbeat &&
+             config_.ha.snapshot_service_port == config_.rpc.heartbeat_port);
+        if (redis_election && config_.oplog.enabled &&
+            config_.ha.snapshot_service_port > 0 && invalid_snapshot_port) {
+            LOG(ERROR) << "P2P primary snapshot fallback port conflicts with "
+                          "active RPC port";
+            master_view->CancelKeepAlive(lease_id);
+            keep_leader_thread.join();
+            return -1;
+        }
+        if (redis_election && config_.oplog.enabled &&
+            config_.ha.snapshot_service_port > 0) {
+            auto* primary_service = &active_service->GetMasterService();
+            primary_snapshot_service =
+                std::make_unique<P2PStandbySnapshotService>(
+                    MakeP2PPrimarySnapshotSource(config_.cluster_id,
+                                                 primary_service));
+            primary_snapshot_server =
+                std::make_unique<coro_rpc::coro_rpc_server>(
+                    1, config_.ha.snapshot_service_port, config_.rpc.address);
+            RegisterP2PStandbySnapshotRpcHandlers(
+                *primary_snapshot_server, primary_snapshot_service.get());
+            auto snapshot_result = primary_snapshot_server->async_start();
+            if (snapshot_result.hasResult()) {
+                LOG(ERROR) << "P2P primary snapshot fallback server failed"
+                           << ", port=" << config_.ha.snapshot_service_port;
+                primary_snapshot_server->stop();
+                primary_snapshot_server.reset();
+                primary_snapshot_service.reset();
+                master_view->CancelKeepAlive(lease_id);
+                keep_leader_thread.join();
+                return -1;
+            }
+            LOG(INFO) << "P2P primary snapshot fallback server started"
+                      << ", port=" << config_.ha.snapshot_service_port;
+        }
+#endif
+
+#ifdef STORE_USE_REDIS
+        auto mark_primary = [&master_registry_heartbeat,
+                             primary_service =
+                                 &active_service->GetMasterService()] {
             if (master_registry_heartbeat) {
+                master_registry_heartbeat->SetAppliedSequenceProvider(
+                    [primary_service] {
+                        return primary_service->GetLatestOpLogSequenceId();
+                    });
+                master_registry_heartbeat->SetSnapshotReadyProvider({});
                 master_registry_heartbeat->UpdateRole("primary", false);
             }
         };
@@ -371,6 +424,17 @@ int P2PMaster::RunWithHA() {
                 primary_oplog_manager.load(std::memory_order_acquire)) {
             manager->StopWriting();
         }
+        if (primary_snapshot_server) {
+            primary_snapshot_server->stop();
+        }
+        primary_snapshot_server.reset();
+        primary_snapshot_service.reset();
+#ifdef STORE_USE_REDIS
+        if (master_registry_heartbeat) {
+            master_registry_heartbeat->SetAppliedSequenceProvider({});
+            master_registry_heartbeat->SetSnapshotReadyProvider({});
+        }
+#endif
         active_service.reset();
         master_view->CancelKeepAlive(lease_id);
         keep_leader_thread.join();

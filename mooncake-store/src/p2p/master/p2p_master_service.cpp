@@ -415,6 +415,62 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
     return ErrorCode::OK;
 }
 
+uint64_t P2PMasterService::GetLatestOpLogSequenceId() const {
+    auto* manager = GetOpLogManager();
+    return manager ? manager->GetLastSequenceId() : 0;
+}
+
+std::vector<std::string> P2PMasterService::ListSnapshotObjectKeys() const {
+    return ListRouteKeys();
+}
+
+std::vector<UUID> P2PMasterService::ListSnapshotClientIds() const {
+    auto clients = client_manager_->GetAllClients();
+    std::vector<UUID> ids;
+    ids.reserve(clients.size());
+    for (const auto& client : clients) {
+        ids.push_back(client->get_client_id());
+    }
+    return ids;
+}
+
+std::optional<P2PStandbyRouteEntry> P2PMasterService::GetSnapshotObjectMetadata(
+    const std::string& key) const {
+    auto route = GetRouteSnapshot(key);
+    if (!route) {
+        return std::nullopt;
+    }
+
+    P2PStandbyRouteEntry snapshot_route;
+    snapshot_route.object_size = route->object_size;
+    snapshot_route.locations = std::move(route->locations);
+    snapshot_route.last_sequence_id = GetLatestOpLogSequenceId();
+    return snapshot_route;
+}
+
+std::optional<P2PStandbyClientInfo> P2PMasterService::GetSnapshotClientInfo(
+    const UUID& client_id) const {
+    auto client = client_manager_->GetClient(client_id);
+    if (!client) {
+        return std::nullopt;
+    }
+    auto segments = client->GetSegments();
+    if (!segments.has_value()) {
+        LOG(WARNING) << "P2PMasterService: failed to list client segments "
+                        "for snapshot"
+                     << ", client_id=" << client_id
+                     << ", error=" << toString(segments.error());
+        return std::nullopt;
+    }
+
+    P2PStandbyClientInfo info;
+    info.client_id = client_id;
+    info.ip_address = client->get_ip_address();
+    info.rpc_port = client->get_rpc_port();
+    info.segments = std::move(segments.value());
+    return info;
+}
+
 auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
     -> tl::expected<ViewVersionId, ErrorCode> {
     if (req.ip_address.empty() || req.rpc_port == 0) {

@@ -6,11 +6,14 @@
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <utility>
 
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "p2p/ha/oplog/p2p_hot_standby_service.h"
+#include "p2p/master/p2p_master_service.h"
 #ifdef STORE_USE_REDIS
 #include "p2p/ha/redis_util.h"
 #endif
@@ -22,11 +25,47 @@ namespace {
 constexpr auto kSnapshotSessionIdleTimeout = std::chrono::minutes(5);
 constexpr auto kSnapshotSessionCleanupInterval = std::chrono::minutes(1);
 
+bool HasValidSnapshotSource(const P2PStandbySnapshotService::Source& source) {
+    return source.get_cluster_id && source.is_ready &&
+           source.get_baseline_sequence_id && source.list_object_keys &&
+           source.list_client_ids && source.get_object_metadata &&
+           source.get_client_info;
+}
+
+P2PStandbySnapshotService::Source MakeStandbySnapshotSource(
+    P2PHotStandbyService* standby) {
+    P2PStandbySnapshotService::Source source;
+    if (!standby) {
+        return source;
+    }
+    source.get_cluster_id = [standby] { return standby->GetClusterId(); };
+    source.is_ready = [standby] { return standby->IsReadyForSnapshot(); };
+    source.get_baseline_sequence_id = [standby] {
+        return standby->GetLatestAppliedSequenceId();
+    };
+    source.list_object_keys = [standby] {
+        return standby->GetMetadataStore()->ListRouteKeys();
+    };
+    source.list_client_ids = [standby] {
+        return standby->GetMetadataStore()->ListClientIds();
+    };
+    source.get_object_metadata = [standby](const std::string& key) {
+        return standby->GetMetadataStore()->GetRoute(key);
+    };
+    source.get_client_info = [standby](const UUID& client_id) {
+        return standby->GetMetadataStore()->GetClientInfo(client_id);
+    };
+    return source;
+}
+
 }  // namespace
 
 P2PStandbySnapshotService::P2PStandbySnapshotService(
     P2PHotStandbyService* standby)
-    : standby_(standby), cleanup_thread_([this] { CleanupLoop(); }) {}
+    : P2PStandbySnapshotService(MakeStandbySnapshotSource(standby)) {}
+
+P2PStandbySnapshotService::P2PStandbySnapshotService(Source source)
+    : source_(std::move(source)), cleanup_thread_([this] { CleanupLoop(); }) {}
 
 P2PStandbySnapshotService::~P2PStandbySnapshotService() {
     {
@@ -42,17 +81,17 @@ P2PStandbySnapshotService::~P2PStandbySnapshotService() {
 BeginStandbySnapshotResponse P2PStandbySnapshotService::BeginSnapshot(
     const BeginStandbySnapshotRequest& request) {
     BeginStandbySnapshotResponse response;
-    const bool has_standby = standby_ != nullptr;
+    const bool has_source = HasValidSnapshotSource(source_);
     const std::string local_cluster_id =
-        has_standby ? standby_->GetClusterId() : "";
-    const bool snapshot_ready = has_standby &&
+        has_source ? source_.get_cluster_id() : "";
+    const bool snapshot_ready = has_source &&
                                 request.cluster_id == local_cluster_id &&
-                                standby_->IsReadyForSnapshot();
+                                source_.is_ready();
     if (!snapshot_ready) {
         LOG(WARNING) << "Standby snapshot: BeginSnapshot rejected"
                      << ", request_cluster_id=" << request.cluster_id
                      << ", local_cluster_id=" << local_cluster_id
-                     << ", has_standby=" << has_standby;
+                     << ", has_source=" << has_source;
         response.error_code = toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         return response;
     }
@@ -70,10 +109,9 @@ BeginStandbySnapshotResponse P2PStandbySnapshotService::BeginSnapshot(
     // reflected. This is intentional: P2P metadata OpLog operations are
     // designed to be idempotent, and replay from baseline_sequence_id + 1
     // reconciles the snapshot for the asynchronous HA consistency model.
-    session.baseline_sequence_id = standby_->GetLatestAppliedSequenceId();
-    auto* store = standby_->GetMetadataStore();
-    session.object_keys = store->ListRouteKeys();
-    session.client_ids = store->ListClientIds();
+    session.baseline_sequence_id = source_.get_baseline_sequence_id();
+    session.object_keys = source_.list_object_keys();
+    session.client_ids = source_.list_client_ids();
     session.last_access = std::chrono::steady_clock::now();
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -102,12 +140,13 @@ BeginStandbySnapshotResponse P2PStandbySnapshotService::BeginSnapshot(
 StandbySnapshotChunkResponse P2PStandbySnapshotService::GetSnapshotChunk(
     const StandbySnapshotChunkRequest& request) {
     StandbySnapshotChunkResponse response;
-    if (!standby_ || request.limit == 0 ||
+    const bool has_source = HasValidSnapshotSource(source_);
+    if (!has_source || request.limit == 0 ||
         request.limit > kMaxStandbySnapshotChunkSize) {
         LOG(WARNING) << "Standby snapshot: GetSnapshotChunk rejected, invalid "
                         "request"
                      << ", session_id=" << request.session_id
-                     << ", has_standby=" << (standby_ != nullptr)
+                     << ", has_source=" << has_source
                      << ", limit=" << request.limit
                      << ", max_limit=" << kMaxStandbySnapshotChunkSize;
         response.error_code = toInt(ErrorCode::INVALID_PARAMS);
@@ -147,8 +186,7 @@ StandbySnapshotChunkResponse P2PStandbySnapshotService::GetSnapshotChunk(
         std::min<size_t>(request.limit,
                          session.object_keys.size() - object_offset);
     for (size_t i = object_offset; i < object_end; ++i) {
-        auto route =
-            standby_->GetMetadataStore()->GetRoute(session.object_keys[i]);
+        auto route = source_.get_object_metadata(session.object_keys[i]);
         if (route) {
             response.objects.push_back(
                 {session.object_keys[i], std::move(*route)});
@@ -161,8 +199,7 @@ StandbySnapshotChunkResponse P2PStandbySnapshotService::GetSnapshotChunk(
         std::min<size_t>(request.limit,
                          session.client_ids.size() - client_offset);
     for (size_t i = client_offset; i < client_end; ++i) {
-        auto info =
-            standby_->GetMetadataStore()->GetClientInfo(session.client_ids[i]);
+        auto info = source_.get_client_info(session.client_ids[i]);
         if (info) {
             response.clients.push_back(
                 {session.client_ids[i], std::move(*info)});
@@ -203,6 +240,43 @@ void P2PStandbySnapshotService::CleanupLoop() {
             CleanupExpiredSessionsLocked();
         }
     }
+}
+
+P2PStandbySnapshotService::Source MakeP2PPrimarySnapshotSource(
+    std::string cluster_id, P2PMasterService* master_service) {
+    P2PStandbySnapshotService::Source source;
+    if (!master_service) {
+        return source;
+    }
+    source.get_cluster_id = [cluster_id = std::move(cluster_id)] {
+        return cluster_id;
+    };
+    source.is_ready = [master_service] { return master_service != nullptr; };
+    source.get_baseline_sequence_id = [master_service] {
+        return master_service->GetLatestOpLogSequenceId();
+    };
+    source.list_object_keys = [master_service] {
+        return master_service->ListSnapshotObjectKeys();
+    };
+    source.list_client_ids = [master_service] {
+        return master_service->ListSnapshotClientIds();
+    };
+    source.get_object_metadata = [master_service](const std::string& key) {
+        return master_service->GetSnapshotObjectMetadata(key);
+    };
+    source.get_client_info = [master_service](const UUID& client_id) {
+        return master_service->GetSnapshotClientInfo(client_id);
+    };
+    return source;
+}
+
+void RegisterP2PStandbySnapshotRpcHandlers(coro_rpc::coro_rpc_server& server,
+                                           P2PStandbySnapshotService* service) {
+    CHECK(service != nullptr);
+    server.register_handler<&P2PStandbySnapshotService::BeginSnapshot>(service);
+    server.register_handler<&P2PStandbySnapshotService::GetSnapshotChunk>(
+        service);
+    server.register_handler<&P2PStandbySnapshotService::EndSnapshot>(service);
 }
 
 namespace {
@@ -650,9 +724,11 @@ void RedisMasterRegistryHeartbeat::Run() {
         auto entry = entry_;
         std::function<uint64_t()> applied_sequence_provider;
         std::function<bool()> snapshot_ready_provider;
+        applied_sequence_provider = applied_sequence_provider_;
         if (entry.role == "standby") {
-            applied_sequence_provider = applied_sequence_provider_;
             snapshot_ready_provider = snapshot_ready_provider_;
+        } else {
+            entry.snapshot_ready = false;
         }
         bool has_provider =
             applied_sequence_provider || snapshot_ready_provider;

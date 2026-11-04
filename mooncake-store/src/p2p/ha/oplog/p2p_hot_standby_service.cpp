@@ -12,6 +12,41 @@
 
 namespace mooncake {
 
+#ifdef STORE_USE_REDIS
+P2PSnapshotSourceSelection SelectP2PSnapshotSources(
+    std::vector<RedisMasterRegistryEntry> masters,
+    const std::string& self_instance_id, uint64_t trimmed_sequence_id) {
+    std::sort(masters.begin(), masters.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.applied_sequence_id > rhs.applied_sequence_id;
+              });
+    auto eligible_source = [&self_instance_id, trimmed_sequence_id](
+                               const RedisMasterRegistryEntry& master) {
+        return master.instance_id != self_instance_id &&
+               master.applied_sequence_id >= trimmed_sequence_id &&
+               !master.snapshot_endpoint.empty();
+    };
+
+    P2PSnapshotSourceSelection selection;
+    for (const auto& master : masters) {
+        if (eligible_source(master) && master.role == "standby" &&
+            master.snapshot_ready) {
+            selection.endpoints.push_back(master.snapshot_endpoint);
+        }
+    }
+    if (!selection.endpoints.empty()) {
+        return selection;
+    }
+    for (const auto& master : masters) {
+        if (eligible_source(master) && master.role == "primary") {
+            selection.endpoints.push_back(master.snapshot_endpoint);
+        }
+    }
+    selection.used_primary_fallback = !selection.endpoints.empty();
+    return selection;
+}
+#endif
+
 P2PHotStandbyService::P2PHotStandbyService(
     P2PHotStandbyConfig config, ReaderStoreFactory reader_store_factory)
     : config_(std::move(config)),
@@ -709,14 +744,8 @@ ErrorCode P2PHotStandbyService::StartSnapshotServer() {
     snapshot_service_ = std::make_unique<P2PStandbySnapshotService>(this);
     snapshot_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         1, config_.snapshot_service_port);
-    snapshot_server_
-        ->register_handler<&P2PStandbySnapshotService::BeginSnapshot>(
-            snapshot_service_.get());
-    snapshot_server_
-        ->register_handler<&P2PStandbySnapshotService::GetSnapshotChunk>(
-            snapshot_service_.get());
-    snapshot_server_->register_handler<&P2PStandbySnapshotService::EndSnapshot>(
-        snapshot_service_.get());
+    RegisterP2PStandbySnapshotRpcHandlers(*snapshot_server_,
+                                          snapshot_service_.get());
 
     auto start_result = snapshot_server_->async_start();
     if (start_result.hasResult()) {
@@ -764,17 +793,14 @@ std::vector<std::string> P2PHotStandbyService::DiscoverSnapshotSources() const {
         endpoints.clear();
         return endpoints;
     }
-    std::sort(masters.begin(), masters.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs.applied_sequence_id > rhs.applied_sequence_id;
-              });
-    for (const auto& master : masters) {
-        if (master.instance_id != config_.master_instance_id &&
-            master.role == "standby" && master.snapshot_ready &&
-            master.applied_sequence_id >= trimmed_sequence_id &&
-            !master.snapshot_endpoint.empty()) {
-            endpoints.push_back(master.snapshot_endpoint);
-        }
+    auto selection = SelectP2PSnapshotSources(
+        std::move(masters), config_.master_instance_id, trimmed_sequence_id);
+    endpoints = std::move(selection.endpoints);
+    if (selection.used_primary_fallback) {
+        LOG(INFO) << "P2PHotStandbyService: using primary snapshot fallback"
+                  << ", cluster_id=" << config_.cluster_id
+                  << ", source_count=" << endpoints.size()
+                  << ", trimmed_sequence_id=" << trimmed_sequence_id;
     }
 #endif
     return endpoints;

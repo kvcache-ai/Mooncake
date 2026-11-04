@@ -58,6 +58,17 @@ struct P2PStandbySyncStatus {
     std::chrono::milliseconds time_in_state{0};
 };
 
+#ifdef STORE_USE_REDIS
+struct P2PSnapshotSourceSelection {
+    std::vector<std::string> endpoints;
+    bool used_primary_fallback{false};
+};
+
+P2PSnapshotSourceSelection SelectP2PSnapshotSources(
+    std::vector<RedisMasterRegistryEntry> masters,
+    const std::string& self_instance_id, uint64_t trimmed_sequence_id);
+#endif
+
 // NOTE: P2PHotStandbyService intentionally does not inherit from the
 // centralized HotStandbyService. The centralized service owns centralized
 // metadata/apply/export semantics, while P2P promotion needs
