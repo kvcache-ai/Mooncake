@@ -74,6 +74,24 @@ ErrorCode ValidateWriteSlices(uint64_t object_size, uint64_t max_object_bytes,
                                        : ErrorCode::INVALID_PARAMS;
 }
 
+tl::expected<uint64_t, ErrorCode> ValidateReadSlices(
+    uint64_t object_size, uint64_t max_object_bytes,
+    const std::vector<Slice>& slices, uint64_t offset) {
+    if (object_size > max_object_bytes || offset > object_size) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto total_bytes = SliceBytes(slices, object_size - offset);
+    if (!total_bytes || *total_bytes == 0) {
+        return total_bytes;
+    }
+    const auto max_offset =
+        static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    if (offset > max_offset || *total_bytes - 1 > max_offset - offset) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return total_bytes;
+}
+
 }  // namespace
 
 ObjectStorageBackend::ObjectStorageBackend(
@@ -209,10 +227,8 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
                                      uint64_t object_size,
                                      const std::vector<Slice>& slices,
                                      uint64_t offset, const Copy& from_host) {
-    if (object_size > config_.max_object_bytes || offset > object_size) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-    const auto total_bytes = SliceBytes(slices, object_size - offset);
+    const auto total_bytes = ValidateReadSlices(
+        object_size, config_.max_object_bytes, slices, offset);
     if (!total_bytes) {
         return total_bytes.error();
     }
@@ -221,11 +237,6 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
     }
     if (*total_bytes == 0) {
         return ErrorCode::OK;
-    }
-    const auto max_offset =
-        static_cast<uint64_t>(std::numeric_limits<off_t>::max());
-    if (offset > max_offset || *total_bytes - 1 > max_offset - offset) {
-        return ErrorCode::INVALID_PARAMS;
     }
 
     const auto chunk =
@@ -270,6 +281,53 @@ ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
         }
         remaining -= length;
         offset += length;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ObjectStorageBackend::Read(const std::string& object_key,
+                                     uint64_t object_size,
+                                     const std::vector<Slice>& slices,
+                                     uint64_t offset, const Copy& from_host,
+                                     const IsHostMemory& is_host) {
+    if (!is_host) {
+        return Read(object_key, object_size, slices, offset, from_host);
+    }
+    const Slice* direct = nullptr;
+    for (const auto& slice : slices) {
+        if (slice.size == 0) {
+            continue;
+        }
+        if (direct != nullptr) {
+            return Read(object_key, object_size, slices, offset, from_host);
+        }
+        direct = &slice;
+    }
+    if (direct == nullptr) {
+        return Read(object_key, object_size, slices, offset, from_host);
+    }
+    const auto total_bytes = ValidateReadSlices(
+        object_size, config_.max_object_bytes, slices, offset);
+    if (!total_bytes) {
+        return total_bytes.error();
+    }
+    if (!is_host(*direct)) {
+        return Read(object_key, object_size, slices, offset, from_host);
+    }
+    const auto chunk =
+        std::min({*total_bytes, kMaxReadChunkBytes, config_.max_staging_bytes});
+    for (uint64_t done = 0; done < *total_bytes;) {
+        const auto length = std::min(chunk, *total_bytes - done);
+        const auto result = adapter_->GetRange(
+            object_key, static_cast<char*>(direct->ptr) + done, length,
+            static_cast<off_t>(offset + done));
+        if (!result) {
+            return result.error();
+        }
+        if (*result != length) {
+            return ErrorCode::FILE_READ_FAIL;
+        }
+        done += length;
     }
     return ErrorCode::OK;
 }

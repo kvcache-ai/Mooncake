@@ -19,6 +19,7 @@ class MemoryObjectAdapter : public ObjectStorageAdapter {
    public:
     std::map<std::string, std::string> objects;
     std::vector<std::pair<off_t, size_t>> ranges;
+    std::vector<void*> read_buffers;
     size_t put_calls{0};
     size_t putv_calls{0};
     std::vector<iovec> putv_inputs;
@@ -67,6 +68,7 @@ class MemoryObjectAdapter : public ObjectStorageAdapter {
                                              void* buffer, size_t size,
                                              off_t offset) override {
         ranges.emplace_back(offset, size);
+        read_buffers.push_back(buffer);
         if (before_read) before_read();
         if (read_error != ErrorCode::OK) return tl::make_unexpected(read_error);
         const auto it = objects.find(key);
@@ -603,6 +605,169 @@ TEST_F(ObjectStorageBackendTest, WriteVFailuresReleaseStagingAndNeverRetry) {
         ErrorCode::OK);
     EXPECT_EQ(adapter->putv_calls, 3U);
     EXPECT_EQ(adapter->objects.at("new-attempt"), "abcd");
+}
+
+TEST_F(ObjectStorageBackendTest, DirectHostReadUsesCallerBufferAcrossChunks) {
+    constexpr size_t max_chunk = 4 * 1024 * 1024;
+    for (const size_t budget : {size_t{3}, max_chunk}) {
+        SCOPED_TRACE(budget);
+        const size_t size = budget == 3 ? 13 : max_chunk + 11;
+        std::string source(size + 8, '\0');
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i] = static_cast<char>(i % 251);
+        }
+        adapter->objects["key"] = source;
+        adapter->ranges.clear();
+        adapter->read_buffers.clear();
+        ObjectStorageBackend backend({source.size(), budget}, adapter);
+        std::string output(size + 2, '!');
+        size_t classified = 0, copies = 0;
+        const auto host = [&](const Slice& slice) {
+            ++classified;
+            EXPECT_EQ(slice.ptr, output.data() + 1);
+            return true;
+        };
+        ASSERT_EQ(
+            backend.Read(
+                "key", source.size(),
+                {{nullptr, 0}, {output.data() + 1, size}, {nullptr, 0}}, 5,
+                [&](void*, const void*, size_t) {
+                    ++copies;
+                    return false;
+                },
+                host),
+            ErrorCode::OK);
+        EXPECT_EQ(classified, 1U);
+        EXPECT_EQ(copies, 0U);
+        EXPECT_EQ(output.substr(1, size), source.substr(5, size));
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+        ASSERT_EQ(adapter->ranges.size(), (size + budget - 1) / budget);
+        for (size_t i = 0; i < adapter->ranges.size(); ++i) {
+            EXPECT_EQ(adapter->ranges[i].first, 5 + i * budget);
+            EXPECT_EQ(adapter->ranges[i].second,
+                      std::min(budget, size - i * budget));
+            EXPECT_EQ(adapter->read_buffers[i], output.data() + 1 + i * budget);
+        }
+    }
+}
+
+TEST_F(ObjectStorageBackendTest,
+       DirectReadFallsBackWithoutSplittingSlicesIntoGets) {
+    ObjectStorageBackend backend({64, 64}, adapter);
+    adapter->objects["key"] = std::string(64, 'x');
+    std::array<std::array<char, 3>, 64> buffers;
+    std::vector<Slice> slices;
+    for (auto& buffer : buffers) {
+        buffer.fill('!');
+        slices.push_back({buffer.data() + 1, 1});
+    }
+    size_t classified = 0, copied = 0;
+    const auto host = [&](const Slice&) {
+        ++classified;
+        return true;
+    };
+    const auto copy = [&](void* dst, const void* src, size_t n) {
+        copied += n;
+        return HostCopy(dst, src, n);
+    };
+    ASSERT_EQ(backend.Read("key", 64, slices, 0, copy, host), ErrorCode::OK);
+    EXPECT_EQ(classified, 0U);
+    EXPECT_EQ(copied, 64U);
+    EXPECT_EQ(adapter->ranges.size(), 1U);
+    for (const auto& buffer : buffers) {
+        EXPECT_EQ(std::string(buffer.data(), buffer.size()), "!x!");
+    }
+    const auto requests = adapter->ranges.size();
+    EXPECT_EQ(backend.Read("key", 64, slices, 0, {}, host),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(adapter->ranges.size(), requests);
+    char output = '!';
+    ASSERT_EQ(backend.Read("key", 64, {{&output, 1}}, 0, copy,
+                           [](const Slice&) { return false; }),
+              ErrorCode::OK);
+    EXPECT_EQ(output, 'x');
+    EXPECT_NE(adapter->read_buffers.back(), &output);
+    ASSERT_EQ(backend.Read("key", 64, {{&output, 1}}, 0, copy), ErrorCode::OK);
+    EXPECT_NE(adapter->read_buffers.back(), &output);
+    EXPECT_EQ(backend.Read("key", 64, {{&output, 1}}, 0, {},
+                           [](const Slice&) { return false; }),
+              ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(ObjectStorageBackendTest, DirectReadValidatesAndReportsPartialFailures) {
+    ObjectStorageBackend backend({16, 4}, adapter);
+    adapter->objects["key"] = "abcdefghi";
+    std::array<char, 11> output;
+    output.fill('!');
+    size_t classified = 0;
+    const auto host = [&](const Slice&) {
+        ++classified;
+        return true;
+    };
+    EXPECT_EQ(backend.Read("key", 9, {{nullptr, 1}}, 0, {}, host),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(backend.Read("key", 9, {{output.data(), 2}}, 8, {}, host),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(backend.Read("key", 17, {{output.data(), 1}}, 0, {}, host),
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(backend.Read("key", 9, {{nullptr, 0}}, 9, {}, host),
+              ErrorCode::OK);
+    const auto limit = static_cast<uint64_t>(std::numeric_limits<off_t>::max());
+    ObjectStorageBackend huge({std::numeric_limits<uint64_t>::max(), 4},
+                              adapter);
+    EXPECT_EQ(
+        huge.Read("key", limit + 2, {{output.data(), 1}}, limit + 1, {}, host),
+        ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(classified, 0U);
+    EXPECT_TRUE(adapter->ranges.empty());
+    EXPECT_THROW(backend.Read("key", 9, {{output.data() + 1, 9}}, 0, {},
+                              [](const Slice&) -> bool {
+                                  throw std::runtime_error("classification");
+                              }),
+                 std::runtime_error);
+    EXPECT_TRUE(adapter->ranges.empty());
+    adapter->before_read = [&] {
+        adapter->short_read = adapter->ranges.back().first == 4;
+    };
+    EXPECT_EQ(backend.Read("key", 9, {{output.data() + 1, 9}}, 0, {}, host),
+              ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(output.front(), '!');
+    EXPECT_EQ(output.back(), '!');
+    EXPECT_EQ(std::string(output.data() + 1, 9), "abcdefg!!");
+    EXPECT_EQ(adapter->ranges.size(), 2U);
+    adapter->before_read = {};
+    adapter->short_read = false;
+    adapter->read_error = ErrorCode::FILE_NOT_FOUND;
+    EXPECT_EQ(backend.Read("missing", 9, {{output.data() + 1, 9}}, 0, {}, host),
+              ErrorCode::FILE_NOT_FOUND);
+    adapter->read_error = ErrorCode::OK;
+    ASSERT_EQ(backend.Read("key", 9, {{output.data() + 1, 9}}, 0, {}, host),
+              ErrorCode::OK);
+    EXPECT_EQ(std::string(output.data() + 1, 9), "abcdefghi");
+}
+
+TEST_F(ObjectStorageBackendTest,
+       DirectReadDoesNotConsumeOccupiedStagingBudget) {
+    ObjectStorageBackend backend({4, 4}, adapter);
+    adapter->objects["read"] = "data";
+    std::string value = "held";
+    std::array<char, 6> output;
+    output.fill('!');
+    adapter->before_put = [&] {
+        EXPECT_EQ(backend.Read("read", 4, {{output.data() + 1, 4}}, 0, {},
+                               [](const Slice&) { return true; }),
+                  ErrorCode::OK);
+        EXPECT_EQ(std::string(output.data(), output.size()), "!data!");
+        EXPECT_EQ(
+            backend.Read("read", 4, {{output.data() + 1, 4}}, 0, HostCopy),
+            ErrorCode::NO_AVAILABLE_HANDLE);
+    };
+    EXPECT_EQ(backend.Write("held", 4, {{value.data(), 4}}, HostCopy),
+              ErrorCode::OK);
+    adapter->before_put = {};
+    EXPECT_EQ(backend.Read("read", 4, {{output.data() + 1, 4}}, 0, HostCopy),
+              ErrorCode::OK);
 }
 
 }  // namespace

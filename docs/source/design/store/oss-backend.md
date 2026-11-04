@@ -232,6 +232,26 @@ against the requested offset and length, for both individual and batch reads.
 Adapters that do not implement
 the optional generic `GetRange` method return `NOT_SUPPORTED`.
 
+The six-argument `Read` overload accepts an `IsHostMemory` predicate. With
+exactly one nonempty slice classified as host, `GetRange` writes directly to
+that destination, skipping `from_host` and payload staging. Empty slices are
+ignored. GETs retain the same serial chunking, including the configured limit
+when it is below 4 MiB. This path can run while other operations occupy the
+staging budget; the caller remains responsible for request admission.
+Multiple nonempty slices or a non-host destination use the staged path and
+require `from_host`. The original five-argument API always uses staging.
+
+```cpp
+backend.Read(object_key, object_size, {{host_buffer, length}}, offset, {},
+             [](const Slice&) { return true; });
+```
+
+A direct-read destination must remain valid, writable and exclusively owned
+until return. On failure, it may contain partial data or an HTTP error body,
+including when response range validation fails. Only use the result after a
+successful return. Direct reads remove the backend's staging copy, not copies
+inside the adapter or network stack.
+
 Copy callbacks allow callers to stage device buffers. They must finish copying
 before returning, and report failure with `false`. Invalid arguments return
 `INVALID_PARAMS`; staging exhaustion returns `NO_AVAILABLE_HANDLE`; copy

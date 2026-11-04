@@ -1866,5 +1866,65 @@ TEST(S3ObjectStorageAdapterEngineTest,
               2);
 }
 
+TEST(S3ObjectStorageAdapterEngineTest,
+     BackendDirectHostReadValidatesResponsesAndBounds) {
+    using Server = test::OssFaultHttpServer;
+    Server server(
+        {{"valid",
+          Server::Reply(206, "bcdefg", "Content-Range: bytes 1-6/8\r\n")},
+         {"wrong",
+          Server::Reply(206, "UVWXYZ", "Content-Range: bytes 0-5/8\r\n")},
+         {"clipped",
+          Server::Reply(206, "bc", "Content-Range: bytes 1-2/3\r\n")},
+         {"truncated",
+          Server::Raw(
+              "HTTP/1.1 206 Test\r\nContent-Length: 6\r\n"
+              "Content-Range: bytes 1-6/8\r\nConnection: close\r\n\r\nbc")},
+         {"missing", Server::Reply(404, std::string(512, 'x'))},
+         {"unsatisfiable", Server::Reply(416, std::string(512, 'x'))},
+         {"oversized",
+          Server::Reply(206, "too-long", "Content-Range: bytes 1-6/8\r\n")}});
+    ScopedEnvironment environment;
+    ConfigureFaultEndpoint(environment, server.port());
+    auto adapter = std::make_shared<S3ObjectStorageAdapter>("/direct-read/");
+    ASSERT_TRUE(adapter->Init());
+    ObjectStorageBackend backend({8, 8}, adapter);
+    const auto host = [](const Slice&) { return true; };
+    std::array<char, 8> output;
+    output.fill('!');
+    ASSERT_EQ(backend.Read("valid", 8,
+                           {{nullptr, 0}, {output.data() + 1, 6}, {nullptr, 0}},
+                           1, {}, host),
+              ErrorCode::OK);
+    EXPECT_EQ(std::string(output.data(), output.size()), "!bcdefg!");
+    const std::vector<std::pair<std::string, ErrorCode>> errors{
+        {"wrong", ErrorCode::FILE_READ_FAIL},
+        {"clipped", ErrorCode::FILE_READ_FAIL},
+        {"truncated", ErrorCode::DFS_SERVICE_UNAVAILABLE},
+        {"missing", ErrorCode::FILE_NOT_FOUND},
+        {"unsatisfiable", ErrorCode::FILE_READ_FAIL},
+        {"oversized", ErrorCode::DFS_SERVICE_UNAVAILABLE}};
+    for (const auto& [key, error] : errors) {
+        SCOPED_TRACE(key);
+        output.fill('!');
+        EXPECT_EQ(backend.Read(key, 8, {{output.data() + 1, 6}}, 1, {}, host),
+                  error);
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+        if (key == "wrong") {
+            // Direct reads may write data before range validation rejects it.
+            EXPECT_EQ(std::string(output.data() + 1, 6), "UVWXYZ");
+        }
+    }
+    ASSERT_EQ(backend.Read("valid", 8, {{output.data() + 1, 6}}, 1, {}, host),
+              ErrorCode::OK);
+    EXPECT_EQ(std::string(output.data(), output.size()), "!bcdefg!");
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    for (const auto& request : server.requests()) {
+        EXPECT_NE(request.find("Range: bytes=1-6"), std::string::npos);
+    }
+}
+
 }  // namespace
 }  // namespace mooncake

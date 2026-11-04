@@ -28,8 +28,8 @@ class ObjectStorageBackend {
     // Return only when copying is complete; false reports TRANSFER_FAIL.
     using Copy = std::function<bool(void*, const void*, size_t)>;
 
-    // True only for host-accessible buffers that can be borrowed unchanged
-    // until the synchronous WriteV returns. Invoked once per nonempty slice.
+    // True only when the entire slice is host-accessible. WriteV invokes this
+    // once per nonempty slice; Read only for a single nonempty destination.
     using IsHostMemory = std::function<bool(const Slice&)>;
 
     // Throws std::invalid_argument for a null adapter or zero limits.
@@ -46,8 +46,8 @@ class ObjectStorageBackend {
     // Borrow host slices and stage only the remaining slices before one
     // PutVOnce. The caller supplies memory classification; no pointer probing
     // is done. Requires SupportsSinglePutVAttempt(). to_host may be empty when
-    // every nonempty slice is borrowed. upload_started has the same meaning as
-    // Write.
+    // every nonempty slice is borrowed. Borrowed payloads must remain valid and
+    // unchanged until return. upload_started has the same meaning as Write.
     ErrorCode WriteV(const std::string& object_key, uint64_t object_size,
                      const std::vector<Slice>& slices,
                      const IsHostMemory& is_host, const Copy& to_host,
@@ -59,6 +59,16 @@ class ObjectStorageBackend {
     ErrorCode Read(const std::string& object_key, uint64_t object_size,
                    const std::vector<Slice>& slices, uint64_t offset,
                    const Copy& from_host);
+
+    // Opt into direct GetRange for a single nonempty host slice. The caller
+    // must keep that destination valid, writable and exclusively owned until
+    // return. Direct reads skip from_host and payload staging; failures may
+    // modify the destination, including with an HTTP error body. GETs retain
+    // the same chunk bound as staged reads. Other layouts use from_host and
+    // staging as above. An empty predicate keeps the staged behavior.
+    ErrorCode Read(const std::string& object_key, uint64_t object_size,
+                   const std::vector<Slice>& slices, uint64_t offset,
+                   const Copy& from_host, const IsHostMemory& is_host);
 
    private:
     const ObjectStorageBackendConfig config_;
