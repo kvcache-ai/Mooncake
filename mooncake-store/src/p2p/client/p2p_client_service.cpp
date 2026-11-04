@@ -235,6 +235,9 @@ void P2PClientService::HeartbeatThreadMain() {
     const int max_heartbeat_fail_count = GetHeartbeatFailureThreshold();
     const auto kHeartbeatInterval =
         std::chrono::milliseconds(kHeartbeatIntervalMs);
+    LOG(INFO) << "P2P heartbeat thread start"
+              << ", max_heartbeat_fail_count=" << max_heartbeat_fail_count
+              << ", master_entry=" << master_server_entry_;
     int heartbeat_fail_count = 0;
 
     while (true) {
