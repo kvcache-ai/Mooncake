@@ -22,6 +22,7 @@
 #include <set>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <thread>
 #include <tuple>
@@ -30,8 +31,22 @@
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/proxy_manager.h"
+#include "tent/transport/rdma/rdma_transport.h"
 
 namespace mooncake {
+namespace tent {
+// A timed-out slice can leave the worker's inflight count while its posted
+// work request still owes a CQE. The orphan list retains those live slices.
+class RdmaTransportTestPeer {
+   public:
+    static bool hasOrphanSlices(RdmaTransport& transport) {
+        // The reaper temporarily removes the vector while scanning it; this
+        // flag stays set until the scan has settled every orphan.
+        return transport.orphans_pending_.load(std::memory_order_acquire);
+    }
+};
+}  // namespace tent
+
 // Fail before dispatch, rather than rewriting an already-completed copy.
 // All accepted, non-injected work still runs through the real transports.
 class MluFaultTransport : public tent::Transport {
@@ -205,6 +220,29 @@ class TransferEngineImplTestPeer {
     }
     static tent::Status stopStaging(tent::TransferEngineImpl& engine) {
         return engine.staging_proxy_->deconstruct();
+    }
+    static tent::Status quiesce(tent::TransferEngineImpl& engine) {
+        tent::Status first_error = tent::Status::OK();
+        for (const auto& transport : engine.transport_list_) {
+            if (!transport) continue;
+            const auto status = transport->quiesce();
+            if (!status.ok() && first_error.ok()) first_error = status;
+        }
+        return first_error;
+    }
+    static bool batchAlive(tent::TransferEngineImpl& engine,
+                           tent::BatchID batch) {
+        std::lock_guard<std::recursive_mutex> guard(
+            engine.progressLockFor(batch));
+        return engine.isBatchAlive(batch);
+    }
+    static bool hasRdmaOrphans(tent::TransferEngineImpl& engine) {
+        const auto& transport = engine.transport_list_[tent::RDMA];
+        if (!transport) return false;
+        auto* rdma = dynamic_cast<tent::RdmaTransport*>(transport.get());
+        // An unrecognized wrapper cannot prove that posted WRs are gone.
+        return rdma ? tent::RdmaTransportTestPeer::hasOrphanSlices(*rdma)
+                    : true;
     }
     static tent::Status sweep(tent::TransferEngineImpl& engine) {
         return engine.lazyFreeBatch();
@@ -902,13 +940,82 @@ class MluDirectRdmaTest : public ::testing::TestWithParam<bool> {
         b_ = std::make_unique<TransferEngineImpl>(config());
         ASSERT_TRUE(a_->available());
         ASSERT_TRUE(b_->available());
-        if (!TransferEngineImplTestPeer::rdmaGpuDirect(*a_)) {
-            if (strict) FAIL() << "No RNIC with ibv_reg_dmabuf_mr";
-            GTEST_SKIP() << "No RNIC with ibv_reg_dmabuf_mr";
+        // A verbs symbol and a successful MLU export do not establish that
+        // every enabled RNIC can register the exported buffer. Use the same
+        // RDMA registration path (and allocation size) as the data-plane test.
+        for (auto* engine : {a_.get(), b_.get()}) {
+            if (!TransferEngineImplTestPeer::rdmaGpuDirect(*engine)) {
+                if (strict) FAIL() << "No RNIC with ibv_reg_dmabuf_mr";
+                GTEST_SKIP() << "No RNIC with ibv_reg_dmabuf_mr";
+            }
+            void* registration_probe = nullptr;
+            MemoryOptions options;
+            options.location = "mlu:0";
+            ASSERT_TRUE(engine
+                            ->allocateLocalMemory(&registration_probe,
+                                                  kDirectLength, options)
+                            .ok());
+            ASSERT_NE(registration_probe, nullptr);
+            options.type = RDMA;
+            const auto registration = engine->registerLocalMemory(
+                {registration_probe}, {kDirectLength}, options);
+            const bool imported =
+                registration.ok() && TransferEngineImplTestPeer::hasRdmaTag(
+                                         *engine, registration_probe);
+            if (registration.ok()) {
+                ASSERT_TRUE(
+                    engine->unregisterLocalMemory(registration_probe).ok());
+            }
+            ASSERT_TRUE(engine->freeLocalMemory(registration_probe).ok());
+            if (registration.ok() && !imported) {
+                FAIL() << "RDMA registration succeeded without an RDMA tag";
+            }
+            if (!registration.ok() && !registration.IsRdmaError()) {
+                FAIL() << "RDMA registration probe failed: " << registration;
+            }
+            if (!registration.ok()) {
+                if (strict)
+                    FAIL() << "RNIC cannot register MLU DMA-BUF: "
+                           << registration;
+                GTEST_SKIP()
+                    << "RNIC cannot register MLU DMA-BUF: " << registration;
+            }
         }
     }
 
     void TearDown() override {
+        if (!allocations_.empty()) {
+            // freeBatch() can report success while deferring retirement, even
+            // after a completed poll. Stop staging workers and drain every
+            // transport before releasing any data-plane allocation. An
+            // unfinished batch is retained even if quiesce succeeds: RDMA
+            // timeout accounting can reach zero before the NIC's CQE arrives.
+            const auto stage_a = TransferEngineImplTestPeer::stopStaging(*a_);
+            const auto stage_b = TransferEngineImplTestPeer::stopStaging(*b_);
+            const auto drain_a = TransferEngineImplTestPeer::quiesce(*a_);
+            const auto drain_b = TransferEngineImplTestPeer::quiesce(*b_);
+            const bool orphans_a =
+                TransferEngineImplTestPeer::hasRdmaOrphans(*a_);
+            const bool orphans_b =
+                TransferEngineImplTestPeer::hasRdmaOrphans(*b_);
+            if (!batches_.empty() || !stage_a.ok() || !stage_b.ok() ||
+                !drain_a.ok() || !drain_b.ok() || orphans_a || orphans_b) {
+                ADD_FAILURE()
+                    << "Retaining buffers because transfer "
+                       "completion or drain was not confirmed: "
+                    << batches_.size() << " unfinished batch(es), "
+                    << (orphans_a || orphans_b) << " RDMA orphan work present, "
+                    << stage_a << ", " << stage_b << ", " << drain_a << ", "
+                    << drain_b;
+                // Keep both engines, their registrations, and allocations
+                // alive until process exit if a drain cannot be confirmed.
+                static auto* retained = new std::vector<
+                    std::pair<std::unique_ptr<TransferEngineImpl>,
+                              std::unique_ptr<TransferEngineImpl>>>();
+                retained->emplace_back(std::move(a_), std::move(b_));
+                return;
+            }
+        }
         for (auto [engine, batch] : batches_)
             EXPECT_TRUE(engine->freeBatch(batch).ok());
         for (auto [engine, address] : allocations_) {
@@ -982,7 +1089,8 @@ class MluDirectRdmaTest : public ::testing::TestWithParam<bool> {
         ASSERT_TRUE(platform.copy(actual.data(), target, kDirectLength).ok());
         EXPECT_EQ(actual, seed);
         ASSERT_TRUE(a_->freeBatch(batch).ok());
-        batches_.pop_back();
+        if (!TransferEngineImplTestPeer::batchAlive(*a_, batch))
+            batches_.pop_back();
     }
 
     std::unique_ptr<TransferEngineImpl> a_, b_;
