@@ -215,15 +215,17 @@ int P2PMaster::RunWithHA() {
 #ifdef STORE_USE_REDIS
         std::unique_ptr<RedisMasterRegistryHeartbeat> master_registry_heartbeat;
         std::string master_instance_id;
+        std::string p2p_snapshot_endpoint;
         if (config_.oplog.enabled &&
             config_.ha.election_backend == ElectionBackend::REDIS) {
             master_instance_id = GenerateMasterInstanceId();
             RedisMasterRegistryEntry entry;
             entry.instance_id = master_instance_id;
             entry.master_endpoint = local_endpoint;
-            entry.snapshot_endpoint = BuildSnapshotEndpoint(
+            p2p_snapshot_endpoint = BuildSnapshotEndpoint(
                 local_endpoint, config_.ha.snapshot_service_port,
                 config_.ha.snapshot_service_endpoint);
+            entry.snapshot_endpoint = p2p_snapshot_endpoint;
             entry.role = "starting";
             entry.snapshot_ready = false;
             master_registry_heartbeat =
@@ -259,6 +261,8 @@ int P2PMaster::RunWithHA() {
                 static_cast<uint16_t>(config_.ha.snapshot_service_port);
 #ifdef STORE_USE_REDIS
             standby_config.master_instance_id = master_instance_id;
+            standby_config.local_master_endpoint = local_endpoint;
+            standby_config.local_snapshot_endpoint = p2p_snapshot_endpoint;
 #endif
             standby_config.oplog_pending_max_entries =
                 config_.ha.standby_oplog_pending_max_entries;

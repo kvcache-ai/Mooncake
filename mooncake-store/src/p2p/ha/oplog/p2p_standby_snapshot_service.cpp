@@ -6,6 +6,7 @@
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <thread>
 #include <utility>
 
 #include <async_simple/coro/SyncAwait.h>
@@ -24,6 +25,10 @@ namespace {
 
 constexpr auto kSnapshotSessionIdleTimeout = std::chrono::minutes(5);
 constexpr auto kSnapshotSessionCleanupInterval = std::chrono::minutes(1);
+constexpr int kSnapshotChunkMaxRetries = 3;
+constexpr auto kSnapshotChunkRetryInitialBackoff =
+    std::chrono::milliseconds(200);
+constexpr auto kSnapshotChunkRetryMaxBackoff = std::chrono::milliseconds(2000);
 
 bool HasValidSnapshotSource(const P2PStandbySnapshotService::Source& source) {
     return source.get_cluster_id && source.is_ready &&
@@ -354,24 +359,57 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
     target->RemoveAllMetadata();
 
     ErrorCode result = ErrorCode::OK;
+    uint32_t chunk_retries = 0;
+    // Retry transient RPC failures on the same session_id + offset before
+    // giving up, so a single network blip does not abort the whole bootstrap.
+    auto fetch_chunk_with_retry =
+        [&](const StandbySnapshotChunkRequest& request)
+        -> std::optional<StandbySnapshotChunkResponse> {
+        for (int attempt = 0; attempt <= kSnapshotChunkMaxRetries; ++attempt) {
+            auto chunk = async_simple::coro::syncAwait(
+                client.call_for<&P2PStandbySnapshotService::GetSnapshotChunk>(
+                    std::chrono::seconds(30), request));
+            if (chunk && fromInt(chunk->error_code) == ErrorCode::OK) {
+                return std::optional(std::move(*chunk));
+            }
+            result = chunk ? fromInt(chunk->error_code) : ErrorCode::RPC_FAIL;
+            const bool transient = result == ErrorCode::RPC_FAIL ||
+                                   result == ErrorCode::INTERNAL_ERROR;
+            if (!transient || attempt == kSnapshotChunkMaxRetries) {
+                LOG(WARNING) << "Standby snapshot: GetSnapshotChunk failed"
+                             << ", endpoint=" << endpoint
+                             << ", session_id=" << session_id
+                             << ", object_offset=" << object_offset
+                             << ", client_offset=" << client_offset
+                             << ", error=" << toString(result)
+                             << ", attempts=" << attempt + 1;
+                return std::nullopt;
+            }
+            ++chunk_retries;
+            const auto backoff =
+                std::min(kSnapshotChunkRetryInitialBackoff * (1 << attempt),
+                         kSnapshotChunkRetryMaxBackoff);
+            VLOG(1) << "Standby snapshot: GetSnapshotChunk retrying"
+                    << ", endpoint=" << endpoint
+                    << ", session_id=" << session_id
+                    << ", object_offset=" << object_offset
+                    << ", client_offset=" << client_offset
+                    << ", error=" << toString(result)
+                    << ", retry=" << attempt + 1 << "/"
+                    << kSnapshotChunkMaxRetries
+                    << ", backoff_ms=" << backoff.count();
+            std::this_thread::sleep_for(backoff);
+        }
+        return std::nullopt;
+    };
     while (true) {
         StandbySnapshotChunkRequest request;
         request.session_id = session_id;
         request.object_offset = object_offset;
         request.client_offset = client_offset;
         request.limit = chunk_size;
-        auto chunk = async_simple::coro::syncAwait(
-            client.call_for<&P2PStandbySnapshotService::GetSnapshotChunk>(
-                std::chrono::seconds(30), request));
-        if (!chunk || fromInt(chunk->error_code) != ErrorCode::OK) {
-            result = chunk ? fromInt(chunk->error_code) : ErrorCode::RPC_FAIL;
-            LOG(WARNING) << "Standby snapshot: GetSnapshotChunk RPC failed"
-                         << ", endpoint=" << endpoint
-                         << ", session_id=" << session_id
-                         << ", object_offset=" << object_offset
-                         << ", client_offset=" << client_offset
-                         << ", limit=" << request.limit
-                         << ", error=" << toString(result);
+        auto chunk = fetch_chunk_with_retry(request);
+        if (!chunk) {
             break;
         }
         for (const auto& record : chunk->clients) {
@@ -403,6 +441,7 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
                    << ", endpoint=" << endpoint << ", session_id=" << session_id
                    << ", object_offset=" << object_offset
                    << ", client_offset=" << client_offset
+                   << ", chunk_retries=" << chunk_retries
                    << ", error=" << toString(result);
         target->RemoveAllMetadata();
     } else {
@@ -413,6 +452,7 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
                   << ", endpoint=" << endpoint << ", session_id=" << session_id
                   << ", baseline_sequence_id=" << baseline_sequence_id
                   << ", chunks=" << chunk_count
+                  << ", chunk_retries=" << chunk_retries
                   << ", elapsed_ms=" << elapsed.count();
     }
 

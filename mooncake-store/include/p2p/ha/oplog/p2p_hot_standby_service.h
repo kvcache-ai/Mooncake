@@ -42,6 +42,8 @@ struct P2PHotStandbyConfig {
     int reconnect_max_backoff_ms{5000};
     uint16_t snapshot_service_port{0};
     std::string master_instance_id;
+    std::string local_master_endpoint;
+    std::string local_snapshot_endpoint;
     std::vector<std::string> snapshot_source_endpoints;
     uint32_t snapshot_chunk_size{256};
     int master_registry_ttl_sec{10};
@@ -68,7 +70,9 @@ struct P2PSnapshotSourceSelection {
 
 P2PSnapshotSourceSelection SelectP2PSnapshotSources(
     std::vector<RedisMasterRegistryEntry> masters,
-    const std::string& self_instance_id, uint64_t trimmed_sequence_id);
+    const std::string& self_instance_id,
+    const std::string& self_master_endpoint,
+    const std::string& self_snapshot_endpoint, uint64_t trimmed_sequence_id);
 #endif
 
 namespace test {

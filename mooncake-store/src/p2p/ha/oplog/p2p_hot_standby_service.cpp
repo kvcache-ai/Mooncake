@@ -15,14 +15,25 @@ namespace mooncake {
 #ifdef STORE_USE_REDIS
 P2PSnapshotSourceSelection SelectP2PSnapshotSources(
     std::vector<RedisMasterRegistryEntry> masters,
-    const std::string& self_instance_id, uint64_t trimmed_sequence_id) {
+    const std::string& self_instance_id,
+    const std::string& self_master_endpoint,
+    const std::string& self_snapshot_endpoint, uint64_t trimmed_sequence_id) {
     std::sort(masters.begin(), masters.end(),
               [](const auto& lhs, const auto& rhs) {
                   return lhs.applied_sequence_id > rhs.applied_sequence_id;
               });
-    auto eligible_source = [&self_instance_id, trimmed_sequence_id](
+    auto is_self =
+        [&self_instance_id, &self_master_endpoint,
+         &self_snapshot_endpoint](const RedisMasterRegistryEntry& master) {
+            return master.instance_id == self_instance_id ||
+                   (!self_master_endpoint.empty() &&
+                    master.master_endpoint == self_master_endpoint) ||
+                   (!self_snapshot_endpoint.empty() &&
+                    master.snapshot_endpoint == self_snapshot_endpoint);
+        };
+    auto eligible_source = [&is_self, trimmed_sequence_id](
                                const RedisMasterRegistryEntry& master) {
-        return master.instance_id != self_instance_id &&
+        return !is_self(master) &&
                master.applied_sequence_id >= trimmed_sequence_id &&
                !master.snapshot_endpoint.empty();
     };
@@ -810,7 +821,9 @@ std::vector<std::string> P2PHotStandbyService::DiscoverSnapshotSources() const {
         return endpoints;
     }
     auto selection = SelectP2PSnapshotSources(
-        std::move(masters), config_.master_instance_id, trimmed_sequence_id);
+        std::move(masters), config_.master_instance_id,
+        config_.local_master_endpoint, config_.local_snapshot_endpoint,
+        trimmed_sequence_id);
     endpoints = std::move(selection.endpoints);
     if (selection.used_primary_fallback) {
         LOG(INFO) << "P2PHotStandbyService: using primary snapshot fallback"

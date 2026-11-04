@@ -461,6 +461,7 @@ TEST_F(P2PHotStandbyServiceTest,
                           std::string snapshot_endpoint) {
         RedisMasterRegistryEntry entry;
         entry.instance_id = std::move(instance_id);
+        entry.master_endpoint = entry.instance_id + ":50051";
         entry.snapshot_endpoint = std::move(snapshot_endpoint);
         entry.role = std::move(role);
         entry.snapshot_ready = snapshot_ready;
@@ -477,7 +478,7 @@ TEST_F(P2PHotStandbyServiceTest,
          make_source("standby-not-ready", "standby", false, 800,
                      "not-ready:52051"),
          make_source("standby-stale", "standby", true, 99, "stale:52051")},
-        "self", 100);
+        "self", "self:50051", "self:52051", 100);
     EXPECT_FALSE(standby_selection.used_primary_fallback);
     EXPECT_EQ(
         standby_selection.endpoints,
@@ -492,11 +493,22 @@ TEST_F(P2PHotStandbyServiceTest,
                      "not-ready:52051"),
          make_source("standby-no-endpoint", "standby", true, 1000, ""),
          make_source("standby-stale", "standby", true, 99, "stale:52051")},
-        "self", 100);
+        "self", "self:50051", "self:52051", 100);
     EXPECT_TRUE(primary_selection.used_primary_fallback);
     EXPECT_EQ(
         primary_selection.endpoints,
         (std::vector<std::string>{"primary-high:52051", "primary-low:52051"}));
+
+    auto restarted_self_by_endpoint =
+        make_source("previous-self", "primary", false, 1000, "self:52051");
+    restarted_self_by_endpoint.master_endpoint = "self:50051";
+    auto restart_selection = SelectP2PSnapshotSources(
+        {restarted_self_by_endpoint,
+         make_source("remote-primary", "primary", false, 900, "remote:52051")},
+        "new-self", "self:50051", "self:52051", 100);
+    EXPECT_TRUE(restart_selection.used_primary_fallback);
+    EXPECT_EQ(restart_selection.endpoints,
+              (std::vector<std::string>{"remote:52051"}));
 }
 #endif
 
