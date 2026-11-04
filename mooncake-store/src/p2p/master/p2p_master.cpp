@@ -254,6 +254,10 @@ int P2PMaster::RunWithHA() {
 #ifdef STORE_USE_REDIS
             standby_config.master_instance_id = master_instance_id;
 #endif
+            standby_config.oplog_pending_max_entries =
+                config_.ha.standby_oplog_pending_max_entries;
+            standby_config.oplog_poll_batch_size =
+                config_.ha.standby_oplog_poll_batch_size;
             standby_config.snapshot_chunk_size = config_.ha.snapshot_chunk_size;
             if (!config_.ha.snapshot_sources.empty()) {
                 standby_config.snapshot_source_endpoints = splitString(

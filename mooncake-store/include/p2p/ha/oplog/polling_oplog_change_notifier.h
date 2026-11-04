@@ -13,7 +13,8 @@ namespace mooncake {
 
 class PollingOpLogChangeNotifier : public OpLogChangeNotifier {
    public:
-    PollingOpLogChangeNotifier(OpLogStore* store, int poll_interval_ms);
+    PollingOpLogChangeNotifier(OpLogStore* store, int poll_interval_ms,
+                               size_t poll_batch_size = 1000);
     ~PollingOpLogChangeNotifier();
 
     ErrorCode Start(uint64_t start_sequence_id, EntryCallback on_entry,
@@ -27,6 +28,7 @@ class PollingOpLogChangeNotifier : public OpLogChangeNotifier {
 
     OpLogStore* store_;  // Not owned
     int poll_interval_ms_;
+    size_t poll_batch_size_;
 
     EntryCallback on_entry_;
     ErrorCallback on_error_;
@@ -40,8 +42,6 @@ class PollingOpLogChangeNotifier : public OpLogChangeNotifier {
     // For interruptible sleep on Stop()
     std::mutex stop_mutex_;
     std::condition_variable stop_cv_;
-
-    static constexpr size_t kPollBatchSize = 1000;
 };
 
 }  // namespace mooncake

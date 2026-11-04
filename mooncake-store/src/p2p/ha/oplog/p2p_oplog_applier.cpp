@@ -14,10 +14,13 @@ namespace mooncake {
 
 P2POpLogApplier::P2POpLogApplier(P2PStandbyMetadataStore* p2p_store,
                                  const std::string& cluster_id,
-                                 OpLogStore* oplog_store)
+                                 OpLogStore* oplog_store,
+                                 size_t max_pending_entries)
     : cluster_id_(cluster_id),
       oplog_store_(oplog_store),
+      max_pending_entries_(max_pending_entries),
       p2p_store_(p2p_store) {
+    CHECK_GT(max_pending_entries_, 0);
     HAMetricManager::instance().set_standby_degraded(false);
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for OpLogApplier: '" << cluster_id_
@@ -231,12 +234,14 @@ bool P2POpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         // Future entry - store into pending, wait for the gap to be filled.
         std::lock_guard<std::mutex> lock(pending_mutex_);
 
-        if (pending_entries_.size() >=
-            static_cast<size_t>(kMaxPendingEntries)) {
-            LOG(ERROR) << "OpLogApplier: too many pending entries ("
-                       << pending_entries_.size()
-                       << "), discarding entry sequence_id="
-                       << entry.sequence_id << ", key=" << entry.object_key;
+        if (pending_entries_.size() >= max_pending_entries_) {
+            LOG(ERROR) << "OpLogApplier: pending full, rejected entry "
+                          "sequence_id="
+                       << entry.sequence_id
+                       << ", expected_sequence_id=" << expected
+                       << ", key=" << entry.object_key
+                       << ", pending=" << pending_entries_.size()
+                       << ", capacity=" << max_pending_entries_;
             return false;
         }
 

@@ -110,6 +110,27 @@ class SparseReadOpLogStore : public MockOpLogStore {
     }
 };
 
+class BatchRecordingOpLogStore : public MockOpLogStore {
+   public:
+    ErrorCode ReadOpLogSinceWithProgress(uint64_t start_sequence_id,
+                                         size_t limit,
+                                         std::vector<OpLogEntry>& entries,
+                                         OpLogReadProgress& progress) override {
+        entries.clear();
+        ++read_count_;
+        last_limit_.store(limit);
+        progress.last_scanned_sequence_id = start_sequence_id;
+        return ErrorCode::OK;
+    }
+
+    int ReadCount() const { return read_count_; }
+    size_t LastLimit() const { return last_limit_.load(); }
+
+   private:
+    int read_count_{0};
+    std::atomic<size_t> last_limit_{0};
+};
+
 class OpLogReplicatorTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -267,6 +288,22 @@ TEST(PollingOpLogChangeNotifierTest, ReportsMiddleAndTrailingGaps) {
 
     EXPECT_GT(maintenance_count.load(), 0);
     EXPECT_EQ(2u, max_missing_count.load());
+}
+
+TEST(PollingOpLogChangeNotifierTest, UsesConfiguredBatchSize) {
+    BatchRecordingOpLogStore store;
+    PollingOpLogChangeNotifier notifier(&store, /*poll_interval_ms=*/10,
+                                        /*poll_batch_size=*/7);
+    ASSERT_EQ(ErrorCode::OK,
+              notifier.Start(/*start_sequence_id=*/0, [](const OpLogEntry&) {},
+                             [](ErrorCode) {}));
+    for (int i = 0; i < 50 && store.ReadCount() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    notifier.Stop();
+
+    EXPECT_GT(store.ReadCount(), 0);
+    EXPECT_EQ(7u, store.LastLimit());
 }
 
 // ========== Utility tests ==========

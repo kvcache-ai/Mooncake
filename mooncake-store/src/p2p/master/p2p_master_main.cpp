@@ -60,6 +60,10 @@ DEFINE_uint64(oplog_best_effort_max_retries, 3,
               "Maximum best-effort Redis OpLog retries");
 DEFINE_uint32(oplog_async_write_batch_size, 64,
               "Maximum entries in a Redis OpLog pipeline batch");
+DEFINE_uint32(standby_oplog_pending_max_entries, 1000,
+              "Maximum future OpLog entries buffered by a standby");
+DEFINE_uint32(standby_oplog_poll_batch_size, 1000,
+              "Maximum OpLog sequence IDs scanned per standby poll batch");
 DEFINE_bool(enable_ha, false, "Enable P2P master HA");
 DEFINE_string(election_backend, "etcd",
               "P2P HA election backend: etcd or redis");
@@ -142,6 +146,12 @@ void LoadConfigFile(const DefaultConfig& source, P2PMasterConfig& config,
     source.GetUInt32("oplog_async_write_batch_size",
                      &config.oplog.async_write_batch_size,
                      config.oplog.async_write_batch_size);
+    source.GetUInt32("standby_oplog_pending_max_entries",
+                     &config.ha.standby_oplog_pending_max_entries,
+                     config.ha.standby_oplog_pending_max_entries);
+    source.GetUInt32("standby_oplog_poll_batch_size",
+                     &config.ha.standby_oplog_poll_batch_size,
+                     config.ha.standby_oplog_poll_batch_size);
     source.GetBool("enable_ha", &config.ha.enabled, config.ha.enabled);
     source.GetString("election_backend", &election_backend, election_backend);
     source.GetString("etcd_endpoints", &config.ha.etcd_endpoints,
@@ -200,6 +210,10 @@ void ApplyCommandLineOverrides(P2PMasterConfig& config,
                    config.oplog.best_effort_max_retries);
     APPLY_OVERRIDE(oplog_async_write_batch_size,
                    config.oplog.async_write_batch_size);
+    APPLY_OVERRIDE(standby_oplog_pending_max_entries,
+                   config.ha.standby_oplog_pending_max_entries);
+    APPLY_OVERRIDE(standby_oplog_poll_batch_size,
+                   config.ha.standby_oplog_poll_batch_size);
     APPLY_OVERRIDE(enable_ha, config.ha.enabled);
     APPLY_OVERRIDE(election_backend, election_backend);
     APPLY_OVERRIDE(etcd_endpoints, config.ha.etcd_endpoints);
@@ -255,6 +269,13 @@ tl::expected<void, std::string> ValidateAndNormalize(
         (config.oplog.async_write_batch_size == 0 ||
          config.oplog.async_write_batch_size > kMaxRedisOpLogWriteBatchSize)) {
         return tl::make_unexpected("invalid oplog_async_write_batch_size");
+    }
+
+    if (config.oplog.enabled &&
+        (config.ha.standby_oplog_pending_max_entries == 0 ||
+         config.ha.standby_oplog_poll_batch_size == 0)) {
+        return tl::make_unexpected(
+            "standby OpLog pending and poll batch limits must be positive");
     }
 
     if (config.ha.enabled && config.oplog.enabled &&

@@ -60,6 +60,8 @@ struct P2PMasterConfig {
         std::string snapshot_service_endpoint;
         std::string snapshot_sources;
         uint32_t snapshot_chunk_size = 256;
+        uint32_t standby_oplog_pending_max_entries = 1000;
+        uint32_t standby_oplog_poll_batch_size = 1000;
     } ha;
 
     std::string cluster_id = DEFAULT_CLUSTER_ID;

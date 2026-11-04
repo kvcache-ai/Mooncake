@@ -780,9 +780,9 @@ ErrorCode LocalFsOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
 // ============================================================
 
 std::unique_ptr<OpLogChangeNotifier> LocalFsOpLogStore::CreateChangeNotifier(
-    const std::string& /*cluster_id*/) {
-    return std::make_unique<PollingOpLogChangeNotifier>(this,
-                                                        poll_interval_ms_);
+    const std::string& /*cluster_id*/, size_t poll_batch_size) {
+    return std::make_unique<PollingOpLogChangeNotifier>(this, poll_interval_ms_,
+                                                        poll_batch_size);
 }
 
 }  // namespace mooncake

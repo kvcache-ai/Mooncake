@@ -1,6 +1,7 @@
 // mooncake-store/include/oplog_store.h
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -99,8 +100,9 @@ class OpLogStore {
     // Each backend provides its own notifier (e.g., etcd watch, polling).
     // Returns nullptr if the backend does not support change notification.
     virtual std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
-        const std::string& cluster_id) {
+        const std::string& cluster_id, size_t poll_batch_size = 1000) {
         (void)cluster_id;
+        (void)poll_batch_size;
         return nullptr;
     }
 };

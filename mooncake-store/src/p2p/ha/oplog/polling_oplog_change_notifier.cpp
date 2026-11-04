@@ -7,8 +7,13 @@
 namespace mooncake {
 
 PollingOpLogChangeNotifier::PollingOpLogChangeNotifier(OpLogStore* store,
-                                                       int poll_interval_ms)
-    : store_(store), poll_interval_ms_(poll_interval_ms) {}
+                                                       int poll_interval_ms,
+                                                       size_t poll_batch_size)
+    : store_(store),
+      poll_interval_ms_(poll_interval_ms),
+      poll_batch_size_(poll_batch_size) {
+    CHECK_GT(poll_batch_size_, 0);
+}
 
 PollingOpLogChangeNotifier::~PollingOpLogChangeNotifier() { Stop(); }
 
@@ -48,8 +53,8 @@ void PollingOpLogChangeNotifier::PollLoop() {
         uint64_t last_seq = last_scanned_sequence_id_.load();
         std::vector<OpLogEntry> entries;
         OpLogReadProgress progress;
-        auto err = store_->ReadOpLogSinceWithProgress(last_seq, kPollBatchSize,
-                                                      entries, progress);
+        auto err = store_->ReadOpLogSinceWithProgress(
+            last_seq, poll_batch_size_, entries, progress);
         std::vector<uint64_t> missing_sequence_ids;
         if (err == ErrorCode::OK) {
             missing_sequence_ids = FindMissingSequenceIds(

@@ -38,7 +38,7 @@ class LocalFsOpLogStore : public OpLogStore {
                                     uint64_t& sequence_id) override;
     ErrorCode CleanupOpLogBefore(uint64_t before_sequence_id) override;
     std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
-        const std::string& cluster_id) override;
+        const std::string& cluster_id, size_t poll_batch_size = 1000) override;
 
    private:
     // Segment file format: 32-byte header + length-prefixed entries

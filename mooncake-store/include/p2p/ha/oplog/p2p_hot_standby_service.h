@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -33,6 +34,8 @@ struct P2PHotStandbyConfig {
     std::string redis_password;
     int redis_db_index{0};
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
+    size_t oplog_pending_max_entries{1000};
+    size_t oplog_poll_batch_size{1000};
     int reconnect_initial_backoff_ms{100};
     int reconnect_max_backoff_ms{5000};
     uint16_t snapshot_service_port{0};

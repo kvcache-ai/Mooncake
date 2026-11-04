@@ -27,6 +27,8 @@
   "oplog_async_write_batch_size": 64,
   "oplog_async_queue_overflow_mode": "reject",
   "oplog_best_effort_max_retries": 3,
+  "standby_oplog_pending_max_entries": 1000,
+  "standby_oplog_poll_batch_size": 1000,
   "standby_snapshot_service_port": 0,
   "standby_snapshot_service_endpoint": "",
   "standby_snapshot_sources": "",

@@ -17,8 +17,9 @@ P2PHotStandbyService::P2PHotStandbyService(
     : config_(std::move(config)),
       reader_store_factory_(std::move(reader_store_factory)) {
     metadata_store_ = std::make_unique<P2PStandbyMetadataStore>();
-    oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
-                                                       config_.cluster_id);
+    oplog_applier_ = std::make_unique<P2POpLogApplier>(
+        metadata_store_.get(), config_.cluster_id, nullptr,
+        config_.oplog_pending_max_entries);
 }
 
 P2PHotStandbyService::~P2PHotStandbyService() { Stop(); }
@@ -41,8 +42,9 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
     snapshot_resync_required_.store(false);
     metadata_store_->RemoveAllMetadata();
-    oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
-                                                       config_.cluster_id);
+    oplog_applier_ = std::make_unique<P2POpLogApplier>(
+        metadata_store_.get(), config_.cluster_id, nullptr,
+        config_.oplog_pending_max_entries);
 
     uint64_t initial_sync_target = baseline_sequence_id;
     uint64_t trimmed_sequence_id = 0;
@@ -213,8 +215,8 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
     }
 
     oplog_applier_->SetOpLogStore(watcher_oplog_store_.get());
-    oplog_change_notifier_ =
-        watcher_oplog_store_->CreateChangeNotifier(config_.cluster_id);
+    oplog_change_notifier_ = watcher_oplog_store_->CreateChangeNotifier(
+        config_.cluster_id, config_.oplog_poll_batch_size);
     if (!oplog_change_notifier_) {
         LOG(ERROR)
             << "P2PHotStandbyService: failed to create OpLogChangeNotifier"
@@ -622,8 +624,9 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
         return ErrorCode::OPLOG_TRIMMED;
     }
 
-    oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
-                                                       config_.cluster_id);
+    oplog_applier_ = std::make_unique<P2POpLogApplier>(
+        metadata_store_.get(), config_.cluster_id, nullptr,
+        config_.oplog_pending_max_entries);
     oplog_applier_->Recover(baseline_sequence_id);
 
     uint64_t catch_up_target = baseline_sequence_id;

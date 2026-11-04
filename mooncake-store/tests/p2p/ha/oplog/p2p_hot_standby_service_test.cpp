@@ -27,6 +27,7 @@ struct ControlledNotifierState {
     std::condition_variable cv;
     OpLogChangeNotifier::ErrorCallback on_error;
     uint64_t start_sequence_id{0};
+    size_t poll_batch_size{0};
     int active_callbacks{0};
     bool healthy_on_start{true};
     bool healthy{false};
@@ -68,7 +69,9 @@ class ControlledReaderStore : public MockOpLogStore {
         : state_(std::move(state)) {}
 
     std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
-        const std::string&) override {
+        const std::string&, size_t poll_batch_size) override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->poll_batch_size = poll_batch_size;
         return std::make_unique<ControlledNotifier>(state_);
     }
 
@@ -234,6 +237,21 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
     static constexpr const char* kClusterId = "p2p-hot-standby-test";
     std::filesystem::path test_dir_;
 };
+
+TEST_F(P2PHotStandbyServiceTest, UsesConfiguredOpLogPollBatchSize) {
+    auto state = std::make_shared<ControlledNotifierState>();
+    auto config = MakeStandbyConfig();
+    config.oplog_poll_batch_size = 7;
+    P2PHotStandbyService standby(
+        config, [&] { return std::make_unique<ControlledReaderStore>(state); });
+
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        EXPECT_EQ(7u, state->poll_batch_size);
+    }
+    standby.Stop();
+}
 
 TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POplog) {
     P2PMasterService master(MakeMasterConfig());

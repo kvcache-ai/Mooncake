@@ -112,8 +112,8 @@ TEST_F(OpLogApplierTest, TestApplyWithdrawRoute) {
 TEST_F(OpLogApplierTest, NoopAdvancesSequenceWithoutChangingMetadata) {
     const auto before_noops =
         HAMetricManager::instance().get_oplog_applied_noop_entries_total();
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
-        1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"))));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"))));
     ASSERT_EQ(1u, metadata_store_->GetRouteKeyCount());
 
     const auto noop = MakeEntry(2, OpType_NOOP, "", "");
@@ -142,6 +142,22 @@ TEST_F(OpLogApplierTest, PendingNoopDrainsAfterPreviousEntry) {
     EXPECT_EQ(
         before_noops + 1,
         HAMetricManager::instance().get_oplog_applied_noop_entries_total());
+}
+
+TEST_F(OpLogApplierTest, ConfiguredPendingCapacity) {
+    P2POpLogApplier applier(metadata_store_.get(), cluster_id_, nullptr,
+                            /*max_pending_entries=*/2);
+    EXPECT_FALSE(applier.ApplyOpLogEntry(MakeEntry(
+        2, OpType_WITHDRAW_ROUTE, "key2", MakeWithdrawPayload("key2"))));
+    EXPECT_FALSE(applier.ApplyOpLogEntry(MakeEntry(
+        3, OpType_WITHDRAW_ROUTE, "key3", MakeWithdrawPayload("key3"))));
+    EXPECT_FALSE(applier.ApplyOpLogEntry(MakeEntry(
+        4, OpType_WITHDRAW_ROUTE, "key4", MakeWithdrawPayload("key4"))));
+    EXPECT_TRUE(applier.ApplyOpLogEntry(MakeEntry(
+        1, OpType_WITHDRAW_ROUTE, "key1", MakeWithdrawPayload("key1"))));
+
+    // Sequence 4 was rejected after the two-entry pending buffer filled.
+    EXPECT_EQ(4u, applier.GetExpectedSequenceId());
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
