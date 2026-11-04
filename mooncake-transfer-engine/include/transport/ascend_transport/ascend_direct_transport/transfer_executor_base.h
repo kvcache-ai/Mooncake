@@ -78,11 +78,26 @@ class TransferExecutorBase {
         adxl::TransferOp operation,
         const std::vector<Transport::Slice*>& slice_list) = 0;
 
-    void processSliceList(const std::vector<Transport::Slice*>& slice_list);
+    // Runs one group of slices that already share a target engine. Every
+    // dispatcher splits by target engine before it queues a group, so this is
+    // the single execution entry: a group is looked up and dispatched once,
+    // on the worker that runs it.
+    void processGroupedSliceList(
+        const std::vector<Transport::Slice*>& slice_list);
+
+    // Splits slices that share a target segment into one group per target
+    // adxl engine. A store process that owns several NPUs publishes them all
+    // under one segment, so a dispatcher that stops at the segment would drive
+    // those engines one after another from a single thread.
+    std::vector<std::vector<Transport::Slice*>> splitByTargetEngine(
+        const std::vector<Transport::Slice*>& slice_list);
 
     // Forwards to LocalCopyEngine::SetTaskRunner.
     void setLocalCopyTaskRunner(
         std::function<void(std::function<void()>)> runner);
+
+    // Polls pending local-copy groups from the transport's status path.
+    void pollLocalCopies();
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
                     bool use_buffer_pool, bool remote_accessible);
@@ -120,15 +135,18 @@ class TransferExecutorBase {
         const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
         const std::vector<Transport::Slice*>& slice_list,
         std::vector<void*>& dest_addrs);
-    void processHomogeneousSliceList(
-        const std::vector<Transport::Slice*>& slice_list);
 
     InitParams params_;
-    std::unique_ptr<LocalCopyEngine> local_copy_engine_;
+    // One instance per local engine: it owns that engine's ACL context, copy
+    // streams and in-flight groups, so Copy()/Poll() need no device lookup.
+    std::vector<std::unique_ptr<LocalCopyEngine>> local_copy_engines_;
     // Imports host segments owned by other processes on this machine.
     // Installed for non-fabric engines. A transfer uses it only when the
     // destination buffer advertises a shared memfd handle.
     std::unique_ptr<SharedHostMapper> shared_host_mapper_;
+    // ASCEND_USE_SHMEM is read once. When off, no buffer carries a memfd
+    // handle, so the per-slice mapper probe can be skipped entirely.
+    bool use_shmem_{false};
     std::vector<std::shared_ptr<adxl::AdxlEngine>> adxl_engines_;
     std::vector<aclrtContext> local_engine_contexts_;
     std::mutex mem_handle_mutex_;

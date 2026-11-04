@@ -850,8 +850,22 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   set_target_properties(tent_ascend_direct_transport_test
                         PROPERTIES LINK_FLAGS "-Wl,--allow-shlib-undefined")
+  if(TARGET ascend_allocator)
+    target_compile_definitions(tent_ascend_direct_transport_test
+                               PRIVATE TENT_HAS_ASCEND_ALLOCATOR)
+  endif()
   add_test(NAME tent_ascend_direct_transport_test
            COMMAND tent_ascend_direct_transport_test)
+endif()
+
+if(USE_ASCEND_DIRECT)
+  add_executable(tent_shared_host_mapper_test shared_host_mapper_test.cpp)
+  target_link_libraries(tent_shared_host_mapper_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_shared_host_mapper_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_shared_host_mapper_test
+           COMMAND tent_shared_host_mapper_test)
 endif()
 
 add_executable(tent_segment_desc_retry_test segment_desc_retry_test.cpp)
