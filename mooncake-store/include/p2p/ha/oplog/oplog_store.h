@@ -60,6 +60,12 @@ class OpLogStore {
     // store.
     virtual void StopWriting() {}
 
+    // Best-effort wait for already admitted async writes to commit.
+    virtual OpLogDrainResult DrainWriting(uint32_t timeout_ms) {
+        (void)timeout_ms;
+        return {};
+    }
+
     // Read
     virtual ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) = 0;
     virtual ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,

@@ -49,6 +49,7 @@ class RedisOpLogStore : public OpLogStore {
     void RequestStopWriting() override;
     // Once this returns, all workers have exited and no async writes remain.
     void StopWriting() override;
+    OpLogDrainResult DrainWriting(uint32_t timeout_ms) override;
     ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) override;
     ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,
                              std::vector<OpLogEntry>& entries) override;

@@ -32,6 +32,14 @@ enum class OpType : uint8_t {
 // A single operation log entry.
 // Payload contains serialized operation-specific data. The P2P applier
 // restores clients, segments and routes from P2P payloads.
+struct OpLogDrainResult {
+    bool drained{true};
+    size_t queued_count{0};
+    size_t inflight_count{0};
+    uint64_t committed_sequence_id{0};
+    uint64_t max_known_sequence_id{0};
+};
+
 struct OpLogEntry {
     uint64_t sequence_id{0};   // Monotonically increasing global sequence
     uint64_t timestamp_ms{0};  // Logical timestamp in milliseconds
@@ -64,6 +72,9 @@ class OpLogManager {
 
     // Request cancellation, clean up pending writes, and wait for workers.
     void StopWriting();
+
+    // Best-effort wait for already admitted async writes to commit.
+    OpLogDrainResult DrainWriting(uint32_t timeout_ms);
 
     // Append a new entry and return the assigned sequence_id.
     // This is a best-effort (async) path: the entry is buffered in memory

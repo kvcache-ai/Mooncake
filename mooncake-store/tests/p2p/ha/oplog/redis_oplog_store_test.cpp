@@ -402,6 +402,20 @@ TEST_F(RedisOpLogStoreTest, AsyncWriteEventuallyAdvancesLatest) {
     EXPECT_EQ(2u, entries[1].sequence_id);
 }
 
+TEST_F(RedisOpLogStoreTest, DrainWritingWaitsForCommits) {
+    std::shared_ptr<RedisOpLogStore> writer(CreateWriter());
+    OpLogManager manager;
+    manager.SetOpLogStore(writer);
+
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), false));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), false));
+
+    const auto drain = manager.DrainWriting(3000);
+    EXPECT_TRUE(drain.drained);
+    EXPECT_EQ(2u, drain.committed_sequence_id);
+    EXPECT_EQ(2u, drain.max_known_sequence_id);
+}
+
 TEST_F(RedisOpLogStoreTest, ReadSinceHonorsCommittedLatest) {
     auto writer = CreateWriter();
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));

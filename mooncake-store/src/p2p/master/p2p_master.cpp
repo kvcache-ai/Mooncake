@@ -362,8 +362,31 @@ int P2PMaster::RunWithHA() {
             standby.reset();
         }
 
+        auto stepdown_callback = [&stop_primary_rpc, &primary_oplog_manager] {
+            if (auto* manager =
+                    primary_oplog_manager.load(std::memory_order_acquire)) {
+                auto drain = manager->DrainWriting(3000);
+                if (!drain.drained) {
+                    LOG(WARNING)
+                        << "P2P primary stepdown OpLog drain incomplete"
+                        << ", queued=" << drain.queued_count
+                        << ", inflight=" << drain.inflight_count
+                        << ", committed_sequence_id="
+                        << drain.committed_sequence_id
+                        << ", max_known_sequence_id="
+                        << drain.max_known_sequence_id;
+                } else {
+                    LOG(INFO) << "P2P primary stepdown OpLog drain completed"
+                              << ", committed_sequence_id="
+                              << drain.committed_sequence_id
+                              << ", max_known_sequence_id="
+                              << drain.max_known_sequence_id;
+                }
+            }
+            stop_primary_rpc();
+        };
         auto active_service =
-            CreateActiveService(config_, view_version, stop_primary_rpc);
+            CreateActiveService(config_, view_version, stepdown_callback);
         {
             auto* manager =
                 active_service->GetMasterService().GetOpLogManager();

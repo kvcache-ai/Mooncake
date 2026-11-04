@@ -282,6 +282,32 @@ void RedisOpLogStore::RequestStopWriting() {
     async_stop_source_.request_stop();
 }
 
+OpLogDrainResult RedisOpLogStore::DrainWriting(uint32_t timeout_ms) {
+    OpLogDrainResult result;
+    if (!enable_write_ || !async_running_.load()) {
+        return result;
+    }
+
+    std::unique_lock<std::mutex> lock(async_mutex_);
+    auto snapshot = [&] {
+        result.queued_count = pending_writes_.size();
+        result.inflight_count = inflight_writes_.size();
+        result.committed_sequence_id = committed_sequence_id_;
+        result.max_known_sequence_id = MaxKnownSequenceUnlocked();
+        result.drained = pending_writes_.empty() && inflight_writes_.empty();
+    };
+
+    snapshot();
+    if (result.drained || timeout_ms == 0) {
+        return result;
+    }
+    sync_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
+        return pending_writes_.empty() && inflight_writes_.empty();
+    });
+    snapshot();
+    return result;
+}
+
 void RedisOpLogStore::StopWriting() {
     if (!enable_write_) return;
     RequestStopWriting();
