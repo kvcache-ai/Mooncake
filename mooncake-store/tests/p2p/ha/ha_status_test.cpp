@@ -373,6 +373,29 @@ TEST_F(HAStatusTest, DoctorReportsOpLogPollStale) {
     EXPECT_EQ(doctor().health, "ok");
 }
 
+TEST_F(HAStatusTest, DoctorReportsElectionReadinessBlocked) {
+    status.SetOpLogProgress(40, 140);
+    EXPECT_EQ(doctor().health, "ok");
+
+    // The readiness gate is event-driven: only set while the standby is
+    // actually blocked inside the readiness wait loop or election callback.
+    status.SetElectionReadinessBlocked(true, 100, 50);
+    auto report = doctor();
+    EXPECT_EQ(report.health, "degraded");
+    const auto* issue = FindIssue(report, "ELECTION_READINESS_BLOCKED");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_EQ(issue->severity, "warning");
+    EXPECT_NE(issue->message.find("lag=100"), std::string::npos);
+    EXPECT_NE(issue->message.find("max=50"), std::string::npos);
+    EXPECT_NE(issue->message.find("applied_sequence_id=40"), std::string::npos);
+    EXPECT_NE(issue->message.find("latest_sequence_id=140"), std::string::npos);
+
+    // Once the standby catches up the caller clears the flag and the issue is
+    // gone, so normal lag/catch-up never produces a false positive.
+    status.SetElectionReadinessBlocked(false);
+    EXPECT_EQ(FindIssue(doctor(), "ELECTION_READINESS_BLOCKED"), nullptr);
+}
+
 TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())

@@ -114,7 +114,8 @@ std::string IssueSeverity(const std::string& code) {
         code == "STANDBY_SNAPSHOT_INSUFFICIENT" || code == "OPLOG_TRIM_RISK" ||
         code == "OPLOG_QUEUE_PRESSURE" || code == "OPLOG_LATEST_STALLED" ||
         code == "OPLOG_CATCHUP_STALLED" || code == "OPLOG_POLL_STALE" ||
-        code == "OPLOG_LAG_GROWING" || code == "PROMOTION_CATCHUP_INCOMPLETE") {
+        code == "OPLOG_LAG_GROWING" || code == "PROMOTION_CATCHUP_INCOMPLETE" ||
+        code == "ELECTION_READINESS_BLOCKED") {
         return "warning";
     }
     return "error";
@@ -199,10 +200,22 @@ void HAStatusManager::Reset() {
     oplog_lag_growth_ = {};
     standby_snapshot_ = {};
     oplog_poll_ = {};
+    election_readiness_blocked_ = false;
+    election_readiness_blocked_lag_ = 0;
+    election_readiness_blocked_max_ = 0;
     status_.oplog_pending_writes = 0;
     oplog_latest_stall_timeout_sec_ = 10;
     oplog_catchup_stall_timeout_sec_ = 10;
     TouchLocked();
+}
+
+void HAStatusManager::SetElectionReadinessBlocked(bool blocked,
+                                                  uint64_t lag_entries,
+                                                  uint64_t max_lag_entries) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    election_readiness_blocked_ = blocked;
+    election_readiness_blocked_lag_ = lag_entries;
+    election_readiness_blocked_max_ = max_lag_entries;
 }
 
 void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
@@ -632,6 +645,9 @@ void HAStatusManager::ClearDoctorIssues() {
     oplog_catchup_ = {};
     oplog_lag_growth_ = {};
     oplog_poll_ = {};
+    election_readiness_blocked_ = false;
+    election_readiness_blocked_lag_ = 0;
+    election_readiness_blocked_max_ = 0;
     status_.oplog_pending_writes = 0;
 }
 
@@ -798,6 +814,19 @@ HADoctorReport HAStatusManager::GetDoctorReport() const {
             if (auto issue = ElectionUnstableMessageLocked(); !issue.empty()) {
                 report.issues.push_back(
                     MakeDoctorIssue("ELECTION_UNSTABLE", std::move(issue)));
+            }
+            if (election_readiness_blocked_) {
+                report.issues.push_back(MakeDoctorIssue(
+                    "ELECTION_READINESS_BLOCKED",
+                    "standby oplog lag exceeds election readiness lag gate: "
+                    "lag=" +
+                        std::to_string(election_readiness_blocked_lag_) +
+                        ", max=" +
+                        std::to_string(election_readiness_blocked_max_) +
+                        " (applied_sequence_id=" +
+                        std::to_string(status_.applied_sequence_id) +
+                        ", latest_sequence_id=" +
+                        std::to_string(status_.latest_sequence_id) + ")"));
             }
             if (auto issue = MasterViewMismatchMessageLocked();
                 !issue.empty()) {

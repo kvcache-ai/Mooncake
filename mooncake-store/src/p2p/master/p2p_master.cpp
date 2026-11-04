@@ -464,7 +464,17 @@ int P2PMaster::RunWithHA() {
                             self_status.applied_seq_id,
                             config_.oplog.election_max_standby_lag_entries);
                     if (!readiness_decision.should_wait) {
+                        HAStatusManager::instance().SetElectionReadinessBlocked(
+                            false);
                         return true;
+                    }
+                    if (self_status.state == StandbyState::WATCHING) {
+                        HAStatusManager::instance().SetElectionReadinessBlocked(
+                            true, readiness_decision.lag_entries,
+                            config_.oplog.election_max_standby_lag_entries);
+                    } else {
+                        HAStatusManager::instance().SetElectionReadinessBlocked(
+                            false);
                     }
                     LOG_EVERY_N(WARNING, 30)
                         << "P2P election attempt blocked by standby readiness"

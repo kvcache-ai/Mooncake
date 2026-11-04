@@ -4,6 +4,8 @@
 
 #include <glog/logging.h>
 
+#include "p2p/ha/ha_status.h"
+
 namespace mooncake {
 namespace {
 
@@ -55,6 +57,7 @@ bool WaitForP2PElectionReadiness(const P2PMasterConfig& config,
             self_status.primary_seq_id, self_status.applied_seq_id,
             config.oplog.election_max_standby_lag_entries);
         if (!readiness_decision.should_wait) {
+            HAStatusManager::instance().SetElectionReadinessBlocked(false);
             if (waited) {
                 LOG(INFO) << "P2P election readiness wait completed"
                           << ", self_instance_id=" << self_instance_id
@@ -73,6 +76,7 @@ bool WaitForP2PElectionReadiness(const P2PMasterConfig& config,
 
         waited = true;
         if (self_status.state != StandbyState::WATCHING) {
+            HAStatusManager::instance().SetElectionReadinessBlocked(false);
             LOG_EVERY_N(WARNING, 30)
                 << "P2P election waiting for standby to become "
                    "promotion-ready"
@@ -84,19 +88,22 @@ bool WaitForP2PElectionReadiness(const P2PMasterConfig& config,
             continue;
         }
 
+        HAStatusManager::instance().SetElectionReadinessBlocked(
+            true, readiness_decision.lag_entries,
+            config.oplog.election_max_standby_lag_entries);
         LOG_EVERY_N(INFO, 10)
             << "P2P election waiting for standby catch-up before election"
             << ", self_instance_id=" << self_instance_id
             << ", self_endpoint=" << config.rpc.address
             << ", self_applied_sequence_id=" << self_status.applied_seq_id
-            << ", latest_sequence_id_known="
-            << self_status.primary_seq_id_known
+            << ", latest_sequence_id_known=" << self_status.primary_seq_id_known
             << ", latest_sequence_id=" << self_status.primary_seq_id
             << ", lag_entries=" << readiness_decision.lag_entries
             << ", max_lag_entries="
             << config.oplog.election_max_standby_lag_entries;
         std::this_thread::sleep_for(kP2PElectionReadinessCheckInterval);
     }
+    HAStatusManager::instance().SetElectionReadinessBlocked(false);
     return false;
 }
 
