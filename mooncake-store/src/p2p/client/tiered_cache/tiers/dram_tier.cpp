@@ -10,6 +10,7 @@
 #endif
 
 #include "p2p/client/tiered_cache/tiers/dram_tier.h"
+#include "common/client_buffer_allocation.h"
 #include "utils.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "p2p/client/tiered_cache/copier_registry.h"

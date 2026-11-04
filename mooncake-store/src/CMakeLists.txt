@@ -4,6 +4,8 @@ add_subdirectory(cachelib_memory_allocator)
 set(MOONCAKE_MASTER_SUPPORT_SOURCES
     common_types.cpp
     utils.cpp
+    common/client_buffer_allocation.cpp
+    common/mmap_buffer.cpp
     common/network.cpp
     etcd_helper.cpp
     allocator.cpp
@@ -99,7 +101,7 @@ target_link_libraries(mooncake_master_support PUBLIC
     ibverbs
     asio_shared
 )
-# utils.cpp uses the Ascend allocation primitives only in direct mode.
+# common/client_buffer_allocation.cpp uses Ascend primitives only in direct mode.
 if(USE_ASCEND_DIRECT)
     target_link_libraries(mooncake_master_support PRIVATE transfer_engine)
 endif()

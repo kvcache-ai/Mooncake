@@ -18,6 +18,7 @@
 #include "transport/transport.h"
 #include "config.h"
 #include "types.h"
+#include "common/client_buffer_allocation.h"
 #include "utils.h"
 
 namespace mooncake {

@@ -25,6 +25,7 @@
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "common/client_buffer_allocation.h"
 #include "utils.h"
 
 namespace mooncake {

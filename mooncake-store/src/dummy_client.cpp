@@ -11,6 +11,7 @@
 
 #include "real_client.h"
 #include "dummy_client.h"
+#include "common/client_buffer_allocation.h"
 #include "utils.h"
 #include "common/result.h"
 #include "common/scoped_vlog_timer.h"
