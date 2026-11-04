@@ -322,12 +322,6 @@ int getFreeTcpPort() {
     return port;
 }
 
-int64_t time_gen() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
 std::string GetEnvStringOr(const char* name, const std::string& default_value) {
     const char* env_val = std::getenv(name);
     return env_val ? std::string(env_val) : default_value;

@@ -8,7 +8,7 @@
 
 #include <ylt/struct_pb.hpp>
 
-#include "utils.h"
+#include "common/timestamp.h"
 
 namespace mooncake::v1 {
 
