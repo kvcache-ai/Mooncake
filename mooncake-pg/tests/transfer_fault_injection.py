@@ -22,6 +22,11 @@ def _build_preload(output: Path) -> None:
         repository_root / "mooncake-transfer-engine" / "include"
     )
     process_group_include = repository_root / "mooncake-pg" / "include"
+    # transport.h includes a header that CMake generates in the build tree.
+    generated_config = next(
+        repository_root.glob("build*/**/mooncake_te_build_config.h"), None
+    )
+    generated_include = [f"-I{generated_config.parent}"] if generated_config else []
     command = [
         os.environ.get("CXX", "c++"),
         "-std=c++20",
@@ -30,6 +35,7 @@ def _build_preload(output: Path) -> None:
         "-fPIC",
         f"-I{transfer_engine_include}",
         f"-I{process_group_include}",
+        *generated_include,
         str(source),
         "-ldl",
         "-o",
