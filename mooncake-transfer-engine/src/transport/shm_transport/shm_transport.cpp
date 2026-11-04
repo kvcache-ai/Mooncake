@@ -562,7 +562,7 @@ int ShmTransport::registerLocalMemory(void* addr, size_t length,
 int ShmTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     std::string shm_name;
     if (!getShmName(addr, &shm_name)) return 0;
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, "shm");
 }
 
 int ShmTransport::registerLocalMemoryBatch(

@@ -89,6 +89,9 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                      bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_desc.protocol = "ub";
+#endif
     for (auto& context : context_list_) {
         int ret = context->registerMemoryRegion((uint64_t)addr, length);
         if (ret) {
@@ -126,7 +129,7 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
 }
 
 int UbTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata, "ub");
     if (rc) return rc;
     for (auto& context : context_list_)
         context->unregisterMemoryRegion((uint64_t)addr);

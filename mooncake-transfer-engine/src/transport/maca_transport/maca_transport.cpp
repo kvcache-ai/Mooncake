@@ -862,7 +862,7 @@ int MacaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
         std::lock_guard<std::mutex> lock(register_mutex_);
         registered_base_addrs_.erase((uint64_t)key_ptr);
     }
-    return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(key_ptr, update_metadata, "maca");
 }
 
 int MacaTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,

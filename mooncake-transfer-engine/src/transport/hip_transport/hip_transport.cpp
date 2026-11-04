@@ -703,8 +703,15 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
 #ifdef ENABLE_MULTI_PROTOCOL
         desc.protocol = "hip";
-#endif
+        return published_buffers_.add(
+            addr, reinterpret_cast<void*>(desc.addr), desc.length,
+            [&] { return metadata_->addLocalMemoryBuffer(desc, false); },
+            update_metadata,
+            [&] { return metadata_->updateLocalSegmentDesc(); });
+#else
+        registered_addresses_[addr] = {addr, false};
         return metadata_->addLocalMemoryBuffer(desc, true);
+#endif
     }
 
     // Fabric memory registration
@@ -749,12 +756,49 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.name = location;
         desc.shm_name = serializeBinaryData((const void*)&export_handle_raw,
                                             sizeof(hipxFabricHandle));
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "hip";
+        return published_buffers_.add(
+            addr, reinterpret_cast<void*>(desc.addr), desc.length,
+            [&] { return metadata_->addLocalMemoryBuffer(desc, false); },
+            update_metadata,
+            [&] { return metadata_->updateLocalSegmentDesc(); });
+#else
+        registered_addresses_[addr] = {real_addr, false};
         return metadata_->addLocalMemoryBuffer(desc, true);
+#endif
     }
 }
 
 int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    std::lock_guard<std::mutex> lock(register_mutex_);
+#ifdef ENABLE_MULTI_PROTOCOL
+    return published_buffers_.remove(
+        addr,
+        [&](void* base) {
+            return metadata_->removeLocalMemoryBuffer(base, false, "hip");
+        },
+        update_metadata, [&] { return metadata_->updateLocalSegmentDesc(); });
+#else
+    auto registration = registered_addresses_.find(addr);
+    if (registration == registered_addresses_.end()) return 0;
+
+    // Remove locally before publishing, matching TransferMetadata's contract.
+    // Keep the registration on an ambiguous/missing match so errors remain
+    // visible and another transport's descriptor is never used as a fallback.
+    if (!registration->second.metadata_removed) {
+        int rc = metadata_->removeLocalMemoryBuffer(registration->second.base,
+                                                    false, "hip");
+        if (rc != 0) return rc;
+        registration->second.metadata_removed = true;
+    }
+    if (update_metadata) {
+        int rc = metadata_->updateLocalSegmentDesc();
+        if (rc != 0) return rc;
+    }
+    registered_addresses_.erase(registration);
+    return 0;
+#endif
 }
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,

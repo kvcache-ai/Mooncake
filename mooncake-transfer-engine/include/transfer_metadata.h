@@ -278,7 +278,19 @@ class TransferMetadata {
     // If publication fails, the local removal remains committed; a retry must
     // publish the updated descriptor rather than remove the entry again.
     // ERR_ADDRESS_NOT_REGISTERED means no matching local entry was present.
+    // In multi-protocol builds, this legacy overload only selects descriptors
+    // with an empty protocol. Multiple such matches return ERR_INVALID_ARGUMENT
+    // without changing local metadata. Tagged descriptors require the explicit
+    // overload below. Single-protocol builds retain the first-match behavior.
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+
+    // Selects the matching (address, protocol) descriptor in multi-protocol
+    // builds. In single-protocol builds the protocol is ignored for backward
+    // compatibility. An absent match returns ERR_ADDRESS_NOT_REGISTERED;
+    // ambiguous matches return ERR_INVALID_ARGUMENT without mutation. An empty
+    // protocol selects only untagged descriptors; it is not a wildcard.
+    int removeLocalMemoryBuffer(void *addr, bool update_metadata,
+                                const std::string &protocol);
 
     // Rebuilds interned NIC paths on `desc` before insert. The caller must
     // exclusively own `desc`; do not pass a live descriptor from the metadata

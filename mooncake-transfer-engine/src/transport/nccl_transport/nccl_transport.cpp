@@ -625,7 +625,8 @@ class NcclHostTransport::Impl {
         size_t removed = 0;
         for (; removed < addr_list.size(); ++removed) {
             void* addr = addr_list[removed];
-            int result = metadata_->removeLocalMemoryBuffer(addr, false);
+            int result =
+                metadata_->removeLocalMemoryBuffer(addr, false, "nccl");
             if (result != 0) {
                 restoreMetadataBuffers(metadata_buffers, removed);
                 return result;
@@ -799,6 +800,9 @@ class NcclHostTransport::Impl {
         if (!segment) return false;
         auto it = std::find_if(segment->buffers.begin(), segment->buffers.end(),
                                [addr](const BufferDesc& buffer) {
+#ifdef ENABLE_MULTI_PROTOCOL
+                                   if (buffer.protocol != "nccl") return false;
+#endif
                                    return buffer.addr ==
                                           reinterpret_cast<uint64_t>(addr);
                                });
@@ -856,6 +860,9 @@ class NcclHostTransport::Impl {
         local_buffers_.push_back(info);
 
         BufferDesc desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "nccl";
+#endif
         desc.name = location;
         desc.addr = info.addr;
         desc.length = info.length;
@@ -863,7 +870,7 @@ class NcclHostTransport::Impl {
         int result = metadata_->addLocalMemoryBuffer(desc, update_metadata);
         if (result != 0) {
             int rollback_result =
-                metadata_->removeLocalMemoryBuffer(addr, false);
+                metadata_->removeLocalMemoryBuffer(addr, false, "nccl");
             if (rollback_result != 0 &&
                 rollback_result != ERR_ADDRESS_NOT_REGISTERED) {
                 LOG(ERROR) << "[Host NCCL] failed to roll back metadata for "
@@ -898,7 +905,16 @@ class NcclHostTransport::Impl {
         if (!findMetadataBuffer(addr, &metadata_buffer)) {
             return ERR_ADDRESS_NOT_REGISTERED;
         }
-        int result = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+#ifdef ENABLE_MULTI_PROTOCOL
+        int result = metadata_->removeLocalMemoryBuffer(addr, false, "nccl");
+        // A rejected local removal changed nothing: restoring would duplicate
+        // the descriptor. Roll back only a failed external publication.
+        if (result != 0) return result;
+        if (update_metadata) result = metadata_->updateLocalSegmentDesc();
+#else
+        int result =
+            metadata_->removeLocalMemoryBuffer(addr, update_metadata, "nccl");
+#endif
         if (result != 0) {
             if (update_metadata) {
                 restoreMetadataBuffers({metadata_buffer}, 1);

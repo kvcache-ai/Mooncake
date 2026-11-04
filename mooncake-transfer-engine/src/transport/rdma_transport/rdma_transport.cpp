@@ -583,7 +583,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         size_t n = std::min(committed, chunks.size());
         for (size_t ri = 0; ri < n; ++ri) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                chunks[ri].first, /*update_metadata=*/false);
+                chunks[ri].first, /*update_metadata=*/false, "rdma");
             if (rc)
                 LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
                                 "at "
@@ -792,13 +792,18 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         // chunk); publish once after all removals, below.
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+                reinterpret_cast<void *>(ca), /*update_metadata=*/false,
+                "rdma");
             // ERR_ADDRESS_NOT_REGISTERED means an earlier attempt already
             // removed this chunk's metadata and then failed partway through
             // deregistration: tolerate it so the retry reaches the MR cleanup.
             if (rc && rc != ERR_ADDRESS_NOT_REGISTERED && !first_err)
                 first_err = rc;
         }
+
+        // Ambiguous metadata remains published. Keep the MRs and chunk map
+        // intact so cleanup can be retried after the ambiguity is resolved.
+        if (first_err) return first_err;
 
         // MRs: unregister across contexts in PARALLEL (one thread per context,
         // each releasing all chunks) — the previous code did chunks × contexts
@@ -854,7 +859,10 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         return first_err;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata, "rdma");
+    // Ambiguity leaves metadata untouched and must not authorize a later
+    // retry to deregister MRs behind a missing descriptor.
+    if (rc == ERR_INVALID_ARGUMENT) return rc;
     // A missing metadata entry does NOT prove the MRs are gone: a partial
     // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
     // But a missing entry also occurs for an address that was never a

@@ -562,6 +562,9 @@ int HcclTransport::registerLocalMemory(void *addr, size_t length,
                                        bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_desc.protocol = "hccl";
+#endif
     buffer_desc.name = location;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = (uint64_t)length;
@@ -584,7 +587,7 @@ int HcclTransport::registerLocalMemory(void *addr, size_t length,
 }
 
 int HcclTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, "hccl");
 }
 
 int HcclTransport::allocateLocalSegmentID() {

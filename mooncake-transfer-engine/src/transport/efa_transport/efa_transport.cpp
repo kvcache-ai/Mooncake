@@ -592,6 +592,9 @@ int EfaTransport::registerLocalMemoryInternal(
         // Libfabric before 2.6 registers every EFA MR with remote access
         // whatever fi_mr_reg is asked for, so the real key must not leak.
         BufferDesc buffer_desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+        buffer_desc.protocol = "efa";
+#endif
         for (auto& context : context_list_) {
             uint64_t key = context->lkey(chunk_addr);
             if (remote_accessible) {
@@ -648,7 +651,8 @@ int EfaTransport::unregisterLocalMemoryInternal(void* addr,
         // Unregister each chunk from its assigned NICs only
         for (auto& reg : chunk_regs) {
             void* ca = (void*)reg.addr;
-            int rc = metadata_->removeLocalMemoryBuffer(ca, update_metadata);
+            int rc =
+                metadata_->removeLocalMemoryBuffer(ca, update_metadata, "efa");
             if (rc) {
                 LOG(ERROR) << "Failed to remove chunk metadata at " << ca;
                 return rc;
@@ -667,7 +671,7 @@ int EfaTransport::unregisterLocalMemoryInternal(void* addr,
     }
 
     // Non-chunked buffer: original path
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata, "efa");
     if (rc) return rc;
 
     int use_parallel_unreg = 0;

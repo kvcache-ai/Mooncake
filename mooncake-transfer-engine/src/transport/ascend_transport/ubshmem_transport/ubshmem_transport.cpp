@@ -601,6 +601,9 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
 
         (void)remote_accessible;
         BufferDesc desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "ubshmem";
+#endif
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = location;
@@ -633,6 +636,9 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
 
         (void)remote_accessible;
         BufferDesc desc;
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "ubshmem";
+#endif
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = location;
@@ -643,7 +649,7 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
 }
 
 int UBShmemTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, "ubshmem");
 }
 
 int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,

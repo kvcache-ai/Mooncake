@@ -710,9 +710,8 @@ NvlinkTransport::~NvlinkTransport() {
         const int rc = unregisterHostNumaMemoryLocked(
             address, true,
             [this](void *base, bool update) {
-                return metadata_
-                           ? metadata_->removeLocalMemoryBuffer(base, update)
-                           : ERR_METADATA;
+                return metadata_ ? removeLocalMemoryBuffer(base, update)
+                                 : ERR_METADATA;
             },
             [this]() {
                 return metadata_ ? metadata_->updateLocalSegmentDesc()
@@ -1019,10 +1018,15 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         desc.shm_name =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
 #ifdef ENABLE_MULTI_PROTOCOL
-        if (policy_->preserveExistingMetadata())
-            desc.protocol = policy_->protocol();
-#endif
+        desc.protocol = policy_->protocol();
+        return published_buffers_.add(
+            addr, reinterpret_cast<void *>(desc.addr), desc.length,
+            [&] { return metadata_->addLocalMemoryBuffer(desc, false); },
+            update_metadata,
+            [&] { return metadata_->updateLocalSegmentDesc(); });
+#else
         return metadata_->addLocalMemoryBuffer(desc, true);
+#endif
     } else {
 #if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
         const auto host_numa_result = registerHostNumaMemoryLocked(
@@ -1031,7 +1035,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                 return metadata_->addLocalMemoryBuffer(desc, update);
             },
             [this](void *base, bool update) {
-                return metadata_->removeLocalMemoryBuffer(base, update);
+                return removeLocalMemoryBuffer(base, update);
             },
             [this]() { return metadata_->updateLocalSegmentDesc(); });
         if (host_numa_result) return *host_numa_result;
@@ -1077,10 +1081,15 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         desc.shm_name =
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
 #ifdef ENABLE_MULTI_PROTOCOL
-        if (policy_->preserveExistingMetadata())
-            desc.protocol = policy_->protocol();
-#endif
+        desc.protocol = policy_->protocol();
+        return published_buffers_.add(
+            addr, reinterpret_cast<void *>(desc.addr), desc.length,
+            [&] { return metadata_->addLocalMemoryBuffer(desc, false); },
+            update_metadata,
+            [&] { return metadata_->updateLocalSegmentDesc(); });
+#else
         return metadata_->addLocalMemoryBuffer(desc, true);
+#endif
     }
 }
 
@@ -1177,6 +1186,9 @@ std::optional<int> NvlinkTransport::registerHostNumaMemoryLocked(
     desc.name = location;
     desc.shm_name =
         serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+#ifdef ENABLE_MULTI_PROTOCOL
+    desc.protocol = policy_->protocol();
+#endif
     registration->second.metadata_removed_locally = false;
     registration->second.metadata_cleanup_complete = false;
 
@@ -1213,6 +1225,9 @@ int NvlinkTransport::unregisterHostNumaMemoryLocked(
                 if (update_rc != 0) return update_rc;
             }
             registration->second.metadata_cleanup_complete = update_metadata;
+        } else if (rc == ERR_INVALID_ARGUMENT) {
+            // Ambiguity leaves metadata untouched: retain the owner for retry.
+            return rc;
         } else if (rc != 0) {
             // removeLocalMemoryBuffer updates the local descriptor before it
             // attempts external publication.
@@ -1272,9 +1287,13 @@ int NvlinkTransport::unregisterHostNumaMemoryBatchLocked(
                 needs_publication = true;
             }
         } else if (!NvlinkHostNumaAllocation::IsOwnedRangeBase(addr)) {
-            // Keep legacy address/error semantics. Owned addresses without a
-            // record are already done, including on a partial-batch retry.
+            // HOST_NUMA and fabric/IPC registrations have separate records.
+            // A skipped fabric registration must not withdraw peer metadata.
+#ifdef ENABLE_MULTI_PROTOCOL
+            rc = unregisterPublishedMemoryLocked(addr, false);
+#else
             rc = remove_buffer(addr, false);
+#endif
             needs_publication = true;
         }
         if (rc != 0 && first_error == 0) first_error = rc;
@@ -1303,21 +1322,56 @@ int NvlinkTransport::unregisterHostNumaMemoryBatchLocked(
 }
 #endif
 
+int NvlinkTransport::removeLocalMemoryBuffer(void *addr, bool update_metadata) {
+    // Match the tag written by every registration path, including HOST_NUMA.
+#ifdef ENABLE_MULTI_PROTOCOL
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata,
+                                              policy_->protocol());
+#else
+    const std::string protocol =
+        policy_->preserveExistingMetadata() ? policy_->protocol() : "";
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, protocol);
+#endif
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+int NvlinkTransport::unregisterPublishedMemoryLocked(void *addr,
+                                                     bool update_metadata) {
+    return published_buffers_.remove(
+        addr, [&](void *base) { return removeLocalMemoryBuffer(base, false); },
+        update_metadata, [&] { return metadata_->updateLocalSegmentDesc(); });
+}
+#endif
+
 int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    std::lock_guard<std::mutex> lock(register_mutex_);
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    if (host_numa_registration_handles_.count(addr) != 0)
+        return unregisterHostNumaMemoryLocked(
+            addr, update_metadata,
+            [this](void *base, bool update) {
+                return removeLocalMemoryBuffer(base, update);
+            },
+            [this]() { return metadata_->updateLocalSegmentDesc(); });
+#endif
+    return unregisterPublishedMemoryLocked(addr, update_metadata);
+#else
 #if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
     std::unique_lock<std::mutex> lock(register_mutex_);
     if (host_numa_registration_handles_.count(addr) == 0) {
         lock.unlock();
-        return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+        return removeLocalMemoryBuffer(addr, update_metadata);
     }
     return unregisterHostNumaMemoryLocked(
         addr, update_metadata,
         [this](void *base, bool update) {
-            return metadata_->removeLocalMemoryBuffer(base, update);
+            return removeLocalMemoryBuffer(base, update);
         },
         [this]() { return metadata_->updateLocalSegmentDesc(); });
 #else
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return removeLocalMemoryBuffer(addr, update_metadata);
+#endif
 #endif
 }
 
@@ -1454,7 +1508,7 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
     return unregisterHostNumaMemoryBatchLocked(
         addr_list,
         [this](void *base, bool update) {
-            return metadata_->removeLocalMemoryBuffer(base, update);
+            return removeLocalMemoryBuffer(base, update);
         },
         [this]() { return metadata_->updateLocalSegmentDesc(); });
 #else

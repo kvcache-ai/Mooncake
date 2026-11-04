@@ -331,7 +331,7 @@ int FlagCxTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
             }
         }
     }
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return metadata_->removeLocalMemoryBuffer(addr, update_metadata, "flagcx");
 }
 
 int FlagCxTransport::registerLocalMemoryBatch(

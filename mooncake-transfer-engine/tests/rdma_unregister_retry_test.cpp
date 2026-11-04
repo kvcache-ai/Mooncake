@@ -133,6 +133,9 @@ class RdmaUnregisterRetryTest : public ::testing::Test {
         desc.name = "local-rdma-segment";
         desc.addr = reinterpret_cast<uint64_t>(buffer_);
         desc.length = kLength;
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "rdma";
+#endif
         ASSERT_EQ(metadata_->addLocalMemoryBuffer(desc, false), 0);
     }
 
@@ -258,6 +261,9 @@ TEST_F(RdmaUnregisterRetryTest, BatchRetryIgnoresAlreadyCleanedSibling) {
     sibling_desc.name = "local-rdma-segment";
     sibling_desc.addr = reinterpret_cast<uint64_t>(sibling);
     sibling_desc.length = kLength;
+#ifdef ENABLE_MULTI_PROTOCOL
+    sibling_desc.protocol = "rdma";
+#endif
     ASSERT_EQ(metadata_->addLocalMemoryBuffer(sibling_desc, false), 0);
     addMetadataEntry();
 
@@ -316,5 +322,106 @@ TEST_F(RdmaUnregisterRetryTest, NeverRegisteredKeepsNotRegisteredContract) {
     addMetadataEntry();
     EXPECT_EQ(engine.unregisterLocalMemory(buffer_, false), 0);
 }
+
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST_F(RdmaUnregisterRetryTest, RetryPreservesPeerProtocolDescriptor) {
+    addMetadataEntry();
+    auto peer =
+        metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.front();
+    peer.protocol = "tcp";
+    ASSERT_EQ(metadata_->addLocalMemoryBuffer(peer, false), 0);
+
+    g_fake_dereg_failures_remaining = 1;
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), ERR_CONTEXT);
+    EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), 0);
+    EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
+    EXPECT_EQ(g_fake_dereg_calls.load(), 2);
+
+    auto remaining = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_EQ(remaining->buffers.size(), 1U);
+    EXPECT_EQ(remaining->buffers.front().protocol, "tcp");
+    EXPECT_EQ(remaining->buffers.front().addr, peer.addr);
+}
+
+TEST_F(RdmaUnregisterRetryTest, AmbiguityDoesNotCreatePendingCleanup) {
+    addMetadataEntry();
+    addMetadataEntry();
+    auto original = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID), original);
+    EXPECT_EQ(g_fake_dereg_calls.load(), 0);
+    EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
+
+    // Repair the duplicate, then perform an ordinary successful unregister.
+    auto repaired = std::make_shared<TransferMetadata::SegmentDesc>(*original);
+    repaired->buffers.pop_back();
+    ASSERT_EQ(metadata_->addLocalSegment(LOCAL_SEGMENT_ID, repaired->name,
+                                         std::move(repaired)),
+              0);
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), 0);
+    EXPECT_EQ(g_fake_dereg_calls.load(), 1);
+
+    // An ambiguity must not leave a pending record that turns this later,
+    // already-clean unregister into a spurious successful retry.
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(g_fake_dereg_calls.load(), 1);
+}
+
+TEST_F(RdmaUnregisterRetryTest, ChunkAmbiguityPreservesMrsForRetry) {
+    constexpr size_t chunk_length = kLength / 2;
+    void* tail = static_cast<char*>(buffer_) + chunk_length;
+    mr_.length = chunk_length;
+    RdmaContextTestPeer::seedMemoryRegion(*context_, buffer_, chunk_length,
+                                          &mr_);
+    ibv_mr tail_mr{};
+    tail_mr.addr = tail;
+    tail_mr.length = chunk_length;
+    RdmaContextTestPeer::seedMemoryRegion(*context_, tail, chunk_length,
+                                          &tail_mr);
+    RdmaTransportTestPeer::seedChunks(*transport_, buffer_,
+                                      {reinterpret_cast<uint64_t>(buffer_),
+                                       reinterpret_cast<uint64_t>(tail)});
+
+    TransferMetadata::BufferDesc desc{};
+    desc.name = "local-rdma-segment";
+    desc.protocol = "rdma";
+    desc.length = chunk_length;
+    for (void* chunk : {buffer_, tail, buffer_}) {
+        desc.addr = reinterpret_cast<uint64_t>(chunk);
+        ASSERT_EQ(metadata_->addLocalMemoryBuffer(desc, false), 0);
+    }
+
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(g_fake_dereg_calls.load(), 0);
+    EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
+    EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, tail));
+
+    // The tail descriptor was removed, but both MRs must remain reachable
+    // through the chunk map. Repair the duplicated base descriptor.
+    auto repaired = std::make_shared<TransferMetadata::SegmentDesc>(
+        *metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID));
+    ASSERT_EQ(repaired->buffers.size(), 2U);
+    repaired->buffers.pop_back();
+    ASSERT_EQ(metadata_->addLocalSegment(LOCAL_SEGMENT_ID, repaired->name,
+                                         std::move(repaired)),
+              0);
+
+    g_fake_dereg_failures_remaining = 1;
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), ERR_CONTEXT);
+    EXPECT_EQ(g_fake_dereg_calls.load(), 2);
+    EXPECT_TRUE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
+    EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, tail));
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false), 0);
+    EXPECT_EQ(g_fake_dereg_calls.load(), 3);
+    EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, buffer_));
+    EXPECT_FALSE(RdmaContextTestPeer::hasMemoryRegion(*context_, tail));
+    EXPECT_EQ(transport_->unregisterLocalMemory(buffer_, false),
+              ERR_ADDRESS_NOT_REGISTERED);
+}
+#endif
 
 }  // namespace
