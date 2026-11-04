@@ -18,8 +18,9 @@ HAMetricManager::HAMetricManager()
     // OpLog Sequence Gauges
     : oplog_last_sequence_id_("ha_oplog_last_sequence_id",
                               "Latest OpLog sequence ID written by Primary"),
-      oplog_applied_sequence_id_("ha_oplog_applied_sequence_id",
-                                 "Latest OpLog sequence ID applied by Standby"),
+      oplog_applied_sequence_id_(
+          "ha_oplog_applied_sequence_id",
+          "Local OpLog metadata apply watermark (same as /ha/status)"),
       oplog_standby_lag_("ha_oplog_standby_lag",
                          "Number of OpLog entries Standby is behind Primary"),
       oplog_pending_entries_(

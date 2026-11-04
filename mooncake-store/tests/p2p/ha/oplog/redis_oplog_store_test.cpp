@@ -304,6 +304,20 @@ TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
     EXPECT_EQ(2u, latest);
 }
 
+TEST_F(RedisOpLogStoreTest, PrimaryLatestSequenceUpdatesAppliedMetric) {
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(2));
+    HAMetricManager::instance().set_oplog_applied_sequence_id(0);
+
+    uint64_t latest = 0;
+    ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+    EXPECT_EQ(2u, latest);
+    EXPECT_EQ(static_cast<int64_t>(latest),
+              HAMetricManager::instance().get_oplog_applied_sequence_id());
+}
+
 TEST_F(RedisOpLogStoreTest, OpLogKeysDoNotUseRedisHashTags) {
     auto writer = CreateWriter();
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
