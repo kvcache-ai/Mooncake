@@ -17,6 +17,12 @@
 #include "p2p/ha/redis_election_helper.h"
 #include "p2p/ha/p2p_master_view.h"
 #include "redis_test_utils.h"
+
+// Keep this include after standard dependencies; the private runner is used to
+// exercise the same master-view startup path without launching the RPC loop.
+#define private public
+#include "p2p/master/p2p_master.h"
+#undef private
 #include <hiredis/hiredis.h>
 
 namespace mooncake {
@@ -95,6 +101,28 @@ class RedisElectionHelperTest : public ::testing::Test {
     void TearDown() override { CleanupRedisKeys(); }
 };
 
+static std::string WrongRedisPassword() {
+    return FLAGS_redis_password + "-wrong-for-auth-failure-test";
+}
+
+static P2PMasterConfig MakeRedisMasterConfig(
+    const std::string& redis_password) {
+    P2PMasterConfig config;
+    config.rpc.port = 0;
+    config.rpc.thread_num = 1;
+    config.rpc.address = "127.0.0.1";
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    config.ha.election_backend = ElectionBackend::REDIS;
+    config.redis.endpoint = FLAGS_redis_endpoint;
+    config.redis.username = FLAGS_redis_username;
+    config.redis.password = redis_password;
+    config.redis.master_view_ttl_seconds = FLAGS_redis_ttl_sec;
+    config.redis.heartbeat_interval_seconds = 1;
+    config.cluster_id = FLAGS_cluster_id + "_wrong_password_startup";
+    return config;
+}
+
 TEST_F(RedisElectionHelperTest, Connect) {
     RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
                                FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
@@ -106,6 +134,37 @@ TEST_F(RedisElectionHelperTest, Connect) {
                                 FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
                                 FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, helper2.Connect());
+}
+
+TEST_F(RedisElectionHelperTest, ConnectFailsWithWrongPassword) {
+    RedisElectionHelper reachable(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                                  FLAGS_redis_password, 0, FLAGS_redis_ttl_sec,
+                                  1, FLAGS_redis_username);
+    ASSERT_EQ(ErrorCode::OK, reachable.Connect());
+
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               WrongRedisPassword(), 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
+
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, helper.Connect());
+}
+
+TEST_F(RedisElectionHelperTest, MasterRunWithHAFailsWithWrongRedisPassword) {
+    RedisElectionHelper reachable(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                                  FLAGS_redis_password, 0, FLAGS_redis_ttl_sec,
+                                  1, FLAGS_redis_username);
+    ASSERT_EQ(ErrorCode::OK, reachable.Connect());
+
+    HAStatusManager::instance().Reset();
+    P2PMaster master(MakeRedisMasterConfig(WrongRedisPassword()));
+    EXPECT_EQ(-1, master.RunWithHA());
+    const auto status = HAStatusManager::instance().Snapshot();
+    EXPECT_EQ(status.role, "starting");
+    EXPECT_EQ(status.state, "FAILED");
+    EXPECT_NE(HAStatusManager::instance().SerializeJson().find(
+                  "Failed to initialize P2P master view"),
+              std::string::npos);
+    HAStatusManager::instance().Reset();
 }
 
 // === Test 2: ElectLeader + GetMasterView ===

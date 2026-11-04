@@ -343,8 +343,12 @@ int P2PMaster::RunWithHA() {
             master_view = std::move(etcd_view);
         }
         if (connect_result != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to initialize P2P master view: "
-                       << toString(connect_result);
+            const std::string error =
+                std::string("Failed to initialize P2P master view: ") +
+                toString(connect_result);
+            HAStatusManager::instance().SetRoleState("starting", "FAILED");
+            HAStatusManager::instance().SetLastError(error);
+            LOG(ERROR) << error;
             return -1;
         }
 
