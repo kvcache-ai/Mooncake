@@ -16,6 +16,16 @@
 #include <hiredis/hiredis.h>
 
 namespace mooncake {
+class RedisElectionHelperTestPeer {
+   public:
+    static bool PollLeaderOnce(RedisElectionHelper& helper,
+                               redisContext*& context) {
+        return helper.PollLeaderOnce(context);
+    }
+};
+}  // namespace mooncake
+
+namespace mooncake {
 namespace testing {
 
 DEFINE_string(redis_endpoint, "127.0.0.1:6379",
@@ -645,6 +655,49 @@ TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
 // Covers: redis_election_helper.cpp:379-413 (polling path when SUBSCRIBE fails)
 // We use CLIENT KILL to break subscribe_ctx_ so SUBSCRIBE command fails,
 // forcing WatchLeader to fall through to the pure polling path.
+
+TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
+    auto [host, port] = ParseRedisEndpoint();
+    redisContext* admin = redisConnect(host.c_str(), port);
+    ASSERT_TRUE(AuthenticateRedisContext(admin, FLAGS_redis_username,
+                                         FLAGS_redis_password));
+    const std::string key =
+        "mooncake:{" + FLAGS_cluster_id + "}:master_view";
+
+    RedisReplyPtr reply((redisReply*)redisCommand(admin, "DEL %b",
+                                                   key.data(), key.size()));
+    reply.reset((redisReply*)redisCommand(admin, "LPUSH %b wrongtype",
+                                          key.data(), key.size()));
+    ASSERT_TRUE(reply && reply->type == REDIS_REPLY_INTEGER);
+
+    redisContext* context = nullptr;
+    EXPECT_FALSE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
+    EXPECT_EQ(context, nullptr);
+
+    const auto leader_value = RedisElectionHelper::SerializeLeaderValue(
+        "primary:50051", 1, FLAGS_redis_ttl_sec);
+    reply.reset((redisReply*)redisCommand(
+        admin, "DEL %b", key.data(), key.size()));
+    ASSERT_TRUE(reply);
+    reply.reset((redisReply*)redisCommand(
+        admin, "SET %b %b", key.data(), key.size(), leader_value.data(),
+        leader_value.size()));
+    ASSERT_TRUE(reply && reply->type == REDIS_REPLY_STATUS);
+    EXPECT_FALSE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
+    ASSERT_NE(context, nullptr);
+
+    reply.reset((redisReply*)redisCommand(admin, "DEL %b", key.data(),
+                                           key.size()));
+    ASSERT_TRUE(reply && reply->type == REDIS_REPLY_INTEGER);
+    EXPECT_TRUE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
+    ASSERT_NE(context, nullptr);
+
+    redisFree(context);
+    redisFree(admin);
+}
 
 TEST_F(RedisElectionHelperTest, WatchLeaderPollingFallback) {
     if (!FLAGS_redis_supports_client_kill) {
