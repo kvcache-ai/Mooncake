@@ -60,6 +60,18 @@ DEFINE_uint64(oplog_best_effort_max_retries, 3,
               "Maximum best-effort Redis OpLog retries");
 DEFINE_uint32(oplog_async_write_batch_size, 64,
               "Maximum entries in a Redis OpLog pipeline batch");
+DEFINE_bool(oplog_auto_trim_enabled, false,
+            "Enable primary-side Redis OpLog auto trim in P2P HA mode");
+DEFINE_uint32(oplog_auto_trim_interval_sec, 60,
+              "Interval in seconds for Redis OpLog auto trim");
+DEFINE_uint64(oplog_trim_retention_entries, 100000,
+              "Number of recent OpLog entries to retain before auto trim");
+DEFINE_uint64(oplog_trim_delete_batch_size, 10000,
+              "Maximum number of trimmed Redis OpLog entries to delete per "
+              "auto trim cycle");
+DEFINE_uint32(
+    oplog_trim_min_snapshot_ready_standby_count, 1,
+    "Minimum number of snapshot-ready Standbys required before auto trim");
 DEFINE_uint32(standby_oplog_pending_max_entries, 1000,
               "Maximum future OpLog entries buffered by a standby");
 DEFINE_uint32(standby_oplog_poll_batch_size, 1000,
@@ -146,6 +158,20 @@ void LoadConfigFile(const DefaultConfig& source, P2PMasterConfig& config,
     source.GetUInt32("oplog_async_write_batch_size",
                      &config.oplog.async_write_batch_size,
                      config.oplog.async_write_batch_size);
+    source.GetBool("oplog_auto_trim_enabled", &config.oplog.auto_trim_enabled,
+                   config.oplog.auto_trim_enabled);
+    source.GetUInt32("oplog_auto_trim_interval_sec",
+                     &config.oplog.auto_trim_interval_sec,
+                     config.oplog.auto_trim_interval_sec);
+    source.GetUInt64("oplog_trim_retention_entries",
+                     &config.oplog.trim_retention_entries,
+                     config.oplog.trim_retention_entries);
+    source.GetUInt64("oplog_trim_delete_batch_size",
+                     &config.oplog.trim_delete_batch_size,
+                     config.oplog.trim_delete_batch_size);
+    source.GetUInt32("oplog_trim_min_snapshot_ready_standby_count",
+                     &config.oplog.trim_min_snapshot_ready_standby_count,
+                     config.oplog.trim_min_snapshot_ready_standby_count);
     source.GetUInt32("standby_oplog_pending_max_entries",
                      &config.ha.standby_oplog_pending_max_entries,
                      config.ha.standby_oplog_pending_max_entries);
@@ -210,6 +236,15 @@ void ApplyCommandLineOverrides(P2PMasterConfig& config,
                    config.oplog.best_effort_max_retries);
     APPLY_OVERRIDE(oplog_async_write_batch_size,
                    config.oplog.async_write_batch_size);
+    APPLY_OVERRIDE(oplog_auto_trim_enabled, config.oplog.auto_trim_enabled);
+    APPLY_OVERRIDE(oplog_auto_trim_interval_sec,
+                   config.oplog.auto_trim_interval_sec);
+    APPLY_OVERRIDE(oplog_trim_retention_entries,
+                   config.oplog.trim_retention_entries);
+    APPLY_OVERRIDE(oplog_trim_delete_batch_size,
+                   config.oplog.trim_delete_batch_size);
+    APPLY_OVERRIDE(oplog_trim_min_snapshot_ready_standby_count,
+                   config.oplog.trim_min_snapshot_ready_standby_count);
     APPLY_OVERRIDE(standby_oplog_pending_max_entries,
                    config.ha.standby_oplog_pending_max_entries);
     APPLY_OVERRIDE(standby_oplog_poll_batch_size,
@@ -276,6 +311,33 @@ tl::expected<void, std::string> ValidateAndNormalize(
          config.ha.standby_oplog_poll_batch_size == 0)) {
         return tl::make_unexpected(
             "standby OpLog pending and poll batch limits must be positive");
+    }
+
+    if (config.oplog.auto_trim_enabled) {
+        if (!config.oplog.enabled || !config.ha.enabled ||
+            config.ha.election_backend != ElectionBackend::REDIS ||
+            ParseOpLogStoreType(config.oplog.store_type) !=
+                OpLogStoreType::REDIS) {
+            return tl::make_unexpected(
+                "oplog_auto_trim_enabled requires Redis HA and Redis OpLog");
+        }
+        if (config.oplog.auto_trim_interval_sec == 0) {
+            return tl::make_unexpected(
+                "oplog_auto_trim_interval_sec must be greater than 0");
+        }
+        if (config.oplog.trim_retention_entries == 0) {
+            return tl::make_unexpected(
+                "oplog_trim_retention_entries must be greater than 0");
+        }
+        if (config.oplog.trim_delete_batch_size == 0) {
+            return tl::make_unexpected(
+                "oplog_trim_delete_batch_size must be greater than 0");
+        }
+        if (config.oplog.trim_min_snapshot_ready_standby_count == 0) {
+            return tl::make_unexpected(
+                "oplog_trim_min_snapshot_ready_standby_count must be greater "
+                "than 0");
+        }
     }
 
     if (config.ha.enabled && config.oplog.enabled &&

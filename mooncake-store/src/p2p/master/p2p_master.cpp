@@ -26,6 +26,7 @@
 #include "utils.h"
 #ifdef STORE_USE_REDIS
 #include "p2p/ha/oplog/redis_oplog_store.h"
+#include "p2p/ha/oplog/redis_oplog_trim_worker.h"
 #endif
 
 namespace mooncake {
@@ -429,6 +430,37 @@ int P2PMaster::RunWithHA() {
 #endif
 
 #ifdef STORE_USE_REDIS
+        std::unique_ptr<RedisOpLogTrimWorker> redis_oplog_trim_worker;
+        if (config_.oplog.auto_trim_enabled) {
+            RedisOpLogTrimWorkerConfig trim_config;
+            trim_config.cluster_id = config_.cluster_id;
+            trim_config.self_instance_id = master_instance_id;
+            trim_config.redis_endpoint = config_.redis.endpoint;
+            trim_config.redis_username = config_.redis.username;
+            trim_config.redis_password = config_.redis.password;
+            trim_config.redis_db_index = config_.redis.db_index;
+            trim_config.registry_ttl = std::chrono::seconds(10);
+            trim_config.interval =
+                std::chrono::seconds(config_.oplog.auto_trim_interval_sec);
+            trim_config.retention_entries =
+                config_.oplog.trim_retention_entries;
+            trim_config.delete_batch_size =
+                config_.oplog.trim_delete_batch_size;
+            trim_config.min_snapshot_ready_standby_count =
+                config_.oplog.trim_min_snapshot_ready_standby_count;
+            redis_oplog_trim_worker =
+                std::make_unique<RedisOpLogTrimWorker>(std::move(trim_config));
+            auto trim_start = redis_oplog_trim_worker->Start();
+            if (trim_start != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to start Redis OpLog auto trim worker: "
+                           << toString(trim_start);
+                redis_oplog_trim_worker.reset();
+                master_view->CancelKeepAlive(lease_id);
+                keep_leader_thread.join();
+                return -1;
+            }
+        }
+
         auto mark_primary = [&master_registry_heartbeat,
                              primary_service =
                                  &active_service->GetMasterService()] {
@@ -443,6 +475,7 @@ int P2PMaster::RunWithHA() {
         };
         const int run_result = RunActiveRpcServers(*server, *active_service,
                                                    std::move(mark_primary));
+        redis_oplog_trim_worker.reset();
 #else
         const int run_result = RunActiveRpcServers(*server, *active_service);
 #endif
