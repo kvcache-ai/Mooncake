@@ -6,7 +6,7 @@
 ARG CUDA_VERSION=13.0.3
 ARG UBUNTU_VERSION=22.04
 
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS build-deps
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -43,17 +43,51 @@ RUN apt-get update && \
         python${PYTHON_VERSION}-dev \
         python${PYTHON_VERSION}-venv && \
     curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
-    python${PYTHON_VERSION} -m pip install --no-cache-dir "torch==${TORCH_VERSION}" && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get purge -y --auto-remove software-properties-common && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
-COPY . /workspace
+# Install system dependencies before copying source so edits reuse this layer;
+# submodules are initialized in the source stage after the repository is copied.
+COPY dependencies.sh /workspace/dependencies.sh
+RUN bash dependencies.sh -y --skip-submodules
 
-# Install Mooncake dependencies (submodules, Go, etc.)
-RUN bash dependencies.sh -y
+COPY mooncake-wheel/pyproject.toml /tmp/mooncake-pyproject.toml
+RUN python${PYTHON_VERSION} -m pip install --upgrade pip tomli && \
+    python${PYTHON_VERSION} - <<'PYTHON'
+import tomli
+from pathlib import Path
+
+with open("/tmp/mooncake-pyproject.toml", "rb") as manifest:
+    metadata = tomli.load(manifest)
+Path("/tmp/build-requirements.txt").write_text(
+    "\n".join(metadata["build-system"]["requires"] + ["build", "auditwheel", "patchelf"])
+)
+Path("/tmp/runtime-requirements.txt").write_text("\n".join(metadata["project"]["dependencies"]))
+PYTHON
+# Wheels only: the runtime stage installs offline from this directory, and an
+# sdist could not be built there without network access.
+RUN python${PYTHON_VERSION} -m pip wheel --wheel-dir /opt/python-wheels/build -r /tmp/build-requirements.txt && \
+    python${PYTHON_VERSION} -m pip download --only-binary=:all: --dest /opt/python-wheels/runtime -r /tmp/runtime-requirements.txt && \
+    cp /tmp/runtime-requirements.txt /opt/python-wheels/runtime-requirements.txt && \
+    python${PYTHON_VERSION} -m pip download --only-binary=:all: --dest /opt/python-wheels/torch "torch==${TORCH_VERSION}" && \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links=/opt/python-wheels/build -r /tmp/build-requirements.txt && \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links=/opt/python-wheels/torch "torch==${TORCH_VERSION}"
+
+COPY mooncake-common/etcd/go.mod mooncake-common/etcd/go.sum mooncake-common/etcd/*.go /workspace/mooncake-common/etcd/
+RUN cd /workspace/mooncake-common/etcd && go mod tidy
+
+FROM build-deps AS source
+ENV PIP_NO_INDEX=1 \
+    PIP_FIND_LINKS="/opt/python-wheels/build /opt/python-wheels/runtime /opt/python-wheels/torch" \
+    SKIP_WHEEL_BUILD_DEPS=1 \
+    WHEEL_BUILD_NO_ISOLATION=1
+COPY . /workspace
+RUN git submodule sync --recursive && git submodule update --init --recursive
+
+FROM source AS builder
 
 # Configure and build the wheel in one layer, then remove build/ only after
 # auditwheel has resolved libraries from it. The large intermediate tree is
@@ -67,6 +101,7 @@ RUN mkdir -p build && \
         -DUSE_CUDA=ON \
         -DWITH_EP=ON \
         -DSTORE_USE_ETCD=ON \
+        -DYLT_DOWNLOAD_DIR=/workspace/.cache/yalantinglibs \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
@@ -80,7 +115,7 @@ RUN mkdir -p build && \
     bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
     cd /workspace && \
     OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
-    python${PYTHON_VERSION} -m pip install --no-cache-dir mooncake-wheel/dist/*.whl && \
+    python${PYTHON_VERSION} -m pip install mooncake-wheel/dist/*.whl && \
     ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
     python${PYTHON_VERSION} -m mooncake.pg --prebuild && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
@@ -121,16 +156,20 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION} && \
     curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
-    python${PYTHON_VERSION} -m pip install --no-cache-dir "torch==${TORCH_VERSION}" && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
     apt-get purge -y --auto-remove software-properties-common curl && \
     rm -rf /var/lib/apt/lists/*
 
+# Install the prefetched runtime dependencies without retaining wheel archives.
+RUN --mount=type=bind,from=build-deps,source=/opt/python-wheels,target=/tmp/python-wheels \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/python-wheels/torch "torch==${TORCH_VERSION}" && \
+    python${PYTHON_VERSION} -m pip install --no-index --find-links=/tmp/python-wheels/runtime -r /tmp/python-wheels/runtime-requirements.txt
+
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
 COPY --from=builder /root/.cache/mooncake/pg_jit /root/.cache/mooncake/pg_jit
 COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
-RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
+RUN python${PYTHON_VERSION} -m pip install --no-index --no-deps /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]
