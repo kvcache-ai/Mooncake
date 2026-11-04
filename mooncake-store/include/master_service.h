@@ -1151,9 +1151,6 @@ class MasterService {
     // raises it again when the round could free nothing that was there to
     // free.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
-    // Walks all objects and publishes the memory bytes that eviction cannot
-    // reclaim now: PROCESSING replicas and leased COMPLETE replicas.
-    void UpdateUnevictableMemMetrics(std::chrono::system_clock::time_point now);
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     using NamespaceEvictionResult = StoreControl::EvictionResult;
@@ -1654,8 +1651,6 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
-    // Interval of the full-metadata walk behind UpdateUnevictableMemMetrics.
-    static constexpr uint64_t kUnevictableMemMetricsIntervalMs = 1000;
 
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
@@ -2130,6 +2125,12 @@ class MasterService {
             for (auto& replica : replicas_) {
                 if (replica.is_memory_replica()) {
                     mem_size_ += replica.get_memory_buffer_size();
+                    // An abandoned put is staging memory now, reported by
+                    // master_put_start_discarded_staging_size, not a put
+                    // in flight.
+                    if (replica.is_processing()) {
+                        replica.mark_removed();
+                    }
                 }
             }
             MasterMetricManager::instance().inc_put_start_discard_cnt(

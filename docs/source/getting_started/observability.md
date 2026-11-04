@@ -170,30 +170,26 @@ The admin HTTP server is configured in the master config file (`master.json` or 
 
 Set `enable_metric_reporting` to `false` to disable the periodic metrics log. HTTP endpoints (`/metrics`, `/health`, etc.) remain available regardless of this setting.
 
-### Unevictable Memory Metrics
+### In-Flight Write Metrics
 
 `master_allocated_bytes` counts all allocated memory, including data that
 eviction can reclaim, so it cannot tell a full-but-evictable store from one
-pinned by in-flight work. Two gauges split out the memory eviction cannot
-reclaim right now. A metadata walk on the eviction thread refreshes them about
-once a second.
+pinned by puts that have not finished.
 
 | Metric | Type | Meaning |
 |--------|------|---------|
 | `master_mem_processing_bytes` | gauge | Memory held by `PROCESSING` replicas: puts that have started but not ended |
-| `master_mem_leased_bytes` | gauge | Memory of `COMPLETE` replicas whose object holds an unexpired read lease |
+| `master_put_start_discarded_staging_size` | gauge | Memory of replicas displaced by an overwrite, a preempted put or a timed-out put, until deferred release |
 
-Divided by `master_total_capacity_bytes`, these give the write, read and total
-(sum) usage that clients such as vLLM's Mooncake store connector report. Read
-usage includes the whole lease TTL (`default_kv_lease_ttl`), not only the time
-a read transfer takes. Both gauges read `0` once the master stops serving, for
-example after an HA step-down.
+Each replica updates `master_mem_processing_bytes` when its status changes, so
+the gauge is always current and costs no metadata walk or lock. A put that is
+preempted or times out moves from the first gauge to the second, so the two
+never count the same bytes. Divided by `master_total_capacity_bytes`, their sum
+is the memory that eviction cannot reclaim because of unfinished or displaced
+writes.
 
-Replicas displaced by an overwrite, a preempted put or a timed-out put leave
-the object metadata, so the walk does not count them, but their memory stays
-allocated until deferred release. `master_put_start_discarded_staging_size`
-reports those bytes. The memory eviction cannot reclaim is the sum of all three
-gauges.
+Memory pinned by read leases is not exported: a lease is only an expiry time on
+the object, so counting it would need a walk over all objects.
 
 ### Process and Allocator Memory Metrics
 

@@ -304,70 +304,69 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 }
 
-TEST_F(MasterMetricsTest, UnevictableMemGaugesTrackPutsAndLeases) {
-    const uint64_t default_kv_lease_ttl = 2000;
+TEST_F(MasterMetricsTest, ProcessingMemGaugeTracksPutLifecycle) {
     auto& metrics = MasterMetricManager::instance();
     WrappedMasterServiceConfig service_config;
-    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
+    service_config.default_kv_lease_ttl = 1000;
     auto service = std::make_unique<WrappedMasterService>(service_config);
 
     Segment segment;
     segment.id = generate_uuid();
-    segment.name = "unevictable_segment";
+    segment.name = "processing_segment";
     segment.base = 0x300000000;
     segment.size = 1024 * 1024 * 16;
-    UUID client_id = generate_uuid();
-    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    UUID writer = generate_uuid();
+    UUID upserter = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, writer).has_value());
 
-    // The gauges are refreshed by the eviction thread about once a second.
-    auto wait_for = [&](int64_t processing, int64_t leased) {
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (metrics.get_mem_processing_bytes() == processing &&
-                metrics.get_mem_leased_bytes() == leased) {
-                return true;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        return false;
-    };
-
-    const std::string key = "unevictable_key";
     const uint64_t value_length = 4096;
     ReplicateConfig config;
     config.replica_num = 1;
+    const int64_t processing0 = metrics.get_mem_processing_bytes();
+    const int64_t staging0 = metrics.get_put_start_discarded_staging_size();
 
+    // A put is in flight from PutStart until PutEnd.
     ASSERT_TRUE(
-        service->PutStart(client_id, key, value_length, config).has_value());
-    EXPECT_TRUE(wait_for(value_length, 0));
-
+        service->PutStart(writer, "done", value_length, config).has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0 + value_length);
     ASSERT_TRUE(service
-                    ->PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                    ->PutEnd(writer, ObjectMeta{"done", std::nullopt},
                              ReplicaType::MEMORY)
                     .has_value());
-    EXPECT_TRUE(wait_for(0, 0));
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0);
 
-    // A read grants a lease, which pins the complete replica until it expires.
-    ASSERT_TRUE(service->GetReplicaList(key, "default").has_value());
-    EXPECT_TRUE(wait_for(0, value_length));
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(default_kv_lease_ttl));
-    EXPECT_TRUE(wait_for(0, 0));
+    // A revoked put is no longer in flight.
+    ASSERT_TRUE(
+        service->PutStart(writer, "revoked", value_length, config).has_value());
+    ASSERT_TRUE(service->PutRevoke(writer, "revoked").has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0);
+
+    // A preempted put moves to discarded staging, so the two gauges never
+    // count the same bytes.
+    ASSERT_TRUE(service->PutStart(writer, "upserted", value_length, config)
+                    .has_value());
+    ASSERT_TRUE(service->UpsertStart(upserter, "upserted", value_length, config)
+                    .has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0 + value_length);
+    EXPECT_EQ(metrics.get_put_start_discarded_staging_size(),
+              staging0 + value_length);
+    ASSERT_TRUE(service
+                    ->UpsertEnd(upserter, ObjectMeta{"upserted", std::nullopt},
+                                ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0);
+
+    // A master that stops serving releases its in-flight puts.
+    ASSERT_TRUE(service->PutStart(writer, "inflight", value_length, config)
+                    .has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0 + value_length);
+    service.reset();
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0);
+    EXPECT_EQ(metrics.get_put_start_discarded_staging_size(), staging0);
 
     std::string serialized = metrics.serialize_metrics();
     EXPECT_NE(serialized.find("master_mem_processing_bytes"),
               std::string::npos);
-    EXPECT_NE(serialized.find("master_mem_leased_bytes"), std::string::npos);
-
-    // A master that steps down must not keep reporting its last sample.
-    ASSERT_TRUE(
-        service->PutStart(client_id, "unevictable_key_2", value_length, config)
-            .has_value());
-    EXPECT_TRUE(wait_for(value_length, 0));
-    service.reset();
-    EXPECT_EQ(metrics.get_mem_processing_bytes(), 0);
-    EXPECT_EQ(metrics.get_mem_leased_bytes(), 0);
 }
 
 TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
