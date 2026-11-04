@@ -156,10 +156,10 @@ class XpuRuntime {
     // Import existing host memory (e.g. a Store segment) into the shared
     // context, so copies between it and any device DMA it directly instead
     // of staging pageable memory.
-    bool RegisterHost(void* addr, size_t size, std::string* error_message) {
+    bool RegisterHost(void* addr, size_t size, std::string& error_message) {
         std::lock_guard<std::mutex> lock(mu_);
         if (!context_) {
-            if (error_message) *error_message = "no XPU context";
+            error_message = "no XPU context";
             return false;
         }
         try {
@@ -167,15 +167,15 @@ class XpuRuntime {
                                                                      *context_);
             return true;
         } catch (const sycl::exception& e) {
-            if (error_message) *error_message = e.what();
+            error_message = e.what();
             return false;
         }
     }
 
-    bool UnregisterHost(void* addr, std::string* error_message) {
+    bool UnregisterHost(void* addr, std::string& error_message) {
         std::lock_guard<std::mutex> lock(mu_);
         if (!context_) {
-            if (error_message) *error_message = "no XPU context";
+            error_message = "no XPU context";
             return false;
         }
         try {
@@ -183,7 +183,7 @@ class XpuRuntime {
                 addr, *context_);
             return true;
         } catch (const sycl::exception& e) {
-            if (error_message) *error_message = e.what();
+            error_message = e.what();
             return false;
         }
     }
@@ -261,17 +261,17 @@ class XpuAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     }
 
     bool RegisterHostMemory(void* addr, size_t size,
-                            std::string* error_message) const override {
+                            std::string& error_message) const override {
         auto& runtime = XpuRuntime::Instance();
         if (!runtime.Init()) {
-            if (error_message) *error_message = "no usable XPU device";
+            error_message = "no usable XPU device";
             return false;
         }
         return runtime.RegisterHost(addr, size, error_message);
     }
 
     bool UnregisterHostMemory(void* addr,
-                              std::string* error_message) const override {
+                              std::string& error_message) const override {
         return XpuRuntime::Instance().UnregisterHost(addr, error_message);
     }
 

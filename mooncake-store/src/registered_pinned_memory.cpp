@@ -1,6 +1,7 @@
 #include "registered_pinned_memory.h"
 
 #include <string>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -62,16 +63,21 @@ bool RegisterPinnedRegionWithXpu(void* addr, size_t size,
         if (error_message) *error_message = "no XPU accelerator registered";
         return false;
     }
-    return xpu->RegisterHostMemory(addr, size, error_message);
+    std::string message;
+    const bool ok = xpu->RegisterHostMemory(addr, size, message);
+    if (!ok && error_message) *error_message = std::move(message);
+    return ok;
 }
 
 RegisteredPinnedMemoryManager::UnregisterResult UnregisterPinnedRegionWithXpu(
     void* addr, std::string* error_message) {
     const auto* xpu = device::GetAcceleratorRegistry().GetDevice(
         device::AcceleratorVendor::kIntel);
-    if (xpu && xpu->UnregisterHostMemory(addr, error_message)) {
+    std::string message = "no XPU accelerator registered";
+    if (xpu && xpu->UnregisterHostMemory(addr, message)) {
         return RegisteredPinnedMemoryManager::UnregisterResult::kSuccess;
     }
+    if (error_message) *error_message = std::move(message);
     return RegisteredPinnedMemoryManager::UnregisterResult::kError;
 }
 #endif
