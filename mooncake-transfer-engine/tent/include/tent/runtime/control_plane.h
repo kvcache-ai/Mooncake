@@ -25,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -168,9 +169,19 @@ class ControlClient {
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length);
 
+    static Status sendDataWithTimeout(const std::string& server_addr,
+                                      uint64_t peer_mem_addr,
+                                      void* local_mem_addr, size_t length,
+                                      std::chrono::milliseconds call_timeout);
+
     static Status recvData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
                            size_t length);
+
+    static Status recvDataWithTimeout(const std::string& server_addr,
+                                      uint64_t peer_mem_addr,
+                                      void* local_mem_addr, size_t length,
+                                      std::chrono::milliseconds call_timeout);
 
     static Status notify(const std::string& server_addr,
                          const Notification& message);
