@@ -117,8 +117,9 @@ request.
 
 - `ok`: the primary is running or a standby is watching, and no active issue is
   recorded.
-- `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect,
-  snapshot recovery, registry heartbeat, master view mismatch, standby
+- `degraded`: an election/watch/renewal, OpLog read/write/commit/apply/
+  reconnect, snapshot recovery, registry heartbeat, master view mismatch,
+  standby
   snapshot availability, OpLog trim horizon risk, or fatal HA failure is
   recorded, or pending OpLogs have exceeded the latest stall timeout,
   or a primary was promoted before finishing OpLog catch-up, or a primary writer
@@ -146,6 +147,14 @@ baseline; duplicate or older epochs are ignored, while a newer epoch counts once
 even when the same node is re-elected. The issue clears when fewer than 3 changes
 remain in the sliding window. Disabling HA, changing clusters, or resetting the
 process clears history.
+
+`ELECTION_WATCH_FAILED` means Redis leader-key polling could not connect or
+complete a GET. Subscription backup polling and pure polling reconnect and
+retry at the existing polling interval. The issue clears after a successful
+GET, including a missing key, or when leader watching ends. A recovered
+connection alone does not clear it. Subscription failure with working fallback
+polling does not trigger this issue. GET failures use rate-limited warning
+logs; connection failures are logged by the Redis connection layer.
 
 `MASTER_VIEW_MISMATCH` means the local process is reporting
 `role=primary,state=RUNNING`, but its cached master view does not identify this

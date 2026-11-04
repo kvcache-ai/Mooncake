@@ -442,6 +442,9 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
 // ============================================================
 
 void RedisElectionHelper::WatchLeader() {
+    ScopeGuard watch_status([] {
+        HAStatusManager::instance().SetDoctorIssue("ELECTION_WATCH_FAILED");
+    });
     // Fast path: SUBSCRIBE for leader event notification
     if (WatchLeaderSubscribe()) {
         return;
@@ -593,6 +596,9 @@ bool RedisElectionHelper::PollLeaderOnce(redisContext*& context) {
         context = CreateConnection();
         if (!context) {
             // CreateConnection logs the underlying connection/auth failure.
+            HAStatusManager::instance().SetDoctorIssue(
+                "ELECTION_WATCH_FAILED",
+                "Cannot connect to Redis while watching leader");
             return false;
         }
     }
@@ -605,10 +611,13 @@ bool RedisElectionHelper::PollLeaderOnce(redisContext*& context) {
         LOG_EVERY_N(WARNING, 30)
             << "WatchLeader: polling GET failed; reconnecting on next poll"
             << ", key=" << master_view_key_ << ", error=" << error;
+        HAStatusManager::instance().SetDoctorIssue(
+            "ELECTION_WATCH_FAILED", "Leader polling GET failed: " + error);
         redisFree(context);
         context = nullptr;
         return false;
     }
+    HAStatusManager::instance().SetDoctorIssue("ELECTION_WATCH_FAILED");
     return reply->type == REDIS_REPLY_NIL;
 }
 

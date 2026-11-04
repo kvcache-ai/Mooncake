@@ -691,7 +691,12 @@ TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
 // We use CLIENT KILL to break subscribe_ctx_ so SUBSCRIBE command fails,
 // forcing WatchLeader to fall through to the pure polling path.
 
-TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
+TEST_F(RedisElectionHelperTest, PollLeaderOnceRecordsAndClearsWatchFailure) {
+    auto& ha_status = HAStatusManager::instance();
+    ha_status.Reset();
+    ha_status.Configure(true, FLAGS_cluster_id, "test-standby");
+    ha_status.SetRoleState("standby", "WATCHING");
+
     RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
                                FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
                                FLAGS_redis_username);
@@ -710,6 +715,8 @@ TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
     redisContext* context = nullptr;
     EXPECT_FALSE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
     EXPECT_EQ(context, nullptr);
+    EXPECT_NE(ha_status.SerializeDoctorJson().find("ELECTION_WATCH_FAILED"),
+              std::string::npos);
 
     const auto leader_value = RedisElectionHelper::SerializeLeaderValue(
         "primary:50051", 1, FLAGS_redis_ttl_sec);
@@ -722,6 +729,8 @@ TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
     ASSERT_TRUE(reply && reply->type == REDIS_REPLY_STATUS);
     EXPECT_FALSE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
     ASSERT_NE(context, nullptr);
+    EXPECT_EQ(ha_status.SerializeDoctorJson().find("ELECTION_WATCH_FAILED"),
+              std::string::npos);
 
     reply.reset(
         (redisReply*)redisCommand(admin, "DEL %b", key.data(), key.size()));
@@ -731,6 +740,7 @@ TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
 
     redisFree(context);
     redisFree(admin);
+    ha_status.Reset();
 }
 
 TEST_F(RedisElectionHelperTest, WatchLeaderPollingFallback) {
