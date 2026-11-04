@@ -44,6 +44,8 @@ class HipTransport : public Transport {
 
     static void freePinnedLocalMemory(void* addr);
 
+    bool hasPendingUnregistration(void* addr) override;
+
    protected:
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
@@ -68,7 +70,6 @@ class HipTransport : public Transport {
 
    private:
     friend class HipTransportTestPeer;
-
     struct OpenedShmEntry {
         void* shm_addr;
         uint64_t length;
@@ -95,6 +96,8 @@ class HipTransport : public Transport {
     // count. One IPC registration per base, removed by the last unregister.
     std::unordered_map<uint64_t, uint64_t> registered_addr_to_base_;
     std::unordered_map<uint64_t, size_t> registered_base_refs_;
+    // Last-alias removal completed locally but still needs metadata publish.
+    std::unordered_set<uint64_t> pending_cleanup_addrs_;
     // Addresses registerLocalMemory deliberately skipped (e.g. host memory
     // left to other transports), distinguishing them from never-registered
     // ones at unregister time.

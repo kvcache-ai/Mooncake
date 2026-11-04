@@ -51,6 +51,9 @@ class Transport {
     friend class MultiTransport;
 
    public:
+    // Registration may skip a range that another installed transport can use.
+    // The engine rejects the range when every transport skips it.
+    static constexpr int REGISTER_MEMORY_SKIPPED = 1;
     using SegmentID = uint64_t;
     using SegmentHandle = SegmentID;
 
@@ -642,6 +645,10 @@ class Transport {
         return Status::OK();
     }
     virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
+
+    // True while this transport still owns cleanup for an address whose
+    // engine region record was removed by a deferred unregister.
+    virtual bool hasPendingUnregistration(void *addr) { return false; }
 
    protected:
     virtual int install(std::string &local_server_name,

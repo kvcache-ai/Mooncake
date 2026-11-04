@@ -243,6 +243,79 @@ static std::shared_ptr<GpuIpcTransportPolicy> makeDefaultNvlinkPolicy() {
     return policy;
 }
 
+// An IPC handle exports a whole allocation, and cudaIpcOpenMemHandle maps it
+// at its base, so a buffer carved out of a larger allocation (as by a caching
+// allocator) sits `offset` bytes into the peer's mapping. The published
+// BufferDesc keeps the buffer's own range, so lookup and unregister still work
+// per buffer; the offset travels with the handle. Wire format of shm_name:
+//   cudaIpcMemHandle_t                      buffer starts its allocation
+//   cudaIpcMemHandle_t + uint64_t offset    buffer starts `offset` bytes in
+// The offset is in host byte order (IPC peers share a host). The short form
+// is what this transport has always published, so buffers that start their
+// allocation stay compatible with older peers; an older peer rejects the long
+// form ("Mismatched NVLink data transfer method") instead of writing to the
+// wrong address.
+constexpr size_t kIpcHandleBytes = sizeof(cudaIpcMemHandle_t);
+constexpr size_t kIpcHandleWithOffsetBytes =
+    sizeof(cudaIpcMemHandle_t) + sizeof(uint64_t);
+
+// Finds the allocation holding [addr, addr + length) and addr's offset in it.
+// Returns 0 on success, 1 for an unsupported range, or -1 on lookup failure.
+// Uses pointer attributes rather than cuMemGetAddressRange, which can fail
+// unless the allocation's context is current on the calling thread.
+int findIpcAllocation(void *addr, size_t length, void **base,
+                      uint64_t *offset) {
+    CUdeviceptr alloc_base = 0;
+    size_t alloc_size = 0;
+#ifdef USE_SUPA
+    // supa.h has no alias for the range start attribute.
+    auto result =
+        cuMemGetAddressRange(&alloc_base, &alloc_size, (CUdeviceptr)addr);
+#else
+    auto result = cuPointerGetAttribute(
+        &alloc_base, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (CUdeviceptr)addr);
+    if (result == CUDA_SUCCESS)
+        result = cuPointerGetAttribute(
+            &alloc_size, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
+#endif
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "NvlinkTransport: allocation lookup failed: " << result;
+        return -1;
+    }
+    *base = (void *)alloc_base;
+    *offset = (uint64_t)addr - (uint64_t)alloc_base;
+    if (*offset > alloc_size || length > alloc_size - *offset) {
+        LOG(WARNING) << "NvlinkTransport: skipping buffer " << addr << " + "
+                     << length << " extends past its allocation " << *base
+                     << " + " << alloc_size
+                     << ", leaving it to other transports";
+        return 1;
+    }
+    return 0;
+}
+
+std::string serializeIpcHandle(const cudaIpcMemHandle_t &handle,
+                               uint64_t offset) {
+    if (offset == 0) return serializeBinaryData(&handle, kIpcHandleBytes);
+    unsigned char payload[kIpcHandleWithOffsetBytes];
+    memcpy(payload, &handle, kIpcHandleBytes);
+    memcpy(payload + kIpcHandleBytes, &offset, sizeof(offset));
+    return serializeBinaryData(payload, sizeof(payload));
+}
+
+bool isIpcPayload(const std::vector<unsigned char> &buffer) {
+    return buffer.size() == kIpcHandleBytes ||
+           buffer.size() == kIpcHandleWithOffsetBytes;
+}
+
+uint64_t ipcPayloadOffset(const std::vector<unsigned char> &buffer) {
+    uint64_t offset = 0;
+    if (buffer.size() == kIpcHandleWithOffsetBytes) {
+        memcpy(&offset, buffer.data() + kIpcHandleBytes, sizeof(offset));
+    }
+    return offset;
+}
+
 }  // anonymous namespace
 
 using Slice = Transport::Slice;
@@ -987,6 +1060,8 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                                          bool remote_accessible,
                                          bool update_metadata) {
     std::lock_guard<std::mutex> lock(register_mutex_);
+    if (ipc_pending_cleanup_addrs_.count(addr) != 0)
+        return ERR_ADDRESS_OVERLAPPED;
     if (globalConfig().trace) {
         LOG(INFO) << "register memory: addr " << addr << ", length " << length;
     }
@@ -1004,8 +1079,18 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             return -1;
         }
 
+        // Export the handle from the allocation base, so the handle itself
+        // carries no offset and ipc_offset is the only one the peer applies.
+        void *alloc_base = nullptr;
+        uint64_t ipc_offset = 0;
+        const int allocation_rc =
+            findIpcAllocation(addr, length, &alloc_base, &ipc_offset);
+        if (allocation_rc != 0) {
+            // A skipped IPC range must not roll back other transports.
+            return allocation_rc < 0 ? -1 : REGISTER_MEMORY_SKIPPED;
+        }
         cudaIpcMemHandle_t handle;
-        err = cudaIpcGetMemHandle(&handle, addr);
+        err = cudaIpcGetMemHandle(&handle, alloc_base);
         if (err != cudaSuccess) {
             LOG(ERROR) << "NvlinkTransport: cudaIpcGetMemHandle failed";
             return -1;
@@ -1016,8 +1101,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = policy_->normalizeMemoryLocation(addr, location);
-        desc.shm_name =
-            serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+        desc.shm_name = serializeIpcHandle(handle, ipc_offset);
 #ifdef ENABLE_MULTI_PROTOCOL
         if (policy_->preserveExistingMetadata())
             desc.protocol = policy_->protocol();
@@ -1043,7 +1127,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             LOG(WARNING) << "Memory region " << addr
                          << " is not allocated by cuMemCreate, "
                          << "but it can be used as local buffer";
-            return 0;
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Find whole physical page for memory registration
@@ -1080,6 +1164,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         if (policy_->preserveExistingMetadata())
             desc.protocol = policy_->protocol();
 #endif
+        fabric_registrations_[addr] = {real_addr, desc.shm_name, false};
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 }
@@ -1282,7 +1367,7 @@ int NvlinkTransport::unregisterHostNumaMemoryBatchLocked(
 
     if (needs_publication) {
         const int rc = update_segment();
-        if (rc != 0) return first_error ? first_error : rc;
+        if (rc != 0) return rc;
         for (void *addr : addr_list) {
             auto registration = host_numa_registration_handles_.find(addr);
             if (registration != host_numa_registration_handles_.end() &&
@@ -1303,21 +1388,66 @@ int NvlinkTransport::unregisterHostNumaMemoryBatchLocked(
 }
 #endif
 
-int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
-#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
-    std::unique_lock<std::mutex> lock(register_mutex_);
-    if (host_numa_registration_handles_.count(addr) == 0) {
-        lock.unlock();
-        return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+int NvlinkTransport::removeLocalBufferLocked(void *addr, bool update_metadata) {
+    if (!use_fabric_mem_) {
+        if (ipc_pending_cleanup_addrs_.count(addr) != 0) {
+            if (!update_metadata) return 0;
+            const int rc = metadata_->updateLocalSegmentDesc();
+            if (rc == 0) ipc_pending_cleanup_addrs_.erase(addr);
+            return rc;
+        }
+        const int rc =
+            metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+        if (rc != ERR_ADDRESS_NOT_REGISTERED && (rc != 0 || !update_metadata))
+            ipc_pending_cleanup_addrs_.insert(addr);
+        return rc;
     }
-    return unregisterHostNumaMemoryLocked(
-        addr, update_metadata,
-        [this](void *base, bool update) {
-            return metadata_->removeLocalMemoryBuffer(base, update);
+    auto registration = fabric_registrations_.find(addr);
+    if (registration == fabric_registrations_.end())
+        return ERR_ADDRESS_NOT_REGISTERED;
+    if (registration->second.metadata_removed) {
+        if (!update_metadata) return 0;
+        int rc = metadata_->updateLocalSegmentDesc();
+        if (rc == 0) fabric_registrations_.erase(registration);
+        return rc;
+    }
+    int rc = metadata_->removeLocalMemoryBuffer(
+        registration->second.base,
+        [handle = registration->second.handle](const BufferDesc &desc) {
+            return desc.shm_name == handle;
         },
-        [this]() { return metadata_->updateLocalSegmentDesc(); });
+        update_metadata);
+    if (rc != ERR_ADDRESS_NOT_REGISTERED)
+        registration->second.metadata_removed = true;
+    if (rc == 0 && update_metadata) fabric_registrations_.erase(registration);
+    return rc;
+}
+
+int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+    std::lock_guard<std::mutex> lock(register_mutex_);
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    if (host_numa_registration_handles_.count(addr) != 0)
+        return unregisterHostNumaMemoryLocked(
+            addr, update_metadata,
+            [this](void *base, bool update) {
+                return metadata_->removeLocalMemoryBuffer(base, update);
+            },
+            [this]() { return metadata_->updateLocalSegmentDesc(); });
+#endif
+    return removeLocalBufferLocked(addr, update_metadata);
+}
+
+bool NvlinkTransport::hasPendingUnregistration(void *addr) {
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    if (ipc_pending_cleanup_addrs_.count(addr) != 0) return true;
+    auto fabric = fabric_registrations_.find(addr);
+    if (fabric != fabric_registrations_.end() &&
+        fabric->second.metadata_removed)
+        return true;
+#if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
+    return host_numa_registration_handles_.count(addr) != 0;
 #else
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    return false;
 #endif
 }
 
@@ -1329,13 +1459,14 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     for (auto &entry : desc->buffers) {
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
+            auto relocate = [&](const OpenedShmEntry &opened) {
+                dest_addr = dest_addr - entry.addr +
+                            ((uint64_t)opened.shm_addr) + opened.offset;
+            };
             remap_lock_.lockShared();
             if (remap_entries_.count(std::make_pair(target_id, entry.addr))) {
-                auto shm_addr =
-                    remap_entries_[std::make_pair(target_id, entry.addr)]
-                        .shm_addr;
+                relocate(remap_entries_[std::make_pair(target_id, entry.addr)]);
                 remap_lock_.unlockShared();
-                dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
                 return 0;
             }
             remap_lock_.unlockShared();
@@ -1343,8 +1474,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (!remap_entries_.count(std::make_pair(target_id, entry.addr))) {
                 std::vector<unsigned char> output_buffer;
                 deserializeBinaryData(entry.shm_name, output_buffer);
-                if (output_buffer.size() == sizeof(cudaIpcMemHandle_t) &&
-                    !use_fabric_mem_) {
+                if (isIpcPayload(output_buffer) && !use_fabric_mem_) {
                     cudaIpcMemHandle_t handle;
                     memcpy(&handle, output_buffer.data(), sizeof(handle));
                     void *shm_addr = nullptr;
@@ -1360,6 +1490,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = entry.length;
+                    shm_entry.offset = ipcPayloadOffset(output_buffer);
 #ifdef USE_MUSA
                     shm_entry.device_id = ipc_device;
 #endif
@@ -1424,9 +1555,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     return -1;
                 }
             }
-            auto shm_addr =
-                remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
-            dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
+            relocate(remap_entries_[std::make_pair(target_id, entry.addr)]);
             return 0;
         }
         index++;
@@ -1439,24 +1568,39 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 int NvlinkTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
+    bool skipped = false;
     for (auto &buffer : buffer_list) {
         int ret = registerLocalMemory(buffer.addr, buffer.length, location,
                                       true, false);
-        if (ret) return ret;
+        if (ret < 0) return ret;
+        skipped |= ret == REGISTER_MEMORY_SKIPPED;
     }
-    return metadata_->updateLocalSegmentDesc();
+    int rc = metadata_->updateLocalSegmentDesc();
+    return rc == 0 && skipped ? REGISTER_MEMORY_SKIPPED : rc;
 }
 
 int NvlinkTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
 #if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
     std::lock_guard<std::mutex> lock(register_mutex_);
-    return unregisterHostNumaMemoryBatchLocked(
+    int rc = unregisterHostNumaMemoryBatchLocked(
         addr_list,
         [this](void *base, bool update) {
-            return metadata_->removeLocalMemoryBuffer(base, update);
+            if (host_numa_registration_handles_.count(base) != 0)
+                return metadata_->removeLocalMemoryBuffer(base, update);
+            return removeLocalBufferLocked(base, update);
         },
         [this]() { return metadata_->updateLocalSegmentDesc(); });
+    if (rc == 0 || rc == ERR_ADDRESS_NOT_REGISTERED) {
+        for (void *addr : addr_list) ipc_pending_cleanup_addrs_.erase(addr);
+        for (void *addr : addr_list) {
+            auto it = fabric_registrations_.find(addr);
+            if (it != fabric_registrations_.end() &&
+                it->second.metadata_removed)
+                fabric_registrations_.erase(it);
+        }
+    }
+    return rc;
 #else
     int first_error = 0;
     for (auto &addr : addr_list) {
@@ -1464,7 +1608,17 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
         if (ret && !first_error) first_error = ret;
     }
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    return first_error ? first_error : metadata_ret;
+    if (metadata_ret == 0) {
+        std::lock_guard<std::mutex> lock(register_mutex_);
+        for (void *addr : addr_list) ipc_pending_cleanup_addrs_.erase(addr);
+        for (void *addr : addr_list) {
+            auto it = fabric_registrations_.find(addr);
+            if (it != fabric_registrations_.end() &&
+                it->second.metadata_removed)
+                fabric_registrations_.erase(it);
+        }
+    }
+    return metadata_ret ? metadata_ret : first_error;
 #endif
 }
 

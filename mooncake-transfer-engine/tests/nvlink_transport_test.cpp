@@ -1,21 +1,41 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <thread>
 #include <memory>
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <condition_variable>
 #include <future>
+#include <iterator>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include "cuda_alike.h"
+#include "multi_transport.h"
 #include "transfer_engine.h"
+#include "transfer_engine_impl.h"
 #include "transfer_metadata.h"
+#include "transfer_metadata_plugin.h"
 #include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
 #include "transport/nvlink_transport/nvlink_transport.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
+
+extern char** environ;
 
 // Select protocol based on build configuration
 #ifdef USE_HIP
@@ -72,12 +92,29 @@ class NvlinkTransportTestPeer {
         return metadata;
     }
 
+    static void SetMetadata(NvlinkTransport& transport,
+                            std::shared_ptr<TransferMetadata> metadata,
+                            bool use_fabric) {
+        transport.meta() = std::move(metadata);
+        transport.use_fabric_mem_ = use_fabric;
+    }
+
     static int Register(NvlinkTransport& transport, void* base, size_t length) {
         return transport.registerLocalMemory(base, length, "cpu:0", true, true);
     }
 
     static int Unregister(NvlinkTransport& transport, void* base) {
         return transport.unregisterLocalMemory(base, true);
+    }
+
+    static int UnregisterActualBatch(NvlinkTransport& transport,
+                                     const std::vector<void*>& addresses) {
+        return transport.unregisterLocalMemoryBatch(addresses);
+    }
+
+    static void AddFabricRegistration(NvlinkTransport& transport, void* addr,
+                                      void* base, const std::string& handle) {
+        transport.fabric_registrations_[addr] = {base, handle, false};
     }
 
     static int RegisterWithOperations(
@@ -124,7 +161,170 @@ class NvlinkTransportTestPeer {
     }
 };
 
+class TransferEngineImplTestPeer {
+   public:
+    static void ReplaceTransport(TransferEngineImpl& engine,
+                                 std::shared_ptr<Transport> transport) {
+        engine.multi_transports_->transport_map_.clear();
+        engine.multi_transports_->transport_map_.emplace("nvlink",
+                                                         std::move(transport));
+    }
+
+    static void SeedRegion(TransferEngineImpl& engine, void* addr,
+                           size_t length) {
+        std::unique_lock<std::shared_mutex> lock(engine.mutex_);
+        engine.insertMemoryRegionLocked(
+            TransferEngineImpl::MemoryRegion{addr, length, "gpu:0", true});
+    }
+};
+
 }  // namespace mooncake
+
+TEST(NvlinkFabricRegistrationTest, UnregisterRequiresOriginalRegistration) {
+    NvlinkTransport transport;
+    auto metadata = NvlinkTransportTestPeer::Configure(transport);
+    constexpr uint64_t base = 0x200000;
+    auto* first = reinterpret_cast<void*>(base + 0x100);
+    auto* second = reinterpret_cast<void*>(base + 0x200);
+    auto* never_registered = reinterpret_cast<void*>(base + 0x300);
+    for (const auto& [addr, handle] :
+         {std::pair<void*, std::string>{first, "handle-A"},
+          std::pair<void*, std::string>{second, "handle-B"}}) {
+        TransferMetadata::BufferDesc desc;
+        desc.addr = base;
+        desc.length = 0x1000;
+        desc.shm_name = handle;
+        ASSERT_EQ(metadata->addLocalMemoryBuffer(desc, false), 0);
+        NvlinkTransportTestPeer::AddFabricRegistration(
+            transport, addr, reinterpret_cast<void*>(base), handle);
+    }
+    auto count = [&] {
+        return metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.size();
+    };
+    ASSERT_EQ(count(), 2U);
+    EXPECT_EQ(NvlinkTransportTestPeer::Unregister(transport, never_registered),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(count(), 2U);
+    EXPECT_EQ(NvlinkTransportTestPeer::Unregister(transport, first), 0);
+    EXPECT_EQ(count(), 1U);
+    EXPECT_EQ(metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)
+                  ->buffers.front()
+                  .shm_name,
+              "handle-B");
+    EXPECT_EQ(NvlinkTransportTestPeer::Unregister(transport, first),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_EQ(count(), 1U);
+    EXPECT_EQ(NvlinkTransportTestPeer::Unregister(transport, second), 0);
+    EXPECT_EQ(count(), 0U);
+}
+
+TEST(NvlinkFabricRegistrationTest,
+     DeferredSingleUnregisterCompletesThroughEngineBatch) {
+    constexpr uint64_t base = 0x300000;
+    auto* addr = reinterpret_cast<void*>(base + 0x100);
+    auto transport = std::make_shared<NvlinkTransport>();
+    auto metadata = NvlinkTransportTestPeer::Configure(*transport);
+    TransferMetadata::BufferDesc desc;
+    desc.addr = base;
+    desc.length = 0x1000;
+    desc.shm_name = "fabric-handle";
+    ASSERT_EQ(metadata->addLocalMemoryBuffer(desc, false), 0);
+    NvlinkTransportTestPeer::AddFabricRegistration(
+        *transport, addr, (void*)base, "fabric-handle");
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    TransferEngineImplTestPeer::ReplaceTransport(engine, transport);
+    TransferEngineImplTestPeer::SeedRegion(engine, addr, 0x80);
+
+    EXPECT_EQ(engine.unregisterLocalMemory(addr, false), 0);
+    EXPECT_TRUE(transport->hasPendingUnregistration(addr));
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({addr}), 0);
+    EXPECT_FALSE(transport->hasPendingUnregistration(addr));
+    EXPECT_TRUE(
+        metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+}
+
+namespace {
+class FailOnceMetadataStorage : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string&, Json::Value&) override { return false; }
+    bool set(const std::string&, const Json::Value&) override {
+        return ++set_calls != 1;
+    }
+    bool remove(const std::string&) override { return true; }
+    int set_calls = 0;
+};
+
+class MetadataWithStorage : public TransferMetadata {
+   public:
+    explicit MetadataWithStorage(std::shared_ptr<MetadataStoragePlugin> storage)
+        : TransferMetadata(std::move(storage)) {}
+};
+}  // namespace
+
+TEST(NvlinkFabricRegistrationTest, BatchPublicationFailureTakesPrecedence) {
+    constexpr uint64_t base = 0x400000;
+    auto* first = reinterpret_cast<void*>(base + 0x100);
+    auto* skipped = reinterpret_cast<void*>(base + 0x200);
+    auto storage = std::make_shared<FailOnceMetadataStorage>();
+    auto metadata = std::make_shared<MetadataWithStorage>(storage);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "local";
+    segment->protocol = "nvlink";
+    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID, "local",
+                                        std::move(segment)),
+              0);
+    NvlinkTransport transport;
+    NvlinkTransportTestPeer::SetMetadata(transport, metadata, true);
+    TransferMetadata::BufferDesc desc;
+    desc.addr = base;
+    desc.length = 0x1000;
+    desc.shm_name = "fabric-handle";
+    ASSERT_EQ(metadata->addLocalMemoryBuffer(desc, false), 0);
+    NvlinkTransportTestPeer::AddFabricRegistration(
+        transport, first, (void*)base, "fabric-handle");
+
+    EXPECT_EQ(NvlinkTransportTestPeer::UnregisterActualBatch(transport,
+                                                             {first, skipped}),
+              ERR_METADATA);
+    EXPECT_TRUE(transport.hasPendingUnregistration(first));
+    EXPECT_EQ(NvlinkTransportTestPeer::UnregisterActualBatch(transport,
+                                                             {first, skipped}),
+              ERR_ADDRESS_NOT_REGISTERED);
+    EXPECT_FALSE(transport.hasPendingUnregistration(first));
+    EXPECT_EQ(storage->set_calls, 2);
+    EXPECT_TRUE(
+        metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+}
+
+TEST(NvlinkTransportTest, DeferredSingleUnregisterCompletesThroughEngineBatch) {
+    constexpr uint64_t base = 0x500000;
+    auto* addr = reinterpret_cast<void*>(base + 0x100);
+    auto transport = std::make_shared<NvlinkTransport>();
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    auto segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment->name = "local";
+    segment->protocol = "nvlink";
+    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID, "local",
+                                        std::move(segment)),
+              0);
+    NvlinkTransportTestPeer::SetMetadata(*transport, metadata, false);
+    TransferMetadata::BufferDesc desc;
+    desc.addr = (uint64_t)addr;
+    desc.length = 0x80;
+    ASSERT_EQ(metadata->addLocalMemoryBuffer(desc, false), 0);
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    TransferEngineImplTestPeer::ReplaceTransport(engine, transport);
+    TransferEngineImplTestPeer::SeedRegion(engine, addr, 0x80);
+
+    EXPECT_EQ(engine.unregisterLocalMemory(addr, false), 0);
+    EXPECT_TRUE(transport->hasPendingUnregistration(addr));
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({addr}), 0);
+    EXPECT_FALSE(transport->hasPendingUnregistration(addr));
+    EXPECT_TRUE(
+        metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+}
 
 namespace {
 
@@ -321,6 +521,53 @@ TEST(NvlinkHostNumaRegistrationTest, PublishesExactRangeAndRetainsHandle) {
     EXPECT_EQ(driver.release_calls, 1);
     EXPECT_EQ(driver.live_handles, 0);
     EXPECT_EQ(NvlinkTransportTestPeer::RegistrationCount(transport), 0U);
+    EXPECT_TRUE(owner->Release().ok());
+}
+
+TEST(NvlinkHostNumaRegistrationTest,
+     ActualBatchRemovesDescriptorBeforeReleasingOwner) {
+    constexpr size_t kLength = 64 * 1024;
+    void* const base = reinterpret_cast<void*>(0xe00000000ULL);
+    FakeRegistrationDriver driver;
+    auto owner =
+        NvlinkTransportTestPeer::MakeOwnedRange(base, kLength, driver.api());
+    ASSERT_NE(owner, nullptr);
+    NvlinkTransport transport;
+    auto metadata = NvlinkTransportTestPeer::Configure(transport);
+    ASSERT_EQ(NvlinkTransportTestPeer::Register(transport, base, kLength), 0);
+    ASSERT_EQ(metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.size(),
+              1U);
+
+    EXPECT_EQ(NvlinkTransportTestPeer::UnregisterActualBatch(transport, {base}),
+              0);
+    EXPECT_TRUE(
+        metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+    EXPECT_EQ(driver.release_calls, 1);
+    EXPECT_EQ(NvlinkTransportTestPeer::RegistrationCount(transport), 0U);
+    EXPECT_TRUE(owner->Release().ok());
+}
+
+TEST(NvlinkHostNumaRegistrationTest,
+     DeferredSingleUnregisterCompletesThroughEngineBatch) {
+    constexpr size_t kLength = 64 * 1024;
+    void* const base = reinterpret_cast<void*>(0xf00000000ULL);
+    FakeRegistrationDriver driver;
+    auto owner =
+        NvlinkTransportTestPeer::MakeOwnedRange(base, kLength, driver.api());
+    ASSERT_NE(owner, nullptr);
+    auto transport = std::make_shared<NvlinkTransport>();
+    auto metadata = NvlinkTransportTestPeer::Configure(*transport);
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    TransferEngineImplTestPeer::ReplaceTransport(engine, transport);
+    ASSERT_EQ(engine.registerLocalMemory(base, kLength, "cpu:0"), 0);
+
+    EXPECT_EQ(engine.unregisterLocalMemory(base, false), 0);
+    EXPECT_FALSE(owner->Release().ok());
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch({base}), 0);
+    EXPECT_TRUE(
+        metadata->getSegmentDescByID(LOCAL_SEGMENT_ID)->buffers.empty());
+    EXPECT_EQ(driver.release_calls, 1);
     EXPECT_TRUE(owner->Release().ok());
 }
 
@@ -1087,8 +1334,405 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     freeCudaBuffer(server_buffer);
 }
 
+#ifdef USE_CUDA
+// cudaIpcOpenMemHandle maps the whole allocation that holds a registered
+// buffer, at the allocation's base. Transfers to and from a buffer that starts
+// inside a larger allocation (as caching allocators produce) must still hit the
+// buffer, not the allocation base.
+//
+// The destination runs in a second process, since transfers to this process's
+// own segment use LOCAL_SEGMENT_ID, which bypasses relocation and the IPC path.
+// It is this binary re-executed with --nvlink_ipc_dst, not a fork, since the
+// parent may already have initialized CUDA. It registers three buffers in one
+// zeroed allocation and reports their addresses; the parent writes two of them
+// (one of them twice, which takes the cached-mapping path) and reads the third,
+// closes its mappings, and then the destination checks every byte of the
+// allocation.
+
+DEFINE_bool(nvlink_ipc_dst, false, "Internal: run as the IPC destination.");
+
+namespace {
+constexpr size_t kAllocLen = 4 * 1024 * 1024;
+constexpr size_t kSliceLen = 64 * 1024;
+// Offset 0 keeps the legacy handle-only payload; 512-byte alignment is what
+// PyTorch's caching allocator produces.
+constexpr size_t kSliceOffsets[] = {0, 1024 * 1024 + 512,
+                                    2 * 1024 * 1024 + 4096};
+constexpr unsigned char kWritten0 = 0xA0;
+constexpr unsigned char kWritten1First = 0xB1;
+constexpr unsigned char kWritten1 = 0xB2;
+constexpr unsigned char kReadSource = 0x5C;
+constexpr char kDstMarker[] = "NVLINK_IPC_DST ";
+constexpr int kDstOk = 0, kDstWrongBytes = 1, kDstRegisterFailed = 2,
+              kDstSetupFailed = 3, kDstNoGo = 4;
+
+const char* describeDstExit(int rc) {
+    switch (rc) {
+        case kDstOk:
+            return "ok";
+        case kDstWrongBytes:
+            return "a transfer reached the wrong bytes of the destination "
+                   "allocation (its stderr shows the first one)";
+        case kDstRegisterFailed:
+            return "the destination could not register its buffers";
+        case kDstSetupFailed:
+            return "the destination failed to set up (see its stderr)";
+        case kDstNoGo:
+            return "the parent stopped before the check";
+        default:
+            return "the destination crashed or was killed";
+    }
+}
+
+int dstFailed(int rc, const char* what) {
+    fprintf(stderr, "IPC destination: %s failed\n", what);
+    return rc;
+}
+
+unsigned char expectedDstByte(size_t i) {
+    for (size_t s = 0; s < std::size(kSliceOffsets); ++s) {
+        if (i >= kSliceOffsets[s] && i < kSliceOffsets[s] + kSliceLen)
+            return s == 0 ? kWritten0 : s == 1 ? kWritten1 : kReadSource;
+    }
+    return 0;
+}
+
+int runIpcDestination() {
+    auto engine = std::make_unique<TransferEngine>(false);
+    // P2PHANDSHAKE binds a free port (the one given here is ignored); the
+    // address it really uses is reported below.
+    if (engine->init(P2PHANDSHAKE, "127.0.0.1:17825", "127.0.0.1", 17825) != 0)
+        return dstFailed(kDstSetupFailed, "TransferEngine::init");
+    if (engine->installTransport("nvlink", nullptr) == nullptr)
+        return dstFailed(kDstSetupFailed, "installTransport");
+
+    char* alloc = nullptr;
+    if (cudaSetDevice(0) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&alloc), kAllocLen) !=
+            cudaSuccess ||
+        cudaMemset(alloc, 0, kAllocLen) != cudaSuccess ||
+        cudaMemset(alloc + kSliceOffsets[2], kReadSource, kSliceLen) !=
+            cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess)
+        return dstFailed(kDstSetupFailed, "preparing the allocation");
+    std::string report = kDstMarker + engine->getLocalIpAndPort();
+    for (size_t off : kSliceOffsets) {
+        if (engine->registerLocalMemory(alloc + off, kSliceLen, "cuda:0") != 0)
+            return dstFailed(kDstRegisterFailed, "registerLocalMemory");
+        report +=
+            " " + std::to_string(reinterpret_cast<uintptr_t>(alloc + off));
+    }
+    printf("%s\n", report.c_str());
+    fflush(stdout);
+
+    char go = 0;
+    ssize_t n;
+    do {
+        n = read(STDIN_FILENO, &go, 1);
+    } while (n < 0 && errno == EINTR);
+    if (n != 1) return kDstNoGo;
+
+    std::vector<unsigned char> host(kAllocLen);
+    if (cudaMemcpy(host.data(), alloc, kAllocLen, cudaMemcpyDeviceToHost) !=
+        cudaSuccess)
+        return dstFailed(kDstSetupFailed, "copying the allocation back");
+    int rc = kDstOk;
+    for (size_t i = 0; i < kAllocLen; ++i) {
+        if (host[i] != expectedDstByte(i)) {
+            fprintf(stderr, "destination byte %zu is 0x%02x, expected 0x%02x\n",
+                    i, host[i], expectedDstByte(i));
+            rc = kDstWrongBytes;
+            break;
+        }
+    }
+    for (size_t off : kSliceOffsets) engine->unregisterLocalMemory(alloc + off);
+    engine.reset();
+    (void)cudaFree(alloc);
+    return rc;
+}
+
+// Owns the destination process and reaps it when destroyed.
+class DestinationProcess {
+   public:
+    bool start() {
+        int to_child[2], from_child[2];
+        if (pipe(to_child) != 0) return false;
+        if (pipe(from_child) != 0) {
+            close(to_child[0]);
+            close(to_child[1]);
+            return false;
+        }
+        char exe[] = "/proc/self/exe";
+        char flag[] = "--nvlink_ipc_dst";
+        char* argv[] = {exe, flag, nullptr};
+        posix_spawn_file_actions_t actions;
+        int rc = posix_spawn_file_actions_init(&actions);
+        if (rc == 0) {
+            rc = posix_spawn_file_actions_adddup2(&actions, to_child[0],
+                                                  STDIN_FILENO);
+            if (rc == 0)
+                rc = posix_spawn_file_actions_adddup2(&actions, from_child[1],
+                                                      STDOUT_FILENO);
+            // A pipe end can itself be fd 0 or 1 if the parent ran with stdio
+            // closed; those were just replaced by dup2 and must stay open.
+            for (int fd :
+                 {to_child[0], to_child[1], from_child[0], from_child[1]}) {
+                if (rc == 0 && fd > STDERR_FILENO)
+                    rc = posix_spawn_file_actions_addclose(&actions, fd);
+            }
+            if (rc == 0)
+                rc = posix_spawn(&pid_, exe, &actions, nullptr, argv, environ);
+            posix_spawn_file_actions_destroy(&actions);
+        }
+        close(to_child[0]);
+        close(from_child[1]);
+        if (rc != 0) {
+            close(to_child[1]);
+            close(from_child[0]);
+            pid_ = -1;
+            return false;
+        }
+        to_child_ = to_child[1];
+        from_child_ = from_child[0];
+        return true;
+    }
+
+    // Reads the destination's report line: handshake name, then addresses.
+    bool readReport(std::string* name, std::vector<uint64_t>* addrs) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        std::string line;
+        char c;
+        while (true) {
+            const auto left =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now())
+                    .count();
+            if (left <= 0) return false;
+            pollfd pfd{from_child_, POLLIN, 0};
+            const int ready = poll(&pfd, 1, static_cast<int>(left));
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready <= 0) return false;
+            const ssize_t n = read(from_child_, &c, 1);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return false;
+            if (c != '\n') {
+                line.push_back(c);
+                continue;
+            }
+            if (line.rfind(kDstMarker, 0) == 0) break;
+            line.clear();  // other output the engine wrote to stdout
+        }
+        std::istringstream in(line.substr(sizeof(kDstMarker) - 1));
+        in >> *name;
+        uint64_t addr;
+        while (in >> addr) addrs->push_back(addr);
+        reported_ = true;
+        return !name->empty();
+    }
+
+    // Tells the destination to check its memory (only if it reported) and
+    // returns its exit code, or -1 if it had to be killed.
+    int finish() {
+        if (pid_ < 0) return -1;
+        if (to_child_ >= 0) {
+            if (reported_) {
+                const char go = 1;
+                while (write(to_child_, &go, 1) < 0 && errno == EINTR) {
+                }
+            }
+            close(to_child_);
+            to_child_ = -1;
+        }
+        int status = 0;
+        for (int i = 0; i < 600; ++i) {  // up to 60 s
+            if (waitpid(pid_, &status, WNOHANG) == pid_) {
+                pid_ = -1;
+                return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            }
+            usleep(100 * 1000);
+        }
+        kill(pid_, SIGKILL);
+        while (waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
+        }
+        pid_ = -1;
+        return -1;
+    }
+
+    ~DestinationProcess() {
+        reported_ = false;  // an early return must not trigger the check
+        finish();
+        if (from_child_ >= 0) close(from_child_);
+    }
+
+   private:
+    pid_t pid_ = -1;
+    int to_child_ = -1;
+    int from_child_ = -1;
+    bool reported_ = false;
+};
+
+// Sets an environment variable for the lifetime of the object.
+class ScopedEnv {
+   public:
+    ScopedEnv(const char* name, const char* value) : name_(name) {
+        const char* old = getenv(name);
+        had_old_ = old != nullptr;
+        if (had_old_) old_ = old;
+        setenv(name, value, 1);
+    }
+    ~ScopedEnv() {
+        if (had_old_)
+            setenv(name_, old_.c_str(), 1);
+        else
+            unsetenv(name_);
+    }
+
+   private:
+    const char* name_;
+    std::string old_;
+    bool had_old_ = false;
+};
+
+bool runTransfer(TransferEngine* engine, TransferRequest::OpCode opcode,
+                 void* local, Transport::SegmentID segment, uint64_t remote) {
+    auto batch_id = engine->allocateBatchID(1);
+    TransferRequest entry;
+    entry.opcode = opcode;
+    entry.length = kSliceLen;
+    entry.source = local;
+    entry.target_id = segment;
+    entry.target_offset = remote;
+    bool ok = engine->submitTransfer(batch_id, {entry}).ok();
+    TransferStatus status;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (ok) {
+        ok = engine->getTransferStatus(batch_id, 0, status).ok();
+        if (!ok || status.s != TransferStatusEnum::WAITING) break;
+        if (std::chrono::steady_clock::now() > deadline) ok = false;
+    }
+    ok = ok && status.s == TransferStatusEnum::COMPLETED;
+    const bool freed = engine->freeBatchID(batch_id).ok();
+    return ok && freed;
+}
+}  // namespace
+
+TEST(NvlinkIpcTest, TransfersHitBuffersInsideLargerAllocation) {
+    int device_count = 0;
+    const auto count_err = cudaGetDeviceCount(&device_count);
+    if (count_err == cudaErrorNoDevice ||
+        count_err == cudaErrorInsufficientDriver ||
+        (count_err == cudaSuccess && device_count < 1))
+        GTEST_SKIP() << "Needs a GPU.";
+    ASSERT_EQ(count_err, cudaSuccess);
+    // Setting MC_USE_NVLINK_IPC selects the cudaIpc* path over fabric handles,
+    // in both processes.
+    ScopedEnv use_ipc("MC_USE_NVLINK_IPC", "1");
+    DestinationProcess dst;
+    ASSERT_TRUE(dst.start());
+    // The destination may exit before reading the go byte.
+    struct IgnoreSigpipe {
+        void (*previous)(int) = signal(SIGPIPE, SIG_IGN);
+        ~IgnoreSigpipe() { signal(SIGPIPE, previous); }
+    } ignore_sigpipe;
+    std::string dst_name;
+    std::vector<uint64_t> dst_addrs;
+    if (!dst.readReport(&dst_name, &dst_addrs)) {
+        const int rc = dst.finish();
+        FAIL() << "IPC destination did not report: " << describeDstExit(rc)
+               << " (exit " << rc << ")";
+    }
+    ASSERT_EQ(dst_addrs.size(), std::size(kSliceOffsets));
+
+    auto engine = std::make_unique<TransferEngine>(false);
+    // As in the destination, the port is ignored in P2PHANDSHAKE mode.
+    ASSERT_EQ(engine->init(P2PHANDSHAKE, "127.0.0.1:17826", "127.0.0.1", 17826),
+              0);
+    ASSERT_NE(engine->installTransport("nvlink", nullptr), nullptr);
+    // The source buffer is on another GPU than the destination's when one can
+    // reach it, and is registered from a thread that has never touched the
+    // GPU runtime, so registration cannot rely on the caller's current device
+    // or context.
+    int local_device = 0;
+    for (int d = device_count - 1; d > 0; --d) {
+        int can_access = 0;
+        if (cudaDeviceCanAccessPeer(&can_access, d, 0) == cudaSuccess &&
+            can_access) {
+            local_device = d;
+            break;
+        }
+    }
+    const std::string local_location = "cuda:" + std::to_string(local_device);
+    ASSERT_EQ(cudaSetDevice(local_device), cudaSuccess);
+    void* local = nullptr;
+    ASSERT_EQ(cudaMalloc(&local, kSliceLen), cudaSuccess);
+    char* past_end = static_cast<char*>(local) + 512;
+    int past_end_rc = -1, wrap_rc = -1, local_rc = -1;
+    bool past_end_unpublished = false, wrap_unpublished = false;
+    std::thread([&] {
+        // With only NVLink installed, unsupported ranges fail registration and
+        // publish no IPC buffer.
+        past_end_rc =
+            engine->registerLocalMemory(past_end, kAllocLen, local_location);
+        auto metadata = engine->getMetadata();
+        auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        past_end_unpublished = desc && desc->buffers.empty();
+        wrap_rc = engine->registerLocalMemory(past_end, SIZE_MAX - 256,
+                                              local_location);
+        desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        wrap_unpublished = desc && desc->buffers.empty();
+        local_rc =
+            engine->registerLocalMemory(local, kSliceLen, local_location);
+    }).join();
+    EXPECT_EQ(past_end_rc, ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(wrap_rc, ERR_INVALID_ARGUMENT);
+    EXPECT_TRUE(past_end_unpublished);
+    EXPECT_TRUE(wrap_unpublished);
+    ASSERT_EQ(local_rc, 0);
+    auto segment = engine->openSegment(dst_name);
+    ASSERT_NE(segment, static_cast<Transport::SegmentID>(-1));
+
+    auto fill = [&](unsigned char value) {
+        return cudaMemset(local, value, kSliceLen) == cudaSuccess &&
+               cudaDeviceSynchronize() == cudaSuccess;
+    };
+    ASSERT_TRUE(fill(kWritten0));
+    ASSERT_TRUE(runTransfer(engine.get(), TransferRequest::WRITE, local,
+                            segment, dst_addrs[0]));
+    ASSERT_TRUE(fill(kWritten1First));
+    ASSERT_TRUE(runTransfer(engine.get(), TransferRequest::WRITE, local,
+                            segment, dst_addrs[1]));
+    // Second write to the same buffer: takes the cached mapping.
+    ASSERT_TRUE(fill(kWritten1));
+    ASSERT_TRUE(runTransfer(engine.get(), TransferRequest::WRITE, local,
+                            segment, dst_addrs[1]));
+    ASSERT_TRUE(fill(0));
+    ASSERT_TRUE(runTransfer(engine.get(), TransferRequest::READ, local, segment,
+                            dst_addrs[2]));
+    std::vector<unsigned char> read_back(kSliceLen);
+    ASSERT_EQ(
+        cudaMemcpy(read_back.data(), local, kSliceLen, cudaMemcpyDeviceToHost),
+        cudaSuccess);
+    EXPECT_EQ(std::count(read_back.begin(), read_back.end(), kReadSource),
+              static_cast<std::ptrdiff_t>(kSliceLen))
+        << "the READ did not come from the registered buffer";
+
+    // Close this process's mappings of the destination's memory before the
+    // destination frees it.
+    EXPECT_EQ(engine->unregisterLocalMemory(local), 0);
+    engine.reset();
+    (void)cudaFree(local);
+    const int dst_rc = dst.finish();
+    EXPECT_EQ(dst_rc, kDstOk) << describeDstExit(dst_rc);
+}
+#endif  // USE_CUDA
+
 int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
+#ifdef USE_CUDA
+    if (FLAGS_nvlink_ipc_dst) return runIpcDestination();
+#endif
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
