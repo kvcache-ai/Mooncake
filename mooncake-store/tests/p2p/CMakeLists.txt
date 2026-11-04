@@ -205,6 +205,10 @@ add_executable(redis_election_helper_test redis_election_helper_test.cpp)
 target_link_libraries(redis_election_helper_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
     add_test(NAME redis_election_helper_test COMMAND redis_election_helper_test)
     add_p2p_store_test(redis_oplog_store_test ha/oplog/redis_oplog_store_test.cpp)
+target_link_options(redis_oplog_store_test PRIVATE
+    "LINKER:--wrap=redisCommand"
+    "LINKER:--wrap=redisAppendCommand"
+    "LINKER:--wrap=redisGetReply")
     set_tests_properties(redis_election_helper_test redis_oplog_store_test
         PROPERTIES LABELS "p2p;ha;redis")
 endif()

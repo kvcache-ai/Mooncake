@@ -79,23 +79,30 @@ class RedisOpLogStore : public OpLogStore {
         size_t attempts{0};
     };
 
+    struct WriteResult {
+        ErrorCode error{ErrorCode::INTERNAL_ERROR};
+        int64_t latency_us{0};
+    };
+
     redisContext* CreateConnection() const;
     ErrorCode EnsureConnectedUnlocked();
     ErrorCode ReadOpLogUnlocked(uint64_t sequence_id, OpLogEntry& entry);
     bool IsValidSnapshotId(const std::string& snapshot_id) const;
     ErrorCode EnqueueWrite(const OpLogEntry& entry, bool sync);
     void StartAsyncWorkers();
-    bool WaitForPendingWrite(std::shared_ptr<PendingWrite>& pending);
+    bool WaitForPendingWrites(
+        std::vector<std::shared_ptr<PendingWrite>>& batch);
     void AsyncWriteLoop(size_t worker_id);
-    void FinishOrRetryWrite(redisContext*& ctx,
+    bool FinishOrRetryWrite(redisContext*& ctx,
                             const std::shared_ptr<PendingWrite>& pending,
                             ErrorCode err, size_t worker_id,
                             int64_t write_latency_us);
-    ErrorCode PersistEntryNoLatest(redisContext* ctx, const OpLogEntry& entry);
+    std::vector<WriteResult> PersistEntriesNoLatest(
+        redisContext* ctx,
+        const std::vector<std::shared_ptr<PendingWrite>>& batch);
     bool HasCommittableLatestUnlocked() const;
     ErrorCode AdvanceCommittedLatestUnlocked(redisContext* ctx);
-    void CompleteWrite(redisContext* ctx,
-                       const std::shared_ptr<PendingWrite>& pending,
+    void CompleteWrite(const std::shared_ptr<PendingWrite>& pending,
                        ErrorCode result);
 
     std::string EntryKey(uint64_t sequence_id) const;
@@ -147,6 +154,7 @@ class RedisOpLogStore : public OpLogStore {
     size_t best_effort_max_retries_;
 
     static constexpr size_t kAsyncWorkerCount = 4;
+    static constexpr size_t kAsyncWriteBatchSize = 64;
     static constexpr size_t kCleanupBatchSize = 1000;
     static constexpr int kAsyncRetryDelayMs = 100;
     static constexpr int kSyncWaitTimeoutMs = 30000;

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <string_view>
 #include <vector>
 #include <string>
 #include <thread>
@@ -30,6 +31,82 @@
 
 namespace mooncake {
 namespace {
+
+std::atomic<bool> fail_one_latest_write{false};
+std::atomic<size_t> max_pipelined_sets{0};
+std::atomic<bool> fail_one_pipelined_reply{false};
+std::atomic<bool> fail_one_pipelined_status{false};
+thread_local size_t appended_sets = 0;
+thread_local size_t pipeline_replies_total = 0;
+thread_local size_t pipeline_replies_remaining = 0;
+
+extern "C" void* __wrap_redisCommand(redisContext* ctx, const char* format,
+                                     ...) {
+    va_list args;
+    va_start(args, format);
+    va_list copy;
+    va_copy(copy, args);
+    if (std::strcmp(format, "SET %b %b") == 0) {
+        const auto* key = va_arg(copy, const char*);
+        const auto length = va_arg(copy, size_t);
+        if (std::string_view(key, length).ends_with(":latest") &&
+            fail_one_latest_write.exchange(false)) {
+            va_end(copy);
+            va_end(args);
+            return nullptr;
+        }
+    }
+    va_end(copy);
+    void* return_value = redisvCommand(ctx, format, args);
+    va_end(args);
+    return return_value;
+}
+
+extern "C" int __wrap_redisAppendCommand(redisContext* ctx, const char* format,
+                                         ...) {
+    va_list args;
+    va_start(args, format);
+    const int result = redisvAppendCommand(ctx, format, args);
+    va_end(args);
+    if (result == REDIS_OK && std::strcmp(format, "SET %b %b") == 0) {
+        const size_t count = ++appended_sets;
+        size_t previous = max_pipelined_sets.load();
+        while (count > previous &&
+               !max_pipelined_sets.compare_exchange_weak(previous, count)) {
+        }
+    }
+    return result;
+}
+
+extern "C" int __real_redisGetReply(redisContext* ctx, void** reply);
+extern "C" int __wrap_redisGetReply(redisContext* ctx, void** reply) {
+    if (appended_sets > 0) {
+        pipeline_replies_total = appended_sets;
+        pipeline_replies_remaining = appended_sets;
+        appended_sets = 0;
+    }
+    const int result = __real_redisGetReply(ctx, reply);
+    if (result == REDIS_OK && pipeline_replies_remaining > 0) {
+        const size_t reply_number =
+            pipeline_replies_total - pipeline_replies_remaining + 1;
+        --pipeline_replies_remaining;
+        if (pipeline_replies_total > 1 && reply_number == 2 &&
+            fail_one_pipelined_reply.exchange(false)) {
+            freeReplyObject(*reply);
+            *reply = nullptr;
+            ctx->err = REDIS_ERR_IO;
+            return REDIS_ERR;
+        }
+        if (pipeline_replies_total > 1 && reply_number == 2 &&
+            fail_one_pipelined_status.exchange(false)) {
+            auto* status = static_cast<redisReply*>(*reply);
+            if (status->type == REDIS_REPLY_STATUS && status->len >= 2) {
+                std::memcpy(status->str, "NO", 2);
+            }
+        }
+    }
+    return result;
+}
 
 TEST(RedisOpLogStoreStandaloneTest, InvalidEndpointReturnsError) {
     RedisOpLogStore store("invalid_endpoint_test", "127.0.0.1:notaport",
@@ -391,6 +468,50 @@ TEST_F(RedisOpLogStoreTest, StopRacesWithSyncWaitAndIdleWorkers) {
         writer->StopWriting();
         EXPECT_EQ(pending.get(), ErrorCode::INTERNAL_ERROR);
     }
+}
+
+TEST_F(RedisOpLogStoreTest, PipelineRetriesAndCommitsEveryEntry) {
+    max_pipelined_sets.store(0);
+    fail_one_pipelined_reply.store(true);
+    fail_one_pipelined_status.store(true);
+    auto writer = CreateWriter();
+
+    // Queue entries beyond the gap so workers can pipeline batches before
+    // seq=1 allows latest to advance.
+    for (uint64_t seq = 2; seq <= 40; ++seq) {
+        ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(seq), false));
+    }
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    EXPECT_GT(max_pipelined_sets.load(), 1u);
+    EXPECT_FALSE(fail_one_pipelined_reply.load());
+    EXPECT_FALSE(fail_one_pipelined_status.load());
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    do {
+        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
+        if (latest == 40u) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    EXPECT_EQ(40u, latest);
+    for (uint64_t seq = 1; seq <= 40; ++seq) {
+        OpLogEntry entry;
+        ASSERT_EQ(ErrorCode::OK, reader->ReadOpLog(seq, entry)) << seq;
+        EXPECT_EQ("payload_" + std::to_string(seq), entry.payload);
+    }
+}
+
+TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
+    auto writer = CreateWriter();
+    fail_one_latest_write.store(true);
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    EXPECT_FALSE(fail_one_latest_write.load());
+
+    uint64_t latest = 0;
+    ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+    EXPECT_EQ(1u, latest);
 }
 
 TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {

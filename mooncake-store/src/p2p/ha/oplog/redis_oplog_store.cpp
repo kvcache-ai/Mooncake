@@ -27,6 +27,18 @@ bool IsRedisOkStatus(const redisReply* reply) {
            reply->len == 2 && std::memcmp(reply->str, "OK", 2) == 0;
 }
 
+bool SetTimeoutUntil(redisContext* ctx,
+                     std::chrono::steady_clock::time_point deadline) {
+    const auto remaining_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - std::chrono::steady_clock::now())
+            .count();
+    if (remaining_us <= 0) return false;
+    const struct timeval timeout = {remaining_us / 1000000,
+                                    remaining_us % 1000000};
+    return redisSetTimeout(ctx, timeout) == REDIS_OK;
+}
+
 bool ParseUint64(const std::string& value, uint64_t& result) {
     try {
         size_t pos = 0;
@@ -299,18 +311,19 @@ void RedisOpLogStore::StopWriting() {
     HAMetricManager::instance().set_oplog_async_workers_running(false);
 }
 
-bool RedisOpLogStore::WaitForPendingWrite(
-    std::shared_ptr<PendingWrite>& pending) {
-    pending.reset();
+bool RedisOpLogStore::WaitForPendingWrites(
+    std::vector<std::shared_ptr<PendingWrite>>& batch) {
+    batch.clear();
     std::unique_lock<std::mutex> lock(async_mutex_);
     async_cv_.wait(lock, async_stop_source_.get_token(), [&] {
         return !async_running_.load() || !pending_writes_.empty() ||
                HasCommittableLatestUnlocked();
     });
-    // A stop notification must not let a worker drain the queue.
-    if (!async_running_.load()) return false;
-    if (!pending_writes_.empty()) {
-        pending = pending_writes_.front();
+    if (!async_running_.load()) {
+        return false;
+    }
+    while (!pending_writes_.empty() && batch.size() < kAsyncWriteBatchSize) {
+        batch.push_back(pending_writes_.front());
         pending_writes_.pop_front();
     }
     return true;
@@ -318,20 +331,27 @@ bool RedisOpLogStore::WaitForPendingWrite(
 
 void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
     redisContext* ctx = CreateConnection();
-    std::shared_ptr<PendingWrite> pending;
-    while (WaitForPendingWrite(pending)) {
+    std::vector<std::shared_ptr<PendingWrite>> batch;
+    batch.reserve(kAsyncWriteBatchSize);
+    while (WaitForPendingWrites(batch)) {
         if (!ctx || ctx->err) {
-            if (ctx) redisFree(ctx);
+            if (ctx) {
+                redisFree(ctx);
+                ctx = nullptr;
+            }
             ctx = CreateConnection();
         }
-        if (!pending) {
+
+        if (batch.empty()) {
             bool advanced = false;
             {
                 std::lock_guard<std::mutex> lock(async_mutex_);
                 advanced =
                     ctx && AdvanceCommittedLatestUnlocked(ctx) == ErrorCode::OK;
             }
-            if (advanced) continue;
+            if (advanced) {
+                continue;
+            }
             if (ctx) {
                 redisFree(ctx);
                 ctx = nullptr;
@@ -340,41 +360,71 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
                 std::chrono::milliseconds(kAsyncRetryDelayMs));
             continue;
         }
-        const auto write_start = std::chrono::steady_clock::now();
-        const auto err = ctx ? PersistEntryNoLatest(ctx, pending->entry)
-                             : ErrorCode::INTERNAL_ERROR;
-        const auto write_latency_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - write_start)
-                .count();
-        FinishOrRetryWrite(ctx, pending, err, worker_id, write_latency_us);
+
+        const auto results = PersistEntriesNoLatest(ctx, batch);
+        std::vector<std::shared_ptr<PendingWrite>> retry_batch;
+        for (size_t i = batch.size(); i > 0; --i) {
+            const size_t index = i - 1;
+            if (FinishOrRetryWrite(ctx, batch[index], results[index].error,
+                                   worker_id, results[index].latency_us)) {
+                retry_batch.push_back(batch[index]);
+            }
+        }
+
+        bool latest_failed = false;
+        if (async_running_.load()) {
+            std::lock_guard<std::mutex> lock(async_mutex_);
+            latest_failed =
+                ctx && AdvanceCommittedLatestUnlocked(ctx) != ErrorCode::OK;
+        }
+        if (latest_failed && ctx) {
+            redisFree(ctx);
+            ctx = nullptr;
+        }
+
+        if (!retry_batch.empty() || latest_failed) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kAsyncRetryDelayMs));
+            {
+                std::lock_guard<std::mutex> lock(async_mutex_);
+                if (async_running_.load()) {
+                    for (const auto& pending : retry_batch) {
+                        pending_writes_.push_front(pending);
+                    }
+                }
+            }
+            async_cv_.notify_one();
+        }
     }
     if (ctx) redisFree(ctx);
 }
 
-void RedisOpLogStore::FinishOrRetryWrite(
+bool RedisOpLogStore::FinishOrRetryWrite(
     redisContext*& ctx, const std::shared_ptr<PendingWrite>& pending,
     ErrorCode err, size_t worker_id, int64_t write_latency_us) {
-    // Redis I/O may have outlived the stop request. Leave cancellation cleanup
-    // and its aggregate error log to StopWriting().
-    if (!async_running_.load()) return;
+    if (!async_running_.load()) {
+        return false;
+    }
+
     HAMetricManager::instance().observe_oplog_write_latency_us(
         write_latency_us);
     if (err != ErrorCode::OK) {
         HAMetricManager::instance().inc_oplog_write_failures();
         if (err == ErrorCode::INVALID_PARAMS) {
-            CompleteWrite(ctx, pending, err);
-            return;
+            CompleteWrite(pending, err);
+            return false;
         }
         if (ctx) {
             redisFree(ctx);
             ctx = nullptr;
         }
-        size_t attempts;
+
+        size_t attempts = 0;
         {
-            // Mutable PendingWrite state is protected by async_mutex_.
             std::lock_guard<std::mutex> lock(async_mutex_);
-            if (!async_running_.load() || pending->done) return;
+            if (!async_running_.load() || pending->done) {
+                return false;
+            }
             attempts = ++pending->attempts;
             if (IsBestEffortP2POpLog(pending->entry.op_type) &&
                 attempts >= best_effort_max_retries_) {
@@ -391,53 +441,131 @@ void RedisOpLogStore::FinishOrRetryWrite(
                            << ", attempts=" << attempts
                            << ", max_retries=" << best_effort_max_retries_;
                 async_cv_.notify_one();
-                return;
+                return false;
             }
         }
-        // TODO(P2P HA): Add bounded exponential backoff, jitter, and
-        // pending/retry metrics.
+
         LOG(WARNING) << "RedisOpLogStore: async write failed, retrying"
                      << ", worker_id=" << worker_id
                      << ", sequence_id=" << pending->entry.sequence_id
                      << ", attempts=" << attempts
                      << ", error=" << toString(err);
         HAMetricManager::instance().inc_oplog_write_retries();
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kAsyncRetryDelayMs));
-        {
-            std::lock_guard<std::mutex> lock(async_mutex_);
-            if (async_running_.load()) {
-                pending_writes_.push_front(pending);
-            }
-        }
-        async_cv_.notify_one();
-        return;
+        return true;
     }
 
-    CompleteWrite(ctx, pending, ErrorCode::OK);
+    CompleteWrite(pending, ErrorCode::OK);
+    return false;
 }
 
-ErrorCode RedisOpLogStore::PersistEntryNoLatest(redisContext* ctx,
-                                                const OpLogEntry& entry) {
-    const std::string entry_key = EntryKey(entry.sequence_id);
-    const std::string serialized = SerializeOpLogEntry(entry);
-    // A previous Primary may leave an uncommitted entry beyond latest; the
-    // current Primary must be able to overwrite it and continue the sequence.
-    // TODO(P2P HA): Atomically reject conflicting overwrites at or below the
-    // committed latest while still allowing overwrites beyond latest.
-    // Recheck admission immediately before I/O. StopWriting performs the
-    // aggregate cancellation cleanup.
-    if (!async_running_.load()) return ErrorCode::INTERNAL_ERROR;
-    RedisReplyPtr reply((redisReply*)redisCommand(
-        ctx, "SET %b %b", entry_key.data(), entry_key.size(), serialized.data(),
-        serialized.size()));
-    if (!IsRedisOkStatus(reply.get())) {
-        LOG(ERROR) << "RedisOpLogStore::PersistEntryNoLatest: Redis command "
-                      "failed"
-                   << ", sequence_id=" << entry.sequence_id;
-        return ErrorCode::INTERNAL_ERROR;
+std::vector<RedisOpLogStore::WriteResult>
+RedisOpLogStore::PersistEntriesNoLatest(
+    redisContext* ctx,
+    const std::vector<std::shared_ptr<PendingWrite>>& batch) {
+    std::vector<WriteResult> results(batch.size());
+
+    if (!ctx || !async_running_.load()) {
+        return results;
     }
-    return ErrorCode::OK;
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline =
+        started + std::chrono::milliseconds(kCommandTimeoutMs);
+    std::vector<std::chrono::steady_clock::time_point> entry_starts(
+        batch.size(), started);
+
+    auto fail_batch = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < results.size(); ++i) {
+            results[i].error = ErrorCode::INTERNAL_ERROR;
+            results[i].latency_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    now - entry_starts[i])
+                    .count();
+        }
+        return results;
+    };
+
+    for (size_t i = 0; i < batch.size(); ++i) {
+        if (!async_running_.load()) {
+            return fail_batch();
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            LOG_EVERY_N(WARNING, 100)
+                << "RedisOpLogStore: pipeline SET batch deadline exceeded "
+                   "before append"
+                << ", batch_size=" << batch.size() << ", sample_every_n=100";
+            return fail_batch();
+        }
+        entry_starts[i] = std::chrono::steady_clock::now();
+        const auto& pending = batch[i];
+        const auto entry_key = EntryKey(pending->entry.sequence_id);
+        const auto serialized = SerializeOpLogEntry(pending->entry);
+        if (redisAppendCommand(ctx, "SET %b %b", entry_key.data(),
+                               entry_key.size(), serialized.data(),
+                               serialized.size()) != REDIS_OK) {
+            LOG_EVERY_N(WARNING, 100)
+                << "RedisOpLogStore: pipeline SET append failed"
+                << ", first_sequence_id=" << batch.front()->entry.sequence_id
+                << ", batch_size=" << batch.size()
+                << ", error=" << (ctx->err ? ctx->errstr : "unknown")
+                << ", sample_every_n=100";
+            return fail_batch();
+        }
+    }
+
+    for (size_t i = 0; i < batch.size(); ++i) {
+        if (!SetTimeoutUntil(ctx, deadline)) {
+            LOG_EVERY_N(WARNING, 100)
+                << "RedisOpLogStore: pipeline SET batch deadline exceeded"
+                << ", sequence_id=" << batch[i]->entry.sequence_id
+                << ", batch_size=" << batch.size() << ", sample_every_n=100";
+            return fail_batch();
+        }
+
+        redisReply* raw_reply = nullptr;
+        if (redisGetReply(ctx, reinterpret_cast<void**>(&raw_reply)) !=
+            REDIS_OK) {
+            LOG_EVERY_N(WARNING, 100)
+                << "RedisOpLogStore: pipeline SET reply failed"
+                << ", sequence_id=" << batch[i]->entry.sequence_id
+                << ", batch_size=" << batch.size()
+                << ", error=" << (ctx->err ? ctx->errstr : "unknown")
+                << ", sample_every_n=100";
+            freeReplyObject(raw_reply);
+            return fail_batch();
+        }
+
+        RedisReplyPtr reply(raw_reply);
+        results[i].latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - entry_starts[i])
+                .count();
+
+        if (IsRedisOkStatus(reply.get())) {
+            results[i].error = ErrorCode::OK;
+        } else {
+            LOG_EVERY_N(WARNING, 100)
+                << "RedisOpLogStore: pipeline SET command failed"
+                << ", sequence_id=" << batch[i]->entry.sequence_id << ", error="
+                << (reply && reply->str ? reply->str
+                                        : (ctx->err ? ctx->errstr : "unknown"))
+                << ", sample_every_n=100";
+        }
+    }
+
+    const struct timeval default_timeout = {kCommandTimeoutMs / 1000,
+                                            (kCommandTimeoutMs % 1000) * 1000};
+    if (redisSetTimeout(ctx, default_timeout) != REDIS_OK) {
+        LOG_EVERY_N(WARNING, 100)
+            << "RedisOpLogStore: failed to restore Redis command timeout"
+            << ", batch_size=" << batch.size()
+            << ", error=" << (ctx->err ? ctx->errstr : "unknown")
+            << ", sample_every_n=100";
+        return fail_batch();
+    }
+
+    return results;
 }
 
 bool RedisOpLogStore::HasCommittableLatestUnlocked() const {
@@ -508,10 +636,12 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
 }
 
 void RedisOpLogStore::CompleteWrite(
-    redisContext* ctx, const std::shared_ptr<PendingWrite>& pending,
-    ErrorCode result) {
+    const std::shared_ptr<PendingWrite>& pending, ErrorCode result) {
     std::lock_guard<std::mutex> lock(async_mutex_);
-    if (!async_running_.load()) return;
+    if (!async_running_.load() || pending->done) {
+        return;
+    }
+
     if (result != ErrorCode::OK) {
         pending->done = true;
         pending->result = result;
@@ -533,11 +663,6 @@ void RedisOpLogStore::CompleteWrite(
     }
 
     persisted_sequences_.insert(pending->entry.sequence_id);
-    ErrorCode latest_err = AdvanceCommittedLatestUnlocked(ctx);
-    if (latest_err != ErrorCode::OK) {
-        pending_writes_.push_front(pending);
-        async_cv_.notify_one();
-    }
 }
 
 ErrorCode RedisOpLogStore::ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) {
