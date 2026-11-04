@@ -391,8 +391,8 @@ int P2PMaster::RunWithHA() {
             }
             promoted_sequence_id = standby->GetLatestAppliedSequenceId();
             promoted_metadata = standby->ExportMetadata();
-            HAStatusManager::instance().SetOpLogProgress(
-                promoted_sequence_id, promoted_sequence_id);
+            HAStatusManager::instance().SetOpLogProgress(promoted_sequence_id,
+                                                         promoted_sequence_id);
 #ifdef STORE_USE_REDIS
             standby_registry_providers.reset();
 #endif
@@ -532,8 +532,8 @@ int P2PMaster::RunWithHA() {
                                  &active_service->GetMasterService()] {
             const uint64_t latest_sequence_id =
                 primary_service->GetLatestOpLogSequenceId();
-            HAStatusManager::instance().SetOpLogProgress(
-                latest_sequence_id, latest_sequence_id);
+            HAStatusManager::instance().SetOpLogProgress(latest_sequence_id,
+                                                         latest_sequence_id);
             HAStatusManager::instance().SetRoleState("primary", "RUNNING");
             {
                 master_registry_heartbeat->SetAppliedSequenceProvider(
@@ -556,7 +556,7 @@ int P2PMaster::RunWithHA() {
 #endif
         HAStatusManager::instance().SetRoleState(
             leadership_lost.load(std::memory_order_acquire) ? "standby"
-                                                           : "primary",
+                                                            : "primary",
             leadership_lost.load(std::memory_order_acquire) ? "LEADERSHIP_LOST"
                                                             : "STOPPED");
         if (auto* manager =

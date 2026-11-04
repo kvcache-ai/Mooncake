@@ -462,8 +462,7 @@ bool RedisOpLogStore::FinishOrRetryWrite(
     if (err != ErrorCode::OK) {
         HAStatusManager::instance().SetDoctorIssue(
             "OPLOG_WRITE_FAILED",
-            "sequence_id=" +
-                std::to_string(pending->entry.sequence_id) + ": " +
+            "sequence_id=" + std::to_string(pending->entry.sequence_id) + ": " +
                 std::string(toString(err)));
         HAMetricManager::instance().inc_oplog_write_failures();
         if (err == ErrorCode::INVALID_PARAMS) {
@@ -682,8 +681,7 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
                                   latest_key_.size(), seq.data(), seq.size()));
     if (!IsRedisOkStatus(reply.get())) {
         HAStatusManager::instance().SetDoctorIssue(
-            "OPLOG_COMMIT_FAILED",
-            "target=" + std::to_string(target));
+            "OPLOG_COMMIT_FAILED", "target=" + std::to_string(target));
         LOG(ERROR) << "RedisOpLogStore::AdvanceCommittedLatest: SET failed"
                    << ", target=" << target;
         return ErrorCode::INTERNAL_ERROR;

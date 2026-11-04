@@ -430,9 +430,9 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
     ViewVersionId parsed_epoch = 0;
     if (ParseElectionValue(our_value_, address, parsed_epoch, nullptr,
                            &written_timestamp_ms, &written_ttl_sec)) {
-        HAStatusManager::instance().SetMasterView(
-            master_address, parsed_epoch, written_timestamp_ms,
-            written_ttl_sec, instance_id);
+        HAStatusManager::instance().SetMasterView(master_address, parsed_epoch,
+                                                  written_timestamp_ms,
+                                                  written_ttl_sec, instance_id);
     }
     return ElectionAttemptResult::ELECTED;
 }
@@ -758,9 +758,9 @@ ErrorCode RedisElectionHelper::GetMasterView(std::string& master_address,
             int64_t ttl_sec = 0;
             if (ParseElectionValue(value, master_address, version, &instance_id,
                                    &timestamp_ms, &ttl_sec)) {
-                HAStatusManager::instance().SetMasterView(
-                    master_address, version, timestamp_ms, ttl_sec,
-                    instance_id);
+                HAStatusManager::instance().SetMasterView(master_address,
+                                                          version, timestamp_ms,
+                                                          ttl_sec, instance_id);
             }
             return ErrorCode::OK;
         }

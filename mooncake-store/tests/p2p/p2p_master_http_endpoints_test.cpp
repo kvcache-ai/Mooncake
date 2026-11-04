@@ -2,7 +2,8 @@
  * @file p2p_master_http_endpoints_test.cpp
  * @brief Integration tests for the P2P master HTTP endpoints
  *        (GET /health, GET /get_key_count, GET /get_all_keys,
- *         GET /batch_query_routes, GET /metrics, GET /ha/status, GET /ha/doctor).
+ *         GET /batch_query_routes, GET /metrics, GET /ha/status, GET
+ * /ha/doctor).
  *
  * Brings up an in-process P2PMasterRpcService with the embedded HTTP
  * server bound to a kernel-assigned port (no RPC server)
@@ -116,7 +117,8 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
 
     static HttpResponse HttpPost(const std::string& url) {
         coro_http::coro_http_client client;
-        auto resp = client.post(url, "", coro_http::req_content_type::octet_stream);
+        auto resp =
+            client.post(url, "", coro_http::req_content_type::octet_stream);
         return {resp.status, std::string(resp.resp_body)};
     }
 
@@ -267,9 +269,8 @@ TEST_F(P2PMasterHttpEndpointsTest, HealthEndpointReturnsOk) {
 
 TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
     std::atomic<bool> stepdown_called{false};
-    wrapped_->SetStepdownCallback([&stepdown_called] {
-        stepdown_called.store(true);
-    });
+    wrapped_->SetStepdownCallback(
+        [&stepdown_called] { stepdown_called.store(true); });
 
     const auto response = HttpPost(http_base_url_ + "/ha/stepdown");
     ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
@@ -281,8 +282,7 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
 TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
     HAStatusResetGuard reset_guard;
     auto& status = HAStatusManager::instance();
-    status.Configure(/*ha_enabled=*/true, "test_cluster",
-                    "127.0.0.1:50051");
+    status.Configure(/*ha_enabled=*/true, "test_cluster", "127.0.0.1:50051");
     status.SetInstanceId("test-instance");
     status.SetRoleState("primary", "RUNNING");
     status.SetMasterView("127.0.0.1:50051", 7,
@@ -290,9 +290,9 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
                          /*ttl_sec=*/4,
                          /*instance_id=*/"candidate-1");
     status.SetOpLogProgress(/*applied_sequence_id=*/12,
-                           /*latest_sequence_id=*/15,
-                           /*trimmed_sequence_id=*/3,
-                           /*gc_cursor_sequence_id=*/2);
+                            /*latest_sequence_id=*/15,
+                            /*trimmed_sequence_id=*/3,
+                            /*gc_cursor_sequence_id=*/2);
     status.SetSnapshotReady(true);
     status.RecordRegistryHeartbeat(ErrorCode::OK, "");
 
@@ -331,12 +331,11 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
                   .value_or(0),
               1);
     EXPECT_EQ(
-        ParseMetricValue(metrics_response.resp_body,
-                         "ha_registry_heartbeat_ok")
+        ParseMetricValue(metrics_response.resp_body, "ha_registry_heartbeat_ok")
             .value_or(0),
         1);
     EXPECT_GT(ParseMetricValue(metrics_response.resp_body,
-                              "ha_status_updated_timestamp_ms")
+                               "ha_status_updated_timestamp_ms")
                   .value_or(0),
               0);
 }
@@ -360,8 +359,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     auto report = doctor();
     EXPECT_EQ(report["status"].asString(), "degraded");
     ASSERT_EQ(report["issues"].size(), 2u);
-    EXPECT_EQ(report["issues"][0]["code"].asString(),
-              "OPLOG_APPLY_FAILED");
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_APPLY_FAILED");
     EXPECT_EQ(report["issues"][0]["message"].asString(),
               "seq=123: invalid payload");
 
@@ -397,8 +395,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     }
 }
 
-TEST_F(P2PMasterHttpEndpointsTest,
-       HADoctorHandlesLifecycleAndFatalFailure) {
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorHandlesLifecycleAndFatalFailure) {
     HAStatusResetGuard reset_guard;
     auto& status = HAStatusManager::instance();
     const auto doctor = [&] {
