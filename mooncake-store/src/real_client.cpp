@@ -20,6 +20,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -5296,16 +5297,77 @@ RealClient::get_into_ranges_internal(
         }
     }
 
+    // Both passes below skip exactly the same malformed buffers and key
+    // groups, so every group the planning pass visits has a resolved entry.
+    auto buffer_is_readable = [&](size_t i) {
+        return buffers[i] && (buffer_capacities || capacities[i] != 0) &&
+               all_keys[i].size() == all_dst_offsets[i].size() &&
+               all_keys[i].size() == all_src_offsets[i].size() &&
+               all_keys[i].size() == all_sizes[i].size();
+    };
+    auto key_ranges_match = [&](size_t i, size_t j) {
+        return all_dst_offsets[i][j].size() == all_src_offsets[i][j].size() &&
+               all_dst_offsets[i][j].size() == all_sizes[i][j].size();
+    };
+
     std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
         metadata_cache;
-    auto metadata_for = [&](const std::string &key) -> auto & {
-        auto found = metadata_cache.find(key);
-        if (found != metadata_cache.end()) return found->second;
-        return metadata_cache
-            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache,
-                                                       allow_query_refresh))
-            .first->second;
-    };
+    std::unordered_set<std::string_view> seen_keys;
+    std::vector<std::string> query_keys;
+    // Resolve each structurally valid key once before planning transfers.
+    // Reuse cached errors and live descriptors, and never query the Master
+    // for a snapshot read, even when its entry is missing or expired.
+    for (size_t i = 0; i < buffer_count; ++i) {
+        if (!buffer_is_readable(i)) continue;
+        const auto &keys = all_keys[i];
+        for (size_t j = 0; j < keys.size(); ++j) {
+            if (!key_ranges_match(i, j) || !seen_keys.emplace(keys[j]).second) {
+                continue;
+            }
+            if (query_result_cache) {
+                auto cached = query_result_cache->find(keys[j]);
+                if (cached != query_result_cache->end() &&
+                    (!cached->second || !cached->second->IsLeaseExpired())) {
+                    metadata_cache.emplace(
+                        keys[j], build_ranged_read_metadata_from_query_result(
+                                     keys[j], cached->second));
+                    continue;
+                }
+            }
+            if (!allow_query_refresh) {
+                metadata_cache.emplace(keys[j],
+                                       resolve_ranged_read_metadata(
+                                           keys[j], query_result_cache, false));
+                continue;
+            }
+            query_keys.push_back(keys[j]);
+        }
+    }
+
+    constexpr size_t kMetadataQueryBatchSize = 128;
+    for (size_t offset = 0; offset < query_keys.size();
+         offset += kMetadataQueryBatchSize) {
+        const size_t end =
+            std::min(offset + kMetadataQueryBatchSize, query_keys.size());
+        std::vector<std::string> chunk(query_keys.begin() + offset,
+                                       query_keys.begin() + end);
+        auto queries = client_->BatchQuery(chunk);
+        if (queries.size() != chunk.size()) {
+            LOG(ERROR) << "Ranged read BatchQuery response size mismatch: "
+                       << "expected=" << chunk.size()
+                       << ", got=" << queries.size();
+            for (const auto &key : chunk) {
+                metadata_cache.emplace(key,
+                                       tl::unexpected(ErrorCode::RPC_FAIL));
+            }
+            continue;
+        }
+        for (size_t j = 0; j < chunk.size(); ++j) {
+            metadata_cache.emplace(chunk[j],
+                                   build_ranged_read_metadata_from_query_result(
+                                       chunk[j], std::move(queries[j])));
+        }
+    }
 
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
@@ -5316,29 +5378,27 @@ RealClient::get_into_ranges_internal(
     std::unordered_map<std::string, ScatterLease> scatter_leases;
     std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
     for (size_t i = 0; i < buffer_count; ++i) {
-        if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
-            continue;
-        }
+        if (!buffer_is_readable(i)) continue;
         const auto &keys = all_keys[i];
         const auto &dst_groups = all_dst_offsets[i];
         const auto &src_groups = all_src_offsets[i];
         const auto &size_groups = all_sizes[i];
-        if (keys.size() != dst_groups.size() ||
-            keys.size() != src_groups.size() ||
-            keys.size() != size_groups.size()) {
-            continue;
-        }
 
         for (size_t j = 0; j < keys.size(); ++j) {
+            if (!key_ranges_match(i, j)) continue;
             const auto &dst_offsets = dst_groups[j];
             const auto &src_offsets = src_groups[j];
             const auto &sizes = size_groups[j];
             auto &range_results = results[i][j];
-            if (dst_offsets.size() != src_offsets.size() ||
-                dst_offsets.size() != sizes.size()) {
+            auto metadata_it = metadata_cache.find(keys[j]);
+            if (metadata_it == metadata_cache.end()) {
+                // Unreachable while both passes share the checks above; the
+                // ranges keep their INVALID_PARAMS default.
+                LOG(ERROR) << "get_into_ranges: no metadata resolved for key "
+                           << keys[j];
                 continue;
             }
-            auto &metadata_result = metadata_for(keys[j]);
+            auto &metadata_result = metadata_it->second;
             if (!metadata_result) {
                 std::fill(range_results.begin(), range_results.end(),
                           tl::unexpected(metadata_result.error()));
