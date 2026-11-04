@@ -486,6 +486,44 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorHandlesLifecycleAndFatalFailure) {
     EXPECT_EQ(doctor()["status"].asString(), "ok");
 }
 
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorKeepsIncompleteCatchupUntilRoleEnds) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "test-primary");
+    status.SetRoleState("primary", "STARTING");
+    status.SetLeader("test-primary", 1);
+    status.SetMasterView("test-primary", 1);
+    status.SetDoctorIssue("PROMOTION_CATCHUP_INCOMPLETE",
+                          "oplog_applied_sequence_id=100, "
+                          "oplog_latest_sequence_id=200");
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << "body=" << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetRoleState("primary", "RUNNING");
+    status.SetOpLogProgress(201, 201);
+    status.RecordRegistryHeartbeat(ErrorCode::OK, "");
+    auto report = doctor();
+    EXPECT_EQ(report["status"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(),
+              "PROMOTION_CATCHUP_INCOMPLETE");
+    EXPECT_EQ(report["issues"][0]["message"].asString(),
+              "oplog_applied_sequence_id=100, oplog_latest_sequence_id=200");
+
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "standby read failed");
+    status.SetRoleState("standby", "WATCHING");
+    report = doctor();
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_READ_FAILED");
+    status.ClearDoctorIssues();
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+}
+
 TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
     HAStatusResetGuard reset_guard;
     auto& status = HAStatusManager::instance();

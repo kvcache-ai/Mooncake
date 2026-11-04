@@ -200,6 +200,9 @@ void HAStatusManager::SetRoleState(std::string role, std::string state) {
         new_role = role;
         new_state = state;
     }
+    if (status_.role == "primary" && role != "primary") {
+        doctor_issues_.erase("PROMOTION_CATCHUP_INCOMPLETE");
+    }
     status_.role = std::move(role);
     status_.state = std::move(state);
     TouchLocked();

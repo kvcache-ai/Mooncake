@@ -100,7 +100,8 @@ request.
   snapshot recovery, registry heartbeat, master view mismatch, standby
   snapshot availability, OpLog trim horizon risk, or fatal HA failure is
   recorded, or pending OpLogs have exceeded the latest stall timeout,
-  or a primary writer queue is near capacity, or a watching standby has stopped
+  or a primary was promoted before finishing OpLog catch-up, or a primary writer
+  queue is near capacity, or a watching standby has stopped
   polling or applying known pending OpLogs beyond the catch-up stall timeout.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
   recorded failure. This endpoint is not a readiness or cluster health check.
@@ -173,6 +174,13 @@ starting a new HA round. Latest growth does not restart it; a failed latest read
 retains the last successful sample. The message is concise, for example
 `oplog_applied_sequence_id=100, oplog_latest_sequence_id=200,
 stalled_ms=12000`.
+
+`PROMOTION_CATCHUP_INCOMPLETE` records that a promoted primary restored metadata
+behind the committed OpLog latest, for example
+`oplog_applied_sequence_id=100, oplog_latest_sequence_id=200`. These are the
+promotion-time watermarks. New writes use sequence IDs above both watermarks,
+but do not replay missing metadata or clear this issue. It clears when the
+process leaves the primary role or starts a new supervisor round.
 
 `STANDBY_BEHIND_TRIM` means a standby in `WATCHING` has
 `applied_sequence_id < trimmed_sequence_id`. This standby has missed the retained
