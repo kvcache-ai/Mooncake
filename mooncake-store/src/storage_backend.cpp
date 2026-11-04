@@ -1623,22 +1623,6 @@ BucketStorageBackend::BucketStorageBackend(
         disks_[i].max_total_size =
             use_per_disk ? per_disk[i] : bucket_backend_config_.max_total_size;
     }
-
-    // Allocate aligned buffer for O_DIRECT I/O operations
-    void* buf = nullptr;
-    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
-    if (ret != 0) {
-        LOG(ERROR)
-            << "BucketStorageBackend: Failed to allocate aligned buffer: "
-            << strerror(ret);
-    } else {
-        aligned_io_buffer_.reset(buf);
-        // Update the deleter to use free
-        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
-            buf, [](void* p) { free(p); });
-        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
-                  << " bytes aligned buffer at " << buf;
-    }
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -2162,6 +2146,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 
         const auto direct_write = ReadPackedBucketDirectWrite();
         if (!direct_write) return tl::make_unexpected(direct_write.error());
+        if (direct_write.value()) {
+#ifdef USE_URING
+            if (!file_storage_config_.use_uring) {
+                LOG(WARNING)
+                    << "Packed bucket direct writes require "
+                       "MOONCAKE_OFFLOAD_USE_URING=true; using buffered bucket "
+                       "writes";
+            }
+#else
+            LOG(WARNING) << "Packed bucket direct writes require a build with "
+                            "liburing; using buffered bucket writes";
+#endif
+        }
 
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
