@@ -8,6 +8,16 @@
 
 namespace mooncake {
 
+const HADoctorIssue* FindIssue(const HADoctorReport& report,
+                               const std::string& code) {
+    for (const auto& issue : report.issues) {
+        if (issue.code == code) {
+            return &issue;
+        }
+    }
+    return nullptr;
+}
+
 struct HAStatusTestPeer {
     static void ExpireOldestChange(HAStatusManager& status) {
         std::lock_guard<std::mutex> lock(status.mutex_);
@@ -46,8 +56,8 @@ TEST_F(HAStatusTest, CountsObservedTermsAcrossSupervisorRounds) {
     status.ClearDoctorIssues();
     status.Configure(true, "test_cluster", "local");
     EXPECT_EQ(doctor().status, "ok");
-    status.SetLeader("other", 20);
-    status.SetMasterView("other", 20);
+    status.SetLeader("local", 20);
+    status.SetMasterView("local", 20);
     status.SetRoleState("primary", "RUNNING");
     auto report = doctor();
     EXPECT_EQ(report.status, "degraded");
@@ -55,7 +65,7 @@ TEST_F(HAStatusTest, CountsObservedTermsAcrossSupervisorRounds) {
     EXPECT_EQ(report.issues[0].code, "ELECTION_UNSTABLE");
     EXPECT_NE(report.issues[0].message.find("window_sec=300, changes=3"),
               std::string::npos);
-    EXPECT_NE(report.issues[0].message.find("leader=other, epoch=20"),
+    EXPECT_NE(report.issues[0].message.find("leader=local, epoch=20"),
               std::string::npos);
     status.SetDoctorIssue("ELECTION_FAILED", "Redis unavailable");
     EXPECT_EQ(doctor().issues.size(), 2u);
@@ -95,6 +105,104 @@ TEST_F(HAStatusTest, ElectionWindowExpiresAndResets) {
     status.SetRoleState("standby", "WATCHING");
     status.SetLeader("new", 5);
     EXPECT_TRUE(doctor().issues.empty());
+}
+
+TEST_F(HAStatusTest, DoctorReportsPrimaryMasterViewMismatch) {
+    status.SetInstanceId("local-instance");
+    status.SetMasterView("remote", 7, 1000, 10, "remote-instance");
+    status.SetRoleState("primary", "RUNNING");
+    auto report = doctor();
+    EXPECT_EQ(report.status, "degraded");
+    const auto* issue = FindIssue(report, "MASTER_VIEW_MISMATCH");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_NE(issue->message.find("local=local"), std::string::npos);
+    EXPECT_NE(issue->message.find("local_instance_id=local-instance"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("view=remote"), std::string::npos);
+    EXPECT_NE(issue->message.find("view_instance_id=remote-instance"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("view_epoch=7"), std::string::npos);
+
+    status.SetMasterView("local", 8, 1000, 10, "local-instance");
+    report = doctor();
+    EXPECT_EQ(report.status, "ok");
+    EXPECT_EQ(FindIssue(report, "MASTER_VIEW_MISMATCH"), nullptr);
+}
+
+TEST_F(HAStatusTest, DoctorHandlesMissingViewAndEmptyInstanceConservatively) {
+    status.SetRoleState("primary", "RUNNING");
+    auto report = doctor();
+    EXPECT_EQ(report.status, "degraded");
+    const auto* issue = FindIssue(report, "MASTER_VIEW_MISMATCH");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_NE(issue->message.find("view=<empty>"), std::string::npos);
+
+    status.SetRoleState("standby", "WATCHING");
+    report = doctor();
+    EXPECT_EQ(report.status, "ok");
+    EXPECT_EQ(FindIssue(report, "MASTER_VIEW_MISMATCH"), nullptr);
+
+    status.SetRoleState("primary", "STARTING");
+    report = doctor();
+    EXPECT_EQ(report.status, "unknown");
+    EXPECT_EQ(FindIssue(report, "MASTER_VIEW_MISMATCH"), nullptr);
+
+    status.SetRoleState("primary", "RUNNING");
+    status.SetMasterView("local", 1, 1000, 10, "remote-instance");
+    report = doctor();
+    EXPECT_EQ(report.status, "ok");
+    EXPECT_EQ(FindIssue(report, "MASTER_VIEW_MISMATCH"), nullptr);
+}
+
+TEST_F(HAStatusTest, StatusTracksPendingWrites) {
+    status.SetLeader("local", 1);
+    status.SetRoleState("primary", "RUNNING");
+    status.SetOpLogWriterRunning(true);
+    status.SetOpLogWriteProgress(1, 3);
+    auto snapshot = status.Snapshot();
+    EXPECT_EQ(snapshot.oplog_pending_writes, 3u);
+    EXPECT_EQ(snapshot.oplog_writer_running, true);
+    EXPECT_EQ(snapshot.oplog_writer_last_committed_sequence_id, 1u);
+    EXPECT_EQ(snapshot.oplog_writer_pending_writes, 3u);
+    status.SetOpLogWriterRunning(false);
+    snapshot = status.Snapshot();
+    EXPECT_EQ(snapshot.oplog_pending_writes, 0u);
+    EXPECT_EQ(snapshot.oplog_writer_running, false);
+    EXPECT_EQ(snapshot.oplog_writer_last_committed_sequence_id, 0u);
+}
+
+TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    status.SetMasterView("local", 9, now_ms - 1000, 10, "local-instance");
+    status.SetOpLogProgress(12, 15, 2, 3);
+    auto snapshot = status.Snapshot();
+    EXPECT_EQ(snapshot.master_view_address, "local");
+    EXPECT_EQ(snapshot.master_view_endpoint, "local");
+    EXPECT_EQ(snapshot.master_view_timestamp_ms, now_ms - 1000);
+    EXPECT_EQ(snapshot.master_view_updated_at_ms, now_ms - 1000);
+    EXPECT_GE(snapshot.master_view_age_ms, 1000);
+    EXPECT_GT(snapshot.master_view_expires_in_ms, 0);
+    EXPECT_EQ(snapshot.applied_sequence_id, 12u);
+    EXPECT_EQ(snapshot.oplog_applied_sequence_id, 12u);
+    EXPECT_EQ(snapshot.latest_sequence_id, 15u);
+    EXPECT_EQ(snapshot.oplog_latest_sequence_id, 15u);
+    EXPECT_TRUE(snapshot.oplog_latest_read_ok);
+    EXPECT_EQ(snapshot.trimmed_sequence_id, 2u);
+    EXPECT_EQ(snapshot.oplog_trimmed_sequence_id, 2u);
+    EXPECT_EQ(snapshot.gc_cursor_sequence_id, 3u);
+    EXPECT_EQ(snapshot.oplog_gc_cursor_sequence_id, 3u);
+    EXPECT_EQ(snapshot.oplog_lag, 3u);
+    EXPECT_EQ(snapshot.oplog_apply_lag, 3u);
+
+    status.SetOpLogProgress(13, std::nullopt, 4, 5);
+    snapshot = status.Snapshot();
+    EXPECT_EQ(snapshot.latest_sequence_id, 15u);
+    EXPECT_EQ(snapshot.oplog_latest_sequence_id, 15u);
+    EXPECT_FALSE(snapshot.oplog_latest_read_ok);
+    EXPECT_EQ(snapshot.oplog_lag, 2u);
+    EXPECT_EQ(snapshot.oplog_apply_lag, 2u);
 }
 
 }  // namespace mooncake

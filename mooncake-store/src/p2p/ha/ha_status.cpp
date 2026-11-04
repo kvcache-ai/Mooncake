@@ -62,6 +62,7 @@ void HAStatusManager::Reset() {
     doctor_issues_.clear();
     oplog_writer_ = {};
     oplog_catchup_ = {};
+    status_.oplog_pending_writes = 0;
     oplog_latest_stall_timeout_sec_ = 10;
     oplog_catchup_stall_timeout_sec_ = 10;
     TouchLocked();
@@ -88,6 +89,8 @@ void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
     if (!ha_enabled) {
         oplog_writer_ = {};
         oplog_catchup_ = {};
+        status_.oplog_latest_read_ok = false;
+        status_.oplog_pending_writes = 0;
         status_.role = "disabled";
         status_.state = "disabled";
     }
@@ -187,6 +190,39 @@ std::string HAStatusManager::ElectionUnstableMessageLocked() const {
            ", epoch=" + std::to_string(election_.epoch);
 }
 
+std::string HAStatusManager::MasterViewMismatchMessageLocked() const {
+    if (!status_.ha_enabled || status_.role != "primary" ||
+        status_.state != "RUNNING" || status_.local_endpoint.empty()) {
+        return {};
+    }
+
+    const bool missing_view = status_.master_view_address.empty();
+    const bool address_mismatch =
+        !missing_view && status_.master_view_address != status_.local_endpoint;
+    const bool instance_mismatch =
+        !status_.instance_id.empty() &&
+        !status_.master_view_instance_id.empty() &&
+        status_.instance_id != status_.master_view_instance_id;
+    const bool epoch_mismatch = status_.epoch != 0 &&
+                                status_.master_view_epoch != 0 &&
+                                status_.epoch != status_.master_view_epoch;
+    if (!missing_view && !address_mismatch && !instance_mismatch &&
+        !epoch_mismatch) {
+        return {};
+    }
+
+    return "local=" + status_.local_endpoint + ", local_instance_id=" +
+           (status_.instance_id.empty() ? "<empty>" : status_.instance_id) +
+           ", local_epoch=" + std::to_string(status_.epoch) + ", view=" +
+           (status_.master_view_address.empty() ? "<empty>"
+                                                : status_.master_view_address) +
+           ", view_instance_id=" +
+           (status_.master_view_instance_id.empty()
+                ? "<empty>"
+                : status_.master_view_instance_id) +
+           ", view_epoch=" + std::to_string(status_.master_view_epoch);
+}
+
 void HAStatusManager::SetSnapshotReady(bool snapshot_ready) {
     std::lock_guard<std::mutex> lock(mutex_);
     status_.snapshot_ready = snapshot_ready;
@@ -197,6 +233,7 @@ void HAStatusManager::SetOpLogProgress(
     uint64_t applied_sequence_id, std::optional<uint64_t> latest_sequence_id,
     uint64_t trimmed_sequence_id, uint64_t gc_cursor_sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
+    status_.oplog_latest_read_ok = latest_sequence_id.has_value();
     if (latest_sequence_id) {
         status_.latest_sequence_id = *latest_sequence_id;
     }
@@ -285,7 +322,7 @@ void HAStatusManager::RecordRegistryHeartbeat(ErrorCode result,
 
 HAStatusSnapshot HAStatusManager::Snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return status_;
+    return BuildSnapshotLocked(NowMs());
 }
 
 std::string HAStatusManager::SerializeJson() const {
@@ -308,18 +345,21 @@ void HAStatusManager::ClearDoctorIssues() {
     doctor_issues_.clear();
     oplog_writer_ = {};
     oplog_catchup_ = {};
+    status_.oplog_pending_writes = 0;
 }
 
 void HAStatusManager::SetOpLogWriterRunning(bool running) {
     std::lock_guard<std::mutex> lock(mutex_);
     oplog_writer_ = {};
     oplog_writer_.running = running;
+    status_.oplog_pending_writes = 0;
 }
 
 void HAStatusManager::SetOpLogWriteProgress(uint64_t committed_sequence_id,
                                             size_t pending) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!oplog_writer_.running) return;
+    status_.oplog_pending_writes = static_cast<uint64_t>(pending);
     if (pending == 0) {
         oplog_writer_.stalled_since.reset();
     } else if (!oplog_writer_.stalled_since ||
@@ -377,6 +417,11 @@ std::string HAStatusManager::SerializeDoctorJson() const {
                 report.issues.push_back(
                     {"ELECTION_UNSTABLE", std::move(issue)});
             }
+            if (auto issue = MasterViewMismatchMessageLocked();
+                !issue.empty()) {
+                report.issues.push_back(
+                    {"MASTER_VIEW_MISMATCH", std::move(issue)});
+            }
             for (const auto& [code, message] : doctor_issues_) {
                 report.issues.push_back({code, message});
             }
@@ -415,6 +460,32 @@ int64_t HAStatusManager::NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+HAStatusSnapshot HAStatusManager::BuildSnapshotLocked(int64_t now_ms) const {
+    auto snapshot = status_;
+    snapshot.master_view_endpoint = snapshot.master_view_address;
+    snapshot.master_view_updated_at_ms = snapshot.master_view_timestamp_ms;
+    if (snapshot.master_view_timestamp_ms > 0) {
+        snapshot.master_view_age_ms =
+            std::max<int64_t>(0, now_ms - snapshot.master_view_timestamp_ms);
+        if (snapshot.master_view_ttl_sec > 0) {
+            snapshot.master_view_expires_in_ms =
+                snapshot.master_view_timestamp_ms +
+                snapshot.master_view_ttl_sec * 1000 - now_ms;
+        }
+    }
+
+    snapshot.oplog_applied_sequence_id = snapshot.applied_sequence_id;
+    snapshot.oplog_latest_sequence_id = snapshot.latest_sequence_id;
+    snapshot.oplog_trimmed_sequence_id = snapshot.trimmed_sequence_id;
+    snapshot.oplog_gc_cursor_sequence_id = snapshot.gc_cursor_sequence_id;
+    snapshot.oplog_apply_lag = snapshot.oplog_lag;
+    snapshot.oplog_writer_pending_writes = snapshot.oplog_pending_writes;
+    snapshot.oplog_writer_running = oplog_writer_.running;
+    snapshot.oplog_writer_last_committed_sequence_id =
+        oplog_writer_.committed_sequence_id;
+    return snapshot;
 }
 
 void HAStatusManager::TouchLocked() {

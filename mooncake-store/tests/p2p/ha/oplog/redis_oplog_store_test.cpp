@@ -547,6 +547,7 @@ TEST_F(RedisOpLogStoreTest, LatestStallOnlyTimesBusyPendingWork) {
     auto& status = HAStatusManager::instance();
     status.Reset();
     status.Configure(true, cluster_id_, "test-primary", 1);
+    status.SetLeader("test-primary", 1);
     status.SetRoleState("primary", "RUNNING");
     auto has_stall_issue = [&] {
         return status.SerializeDoctorJson().find("OPLOG_LATEST_STALLED") !=

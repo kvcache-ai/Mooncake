@@ -38,15 +38,29 @@ struct HAStatusSnapshot {
     std::string leader_endpoint;
     uint64_t epoch{0};
     std::string master_view_address;
+    std::string master_view_endpoint;
     uint64_t master_view_epoch{0};
     int64_t master_view_timestamp_ms{0};
+    int64_t master_view_updated_at_ms{0};
     int64_t master_view_ttl_sec{0};
+    int64_t master_view_age_ms{0};
+    int64_t master_view_expires_in_ms{0};
     std::string master_view_instance_id;
     uint64_t applied_sequence_id{0};
+    uint64_t oplog_applied_sequence_id{0};
     uint64_t latest_sequence_id{0};
+    uint64_t oplog_latest_sequence_id{0};
+    bool oplog_latest_read_ok{false};
     uint64_t trimmed_sequence_id{0};
+    uint64_t oplog_trimmed_sequence_id{0};
     uint64_t gc_cursor_sequence_id{0};
+    uint64_t oplog_gc_cursor_sequence_id{0};
     uint64_t oplog_lag{0};
+    uint64_t oplog_apply_lag{0};
+    uint64_t oplog_pending_writes{0};
+    uint64_t oplog_writer_pending_writes{0};
+    bool oplog_writer_running{false};
+    uint64_t oplog_writer_last_committed_sequence_id{0};
     bool snapshot_ready{false};
     bool registry_heartbeat_ok{false};
     int64_t registry_heartbeat_last_success_ms{0};
@@ -57,9 +71,15 @@ struct HAStatusSnapshot {
 
     YLT_REFL(HAStatusSnapshot, ha_enabled, cluster_id, local_endpoint, role,
              state, instance_id, leader_endpoint, epoch, master_view_address,
-             master_view_epoch, master_view_timestamp_ms, master_view_ttl_sec,
-             master_view_instance_id, applied_sequence_id, latest_sequence_id,
-             trimmed_sequence_id, gc_cursor_sequence_id, oplog_lag,
+             master_view_endpoint, master_view_epoch, master_view_timestamp_ms,
+             master_view_updated_at_ms, master_view_ttl_sec, master_view_age_ms,
+             master_view_expires_in_ms, master_view_instance_id,
+             applied_sequence_id, oplog_applied_sequence_id, latest_sequence_id,
+             oplog_latest_sequence_id, oplog_latest_read_ok,
+             trimmed_sequence_id, oplog_trimmed_sequence_id,
+             gc_cursor_sequence_id, oplog_gc_cursor_sequence_id, oplog_lag,
+             oplog_apply_lag, oplog_pending_writes, oplog_writer_pending_writes,
+             oplog_writer_running, oplog_writer_last_committed_sequence_id,
              snapshot_ready, registry_heartbeat_ok,
              registry_heartbeat_last_success_ms,
              registry_heartbeat_last_failure_ms, registry_heartbeat_last_error,
@@ -112,9 +132,11 @@ class HAStatusManager {
     HAStatusManager();
 
     static int64_t NowMs();
+    HAStatusSnapshot BuildSnapshotLocked(int64_t now_ms) const;
     void TouchLocked();
     void ObserveLeaderLocked(const std::string& address, uint64_t epoch);
     std::string ElectionUnstableMessageLocked() const;
+    std::string MasterViewMismatchMessageLocked() const;
     std::string OpLogLatestStallMessageLocked() const;
     std::string OpLogCatchUpStallMessageLocked() const;
 

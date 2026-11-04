@@ -301,6 +301,9 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
                             /*latest_sequence_id=*/15,
                             /*trimmed_sequence_id=*/3,
                             /*gc_cursor_sequence_id=*/2);
+    status.SetOpLogWriterRunning(true);
+    status.SetOpLogWriteProgress(/*committed_sequence_id=*/15,
+                                 /*pending=*/4);
     status.SetSnapshotReady(true);
     status.RecordRegistryHeartbeat(ErrorCode::OK, "");
 
@@ -321,10 +324,20 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
     EXPECT_EQ(body["master_view_ttl_sec"].asInt64(), 4);
     EXPECT_EQ(body["master_view_instance_id"].asString(), "candidate-1");
     EXPECT_EQ(body["applied_sequence_id"].asUInt64(), 12u);
+    EXPECT_EQ(body["oplog_applied_sequence_id"].asUInt64(), 12u);
     EXPECT_EQ(body["latest_sequence_id"].asUInt64(), 15u);
+    EXPECT_EQ(body["oplog_latest_sequence_id"].asUInt64(), 15u);
+    EXPECT_TRUE(body["oplog_latest_read_ok"].asBool());
     EXPECT_EQ(body["trimmed_sequence_id"].asUInt64(), 3u);
+    EXPECT_EQ(body["oplog_trimmed_sequence_id"].asUInt64(), 3u);
     EXPECT_EQ(body["gc_cursor_sequence_id"].asUInt64(), 2u);
+    EXPECT_EQ(body["oplog_gc_cursor_sequence_id"].asUInt64(), 2u);
     EXPECT_EQ(body["oplog_lag"].asUInt64(), 3u);
+    EXPECT_EQ(body["oplog_apply_lag"].asUInt64(), 3u);
+    EXPECT_EQ(body["oplog_pending_writes"].asUInt64(), 4u);
+    EXPECT_EQ(body["oplog_writer_pending_writes"].asUInt64(), 4u);
+    EXPECT_TRUE(body["oplog_writer_running"].asBool());
+    EXPECT_EQ(body["oplog_writer_last_committed_sequence_id"].asUInt64(), 15u);
     EXPECT_EQ(body["snapshot_ready"].asBool(), true);
     EXPECT_EQ(body["registry_heartbeat_ok"].asBool(), true);
     EXPECT_GT(body["updated_at_ms"].asInt64(), 0);
@@ -449,6 +462,7 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorHandlesLifecycleAndFatalFailure) {
     report = doctor();
     EXPECT_EQ(report["status"].asString(), "unknown");
     EXPECT_TRUE(report["issues"].empty());
+    status.SetLeader("127.0.0.1:50051", 1);
     status.SetRoleState("primary", "RUNNING");
     EXPECT_EQ(doctor()["status"].asString(), "ok");
 }
@@ -458,6 +472,7 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
     auto& status = HAStatusManager::instance();
     status.Reset();
     status.Configure(true, "test_cluster", "test-primary", 1);
+    status.SetLeader("test-primary", 1);
     status.SetRoleState("primary", "RUNNING");
     // This is the assigned primary watermark, not the writer's committed
     // latest. The stall diagnosis must use the latter.
@@ -596,6 +611,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     status.SetOpLogProgress(10, 20);
     EXPECT_EQ(doctor()["status"].asString(), "degraded");
 
+    status.SetLeader("test-standby", 1);
     status.SetRoleState("primary", "RUNNING");
     EXPECT_EQ(doctor()["status"].asString(), "ok");
     status.SetRoleState("standby", "WATCHING");

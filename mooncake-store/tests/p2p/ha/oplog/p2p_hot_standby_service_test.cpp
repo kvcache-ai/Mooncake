@@ -1085,6 +1085,7 @@ TEST_F(P2PHotStandbyServiceTest, StoppedRecoveryClearsIssuesBeforePromotion) {
     seed_issues();
     ASSERT_EQ(standby.Promote(), ErrorCode::OK);
     expect_no_recovery_issues();
+    status.SetLeader("test-standby", 1);
     status.SetRoleState("primary", "RUNNING");
     EXPECT_NE(status.SerializeDoctorJson().find("\"ok\""), std::string::npos);
     standby.Stop();

@@ -40,6 +40,40 @@ curl http://localhost:8080/metrics/summary
 
 ### HA Diagnostics
 
+#### `/ha/status`
+
+`GET /ha/status` returns the local cached HA status as JSON. The endpoint is
+read-only and does not probe Redis or peer nodes while serving the request.
+
+Prefer the explicit OpLog field names:
+
+- `oplog_applied_sequence_id`: local metadata apply watermark.
+- `oplog_latest_sequence_id`: latest OpLog sequence ID from the most recent
+  successful latest read. If the latest read fails, the previous value is
+  retained.
+- `oplog_latest_read_ok`: whether the latest read in the most recent OpLog
+  progress sample succeeded.
+- `oplog_trimmed_sequence_id`: OpLog trim watermark.
+- `oplog_gc_cursor_sequence_id`: OpLog GC cursor watermark.
+- `oplog_apply_lag`: `oplog_latest_sequence_id - oplog_applied_sequence_id`,
+  clamped to 0.
+
+Primary async writer fields use the `oplog_writer_` prefix:
+
+- `oplog_writer_running`: whether the local primary async OpLog writer is
+  currently running.
+- `oplog_writer_pending_writes`: primary writer entries that are still queued,
+  retrying, or persisted-but-uncommitted.
+- `oplog_writer_last_committed_sequence_id`: writer's last locally confirmed
+  committed sequence ID.
+
+The older fields `applied_sequence_id`, `latest_sequence_id`,
+`trimmed_sequence_id`, `gc_cursor_sequence_id`, `oplog_lag`, and
+`oplog_pending_writes` remain in the response for compatibility.
+`master_view_endpoint` and `master_view_updated_at_ms` are clearer aliases for
+`master_view_address` and `master_view_timestamp_ms`. `master_view_age_ms` and
+`master_view_expires_in_ms` are computed from the cached view timestamp and TTL.
+
 #### `/ha/doctor`
 
 `GET /ha/doctor` returns a local, read-only diagnosis as JSON on the same HTTP
@@ -52,8 +86,9 @@ request.
 
 - `ok`: the primary is running or a standby is watching, and no active issue is
   recorded.
-- `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect, snapshot
-  recovery, registry heartbeat, or fatal HA failure is recorded, or pending OpLogs
+- `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect,
+  snapshot recovery, registry heartbeat, master view mismatch, or fatal HA
+  failure is recorded, or pending OpLogs
   exceed the configured latest stall timeout, or a watching standby stops applying
   known pending OpLogs beyond the catch-up stall timeout.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
@@ -75,6 +110,15 @@ baseline; duplicate or older epochs are ignored, while a newer epoch counts once
 even when the same node is re-elected. The issue clears when fewer than 3 changes
 remain in the sliding window. Disabling HA, changing clusters, or resetting the
 process clears history.
+
+`MASTER_VIEW_MISMATCH` means the local process is reporting
+`role=primary,state=RUNNING`, but its cached master view does not identify this
+same process as the leader. The issue is reported when the cached view is
+missing, when `master_view_address` differs from `local_endpoint`, when both
+instance IDs are present and differ, or when both epochs are present and differ.
+Empty instance IDs are not treated as a mismatch by themselves, so older paths
+and non-Redis election backends do not degrade solely because they do not publish
+an instance ID.
 
 `OPLOG_LATEST_STALLED` means the Redis writer has pending work and its locally
 confirmed committed latest has not advanced for
