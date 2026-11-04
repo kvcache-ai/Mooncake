@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -106,16 +107,28 @@ class HAStatusManager {
     void SetOpLogWriteProgress(uint64_t committed_sequence_id, size_t pending);
 
    private:
+    friend struct HAStatusTestPeer;
+
     HAStatusManager();
 
     static int64_t NowMs();
     void TouchLocked();
+    void ObserveLeaderLocked(const std::string& address, uint64_t epoch);
+    std::string ElectionUnstableMessageLocked() const;
     std::string OpLogLatestStallMessageLocked() const;
     std::string OpLogCatchUpStallMessageLocked() const;
 
     mutable std::mutex mutex_;
     HAStatusSnapshot status_;
     std::map<std::string, std::string> doctor_issues_;
+    // Survives supervisor rounds; the first observation only establishes a
+    // baseline.
+    struct ElectionHistory {
+        uint64_t epoch{0};
+        std::string leader;
+        int64_t last_change_ms{0};
+        std::deque<std::chrono::steady_clock::time_point> changes;
+    } election_;
     struct OpLogWriterProgress {
         bool running{false};
         uint64_t committed_sequence_id{0};

@@ -1,5 +1,6 @@
 #include "p2p/ha/ha_status.h"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -11,6 +12,9 @@
 namespace mooncake {
 
 namespace {
+
+constexpr auto kElectionWindow = std::chrono::seconds(300);
+constexpr int kElectionChangeThreshold = 3;
 
 int64_t RoleMetricValue(const HAStatusSnapshot& status) {
     if (status.role == "failed" || status.state == "FAILED") {
@@ -54,6 +58,7 @@ HAStatusManager::HAStatusManager() { TouchLocked(); }
 void HAStatusManager::Reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     status_ = HAStatusSnapshot{};
+    election_ = {};
     doctor_issues_.clear();
     oplog_writer_ = {};
     oplog_catchup_ = {};
@@ -67,6 +72,10 @@ void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
                                 uint32_t oplog_latest_stall_timeout_sec,
                                 uint32_t oplog_catchup_stall_timeout_sec) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!ha_enabled ||
+        (!cluster_id.empty() && cluster_id != status_.cluster_id)) {
+        election_ = {};
+    }
     status_.ha_enabled = ha_enabled;
     oplog_latest_stall_timeout_sec_ = oplog_latest_stall_timeout_sec;
     oplog_catchup_stall_timeout_sec_ = oplog_catchup_stall_timeout_sec;
@@ -120,6 +129,7 @@ void HAStatusManager::SetInstanceId(std::string instance_id) {
 
 void HAStatusManager::SetLeader(std::string leader_endpoint, uint64_t epoch) {
     std::lock_guard<std::mutex> lock(mutex_);
+    ObserveLeaderLocked(leader_endpoint, epoch);
     status_.leader_endpoint = leader_endpoint;
     status_.epoch = epoch;
     status_.master_view_address = std::move(leader_endpoint);
@@ -131,6 +141,7 @@ void HAStatusManager::SetMasterView(std::string address, uint64_t epoch,
                                     int64_t timestamp_ms, int64_t ttl_sec,
                                     std::string instance_id) {
     std::lock_guard<std::mutex> lock(mutex_);
+    ObserveLeaderLocked(address, epoch);
     status_.leader_endpoint = address;
     status_.epoch = epoch;
     status_.master_view_address = std::move(address);
@@ -139,6 +150,41 @@ void HAStatusManager::SetMasterView(std::string address, uint64_t epoch,
     status_.master_view_ttl_sec = ttl_sec;
     status_.master_view_instance_id = std::move(instance_id);
     TouchLocked();
+}
+
+void HAStatusManager::ObserveLeaderLocked(const std::string& address,
+                                          uint64_t epoch) {
+    if (!status_.ha_enabled || address.empty() || epoch <= election_.epoch) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    while (!election_.changes.empty() &&
+           now - election_.changes.front() >= kElectionWindow) {
+        election_.changes.pop_front();
+    }
+    if (election_.epoch != 0) {
+        election_.changes.push_back(now);
+        election_.last_change_ms = NowMs();
+    }
+    election_.epoch = epoch;
+    election_.leader = address;
+    if (auto issue = ElectionUnstableMessageLocked(); !issue.empty()) {
+        // Election paths already log causes; only add a sampled aggregate.
+        LOG_EVERY_N(WARNING, 30) << "HA election unstable: " << issue;
+    }
+}
+
+std::string HAStatusManager::ElectionUnstableMessageLocked() const {
+    const auto cutoff = std::chrono::steady_clock::now() - kElectionWindow;
+    const auto changes = std::count_if(
+        election_.changes.begin(), election_.changes.end(),
+        [cutoff](const auto& changed_at) { return changed_at > cutoff; });
+    if (changes < kElectionChangeThreshold) return {};
+    return "window_sec=" + std::to_string(kElectionWindow.count()) +
+           ", changes=" + std::to_string(changes) +
+           ", last_change_ms=" + std::to_string(election_.last_change_ms) +
+           ", leader=" + election_.leader +
+           ", epoch=" + std::to_string(election_.epoch);
 }
 
 void HAStatusManager::SetSnapshotReady(bool snapshot_ready) {
@@ -327,6 +373,10 @@ std::string HAStatusManager::SerializeDoctorJson() const {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (status_.ha_enabled) {
+            if (auto issue = ElectionUnstableMessageLocked(); !issue.empty()) {
+                report.issues.push_back(
+                    {"ELECTION_UNSTABLE", std::move(issue)});
+            }
             for (const auto& [code, message] : doctor_issues_) {
                 report.issues.push_back({code, message});
             }

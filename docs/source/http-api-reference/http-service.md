@@ -62,11 +62,19 @@ request.
 An empty issue list is `[]`. Each issue contains only a stable `code` and a
 `message`; successful operations clear the corresponding issue, repeated issues
 replace their previous message instead of accumulating, and a new HA round clears
-issues from the preceding round. OpLog holes, sequence lag, catch-up, optional
+active issues from the preceding round, while retaining the election instability
+window described below. OpLog holes, sequence lag, catch-up, optional
 snapshot fallback, and historical `last_error` alone are not failures. The
 doctor only reports failures observed by the live process and does not retain
 history across restarts. It returns HTTP 200 even when `status` is `degraded`
 or `unknown`.
+
+`ELECTION_UNSTABLE` reports at least 3 observed leader term changes in the last
+300 seconds and makes the result `degraded`. The first valid leader establishes a
+baseline; duplicate or older epochs are ignored, while a newer epoch counts once
+even when the same node is re-elected. The issue clears when fewer than 3 changes
+remain in the sliding window. Disabling HA, changing clusters, or resetting the
+process clears history.
 
 `OPLOG_LATEST_STALLED` means the Redis writer has pending work and its locally
 confirmed committed latest has not advanced for

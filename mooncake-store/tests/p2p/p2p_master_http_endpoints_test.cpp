@@ -403,6 +403,23 @@ TEST_F(P2PMasterHttpEndpointsTest,
     }
 }
 
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorReturnsElectionInstability) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "local");
+    status.SetRoleState("standby", "WATCHING");
+    for (uint64_t epoch = 1; epoch <= 4; ++epoch) {
+        status.SetMasterView("leader", epoch);
+    }
+    auto response = HttpGet(http_base_url_ + "/ha/doctor");
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    const auto report = ParseJson(response.resp_body, "/ha/doctor");
+    EXPECT_EQ(report["status"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "ELECTION_UNSTABLE");
+}
+
 TEST_F(P2PMasterHttpEndpointsTest, HADoctorHandlesLifecycleAndFatalFailure) {
     HAStatusResetGuard reset_guard;
     auto& status = HAStatusManager::instance();
