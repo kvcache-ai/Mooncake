@@ -1,6 +1,8 @@
 import os
 import signal
 import socket
+import sys
+import tempfile
 import time
 import unittest
 from contextlib import contextmanager
@@ -71,6 +73,28 @@ def temporary_env(updates: dict[str, str]):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+@contextmanager
+def native_stderr(lines: list):
+    """Collects what native code writes to stderr and echoes it afterwards.
+
+    Mooncake logs go to stderr unless MC_LOG_DIR is set. A worker killed
+    before the block ends, for example by a spawn timeout, loses the output.
+    """
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    with tempfile.TemporaryFile() as sink:
+        os.dup2(sink.fileno(), 2)
+        try:
+            yield
+        finally:
+            os.dup2(saved_fd, 2)
+            os.close(saved_fd)
+            sink.seek(0)
+            output = sink.read()
+            os.write(2, output)
+            lines.extend(output.decode(errors="replace").splitlines())
 
 
 def musa_runtime_available(min_devices: int = 1) -> bool:

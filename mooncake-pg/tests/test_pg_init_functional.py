@@ -1,3 +1,4 @@
+import os
 import unittest
 
 import torch
@@ -8,6 +9,7 @@ from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
     MooncakePGCUDABackendTestCase,
     MooncakePGWorkerContext,
+    native_stderr,
 )
 
 
@@ -82,6 +84,44 @@ def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
                     pass
 
 
+def _subgroup_recreate_worker(
+    ctx: MooncakePGWorkerContext, rounds: int, barrier_first: bool
+) -> None:
+    """Destroys a subgroup and creates the next one with the same ranks.
+
+    A new communicator usually registers its buffers and sync regions at the
+    addresses that the destroyed one used, under new rkeys, so every peer must
+    refresh its cached segment descriptor of this rank before writing to it.
+    """
+    # Count failed writes from the Transfer Engine log on stderr.
+    os.environ.pop("MC_LOG_DIR", None)
+    device = ctx.init_group()
+    ranks = list(range(ctx.world_size))
+    sums = []
+    lines = []
+    with native_stderr(lines):
+        for round_index in range(rounds):
+            group = dist.new_group(ranks=ranks, backend=ctx.backend_name)
+            if barrier_first:
+                # A barrier writes only sync flags. A writer with an old segment
+                # descriptor would use an old rkey for this flag even when the
+                # new receive buffers are at new addresses, for which Transfer
+                # Engine reloads the descriptor by itself.
+                dist.barrier(group=group)
+            tensor = torch.full(
+                (4096,), ctx.rank + round_index, dtype=torch.int32, device=device
+            )
+            dist.all_reduce(tensor, group=group, op=dist.ReduceOp.SUM)
+            sums.append(tensor.unique().cpu().tolist())
+            dist.destroy_process_group(group)
+    ctx.record_result(
+        {
+            "sums": sums,
+            "failed_writes": sum("remote access error" in line for line in lines),
+        }
+    )
+
+
 def _destroy_and_reinit_worker(ctx: MooncakePGWorkerContext, destroyed) -> None:
     """Test destroy and re-init process group."""
     # First init
@@ -152,6 +192,21 @@ class _InitFunctionalMixin:
                 self.assertEqual(row["subgroup_sum"], expected_even)
             else:
                 self.assertEqual(row["subgroup_sum"], expected_odd)
+
+    def test_subgroup_recreate_after_destroy(self) -> None:
+        """Test subgroups recreated with the ranks of a destroyed one."""
+        rounds = 3
+        rank_sum = sum(range(self.world_size))
+        expected = [[rank_sum + self.world_size * r] for r in range(rounds)]
+        for barrier_first in (True, False):
+            with self.subTest(barrier_first=barrier_first):
+                rows = self.spawn_backend_and_collect(
+                    _subgroup_recreate_worker, rounds, barrier_first
+                )
+                self.assert_all_ok(rows)
+                for row in rows:
+                    self.assertEqual(row["sums"], expected, f"rank {row['rank']}")
+                    self.assertEqual(row["failed_writes"], 0, f"rank {row['rank']}")
 
     def test_destroy_and_reinit(self) -> None:
         """Test destroy and re-init process group."""

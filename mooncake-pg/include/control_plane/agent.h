@@ -87,6 +87,12 @@ class AgentStateMachine {
 
     void appendApplyGroupStateEffect(const GroupView& view,
                                      AgentApplyResult& effects) const;
+    // Appends a RefreshPeerLink for every peer whose endpoint in `view` is
+    // new: absent from `old_view` (nullptr for a group's first view) or
+    // published at another endpoint epoch. Returns those peers.
+    std::vector<GlobalRank> appendPeerSegmentRefreshEffects(
+        const GroupView* old_view, const GroupView& view,
+        AgentApplyResult& effects) const;
     void appendApplyRankStateEffects(GlobalRank rank,
                                      AgentApplyResult& effects) const;
     void resetRankForNewEpoch(GlobalRank rank, uint64_t rank_epoch,
