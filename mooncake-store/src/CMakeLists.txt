@@ -4,6 +4,7 @@ add_subdirectory(cachelib_memory_allocator)
 set(MOONCAKE_MASTER_SUPPORT_SOURCES
     common_types.cpp
     utils.cpp
+    common/network.cpp
     etcd_helper.cpp
     allocator.cpp
     offset_allocator.cpp

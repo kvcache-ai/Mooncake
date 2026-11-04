@@ -19,6 +19,7 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "common/network.h"
 #include "p2p/client/client_rpc_service.h"
 #include "p2p/client/data_manager.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"

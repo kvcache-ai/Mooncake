@@ -14,6 +14,7 @@
 
 #include <glog/logging.h>
 
+#include "common/network.h"
 #include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/p2p_client_service.h"
 #include "test_exit_codes.h"
