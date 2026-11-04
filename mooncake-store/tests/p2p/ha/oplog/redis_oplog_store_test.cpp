@@ -514,6 +514,48 @@ TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
     EXPECT_EQ(1u, latest);
 }
 
+TEST_F(RedisOpLogStoreTest, RejectsInvalidWriteBatchSize) {
+    for (size_t batch_size : {size_t{0}, kMaxRedisOpLogWriteBatchSize + 1}) {
+        auto writer = OpLogStoreFactory::Create(
+            OpLogStoreType::REDIS, cluster_id_, OpLogStoreRole::WRITER,
+            redis_endpoint_, /*poll_interval_ms=*/10, redis_password_,
+            redis_username_, /*db_index=*/0,
+            /*async_queue_max_entries=*/100000, /*overflow_mode=*/"reject",
+            /*best_effort_max_retries=*/3, batch_size);
+        EXPECT_EQ(nullptr, writer) << "batch_size=" << batch_size;
+    }
+}
+
+TEST_F(RedisOpLogStoreTest, ConfiguredBatchSizeAboveDefaultIsUsed) {
+    max_pipelined_sets.store(0);
+    RedisOpLogStore store(cluster_id_, redis_endpoint_, /*enable_write=*/true,
+                          /*poll_interval_ms=*/10, redis_password_,
+                          redis_username_, /*db_index=*/0,
+                          /*async_queue_max_entries=*/100000,
+                          OpLogAsyncQueueOverflowMode::REJECT,
+                          /*best_effort_max_retries=*/3,
+                          /*async_write_batch_size=*/128);
+    ASSERT_EQ(ErrorCode::OK, store.Init());
+
+    for (uint64_t seq = 2; seq <= 1000; ++seq) {
+        ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(MakeEntry(seq), false));
+    }
+    ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(MakeEntry(1), true));
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    do {
+        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
+        if (latest == 1000u) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    EXPECT_EQ(1000u, latest);
+    EXPECT_GT(max_pipelined_sets.load(), 64u);
+    EXPECT_LE(max_pipelined_sets.load(), 128u);
+}
+
 TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
     auto writer = std::make_unique<RedisOpLogStore>(
         cluster_id_, redis_endpoint_, /*enable_write=*/true,

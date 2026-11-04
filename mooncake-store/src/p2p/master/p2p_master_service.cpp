@@ -36,7 +36,8 @@ P2PMasterService::P2PMasterService(const P2PMasterConfig& config,
             config.redis.username, config.redis.db_index,
             config.oplog.async_queue_max_entries,
             config.oplog.async_queue_overflow_mode,
-            config.oplog.best_effort_max_retries);
+            config.oplog.best_effort_max_retries,
+            config.oplog.async_write_batch_size);
         if (!store) {
             LOG(ERROR) << "P2PMasterService: failed to initialize OpLogStore"
                        << ", type=" << config.oplog.store_type

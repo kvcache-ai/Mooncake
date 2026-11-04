@@ -15,7 +15,7 @@ std::unique_ptr<OpLogStore> OpLogStoreFactory::Create(
     const std::string& password, const std::string& username, int db_index,
     size_t async_queue_max_entries,
     const std::string& async_queue_overflow_mode,
-    size_t best_effort_max_retries) {
+    size_t best_effort_max_retries, size_t async_write_batch_size) {
     switch (type) {
         case OpLogStoreType::ETCD: {
             // EtcdOpLogStore is not yet ported to this branch.
@@ -41,6 +41,8 @@ std::unique_ptr<OpLogStore> OpLogStoreFactory::Create(
         case OpLogStoreType::REDIS: {
 #ifdef STORE_USE_REDIS
             if (async_queue_max_entries == 0 || best_effort_max_retries == 0 ||
+                async_write_batch_size == 0 ||
+                async_write_batch_size > kMaxRedisOpLogWriteBatchSize ||
                 (async_queue_overflow_mode != "reject" &&
                  async_queue_overflow_mode != "bypass")) {
                 LOG(ERROR) << "OpLogStoreFactory: invalid Redis async OpLog "
@@ -48,7 +50,9 @@ std::unique_ptr<OpLogStore> OpLogStoreFactory::Create(
                            << ", queue_max_entries=" << async_queue_max_entries
                            << ", overflow_mode=" << async_queue_overflow_mode
                            << ", best_effort_max_retries="
-                           << best_effort_max_retries;
+                           << best_effort_max_retries
+                           << ", async_write_batch_size="
+                           << async_write_batch_size;
                 return nullptr;
             }
             bool enable_write = (role == OpLogStoreRole::WRITER);
@@ -59,7 +63,7 @@ std::unique_ptr<OpLogStore> OpLogStoreFactory::Create(
             auto store = std::make_unique<RedisOpLogStore>(
                 cluster_id, oplog_root_dir, enable_write, poll_interval_ms,
                 password, username, db_index, async_queue_max_entries,
-                overflow_mode, best_effort_max_retries);
+                overflow_mode, best_effort_max_retries, async_write_batch_size);
             if (store->Init() != ErrorCode::OK) {
                 LOG(ERROR)
                     << "OpLogStoreFactory: failed to init RedisOpLogStore"

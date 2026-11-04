@@ -18,6 +18,7 @@
 
 #include "p2p/ha/oplog/oplog_store.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
+#include "p2p/ha/oplog/redis_oplog_limits.h"
 #include "mutex.h"
 #include "p2p/ha/redis_util.h"
 
@@ -27,15 +28,15 @@ enum class OpLogAsyncQueueOverflowMode { REJECT, BYPASS };
 
 class RedisOpLogStore : public OpLogStore {
    public:
-    RedisOpLogStore(const std::string& cluster_id,
-                    const std::string& redis_endpoint, bool enable_write,
-                    int poll_interval_ms = 1000,
-                    const std::string& password = "",
-                    const std::string& username = "", int db_index = 0,
-                    size_t async_queue_max_entries = 100000,
-                    OpLogAsyncQueueOverflowMode async_queue_overflow_mode =
-                        OpLogAsyncQueueOverflowMode::REJECT,
-                    size_t best_effort_max_retries = 3);
+    RedisOpLogStore(
+        const std::string& cluster_id, const std::string& redis_endpoint,
+        bool enable_write, int poll_interval_ms = 1000,
+        const std::string& password = "", const std::string& username = "",
+        int db_index = 0, size_t async_queue_max_entries = 100000,
+        OpLogAsyncQueueOverflowMode async_queue_overflow_mode =
+            OpLogAsyncQueueOverflowMode::REJECT,
+        size_t best_effort_max_retries = 3,
+        size_t async_write_batch_size = kDefaultRedisOpLogWriteBatchSize);
     ~RedisOpLogStore() override;
 
     RedisOpLogStore(const RedisOpLogStore&) = delete;
@@ -152,9 +153,9 @@ class RedisOpLogStore : public OpLogStore {
     size_t async_queue_max_entries_;
     OpLogAsyncQueueOverflowMode async_queue_overflow_mode_;
     size_t best_effort_max_retries_;
+    size_t async_write_batch_size_;
 
     static constexpr size_t kAsyncWorkerCount = 4;
-    static constexpr size_t kAsyncWriteBatchSize = 64;
     static constexpr size_t kCleanupBatchSize = 1000;
     static constexpr int kAsyncRetryDelayMs = 100;
     static constexpr int kSyncWaitTimeoutMs = 30000;

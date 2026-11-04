@@ -65,6 +65,12 @@ HAMetricManager::HAMetricManager()
           "Total number of failed OpLog persistence operations"),
       oplog_write_retries_total_("ha_oplog_write_retries_total",
                                  "Total number of OpLog write retry attempts"),
+      oplog_redis_pipeline_batch_failures_total_(
+          "ha_oplog_redis_pipeline_batch_failures_total",
+          "Redis OpLog SET pipeline attempts with at least one failed entry"),
+      oplog_redis_pipeline_batch_retries_total_(
+          "ha_oplog_redis_pipeline_batch_retries_total",
+          "Redis OpLog SET pipeline attempts with entries requeued for retry"),
       election_attempts_total_("ha_election_attempts_total",
                                "Total number of election attempts"),
       election_failures_total_("ha_election_failures_total",
@@ -165,6 +171,11 @@ HAMetricManager::HAMetricManager()
           "Latency of OpLog persistence operations in microseconds",
           {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000,
            5000000}),
+      oplog_redis_pipeline_batch_size_(
+          "ha_oplog_redis_pipeline_batch_size",
+          "Number of entries selected for each Redis OpLog SET pipeline "
+          "attempt",
+          {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}),
       election_duration_ms_(
           "ha_election_duration_ms",
           "Time spent waiting to acquire leadership in milliseconds",
@@ -322,6 +333,24 @@ int64_t HAMetricManager::get_oplog_write_retries_total() {
     return static_cast<int64_t>(oplog_write_retries_total_.value());
 }
 
+void HAMetricManager::inc_oplog_redis_pipeline_batch_failures(int64_t val) {
+    oplog_redis_pipeline_batch_failures_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_redis_pipeline_batch_failures_total() {
+    return static_cast<int64_t>(
+        oplog_redis_pipeline_batch_failures_total_.value());
+}
+
+void HAMetricManager::inc_oplog_redis_pipeline_batch_retries(int64_t val) {
+    oplog_redis_pipeline_batch_retries_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_redis_pipeline_batch_retries_total() {
+    return static_cast<int64_t>(
+        oplog_redis_pipeline_batch_retries_total_.value());
+}
+
 void HAMetricManager::inc_election_attempts(int64_t val) {
     election_attempts_total_.inc(val);
 }
@@ -459,6 +488,11 @@ void HAMetricManager::observe_oplog_write_latency_us(int64_t latency_us) {
     oplog_write_latency_us_.observe(latency_us);
 }
 
+void HAMetricManager::observe_oplog_redis_pipeline_batch_size(
+    int64_t batch_size) {
+    oplog_redis_pipeline_batch_size_.observe(batch_size);
+}
+
 void HAMetricManager::observe_election_duration_ms(int64_t duration_ms) {
     election_duration_ms_.observe(duration_ms);
 }
@@ -519,6 +553,8 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_gap_resolve_success_total_);
     serialize_metric(oplog_write_failures_total_);
     serialize_metric(oplog_write_retries_total_);
+    serialize_metric(oplog_redis_pipeline_batch_failures_total_);
+    serialize_metric(oplog_redis_pipeline_batch_retries_total_);
     serialize_metric(election_attempts_total_);
     serialize_metric(election_failures_total_);
     serialize_metric(election_leadership_lost_total_);
@@ -555,6 +591,7 @@ std::string HAMetricManager::serialize_metrics() {
 
     // Histograms
     serialize_metric(oplog_write_latency_us_);
+    serialize_metric(oplog_redis_pipeline_batch_size_);
     serialize_metric(election_duration_ms_);
     serialize_metric(oplog_apply_latency_us_);
 

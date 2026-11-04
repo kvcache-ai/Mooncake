@@ -108,6 +108,10 @@ class HAMetricManager {
      */
     void inc_oplog_write_retries(int64_t val = 1);
     int64_t get_oplog_write_retries_total();
+    void inc_oplog_redis_pipeline_batch_failures(int64_t val = 1);
+    int64_t get_oplog_redis_pipeline_batch_failures_total();
+    void inc_oplog_redis_pipeline_batch_retries(int64_t val = 1);
+    int64_t get_oplog_redis_pipeline_batch_retries_total();
 
     void inc_election_attempts(int64_t val = 1);
     void inc_election_failures(int64_t val = 1);
@@ -180,6 +184,7 @@ class HAMetricManager {
      * @brief Record OpLog persistence latency in microseconds
      */
     void observe_oplog_write_latency_us(int64_t latency_us);
+    void observe_oplog_redis_pipeline_batch_size(int64_t batch_size);
     void observe_election_duration_ms(int64_t duration_ms);
 
     /**
@@ -244,6 +249,8 @@ class HAMetricManager {
     ylt::metric::counter_t oplog_gap_resolve_success_total_;
     ylt::metric::counter_t oplog_write_failures_total_;
     ylt::metric::counter_t oplog_write_retries_total_;
+    ylt::metric::counter_t oplog_redis_pipeline_batch_failures_total_;
+    ylt::metric::counter_t oplog_redis_pipeline_batch_retries_total_;
     ylt::metric::counter_t election_attempts_total_;
     ylt::metric::counter_t election_failures_total_;
     ylt::metric::counter_t election_leadership_lost_total_;
@@ -280,6 +287,7 @@ class HAMetricManager {
     // Latency Histograms (buckets in microseconds: 100us, 500us, 1ms, 5ms,
     // 10ms, 50ms, 100ms, 500ms, 1s)
     ylt::metric::histogram_t oplog_write_latency_us_;
+    ylt::metric::histogram_t oplog_redis_pipeline_batch_size_;
     ylt::metric::histogram_t election_duration_ms_;
     ylt::metric::histogram_t oplog_apply_latency_us_;
 

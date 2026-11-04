@@ -2,6 +2,8 @@
 #include <glog/logging.h>
 
 #include "p2p/common/p2p_master_config.h"
+#include "p2p/ha/oplog/redis_oplog_limits.h"
+#include "p2p/ha/oplog/oplog_store_factory.h"
 #include "p2p/master/p2p_master.h"
 #include "p2p/common/p2p_types.h"
 
@@ -56,6 +58,8 @@ DEFINE_string(oplog_async_queue_overflow_mode, "reject",
               "Asynchronous OpLog overflow mode: reject or bypass");
 DEFINE_uint64(oplog_best_effort_max_retries, 3,
               "Maximum best-effort Redis OpLog retries");
+DEFINE_uint32(oplog_async_write_batch_size, 64,
+              "Maximum entries in a Redis OpLog pipeline batch");
 DEFINE_bool(enable_ha, false, "Enable P2P master HA");
 DEFINE_string(election_backend, "etcd",
               "P2P HA election backend: etcd or redis");
@@ -135,6 +139,9 @@ void LoadConfigFile(const DefaultConfig& source, P2PMasterConfig& config,
     source.GetUInt64("oplog_best_effort_max_retries",
                      &config.oplog.best_effort_max_retries,
                      config.oplog.best_effort_max_retries);
+    source.GetUInt32("oplog_async_write_batch_size",
+                     &config.oplog.async_write_batch_size,
+                     config.oplog.async_write_batch_size);
     source.GetBool("enable_ha", &config.ha.enabled, config.ha.enabled);
     source.GetString("election_backend", &election_backend, election_backend);
     source.GetString("etcd_endpoints", &config.ha.etcd_endpoints,
@@ -191,6 +198,8 @@ void ApplyCommandLineOverrides(P2PMasterConfig& config,
                    config.oplog.async_queue_overflow_mode);
     APPLY_OVERRIDE(oplog_best_effort_max_retries,
                    config.oplog.best_effort_max_retries);
+    APPLY_OVERRIDE(oplog_async_write_batch_size,
+                   config.oplog.async_write_batch_size);
     APPLY_OVERRIDE(enable_ha, config.ha.enabled);
     APPLY_OVERRIDE(election_backend, election_backend);
     APPLY_OVERRIDE(etcd_endpoints, config.ha.etcd_endpoints);
@@ -239,6 +248,13 @@ tl::expected<void, std::string> ValidateAndNormalize(
     } else if (config.ha.enabled) {
         return tl::make_unexpected(
             "election_backend must be 'etcd' or 'redis'");
+    }
+
+    if (config.oplog.enabled &&
+        ParseOpLogStoreType(config.oplog.store_type) == OpLogStoreType::REDIS &&
+        (config.oplog.async_write_batch_size == 0 ||
+         config.oplog.async_write_batch_size > kMaxRedisOpLogWriteBatchSize)) {
+        return tl::make_unexpected("invalid oplog_async_write_batch_size");
     }
 
     if (config.ha.enabled && config.oplog.enabled &&

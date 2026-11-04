@@ -4,6 +4,7 @@
 #include <string>
 
 #include "p2p/common/p2p_types.h"
+#include "p2p/ha/oplog/redis_oplog_limits.h"
 
 namespace mooncake {
 
@@ -46,6 +47,7 @@ struct P2PMasterConfig {
         std::string store_type = "localfs";
         std::string data_dir = "/tmp/mooncake_oplog";
         uint64_t async_queue_max_entries = 100000;
+        uint32_t async_write_batch_size = kDefaultRedisOpLogWriteBatchSize;
         std::string async_queue_overflow_mode = "reject";
         uint64_t best_effort_max_retries = 3;
     } oplog;

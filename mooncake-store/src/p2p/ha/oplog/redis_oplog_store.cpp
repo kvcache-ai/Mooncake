@@ -63,7 +63,8 @@ RedisOpLogStore::RedisOpLogStore(
     const std::string& cluster_id, const std::string& redis_endpoint,
     bool enable_write, int poll_interval_ms, const std::string& password,
     const std::string& username, int db_index, size_t async_queue_max_entries,
-    OpLogAsyncQueueOverflowMode overflow_mode, size_t best_effort_max_retries)
+    OpLogAsyncQueueOverflowMode overflow_mode, size_t best_effort_max_retries,
+    size_t async_write_batch_size)
     : cluster_id_(cluster_id),
       redis_endpoint_(redis_endpoint),
       username_(username),
@@ -73,7 +74,10 @@ RedisOpLogStore::RedisOpLogStore(
       poll_interval_ms_(poll_interval_ms),
       async_queue_max_entries_(async_queue_max_entries),
       async_queue_overflow_mode_(overflow_mode),
-      best_effort_max_retries_(best_effort_max_retries) {
+      best_effort_max_retries_(best_effort_max_retries),
+      async_write_batch_size_(async_write_batch_size) {
+    CHECK_GT(async_write_batch_size_, 0);
+    CHECK_LE(async_write_batch_size_, kMaxRedisOpLogWriteBatchSize);
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for RedisOpLogStore: '" << cluster_id
                    << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
@@ -322,7 +326,7 @@ bool RedisOpLogStore::WaitForPendingWrites(
     if (!async_running_.load()) {
         return false;
     }
-    while (!pending_writes_.empty() && batch.size() < kAsyncWriteBatchSize) {
+    while (!pending_writes_.empty() && batch.size() < async_write_batch_size_) {
         batch.push_back(pending_writes_.front());
         pending_writes_.pop_front();
     }
@@ -332,7 +336,7 @@ bool RedisOpLogStore::WaitForPendingWrites(
 void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
     redisContext* ctx = CreateConnection();
     std::vector<std::shared_ptr<PendingWrite>> batch;
-    batch.reserve(kAsyncWriteBatchSize);
+    batch.reserve(async_write_batch_size_);
     while (WaitForPendingWrites(batch)) {
         if (!ctx || ctx->err) {
             if (ctx) {
@@ -362,6 +366,18 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
         }
 
         const auto results = PersistEntriesNoLatest(ctx, batch);
+        if (async_running_.load()) {
+            HAMetricManager::instance().observe_oplog_redis_pipeline_batch_size(
+                static_cast<int64_t>(batch.size()));
+            const bool any_failed = std::any_of(
+                results.begin(), results.end(), [](const WriteResult& result) {
+                    return result.error != ErrorCode::OK;
+                });
+            if (any_failed) {
+                HAMetricManager::instance()
+                    .inc_oplog_redis_pipeline_batch_failures();
+            }
+        }
         std::vector<std::shared_ptr<PendingWrite>> retry_batch;
         for (size_t i = batch.size(); i > 0; --i) {
             const size_t index = i - 1;
@@ -382,6 +398,10 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
             ctx = nullptr;
         }
 
+        if (!retry_batch.empty()) {
+            HAMetricManager::instance()
+                .inc_oplog_redis_pipeline_batch_retries();
+        }
         if (!retry_batch.empty() || latest_failed) {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(kAsyncRetryDelayMs));
