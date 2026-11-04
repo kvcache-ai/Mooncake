@@ -42,6 +42,8 @@ P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
         config.rpc.address + ":" + std::to_string(config.rpc.port),
         config.oplog.latest_stall_timeout_sec,
         config.oplog.catchup_stall_timeout_sec);
+    P2PMasterMetricManager::instance().set_component_info(
+        "p2p_master", GetMooncakeStoreVersion(), MOONCAKE_STORE_ARCHITECTURE);
 }
 
 P2PMasterRpcService::~P2PMasterRpcService() {

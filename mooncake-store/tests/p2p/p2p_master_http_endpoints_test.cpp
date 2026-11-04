@@ -1,7 +1,7 @@
 /**
  * @file p2p_master_http_endpoints_test.cpp
  * @brief Integration tests for the P2P master HTTP endpoints
- *        (GET /health, GET /get_key_count, GET /get_all_keys,
+ *        (GET /health, GET /server_info, GET /get_key_count, GET /get_all_keys,
  *         GET /batch_query_routes, GET /metrics, GET /ha/status, GET
  * /ha/doctor).
  *
@@ -62,6 +62,13 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         http_base_url_ = "http://127.0.0.1:" + std::to_string(http_port);
         LOG(INFO) << "P2P master HTTP server at " << http_base_url_;
         ASSERT_EQ(HttpGet(http_base_url_ + "/health").status, 200);
+
+        const auto server_info = HttpGet(http_base_url_ + "/server_info");
+        ASSERT_EQ(server_info.status, 200);
+        EXPECT_NE(server_info.resp_body.find("store_version="),
+                  std::string::npos);
+        EXPECT_NE(server_info.resp_body.find("architecture=p2p"),
+                  std::string::npos);
 
         // Register one client owning two P2P segments so tests can also
         // exercise keys with replicas on multiple segments.

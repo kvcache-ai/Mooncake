@@ -6,8 +6,10 @@
 
 #include <string>
 
+#include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "p2p/client/heartbeat_type.h"
+#include "version.h"
 
 namespace mooncake::test {
 
@@ -21,6 +23,25 @@ class P2PMasterMetricsTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
+
+TEST_F(P2PMasterMetricsTest,
+       StatusHttpServerInitializesComponentInfoWithoutMasterService) {
+    P2PStatusHttpServer server(/*port=*/0);
+    server.Start();
+
+    const auto text = P2PMasterMetricManager::instance().serialize_metrics();
+    EXPECT_NE(
+        text.find("mooncake_component_info{component_name=\"p2p_master\""),
+        std::string::npos);
+    EXPECT_NE(
+        text.find("component_version=\"" + GetMooncakeStoreVersion() + "\""),
+        std::string::npos);
+    EXPECT_NE(text.find("architecture=\"" +
+                        std::string(MOONCAKE_STORE_ARCHITECTURE) + "\""),
+              std::string::npos);
+
+    server.Stop();
+}
 
 TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
     auto& metrics = P2PMasterMetricManager::instance();
@@ -59,6 +80,23 @@ TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
     EXPECT_EQ(metrics.get_batch_get_write_route_failed_items(), 0);
     // Shared metrics must still be reachable through the same instance.
     EXPECT_EQ(metrics.get_key_count(), 0);
+}
+
+TEST_F(P2PMasterMetricsTest, ComponentInfoMetricTest) {
+    auto& metrics = P2PMasterMetricManager::instance();
+    metrics.set_component_info("p2p_master", GetMooncakeStoreVersion(),
+                               MOONCAKE_STORE_ARCHITECTURE);
+    const auto text = metrics.serialize_metrics();
+
+    EXPECT_NE(
+        text.find("mooncake_component_info{component_name=\"p2p_master\""),
+        std::string::npos);
+    EXPECT_NE(
+        text.find("component_version=\"" + GetMooncakeStoreVersion() + "\""),
+        std::string::npos);
+    EXPECT_NE(text.find("architecture=\"" +
+                        std::string(MOONCAKE_STORE_ARCHITECTURE) + "\""),
+              std::string::npos);
 }
 
 TEST_F(P2PMasterMetricsTest, SerializeMetricsContentTest) {
