@@ -804,10 +804,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                          << ". Please migrate to use rpc_thread_num only.";
         }
         master_config.rpc_thread_num = rpc_thread_num;
-    } else {
-        if (!conf_set) {
-            master_config.rpc_thread_num = server_thread_num;
-        }
+    } else if (!conf_set || master_config.rpc_thread_num == 0) {
+        // A config file without rpc_thread_num leaves it at the flag's 0,
+        // which must fall back like the command line does: the RPC handler
+        // worker pool below is sized from it.
+        master_config.rpc_thread_num = server_thread_num;
     }
 
     // Determine RPC server port with compatibility warnings
