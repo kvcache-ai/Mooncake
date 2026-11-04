@@ -53,6 +53,15 @@ class OpLogStore {
     // Write
     virtual ErrorCode WriteOpLog(const OpLogEntry& entry, bool sync = true) = 0;
 
+    // Close write admission and wake waiters without waiting for workers.
+    // Backends without an async stop keep their existing shutdown behavior.
+    virtual void RequestStopWriting() {}
+
+    // Request cancellation, clean up pending writes, and wait for workers.
+    // Must complete before exporting a demotion handoff or destroying the
+    // store.
+    virtual void StopWriting() {}
+
     // Read
     virtual ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) = 0;
     virtual ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,

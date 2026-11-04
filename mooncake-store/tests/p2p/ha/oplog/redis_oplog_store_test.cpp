@@ -9,11 +9,13 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <future>
 
 #include <unistd.h>
 #include <hiredis/hiredis.h>
 #include <xxhash.h>
 
+#include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/oplog/oplog_store_factory.h"
 #include "p2p/ha/oplog/redis_oplog_store.h"
 #include "p2p/ha/oplog/oplog_replicator.h"
@@ -193,12 +195,12 @@ class RedisOpLogStoreTest : public ::testing::Test {
         payload.segment_id = {3, 4};
         OpLogEntry entry = MakeEntry(sequence_id, key, OpType_WITHDRAW_ROUTE);
         entry.payload = SerializeP2PPayload(payload);
-        entry.checksum = static_cast<uint32_t>(XXH32(
-            entry.payload.data(), entry.payload.size(), 0));
-        entry.prefix_hash = key.empty()
-                                ? 0
-                                : static_cast<uint32_t>(
-                                      XXH32(key.data(), key.size(), 0));
+        entry.checksum = static_cast<uint32_t>(
+            XXH32(entry.payload.data(), entry.payload.size(), 0));
+        entry.prefix_hash =
+            key.empty()
+                ? 0
+                : static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
         return entry;
     }
 
@@ -333,6 +335,62 @@ TEST_F(RedisOpLogStoreTest, AsyncWriteDoesNotAdvanceLatestPastGap) {
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
     ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
     EXPECT_EQ(2u, latest);
+}
+
+TEST_F(RedisOpLogStoreTest, StopWritingAbortsSyncWaitAndRejectsNewWrites) {
+    std::shared_ptr<RedisOpLogStore> writer(CreateWriter());
+    OpLogManager manager;
+    manager.SetOpLogStore(writer);
+    auto pending = std::async(std::launch::async, [&] {
+        // seq=2 cannot commit while seq=1 is missing.
+        return manager.PersistEntry(MakeEntry(2), true);
+    });
+    OpLogEntry stored;
+    for (int i = 0; i < 200; ++i) {
+        if (writer->ReadOpLog(2, stored) == ErrorCode::OK) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(2u, stored.sequence_id);
+    ASSERT_EQ(1, HAMetricManager::instance().get_oplog_async_queue_size());
+    EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+
+    manager.RequestStopWriting();
+    ASSERT_EQ(pending.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_EQ(pending.get(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(manager.PersistEntry(MakeEntry(1), true),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(manager.PersistEntry(MakeEntry(1), false),
+              ErrorCode::INTERNAL_ERROR);
+
+    // Concurrent blocking stops and destruction must still join after
+    // RequestStopWriting().
+    auto stop = std::async(std::launch::async, [&] { manager.StopWriting(); });
+    manager.StopWriting();
+    stop.get();
+    uint64_t latest = 99;
+    ASSERT_EQ(writer->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(0u, latest);
+    EXPECT_EQ(writer->ReadOpLog(1, stored), ErrorCode::OPLOG_ENTRY_NOT_FOUND);
+    EXPECT_EQ(0, HAMetricManager::instance().get_oplog_async_queue_size());
+}
+
+TEST_F(RedisOpLogStoreTest, StopRacesWithSyncWaitAndIdleWorkers) {
+    for (int i = 0; i < 50; ++i) {
+        SCOPED_TRACE(i);
+        auto writer = CreateWriter();
+        // A missing seq=1 keeps seq=2 uncommitted, even if it reaches Redis.
+        auto pending = std::async(std::launch::async, [&] {
+            return writer->WriteOpLog(MakeEntry(2), true);
+        });
+        std::this_thread::yield();
+        writer->RequestStopWriting();
+        EXPECT_EQ(pending.wait_for(std::chrono::seconds(1)),
+                  std::future_status::ready);
+        writer->StopWriting();
+        EXPECT_EQ(pending.get(), ErrorCode::INTERNAL_ERROR);
+    }
 }
 
 TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {

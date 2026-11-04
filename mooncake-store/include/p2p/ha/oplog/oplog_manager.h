@@ -59,6 +59,12 @@ class OpLogManager {
     // If not set, OpLog will only be stored in memory buffer.
     void SetOpLogStore(std::shared_ptr<OpLogStore> oplog_store);
 
+    // Close write admission and wake waiters without waiting for workers.
+    void RequestStopWriting();
+
+    // Request cancellation, clean up pending writes, and wait for workers.
+    void StopWriting();
+
     // Append a new entry and return the assigned sequence_id.
     // This is a best-effort (async) path: the entry is buffered in memory
     // and enqueued to etcd without waiting for persistence.

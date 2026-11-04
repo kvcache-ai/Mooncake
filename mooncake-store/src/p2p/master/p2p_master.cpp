@@ -1,6 +1,7 @@
 #include "p2p/master/p2p_master.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -279,10 +280,23 @@ int P2PMaster::RunWithHA() {
         EtcdLeaseId lease_id = 0;
         ViewVersionId view_version = 0;
         master_view->ElectLeader(local_endpoint, view_version, lease_id);
-        auto keep_leader_thread = std::thread(
-            [server = server.get(), view = master_view.get(), lease_id] {
+
+        std::atomic<bool> leadership_lost{false};
+        std::atomic<OpLogManager*> primary_oplog_manager{nullptr};
+        auto stop_primary_rpc = [&server, &leadership_lost,
+                                 &primary_oplog_manager] {
+            leadership_lost.store(true, std::memory_order_release);
+            if (auto* manager =
+                    primary_oplog_manager.load(std::memory_order_acquire)) {
+                manager->RequestStopWriting();
+            }
+            server->stop();
+        };
+        auto keep_leader_thread =
+            std::thread([view = master_view.get(), lease_id, &stop_primary_rpc,
+                         &leadership_lost] {
                 view->KeepLeader(lease_id);
-                server->stop();
+                stop_primary_rpc();
             });
         std::this_thread::sleep_for(
             std::chrono::seconds(master_view->GetLeaderLeaseTTLSeconds()));
@@ -314,6 +328,17 @@ int P2PMaster::RunWithHA() {
         }
 
         auto active_service = CreateActiveService(config_, view_version);
+        {
+            auto* manager =
+                active_service->GetMasterService().GetOpLogManager();
+            primary_oplog_manager.store(manager, std::memory_order_release);
+            // Handle a leader loss that races with service publication. The
+            // keep-leader callback either reads the published manager or sees
+            // leadership_lost here and requests the stop itself.
+            if (leadership_lost.load(std::memory_order_acquire) && manager) {
+                manager->RequestStopWriting();
+            }
+        }
         if (promoted_metadata.has_value()) {
             auto restore_result =
                 active_service->GetMasterService().RestoreFromStandbyMetadata(
@@ -338,6 +363,10 @@ int P2PMaster::RunWithHA() {
 #else
         const int run_result = RunActiveRpcServers(*server, *active_service);
 #endif
+        if (auto* manager =
+                primary_oplog_manager.load(std::memory_order_acquire)) {
+            manager->StopWriting();
+        }
         active_service.reset();
         master_view->CancelKeepAlive(lease_id);
         keep_leader_thread.join();

@@ -16,6 +16,24 @@ void OpLogManager::SetOpLogStore(std::shared_ptr<OpLogStore> oplog_store) {
     oplog_store_ = oplog_store;
 }
 
+void OpLogManager::RequestStopWriting() {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto store = oplog_store_;
+    lock.unlock();
+    if (store) {
+        store->RequestStopWriting();
+    }
+}
+
+void OpLogManager::StopWriting() {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto store = oplog_store_;
+    lock.unlock();
+    if (store) {
+        store->StopWriting();
+    }
+}
+
 uint64_t OpLogManager::Append(OpType type, const std::string& key,
                               const std::string& payload) {
     OpLogEntry entry;
