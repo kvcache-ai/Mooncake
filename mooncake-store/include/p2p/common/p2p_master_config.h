@@ -44,6 +44,7 @@ struct P2PMasterConfig {
 
     struct OpLog {
         bool enabled = false;
+        uint64_t election_max_standby_lag_entries = 0;
         std::string store_type = "localfs";
         std::string data_dir = "/tmp/mooncake_oplog";
         uint64_t async_queue_max_entries = 100000;

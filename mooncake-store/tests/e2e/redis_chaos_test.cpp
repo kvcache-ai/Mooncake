@@ -572,6 +572,37 @@ class RedisChaosTest : public ::testing::Test {
         return false;
     }
 
+    bool WaitForMasterLogOrderSince(int index, const std::string& first,
+                                    const std::string& second,
+                                    std::streampos offset,
+                                    std::chrono::seconds timeout) {
+        const std::string path =
+            FLAGS_out_dir + "/master_" + std::to_string(index) + ".err";
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::ifstream input(path, std::ios::binary);
+            if (!input) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+            input.seekg(offset);
+            std::string content((std::istreambuf_iterator<char>(input)),
+                                std::istreambuf_iterator<char>());
+            const auto first_pos = content.find(first);
+            const auto second_pos = content.find(second);
+            if (second_pos != std::string::npos &&
+                (first_pos == std::string::npos || second_pos < first_pos)) {
+                return false;
+            }
+            if (first_pos != std::string::npos &&
+                second_pos != std::string::npos) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return false;
+    }
+
     bool WaitForSnapshotObject(int source_index, const std::string& key,
                                std::chrono::seconds timeout) {
         const std::string endpoint =
@@ -634,6 +665,27 @@ TEST_F(RedisChaosTest, LeaderKilledFailover) {
         WaitForNewLeader(leader_index, version, new_leader_index, new_version));
     EXPECT_NE(new_leader_index, leader_index);
     EXPECT_GT(new_version, version);
+}
+
+TEST_F(RedisChaosTest, RestartedPrimaryWaitsForStandbyBeforeElection) {
+    int leader_index = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader_index, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+
+    ASSERT_TRUE(masters_[leader_index]->kill());
+    const auto restart_log_offset = MasterLogEndOffset(leader_index);
+    ASSERT_TRUE(masters_[leader_index]->start());
+
+    EXPECT_TRUE(WaitForMasterLogOrderSince(
+        leader_index, "Standby state transition: SYNCING -> WATCHING",
+        "Trying to elect self as leader", restart_log_offset,
+        std::chrono::seconds(40)));
+
+    int next_leader_index = -1;
+    ViewVersionId next_version = 0;
+    ASSERT_TRUE(WaitForNewerView(version, next_leader_index, next_version));
+    EXPECT_GT(next_version, version);
 }
 
 TEST_F(RedisChaosTest, TrimmedStandbyAutoDiscoversPeerAndBootstraps) {

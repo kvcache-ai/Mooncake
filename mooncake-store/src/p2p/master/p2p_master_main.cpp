@@ -48,6 +48,10 @@ DEFINE_int32(redis_master_view_ttl_sec, 4, "Redis leader key TTL in seconds");
 DEFINE_int32(redis_heartbeat_interval_sec, 1,
              "Redis leader heartbeat interval in seconds");
 DEFINE_bool(enable_oplog, false, "Enable P2P metadata OpLog");
+DEFINE_uint64(
+    election_max_standby_lag_entries, 0,
+    "Maximum allowed latest-applied OpLog lag before a P2P standby joins "
+    "leader election; 0 requires the standby to catch up to latest");
 DEFINE_string(oplog_store_type, "localfs",
               "P2P OpLog backend: localfs or redis");
 DEFINE_string(oplog_data_dir, "/tmp/mooncake_oplog",
@@ -148,6 +152,9 @@ void LoadConfigFile(const DefaultConfig& source, P2PMasterConfig& config,
                     &config.redis.heartbeat_interval_seconds,
                     config.redis.heartbeat_interval_seconds);
     source.GetBool("enable_oplog", &config.oplog.enabled, config.oplog.enabled);
+    source.GetUInt64("election_max_standby_lag_entries",
+                     &config.oplog.election_max_standby_lag_entries,
+                     config.oplog.election_max_standby_lag_entries);
     source.GetString("oplog_store_type", &config.oplog.store_type,
                      config.oplog.store_type);
     source.GetString("oplog_data_dir", &config.oplog.data_dir,
@@ -238,6 +245,8 @@ void ApplyCommandLineOverrides(P2PMasterConfig& config,
     APPLY_OVERRIDE(redis_heartbeat_interval_sec,
                    config.redis.heartbeat_interval_seconds);
     APPLY_OVERRIDE(enable_oplog, config.oplog.enabled);
+    APPLY_OVERRIDE(election_max_standby_lag_entries,
+                   config.oplog.election_max_standby_lag_entries);
     APPLY_OVERRIDE(oplog_store_type, config.oplog.store_type);
     APPLY_OVERRIDE(oplog_data_dir, config.oplog.data_dir);
     APPLY_OVERRIDE(oplog_async_queue_max_entries,

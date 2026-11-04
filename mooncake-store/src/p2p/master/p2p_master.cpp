@@ -22,6 +22,7 @@
 
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
+#include "p2p/ha/p2p_election_readiness.h"
 #include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/ha/oplog/p2p_hot_standby_service.h"
 #include "p2p/ha/p2p_master_view.h"
@@ -260,8 +261,8 @@ int P2PMaster::RunWithHA() {
         /*ha_enabled=*/true, config_.cluster_id, "",
         config_.oplog.latest_stall_timeout_sec,
         config_.oplog.catchup_stall_timeout_sec);
-#ifdef STORE_USE_REDIS
     std::string master_instance_id;
+#ifdef STORE_USE_REDIS
     if (config_.oplog.enabled &&
         config_.ha.election_backend == ElectionBackend::REDIS) {
         master_instance_id = GenerateMasterInstanceId();
@@ -410,6 +411,26 @@ int P2PMaster::RunWithHA() {
 #endif
         }
 
+        if (standby) {
+            const std::function<bool()> not_stopping = [] { return false; };
+            if (!WaitForP2PElectionReadiness(config_, master_instance_id,
+                                             *standby, not_stopping)) {
+                LOG(INFO) << "HA shutdown requested during election readiness "
+                             "wait";
+                return 0;
+            }
+#ifdef STORE_USE_REDIS
+            if (config_.ha.election_backend == ElectionBackend::REDIS &&
+                !WaitForP2PElectionPriority(config_, master_instance_id,
+                                            *standby, not_stopping)) {
+                LOG(INFO) << "HA shutdown requested during election priority "
+                             "wait";
+                return 0;
+            }
+#endif
+        }
+
+        LOG(INFO) << "Trying to elect self as leader...";
         EtcdLeaseId lease_id = 0;
         ViewVersionId view_version = 0;
         master_view->ElectLeader(local_endpoint, view_version, lease_id);
