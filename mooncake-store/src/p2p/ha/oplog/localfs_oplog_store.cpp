@@ -33,7 +33,7 @@ LocalFsOpLogStore::LocalFsOpLogStore(const std::string& cluster_id,
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for LocalFsOpLogStore: '"
                    << cluster_id
-                   << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
+                   << "'. Allowed chars: [A-Za-z0-9_.-/], max_len=128.";
     }
     // Rebuild cluster_dir_ after normalization.
     cluster_dir_ = root_dir_ + "/" + cluster_id_;

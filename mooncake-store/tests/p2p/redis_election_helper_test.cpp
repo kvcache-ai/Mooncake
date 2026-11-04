@@ -50,9 +50,9 @@ static void CleanupRedisKeys() {
     if (AuthenticateRedisContext(ctx, FLAGS_redis_username,
                                  FLAGS_redis_password)) {
         std::string master_view_key =
-            "mooncake:{" + FLAGS_cluster_id + "/}master_view";
+            "mooncake:{" + FLAGS_cluster_id + "}:master_view";
         std::string master_epoch_key =
-            "mooncake:{" + FLAGS_cluster_id + "/}master_epoch";
+            "mooncake:{" + FLAGS_cluster_id + "}:master_epoch";
         redisReply* r = (redisReply*)redisCommand(
             ctx, "DEL %b %b", master_view_key.data(), master_view_key.size(),
             master_epoch_key.data(), master_epoch_key.size());
@@ -126,7 +126,7 @@ TEST_F(RedisElectionHelperTest, ElectLeaderAndGetMasterView) {
     ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,
                                          FLAGS_redis_password));
     std::string master_view_key =
-        "mooncake:{" + FLAGS_cluster_id + "/}master_view";
+        "mooncake:{" + FLAGS_cluster_id + "}:master_view";
     RedisReplyPtr raw((redisReply*)redisCommand(
         ctx, "GET %b", master_view_key.data(), master_view_key.size()));
     ASSERT_TRUE(raw && raw->type == REDIS_REPLY_STRING);
@@ -160,7 +160,7 @@ TEST_F(RedisElectionHelperTest, ContentionDoesNotAdvanceEpoch) {
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    std::string epoch_key = "mooncake:{" + FLAGS_cluster_id + "/}master_epoch";
+    std::string epoch_key = "mooncake:{" + FLAGS_cluster_id + "}:master_epoch";
     RedisReplyPtr epoch((redisReply*)redisCommand(
         ctx, "GET %b", epoch_key.data(), epoch_key.size()));
     redisFree(ctx);
@@ -181,7 +181,7 @@ TEST_F(RedisElectionHelperTest, ElectionScriptPublishesEvent) {
     timeval timeout{3, 0};
     ASSERT_EQ(redisSetTimeout(subscriber, timeout), REDIS_OK);
 
-    std::string channel = "mooncake:" + FLAGS_cluster_id + "/leader_event";
+    std::string channel = "mooncake:" + FLAGS_cluster_id + "leader_event";
     RedisReplyPtr subscribe_reply((redisReply*)redisCommand(
         subscriber, "SUBSCRIBE %b", channel.data(), channel.size()));
     ASSERT_TRUE(subscribe_reply && subscribe_reply->type == REDIS_REPLY_ARRAY);
@@ -481,7 +481,7 @@ TEST_F(RedisElectionHelperTest, ElectLeaderUnparsableExistingValue) {
     const int short_ttl = 2;
     // Write garbage into the master_view key directly
     std::string master_view_key =
-        "mooncake:{" + FLAGS_cluster_id + "/}master_view";
+        "mooncake:{" + FLAGS_cluster_id + "}:master_view";
     auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
     ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,
@@ -561,7 +561,7 @@ TEST_F(RedisElectionHelperTest, GetMasterViewCorruptedValue) {
 
     // Write corrupt value directly
     std::string master_view_key =
-        "mooncake:{" + FLAGS_cluster_id + "/}master_view";
+        "mooncake:{" + FLAGS_cluster_id + "}:master_view";
     auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
     ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,
@@ -619,7 +619,7 @@ TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
     // Overwrite the leader key with a different value (simulate another node
     // taking over)
     std::string master_view_key =
-        "mooncake:{" + FLAGS_cluster_id + "/}master_view";
+        "mooncake:{" + FLAGS_cluster_id + "}:master_view";
     auto [host, port] = ParseRedisEndpoint();
     redisContext* ctx = redisConnect(host.c_str(), port);
     ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,

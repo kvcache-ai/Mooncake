@@ -60,7 +60,7 @@ DEFINE_uint64(oplog_best_effort_max_retries, 3,
               "Maximum best-effort Redis OpLog retries");
 DEFINE_uint32(oplog_async_write_batch_size, 64,
               "Maximum entries in a Redis OpLog pipeline batch");
-DEFINE_bool(oplog_auto_trim_enabled, false,
+DEFINE_bool(enable_oplog_auto_trim, false,
             "Enable primary-side Redis OpLog auto trim in P2P HA mode");
 DEFINE_uint32(oplog_auto_trim_interval_sec, 60,
               "Interval in seconds for Redis OpLog auto trim");
@@ -158,8 +158,8 @@ void LoadConfigFile(const DefaultConfig& source, P2PMasterConfig& config,
     source.GetUInt32("oplog_async_write_batch_size",
                      &config.oplog.async_write_batch_size,
                      config.oplog.async_write_batch_size);
-    source.GetBool("oplog_auto_trim_enabled", &config.oplog.auto_trim_enabled,
-                   config.oplog.auto_trim_enabled);
+    source.GetBool("enable_oplog_auto_trim", &config.oplog.enable_auto_trim,
+                   config.oplog.enable_auto_trim);
     source.GetUInt32("oplog_auto_trim_interval_sec",
                      &config.oplog.auto_trim_interval_sec,
                      config.oplog.auto_trim_interval_sec);
@@ -236,7 +236,7 @@ void ApplyCommandLineOverrides(P2PMasterConfig& config,
                    config.oplog.best_effort_max_retries);
     APPLY_OVERRIDE(oplog_async_write_batch_size,
                    config.oplog.async_write_batch_size);
-    APPLY_OVERRIDE(oplog_auto_trim_enabled, config.oplog.auto_trim_enabled);
+    APPLY_OVERRIDE(enable_oplog_auto_trim, config.oplog.enable_auto_trim);
     APPLY_OVERRIDE(oplog_auto_trim_interval_sec,
                    config.oplog.auto_trim_interval_sec);
     APPLY_OVERRIDE(oplog_trim_retention_entries,
@@ -313,13 +313,13 @@ tl::expected<void, std::string> ValidateAndNormalize(
             "standby OpLog pending and poll batch limits must be positive");
     }
 
-    if (config.oplog.auto_trim_enabled) {
+    if (config.oplog.enable_auto_trim) {
         if (!config.oplog.enabled || !config.ha.enabled ||
             config.ha.election_backend != ElectionBackend::REDIS ||
             ParseOpLogStoreType(config.oplog.store_type) !=
                 OpLogStoreType::REDIS) {
             return tl::make_unexpected(
-                "oplog_auto_trim_enabled requires Redis HA and Redis OpLog");
+                "enable_oplog_auto_trim requires Redis HA and Redis OpLog");
         }
         if (config.oplog.auto_trim_interval_sec == 0) {
             return tl::make_unexpected(

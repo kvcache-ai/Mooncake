@@ -34,13 +34,10 @@ inline std::vector<uint64_t> FindMissingSequenceIds(
     return missing_sequence_ids;
 }
 
-// Normalize and validate cluster_id for OpLog key prefix construction.
-// Strips trailing slashes, then validates the remaining string.
-// Returns true if valid (or empty after normalization), false otherwise.
+// Validate cluster_id for OpLog key prefix construction.
+// Returns true if valid or empty; empty is later replaced by
+// DEFAULT_CLUSTER_ID.
 inline bool NormalizeAndValidateClusterId(std::string& cluster_id) {
-    while (!cluster_id.empty() && cluster_id.back() == '/') {
-        cluster_id.pop_back();
-    }
     return cluster_id.empty() || IsValidClusterIdComponent(cluster_id);
 }
 

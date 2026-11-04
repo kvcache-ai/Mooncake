@@ -24,7 +24,7 @@ P2POpLogApplier::P2POpLogApplier(P2PStandbyMetadataStore* p2p_store,
     HAMetricManager::instance().set_standby_degraded(false);
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for OpLogApplier: '" << cluster_id_
-                   << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
+                   << "'. Allowed chars: [A-Za-z0-9_.-/], max_len=128.";
     }
 
     if (p2p_store_ == nullptr) {

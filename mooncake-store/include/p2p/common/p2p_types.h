@@ -309,7 +309,7 @@ inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
     for (unsigned char c : cluster_id) {
         const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
                         (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
-                        c == '.';
+                        c == '.' || c == '/';
         if (!ok) {
             return false;
         }

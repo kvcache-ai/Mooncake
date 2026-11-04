@@ -71,20 +71,12 @@ std::pair<std::string, int> ParseRedisEndpoint() {
     return {host, port};
 }
 
-std::string RedisClusterIdWithSlash() {
-    std::string cluster_id = FLAGS_redis_cluster_id;
-    if (!cluster_id.empty() && cluster_id.back() != '/') {
-        cluster_id += '/';
-    }
-    return cluster_id;
-}
-
 std::string MasterViewKey() {
-    return "mooncake:{" + RedisClusterIdWithSlash() + "}master_view";
+    return "mooncake:{" + FLAGS_redis_cluster_id + "}:master_view";
 }
 
 std::string MasterEpochKey() {
-    return "mooncake:{" + RedisClusterIdWithSlash() + "}master_epoch";
+    return "mooncake:{" + FLAGS_redis_cluster_id + "}:master_epoch";
 }
 
 bool DeleteRedisKey(const std::string& key) {

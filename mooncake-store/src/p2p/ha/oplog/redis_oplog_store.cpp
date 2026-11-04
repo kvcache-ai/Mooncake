@@ -80,7 +80,7 @@ RedisOpLogStore::RedisOpLogStore(
     CHECK_LE(async_write_batch_size_, kMaxRedisOpLogWriteBatchSize);
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for RedisOpLogStore: '" << cluster_id
-                   << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
+                   << "'. Allowed chars: [A-Za-z0-9_.-/], max_len=128.";
     }
     if (cluster_id_.empty()) {
         cluster_id_ = "default";

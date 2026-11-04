@@ -93,13 +93,10 @@ RedisElectionHelper::RedisElectionHelper(const std::string& cluster_id,
       ttl_sec_(ttl_sec),
       heartbeat_interval_sec_(heartbeat_interval_sec),
       cluster_id_(cluster_id) {
-    std::string cid = cluster_id;
-    if (!cid.empty() && cid.back() != '/') {
-        cid += '/';
-    }
+    const std::string& cid = cluster_id_;
     // Use {cid} with braces as hash tag for Redis cluster slot affinity
-    master_view_key_ = "mooncake:{" + cid + "}master_view";
-    master_epoch_key_ = "mooncake:{" + cid + "}master_epoch";
+    master_view_key_ = "mooncake:{" + cid + "}:master_view";
+    master_epoch_key_ = "mooncake:{" + cid + "}:master_epoch";
     leader_event_channel_ = "mooncake:" + cid + "leader_event";
     LOG(INFO) << "RedisElectionHelper created, master_view_key="
               << master_view_key_ << " epoch_key=" << master_epoch_key_

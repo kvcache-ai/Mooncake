@@ -431,7 +431,7 @@ int P2PMaster::RunWithHA() {
 
 #ifdef STORE_USE_REDIS
         std::unique_ptr<RedisOpLogTrimWorker> redis_oplog_trim_worker;
-        if (config_.oplog.auto_trim_enabled) {
+        if (config_.oplog.enable_auto_trim) {
             RedisOpLogTrimWorkerConfig trim_config;
             trim_config.cluster_id = config_.cluster_id;
             trim_config.self_instance_id = master_instance_id;
