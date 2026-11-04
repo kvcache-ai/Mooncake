@@ -10,6 +10,7 @@
 #include "types.h"
 
 #ifdef STORE_USE_REDIS
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/redis_election_helper.h"
 #include "p2p/ha/p2p_master_view.h"
 #include "redis_test_utils.h"
@@ -643,6 +644,9 @@ TEST_F(RedisElectionHelperTest, ParseLeaderValueMissingFields) {
 // Covers: redis_election_helper.cpp:477-479, 484
 
 TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
+    auto& ha_status = HAStatusManager::instance();
+    ha_status.Reset();
+    ha_status.Configure(true, FLAGS_cluster_id, "test-primary");
     const int short_ttl = 2;
     RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
                                FLAGS_redis_password, 0, short_ttl, 1,
@@ -677,6 +681,9 @@ TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
                        .count();
     // Should exit promptly (within heartbeat interval + margin), not hang
     EXPECT_LT(elapsed, (short_ttl + 5) * 1000);
+    EXPECT_NE(ha_status.SerializeDoctorJson().find("LEADERSHIP_LOST"),
+              std::string::npos);
+    ha_status.Reset();
 }
 
 // === Test 17: WatchLeader polling fallback ===

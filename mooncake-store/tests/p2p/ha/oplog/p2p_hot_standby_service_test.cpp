@@ -16,6 +16,7 @@
 #include <xxhash.h>
 #include <ylt/util/utils.hpp>
 
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/localfs_oplog_store.h"
 #include "mock_oplog_store.h"
 #include "p2p/master/p2p_master_service.h"
@@ -839,13 +840,17 @@ TEST_F(P2PHotStandbyServiceTest, StopBeforeRecoveryAcquiresMetadataLock) {
 }
 
 TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
+    auto& ha_status = HAStatusManager::instance();
+    ha_status.Reset();
+    ha_status.Configure(true, kClusterId, "test-standby");
     std::mutex states_mutex;
     std::vector<std::shared_ptr<ControlledNotifierState>> states;
     std::atomic<int> factory_calls{0};
+    std::atomic<bool> allow_reconnect{false};
     auto factory = [&]() -> std::unique_ptr<OpLogStore> {
         const int call = ++factory_calls;
         auto state = std::make_shared<ControlledNotifierState>();
-        if (call == 2) {
+        if (call > 1 && !allow_reconnect.load()) {
             state->healthy_on_start = false;
         }
         {
@@ -868,6 +873,17 @@ TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
     }
     InjectNotifierErrors(first_state, ErrorCode::INTERNAL_ERROR);
 
+    const auto failure_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < failure_deadline &&
+           ha_status.SerializeDoctorJson().find("OPLOG_RECONNECT_FAILED") ==
+               std::string::npos) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_NE(ha_status.SerializeDoctorJson().find("OPLOG_RECONNECT_FAILED"),
+              std::string::npos);
+    allow_reconnect.store(true);
+
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -876,7 +892,9 @@ TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
             std::lock_guard<std::mutex> lock(states_mutex);
             state_count = states.size();
         }
-        if (state_count >= 2 && standby.GetState() == StandbyState::WATCHING) {
+        if (state_count >= 2 && standby.GetState() == StandbyState::WATCHING &&
+            ha_status.SerializeDoctorJson().find("OPLOG_RECONNECT_FAILED") ==
+                std::string::npos) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -894,7 +912,10 @@ TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
         EXPECT_TRUE(second_state->healthy);
     }
     EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    EXPECT_EQ(ha_status.SerializeDoctorJson().find("OPLOG_RECONNECT_FAILED"),
+              std::string::npos);
     standby.Stop();
+    ha_status.Reset();
 }
 
 TEST_F(P2PHotStandbyServiceTest, CoalescesRepeatedWatchErrors) {

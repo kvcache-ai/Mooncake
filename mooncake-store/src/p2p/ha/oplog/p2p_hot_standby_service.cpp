@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 
 namespace mooncake {
 
@@ -154,8 +155,14 @@ ErrorCode P2PHotStandbyService::Start(
                 bootstrap_err = ErrorCode::OPLOG_TRIMMED;
             }
             if (bootstrap_err == ErrorCode::OK || !bootstrap_required) {
+                HAStatusManager::instance().SetDoctorIssue(
+                    "SNAPSHOT_RECOVERY_FAILED");
                 break;
             }
+            HAStatusManager::instance().SetDoctorIssue(
+                "SNAPSHOT_RECOVERY_FAILED",
+                "Required snapshot bootstrap failed: " +
+                    std::string(toString(bootstrap_err)));
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         } while (std::chrono::steady_clock::now() < deadline);
         if (bootstrap_err != ErrorCode::OK) {
@@ -984,6 +991,10 @@ void P2PHotStandbyService::RecoveryLoop() {
                 return;
             }
             if (err == ErrorCode::OK) {
+                HAStatusManager::instance().SetDoctorIssue(
+                    "SNAPSHOT_RECOVERY_FAILED");
+                HAStatusManager::instance().SetDoctorIssue(
+                    "OPLOG_RECONNECT_FAILED");
                 if (!attempted_snapshot_resync) {
                     HAMetricManager::instance().inc_oplog_reader_reconnects();
                     LOG(INFO)
@@ -993,6 +1004,10 @@ void P2PHotStandbyService::RecoveryLoop() {
                 break;
             }
 
+            HAStatusManager::instance().SetDoctorIssue(
+                attempted_snapshot_resync ? "SNAPSHOT_RECOVERY_FAILED"
+                                          : "OPLOG_RECONNECT_FAILED",
+                "Recovery failed, retrying: " + std::string(toString(err)));
             if (!attempted_snapshot_resync) {
                 HAMetricManager::instance()
                     .inc_oplog_reader_reconnect_failures();

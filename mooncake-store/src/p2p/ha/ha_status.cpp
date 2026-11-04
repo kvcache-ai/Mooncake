@@ -54,6 +54,7 @@ HAStatusManager::HAStatusManager() { TouchLocked(); }
 void HAStatusManager::Reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     status_ = HAStatusSnapshot{};
+    doctor_issues_.clear();
     TouchLocked();
 }
 
@@ -174,6 +175,7 @@ void HAStatusManager::RecordRegistryHeartbeat(ErrorCode result,
     bool recovered = false;
     std::lock_guard<std::mutex> lock(mutex_);
     if (result == ErrorCode::OK) {
+        doctor_issues_.erase("REGISTRY_HEARTBEAT_FAILED");
         recovered = !status_.registry_heartbeat_ok &&
                     status_.registry_heartbeat_last_failure_ms > 0;
         status_.registry_heartbeat_ok = true;
@@ -183,6 +185,7 @@ void HAStatusManager::RecordRegistryHeartbeat(ErrorCode result,
         }
         status_.registry_heartbeat_last_error.clear();
     } else {
+        doctor_issues_["REGISTRY_HEARTBEAT_FAILED"] = error;
         status_.registry_heartbeat_ok = false;
         status_.registry_heartbeat_last_failure_ms = NowMs();
         status_.registry_heartbeat_last_error = std::move(error);
@@ -204,6 +207,51 @@ HAStatusSnapshot HAStatusManager::Snapshot() const {
 std::string HAStatusManager::SerializeJson() const {
     std::string json;
     struct_json::to_json(Snapshot(), json);
+    return json;
+}
+
+void HAStatusManager::SetDoctorIssue(std::string code, std::string message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (message.empty()) {
+        doctor_issues_.erase(code);
+    } else {
+        doctor_issues_[std::move(code)] = std::move(message);
+    }
+}
+
+void HAStatusManager::ClearDoctorIssues() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    doctor_issues_.clear();
+}
+
+std::string HAStatusManager::SerializeDoctorJson() const {
+    HADoctorReport report;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status_.ha_enabled) {
+            for (const auto& [code, message] : doctor_issues_) {
+                report.issues.push_back({code, message});
+            }
+            if (status_.state == "FAILED") {
+                report.issues.push_back(
+                    {"HA_FAILED", status_.last_error.empty()
+                                      ? "HA failed, role=" + status_.role
+                                      : status_.last_error});
+            }
+            if (!report.issues.empty()) {
+                report.status = "degraded";
+            } else if ((status_.role == "primary" &&
+                        status_.state == "RUNNING") ||
+                       (status_.role == "standby" &&
+                        status_.state == "WATCHING")) {
+                // Sequence gaps, lag, and historical last_error are not
+                // evidence of a current failure. Transitions stay unknown.
+                report.status = "ok";
+            }
+        }
+    }
+    std::string json;
+    struct_json::to_json(report, json);
     return json;
 }
 

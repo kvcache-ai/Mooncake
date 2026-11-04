@@ -84,6 +84,21 @@ std::string BuildSnapshotEndpoint(const std::string& master_endpoint,
     return host + ":" + std::to_string(snapshot_port);
 }
 
+void UpdateHAStatusFromStandby(P2PHotStandbyService& standby) {
+    const auto status = standby.GetSyncStatus();
+    auto& ha_status = HAStatusManager::instance();
+    ha_status.SetRoleState("standby", StandbyStateToString(status.state));
+    ha_status.SetOpLogProgress(status.applied_seq_id, status.primary_seq_id);
+    ha_status.SetSnapshotReady(standby.IsReadyForSnapshot());
+    ha_status.SetDoctorIssue(
+        "OPLOG_APPLY_FAILED",
+        status.apply_healthy
+            ? ""
+            : "seq=" + std::to_string(status.failed_sequence_id) +
+                  ", op=" + std::to_string(status.failed_op_type) + ": " +
+                  status.failure_reason);
+}
+
 class ScopedStandbyRegistryProviders final {
    public:
     ScopedStandbyRegistryProviders(
@@ -91,7 +106,10 @@ class ScopedStandbyRegistryProviders final {
         P2PHotStandbyService& standby)
         : registry_heartbeat_(&registry_heartbeat) {
         registry_heartbeat_->SetStandbyProviders(
-            [&standby] { return standby.GetLatestAppliedSequenceId(); },
+            [&standby] {
+                UpdateHAStatusFromStandby(standby);
+                return standby.GetLatestAppliedSequenceId();
+            },
             [&standby] { return standby.IsReadyForSnapshot(); });
     }
 
@@ -202,6 +220,7 @@ int P2PMaster::RunWithHA() {
         config_.rpc.address + ":" + std::to_string(config_.rpc.port);
     std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
     while (true) {
+        HAStatusManager::instance().ClearDoctorIssues();
         auto server = CreateRpcServer(config_);
         std::unique_ptr<P2PMasterView> master_view;
         ErrorCode connect_result = ErrorCode::INVALID_PARAMS;
@@ -321,11 +340,7 @@ int P2PMaster::RunWithHA() {
                 standby_registry_providers =
                     std::make_unique<ScopedStandbyRegistryProviders>(
                         *master_registry_heartbeat, *standby);
-                const auto sync_status = standby->GetSyncStatus();
-                HAStatusManager::instance().SetRoleState(
-                    "standby", StandbyStateToString(sync_status.state));
-                HAStatusManager::instance().SetOpLogProgress(
-                    sync_status.applied_seq_id, sync_status.primary_seq_id);
+                UpdateHAStatusFromStandby(*standby);
                 master_registry_heartbeat->UpdateRole(
                     "standby", standby->IsReadyForSnapshot());
             }

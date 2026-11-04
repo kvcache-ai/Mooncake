@@ -2,7 +2,7 @@
  * @file p2p_master_http_endpoints_test.cpp
  * @brief Integration tests for the P2P master HTTP endpoints
  *        (GET /health, GET /get_key_count, GET /get_all_keys,
- *         GET /batch_query_routes, GET /metrics, GET /ha/status).
+ *         GET /batch_query_routes, GET /metrics, GET /ha/status, GET /ha/doctor).
  *
  * Brings up an in-process P2PMasterRpcService with the embedded HTTP
  * server bound to a kernel-assigned port (no RPC server)
@@ -339,6 +339,96 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
                               "ha_status_updated_timestamp_ms")
                   .value_or(0),
               0);
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorReportsCurrentIssuesAndIndependentRecovery) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "127.0.0.1:50051");
+    status.SetRoleState("standby", "WATCHING");
+
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << "body=" << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetDoctorIssue("OPLOG_APPLY_FAILED", "seq=123: invalid payload");
+    status.RecordRegistryHeartbeat(ErrorCode::INTERNAL_ERROR, "Redis timeout");
+    auto report = doctor();
+    EXPECT_EQ(report["status"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 2u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(),
+              "OPLOG_APPLY_FAILED");
+    EXPECT_EQ(report["issues"][0]["message"].asString(),
+              "seq=123: invalid payload");
+
+    // Repeated failures replace the current message without accumulating.
+    status.SetDoctorIssue("OPLOG_APPLY_FAILED", "seq=124: invalid payload");
+    status.RecordRegistryHeartbeat(ErrorCode::OK, "");
+    report = doctor();
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["message"].asString(),
+              "seq=124: invalid payload");
+    status.SetDoctorIssue("OPLOG_APPLY_FAILED");
+    report = doctor();
+    EXPECT_EQ(report["status"].asString(), "ok");
+    EXPECT_TRUE(report["issues"].empty());
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorDoesNotTreatGapsOrHistoryAsFailures) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "127.0.0.1:50051");
+    status.SetLastError("An earlier snapshot attempt failed");
+    status.SetOpLogProgress(10, 1000, 50);
+    for (const auto* state : {"SYNCING", "WATCHING", "PROMOTING"}) {
+        status.SetRoleState("standby", state);
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
+        auto report = ParseJson(response.resp_body, "/ha/doctor");
+        EXPECT_TRUE(report["issues"].empty());
+        EXPECT_EQ(report["status"].asString(),
+                  std::string(state) == "WATCHING" ? "ok" : "unknown");
+    }
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorHandlesLifecycleAndFatalFailure) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << "body=" << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.Reset();
+    EXPECT_EQ(doctor()["status"].asString(), "unknown");
+    status.Configure(false, "test_cluster", "127.0.0.1:50051");
+    EXPECT_EQ(doctor()["status"].asString(), "unknown");
+    status.Configure(true, "test_cluster", "127.0.0.1:50051");
+    status.SetRoleState("promoting", "FAILED");
+    status.SetLastError("Failed to promote: INTERNAL_ERROR");
+    auto report = doctor();
+    EXPECT_EQ(report["status"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "HA_FAILED");
+    EXPECT_EQ(report["issues"][0]["message"].asString(),
+              "Failed to promote: INTERNAL_ERROR");
+    status.SetDoctorIssue("ELECTION_FAILED", "Redis unavailable");
+    status.ClearDoctorIssues();
+    status.ClearLastError();
+    status.SetRoleState("starting", "INITIALIZING");
+    report = doctor();
+    EXPECT_EQ(report["status"].asString(), "unknown");
+    EXPECT_TRUE(report["issues"].empty());
+    status.SetRoleState("primary", "RUNNING");
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,

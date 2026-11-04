@@ -38,6 +38,34 @@ Human-readable metrics summary with key performance indicators.
 curl http://localhost:8080/metrics/summary
 ```
 
+### HA Diagnostics
+
+#### `/ha/doctor`
+
+`GET /ha/doctor` returns a local, read-only diagnosis as JSON on the same HTTP
+port as `/ha/status`. It does not probe Redis or other nodes while handling the
+request.
+
+```json
+{"status":"degraded","issues":[{"code":"OPLOG_WRITE_FAILED","message":"seq=123: Redis command failed"}]}
+```
+
+- `ok`: the primary is running or a standby is watching, and no active issue is
+  recorded.
+- `degraded`: an election/renewal, OpLog write/commit/apply/reconnect, snapshot
+  recovery, registry heartbeat, or fatal HA failure is recorded.
+- `unknown`: HA is disabled, uninitialized, or in a transitional state without a
+  recorded failure. This endpoint is not a readiness or cluster health check.
+
+An empty issue list is `[]`. Each issue contains only a stable `code` and a
+`message`; successful operations clear the corresponding issue, repeated issues
+replace their previous message instead of accumulating, and a new HA round clears
+issues from the preceding round. OpLog holes, sequence lag, catch-up, optional
+snapshot fallback, and historical `last_error` alone are not failures. The
+doctor only reports failures observed by the live process and does not retain
+history across restarts. It returns HTTP 200 even when `status` is `degraded`
+or `unknown`.
+
 ### Data Management Endpoints
 
 #### `/query_key`

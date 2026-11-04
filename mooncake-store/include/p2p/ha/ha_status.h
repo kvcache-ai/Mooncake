@@ -1,14 +1,28 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "p2p/common/p2p_types.h"
 
 namespace mooncake {
+
+struct HADoctorIssue {
+    std::string code;
+    std::string message;
+    YLT_REFL(HADoctorIssue, code, message);
+};
+
+struct HADoctorReport {
+    std::string status{"unknown"};
+    std::vector<HADoctorIssue> issues;
+    YLT_REFL(HADoctorReport, status, issues);
+};
 
 struct HAStatusSnapshot {
     bool ha_enabled{false};
@@ -76,6 +90,11 @@ class HAStatusManager {
 
     HAStatusSnapshot Snapshot() const;
     std::string SerializeJson() const;
+    // An empty message clears the current issue. Callers own recovery and
+    // lifecycle cleanup; existing failure-path logs remain the diagnostics.
+    void SetDoctorIssue(std::string code, std::string message = {});
+    void ClearDoctorIssues();
+    std::string SerializeDoctorJson() const;
 
    private:
     HAStatusManager();
@@ -85,6 +104,7 @@ class HAStatusManager {
 
     mutable std::mutex mutex_;
     HAStatusSnapshot status_;
+    std::map<std::string, std::string> doctor_issues_;
 };
 
 }  // namespace mooncake

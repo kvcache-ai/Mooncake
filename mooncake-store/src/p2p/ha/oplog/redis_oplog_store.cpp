@@ -14,6 +14,7 @@
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/ha/oplog/polling_oplog_change_notifier.h"
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 
 namespace mooncake {
 
@@ -93,6 +94,10 @@ RedisOpLogStore::RedisOpLogStore(
 
 RedisOpLogStore::~RedisOpLogStore() {
     StopWriting();
+    if (enable_write_) {
+        HAStatusManager::instance().SetDoctorIssue("OPLOG_WRITE_FAILED");
+        HAStatusManager::instance().SetDoctorIssue("OPLOG_COMMIT_FAILED");
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (ctx_) {
         redisFree(ctx_);
@@ -455,6 +460,11 @@ bool RedisOpLogStore::FinishOrRetryWrite(
     HAMetricManager::instance().observe_oplog_write_latency_us(
         write_latency_us);
     if (err != ErrorCode::OK) {
+        HAStatusManager::instance().SetDoctorIssue(
+            "OPLOG_WRITE_FAILED",
+            "sequence_id=" +
+                std::to_string(pending->entry.sequence_id) + ": " +
+                std::string(toString(err)));
         HAMetricManager::instance().inc_oplog_write_failures();
         if (err == ErrorCode::INVALID_PARAMS) {
             CompleteWrite(pending, err);
@@ -500,6 +510,7 @@ bool RedisOpLogStore::FinishOrRetryWrite(
         return true;
     }
 
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_WRITE_FAILED");
     CompleteWrite(pending, ErrorCode::OK);
     return false;
 }
@@ -670,10 +681,14 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
         (redisReply*)redisCommand(ctx, "SET %b %b", latest_key_.data(),
                                   latest_key_.size(), seq.data(), seq.size()));
     if (!IsRedisOkStatus(reply.get())) {
+        HAStatusManager::instance().SetDoctorIssue(
+            "OPLOG_COMMIT_FAILED",
+            "target=" + std::to_string(target));
         LOG(ERROR) << "RedisOpLogStore::AdvanceCommittedLatest: SET failed"
                    << ", target=" << target;
         return ErrorCode::INTERNAL_ERROR;
     }
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_COMMIT_FAILED");
 
     for (uint64_t seq_id = committed_sequence_id_ + 1; seq_id <= target;
          ++seq_id) {

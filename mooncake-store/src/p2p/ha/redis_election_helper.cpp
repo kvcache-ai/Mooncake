@@ -250,6 +250,8 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
             connected = (election_ctx_ != nullptr);
         }
         if (!connected) {
+            HAStatusManager::instance().SetDoctorIssue(
+                "ELECTION_FAILED", "Cannot connect to Redis for election");
             WaitForElectionCancellation(std::chrono::seconds(1));
             continue;
         }
@@ -261,10 +263,14 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
             attempt = TryElectOnce(master_address, version, existing_value);
         }
         if (attempt == ElectionAttemptResult::ERROR) {
+            HAStatusManager::instance().SetDoctorIssue(
+                "ELECTION_FAILED", "Redis election attempt failed; retrying");
             WaitForElectionCancellation(std::chrono::seconds(1));
             continue;
         }
+        HAStatusManager::instance().SetDoctorIssue("ELECTION_FAILED");
         if (attempt == ElectionAttemptResult::ELECTED) {
+            HAStatusManager::instance().SetDoctorIssue("LEADERSHIP_LOST");
             {
                 std::lock_guard<std::mutex> lock(election_mutex_);
                 PublishLeaderEvent(master_address, version);
@@ -675,10 +681,14 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
         }
 
         if (!renewed) {
+            HAStatusManager::instance().SetDoctorIssue(
+                "LEADERSHIP_LOST",
+                "Leadership renewal failed or lease ownership changed");
             HAMetricManager::instance().inc_election_leadership_lost();
             break;  // Lost leadership
         }
 
+        HAStatusManager::instance().SetDoctorIssue("LEADERSHIP_LOST");
         WaitForKeepAliveCancellation(
             std::chrono::seconds(heartbeat_interval_sec_));
     }

@@ -77,6 +77,14 @@ void P2PMasterRpcService::init_http_server() {
         });
 
     http_server_.set_http_handler<GET>(
+        "/ha/doctor", [](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            resp.set_status_and_content(
+                status_type::ok,
+                HAStatusManager::instance().SerializeDoctorJson());
+        });
+
+    http_server_.set_http_handler<GET>(
         "/metrics/summary",
         [](coro_http_request& req, coro_http_response& resp) {
             std::string summary =
