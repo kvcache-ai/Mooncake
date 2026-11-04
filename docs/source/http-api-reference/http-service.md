@@ -93,8 +93,9 @@ request.
 - `ok`: the primary is running or a standby is watching, and no active issue is
   recorded.
 - `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect,
-  snapshot recovery, registry heartbeat, master view mismatch, or fatal HA
-  failure is recorded, or pending OpLogs have exceeded the latest stall timeout,
+  snapshot recovery, registry heartbeat, master view mismatch, OpLog trim
+  horizon risk, or fatal HA failure is recorded, or pending OpLogs have exceeded
+  the latest stall timeout,
   or a primary writer queue is near capacity, or a watching standby has stopped
   polling or applying known pending OpLogs beyond the catch-up stall timeout.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
@@ -152,7 +153,25 @@ The timer starts when a valid progress sample first shows backlog, restarts on
 applied progress, and clears on catch-up, leaving `WATCHING`, disabling HA, or
 starting a new HA round. Latest growth does not restart it; a failed latest read
 retains the last successful sample. The message is concise, for example
-`applied=100, latest=200, stalled_ms=12000`.
+`oplog_applied_sequence_id=100, oplog_latest_sequence_id=200,
+stalled_ms=12000`.
+
+`STANDBY_BEHIND_TRIM` means a standby in `WATCHING` has
+`applied_sequence_id < trimmed_sequence_id`. This standby has missed the retained
+OpLog window and cannot catch up from OpLog alone; it needs snapshot
+bootstrap/resync. The message uses `/ha/status`-style field names:
+`oplog_applied_sequence_id`, `oplog_trimmed_sequence_id`,
+`oplog_latest_sequence_id`, `oplog_apply_lag`, and
+`action=snapshot_resync_required`.
+
+`OPLOG_TRIM_RISK` means a standby in `WATCHING` is still at or beyond the trim
+horizon, but its remaining trim headroom is no more than 10% of the retained
+window. This is a local warning derived from cached `/ha/status` watermarks; it
+does not query Redis while serving the request and does not replace ordinary
+`latest > applied` lag monitoring. The message includes
+`oplog_applied_sequence_id`, `oplog_trimmed_sequence_id`,
+`oplog_latest_sequence_id`, `oplog_apply_lag`, `oplog_trim_headroom`,
+`oplog_retained_window`, and `threshold_percent=10`.
 
 `OPLOG_READ_FAILED` persists across reader reconnects until an actual poll
 succeeds (including an empty poll), or the standby stops or is promoted.

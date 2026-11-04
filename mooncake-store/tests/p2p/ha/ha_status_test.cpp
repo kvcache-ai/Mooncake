@@ -276,4 +276,64 @@ TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
     EXPECT_EQ(snapshot.oplog_apply_lag, 2u);
 }
 
+TEST_F(HAStatusTest, DoctorReportsStandbyBehindTrim) {
+    status.SetOpLogProgress(/*applied_sequence_id=*/99,
+                            /*latest_sequence_id=*/150,
+                            /*trimmed_sequence_id=*/100,
+                            /*gc_cursor_sequence_id=*/100);
+    auto report = doctor();
+    EXPECT_EQ(report.status, "degraded");
+    const auto* issue = FindIssue(report, "STANDBY_BEHIND_TRIM");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_NE(issue->message.find("oplog_applied_sequence_id=99"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("oplog_trimmed_sequence_id=100"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("oplog_latest_sequence_id=150"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("oplog_apply_lag=51"), std::string::npos);
+    EXPECT_NE(issue->message.find("action=snapshot_resync_required"),
+              std::string::npos);
+    EXPECT_EQ(FindIssue(report, "OPLOG_TRIM_RISK"), nullptr);
+
+    status.SetRoleState("standby", "SYNCING");
+    EXPECT_EQ(doctor().status, "unknown");
+    status.SetRoleState("primary", "RUNNING");
+    status.SetMasterView("local", 1);
+    EXPECT_EQ(doctor().status, "ok");
+}
+
+TEST_F(HAStatusTest, DoctorReportsOpLogTrimRiskNearHorizon) {
+    status.SetOpLogProgress(/*applied_sequence_id=*/105,
+                            /*latest_sequence_id=*/150,
+                            /*trimmed_sequence_id=*/100,
+                            /*gc_cursor_sequence_id=*/100);
+    auto report = doctor();
+    EXPECT_EQ(report.status, "degraded");
+    const auto* issue = FindIssue(report, "OPLOG_TRIM_RISK");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_NE(issue->message.find("oplog_applied_sequence_id=105"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("oplog_trimmed_sequence_id=100"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("oplog_latest_sequence_id=150"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("oplog_apply_lag=45"), std::string::npos);
+    EXPECT_NE(issue->message.find("oplog_trim_headroom=5"), std::string::npos);
+    EXPECT_NE(issue->message.find("oplog_retained_window=50"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("threshold_percent=10"), std::string::npos);
+
+    status.SetOpLogProgress(/*applied_sequence_id=*/106,
+                            /*latest_sequence_id=*/150,
+                            /*trimmed_sequence_id=*/100,
+                            /*gc_cursor_sequence_id=*/100);
+    EXPECT_EQ(doctor().status, "ok");
+    status.SetOpLogProgress(/*applied_sequence_id=*/100,
+                            /*latest_sequence_id=*/100,
+                            /*trimmed_sequence_id=*/100,
+                            /*gc_cursor_sequence_id=*/100);
+    EXPECT_EQ(doctor().status, "ok");
+}
+
 }  // namespace mooncake

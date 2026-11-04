@@ -408,7 +408,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     status.Reset();
     status.Configure(true, "test_cluster", "127.0.0.1:50051");
     status.SetLastError("An earlier snapshot attempt failed");
-    status.SetOpLogProgress(10, 1000, 50);
+    status.SetOpLogProgress(200, 1000, 50);
     for (const auto* state : {"SYNCING", "WATCHING", "PROMOTING"}) {
         status.SetRoleState("standby", state);
         auto response = HttpGet(http_base_url_ + "/ha/doctor");
@@ -554,7 +554,8 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorDetectsCatchupStallAndRecovery) {
     ASSERT_EQ(report["issues"].size(), 1u);
     EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_CATCHUP_STALLED");
     EXPECT_NE(report["issues"][0]["message"].asString().find(
-                  "applied=100, latest=300, stalled_ms="),
+                  "oplog_applied_sequence_id=100, "
+                  "oplog_latest_sequence_id=300, stalled_ms="),
               std::string::npos);
     EXPECT_NE(report["status"].asString(), "ok");
 

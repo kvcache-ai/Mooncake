@@ -144,6 +144,8 @@ class HAStatusManager {
     void ObserveLeaderLocked(const std::string& address, uint64_t epoch);
     std::string ElectionUnstableMessageLocked() const;
     std::string MasterViewMismatchMessageLocked() const;
+    std::string StandbyBehindTrimMessageLocked() const;
+    std::string OpLogTrimRiskMessageLocked() const;
     std::string OpLogLatestStallMessageLocked() const;
     std::string OpLogCatchUpStallMessageLocked() const;
     std::string OpLogQueuePressureMessageLocked() const;

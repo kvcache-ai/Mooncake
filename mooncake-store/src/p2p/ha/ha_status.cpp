@@ -16,6 +16,11 @@ namespace {
 constexpr auto kElectionWindow = std::chrono::seconds(300);
 constexpr int kElectionChangeThreshold = 3;
 constexpr size_t kOpLogQueuePressurePercent = 80;
+constexpr uint64_t kOpLogTrimRiskThresholdPercent = 10;
+
+uint64_t CeilPercent(uint64_t value, uint64_t percent) {
+    return value / 100 * percent + ((value % 100) * percent + 99) / 100;
+}
 
 int64_t RoleMetricValue(const HAStatusSnapshot& status) {
     if (status.role == "failed" || status.state == "FAILED") {
@@ -227,6 +232,51 @@ std::string HAStatusManager::MasterViewMismatchMessageLocked() const {
            ", view_epoch=" + std::to_string(status_.master_view_epoch);
 }
 
+std::string HAStatusManager::StandbyBehindTrimMessageLocked() const {
+    if (!status_.ha_enabled || status_.role != "standby" ||
+        status_.state != "WATCHING" || status_.trimmed_sequence_id == 0 ||
+        status_.applied_sequence_id >= status_.trimmed_sequence_id) {
+        return {};
+    }
+    return "oplog_applied_sequence_id=" +
+           std::to_string(status_.applied_sequence_id) +
+           ", oplog_trimmed_sequence_id=" +
+           std::to_string(status_.trimmed_sequence_id) +
+           ", oplog_latest_sequence_id=" +
+           std::to_string(status_.latest_sequence_id) +
+           ", oplog_apply_lag=" + std::to_string(status_.oplog_lag) +
+           ", action=snapshot_resync_required";
+}
+
+std::string HAStatusManager::OpLogTrimRiskMessageLocked() const {
+    if (!status_.ha_enabled || status_.role != "standby" ||
+        status_.state != "WATCHING" || status_.trimmed_sequence_id == 0 ||
+        status_.applied_sequence_id < status_.trimmed_sequence_id ||
+        status_.latest_sequence_id <= status_.trimmed_sequence_id) {
+        return {};
+    }
+    const uint64_t trim_headroom =
+        status_.applied_sequence_id - status_.trimmed_sequence_id;
+    const uint64_t retained_window =
+        status_.latest_sequence_id - status_.trimmed_sequence_id;
+    const uint64_t threshold =
+        CeilPercent(retained_window, kOpLogTrimRiskThresholdPercent);
+    if (trim_headroom > threshold) {
+        return {};
+    }
+    return "oplog_applied_sequence_id=" +
+           std::to_string(status_.applied_sequence_id) +
+           ", oplog_trimmed_sequence_id=" +
+           std::to_string(status_.trimmed_sequence_id) +
+           ", oplog_latest_sequence_id=" +
+           std::to_string(status_.latest_sequence_id) +
+           ", oplog_apply_lag=" + std::to_string(status_.oplog_lag) +
+           ", oplog_trim_headroom=" + std::to_string(trim_headroom) +
+           ", oplog_retained_window=" + std::to_string(retained_window) +
+           ", threshold_percent=" +
+           std::to_string(kOpLogTrimRiskThresholdPercent);
+}
+
 void HAStatusManager::SetSnapshotReady(bool snapshot_ready) {
     std::lock_guard<std::mutex> lock(mutex_);
     status_.snapshot_ready = snapshot_ready;
@@ -415,9 +465,10 @@ std::string HAStatusManager::OpLogCatchUpStallMessageLocked() const {
     if (elapsed < std::chrono::seconds(oplog_catchup_stall_timeout_sec_)) {
         return {};
     }
-    return "applied=" + std::to_string(status_.applied_sequence_id) +
-           ", latest=" + std::to_string(status_.latest_sequence_id) +
-           ", stalled_ms=" +
+    return "oplog_applied_sequence_id=" +
+           std::to_string(status_.applied_sequence_id) +
+           ", oplog_latest_sequence_id=" +
+           std::to_string(status_.latest_sequence_id) + ", stalled_ms=" +
            std::to_string(
                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
                    .count());
@@ -473,6 +524,13 @@ std::string HAStatusManager::SerializeDoctorJson() const {
                 !issue.empty()) {
                 report.issues.push_back(
                     {"MASTER_VIEW_MISMATCH", std::move(issue)});
+            }
+            if (auto issue = StandbyBehindTrimMessageLocked(); !issue.empty()) {
+                report.issues.push_back(
+                    {"STANDBY_BEHIND_TRIM", std::move(issue)});
+            } else if (auto issue = OpLogTrimRiskMessageLocked();
+                       !issue.empty()) {
+                report.issues.push_back({"OPLOG_TRIM_RISK", std::move(issue)});
             }
             for (const auto& [code, message] : doctor_issues_) {
                 report.issues.push_back({code, message});
