@@ -228,7 +228,8 @@ class TransferEnginePy {
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, TransferOpcode opcode,
         const std::string &transport_hint = "",
-        const std::string &nic_hint = "");
+        const std::string &nic_hint = "",
+        bool enable_completion_notification = false);
 
     int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 

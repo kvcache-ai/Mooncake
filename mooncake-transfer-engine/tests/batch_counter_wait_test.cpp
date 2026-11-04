@@ -176,6 +176,9 @@ class BatchCounterWait : public ::testing::Test {
         }
         return multi.submitTransfer(b, requests);
     }
+    Status enable(Transport::BatchID b) {
+        return multi.enableBatchCompletionNotification(b);
+    }
     Transport::TransferStatus query(Transport::BatchID b) {
         Transport::TransferStatus s{};
         EXPECT_TRUE(multi.getBatchTransferStatus(b, s).ok());
@@ -348,9 +351,9 @@ bool fdReadable(int fd) {
 }
 #endif
 
-// The wake is published from markSuccess. These tests do not call
-// getBatchTransferStatus until after drain, except where the assertion is
-// that a drained id is still queryable.
+// The wake is published from markSuccess after enableBatchCompletionNotification.
+// These tests do not call getBatchTransferStatus until after drain, except
+// where the assertion is that a drained id is still queryable.
 TEST_F(BatchCounterWait, CompletionFdWakesWithoutStatusPoll) {
 #ifndef __linux__
     EXPECT_EQ(multi.completionFd(), -1);
@@ -359,6 +362,7 @@ TEST_F(BatchCounterWait, CompletionFdWakesWithoutStatusPoll) {
 #else
     ASSERT_GE(multi.completionFd(), 0);
     auto b = batch(2);
+    ASSERT_TRUE(enable(b).ok());
     ASSERT_TRUE(submit(b, {1, 1}).ok());
     rdma->finish(0);
     rdma->finish(1);
@@ -378,6 +382,27 @@ TEST_F(BatchCounterWait, CompletionFdWakesWithoutStatusPoll) {
     EXPECT_EQ(::poll(&pfd, 1, 0), 0);
     EXPECT_EQ(query(b).s, Transport::COMPLETED);
     EXPECT_EQ(query(b).transferred_bytes, 34u);
+    // Release without a status loop: drain already observed the record.
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
+#endif
+}
+
+TEST_F(BatchCounterWait, WithoutOptInCounterBatchDoesNotWakeFd) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(0);
+    EXPECT_EQ(query(b).s, Transport::COMPLETED);
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    EXPECT_TRUE(done.empty());
 #endif
 }
 
@@ -387,6 +412,8 @@ TEST_F(BatchCounterWait, OneDrainReturnsEveryReadyBatch) {
 #else
     auto first = batch(1);
     auto second = batch(1);
+    ASSERT_TRUE(enable(first).ok());
+    ASSERT_TRUE(enable(second).ok());
     ASSERT_TRUE(submit(first, {1}).ok());
     ASSERT_TRUE(submit(second, {1}).ok());
     rdma->finish(0);
@@ -413,6 +440,7 @@ TEST_F(BatchCounterWait, FreeBeforeDrainDropsTheQueuedId) {
     GTEST_SKIP();
 #else
     auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
     ASSERT_TRUE(submit(b, {1}).ok());
     rdma->finish(0);
     ASSERT_TRUE(fdReadable(multi.completionFd()));
@@ -429,6 +457,7 @@ TEST_F(BatchCounterWait, FailedSliceWakesWithFailedStatus) {
     GTEST_SKIP();
 #else
     auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
     ASSERT_TRUE(submit(b, {1}).ok());
     rdma->finish(0, true);
     std::vector<BatchCompletion> done;
@@ -445,6 +474,7 @@ TEST_F(BatchCounterWait, ShortSubmitWakesWhenSubmittedTasksFinish) {
 #else
     // Capacity 4, submit 1: wake on the submitted count, not capacity.
     auto b = batch(4);
+    ASSERT_TRUE(enable(b).ok());
     ASSERT_TRUE(submit(b, {1}).ok());
     rdma->finish(0);
     ASSERT_TRUE(fdReadable(multi.completionFd()));
@@ -457,49 +487,49 @@ TEST_F(BatchCounterWait, ShortSubmitWakesWhenSubmittedTasksFinish) {
 #endif
 }
 
-TEST_F(BatchCounterWait, SecondSubmitStartsNewTerminalWave) {
+TEST_F(BatchCounterWait, SecondSubmitRejectedWhenEventEnabled) {
 #ifndef __linux__
     GTEST_SKIP();
 #else
     auto b = batch(4);
+    ASSERT_TRUE(enable(b).ok());
     ASSERT_TRUE(submit(b, {1}).ok());
     rdma->finish(0);
     std::vector<BatchCompletion> done;
     ASSERT_TRUE(multi.drainCompletions(done).ok());
     ASSERT_EQ(done.size(), 1u);
-    EXPECT_EQ(done[0].status.transferred_bytes, 17u);
-    done.clear();
-    ASSERT_TRUE(submit(b, {1}).ok());
+    auto second = submit(b, {1});
+    EXPECT_TRUE(second.IsInvalidArgument());
+    // Legacy (non-opted-in) append remains accepted.
+    auto legacy = batch(4);
+    ASSERT_TRUE(submit(legacy, {1}).ok());
+    rdma->finish(1);
+    ASSERT_TRUE(submit(legacy, {1}).ok());
+#endif
+}
+
+TEST_F(BatchCounterWait, OptInOnPollDrivenTransportFailsAtSubmit) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    auto status = submit(b, {2});  // tcp probe: not counter-capable
+    EXPECT_TRUE(status.IsNotSupportedTransport());
     pollfd pfd{};
     pfd.fd = multi.completionFd();
     pfd.events = POLLIN;
     EXPECT_EQ(::poll(&pfd, 1, 0), 0);
-    rdma->finish(1);
-    ASSERT_TRUE(fdReadable(multi.completionFd()));
-    ASSERT_TRUE(multi.drainCompletions(done).ok());
-    ASSERT_EQ(done.size(), 1u);
-    EXPECT_EQ(done[0].batch_id, b);
-    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
-    EXPECT_EQ(done[0].status.transferred_bytes, 34u);
 #endif
 }
 
-TEST_F(BatchCounterWait, AppendBeforeDrainReplacesStaleTerminal) {
+TEST_F(BatchCounterWait, EnableRejectedWhenSliceTimeoutRequiresPolling) {
 #ifndef __linux__
     GTEST_SKIP();
 #else
-    auto b = batch(4);
-    ASSERT_TRUE(submit(b, {1}).ok());
-    rdma->finish(0);
-    ASSERT_TRUE(fdReadable(multi.completionFd()));
-    ASSERT_TRUE(submit(b, {1}).ok());
-    rdma->finish(1);
-    std::vector<BatchCompletion> done;
-    ASSERT_TRUE(multi.drainCompletions(done).ok());
-    ASSERT_EQ(done.size(), 1u);
-    EXPECT_EQ(done[0].batch_id, b);
-    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
-    EXPECT_EQ(done[0].status.transferred_bytes, 34u);
+    globalConfig().slice_timeout = 1;
+    auto b = batch(1);
+    EXPECT_TRUE(enable(b).IsNotSupportedTransport());
 #endif
 }
 
@@ -509,6 +539,7 @@ TEST_F(BatchCounterWait, PartialSliceFailureDoesNotWakeUntilTaskDone) {
 #else
     rdma->slices_per_task = 2;
     auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
     ASSERT_TRUE(submit(b, {1}).ok());
     rdma->finishSlice(0, 0, true);
     pollfd pfd{};
@@ -542,7 +573,9 @@ TEST_F(BatchCounterWait, NonCounterTransportDoesNotWakeFd) {
 #endif
 }
 
-TEST_F(BatchCounterWait, DrainKeepsCanceledAndTimeout) {
+// Drain preserves whatever snapshot was queued. v1's engine does not
+// generate TIMEOUT or CANCELED onto the fd; this only checks record fidelity.
+TEST_F(BatchCounterWait, DrainPreservesInjectedCanceledAndTimeout) {
     auto canceled = batch(1);
     auto timed_out = batch(1);
     Transport::TransferStatus canceled_status{};
