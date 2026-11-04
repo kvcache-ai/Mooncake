@@ -578,6 +578,17 @@ add_test(NAME coro_handshake_test COMMAND coro_handshake_test)
 add_executable(handshake_perf ${WORKSPACE}/handshake_perf.cpp)
 target_link_libraries(handshake_perf PUBLIC transfer_engine)
 
+# Connection-lifecycle tests for the redis metadata storage plugin. Uses an
+# in-process RESP fake, so no redis server is required.
+if(USE_REDIS)
+  add_executable(transfer_metadata_redis_plugin_test
+                 ${WORKSPACE}/transfer_metadata_redis_plugin_test.cpp)
+  target_link_libraries(transfer_metadata_redis_plugin_test
+                        PUBLIC transfer_engine gtest glog::glog)
+  add_test(NAME transfer_metadata_redis_plugin_test
+           COMMAND transfer_metadata_redis_plugin_test)
+endif()
+
 add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
