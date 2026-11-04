@@ -588,37 +588,51 @@ RedisOpLogStore::PersistEntriesNoLatest(
     return results;
 }
 
+uint64_t RedisOpLogStore::MaxKnownSequenceUnlocked() const {
+    uint64_t max_known_sequence = committed_sequence_id_;
+    if (!persisted_sequences_.empty() &&
+        *persisted_sequences_.rbegin() > max_known_sequence) {
+        max_known_sequence = *persisted_sequences_.rbegin();
+    }
+    if (!dropped_sequences_.empty() &&
+        *dropped_sequences_.rbegin() > max_known_sequence) {
+        max_known_sequence = *dropped_sequences_.rbegin();
+    }
+    return max_known_sequence;
+}
+
 bool RedisOpLogStore::HasCommittableLatestUnlocked() const {
     uint64_t scan = committed_sequence_id_;
-    for (;;) {
+    const uint64_t max_known_sequence = MaxKnownSequenceUnlocked();
+    while (scan < max_known_sequence) {
         const uint64_t next = scan + 1;
         if (persisted_sequences_.count(next) != 0) {
             return true;
         }
-        if (dropped_sequences_.count(next) != 0) {
-            ++scan;
-            continue;
+        if (dropped_sequences_.count(next) == 0) {
+            return false;
         }
-        return false;
+        scan = next;
     }
+    return false;
 }
 
 ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
     if (!async_running_.load()) return ErrorCode::INTERNAL_ERROR;
     uint64_t scan = committed_sequence_id_;
     uint64_t target = committed_sequence_id_;
-    for (;;) {
+    const uint64_t max_known_sequence = MaxKnownSequenceUnlocked();
+    while (scan < max_known_sequence) {
         const uint64_t next = scan + 1;
         if (persisted_sequences_.count(next) != 0) {
             scan = next;
             target = next;
             continue;
         }
-        if (dropped_sequences_.count(next) != 0) {
-            scan = next;
-            continue;
+        if (dropped_sequences_.count(next) == 0) {
+            break;
         }
-        break;
+        scan = next;
     }
     if (target == committed_sequence_id_) {
         return ErrorCode::OK;

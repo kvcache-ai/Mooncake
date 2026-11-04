@@ -102,6 +102,7 @@ class RedisOpLogStore : public OpLogStore {
     std::vector<WriteResult> PersistEntriesNoLatest(
         redisContext* ctx,
         const std::vector<std::shared_ptr<PendingWrite>>& batch);
+    uint64_t MaxKnownSequenceUnlocked() const;
     bool HasCommittableLatestUnlocked() const;
     ErrorCode AdvanceCommittedLatestUnlocked(redisContext* ctx);
     void CompleteWrite(const std::shared_ptr<PendingWrite>& pending,
