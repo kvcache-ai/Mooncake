@@ -27,12 +27,13 @@ on:
         type: string
         default: ''
       use-tent:
-        # Build the TENT runtime into the wheel. Runtime behavior is unchanged
-        # unless a process opts in via MC_USE_TENT=1 (classic engine is the
-        # default facade path), so callers can enable this purely to ship the
-        # capability. Currently opted in by the PR CI cuda13 build and the
-        # nightly cuda13 x86 wheel that feed T-One; release callers stay
-        # false until TENT is validated on arm64.
+        # Build the TENT runtime into the wheel. Behavior is unchanged unless a
+        # process opts in via MC_USE_TENT=1.
+        type: boolean
+        default: false
+      tent-metrics:
+        # Compile the TENT metrics instrumentation in; off by default, like
+        # TENT_METRICS_ENABLED itself.
         type: boolean
         default: false
 
@@ -123,7 +124,10 @@ jobs:
           # TENT runtime (off unless activated via MC_USE_TENT=1 at runtime).
           # liburing is provided by dependencies.sh / mooncake_provide_liburing().
           if [ "${{ inputs.use-tent }}" = "true" ]; then
-            cmake_args="$cmake_args -DUSE_TENT=ON -DTENT_METRICS_ENABLED=ON"
+            cmake_args="$cmake_args -DUSE_TENT=ON"
+            if [ "${{ inputs.tent-metrics }}" = "true" ]; then
+              cmake_args="$cmake_args -DTENT_METRICS_ENABLED=ON"
+            fi
           fi
 
           {
@@ -237,6 +241,7 @@ jobs:
             ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
+          USE_TENT: ${{ inputs.use-tent }}
 
       - name: Smoke test repaired wheel
         shell: bash
@@ -307,6 +312,25 @@ jobs:
           fi
           "$smoke_venv/bin/python" -c \
             'from mooncake import engine; assert engine.SUPPORT_EFA, "EFA support missing"'
+
+          if [ "${{ inputs.use-tent }}" = "true" ]; then
+            # Resolve TENT from the wheel, not the build install under /usr/local/lib.
+            test -f "$site_packages/mooncake/libtent_metrics.so"
+            tent_ld_path=$("$smoke_venv/bin/python" -c \
+              'import os; print(":".join(p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p and p != "/usr/local/lib"))')
+            LD_LIBRARY_PATH="$tent_ld_path" "$smoke_venv/bin/python" -c \
+              'import tent; assert tent.TransferEngine, "TENT bindings missing"'
+            # A second libtent_metrics copy would split the process-wide singleton.
+            for elf in "$site_packages"/mooncake/*.so; do
+              [ -e "$elf" ] || continue
+              resolved=$( { LD_LIBRARY_PATH="$tent_ld_path" ldd "$elf" 2>/dev/null || true; } |
+                awk '/libtent_metrics/ {print $3}')
+              if [ -n "$resolved" ] && [ "$resolved" != "$site_packages/mooncake/libtent_metrics.so" ]; then
+                echo "::error::$elf resolves libtent_metrics.so to '${resolved}', not the wheel copy"
+                exit 1
+              fi
+            done
+          fi
 
           bash scripts/ci/check_wheel_typing.sh "$smoke_venv/bin/python"
 

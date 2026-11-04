@@ -23,6 +23,7 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
+rm -rf mooncake-wheel/tent
 rm -f mooncake-wheel/mooncake/*.so
 
 if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
@@ -104,12 +105,35 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
 fi
 
-# Copy TENT artifacts for the memfabric wheel.
-if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
+# Copy the TENT runtime and its Python extension for builds that enabled
+# USE_TENT; the wheel installs the extension as mooncake.tent.
+TENT_PYTHON_SOS=$(compgen -G "${BUILD_DIR}/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so" || true)
+if [ -z "${TENT_PYTHON_SOS}" ] && [ "${USE_TENT:-false}" = "true" ]; then
+    echo "Error: USE_TENT is enabled but the build produced no TENT Python extension; initialize the pybind11 submodule and rebuild"
+    exit 1
+fi
+if [ -n "${TENT_PYTHON_SOS}" ]; then
+    if [ "$(printf '%s\n' "${TENT_PYTHON_SOS}" | wc -l)" -ne 1 ]; then
+        echo "Error: expected one TENT Python extension, found:"
+        echo "${TENT_PYTHON_SOS}"
+        exit 1
+    fi
+    TENT_METRICS_SO="${BUILD_DIR}/mooncake-transfer-engine/tent/src/metrics/libtent_metrics.so"
+    if [ ! -f "${TENT_METRICS_SO}" ]; then
+        echo "Error: TENT built its Python extension without libtent_metrics.so"
+        exit 1
+    fi
     echo "Copying TENT libraries and Python extension..."
+    cp "${TENT_METRICS_SO}" mooncake-wheel/mooncake/
+    cp "${TENT_PYTHON_SOS}" mooncake-wheel/mooncake/
+    mkdir -p mooncake-wheel/tent
+    cp python/tent_wheel/__init__.py mooncake-wheel/tent/__init__.py
+    TENT_BUILD=1
+fi
+
+# The memfabric variant also ships the TENT C API shared library.
+if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
     cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so" mooncake-wheel/mooncake/
-    cp "${BUILD_DIR}/mooncake-transfer-engine/tent/src/metrics/libtent_metrics.so" mooncake-wheel/mooncake/
-    cp "${BUILD_DIR}"/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so mooncake-wheel/mooncake/
 fi
 
 # Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
@@ -302,6 +326,7 @@ WHEEL_DIR="$(pwd)"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
+    rm -rf "${WHEEL_DIR}/tent"
     cleanup_migrated_python_staging
 }
 trap cleanup_wheel_metadata_state EXIT
@@ -476,12 +501,14 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 # Prioritize the package directory for sibling-library lookup while preserving
-# build-time dependency paths needed by auditwheel.
-if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
-    echo "Prioritizing package-local RPATH for memfabric ELF files..."
+# build-time dependency paths needed by auditwheel; TENT wheels rely on $ORIGIN
+# to find libtent_metrics.so instead of a bundled second copy.
+if [ "${MEMFABRIC_BUILD:-0}" = "1" ] || [ "${TENT_BUILD:-0}" = "1" ]; then
+    echo "Prioritizing package-local RPATH for staged ELF files..."
+    package_origin_rpath='$ORIGIN'
     while IFS= read -r -d '' elf_file; do
         existing_rpath=$(patchelf --print-rpath "$elf_file")
-        patchelf --set-rpath "\$ORIGIN${existing_rpath:+:$existing_rpath}" "$elf_file"
+        patchelf --set-rpath "${package_origin_rpath}${existing_rpath:+:$existing_rpath}" "$elf_file"
     done < <(find "$WHEEL_PACKAGE_DIR" -type f \
         -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0)
 fi

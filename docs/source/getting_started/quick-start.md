@@ -28,6 +28,9 @@ The same package provides:
 - Mooncake Store Python bindings for vLLM and SGLang HiCache integrations.
 - Transfer Engine Python bindings and runtime components for direct
   `mooncake.engine.TransferEngine` usage.
+- The TENT runtime and its Python bindings. `import tent` uses the native TENT
+  API directly; setting `MC_USE_TENT=1` runs `mooncake.engine.TransferEngine`
+  on TENT without changing the calling code.
 
 ::::{tab-set}
 
