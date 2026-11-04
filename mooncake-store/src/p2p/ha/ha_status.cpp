@@ -68,6 +68,7 @@ void HAStatusManager::Reset() {
     doctor_issues_.clear();
     oplog_writer_ = {};
     oplog_catchup_ = {};
+    standby_snapshot_ = {};
     oplog_poll_ = {};
     status_.oplog_pending_writes = 0;
     oplog_latest_stall_timeout_sec_ = 10;
@@ -97,6 +98,7 @@ void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
         oplog_writer_ = {};
         oplog_catchup_ = {};
         oplog_poll_ = {};
+        standby_snapshot_ = {};
         status_.oplog_latest_read_ok = false;
         status_.oplog_pending_writes = 0;
         status_.role = "disabled";
@@ -277,9 +279,32 @@ std::string HAStatusManager::OpLogTrimRiskMessageLocked() const {
            std::to_string(kOpLogTrimRiskThresholdPercent);
 }
 
+std::string HAStatusManager::StandbySnapshotInsufficientMessageLocked() const {
+    if (!status_.ha_enabled || status_.role != "primary" ||
+        status_.state != "RUNNING" || standby_snapshot_.required == 0 ||
+        standby_snapshot_.available >= standby_snapshot_.required) {
+        return {};
+    }
+    return "standby_snapshot_available=" +
+           std::to_string(standby_snapshot_.available) +
+           ", standby_snapshot_required=" +
+           std::to_string(standby_snapshot_.required) +
+           ", primary_snapshot_fallback_available=" +
+           std::string(status_.snapshot_ready ? "true" : "false") +
+           ", action=ensure_standby_snapshot_source";
+}
+
 void HAStatusManager::SetSnapshotReady(bool snapshot_ready) {
     std::lock_guard<std::mutex> lock(mutex_);
     status_.snapshot_ready = snapshot_ready;
+    TouchLocked();
+}
+
+void HAStatusManager::SetStandbySnapshotAvailability(uint32_t available,
+                                                     uint32_t required) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    standby_snapshot_.available = available;
+    standby_snapshot_.required = required;
     TouchLocked();
 }
 
@@ -524,6 +549,11 @@ std::string HAStatusManager::SerializeDoctorJson() const {
                 !issue.empty()) {
                 report.issues.push_back(
                     {"MASTER_VIEW_MISMATCH", std::move(issue)});
+            }
+            if (auto issue = StandbySnapshotInsufficientMessageLocked();
+                !issue.empty()) {
+                report.issues.push_back(
+                    {"STANDBY_SNAPSHOT_INSUFFICIENT", std::move(issue)});
             }
             if (auto issue = StandbyBehindTrimMessageLocked(); !issue.empty()) {
                 report.issues.push_back(

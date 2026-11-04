@@ -11,6 +11,7 @@
 #include <sstream>
 #include <utility>
 
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/oplog_store.h"
 #include "p2p/ha/redis_util.h"
 
@@ -269,6 +270,8 @@ ErrorCode RedisOpLogTrimWorker::CollectGarbage(redisContext* ctx,
 }
 
 ErrorCode RedisOpLogTrimWorker::TrimOnce() {
+    HAStatusManager::instance().SetStandbySnapshotAvailability(0, 0);
+
     auto ctx = CreateRedisConnection(config_);
     if (!ctx) {
         return ErrorCode::INTERNAL_ERROR;
@@ -300,6 +303,19 @@ ErrorCode RedisOpLogTrimWorker::TrimOnce() {
         if (err != ErrorCode::OK) {
             return err;
         }
+
+        size_t snapshot_ready_count = 0;
+        for (const auto& entry : entries) {
+            if (entry.role == "standby" && entry.snapshot_ready &&
+                !entry.snapshot_endpoint.empty() &&
+                (config_.self_instance_id.empty() ||
+                 entry.instance_id != config_.self_instance_id)) {
+                ++snapshot_ready_count;
+            }
+        }
+        HAStatusManager::instance().SetStandbySnapshotAvailability(
+            static_cast<uint32_t>(snapshot_ready_count),
+            config_.min_snapshot_ready_standby_count);
 
         const uint64_t trim_target = ComputeRedisOpLogTrimTarget(
             latest_sequence_id, trimmed_sequence_id, config_.retention_entries,

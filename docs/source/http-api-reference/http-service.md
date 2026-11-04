@@ -93,9 +93,9 @@ request.
 - `ok`: the primary is running or a standby is watching, and no active issue is
   recorded.
 - `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect,
-  snapshot recovery, registry heartbeat, master view mismatch, OpLog trim
-  horizon risk, or fatal HA failure is recorded, or pending OpLogs have exceeded
-  the latest stall timeout,
+  snapshot recovery, registry heartbeat, master view mismatch, standby
+  snapshot availability, OpLog trim horizon risk, or fatal HA failure is
+  recorded, or pending OpLogs have exceeded the latest stall timeout,
   or a primary writer queue is near capacity, or a watching standby has stopped
   polling or applying known pending OpLogs beyond the catch-up stall timeout.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
@@ -135,6 +135,17 @@ persisted-but-uncommitted entries. This detects current queue pressure, not a
 stall; `OPLOG_LATEST_STALLED` separately reports pending work whose committed
 latest has stopped advancing. HTTP reads cached writer state and does not take
 the writer queue lock.
+
+`STANDBY_SNAPSHOT_INSUFFICIENT` means a `primary` in `RUNNING` does not see
+enough snapshot-ready standbys for the configured OpLog auto-trim safety
+requirement. It compares the cached count of standby snapshot sources from the
+trim worker's last Redis registry scan with
+`oplog_trim_min_snapshot_ready_standby_count`. Primary snapshot fallback is not
+counted toward the required standby count; it is reported separately as context.
+The message includes `standby_snapshot_available`,
+`standby_snapshot_required`, `primary_snapshot_fallback_available`, and
+`action=ensure_standby_snapshot_source`. This diagnosis only uses cached local
+state and does not probe Redis or standby nodes while serving `/ha/doctor`.
 
 `OPLOG_LATEST_STALLED` means the Redis writer has pending work and its locally
 confirmed committed latest has not advanced for

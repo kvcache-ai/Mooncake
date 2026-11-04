@@ -110,6 +110,7 @@ class HAStatusManager {
                        int64_t timestamp_ms = 0, int64_t ttl_sec = 0,
                        std::string instance_id = "");
     void SetSnapshotReady(bool snapshot_ready);
+    void SetStandbySnapshotAvailability(uint32_t available, uint32_t required);
     void SetOpLogProgress(uint64_t applied_sequence_id,
                           std::optional<uint64_t> latest_sequence_id,
                           uint64_t trimmed_sequence_id = 0,
@@ -144,6 +145,7 @@ class HAStatusManager {
     void ObserveLeaderLocked(const std::string& address, uint64_t epoch);
     std::string ElectionUnstableMessageLocked() const;
     std::string MasterViewMismatchMessageLocked() const;
+    std::string StandbySnapshotInsufficientMessageLocked() const;
     std::string StandbyBehindTrimMessageLocked() const;
     std::string OpLogTrimRiskMessageLocked() const;
     std::string OpLogLatestStallMessageLocked() const;
@@ -169,6 +171,10 @@ class HAStatusManager {
         size_t capacity{0};
         std::optional<std::chrono::steady_clock::time_point> stalled_since;
     } oplog_writer_;
+    struct StandbySnapshotAvailability {
+        uint32_t available{0};
+        uint32_t required{0};
+    } standby_snapshot_;
     uint32_t oplog_latest_stall_timeout_sec_{10};
     struct OpLogCatchUpProgress {
         bool latest_known{false};

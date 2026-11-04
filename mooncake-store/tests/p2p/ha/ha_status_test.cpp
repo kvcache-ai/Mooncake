@@ -336,4 +336,34 @@ TEST_F(HAStatusTest, DoctorReportsOpLogTrimRiskNearHorizon) {
     EXPECT_EQ(doctor().status, "ok");
 }
 
+TEST_F(HAStatusTest, DoctorReportsInsufficientStandbySnapshotSources) {
+    status.SetRoleState("primary", "RUNNING");
+    status.SetMasterView("local", 1);
+    status.SetSnapshotReady(true);
+    status.SetStandbySnapshotAvailability(/*available=*/0, /*required=*/1);
+
+    auto report = doctor();
+    EXPECT_EQ(report.status, "degraded");
+    const auto* issue = FindIssue(report, "STANDBY_SNAPSHOT_INSUFFICIENT");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_NE(issue->message.find("standby_snapshot_available=0"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("standby_snapshot_required=1"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("primary_snapshot_fallback_available=true"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("action=ensure_standby_snapshot_source"),
+              std::string::npos);
+
+    status.SetStandbySnapshotAvailability(/*available=*/1, /*required=*/1);
+    EXPECT_EQ(doctor().status, "ok");
+
+    status.SetStandbySnapshotAvailability(/*available=*/0, /*required=*/0);
+    EXPECT_EQ(doctor().status, "ok");
+
+    status.SetStandbySnapshotAvailability(/*available=*/0, /*required=*/1);
+    status.SetRoleState("standby", "WATCHING");
+    EXPECT_EQ(doctor().status, "ok");
+}
+
 }  // namespace mooncake
