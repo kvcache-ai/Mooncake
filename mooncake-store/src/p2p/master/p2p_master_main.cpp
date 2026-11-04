@@ -46,7 +46,8 @@ DEFINE_string(redis_password, "", "Redis AUTH password");
 DEFINE_int32(redis_db_index, 0, "Redis database index");
 DEFINE_int32(redis_master_view_ttl_sec, 4, "Redis leader key TTL in seconds");
 DEFINE_int32(redis_heartbeat_interval_sec, 1,
-             "Redis leader heartbeat interval in seconds");
+             "Redis leader heartbeat interval in seconds; must be less than "
+             "redis_master_view_ttl_sec");
 DEFINE_bool(enable_oplog, false, "Enable P2P metadata OpLog");
 DEFINE_uint64(
     election_max_standby_lag_entries, 0,

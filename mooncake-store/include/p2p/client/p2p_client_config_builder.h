@@ -36,7 +36,9 @@ struct P2PClientConfig : RealClientConfigBase {
     std::string redis_username;
     std::string redis_password;
     int redis_db_index = 0;
-    int redis_master_view_ttl_sec = 4;
+    int redis_master_view_ttl_sec = 4;  // Redis master_view TTL in seconds.
+    // Master-side Redis master_view refresh interval. Must be less than
+    // redis_master_view_ttl_sec.
     int redis_heartbeat_interval_sec = 1;
 
     // Skip Master discovery/registration/heartbeat until an explicit /register.
