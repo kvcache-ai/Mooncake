@@ -364,6 +364,11 @@ int main(int argc, char* argv[]) {
         "Usage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
+    std::string numa_error;
+    if (!XferBenchConfig::validateLocalNuma(numa_error)) {
+        LOG(ERROR) << numa_error;
+        return EXIT_FAILURE;
+    }
     if (!XferBenchConfig::split_output_jsonl.empty()) {
         std::string error;
         if (!openSplitOutput(XferBenchConfig::split_output_jsonl, &error)) {
