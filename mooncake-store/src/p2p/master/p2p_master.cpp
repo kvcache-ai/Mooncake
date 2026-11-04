@@ -254,7 +254,6 @@ int P2PMaster::RunWithHA() {
         HAStatusManager::instance().SetRoleState(
             config_.oplog.enabled ? "standby" : "starting", "INITIALIZING");
         std::unique_ptr<RedisMasterRegistryHeartbeat> master_registry_heartbeat;
-        std::string master_instance_id;
         std::string p2p_snapshot_endpoint;
         if (config_.oplog.enabled &&
             config_.ha.election_backend == ElectionBackend::REDIS) {
