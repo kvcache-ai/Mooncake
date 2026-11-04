@@ -38,5 +38,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 opentelemetry = { version = "0.31", features = ["trace"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
-opentelemetry_sdk = { version = "0.31", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 shadow-rs = { version = "2", default-features = false, features = ["build"] }
