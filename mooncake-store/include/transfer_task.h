@@ -623,7 +623,7 @@ class TransferSubmitter {
      * and immediately submits the operation. Returns a TransferFuture
      * that can be used to track completion and get results.
      *
-     * @param handles Buffer descriptors for the transfer
+     * @param replica Replica descriptor holding the buffer for the transfer
      * @param slices Memory slices for the transfer
      * @param op_code Transfer operation (READ/WRITE)
      * @return TransferFuture representing the async operation, or nullopt on
