@@ -664,11 +664,10 @@ TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
     redisContext* admin = redisConnect(host.c_str(), port);
     ASSERT_TRUE(AuthenticateRedisContext(admin, FLAGS_redis_username,
                                          FLAGS_redis_password));
-    const std::string key =
-        "mooncake:{" + FLAGS_cluster_id + "}:master_view";
+    const std::string key = "mooncake:{" + FLAGS_cluster_id + "}:master_view";
 
-    RedisReplyPtr reply((redisReply*)redisCommand(admin, "DEL %b",
-                                                   key.data(), key.size()));
+    RedisReplyPtr reply(
+        (redisReply*)redisCommand(admin, "DEL %b", key.data(), key.size()));
     reply.reset((redisReply*)redisCommand(admin, "LPUSH %b wrongtype",
                                           key.data(), key.size()));
     ASSERT_TRUE(reply && reply->type == REDIS_REPLY_INTEGER);
@@ -679,18 +678,18 @@ TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
 
     const auto leader_value = RedisElectionHelper::SerializeLeaderValue(
         "primary:50051", 1, FLAGS_redis_ttl_sec);
-    reply.reset((redisReply*)redisCommand(
-        admin, "DEL %b", key.data(), key.size()));
+    reply.reset(
+        (redisReply*)redisCommand(admin, "DEL %b", key.data(), key.size()));
     ASSERT_TRUE(reply);
-    reply.reset((redisReply*)redisCommand(
-        admin, "SET %b %b", key.data(), key.size(), leader_value.data(),
-        leader_value.size()));
+    reply.reset((redisReply*)redisCommand(admin, "SET %b %b", key.data(),
+                                          key.size(), leader_value.data(),
+                                          leader_value.size()));
     ASSERT_TRUE(reply && reply->type == REDIS_REPLY_STATUS);
     EXPECT_FALSE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
     ASSERT_NE(context, nullptr);
 
-    reply.reset((redisReply*)redisCommand(admin, "DEL %b", key.data(),
-                                           key.size()));
+    reply.reset(
+        (redisReply*)redisCommand(admin, "DEL %b", key.data(), key.size()));
     ASSERT_TRUE(reply && reply->type == REDIS_REPLY_INTEGER);
     EXPECT_TRUE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
     ASSERT_NE(context, nullptr);
