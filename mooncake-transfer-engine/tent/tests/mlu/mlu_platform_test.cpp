@@ -134,8 +134,8 @@ TEST_F(MluPlatformTest, NonPageMultipleLengthRequiresAlignedBacking) {
 
     CNaddr base = 0;
     cn_uint64_t allocation_size = 0;
-    ASSERT_EQ(cnMemGetAddressRange(
-                  &base, &allocation_size, reinterpret_cast<CNaddr>(device_)),
+    ASSERT_EQ(cnMemGetAddressRange(&base, &allocation_size,
+                                   reinterpret_cast<CNaddr>(device_)),
               CN_SUCCESS);
     ASSERT_EQ(base, reinterpret_cast<CNaddr>(device_));
     if (allocation_size != kNonPageMultipleLength)

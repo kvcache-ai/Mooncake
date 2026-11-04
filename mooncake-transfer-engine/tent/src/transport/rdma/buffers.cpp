@@ -121,7 +121,8 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     } export_guard{handle};
     for (auto* context : context_list_) {
         if (!context || !context->supportsDmabuf()) continue;
-        auto status = context->exportDmabuf((void*)desc.addr, desc.length, handle);
+        auto status =
+            context->exportDmabuf((void*)desc.addr, desc.length, handle);
         if (!status.ok() && !status.IsNotImplemented() &&
             !status.IsInvalidArgument())
             return status;
@@ -157,9 +158,8 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
             // Calculate access flags per context (for relaxed ordering support)
             int access = getAccessFlags(options.perm,
                                         context->isRelaxedOrderingEnabled());
-            mem_reg_list[id] =
-                context->registerMemReg((void*)desc.addr, range.length, access,
-                                        &handle);
+            mem_reg_list[id] = context->registerMemReg(
+                (void*)desc.addr, range.length, access, &handle);
         }
     }
     // The buffer is usable only if every enabled NIC registered it: slice
