@@ -150,21 +150,27 @@ ErrorCode RedisOpLogStore::Init() {
             ctx_, "SETNX %b %b", latest_key_.data(), latest_key_.size(),
             zero_seq.data(), zero_seq.size()));
         if (!reply || reply->type == REDIS_REPLY_ERROR) {
-            LOG(ERROR) << "RedisOpLogStore::Init: SETNX latest failed";
+            LOG(ERROR) << "RedisOpLogStore::Init: SETNX latest failed"
+                       << ", error="
+                       << RedisUtil::FormatCommandError(ctx_, reply.get());
             return ErrorCode::INTERNAL_ERROR;
         }
         RedisReplyPtr trim_reply((redisReply*)redisCommand(
             ctx_, "SETNX %b %b", trimmed_key_.data(), trimmed_key_.size(),
             zero_seq.data(), zero_seq.size()));
         if (!trim_reply || trim_reply->type == REDIS_REPLY_ERROR) {
-            LOG(ERROR) << "RedisOpLogStore::Init: SETNX trimmed failed";
+            LOG(ERROR) << "RedisOpLogStore::Init: SETNX trimmed failed"
+                       << ", error="
+                       << RedisUtil::FormatCommandError(ctx_, trim_reply.get());
             return ErrorCode::INTERNAL_ERROR;
         }
     }
     RedisReplyPtr latest_reply((redisReply*)redisCommand(
         ctx_, "GET %b", latest_key_.data(), latest_key_.size()));
     if (!latest_reply || latest_reply->type == REDIS_REPLY_ERROR) {
-        LOG(ERROR) << "RedisOpLogStore::Init: GET latest failed";
+        LOG(ERROR) << "RedisOpLogStore::Init: GET latest failed"
+                   << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, latest_reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (latest_reply->type == REDIS_REPLY_STRING &&
@@ -515,11 +521,14 @@ bool RedisOpLogStore::FinishOrRetryWrite(
             }
         }
 
-        LOG(WARNING) << "RedisOpLogStore: async write failed, retrying"
-                     << ", worker_id=" << worker_id
-                     << ", sequence_id=" << pending->entry.sequence_id
-                     << ", attempts=" << attempts
-                     << ", error=" << toString(err);
+        LOG_EVERY_N(WARNING, 100)
+            << "RedisOpLogStore: async write failed, retrying"
+            << ", worker_id=" << worker_id
+            << ", sequence_id=" << pending->entry.sequence_id
+            << ", op_type=" << static_cast<int>(pending->entry.op_type)
+            << ", attempts=" << attempts
+            << ", consecutive_failures=" << consecutive_failures
+            << ", error=" << toString(err) << ", sample_every_n=100";
         HAMetricManager::instance().inc_oplog_write_retries();
         return true;
     }
@@ -582,7 +591,7 @@ RedisOpLogStore::PersistEntriesNoLatest(
                 << "RedisOpLogStore: pipeline SET append failed"
                 << ", first_sequence_id=" << batch.front()->entry.sequence_id
                 << ", batch_size=" << batch.size()
-                << ", error=" << (ctx->err ? ctx->errstr : "unknown")
+                << ", error=" << RedisUtil::FormatCommandError(ctx, nullptr)
                 << ", sample_every_n=100";
             return fail_batch();
         }
@@ -604,7 +613,7 @@ RedisOpLogStore::PersistEntriesNoLatest(
                 << "RedisOpLogStore: pipeline SET reply failed"
                 << ", sequence_id=" << batch[i]->entry.sequence_id
                 << ", batch_size=" << batch.size()
-                << ", error=" << (ctx->err ? ctx->errstr : "unknown")
+                << ", error=" << RedisUtil::FormatCommandError(ctx, nullptr)
                 << ", sample_every_n=100";
             freeReplyObject(raw_reply);
             return fail_batch();
@@ -621,9 +630,8 @@ RedisOpLogStore::PersistEntriesNoLatest(
         } else {
             LOG_EVERY_N(WARNING, 100)
                 << "RedisOpLogStore: pipeline SET command failed"
-                << ", sequence_id=" << batch[i]->entry.sequence_id << ", error="
-                << (reply && reply->str ? reply->str
-                                        : (ctx->err ? ctx->errstr : "unknown"))
+                << ", sequence_id=" << batch[i]->entry.sequence_id
+                << ", error=" << RedisUtil::FormatCommandError(ctx, reply.get())
                 << ", sample_every_n=100";
         }
     }
@@ -734,7 +742,8 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
         HAStatusManager::instance().SetDoctorIssue(
             "OPLOG_COMMIT_FAILED", "target=" + std::to_string(target));
         LOG(ERROR) << "RedisOpLogStore::AdvanceCommittedLatest: SET failed"
-                   << ", target=" << target;
+                   << ", target=" << target << ", error="
+                   << RedisUtil::FormatCommandError(ctx, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     HAStatusManager::instance().SetDoctorIssue("OPLOG_COMMIT_FAILED");
@@ -810,7 +819,8 @@ ErrorCode RedisOpLogStore::ReadOpLogUnlocked(uint64_t sequence_id,
         ctx_, "GET %b", entry_key.data(), entry_key.size()));
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
         LOG(ERROR) << "RedisOpLogStore::ReadOpLog: GET failed"
-                   << ", sequence_id=" << sequence_id;
+                   << ", sequence_id=" << sequence_id << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (reply->type == REDIS_REPLY_NIL) {
@@ -863,7 +873,8 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
         ctx_, "GET %b", latest_key_.data(), latest_key_.size()));
     if (!latest_reply || latest_reply->type == REDIS_REPLY_ERROR) {
         LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: GET latest failed"
-                   << ", start_sequence_id=" << start_sequence_id;
+                   << ", start_sequence_id=" << start_sequence_id << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, latest_reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (latest_reply->type == REDIS_REPLY_STRING &&
@@ -880,7 +891,8 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
         ctx_, "GET %b", trimmed_key_.data(), trimmed_key_.size()));
     if (!trimmed_reply || trimmed_reply->type == REDIS_REPLY_ERROR) {
         LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: GET trimmed failed"
-                   << ", start_sequence_id=" << start_sequence_id;
+                   << ", start_sequence_id=" << start_sequence_id << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, trimmed_reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (trimmed_reply->type == REDIS_REPLY_STRING &&
@@ -920,7 +932,8 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
                                    entry_key.size()) != REDIS_OK) {
                 LOG(ERROR)
                     << "RedisOpLogStore::ReadOpLogSince: append GET failed"
-                    << ", sequence_id=" << sequence_id;
+                    << ", sequence_id=" << sequence_id << ", error="
+                    << RedisUtil::FormatCommandError(ctx_, nullptr);
                 redisFree(ctx_);
                 ctx_ = nullptr;
                 entries.clear();
@@ -936,7 +949,8 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
                 !raw_reply) {
                 LOG(ERROR)
                     << "RedisOpLogStore::ReadOpLogSince: pipeline GET failed"
-                    << ", sequence_id=" << sequence_id;
+                    << ", sequence_id=" << sequence_id << ", error="
+                    << RedisUtil::FormatCommandError(ctx_, raw_reply);
                 redisFree(ctx_);
                 ctx_ = nullptr;
                 entries.clear();
@@ -1003,7 +1017,9 @@ ErrorCode RedisOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
     RedisReplyPtr reply((redisReply*)redisCommand(
         ctx_, "GET %b", latest_key_.data(), latest_key_.size()));
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
-        LOG(ERROR) << "RedisOpLogStore::GetLatestSequenceId: GET failed";
+        LOG(ERROR) << "RedisOpLogStore::GetLatestSequenceId: GET failed"
+                   << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (reply->type == REDIS_REPLY_NIL) {
@@ -1060,7 +1076,9 @@ ErrorCode RedisOpLogStore::GetTrimmedSequenceId(uint64_t& sequence_id) {
     RedisReplyPtr reply((redisReply*)redisCommand(
         ctx_, "GET %b", trimmed_key_.data(), trimmed_key_.size()));
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
-        LOG(ERROR) << "RedisOpLogStore::GetTrimmedSequenceId: GET failed";
+        LOG(ERROR) << "RedisOpLogStore::GetTrimmedSequenceId: GET failed"
+                   << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (reply->type == REDIS_REPLY_NIL) {
@@ -1117,7 +1135,9 @@ ErrorCode RedisOpLogStore::UpdateLatestSequenceId(uint64_t sequence_id) {
         (redisReply*)redisCommand(ctx_, "SET %b %b", latest_key_.data(),
                                   latest_key_.size(), seq.data(), seq.size()));
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
-        LOG(ERROR) << "RedisOpLogStore::UpdateLatestSequenceId: SET failed";
+        LOG(ERROR) << "RedisOpLogStore::UpdateLatestSequenceId: SET failed"
+                   << ", sequence_id=" << sequence_id << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     {
@@ -1163,7 +1183,10 @@ ErrorCode RedisOpLogStore::RecordSnapshotSequenceId(
     RedisReplyPtr reply((redisReply*)redisCommand(
         ctx_, "SET %b %b", key.data(), key.size(), seq.data(), seq.size()));
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
-        LOG(ERROR) << "RedisOpLogStore::RecordSnapshotSequenceId: SET failed";
+        LOG(ERROR) << "RedisOpLogStore::RecordSnapshotSequenceId: SET failed"
+                   << ", snapshot_id=" << snapshot_id
+                   << ", sequence_id=" << sequence_id << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;
@@ -1190,7 +1213,9 @@ ErrorCode RedisOpLogStore::GetSnapshotSequenceId(const std::string& snapshot_id,
     RedisReplyPtr reply(
         (redisReply*)redisCommand(ctx_, "GET %b", key.data(), key.size()));
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
-        LOG(ERROR) << "RedisOpLogStore::GetSnapshotSequenceId: GET failed";
+        LOG(ERROR) << "RedisOpLogStore::GetSnapshotSequenceId: GET failed"
+                   << ", snapshot_id=" << snapshot_id << ", error="
+                   << RedisUtil::FormatCommandError(ctx_, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (reply->type == REDIS_REPLY_NIL) {
@@ -1226,7 +1251,9 @@ ErrorCode RedisOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
             ctx_, "GET %b", latest_key_.data(), latest_key_.size()));
         if (!latest_reply || latest_reply->type == REDIS_REPLY_ERROR) {
             LOG(ERROR)
-                << "RedisOpLogStore::CleanupOpLogBefore: GET latest failed";
+                << "RedisOpLogStore::CleanupOpLogBefore: GET latest failed"
+                << ", before_sequence_id=" << before_sequence_id << ", error="
+                << RedisUtil::FormatCommandError(ctx_, latest_reply.get());
             return ErrorCode::INTERNAL_ERROR;
         }
         if (latest_reply->type == REDIS_REPLY_STRING &&
@@ -1242,7 +1269,9 @@ ErrorCode RedisOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
             ctx_, "GET %b", trimmed_key_.data(), trimmed_key_.size()));
         if (!trimmed_reply || trimmed_reply->type == REDIS_REPLY_ERROR) {
             LOG(ERROR)
-                << "RedisOpLogStore::CleanupOpLogBefore: GET trimmed failed";
+                << "RedisOpLogStore::CleanupOpLogBefore: GET trimmed failed"
+                << ", before_sequence_id=" << before_sequence_id << ", error="
+                << RedisUtil::FormatCommandError(ctx_, trimmed_reply.get());
             return ErrorCode::INTERNAL_ERROR;
         }
         if (trimmed_reply->type == REDIS_REPLY_STRING &&
@@ -1272,7 +1301,8 @@ ErrorCode RedisOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
                                    entry_key.size()) != REDIS_OK) {
                 LOG(ERROR)
                     << "RedisOpLogStore::CleanupOpLogBefore: append DEL failed"
-                    << ", sequence_id=" << sequence_id;
+                    << ", sequence_id=" << sequence_id << ", error="
+                    << RedisUtil::FormatCommandError(ctx_, nullptr);
                 redisFree(ctx_);
                 ctx_ = nullptr;
                 return ErrorCode::INTERNAL_ERROR;
@@ -1286,7 +1316,8 @@ ErrorCode RedisOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
                     REDIS_OK ||
                 !raw_reply) {
                 LOG(ERROR) << "RedisOpLogStore::CleanupOpLogBefore: DEL failed"
-                           << ", sequence_id=" << sequence_id;
+                           << ", sequence_id=" << sequence_id << ", error="
+                           << RedisUtil::FormatCommandError(ctx_, raw_reply);
                 redisFree(ctx_);
                 ctx_ = nullptr;
                 return ErrorCode::INTERNAL_ERROR;
@@ -1295,7 +1326,8 @@ ErrorCode RedisOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
             if (del_reply->type == REDIS_REPLY_ERROR) {
                 LOG(ERROR) << "RedisOpLogStore::CleanupOpLogBefore: DEL error"
                            << ", sequence_id=" << sequence_id << ", error="
-                           << (del_reply->str ? del_reply->str : "null");
+                           << RedisUtil::FormatCommandError(ctx_,
+                                                            del_reply.get());
                 redisFree(ctx_);
                 ctx_ = nullptr;
                 return ErrorCode::INTERNAL_ERROR;
@@ -1309,7 +1341,8 @@ ErrorCode RedisOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
         if (!update_reply || update_reply->type == REDIS_REPLY_ERROR) {
             LOG(ERROR)
                 << "RedisOpLogStore::CleanupOpLogBefore: SET trimmed failed"
-                << ", trimmed_sequence_id=" << batch_end;
+                << ", trimmed_sequence_id=" << batch_end << ", error="
+                << RedisUtil::FormatCommandError(ctx_, update_reply.get());
             return ErrorCode::INTERNAL_ERROR;
         }
     }

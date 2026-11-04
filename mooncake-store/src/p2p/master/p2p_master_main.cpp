@@ -73,7 +73,7 @@ DEFINE_uint32(oplog_async_write_batch_size, 64,
               "Maximum entries in a Redis OpLog pipeline batch");
 DEFINE_bool(enable_oplog_auto_trim, false,
             "Enable primary-side Redis OpLog auto trim in P2P HA mode");
-DEFINE_uint32(oplog_auto_trim_interval_sec, 60,
+DEFINE_uint32(oplog_auto_trim_interval_sec, 10,
               "Interval in seconds for Redis OpLog auto trim");
 DEFINE_uint64(oplog_trim_retention_entries, 100000,
               "Number of recent OpLog entries to retain before auto trim");

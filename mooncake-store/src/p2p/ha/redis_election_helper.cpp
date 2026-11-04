@@ -54,28 +54,6 @@ int64_t CurrentTimestampMs() {
         .count();
 }
 
-std::string FormatPollLeaderError(const redisContext* context,
-                                  const redisReply* reply) {
-    std::ostringstream stream;
-    if (!reply) {
-        stream << "null reply";
-    } else {
-        stream << "reply_type=" << reply->type;
-        if (reply->type == REDIS_REPLY_ERROR && reply->str) {
-            stream << ", redis_error=" << std::string(reply->str, reply->len);
-        }
-    }
-    if (context) {
-        stream << ", ctx_err=" << context->err;
-        if (context->errstr[0] != '\0') {
-            stream << ", ctx_errstr=" << context->errstr;
-        }
-    } else {
-        stream << ", ctx=null";
-    }
-    return stream.str();
-}
-
 bool ParseElectionValue(const std::string& value, std::string& address,
                         ViewVersionId& epoch, std::string* instance_id,
                         int64_t* timestamp_ms = nullptr,
@@ -371,7 +349,9 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         if (!current || current->type != REDIS_REPLY_STRING) {
             LOG(WARNING)
                 << "TryElectOnce: failed to read the election result after "
-                   "reconnect";
+                   "reconnect"
+                << ", error="
+                << RedisUtil::FormatCommandError(election_ctx_, current.get());
             return ElectionAttemptResult::ERROR;
         }
         std::string value(current->str, current->len);
@@ -394,6 +374,14 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         }
         LOG(WARNING) << "TryElectOnce: election result after reconnect does "
                         "not match this attempt";
+        return ElectionAttemptResult::ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_ERROR) {
+        HAMetricManager::instance().inc_election_failures();
+        LOG(WARNING) << "TryElectOnce: election script failed, error="
+                     << RedisUtil::FormatCommandError(election_ctx_,
+                                                      reply.get());
         return ElectionAttemptResult::ERROR;
     }
 
@@ -628,7 +616,7 @@ bool RedisElectionHelper::PollLeaderOnce(redisContext*& context) {
         context, "GET %b", master_view_key_.data(), master_view_key_.size()));
     if (!reply ||
         (reply->type != REDIS_REPLY_STRING && reply->type != REDIS_REPLY_NIL)) {
-        const auto error = FormatPollLeaderError(context, reply.get());
+        const auto error = RedisUtil::FormatCommandError(context, reply.get());
         LOG_EVERY_N(WARNING, 30)
             << "WatchLeader: polling GET failed; reconnecting on next poll"
             << ", key=" << master_view_key_ << ", error=" << error;
@@ -681,8 +669,10 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
                 our_value_.data(), our_value_.size()));
 
             if (!reply) {
-                LOG(ERROR)
-                    << "KeepLeader: Lua renewal failed (connection error)";
+                LOG(ERROR) << "KeepLeader: Lua renewal failed"
+                           << ", error="
+                           << RedisUtil::FormatCommandError(election_ctx_,
+                                                            reply.get());
                 if (Reconnect(election_ctx_)) {
                     // Re-run the ownership check and renewal atomically after
                     // reconnect. GET followed by EXPIRE would allow another
@@ -696,17 +686,27 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
                         renewed = true;
                     } else {
                         LOG(WARNING) << "KeepLeader: Lua renewal failed after "
-                                        "reconnect, key may have changed";
+                                        "reconnect, "
+                                        "key may have changed"
+                                     << ", error="
+                                     << RedisUtil::FormatCommandError(
+                                            election_ctx_, retry.get());
                     }
                 }
             } else if (reply->type == REDIS_REPLY_INTEGER &&
                        reply->integer == 1) {
                 // Renewal succeeded
                 renewed = true;
+            } else if (reply->type == REDIS_REPLY_ERROR) {
+                LOG(ERROR) << "KeepLeader: Lua renewal failed"
+                           << ", error="
+                           << RedisUtil::FormatCommandError(election_ctx_,
+                                                            reply.get());
             } else {
                 // Key no longer ours
-                LOG(WARNING)
-                    << "KeepLeader: lost leadership (key no longer ours)";
+                LOG(WARNING) << "KeepLeader: lost leadership (key no longer "
+                                "ours)"
+                             << ", reply_type=" << reply->type;
             }
         }
 
@@ -766,7 +766,8 @@ ErrorCode RedisElectionHelper::ReleaseLeader() {
         (reply->integer != 0 && reply->integer != 1)) {
         LOG(WARNING) << "ReleaseLeader: failed to release Redis leadership"
                      << ", error="
-                     << FormatPollLeaderError(election_ctx_, reply.get());
+                     << RedisUtil::FormatCommandError(election_ctx_,
+                                                      reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -809,9 +810,10 @@ ErrorCode RedisElectionHelper::GetMasterView(std::string& master_address,
                                                   master_view_key_.data(),
                                                   master_view_key_.size()));
 
-    if (!reply) {
-        LOG(ERROR) << "GetMasterView: GET failed (connection error) at "
-                   << redis_endpoint_;
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        LOG(ERROR) << "GetMasterView: GET failed at " << redis_endpoint_
+                   << ", error="
+                   << RedisUtil::FormatCommandError(election_ctx_, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
 
@@ -853,9 +855,12 @@ void RedisElectionHelper::PublishLeaderEvent(const std::string& event) {
     RedisReplyPtr reply((redisReply*)redisCommand(
         election_ctx_, "PUBLISH %b %b", leader_event_channel_.data(),
         leader_event_channel_.size(), event.data(), event.size()));
-    if (!reply) {
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
         LOG(WARNING) << "PublishLeaderEvent: PUBLISH failed; polling will "
-                        "detect the leader change";
+                        "detect the leader change"
+                     << ", error="
+                     << RedisUtil::FormatCommandError(election_ctx_,
+                                                      reply.get());
     }
 }
 

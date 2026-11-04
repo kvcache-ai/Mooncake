@@ -25,6 +25,9 @@ namespace RedisUtil {
 bool ParseEndpoint(const std::string& redis_endpoint, std::string& host,
                    int& port);
 
+std::string FormatCommandError(const redisContext* ctx,
+                               const redisReply* reply);
+
 redisContext* CreateConnection(const std::string& redis_endpoint,
                                const std::string& username,
                                const std::string& password, int db_index = 0,

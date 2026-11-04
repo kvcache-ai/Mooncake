@@ -5,6 +5,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <sstream>
 #include <utility>
 
 namespace mooncake {
@@ -70,6 +71,28 @@ bool ParseEndpoint(const std::string& redis_endpoint, std::string& host,
     return true;
 }
 
+std::string FormatCommandError(const redisContext* ctx,
+                               const redisReply* reply) {
+    std::ostringstream stream;
+    if (!reply) {
+        stream << "null reply";
+    } else {
+        stream << "reply_type=" << reply->type;
+        if (reply->type == REDIS_REPLY_ERROR && reply->str) {
+            stream << ", redis_error=" << std::string(reply->str, reply->len);
+        }
+    }
+    if (ctx) {
+        stream << ", ctx_err=" << ctx->err;
+        if (ctx->errstr[0] != '\0') {
+            stream << ", ctx_errstr=" << ctx->errstr;
+        }
+    } else {
+        stream << ", ctx=null";
+    }
+    return stream.str();
+}
+
 redisContext* CreateConnection(const std::string& redis_endpoint,
                                const std::string& username,
                                const std::string& password, int db_index,
@@ -109,8 +132,8 @@ redisContext* CreateConnection(const std::string& redis_endpoint,
             password.data(), password.size()));
         if (!auth || auth->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "RedisUtil: AUTH failed"
-                       << ", endpoint=" << redis_endpoint << ", error="
-                       << (auth && auth->str ? auth->str : "null");
+                       << ", endpoint=" << redis_endpoint
+                       << ", error=" << FormatCommandError(ctx, auth.get());
             redisFree(ctx);
             return nullptr;
         }
@@ -119,8 +142,8 @@ redisContext* CreateConnection(const std::string& redis_endpoint,
             ctx, "AUTH %b", password.data(), password.size()));
         if (!auth || auth->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "RedisUtil: AUTH failed"
-                       << ", endpoint=" << redis_endpoint << ", error="
-                       << (auth && auth->str ? auth->str : "null");
+                       << ", endpoint=" << redis_endpoint
+                       << ", error=" << FormatCommandError(ctx, auth.get());
             redisFree(ctx);
             return nullptr;
         }
@@ -132,8 +155,8 @@ redisContext* CreateConnection(const std::string& redis_endpoint,
         if (!select || select->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "RedisUtil: SELECT failed"
                        << ", endpoint=" << redis_endpoint
-                       << ", db_index=" << db_index << ", error="
-                       << (select && select->str ? select->str : "null");
+                       << ", db_index=" << db_index
+                       << ", error=" << FormatCommandError(ctx, select.get());
             redisFree(ctx);
             return nullptr;
         }
