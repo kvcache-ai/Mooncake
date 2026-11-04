@@ -1079,6 +1079,28 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
               promoted_sequence_id + 2);
 }
 
+TEST_F(P2PHotStandbyServiceTest, LatestReadFailureAbortsBeforeMetadataRestore) {
+    class FailedLatestStore : public MockOpLogStore {
+       public:
+        ErrorCode GetLatestSequenceId(uint64_t&) override {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+    };
+
+    P2PMasterService source(MakeMasterConfig());
+    RegisterClient(source, UUID{71, 71}, MakeSegment(UUID{72, 72}));
+    const auto metadata = source.ExportMetadataForStandby();
+    ASSERT_EQ(metadata.clients.size(), 1);
+
+    P2PMasterService promoted(MakeMasterConfig());
+    promoted.GetOpLogManager()->SetOpLogStore(
+        std::make_shared<FailedLatestStore>());
+    EXPECT_EQ(promoted.RestoreFromStandbyMetadata(metadata, 1),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_TRUE(promoted.GetClientManager().GetAllClients().empty());
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 0);
+}
+
 TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {
     P2PMasterService primary_master(MakeMasterConfig());
     const UUID client_id{17, 17};

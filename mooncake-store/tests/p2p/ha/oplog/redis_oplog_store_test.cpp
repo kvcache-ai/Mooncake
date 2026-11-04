@@ -966,6 +966,103 @@ TEST_F(RedisOpLogStoreTest, RejectsInvalidDatabaseIndex) {
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store.Init());
 }
 
+TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
+    {
+        auto old_writer = CreateWriter();
+        for (uint64_t sequence_id = 1; sequence_id <= 3; ++sequence_id) {
+            ASSERT_EQ(old_writer->WriteOpLog(MakeEntry(sequence_id), true),
+                      ErrorCode::OK);
+        }
+    }
+
+    P2PMasterConfig config;
+    config.oplog.enabled = true;
+    config.oplog.store_type = "redis";
+    config.cluster_id = cluster_id_;
+    config.redis.endpoint = redis_endpoint_;
+    config.redis.username = redis_username_;
+    config.redis.password = redis_password_;
+    config.oplog.data_dir = "127.0.0.1:notaport";
+
+    P2PMasterService promoted(config);
+    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 0),
+              ErrorCode::OK);
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 3);
+
+    auto sequence = promoted.GetOpLogManager()->AppendAndPersist(
+        OpType::PUT_END, "new-primary", "new-payload", true);
+    ASSERT_TRUE(sequence.has_value());
+    EXPECT_EQ(sequence.value(), 4);
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 4);
+    for (uint64_t sequence_id = 1; sequence_id <= 3; ++sequence_id) {
+        OpLogEntry entry;
+        ASSERT_EQ(reader->ReadOpLog(sequence_id, entry), ErrorCode::OK);
+        EXPECT_EQ(entry.object_key, MakeEntry(sequence_id).object_key);
+        EXPECT_EQ(entry.payload, MakeEntry(sequence_id).payload);
+    }
+    OpLogEntry new_entry;
+    ASSERT_EQ(reader->ReadOpLog(4, new_entry), ErrorCode::OK);
+    EXPECT_EQ(new_entry.object_key, "new-primary");
+    EXPECT_EQ(new_entry.payload, "new-payload");
+}
+
+TEST_F(RedisOpLogStoreTest, PromotionRejectsUnreadableOrChangedLatest) {
+    {
+        auto old_writer = CreateWriter();
+        ASSERT_EQ(old_writer->UpdateLatestSequenceId(200), ErrorCode::OK);
+    }
+
+    P2PMasterConfig config;
+    config.oplog.enabled = true;
+    config.oplog.store_type = "redis";
+    config.cluster_id = cluster_id_;
+    config.redis.endpoint = redis_endpoint_;
+    config.redis.username = redis_username_;
+    config.redis.password = redis_password_;
+    config.oplog.data_dir = "127.0.0.1:notaport";
+
+    P2PMasterService promoted(config);
+    auto [host, port] = ParseEndpoint();
+    std::unique_ptr<redisContext, decltype(&redisFree)> admin(
+        redisConnect(host.c_str(), port), &redisFree);
+    ASSERT_TRUE(testing::AuthenticateRedisContext(admin.get(), redis_username_,
+                                                  redis_password_));
+    const auto key = "mooncake:" + cluster_id_ + ":oplog:latest";
+
+    RedisReplyPtr corrupt(
+        (redisReply*)redisCommand(admin.get(), "SET %s invalid", key.c_str()));
+    ASSERT_TRUE(corrupt);
+    EXPECT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 0),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 0);
+
+    RedisReplyPtr changed(
+        (redisReply*)redisCommand(admin.get(), "SET %s 300", key.c_str()));
+    ASSERT_TRUE(changed);
+    EXPECT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 100),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 0);
+
+    RedisReplyPtr repair(
+        (redisReply*)redisCommand(admin.get(), "SET %s 200", key.c_str()));
+    ASSERT_TRUE(repair);
+    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 100),
+              ErrorCode::OK);
+    auto sequence = promoted.GetOpLogManager()->AppendAndPersist(
+        OpType::PUT_END, "new-key", "new-payload", true);
+    ASSERT_TRUE(sequence.has_value());
+    EXPECT_EQ(sequence.value(), 201);
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 201);
+}
+
 TEST_F(RedisOpLogStoreTest, MasterServiceUsesRedisEndpointForRedisOpLog) {
     P2PMasterConfig config;
     config.oplog.enabled = true;

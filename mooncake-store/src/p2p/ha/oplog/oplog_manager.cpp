@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <xxhash.h>
 #include <glog/logging.h>
 
@@ -169,20 +170,55 @@ OpLogManager::GetBufferedEntriesAfter(uint64_t sequence_id) const {
     return entries;
 }
 
-void OpLogManager::SetInitialSequenceId(uint64_t sequence_id) {
+ErrorCode OpLogManager::SetInitialSequenceId(uint64_t sequence_id) {
+    std::shared_ptr<OpLogStore> store;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        store = oplog_store_;
+    }
+    uint64_t persisted_latest = 0;
+    if (store) {
+        // Do not hold the manager lock over I/O: RequestStopWriting must
+        // remain responsive if leadership is lost during initialization.
+        uint64_t local_committed = 0;
+        auto err = store->GetLocalCommittedSequenceId(local_committed);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        err = store->GetLatestSequenceId(persisted_latest);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        if (local_committed != persisted_latest) {
+            LOG(ERROR) << "Cannot initialize OpLog sequence: latest changed "
+                          "since writer initialization"
+                       << ", local_committed=" << local_committed
+                       << ", persisted_latest=" << persisted_latest;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+    }
+
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (last_seq_id_ == 0 && buffer_.empty()) {
-        // Only allow setting initial sequence_id if OpLogManager is empty
-        last_seq_id_ = sequence_id;
-        first_seq_id_ = sequence_id +
-                        1;  // first_seq_id_ should be > last_seq_id_ when empty
-        LOG(INFO) << "OpLogManager initial sequence_id set to " << sequence_id;
-    } else {
-        LOG(WARNING)
-            << "Cannot set initial sequence_id: OpLogManager is not empty "
+    if (last_seq_id_ != 0 || !buffer_.empty() || store != oplog_store_) {
+        LOG(ERROR)
+            << "Cannot initialize OpLog sequence: manager was used or store "
+               "changed during initialization "
             << "(last_seq_id_=" << last_seq_id_
             << ", buffer_size=" << buffer_.size() << ")";
+        return ErrorCode::INVALID_PARAMS;
     }
+    const auto initial_sequence_id = std::max(sequence_id, persisted_latest);
+    if (initial_sequence_id == std::numeric_limits<uint64_t>::max()) {
+        LOG(ERROR) << "Cannot initialize OpLog sequence: sequence exhausted"
+                   << ", initial_sequence_id=" << initial_sequence_id;
+        return ErrorCode::INVALID_PARAMS;
+    }
+    last_seq_id_ = initial_sequence_id;
+    first_seq_id_ = initial_sequence_id + 1;
+    LOG(INFO) << "OpLogManager initial sequence_id set to "
+              << initial_sequence_id << ", restored_sequence_id=" << sequence_id
+              << ", persisted_latest=" << persisted_latest;
+    return ErrorCode::OK;
 }
 
 size_t OpLogManager::GetEntryCount() const {

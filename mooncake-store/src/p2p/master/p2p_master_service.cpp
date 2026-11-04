@@ -1259,15 +1259,31 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    if (last_applied_sequence_id > 0) {
-        if (auto* manager = GetOpLogManager()) {
-            manager->SetInitialSequenceId(last_applied_sequence_id);
-        } else {
-            LOG(WARNING)
-                << "RestoreFromStandbyMetadata: cannot set initial OpLog "
-                   "sequence without OpLogManager"
-                << ", last_applied_sequence_id=" << last_applied_sequence_id;
+    // Even an empty standby may be behind an existing Redis latest watermark.
+    // Seed the allocator before restoring metadata or admitting new writes.
+    if (auto* manager = GetOpLogManager()) {
+        auto err = manager->SetInitialSequenceId(last_applied_sequence_id);
+        if (err != ErrorCode::OK) {
+            HAMetricManager::instance().inc_promotion_restore_failures();
+            LOG(ERROR) << "RestoreFromStandbyMetadata: OpLog sequence "
+                          "initialization failed"
+                       << ", last_applied_sequence_id="
+                       << last_applied_sequence_id
+                       << ", error=" << toString(err);
+            return err;
         }
+        if (manager->GetLastSequenceId() > last_applied_sequence_id) {
+            LOG(WARNING)
+                << "RestoreFromStandbyMetadata: promoted with incomplete "
+                   "OpLog catch-up"
+                << ", applied=" << last_applied_sequence_id
+                << ", latest=" << manager->GetLastSequenceId();
+        }
+    } else if (last_applied_sequence_id > 0) {
+        LOG(WARNING) << "RestoreFromStandbyMetadata: cannot set initial OpLog "
+                        "sequence without OpLogManager"
+                     << ", last_applied_sequence_id="
+                     << last_applied_sequence_id;
     }
 
     size_t restored_clients = 0;

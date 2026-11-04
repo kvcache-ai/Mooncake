@@ -115,10 +115,10 @@ class OpLogManager {
     tl::expected<std::vector<OpLogEntry>, ErrorCode> GetBufferedEntriesAfter(
         uint64_t sequence_id) const;
 
-    // Set the initial sequence ID (used when promoting Standby to Primary).
-    // This ensures the new Primary's OpLogManager continues from the correct
-    // sequence_id.
-    void SetInitialSequenceId(uint64_t sequence_id);
+    // Initialize an unused manager above both the restored metadata sequence
+    // and the store's latest watermark. Reading latest must succeed before
+    // promotion can continue; this does not replay missing metadata changes.
+    ErrorCode SetInitialSequenceId(uint64_t sequence_id);
 
     // Current number of entries in the buffer.
     size_t GetEntryCount() const;
