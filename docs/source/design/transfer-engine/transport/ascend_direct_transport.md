@@ -14,6 +14,12 @@ To build and use the Transport library, please follow the process described in `
 
 Please install the latest version of Ascend Compute Architecture for Neural Networks.
 
+The TENT transport backend for Ascend (`MC_USE_TENT=1`) uses HIXL's AutoConnect
+session mode and keeps peer sessions open until teardown, so it requires
+**CANN/HIXL 9.2.0 or newer**. On 9.1.x and earlier, deregistering a memory
+region while AutoConnect sessions to that peer are still open fails; use the
+classic `ascend` transport on those versions.
+
 ### Test Cases
 
 Transport provides a performance test file at `mooncake-transfer-engine/example/transfer_engine_ascend_direct_perf.cpp`.
