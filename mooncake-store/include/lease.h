@@ -20,13 +20,7 @@ class Lease {
     void GrantReadLease(std::chrono::milliseconds ttl) {
         const auto ttl_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(ttl).count();
-        const int64_t now = NowNs();
-        const int64_t new_deadline = now + ttl_ns;
-        int64_t cur = deadline_ns_.load(std::memory_order_relaxed);
-        while (cur < new_deadline &&
-               !deadline_ns_.compare_exchange_weak(cur, new_deadline,
-                                                   std::memory_order_relaxed)) {
-        }
+        RaiseDeadlineTo(NowNs() + ttl_ns);
         // A read or write makes the object recently used, so it ranks by its
         // new deadline from now on, not by the order it was restored with.
         restored_order_ns_.store(0, std::memory_order_relaxed);
@@ -36,14 +30,9 @@ class Lease {
     // protects a restored object for ttl without making it look recently
     // used.
     void GrantRestoreLease(std::chrono::milliseconds ttl) {
-        const int64_t new_deadline =
+        RaiseDeadlineTo(
             NowNs() +
-            std::chrono::duration_cast<std::chrono::nanoseconds>(ttl).count();
-        int64_t cur = deadline_ns_.load(std::memory_order_relaxed);
-        while (cur < new_deadline &&
-               !deadline_ns_.compare_exchange_weak(cur, new_deadline,
-                                                   std::memory_order_relaxed)) {
-        }
+            std::chrono::duration_cast<std::chrono::nanoseconds>(ttl).count());
     }
 
     // Record the eviction order an object had on the primary it was restored
@@ -95,6 +84,15 @@ class Lease {
     }
 
    private:
+    // Monotonic max: raise the deadline to `new_deadline_ns`, never lower it.
+    void RaiseDeadlineTo(const int64_t new_deadline_ns) {
+        int64_t cur = deadline_ns_.load(std::memory_order_relaxed);
+        while (cur < new_deadline_ns &&
+               !deadline_ns_.compare_exchange_weak(cur, new_deadline_ns,
+                                                   std::memory_order_relaxed)) {
+        }
+    }
+
     static std::chrono::system_clock::time_point FromNs(int64_t ns) {
         return std::chrono::system_clock::time_point(
             std::chrono::duration_cast<std::chrono::system_clock::duration>(

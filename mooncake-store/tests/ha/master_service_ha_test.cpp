@@ -1356,8 +1356,12 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     const std::string endpoint = "checksum_restore_segment";
     auto legacy_object = MakeStandbyObject("checksum_legacy_key", endpoint);
     legacy_object.metadata.object_checksum = 0x1234;
+    legacy_object.metadata.session_id = "legacy-session";
+    legacy_object.metadata.residency_affinity_id = "legacy-affinity";
     auto batch_object = MakeStandbyObject("checksum_batch_key", endpoint);
     batch_object.metadata.object_checksum = 0;
+    batch_object.metadata.session_id = "batch-session";
+    batch_object.metadata.residency_affinity_id = "batch-affinity";
 
     MasterService legacy_service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -1372,6 +1376,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     ASSERT_TRUE(legacy_accessor.Exists());
     EXPECT_EQ(legacy_accessor.Get().GetPart(0).checksum(),
               std::optional<uint64_t>(0x1234));
+    EXPECT_EQ("legacy-session", legacy_accessor.Get().session_id);
+    EXPECT_EQ("legacy-affinity", legacy_accessor.Get().residency_affinity_id);
 
     auto source = std::make_unique<StandbyMetadataStore>();
     ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
@@ -1392,6 +1398,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     ASSERT_TRUE(batch_accessor.Exists());
     EXPECT_EQ(batch_accessor.Get().GetPart(0).checksum(),
               std::optional<uint64_t>(0));
+    EXPECT_EQ("batch-session", batch_accessor.Get().session_id);
+    EXPECT_EQ("batch-affinity", batch_accessor.Get().residency_affinity_id);
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
@@ -2156,16 +2164,13 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     OpLogBatchRecord batch;
     ReadBatchEventually(storage, 1, batch);
 
-    // Object i is written one eviction-index bucket after object i - 1, so
-    // the index ranks every object apart from the others.
+    const auto test_start = std::chrono::system_clock::now();
     std::vector<std::string> keys;
     for (int i = 0; i < kObjects; ++i) {
         keys.push_back("lru_promotion_key_" + std::to_string(i));
         PutObjectOnSegment(primary, mounted.client_id, keys.back(), endpoint,
                            kObjectSize);
         ReadBatchEventually(storage, 2 + i, batch);
-        std::this_thread::sleep_for(metadata::LeaseEvictionIndex::kBucketWidth +
-                                    std::chrono::milliseconds(10));
     }
 
     MockMetadataStore standby_metadata;
@@ -2178,12 +2183,31 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     // Rebuild the promotion input from the standby copy, newest object first
     // so the restore files them against their order, and pass it through the
     // batch snapshot codec, as a promotion from a snapshot does.
+    //
+    // The primary wrote all objects within one eviction-index bucket, so their
+    // real orders tie. Check that each reached the standby, then give object i
+    // an order 1 s newer than object i - 1 (all in the past), so the ranking
+    // does not depend on how fast the test ran.
+    const auto test_end_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const auto test_start_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            test_start.time_since_epoch())
+            .count());
+    const uint64_t base_ms = test_start_ms - 20'000;
     std::vector<StandbyObjectEntry> objects;
-    for (auto key = keys.rbegin(); key != keys.rend(); ++key) {
+    for (int i = kObjects - 1; i >= 0; --i) {
         auto metadata =
-            standby_metadata.GetMetadata(kDefaultTenant.value(), *key);
-        ASSERT_TRUE(metadata.has_value()) << *key;
-        objects.push_back({kDefaultTenant.value(), *key, *metadata});
+            standby_metadata.GetMetadata(kDefaultTenant.value(), keys[i]);
+        ASSERT_TRUE(metadata.has_value()) << keys[i];
+        const uint64_t carried = metadata->eviction_order_ms.value_or(0);
+        EXPECT_GE(carried, test_start_ms) << keys[i];
+        // The order is the write time plus the 10 ms lease TTL.
+        EXPECT_LE(carried, test_end_ms + 10) << keys[i];
+        metadata->eviction_order_ms = base_ms + 1000ULL * i;
+        objects.push_back({kDefaultTenant.value(), keys[i], *metadata});
     }
     auto decoded = DecodeBatchOpLogSnapshotObjectChunk(
         EncodeBatchOpLogSnapshotObjectChunk(0, objects), 0, objects.size());
@@ -2214,9 +2238,22 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     // A read after promotion makes the oldest restored object the newest.
     ASSERT_TRUE(promoted.GetReplicaList(keys[0], kDefaultTenant).has_value());
 
-    // Let the remount, PutEnd and read leases run out, then evict
-    // ceil(0.35 * 11) = 4 of the 11 objects.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Expire the remount, PutEnd and read leases without waiting for them.
+    // The restored objects keep the order they were restored with. The two
+    // touched after promotion rank by their deadline, so give them one just
+    // short of now: newer than every restored order.
+    const auto touched_deadline =
+        std::chrono::system_clock::now() - std::chrono::milliseconds(1);
+    for (int i = 1; i < kObjects; ++i) {
+        SetLeaseDeadlineForTesting(promoted, kDefaultTenant, keys[i],
+                                   std::chrono::system_clock::time_point{});
+    }
+    SetLeaseDeadlineForTesting(promoted, kDefaultTenant, keys[0],
+                               touched_deadline);
+    SetLeaseDeadlineForTesting(promoted, kDefaultTenant, fresh_key,
+                               touched_deadline);
+
+    // Evict ceil(0.35 * 11) = 4 of the 11 objects.
     MasterServiceTestPeer(promoted).RunBatchEvictForTesting(
         /*evict_ratio_target=*/0.35,
         /*evict_ratio_lowerbound=*/0.0);
@@ -7664,7 +7701,12 @@ TEST_F(MasterServiceHATest,
                       .set_enable_oplog(true)
                       .set_weight_management_oplog_capability_confirmed(true)
                       .set_cluster_id(cluster_id)
-                      .set_oplog_batch_max_entries(1)
+                      // UnmountSegment below queues one stale-handle cleanup
+                      // per object plus SEGMENT_UNMOUNT back to back, before
+                      // the writer thread can take the previous entry. With
+                      // a single slot those Reserve() calls race the writer
+                      // and fail with TASK_PENDING_LIMIT_EXCEEDED.
+                      .set_oplog_batch_max_entries(16)
                       .build();
     MasterService service(config);
     auto* writer = InstallGatedWriter(service, backend);
@@ -7701,7 +7743,7 @@ TEST_F(MasterServiceHATest,
                                      replicate));
         ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
                                    ReplicaType::MEMORY));
-        // PutEnd returns before durability; drain the single-entry writer.
+        // PutEnd returns before durability; wait for this entry to land.
         ASSERT_TRUE(writer->RunCallbacksThrough(put_sequence++));
     }
     const auto ready = service.CommitWeightImport({

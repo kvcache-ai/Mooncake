@@ -339,16 +339,22 @@ int EfaTransport::registerLocalMemoryInternal(
     bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries()) &&
                              thp_plan != ThpPlan::kThpPartitioned;
 
-    // Optionally narrow a single-chunk DEVICE buffer to the NICs the topology
-    // reports as closest to its GPU. See buildLocalNicMap() for where the set
-    // comes from, and the MC_EFA_NIC_SELECTION docs for the trade-off: fewer
-    // NICs can serve a transfer touching this buffer, so this is registration
-    // time bought with potential per-buffer bandwidth, not a free win.
+    // Narrow a single-chunk DEVICE buffer to the NICs the topology reports as
+    // closest to its GPU (MC_EFA_NIC_SELECTION=local, the default). See
+    // buildLocalNicMap() for where the set comes from. Steady-state bandwidth
+    // is unchanged: Topology::selectDevice() picks only from preferred_hca on
+    // a first attempt, which is exactly this set, so keys on the other NICs
+    // are used only by retries. What `local` gives up is retrying a device
+    // buffer over a non-local NIC; MC_EFA_NIC_SELECTION=all restores that.
     //
     // Registering one buffer on N NICs costs ~N times one registration, and for
     // device memory the per-domain accumulation described above is paid once
     // per domain, so the two multiply. Measured on p5.48xlarge, 48 x 391 MB GPU
     // buffers registered serially: 123.7 s on 32 NICs, 17.6 s on 4, 4.4 s on 1.
+    // On p6-b300.48xlarge (16 NICs, 2 per GPU) with vLLM TP8 registering its KV
+    // cache, the slowest rank took 274 s on all NICs and 9 s on its local pair,
+    // while GPU-to-GPU bandwidth was unchanged (8 GPUs: ~762 GB/s write either
+    // way; 1 GPU: ~95 GB/s either way, i.e. its two local NICs).
     //
     // Host memory is deliberately excluded. It has no accumulation to amplify,
     // it is ~4x cheaper to register in the first place, and a host buffer has

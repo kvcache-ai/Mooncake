@@ -39,19 +39,27 @@ struct StandbyObjectMetadata {
 
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
+    struct_pack::compatible<std::string, 4> residency_affinity_id;
 
     // The object's eviction order on the primary (its lease deadline: the
     // last write time, or last read + lease TTL), in ms since the epoch of
     // the primary's system clock. Restore ranks eviction by it, so the
     // promoted primary still evicts the coldest objects first. Absent (old
     // primary) or 0 means unknown.
-    struct_pack::compatible<uint64_t, 4> eviction_order_ms;
+    //
+    // The order comes from the old primary's clock and is capped at the new
+    // primary's clock at restore. Both nodes should keep synchronized clocks
+    // (NTP or similar). If the new primary's clock runs behind the old one,
+    // the newest restored objects are capped to the same instant and tie, so
+    // they evict in arbitrary order among themselves. They still rank older
+    // than any object written after promotion.
+    struct_pack::compatible<uint64_t, 5> eviction_order_ms;
 
     StandbyObjectMetadata() = default;
 
     YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, group_id,
              data_type, hard_pinned, session_id, object_checksum,
-             eviction_order_ms);
+             residency_affinity_id, eviction_order_ms);
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -117,11 +125,13 @@ struct MetadataPayload {
 
     struct_pack::compatible<std::string, 2> session_id;
     struct_pack::compatible<uint64_t, 3> object_checksum;
+    struct_pack::compatible<std::string, 4> residency_affinity_id;
     // See StandbyObjectMetadata::eviction_order_ms.
-    struct_pack::compatible<uint64_t, 4> eviction_order_ms;
+    struct_pack::compatible<uint64_t, 5> eviction_order_ms;
 
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             hard_pinned, session_id, object_checksum, eviction_order_ms);
+             hard_pinned, session_id, object_checksum, residency_affinity_id,
+             eviction_order_ms);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata() const {
@@ -135,6 +145,7 @@ struct MetadataPayload {
         meta.eviction_order_ms = eviction_order_ms;
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         meta.hard_pinned = hard_pinned.value_or(false);
+        meta.residency_affinity_id = residency_affinity_id.value_or("");
         return meta;
     }
 };
