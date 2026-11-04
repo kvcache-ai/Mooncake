@@ -79,6 +79,7 @@ class RedisOpLogStore : public OpLogStore {
         OpLogEntry entry;
         bool sync{true};
         bool done{false};
+        bool write_failed{false};  // Protected by async_mutex_.
         ErrorCode result{ErrorCode::OK};
         size_t attempts{0};
     };
@@ -104,6 +105,7 @@ class RedisOpLogStore : public OpLogStore {
     std::vector<WriteResult> PersistEntriesNoLatest(
         redisContext* ctx,
         const std::vector<std::shared_ptr<PendingWrite>>& batch);
+    void SetWriteFailedUnlocked(PendingWrite& pending, bool failed);
     uint64_t MaxKnownSequenceUnlocked() const;
     bool HasCommittableLatestUnlocked() const;
     ErrorCode AdvanceCommittedLatestUnlocked(redisContext* ctx);
@@ -152,6 +154,7 @@ class RedisOpLogStore : public OpLogStore {
     std::set<uint64_t> persisted_sequences_ GUARDED_BY(async_mutex_);
     std::set<uint64_t> dropped_sequences_ GUARDED_BY(async_mutex_);
     uint64_t committed_sequence_id_ GUARDED_BY(async_mutex_) = 0;
+    size_t failed_write_count_ GUARDED_BY(async_mutex_) = 0;
     std::atomic<bool> async_running_{false};
     std::vector<std::thread> async_workers_;
     std::mutex async_stop_mutex_;

@@ -95,7 +95,6 @@ RedisOpLogStore::RedisOpLogStore(
 RedisOpLogStore::~RedisOpLogStore() {
     StopWriting();
     if (enable_write_) {
-        HAStatusManager::instance().SetDoctorIssue("OPLOG_WRITE_FAILED");
         HAStatusManager::instance().SetDoctorIssue("OPLOG_COMMIT_FAILED");
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -323,6 +322,7 @@ void RedisOpLogStore::StopWriting() {
         std::lock_guard<std::mutex> lock(async_mutex_);
         size_t unfinished_count = 0;
         for (auto& [seq, pending] : inflight_writes_) {
+            pending->write_failed = false;
             if (!pending->done) {
                 ++unfinished_count;
                 pending->done = true;
@@ -337,6 +337,8 @@ void RedisOpLogStore::StopWriting() {
         inflight_writes_.clear();
         persisted_sequences_.clear();
         dropped_sequences_.clear();
+        failed_write_count_ = 0;
+        HAStatusManager::instance().SetDoctorIssue("OPLOG_WRITE_FAILED");
         HAMetricManager::instance().set_oplog_async_queue_size(0);
         sync_cv_.notify_all();
     }
@@ -461,10 +463,6 @@ bool RedisOpLogStore::FinishOrRetryWrite(
     HAMetricManager::instance().observe_oplog_write_latency_us(
         write_latency_us);
     if (err != ErrorCode::OK) {
-        HAStatusManager::instance().SetDoctorIssue(
-            "OPLOG_WRITE_FAILED",
-            "sequence_id=" + std::to_string(pending->entry.sequence_id) + ": " +
-                std::string(toString(err)));
         HAMetricManager::instance().inc_oplog_write_failures();
         if (err == ErrorCode::INVALID_PARAMS) {
             CompleteWrite(pending, err);
@@ -481,10 +479,12 @@ bool RedisOpLogStore::FinishOrRetryWrite(
             if (!async_running_.load() || pending->done) {
                 return false;
             }
+            SetWriteFailedUnlocked(*pending, true);
             attempts = ++pending->attempts;
             if (IsBestEffortP2POpLog(pending->entry.op_type) &&
                 attempts >= best_effort_max_retries_) {
                 dropped_sequences_.insert(pending->entry.sequence_id);
+                SetWriteFailedUnlocked(*pending, false);
                 inflight_writes_.erase(pending->entry.sequence_id);
                 pending->done = true;
                 pending->result = ErrorCode::INTERNAL_ERROR;
@@ -509,7 +509,6 @@ bool RedisOpLogStore::FinishOrRetryWrite(
         return true;
     }
 
-    HAStatusManager::instance().SetDoctorIssue("OPLOG_WRITE_FAILED");
     CompleteWrite(pending, ErrorCode::OK);
     return false;
 }
@@ -624,6 +623,25 @@ RedisOpLogStore::PersistEntriesNoLatest(
     return results;
 }
 
+void RedisOpLogStore::SetWriteFailedUnlocked(PendingWrite& pending,
+                                             bool failed) {
+    if (pending.write_failed == failed) return;
+    pending.write_failed = failed;
+    if (failed) {
+        ++failed_write_count_;
+    } else {
+        DCHECK_GT(failed_write_count_, 0);
+        --failed_write_count_;
+    }
+    // Update the issue under the same queue lock as the per-entry state.
+    // Write/retry logs keep concrete sequence IDs and Redis errors.
+    HAStatusManager::instance().SetDoctorIssue(
+        "OPLOG_WRITE_FAILED",
+        failed_write_count_ == 0
+            ? ""
+            : "unrecovered_writes=" + std::to_string(failed_write_count_));
+}
+
 void RedisOpLogStore::UpdateWriteProgressUnlocked() {
     // In-flight includes queued, retrying and persisted-but-uncommitted work.
     // Dropped-only tails intentionally do not keep the stall timer alive.
@@ -707,6 +725,7 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
         dropped_sequences_.erase(seq_id);
         auto it = inflight_writes_.find(seq_id);
         if (it != inflight_writes_.end()) {
+            SetWriteFailedUnlocked(*it->second, false);
             it->second->done = true;
             it->second->result = ErrorCode::OK;
             inflight_writes_.erase(it);
@@ -726,6 +745,7 @@ void RedisOpLogStore::CompleteWrite(
     if (!async_running_.load() || pending->done) {
         return;
     }
+    SetWriteFailedUnlocked(*pending, false);
 
     if (result != ErrorCode::OK) {
         pending->done = true;
