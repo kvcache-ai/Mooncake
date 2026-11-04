@@ -330,14 +330,17 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 
 ### Intra-Node NVLink (nvlink_intra)
 
-**Description:** NVIDIA NVLink for GPU-to-GPU communication within a single node.
+**Description:** GPU-to-GPU copies within a single node through CUDA IPC. Despite the name, the copy
+uses whatever peer-to-peer path the driver provides: NVLink when present, otherwise PCIe P2P.
 
 **Use When:**
 - Local GPU-to-GPU transfers are needed
 - Maximizing intra-node GPU bandwidth
+- PCIe-only nodes without an RDMA NIC, where the automatic selection otherwise falls back to TCP
 
 **Requirements:**
-- NVIDIA NVLink hardware
+- GPU peer-to-peer access between the GPUs involved: NVLink, or PCIe P2P on PCIe-only systems.
+  Check with `nvidia-smi topo -p2p r`; a pair reported as `NS` cannot use this transport.
 - Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
 - Registered buffers must be legacy device allocations (`cudaMalloc` / `cuMemAlloc`), because the transport shares them with `cudaIpcGetMemHandle`. Virtual-memory allocations (`cuMemCreate`) have no such handle. In particular, PyTorch tensors allocated with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` cannot be registered: allocate the transfer buffers separately, or disable `expandable_segments` for them.
 - Peers in containers must share the IPC **and** PID namespaces, e.g. `docker run --ipc=host --pid=host` (Kubernetes: `hostIPC` plus `hostPID` or `shareProcessNamespace`). A CUDA IPC handle carries the exporting process's PID. Two containers with separate PID namespaces can hand out the same PID, and the importer then rejects the peer's handle as its own: `cudaIpcOpenMemHandle failed: invalid device context`. A typical symptom is that only the peer pairs with the same worker index fail.
@@ -349,6 +352,17 @@ export MC_INTRANODE_NVLINK=true
 ```
 
 **Note:** On a build without `USE_MNNVL=ON`, leaving `MC_INTRANODE_NVLINK` unset keeps the usual RDMA (or TCP, when no HCA is detected) selection.
+
+On a node with no HCA, that TCP fallback stages every GPU buffer through host memory and a TCP
+socket, so it is far slower than a direct peer copy. For example, on 8x H200 NVL
+(PCIe Gen5, no NVLink, no RDMA NIC), a 1 GiB GPU-to-GPU `transfer_sync_write` with the 0.3.14
+wheel measured:
+
+| Transport | GPU pair | Bandwidth |
+|---|---|---|
+| TCP (default when no HCA) | same CPU socket | 1.3 GB/s |
+| `nvlink_intra` (`MC_INTRANODE_NVLINK=true`) | same CPU socket | 52 GB/s |
+| `nvlink_intra` (`MC_INTRANODE_NVLINK=true`) | across CPU sockets | 37 GB/s |
 
 ### HIP Transport (hip)
 
