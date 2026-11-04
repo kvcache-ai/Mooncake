@@ -126,6 +126,8 @@ class HAMetricManager {
     void inc_oplog_reader_reconnects(int64_t val = 1);
     void inc_oplog_apply_failures(int64_t val = 1);
     void inc_oplog_best_effort_apply_skipped(int64_t val = 1);
+    // Counts missing-ID observations, including Redis NIL replies. A reread
+    // can count the same ID again; this is not a unique-hole count.
     void inc_oplog_confirmed_holes(int64_t val = 1);
 
     void inc_force_promotions(int64_t val = 1);
@@ -149,6 +151,8 @@ class HAMetricManager {
      */
     void inc_oplog_applied_entries(int64_t val = 1);
     int64_t get_oplog_applied_entries_total();
+    void inc_oplog_applied_noop_entries(int64_t val = 1);
+    int64_t get_oplog_applied_noop_entries_total();
 
     /**
      * @brief Increment counter for dropped PUT_END operations (late arrival
@@ -268,6 +272,7 @@ class HAMetricManager {
     ylt::metric::counter_t p2p_snapshot_resync_failures_total_;
     ylt::metric::counter_t oplog_watch_disconnections_total_;
     ylt::metric::counter_t oplog_applied_entries_total_;
+    ylt::metric::counter_t oplog_applied_noop_entries_total_;
     ylt::metric::counter_t oplog_dropped_put_end_total_;
     ylt::metric::counter_t oplog_batch_commits_total_;
     ylt::metric::counter_t oplog_sync_batch_commits_total_;

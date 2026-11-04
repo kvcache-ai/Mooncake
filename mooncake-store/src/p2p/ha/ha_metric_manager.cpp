@@ -110,7 +110,8 @@ HAMetricManager::HAMetricManager()
           "Total number of failed best-effort entries skipped by Standby"),
       oplog_confirmed_holes_total_(
           "ha_oplog_confirmed_holes_total",
-          "Total number of confirmed sparse OpLog sequence IDs"),
+          "Total missing OpLog ID observations in scanned ranges; rereads "
+          "may count the same ID again"),
       force_promotions_total_("ha_force_promotions_total",
                               "Total number of forced P2P promotions"),
       promotion_catchup_incomplete_total_(
@@ -143,6 +144,9 @@ HAMetricManager::HAMetricManager()
       oplog_applied_entries_total_(
           "ha_oplog_applied_entries_total",
           "Total number of OpLog entries successfully applied"),
+      oplog_applied_noop_entries_total_(
+          "ha_oplog_applied_noop_entries_total",
+          "Total number of NOOP OpLog entries processed by the applier"),
       oplog_dropped_put_end_total_("ha_oplog_dropped_put_end_total",
                                    "Total number of dropped PUT_END operations "
                                    "due to late arrival after "
@@ -417,6 +421,14 @@ int64_t HAMetricManager::get_oplog_applied_entries_total() {
     return static_cast<int64_t>(oplog_applied_entries_total_.value());
 }
 
+void HAMetricManager::inc_oplog_applied_noop_entries(int64_t val) {
+    oplog_applied_noop_entries_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_applied_noop_entries_total() {
+    return static_cast<int64_t>(oplog_applied_noop_entries_total_.value());
+}
+
 void HAMetricManager::inc_oplog_dropped_put_end(int64_t val) {
     oplog_dropped_put_end_total_.inc(val);
 }
@@ -535,6 +547,7 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(p2p_snapshot_resync_failures_total_);
     serialize_metric(oplog_watch_disconnections_total_);
     serialize_metric(oplog_applied_entries_total_);
+    serialize_metric(oplog_applied_noop_entries_total_);
     serialize_metric(oplog_dropped_put_end_total_);
     serialize_metric(oplog_batch_commits_total_);
     serialize_metric(oplog_sync_batch_commits_total_);

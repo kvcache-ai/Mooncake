@@ -12,9 +12,15 @@
 
 #include <unistd.h>
 #include <hiredis/hiredis.h>
+#include <xxhash.h>
 
 #include "p2p/ha/oplog/oplog_store_factory.h"
 #include "p2p/ha/oplog/redis_oplog_store.h"
+#include "p2p/ha/oplog/oplog_replicator.h"
+#include "p2p/ha/oplog/p2p_oplog_applier.h"
+#include "p2p/ha/oplog/p2p_oplog_types.h"
+#include "p2p/ha/oplog/p2p_standby_metadata_store.h"
+#include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/oplog/p2p_standby_snapshot_service.h"
 #include "p2p/master/p2p_master_service.h"
 #include "p2p/ha/redis_util.h"
@@ -179,6 +185,23 @@ class RedisOpLogStoreTest : public ::testing::Test {
         return entry;
     }
 
+    OpLogEntry MakeWithdrawEntry(uint64_t sequence_id,
+                                 const std::string& key = "redis_key") const {
+        WithdrawRoutePayload payload;
+        payload.object_key = key;
+        payload.client_id = {1, 2};
+        payload.segment_id = {3, 4};
+        OpLogEntry entry = MakeEntry(sequence_id, key, OpType_WITHDRAW_ROUTE);
+        entry.payload = SerializeP2PPayload(payload);
+        entry.checksum = static_cast<uint32_t>(XXH32(
+            entry.payload.data(), entry.payload.size(), 0));
+        entry.prefix_hash = key.empty()
+                                ? 0
+                                : static_cast<uint32_t>(
+                                      XXH32(key.data(), key.size(), 0));
+        return entry;
+    }
+
     std::string redis_endpoint_;
     std::string redis_username_;
     std::string redis_password_;
@@ -323,7 +346,8 @@ TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
 
     // seq=2 is persisted but retained in-flight because seq=1 is missing,
     // making the one-entry queue deterministically full.
-    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), false));
+    const auto remove = MakeWithdrawEntry(2);
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(remove, false));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), false));
 
@@ -336,14 +360,45 @@ TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
 
     std::vector<OpLogEntry> entries;
     ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(0, 10, entries));
-    ASSERT_EQ(1u, entries.size());
-    EXPECT_EQ(2u, entries.front().sequence_id);
+    ASSERT_EQ(2u, entries.size());
+    EXPECT_EQ(1u, entries[0].sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries[0].op_type);
+    EXPECT_EQ(2u, entries[1].sequence_id);
 
     OpLogReadProgress progress;
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(0, 10, entries, progress));
-    ASSERT_EQ(1u, entries.size());
+    ASSERT_EQ(2u, entries.size());
+    EXPECT_EQ(OpType_NOOP, entries[0].op_type);
     EXPECT_EQ(2u, progress.last_scanned_sequence_id);
+    EXPECT_TRUE(
+        FindMissingSequenceIds(0, entries, progress.last_scanned_sequence_id)
+            .empty());
+
+    auto reader = CreateReader();
+    P2PStandbyMetadataStore metadata_store;
+    const P2PRouteLocation location{UUID{1, 2}, UUID{3, 4}};
+    ASSERT_TRUE(metadata_store.PublishRoute("redis_key", location,
+                                            /*object_size=*/1024,
+                                            /*sequence_id=*/0));
+    P2POpLogApplier applier(&metadata_store, cluster_id_);
+    auto notifier = reader->CreateChangeNotifier(cluster_id_);
+    OpLogReplicator replicator(notifier.get(), &applier);
+    const auto noops_before =
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total();
+    ASSERT_TRUE(replicator.StartFromSequenceId(0));
+    for (int i = 0; i < 100 && replicator.GetLastProcessedSequenceId() < 2;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    replicator.Stop();
+    EXPECT_EQ(2u, replicator.GetLastProcessedSequenceId());
+    EXPECT_TRUE(applier.IsHealthy());
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(metadata_store.RouteExists("redis_key"));
+    EXPECT_EQ(
+        noops_before + 1,
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total());
 }
 
 TEST_F(RedisOpLogStoreTest, DroppedSequenceNeedsLaterPersistedEntry) {
@@ -384,12 +439,14 @@ TEST_F(RedisOpLogStoreTest, DroppedSequenceNeedsLaterPersistedEntry) {
     OpLogReadProgress progress;
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(0, 10, entries, progress));
-    ASSERT_EQ(2u, entries.size());
-    EXPECT_EQ(2u, entries[0].sequence_id);
-    EXPECT_EQ(3u, entries[1].sequence_id);
-    EXPECT_EQ(
-        std::vector<uint64_t>{1},
-        FindMissingSequenceIds(0, entries, progress.last_scanned_sequence_id));
+    ASSERT_EQ(3u, entries.size());
+    EXPECT_EQ(1u, entries[0].sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries[0].op_type);
+    EXPECT_EQ(2u, entries[1].sequence_id);
+    EXPECT_EQ(3u, entries[2].sequence_id);
+    EXPECT_TRUE(
+        FindMissingSequenceIds(0, entries, progress.last_scanned_sequence_id)
+            .empty());
 }
 
 TEST_F(RedisOpLogStoreTest, SparseReadLimitsScannedSequenceRange) {
@@ -410,21 +467,75 @@ TEST_F(RedisOpLogStoreTest, SparseReadLimitsScannedSequenceRange) {
     OpLogReadProgress progress;
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(0, 1000, entries, progress));
-    EXPECT_TRUE(entries.empty());
+    ASSERT_EQ(1000u, entries.size());
+    EXPECT_EQ(1u, entries.front().sequence_id);
+    EXPECT_EQ(1000u, entries.back().sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries.front().op_type);
     EXPECT_EQ(1000u, progress.last_scanned_sequence_id);
 
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(
                   progress.last_scanned_sequence_id, 1000, entries, progress));
-    EXPECT_TRUE(entries.empty());
+    ASSERT_EQ(1000u, entries.size());
+    EXPECT_EQ(1001u, entries.front().sequence_id);
+    EXPECT_EQ(2000u, entries.back().sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries.back().op_type);
     EXPECT_EQ(2000u, progress.last_scanned_sequence_id);
 
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(
                   progress.last_scanned_sequence_id, 1000, entries, progress));
-    ASSERT_EQ(1u, entries.size());
-    EXPECT_EQ(2500u, entries.front().sequence_id);
+    ASSERT_EQ(500u, entries.size());
+    EXPECT_EQ(2001u, entries.front().sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries.front().op_type);
+    EXPECT_EQ(2500u, entries.back().sequence_id);
     EXPECT_EQ(2500u, progress.last_scanned_sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, ReplaysLargeSparseRangeAcrossPollBatches) {
+    constexpr uint64_t kNoopCount = 1500;
+    constexpr uint64_t kLastSequence = kNoopCount + 1;
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(kLastSequence));
+    ASSERT_EQ(ErrorCode::OK,
+              writer->WriteOpLog(MakeWithdrawEntry(kLastSequence), false));
+
+    OpLogEntry stored;
+    for (int i = 0; i < 100; ++i) {
+        if (writer->ReadOpLog(kLastSequence, stored) == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(kLastSequence, stored.sequence_id);
+
+    auto reader = CreateReader();
+    P2PStandbyMetadataStore metadata_store;
+    const P2PRouteLocation location{UUID{1, 2}, UUID{3, 4}};
+    ASSERT_TRUE(metadata_store.PublishRoute("redis_key", location,
+                                            /*object_size=*/1024,
+                                            /*sequence_id=*/0));
+    P2POpLogApplier applier(&metadata_store, cluster_id_);
+    auto notifier = reader->CreateChangeNotifier(cluster_id_);
+    OpLogReplicator replicator(notifier.get(), &applier);
+    const auto noops_before =
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total();
+    ASSERT_TRUE(replicator.StartFromSequenceId(0));
+    for (int i = 0;
+         i < 500 && replicator.GetLastProcessedSequenceId() < kLastSequence;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    replicator.Stop();
+
+    EXPECT_EQ(kLastSequence, replicator.GetLastProcessedSequenceId());
+    EXPECT_TRUE(applier.IsHealthy());
+    EXPECT_EQ(kLastSequence + 1, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(metadata_store.RouteExists("redis_key"));
+    EXPECT_EQ(0, HAMetricManager::instance().get_oplog_pending_entries());
+    EXPECT_EQ(
+        noops_before + kNoopCount,
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total());
 }
 
 TEST_F(RedisOpLogStoreTest, FactoryRejectsInvalidAsyncConfiguration) {

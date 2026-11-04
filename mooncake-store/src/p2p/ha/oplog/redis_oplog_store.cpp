@@ -3,6 +3,7 @@
 #include "p2p/ha/oplog/redis_oplog_store.h"
 
 #include <glog/logging.h>
+#include <xxhash.h>
 
 #include <chrono>
 #include <cstring>
@@ -626,6 +627,7 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
     entries.reserve(limit);
     uint64_t next_sequence_id = effective_start + 1;
     size_t scanned_count = 0;
+    size_t missing_count = 0;
     while (next_sequence_id <= latest_sequence_id && scanned_count < limit) {
         const uint64_t remaining = latest_sequence_id - next_sequence_id + 1;
         const size_t batch_size = static_cast<size_t>(std::min<uint64_t>(
@@ -663,6 +665,14 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
             }
             RedisReplyPtr entry_reply(raw_reply);
             if (entry_reply->type == REDIS_REPLY_NIL) {
+                // The committed range has no Redis entry at this ID. Deliver
+                // a transient NOOP so the applier can advance in order.
+                OpLogEntry noop;
+                noop.sequence_id = sequence_id;
+                noop.op_type = OpType_NOOP;
+                noop.checksum = static_cast<uint32_t>(XXH32("", 0, 0));
+                entries.push_back(std::move(noop));
+                ++missing_count;
                 continue;
             }
             if (entry_reply->type != REDIS_REPLY_STRING) {
@@ -694,6 +704,10 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
         next_sequence_id += batch_size;
         scanned_count += batch_size;
         progress.last_scanned_sequence_id = next_sequence_id - 1;
+    }
+    if (missing_count > 0) {
+        HAMetricManager::instance().inc_oplog_confirmed_holes(
+            static_cast<int64_t>(missing_count));
     }
     return ErrorCode::OK;
 }

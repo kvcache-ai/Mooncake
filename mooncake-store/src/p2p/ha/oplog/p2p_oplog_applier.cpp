@@ -42,6 +42,8 @@ bool P2POpLogApplier::ApplyOpLogEntryInternal(const OpLogEntry& entry) {
         return ApplyRegisterClient(entry);
     } else if (entry.op_type == OpType_UNREGISTER_CLIENT) {
         return ApplyUnregisterClient(entry);
+    } else if (entry.op_type == OpType_NOOP) {
+        return true;
     }
     LOG(ERROR) << "P2POpLogApplier: unsupported operation"
                << ", op_type=" << static_cast<int>(entry.op_type)
@@ -260,7 +262,11 @@ bool P2POpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     expected_sequence_id_.store(entry.sequence_id + 1);
 
     // Update metrics
-    HAMetricManager::instance().inc_oplog_applied_entries();
+    if (entry.op_type == OpType_NOOP) {
+        HAMetricManager::instance().inc_oplog_applied_noop_entries();
+    } else {
+        HAMetricManager::instance().inc_oplog_applied_entries();
+    }
     HAMetricManager::instance().set_oplog_applied_sequence_id(
         static_cast<int64_t>(entry.sequence_id));
 
@@ -318,7 +324,7 @@ size_t P2POpLogApplier::ApplyOpLogEntries(
     const std::vector<OpLogEntry>& entries) {
     size_t applied_count = 0;
     for (const auto& entry : entries) {
-        if (ApplyOpLogEntry(entry)) {
+        if (ApplyOpLogEntry(entry) && entry.op_type != OpType_NOOP) {
             applied_count++;
         }
     }
@@ -481,7 +487,11 @@ size_t P2POpLogApplier::ProcessPendingEntries() {
         }
 
         expected_sequence_id_.store(entry_copy.sequence_id + 1);
-        HAMetricManager::instance().inc_oplog_applied_entries();
+        if (entry_copy.op_type == OpType_NOOP) {
+            HAMetricManager::instance().inc_oplog_applied_noop_entries();
+        } else {
+            HAMetricManager::instance().inc_oplog_applied_entries();
+        }
         HAMetricManager::instance().set_oplog_applied_sequence_id(
             static_cast<int64_t>(entry_copy.sequence_id));
 

@@ -14,6 +14,7 @@
 
 #include "mock_oplog_store.h"
 #include "p2p/ha/oplog/oplog_manager.h"
+#include "p2p/ha/ha_metric_manager.h"
 #include "types.h"
 
 using mooncake::test::MockOpLogStore;
@@ -106,6 +107,41 @@ TEST_F(OpLogApplierTest, TestApplyWithdrawRoute) {
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry2));
     EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
     EXPECT_FALSE(metadata_store_->RouteExists("key1"));
+}
+
+TEST_F(OpLogApplierTest, NoopAdvancesSequenceWithoutChangingMetadata) {
+    const auto before_noops =
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total();
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"))));
+    ASSERT_EQ(1u, metadata_store_->GetRouteKeyCount());
+
+    const auto noop = MakeEntry(2, OpType_NOOP, "", "");
+    EXPECT_EQ(0u, applier_->ApplyOpLogEntries({noop}));
+    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
+    EXPECT_EQ(1u, metadata_store_->GetRouteKeyCount());
+    EXPECT_EQ(
+        before_noops + 1,
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total());
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(noop));  // Duplicate is harmless.
+    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        3, OpType_WITHDRAW_ROUTE, "key1", MakeWithdrawPayload("key1"))));
+    EXPECT_FALSE(metadata_store_->RouteExists("key1"));
+}
+
+TEST_F(OpLogApplierTest, PendingNoopDrainsAfterPreviousEntry) {
+    const auto before_noops =
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total();
+    const auto noop = MakeEntry(2, OpType_NOOP, "", "");
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(noop));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(MakeEntry(
+        1, OpType_WITHDRAW_ROUTE, "key1", MakeWithdrawPayload("key1"))));
+    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
+    EXPECT_EQ(
+        before_noops + 1,
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total());
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
