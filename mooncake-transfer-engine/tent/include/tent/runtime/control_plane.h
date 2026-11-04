@@ -44,6 +44,9 @@ namespace tent {
 class TransferEngineImpl;
 
 struct BootstrapDesc {
+    // Version 2 clients understand retryable BootstrapRdma admission errors.
+    // Version 1 is the wire-compatible default for requests from older peers.
+    uint32_t protocol_version = 1;
     std::string local_nic_path;
     std::string peer_nic_path;
     std::vector<uint32_t> qp_num;
@@ -54,9 +57,29 @@ struct BootstrapDesc {
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
 
    public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
-                                   qp_num, local_lid, local_gid, reply_msg,
-                                   notify_qp_num);
+    friend void to_json(nlohmann::json& j, const BootstrapDesc& desc) {
+        j = nlohmann::json{{"protocol_version", desc.protocol_version},
+                           {"local_nic_path", desc.local_nic_path},
+                           {"peer_nic_path", desc.peer_nic_path},
+                           {"qp_num", desc.qp_num},
+                           {"local_lid", desc.local_lid},
+                           {"local_gid", desc.local_gid},
+                           {"reply_msg", desc.reply_msg},
+                           {"notify_qp_num", desc.notify_qp_num}};
+    }
+
+    friend void from_json(const nlohmann::json& j, BootstrapDesc& desc) {
+        desc.protocol_version = 1;
+        if (j.contains("protocol_version"))
+            j.at("protocol_version").get_to(desc.protocol_version);
+        j.at("local_nic_path").get_to(desc.local_nic_path);
+        j.at("peer_nic_path").get_to(desc.peer_nic_path);
+        j.at("qp_num").get_to(desc.qp_num);
+        j.at("local_lid").get_to(desc.local_lid);
+        j.at("local_gid").get_to(desc.local_gid);
+        j.at("reply_msg").get_to(desc.reply_msg);
+        j.at("notify_qp_num").get_to(desc.notify_qp_num);
+    }
 };
 
 // UB/URMA has Jetty, JFC and EID concepts that are not wire-compatible with

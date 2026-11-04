@@ -25,6 +25,19 @@
             "shared_quota_shm_path" : "mooncake_quota_shm",
             "max_timeout_ns": 10000000000,
             "num_lanes": 1,
+            "bootstrap_admission": {
+                "enabled": true,
+                "max_global_inflight": 4,
+                "max_per_peer_inflight": 1,
+                "max_per_device_inflight": 0,
+                "retry_after_ms": 10
+            },
+            "bootstrap_retry": {
+                "timeout_ms": 30000,
+                "base_ms": 10,
+                "max_ms": 200,
+                "jitter_ms": 20
+            },
             "device": {
                 "num_comp_channels": 1,
                 "port": 1,
