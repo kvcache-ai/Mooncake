@@ -186,7 +186,7 @@ class TransferMetadata {
 
     struct RpcMetaDesc {
         std::string ip_or_host_name;
-        uint16_t rpc_port;
+        uint16_t rpc_port{0};
         uint64_t metadata_version{0};
 #ifdef USE_BAREX
         uint16_t barex_port;
