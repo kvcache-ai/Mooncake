@@ -16,10 +16,20 @@
 
 #include "p2p/ha/oplog/localfs_oplog_store.h"
 #include "p2p/ha/oplog/oplog_store.h"
+#include "p2p/ha/oplog/p2p_oplog_applier.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/common/p2p_rpc_types.h"
 #include "types.h"
 #include "mock_oplog_store.h"
+
+namespace mooncake {
+class P2PRecordOplogTestPeer {
+   public:
+    static void RunMonitor(P2PClientManager& manager) {
+        manager.ClientMonitorFunc();
+    }
+};
+}  // namespace mooncake
 
 namespace mooncake::test {
 namespace {
@@ -29,9 +39,13 @@ class FailingOpLogStore : public OpLogStore {
     ErrorCode Init() override { return ErrorCode::OK; }
     ErrorCode WriteOpLog(const OpLogEntry& entry, bool sync) override {
         (void)entry;
-        (void)sync;
+        ++write_attempts;
+        last_sync = sync;
         return ErrorCode::INTERNAL_ERROR;
     }
+
+    size_t write_attempts{0};
+    bool last_sync{true};
     ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) override {
         (void)sequence_id;
         (void)entry;
@@ -108,7 +122,8 @@ class P2PRecordOplogTest : public ::testing::Test {
     }
 
     void RegisterClient(P2PMasterService& service, const UUID& client_id,
-                        const P2PSegment& segment) const {
+                        const P2PSegment& segment,
+                        bool send_heartbeat = true) const {
         P2PRegisterClientRequest req;
         req.client_id = client_id;
         req.ip_address = "127.0.0.1";
@@ -116,6 +131,7 @@ class P2PRecordOplogTest : public ::testing::Test {
         req.segments = {segment};
         auto result = service.RegisterClient(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
+        if (!send_heartbeat) return;
         P2PHeartbeatRequest heartbeat;
         heartbeat.client_id = client_id;
         heartbeat.service_state = P2PClientServiceState::ONLINE;
@@ -190,6 +206,103 @@ class P2PRecordOplogTest : public ::testing::Test {
     static constexpr const char* kClusterId = "p2p-record-oplog-test";
     std::filesystem::path test_dir_;
 };
+
+TEST_F(P2PRecordOplogTest, CrashRecordsUnregisterAndCleansStandbyReplicas) {
+    auto config = MakeConfig();
+    config.client_lifecycle.live_ttl_seconds = 0;
+    config.client_lifecycle.crashed_ttl_seconds = 1;
+    P2PMasterService service(config);
+    service.GetClientManager().Stop();
+
+    const UUID client_id{1, 1};
+    const UUID segment_id{2, 2};
+    const UUID second_segment_id{3, 3};
+    RegisterClient(service, client_id, MakeSegment(segment_id),
+                   /*send_heartbeat=*/false);
+    MountSegment(service, MakeSegment(second_segment_id), client_id);
+    PublishRoute(service, "first", client_id, segment_id);
+    PublishRoute(service, "second", client_id, second_segment_id);
+    auto* manager = service.GetOpLogManager();
+    ASSERT_NE(manager, nullptr);
+    EXPECT_EQ(manager->GetLastSequenceId(), 4u);
+
+    P2PStandbyMetadataStore standby;
+    P2POpLogApplier applier(&standby, kClusterId);
+    for (uint64_t sequence_id = 1; sequence_id <= 4; ++sequence_id) {
+        ASSERT_TRUE(applier.ApplyOpLogEntry(ReadEntry(sequence_id)));
+    }
+    auto standby_metadata = standby.ExportMetadata();
+    EXPECT_EQ(standby_metadata.routes.size(), 2u);
+    ASSERT_NE(standby_metadata.clients.find(client_id),
+              standby_metadata.clients.end());
+    EXPECT_EQ(standby_metadata.clients.at(client_id).segments.size(), 2u);
+
+    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    auto client = service.GetClientManager().GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    EXPECT_EQ(client->get_health_state().status,
+              P2PClientStatus::DISCONNECTION);
+    EXPECT_EQ(manager->GetLastSequenceId(), 4u);
+    EXPECT_EQ(service.GetKeyCount(), 2u);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    EXPECT_EQ(service.GetClientManager().GetClient(client_id), nullptr);
+    EXPECT_EQ(service.GetKeyCount(), 0u);
+    ASSERT_EQ(manager->GetLastSequenceId(), 5u);
+
+    tl::expected<uint64_t, ErrorCode> committed_sequence_id;
+    for (int attempts = 0; attempts < 1000; ++attempts) {
+        committed_sequence_id = manager->GetLocalCommittedSequenceId();
+        if (committed_sequence_id.has_value() &&
+            committed_sequence_id.value() >= 5) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(committed_sequence_id.has_value());
+    ASSERT_EQ(5u, committed_sequence_id.value());
+
+    auto entry = ReadEntry(5);
+    EXPECT_EQ(entry.op_type, OpType_UNREGISTER_CLIENT);
+    UnregisterClientPayload payload;
+    ASSERT_TRUE(DeserializeP2PPayload(entry.payload, payload));
+    EXPECT_EQ(payload.client_id, client_id);
+
+    ASSERT_TRUE(applier.ApplyOpLogEntry(entry));
+    auto exported = standby.ExportMetadata();
+    EXPECT_TRUE(exported.clients.empty());
+    EXPECT_TRUE(exported.routes.empty());
+
+    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    EXPECT_EQ(manager->GetLastSequenceId(), 5u);
+}
+
+TEST_F(P2PRecordOplogTest, CrashEnqueueFailureStillCleansLocallyWithoutRetry) {
+    auto config = MakeConfig();
+    config.client_lifecycle.live_ttl_seconds = 0;
+    config.client_lifecycle.crashed_ttl_seconds = 0;
+    P2PMasterService service(config);
+    service.GetClientManager().Stop();
+
+    const UUID client_id{1, 1};
+    const UUID segment_id{2, 2};
+    RegisterClient(service, client_id, MakeSegment(segment_id),
+                   /*send_heartbeat=*/false);
+    PublishRoute(service, "key", client_id, segment_id);
+
+    auto failing_store = std::make_shared<FailingOpLogStore>();
+    service.GetOpLogManager()->SetOpLogStore(failing_store);
+    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+
+    EXPECT_EQ(service.GetClientManager().GetClient(client_id), nullptr);
+    EXPECT_EQ(service.GetKeyCount(), 0u);
+    EXPECT_EQ(failing_store->write_attempts, 1u);
+    EXPECT_FALSE(failing_store->last_sync);
+
+    P2PRecordOplogTestPeer::RunMonitor(service.GetClientManager());
+    EXPECT_EQ(failing_store->write_attempts, 1u);
+}
 
 TEST_F(P2PRecordOplogTest, RegisterClientRecordsOplog) {
     P2PMasterService service(MakeConfig());

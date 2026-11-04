@@ -71,6 +71,26 @@ void P2PMasterService::InitializeClientManager() {
         [this](const P2PRouteLocation& location) {
             OnSegmentRemoved(location);
         });
+    client_manager_->SetClientCrashedCallback([this](const UUID& client_id) {
+        auto* manager = GetOpLogManager();
+        if (!manager) return;
+
+        UnregisterClientPayload payload;
+        payload.client_id = client_id;
+        // Only enqueue here: failed admission must not prevent local
+        // cleanup. Admitted entries use the existing required-entry retry
+        // policy.
+        auto result = manager->AppendAndPersist(OpType_UNREGISTER_CLIENT, "",
+                                                SerializeP2PPayload(payload),
+                                                /*sync=*/false);
+        if (!result) {
+            LOG_EVERY_N(WARNING, 100)
+                << "P2P client crash: failed to enqueue unregister oplog; "
+                   "continuing local cleanup without retry"
+                << ", client_id=" << client_id
+                << ", error=" << toString(result.error());
+        }
+    });
 }
 
 std::optional<P2PRouteEntry> P2PMasterService::GetRouteSnapshot(

@@ -20,6 +20,8 @@
 
 namespace mooncake {
 
+class P2PRecordOplogTestPeer;
+
 /**
  * @brief Manages P2P clients' lifecycle and heartbeat state.
  */
@@ -73,7 +75,16 @@ class P2PClientManager final {
         std::function<void(const P2PRouteLocation& location)>;
     void SetSegmentRemovalCallback(SegmentRemovalCallback cb);
 
+    // Set before Start(). Called once on a transition to CRASHED, before the
+    // monitor recycles metadata, while clients_mutex_ is held shared. The
+    // callback must not reenter P2PClientManager or wait for remote
+    // persistence; this ordering ensures cleanup happens before ID reuse.
+    using ClientCrashedCallback = std::function<void(const UUID& client_id)>;
+    void SetClientCrashedCallback(ClientCrashedCallback cb);
+
    private:
+    friend class P2PRecordOplogTestPeer;
+
     static constexpr uint64_t kClientMonitorSleepMs = 1000;
 
     void ClientMonitorFunc();
@@ -91,6 +102,7 @@ class P2PClientManager final {
     const int64_t crash_timeout_sec_;
     const ViewVersionId view_version_;
     SegmentRemovalCallback segment_removal_cb_;
+    ClientCrashedCallback client_crashed_cb_;
 };
 
 }  // namespace mooncake
