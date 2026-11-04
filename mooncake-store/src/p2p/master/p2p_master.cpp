@@ -88,7 +88,11 @@ void UpdateHAStatusFromStandby(P2PHotStandbyService& standby) {
     const auto status = standby.GetSyncStatus();
     auto& ha_status = HAStatusManager::instance();
     ha_status.SetRoleState("standby", StandbyStateToString(status.state));
-    ha_status.SetOpLogProgress(status.applied_seq_id, status.primary_seq_id);
+    ha_status.SetOpLogProgress(
+        status.applied_seq_id,
+        status.primary_seq_id_known
+            ? std::optional<uint64_t>(status.primary_seq_id)
+            : std::nullopt);
     ha_status.SetSnapshotReady(standby.IsReadyForSnapshot());
     ha_status.SetDoctorIssue(
         "OPLOG_APPLY_FAILED",
@@ -200,7 +204,8 @@ int P2PMaster::RunStandalone() {
     HAStatusManager::instance().Configure(
         /*ha_enabled=*/false, config_.cluster_id,
         config_.rpc.address + ":" + std::to_string(config_.rpc.port),
-        config_.oplog.latest_stall_timeout_sec);
+        config_.oplog.latest_stall_timeout_sec,
+        config_.oplog.catchup_stall_timeout_sec);
     HAStatusManager::instance().SetRoleState("disabled", "STANDALONE");
     auto server = CreateRpcServer(config_);
     auto active_service = CreateActiveService(config_, /*view_version=*/0);
@@ -210,7 +215,8 @@ int P2PMaster::RunStandalone() {
 int P2PMaster::RunWithHA() {
     HAStatusManager::instance().Configure(
         /*ha_enabled=*/true, config_.cluster_id, "",
-        config_.oplog.latest_stall_timeout_sec);
+        config_.oplog.latest_stall_timeout_sec,
+        config_.oplog.catchup_stall_timeout_sec);
 #ifdef STORE_USE_REDIS
     std::string master_instance_id;
     if (config_.oplog.enabled &&

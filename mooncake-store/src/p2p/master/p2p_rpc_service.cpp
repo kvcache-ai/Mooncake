@@ -27,7 +27,8 @@ P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
     HAStatusManager::instance().Configure(
         config.ha.enabled, config.cluster_id,
         config.rpc.address + ":" + std::to_string(config.rpc.port),
-        config.oplog.latest_stall_timeout_sec);
+        config.oplog.latest_stall_timeout_sec,
+        config.oplog.catchup_stall_timeout_sec);
 }
 
 P2PMasterRpcService::~P2PMasterRpcService() {

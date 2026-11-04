@@ -75,7 +75,8 @@ class HAStatusManager {
     void Reset();
     void Configure(bool ha_enabled, std::string cluster_id,
                    std::string local_endpoint,
-                   uint32_t oplog_latest_stall_timeout_sec = 10);
+                   uint32_t oplog_latest_stall_timeout_sec = 10,
+                   uint32_t oplog_catchup_stall_timeout_sec = 10);
     void SetRoleState(std::string role, std::string state);
     void SetInstanceId(std::string instance_id);
     void SetLeader(std::string leader_endpoint, uint64_t epoch);
@@ -84,7 +85,7 @@ class HAStatusManager {
                        std::string instance_id = "");
     void SetSnapshotReady(bool snapshot_ready);
     void SetOpLogProgress(uint64_t applied_sequence_id,
-                          uint64_t latest_sequence_id,
+                          std::optional<uint64_t> latest_sequence_id,
                           uint64_t trimmed_sequence_id = 0,
                           uint64_t gc_cursor_sequence_id = 0);
     void SetLastError(std::string error);
@@ -110,6 +111,7 @@ class HAStatusManager {
     static int64_t NowMs();
     void TouchLocked();
     std::string OpLogLatestStallMessageLocked() const;
+    std::string OpLogCatchUpStallMessageLocked() const;
 
     mutable std::mutex mutex_;
     HAStatusSnapshot status_;
@@ -121,6 +123,12 @@ class HAStatusManager {
         std::optional<std::chrono::steady_clock::time_point> stalled_since;
     } oplog_writer_;
     uint32_t oplog_latest_stall_timeout_sec_{10};
+    struct OpLogCatchUpProgress {
+        bool latest_known{false};
+        std::optional<std::chrono::steady_clock::time_point> stalled_since;
+        std::chrono::steady_clock::time_point last_observed_at;
+    } oplog_catchup_;
+    uint32_t oplog_catchup_stall_timeout_sec_{10};
 };
 
 }  // namespace mooncake

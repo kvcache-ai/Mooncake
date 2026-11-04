@@ -54,7 +54,8 @@ request.
   recorded.
 - `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect, snapshot
   recovery, registry heartbeat, or fatal HA failure is recorded, or pending OpLogs
-  exceed the configured latest stall timeout.
+  exceed the configured latest stall timeout, or a watching standby stops applying
+  known pending OpLogs beyond the catch-up stall timeout.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
   recorded failure. This endpoint is not a readiness or cluster health check.
 
@@ -76,6 +77,15 @@ writer stops. New entries and retries do not restart it. Idle time,
 dropped-only tails, and rewrites at or below the committed latest are excluded.
 This diagnoses stalled commits, not slow but continuing progress. The message is
 concise, for example `latest=100, pending=3, stalled_ms=12000`.
+
+`OPLOG_CATCHUP_STALLED` means a standby in `WATCHING` has known backlog
+(`latest > applied`) without applied progress for
+`oplog_catchup_stall_timeout_sec` (default 10 seconds; 0 disables this check).
+The timer starts when a valid progress sample first shows backlog, restarts on
+applied progress, and clears on catch-up, leaving `WATCHING`, disabling HA, or
+starting a new HA round. Latest growth does not restart it; a failed latest read
+retains the last successful sample. The message is concise, for example
+`applied=100, latest=200, stalled_ms=12000`.
 
 `OPLOG_READ_FAILED` persists across reader reconnects until an actual poll
 succeeds (including an empty poll), or the standby stops or is promoted.

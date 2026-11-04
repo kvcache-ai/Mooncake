@@ -56,16 +56,20 @@ void HAStatusManager::Reset() {
     status_ = HAStatusSnapshot{};
     doctor_issues_.clear();
     oplog_writer_ = {};
+    oplog_catchup_ = {};
     oplog_latest_stall_timeout_sec_ = 10;
+    oplog_catchup_stall_timeout_sec_ = 10;
     TouchLocked();
 }
 
 void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
                                 std::string local_endpoint,
-                                uint32_t oplog_latest_stall_timeout_sec) {
+                                uint32_t oplog_latest_stall_timeout_sec,
+                                uint32_t oplog_catchup_stall_timeout_sec) {
     std::lock_guard<std::mutex> lock(mutex_);
     status_.ha_enabled = ha_enabled;
     oplog_latest_stall_timeout_sec_ = oplog_latest_stall_timeout_sec;
+    oplog_catchup_stall_timeout_sec_ = oplog_catchup_stall_timeout_sec;
     if (!cluster_id.empty()) {
         status_.cluster_id = std::move(cluster_id);
     }
@@ -74,6 +78,7 @@ void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
     }
     if (!ha_enabled) {
         oplog_writer_ = {};
+        oplog_catchup_ = {};
         status_.role = "disabled";
         status_.state = "disabled";
     }
@@ -88,6 +93,9 @@ void HAStatusManager::SetRoleState(std::string role, std::string state) {
     std::string new_state;
     std::lock_guard<std::mutex> lock(mutex_);
     changed = status_.role != role || status_.state != state;
+    if (role != "standby" || state != "WATCHING") {
+        oplog_catchup_ = {};
+    }
     if (changed) {
         old_role = status_.role;
         old_state = status_.state;
@@ -139,17 +147,32 @@ void HAStatusManager::SetSnapshotReady(bool snapshot_ready) {
     TouchLocked();
 }
 
-void HAStatusManager::SetOpLogProgress(uint64_t applied_sequence_id,
-                                       uint64_t latest_sequence_id,
-                                       uint64_t trimmed_sequence_id,
-                                       uint64_t gc_cursor_sequence_id) {
+void HAStatusManager::SetOpLogProgress(
+    uint64_t applied_sequence_id, std::optional<uint64_t> latest_sequence_id,
+    uint64_t trimmed_sequence_id, uint64_t gc_cursor_sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (latest_sequence_id) {
+        status_.latest_sequence_id = *latest_sequence_id;
+    }
+    if (status_.ha_enabled && status_.role == "standby" &&
+        status_.state == "WATCHING") {
+        oplog_catchup_.latest_known |= latest_sequence_id.has_value();
+        oplog_catchup_.last_observed_at = std::chrono::steady_clock::now();
+        if (!oplog_catchup_.latest_known ||
+            applied_sequence_id >= status_.latest_sequence_id) {
+            oplog_catchup_.stalled_since.reset();
+        } else if (!oplog_catchup_.stalled_since ||
+                   applied_sequence_id > status_.applied_sequence_id) {
+            oplog_catchup_.stalled_since = oplog_catchup_.last_observed_at;
+        }
+    } else {
+        oplog_catchup_ = {};
+    }
     status_.applied_sequence_id = applied_sequence_id;
-    status_.latest_sequence_id = latest_sequence_id;
     status_.trimmed_sequence_id = trimmed_sequence_id;
     status_.gc_cursor_sequence_id = gc_cursor_sequence_id;
-    status_.oplog_lag = latest_sequence_id > applied_sequence_id
-                            ? latest_sequence_id - applied_sequence_id
+    status_.oplog_lag = status_.latest_sequence_id > applied_sequence_id
+                            ? status_.latest_sequence_id - applied_sequence_id
                             : 0;
     TouchLocked();
 }
@@ -203,6 +226,10 @@ void HAStatusManager::RecordRegistryHeartbeat(ErrorCode result,
         LOG_EVERY_N(WARNING, 30)
             << "OpLog latest stalled: " << stall << ", sample_every_n=30";
     }
+    if (auto stall = OpLogCatchUpStallMessageLocked(); !stall.empty()) {
+        LOG_EVERY_N(WARNING, 30)
+            << "OpLog catch-up stalled: " << stall << ", sample_every_n=30";
+    }
     if (recovered) {
         LOG(INFO) << "Redis Master registry heartbeat recovered"
                   << ", instance_id=" << status_.instance_id
@@ -234,6 +261,7 @@ void HAStatusManager::ClearDoctorIssues() {
     std::lock_guard<std::mutex> lock(mutex_);
     doctor_issues_.clear();
     oplog_writer_ = {};
+    oplog_catchup_ = {};
 }
 
 void HAStatusManager::SetOpLogWriterRunning(bool running) {
@@ -274,6 +302,26 @@ std::string HAStatusManager::OpLogLatestStallMessageLocked() const {
                    .count());
 }
 
+std::string HAStatusManager::OpLogCatchUpStallMessageLocked() const {
+    if (!status_.ha_enabled || !oplog_catchup_.stalled_since ||
+        oplog_catchup_stall_timeout_sec_ == 0) {
+        return {};
+    }
+    // Require a later progress sample to confirm the stall. An old sample
+    // alone cannot distinguish stalled replay from delayed status sampling.
+    const auto elapsed =
+        oplog_catchup_.last_observed_at - *oplog_catchup_.stalled_since;
+    if (elapsed < std::chrono::seconds(oplog_catchup_stall_timeout_sec_)) {
+        return {};
+    }
+    return "applied=" + std::to_string(status_.applied_sequence_id) +
+           ", latest=" + std::to_string(status_.latest_sequence_id) +
+           ", stalled_ms=" +
+           std::to_string(
+               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                   .count());
+}
+
 std::string HAStatusManager::SerializeDoctorJson() const {
     HADoctorReport report;
     {
@@ -285,6 +333,10 @@ std::string HAStatusManager::SerializeDoctorJson() const {
             if (auto stall = OpLogLatestStallMessageLocked(); !stall.empty()) {
                 report.issues.push_back(
                     {"OPLOG_LATEST_STALLED", std::move(stall)});
+            }
+            if (auto stall = OpLogCatchUpStallMessageLocked(); !stall.empty()) {
+                report.issues.push_back(
+                    {"OPLOG_CATCHUP_STALLED", std::move(stall)});
             }
             if (status_.state == "FAILED") {
                 report.issues.push_back(

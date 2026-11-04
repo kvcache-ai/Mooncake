@@ -533,7 +533,6 @@ P2PStandbySyncStatus P2PHotStandbyService::GetSyncStatus() const {
     status.state = state_machine_.GetState();
     status.time_in_state = state_machine_.GetTimeInCurrentState();
     status.is_connected = state_machine_.IsConnected();
-    status.applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
     if (oplog_applier_) {
         status.apply_healthy = oplog_applier_->IsHealthy();
         status.failed_sequence_id = oplog_applier_->GetFailedSequenceId();
@@ -546,9 +545,13 @@ P2PStandbySyncStatus P2PHotStandbyService::GetSyncStatus() const {
         if (watcher_oplog_store_->GetLatestSequenceId(latest_seq) ==
             ErrorCode::OK) {
             status.primary_seq_id = latest_seq;
+            status.primary_seq_id_known = true;
         }
     }
-    if (status.primary_seq_id > status.applied_seq_id) {
+    // Replay can advance during store I/O; sample applied after that read.
+    status.applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    if (status.primary_seq_id_known &&
+        status.primary_seq_id > status.applied_seq_id) {
         status.lag_entries = status.primary_seq_id - status.applied_seq_id;
     }
     HAMetricManager::instance().set_oplog_standby_lag(

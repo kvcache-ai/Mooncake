@@ -365,6 +365,38 @@ TEST_F(P2PHotStandbyServiceTest, UsesConfiguredOpLogPollBatchSize) {
     standby.Stop();
 }
 
+TEST_F(P2PHotStandbyServiceTest, SyncStatusDistinguishesUnknownLatestFromZero) {
+    class UnknownLatestReaderStore : public ControlledReaderStore {
+       public:
+        UnknownLatestReaderStore(std::shared_ptr<ControlledNotifierState> state,
+                                 bool& fail)
+            : ControlledReaderStore(std::move(state)), fail_(fail) {}
+
+        ErrorCode GetLatestSequenceId(uint64_t& latest) override {
+            return fail_ ? ErrorCode::INTERNAL_ERROR
+                         : MockOpLogStore::GetLatestSequenceId(latest);
+        }
+
+       private:
+        bool& fail_;
+    };
+
+    bool fail_latest = false;
+    auto state = std::make_shared<ControlledNotifierState>();
+    P2PHotStandbyService standby(MakeStandbyConfig(), [&] {
+        return std::make_unique<UnknownLatestReaderStore>(state, fail_latest);
+    });
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    EXPECT_TRUE(standby.GetSyncStatus().primary_seq_id_known);
+    EXPECT_EQ(standby.GetSyncStatus().primary_seq_id, 0u);
+    fail_latest = true;
+    EXPECT_FALSE(standby.GetSyncStatus().primary_seq_id_known);
+    fail_latest = false;
+    EXPECT_TRUE(standby.GetSyncStatus().primary_seq_id_known);
+    standby.Stop();
+    EXPECT_FALSE(standby.GetSyncStatus().primary_seq_id_known);
+}
+
 TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POplog) {
     P2PMasterService master(MakeMasterConfig());
     const UUID client_id{1, 1};

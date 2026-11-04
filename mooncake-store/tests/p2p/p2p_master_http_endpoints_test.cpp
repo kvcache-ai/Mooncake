@@ -101,6 +101,14 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
+    void SetUp() override {
+        // Timed doctor tests must not let the shared fixture client expire.
+        P2PHeartbeatRequest request;
+        request.client_id = client_id_;
+        request.service_state = P2PClientServiceState::ONLINE;
+        ASSERT_TRUE(wrapped_->Heartbeat(request).has_value());
+    }
+
     // Owns the response body: resp_data::resp_body is a string_view into
     // the client's internal buffer and would dangle once the client used
     // below is destroyed.
@@ -483,6 +491,110 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
     status.SetOpLogWriteProgress(12, 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     EXPECT_EQ(doctor()["status"].asString(), "ok");
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorDetectsCatchupStallAndRecovery) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "test-standby", 10, 1);
+    status.SetRoleState("standby", "WATCHING");
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetOpLogProgress(100, 100);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    status.SetOpLogProgress(100, 200);
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // More backlog cannot restart the timer.
+    status.SetOpLogProgress(100, 300);
+    auto report = doctor();
+    EXPECT_EQ(report["status"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_CATCHUP_STALLED");
+    EXPECT_NE(report["issues"][0]["message"].asString().find(
+                  "applied=100, latest=300, stalled_ms="),
+              std::string::npos);
+    EXPECT_NE(report["status"].asString(), "ok");
+
+    // A failed latest read retains the last known latest.
+    status.SetOpLogProgress(100, std::nullopt);
+    EXPECT_EQ(status.Snapshot().latest_sequence_id, 300u);
+    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "Redis read failed");
+    report = doctor();
+    EXPECT_EQ(report["issues"].size(), 2u);
+
+    status.Configure(true, "test_cluster", "test-standby", 10, 0);
+    report = doctor();
+    EXPECT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(),
+              std::string("OPLOG_READ_FAILED"));
+    status.Configure(true, "test_cluster", "test-standby", 10, 1);
+    status.SetDoctorIssue("OPLOG_READ_FAILED");
+
+    // Applied progress restarts the timer without requiring a new latest.
+    status.SetOpLogProgress(101, std::nullopt);
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    status.SetOpLogProgress(101, std::nullopt);
+    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+    status.SetOpLogProgress(300, 300);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorCatchupStallFollowsStandbyLifecycle) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "test-standby", 10, 1);
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetRoleState("standby", "SYNCING");
+    status.SetOpLogProgress(10, 20);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_TRUE(doctor()["issues"].empty());
+    status.SetRoleState("standby", "WATCHING");
+
+    // Unknown latest cannot initialize the timer.
+    status.SetOpLogProgress(10, std::nullopt);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    status.SetOpLogProgress(10, 20);
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // No newer sample means the stall is not confirmed yet.
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    status.SetOpLogProgress(10, 20);
+    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+
+    status.SetRoleState("primary", "RUNNING");
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    status.SetRoleState("standby", "WATCHING");
+    status.SetOpLogProgress(10, 20);
+
+    // A new HA round discards the old timer and last-known latest.
+    status.ClearDoctorIssues();
+    status.SetOpLogProgress(10, std::nullopt);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    status.SetOpLogProgress(10, std::nullopt);
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    status.SetOpLogProgress(10, 20);
+
+    status.Configure(false, "test_cluster", "test-standby", 10, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_TRUE(doctor()["issues"].empty());
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,
