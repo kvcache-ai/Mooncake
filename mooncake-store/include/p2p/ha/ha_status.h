@@ -161,6 +161,7 @@ class HAStatusManager {
     // lifecycle cleanup; existing failure-path logs remain the diagnostics.
     void SetDoctorIssue(std::string code, std::string message = {});
     void ClearDoctorIssues();
+    HADoctorReport GetDoctorReport() const;
     std::string SerializeDoctorJson() const;
     // Writer events publish under its queue lock; diagnostics never take it.
     // Stopping disables late progress callbacks until the next writer starts.

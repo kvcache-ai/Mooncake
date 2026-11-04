@@ -26,6 +26,25 @@ Prometheus-compatible metrics endpoint providing detailed system metrics in text
 curl http://localhost:8080/metrics
 ```
 
+When HA metrics are exposed, each scrape includes the current local
+`/ha/doctor` diagnosis as gauges:
+
+```text
+ha_doctor_health{status="ok"} 0
+ha_doctor_health{status="degraded"} 1
+ha_doctor_health{status="unknown"} 0
+ha_doctor_issues 1
+ha_doctor_issue_active{code="OPLOG_READ_FAILED",category="oplog",component="oplog_reader",severity="error"} 1
+```
+
+The three health series are always present and exactly one is `1`.
+`ha_doctor_issues` counts active issues. `ha_doctor_issue_active` emits only
+active issues; a recovered issue disappears on the next scrape. Its labels
+match the doctor issue fields, except `message`, which is intentionally omitted
+to avoid a separate time series for each error message. The metrics are
+computed from the same local snapshot as `/ha/doctor`, including diagnoses
+derived from elapsed time.
+
 #### `/metrics/summary`
 Human-readable metrics summary with key performance indicators.
 

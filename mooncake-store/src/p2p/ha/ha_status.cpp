@@ -788,7 +788,7 @@ std::string HAStatusManager::OpLogPollStaleMessageLocked() const {
            ", timeout_sec=" + std::to_string(oplog_catchup_stall_timeout_sec_);
 }
 
-std::string HAStatusManager::SerializeDoctorJson() const {
+HADoctorReport HAStatusManager::GetDoctorReport() const {
     HADoctorReport report;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -864,8 +864,12 @@ std::string HAStatusManager::SerializeDoctorJson() const {
             }
         }
     }
+    return report;
+}
+
+std::string HAStatusManager::SerializeDoctorJson() const {
     std::string json;
-    struct_json::to_json(report, json);
+    struct_json::to_json(GetDoctorReport(), json);
     return json;
 }
 

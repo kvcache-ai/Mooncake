@@ -1,11 +1,34 @@
 #include "p2p/ha/ha_metric_manager.h"
 
+#include "p2p/ha/ha_status.h"
+
 #include <glog/logging.h>
 
+#include <initializer_list>
 #include <iomanip>
 #include <sstream>
 
 namespace mooncake {
+
+namespace {
+
+std::string EscapeLabelValue(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char c : value) {
+        if (c == '\\' || c == '"') {
+            escaped += '\\';
+            escaped += c;
+        } else if (c == '\n') {
+            escaped += "\\n";
+        } else {
+            escaped += c;
+        }
+    }
+    return escaped;
+}
+
+}  // namespace
 
 // --- Singleton Instance ---
 HAMetricManager& HAMetricManager::instance() {
@@ -646,6 +669,27 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_redis_pipeline_batch_size_);
     serialize_metric(election_duration_ms_);
     serialize_metric(oplog_apply_latency_us_);
+
+    // Doctor includes time-derived diagnoses, so recompute on every scrape.
+    const auto report = HAStatusManager::instance().GetDoctorReport();
+    ss << "# HELP ha_doctor_health Current local HA doctor health (one-hot).\n"
+          "# TYPE ha_doctor_health gauge\n";
+    for (const char* health : {"ok", "degraded", "unknown"}) {
+        ss << "ha_doctor_health{status=\"" << health << "\"} "
+           << (report.health == health ? 1 : 0) << '\n';
+    }
+    ss << "# HELP ha_doctor_issues Number of active local HA doctor issues.\n"
+          "# TYPE ha_doctor_issues gauge\n"
+          "ha_doctor_issues "
+       << report.issues.size() << '\n';
+    ss << "# HELP ha_doctor_issue_active Active local HA doctor issue.\n"
+          "# TYPE ha_doctor_issue_active gauge\n";
+    for (const auto& issue : report.issues) {
+        ss << "ha_doctor_issue_active{code=\"" << EscapeLabelValue(issue.code)
+           << "\",category=\"" << EscapeLabelValue(issue.category)
+           << "\",component=\"" << EscapeLabelValue(issue.component)
+           << "\",severity=\"" << EscapeLabelValue(issue.severity) << "\"} 1\n";
+    }
 
     return ss.str();
 }

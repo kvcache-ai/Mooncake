@@ -4,6 +4,7 @@
 #include <chrono>
 #include <mutex>
 
+#include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
 
 namespace mooncake {
@@ -226,6 +227,75 @@ TEST_F(HAStatusTest, DoctorReportsOpLogQueuePressure) {
     status.SetRoleState("primary", "RUNNING");
     status.SetOpLogWriteProgress(10, 80);
     EXPECT_EQ(FindIssue(doctor(), "OPLOG_QUEUE_PRESSURE"), nullptr);
+}
+
+TEST_F(HAStatusTest, DoctorMetricsTrackActiveIssuesAndRecovery) {
+    const auto metrics = [&] {
+        return HAMetricManager::instance().serialize_metrics();
+    };
+    EXPECT_NE(metrics().find("ha_doctor_health{status=\"ok\"} 1\n"),
+              std::string::npos);
+    EXPECT_NE(metrics().find("ha_doctor_issues 0\n"), std::string::npos);
+    EXPECT_EQ(metrics().find("ha_doctor_issue_active{"), std::string::npos);
+
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "Redis read failed");
+    auto output = metrics();
+    EXPECT_NE(output.find("ha_doctor_health{status=\"degraded\"} 1\n"),
+              std::string::npos);
+    EXPECT_NE(output.find("ha_doctor_issues 1\n"), std::string::npos);
+    EXPECT_NE(output.find("ha_doctor_issue_active{code=\"OPLOG_READ_FAILED\","
+                          "category=\"oplog\",component=\"oplog_reader\","
+                          "severity=\"error\"} 1\n"),
+              std::string::npos);
+    EXPECT_EQ(output.find("Redis read failed"), std::string::npos);
+
+    status.SetDoctorIssue("OPLOG_READ_FAILED");
+    output = metrics();
+    EXPECT_NE(output.find("ha_doctor_health{status=\"ok\"} 1\n"),
+              std::string::npos);
+    EXPECT_NE(output.find("ha_doctor_issues 0\n"), std::string::npos);
+    EXPECT_EQ(output.find("ha_doctor_issue_active{"), std::string::npos);
+
+    status.Configure(false, "test_cluster", "local");
+    EXPECT_NE(metrics().find("ha_doctor_health{status=\"unknown\"} 1\n"),
+              std::string::npos);
+}
+
+TEST_F(HAStatusTest, DoctorMetricsRecomputeDerivedIssuesAtScrapeTime) {
+    status.SetLeader("local", 1);
+    status.SetRoleState("primary", "RUNNING");
+    status.SetOpLogWriterRunning(true);
+    status.SetOpLogWriteProgress(10, 80, 100);
+
+    auto output = HAMetricManager::instance().serialize_metrics();
+    EXPECT_NE(
+        output.find("ha_doctor_issue_active{code=\"OPLOG_QUEUE_PRESSURE\","
+                    "category=\"oplog\",component=\"oplog_writer\","
+                    "severity=\"warning\"} 1\n"),
+        std::string::npos);
+    EXPECT_NE(output.find("ha_doctor_issues 1\n"), std::string::npos);
+
+    status.SetOpLogWriteProgress(10, 0, 100);
+    output = HAMetricManager::instance().serialize_metrics();
+    EXPECT_EQ(output.find("ha_doctor_issue_active{"), std::string::npos);
+    EXPECT_NE(output.find("ha_doctor_issues 0\n"), std::string::npos);
+
+    status.SetMasterView("local", 1, /*timestamp_ms=*/1, /*ttl_sec=*/2);
+    HAStatusTestPeer::AgeMasterViewRefresh(status,
+                                           std::chrono::milliseconds(4000));
+    output = HAMetricManager::instance().serialize_metrics();
+    EXPECT_NE(output.find("code=\"MASTER_VIEW_LEASE_EXPIRED\""),
+              std::string::npos);
+    status.MarkMasterViewRefreshed();
+    output = HAMetricManager::instance().serialize_metrics();
+    EXPECT_EQ(output.find("code=\"MASTER_VIEW_LEASE_EXPIRED\""),
+              std::string::npos);
+}
+
+TEST_F(HAStatusTest, DoctorMetricsEscapeIssueCodeLabels) {
+    status.SetDoctorIssue("CUSTOM_\"\\\n", "unexpected code");
+    const auto output = HAMetricManager::instance().serialize_metrics();
+    EXPECT_NE(output.find("code=\"CUSTOM_\\\"\\\\\\n\""), std::string::npos);
 }
 
 TEST_F(HAStatusTest, DoctorReportsPendingRejectionUntilReinitialization) {
