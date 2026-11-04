@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <string>
 #include <thread>
 #include <utility>
@@ -18,6 +20,7 @@
 
 #include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/localfs_oplog_store.h"
+#include "p2p/ha/oplog/polling_oplog_change_notifier.h"
 #include "mock_oplog_store.h"
 #include "p2p/master/p2p_master_service.h"
 #include "p2p/master/p2p_rpc_service.h"
@@ -63,6 +66,7 @@ struct ControlledNotifierState {
     int active_callbacks{0};
     bool healthy_on_start{true};
     bool healthy{false};
+    std::function<void()> on_health_check;
 };
 
 class ControlledNotifier : public OpLogChangeNotifier {
@@ -86,6 +90,9 @@ class ControlledNotifier : public OpLogChangeNotifier {
     }
 
     bool IsHealthy() const override {
+        if (state_->on_health_check) {
+            state_->on_health_check();
+        }
         std::lock_guard<std::mutex> lock(state_->mutex);
         return state_->healthy;
     }
@@ -916,6 +923,140 @@ TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
               std::string::npos);
     standby.Stop();
     ha_status.Reset();
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       ReadFailureSurvivesReconnectUntilSuccessfulPoll) {
+    class PollingReaderStore : public MockOpLogStore {
+       public:
+        explicit PollingReaderStore(std::atomic<bool>& reads_succeed)
+            : reads_succeed_(reads_succeed) {}
+        ErrorCode ReadOpLogSince(uint64_t, size_t,
+                                 std::vector<OpLogEntry>& entries) override {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            entries.clear();
+            return reads_succeed_.load() ? ErrorCode::OK
+                                         : ErrorCode::INTERNAL_ERROR;
+        }
+        std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
+            const std::string&, size_t poll_batch_size) override {
+            return std::make_unique<PollingOpLogChangeNotifier>(
+                this, 10, poll_batch_size);
+        }
+
+       private:
+        std::atomic<bool>& reads_succeed_;
+    };
+
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, kClusterId, "test-standby");
+    status.SetRoleState("standby", "WATCHING");
+    std::atomic<bool> reads_succeed{true};
+    std::atomic<int> readers_created{0};
+    P2PHotStandbyService standby(MakeStandbyConfig(), [&] {
+        ++readers_created;
+        return std::make_unique<PollingReaderStore>(reads_succeed);
+    });
+    auto has_read_issue = [&] {
+        return status.SerializeDoctorJson().find("OPLOG_READ_FAILED") !=
+               std::string::npos;
+    };
+    auto wait_until = [](auto predicate) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return predicate();
+    };
+
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    reads_succeed.store(false);
+    EXPECT_TRUE(wait_until([&] { return readers_created.load() >= 3; }));
+    EXPECT_TRUE(has_read_issue());
+    EXPECT_NE(status.SerializeDoctorJson().find("degraded"), std::string::npos);
+
+    const int before_reconnect = readers_created.load();
+    EXPECT_TRUE(
+        wait_until([&] { return readers_created.load() > before_reconnect; }));
+    EXPECT_TRUE(has_read_issue());
+
+    reads_succeed.store(true);
+    EXPECT_TRUE(wait_until([&] {
+        return standby.GetState() == StandbyState::WATCHING &&
+               !has_read_issue() &&
+               status.SerializeDoctorJson().find("\"ok\"") != std::string::npos;
+    }));
+
+    reads_succeed.store(false);
+    EXPECT_TRUE(wait_until(has_read_issue));
+    standby.Stop();
+    EXPECT_FALSE(has_read_issue());
+    status.Reset();
+}
+
+TEST_F(P2PHotStandbyServiceTest, StoppedRecoveryClearsIssuesBeforePromotion) {
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, kClusterId, "test-standby");
+    auto seed_issues = [&] {
+        status.SetDoctorIssue("OPLOG_RECONNECT_FAILED", "previous reconnect");
+        status.SetDoctorIssue("SNAPSHOT_RECOVERY_FAILED", "previous resync");
+    };
+    auto expect_no_recovery_issues = [&] {
+        const auto report = status.SerializeDoctorJson();
+        EXPECT_EQ(report.find("OPLOG_RECONNECT_FAILED"), std::string::npos);
+        EXPECT_EQ(report.find("SNAPSHOT_RECOVERY_FAILED"), std::string::npos);
+    };
+
+    std::promise<void> watching;
+    std::promise<void> release_recovery;
+    auto watching_future = watching.get_future();
+    auto release_future = release_recovery.get_future();
+    auto first_state = std::make_shared<ControlledNotifierState>();
+    int readers_created = 0;
+    P2PHotStandbyService standby(MakeStandbyConfig(), [&] {
+        auto state = first_state;
+        if (++readers_created > 1) {
+            state = std::make_shared<ControlledNotifierState>();
+            if (readers_created == 2) {
+                state->on_health_check = [&] {
+                    watching.set_value();
+                    release_future.wait();
+                };
+            }
+        }
+        return std::make_unique<ControlledReaderStore>(state);
+    });
+
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    seed_issues();
+    InjectNotifierErrors(first_state, ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(watching_future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+
+    std::thread stop_worker(
+        [&] { P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!P2PHotStandbyServiceTestAccess::RecoveryStopping(standby) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(P2PHotStandbyServiceTestAccess::RecoveryStopping(standby));
+    release_recovery.set_value();
+    stop_worker.join();
+    expect_no_recovery_issues();
+
+    seed_issues();
+    ASSERT_EQ(standby.Promote(), ErrorCode::OK);
+    expect_no_recovery_issues();
+    status.SetRoleState("primary", "RUNNING");
+    EXPECT_NE(status.SerializeDoctorJson().find("\"ok\""), std::string::npos);
+    standby.Stop();
+    status.Reset();
 }
 
 TEST_F(P2PHotStandbyServiceTest, CoalescesRepeatedWatchErrors) {

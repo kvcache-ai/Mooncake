@@ -52,7 +52,7 @@ request.
 
 - `ok`: the primary is running or a standby is watching, and no active issue is
   recorded.
-- `degraded`: an election/renewal, OpLog write/commit/apply/reconnect, snapshot
+- `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect, snapshot
   recovery, registry heartbeat, or fatal HA failure is recorded.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
   recorded failure. This endpoint is not a readiness or cluster health check.
@@ -65,6 +65,9 @@ snapshot fallback, and historical `last_error` alone are not failures. The
 doctor only reports failures observed by the live process and does not retain
 history across restarts. It returns HTTP 200 even when `status` is `degraded`
 or `unknown`.
+
+`OPLOG_READ_FAILED` persists across reader reconnects until an actual poll
+succeeds (including an empty poll), or the standby stops or is promoted.
 
 ### Data Management Endpoints
 

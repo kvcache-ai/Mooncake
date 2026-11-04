@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 
 namespace mooncake {
 
@@ -57,6 +58,9 @@ void PollingOpLogChangeNotifier::PollLoop() {
             last_seq, poll_batch_size_, entries, progress);
         std::vector<uint64_t> missing_sequence_ids;
         if (err == ErrorCode::OK) {
+            // Keep the issue active until an actual poll succeeds, even if it
+            // returns no entries. Restarting the reader must not clear it.
+            HAStatusManager::instance().SetDoctorIssue("OPLOG_READ_FAILED");
             missing_sequence_ids = FindMissingSequenceIds(
                 last_seq, entries, progress.last_scanned_sequence_id);
             HAMetricManager::instance()
@@ -79,6 +83,12 @@ void PollingOpLogChangeNotifier::PollLoop() {
                 on_entry_(entry);
             }
         } else if (err != ErrorCode::OK) {
+            // Store and replicator logs already describe the failure; persist
+            // the doctor issue across notifier restarts.
+            HAStatusManager::instance().SetDoctorIssue(
+                "OPLOG_READ_FAILED",
+                "Read after seq=" + std::to_string(last_seq) + ": " +
+                    std::string(toString(err)));
             HAMetricManager::instance().inc_oplog_read_failures();
             if (on_error_) {
                 on_error_(err);

@@ -345,6 +345,7 @@ void P2PHotStandbyService::Stop() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     ResetOplogFollowingLocked();
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_READ_FAILED");
 
     StandbyState state = state_machine_.GetState();
     if (state != StandbyState::STOPPED) {
@@ -443,6 +444,9 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
     }
 
     ResetOplogFollowingLocked();
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_READ_FAILED");
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_RECONNECT_FAILED");
+    HAStatusManager::instance().SetDoctorIssue("SNAPSHOT_RECOVERY_FAILED");
     LOG(INFO) << "P2PHotStandbyService promoted"
               << ", latest_applied_sequence_id="
               << GetLocalLastAppliedSequenceIdLocked();
@@ -986,15 +990,20 @@ void P2PHotStandbyService::RecoveryLoop() {
                 }
             }
 
+            if (err == ErrorCode::OK) {
+                // Commit successful recovery diagnostics before Promote can
+                // acquire mutex_ and stop this worker.
+                HAStatusManager::instance().SetDoctorIssue(
+                    "SNAPSHOT_RECOVERY_FAILED");
+                HAStatusManager::instance().SetDoctorIssue(
+                    "OPLOG_RECONNECT_FAILED");
+            }
+
             recovery_lock.lock();
             if (recovery_stopping_.load()) {
                 return;
             }
             if (err == ErrorCode::OK) {
-                HAStatusManager::instance().SetDoctorIssue(
-                    "SNAPSHOT_RECOVERY_FAILED");
-                HAStatusManager::instance().SetDoctorIssue(
-                    "OPLOG_RECONNECT_FAILED");
                 if (!attempted_snapshot_resync) {
                     HAMetricManager::instance().inc_oplog_reader_reconnects();
                     LOG(INFO)
