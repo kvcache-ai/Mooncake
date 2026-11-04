@@ -116,6 +116,15 @@ std::string buildMetadataKey(const std::string& segment_name) {
 }
 
 #ifndef _WIN32
+std::error_code connectToLoopback(uint16_t port) {
+    asio::io_context io_context;
+    asio::ip::tcp::socket socket(io_context);
+    std::error_code ec;
+    socket.connect(
+        asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), port), ec);
+    return ec;
+}
+
 uint16_t reserveUnusedTcpPort() {
     asio::io_context io_context;
     asio::ip::tcp::acceptor acceptor(
@@ -170,6 +179,12 @@ class TestHttpMetadataServer {
 
     size_t deleteRequests() const { return delete_requests_.load(); }
 
+    uint16_t rejectedRpcPort() const { return rejected_rpc_port_.load(); }
+
+    bool rejectedRpcWasReachable() const {
+        return rejected_rpc_reachable_.load();
+    }
+
     std::optional<std::string> getStoredValue(const std::string& key) const {
         std::lock_guard<std::mutex> lock(store_mutex_);
         auto it = store_.find(key);
@@ -221,6 +236,12 @@ class TestHttpMetadataServer {
                 }
 
                 if (reject_writes_) {
+                    const std::string address =
+                        json::parse(req.get_body()).at("rpc_server_addr");
+                    const auto port = static_cast<uint16_t>(
+                        std::stoul(address.substr(address.rfind(':') + 1)));
+                    rejected_rpc_reachable_ = !connectToLoopback(port);
+                    rejected_rpc_port_ = port;
                     resp.set_status_and_content(
                         status_type::service_unavailable, "unavailable");
                     return;
@@ -270,6 +291,8 @@ class TestHttpMetadataServer {
     uint16_t port_;
     bool reject_writes_;
     std::atomic<size_t> delete_requests_{0};
+    std::atomic<uint16_t> rejected_rpc_port_{0};
+    std::atomic<bool> rejected_rpc_reachable_{false};
     bool started_ = false;
     bool running_ = false;
     std::unique_ptr<coro_http::coro_http_server> server_;
@@ -796,6 +819,14 @@ TEST(TransferEngineConfigOverrideTest,
         TransferEngine engine(conf);
         EXPECT_FALSE(engine.available());
         EXPECT_EQ(engine.getRpcServerPort(), 0);
+        // Observe the actual address sent during PUT, not the cleared getter.
+        // The listener was live before rejection and must be closed while the
+        // failed engine is still alive, without waiting for its destructor.
+        ASSERT_NE(server.rejectedRpcPort(), 0);
+        ASSERT_TRUE(server.rejectedRpcWasReachable());
+        EXPECT_EQ(
+            connectToLoopback(server.rejectedRpcPort()),
+            asio::error::make_error_code(asio::error::connection_refused));
         EXPECT_EQ(server.getStoredValue(key), original);
         EXPECT_EQ(server.deleteRequests(), 0);
     }

@@ -737,7 +737,10 @@ class TestTransferEngineInitialization(unittest.TestCase):
             for selector in ("MC_USE_TENT", "MC_USE_TEV1"):
                 with self.subTest(selector=selector):
                     self.assertEqual(
-                        self.initialize([connection], selector=selector), [-1]
+                        self.initialize(
+                            [connection, "P2PHANDSHAKE"], selector=selector
+                        ),
+                        [-1, 0],
                     )
                     self.assertEqual(entries, {key: b'{"owner":"existing"}'})
                     self.assertEqual(deleted, [])

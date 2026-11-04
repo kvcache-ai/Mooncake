@@ -1492,12 +1492,15 @@ int rejectTentMetadataAndRetry() {
 #ifdef MOONCAKE_TENT_HAS_HTTP
         std::erase(connections, "http://127.0.0.1:1/metadata");
 #endif
+        const int before = openSocketCount();
+        if (before < 0) return 6;
         for (const auto &connection : connections) {
             for (int attempt = 0; attempt < 4; ++attempt) {
                 if (engine.init(connection, "127.0.0.1", "", 0, "tcp") !=
                     ERR_CONTEXT)
                     return 2;
                 if (engine.getRpcPort() != 0) return 3;
+                if (openSocketCount() != before) return 7;
             }
         }
         if (engine.init(P2PHANDSHAKE, "127.0.0.1", "", 0, "tcp") != 0) return 4;
