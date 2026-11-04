@@ -2,7 +2,13 @@
 option(USE_ASCEND_CACHE_TIER "Enable Ascend NPU cache tier support" OFF)
 option(USE_ASCEND_DRAM_TIER "Enable Ascend ACL Host memory for DRAM tier (aclrtMallocHost)" OFF)
 
-set(MOONCAKE_P2P_MASTER_SOURCES
+set(MOONCAKE_STORE_P2P_SHARED_SOURCES
+    util/metric_util.cpp
+    ha/p2p_master_view.cpp
+    ha/ha_metric_manager.cpp
+)
+
+set(MOONCAKE_STORE_P2P_MASTER_SOURCES
     master/p2p_route_table.cpp
     master/p2p_master_service.cpp
     master/p2p_master_metric_manager.cpp
@@ -12,7 +18,6 @@ set(MOONCAKE_P2P_MASTER_SOURCES
     master/p2p_client_meta.cpp
     master/p2p_client_manager.cpp
     master/client_metrics_aggregator.cpp
-    util/metric_util.cpp
     ha/oplog/oplog_manager.cpp
     ha/oplog/oplog_serializer.cpp
     ha/oplog/localfs_oplog_store.cpp
@@ -25,8 +30,6 @@ set(MOONCAKE_P2P_MASTER_SOURCES
     ha/oplog/p2p_hot_standby_service.cpp
     ha/oplog/p2p_standby_snapshot_service.cpp
     ha/standby_state_machine.cpp
-    ha/p2p_master_view.cpp
-    ha/ha_metric_manager.cpp
 )
 
 # Find hiredis for Redis election backend
@@ -34,20 +37,22 @@ if(STORE_USE_REDIS)
     find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
     find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
     message(STATUS "Found hiredis: include=${HIREDIS_INCLUDE_DIR} lib=${HIREDIS_LIB}")
-    list(APPEND MOONCAKE_P2P_MASTER_SOURCES ha/redis_util.cpp)
-    list(APPEND MOONCAKE_P2P_MASTER_SOURCES ha/redis_election_helper.cpp)
-    list(APPEND MOONCAKE_P2P_MASTER_SOURCES ha/oplog/redis_oplog_store.cpp)
-    foreach(target mooncake_store mooncake_master_core)
+    list(APPEND MOONCAKE_STORE_P2P_SHARED_SOURCES
+        ha/redis_util.cpp
+        ha/redis_election_helper.cpp
+    )
+    list(APPEND MOONCAKE_STORE_P2P_MASTER_SOURCES ha/oplog/redis_oplog_store.cpp)
+    foreach(target mooncake_store mooncake_master_support mooncake_master_core)
         target_include_directories(${target} PUBLIC ${HIREDIS_INCLUDE_DIR})
         target_link_libraries(${target} PUBLIC ${HIREDIS_LIB})
     endforeach()
     target_compile_definitions(mooncake_store PUBLIC STORE_USE_REDIS)
 endif()
 
-set(MOONCAKE_STORE_P2P_SOURCES
-    ${MOONCAKE_P2P_MASTER_SOURCES}
+set(MOONCAKE_STORE_P2P_CLIENT_SOURCES
     master/p2p_master_client.cpp
     client/p2p_client_service.cpp
+    client/p2p_real_client.cpp
     client/p2p_client_metric.cpp
     client/peer_client.cpp
     client/client_rpc_service.cpp
@@ -96,7 +101,7 @@ set(MOONCAKE_STORE_P2P_SOURCES
 
 # Ascend Cache Tier support
 if(USE_ASCEND_CACHE_TIER)
-  list(APPEND MOONCAKE_STORE_P2P_SOURCES client/tiered_cache/tiers/ascend_tier.cpp)
+  list(APPEND MOONCAKE_STORE_P2P_CLIENT_SOURCES client/tiered_cache/tiers/ascend_tier.cpp)
   message(STATUS "Ascend Cache Tier enabled")
 endif()
 
@@ -106,10 +111,17 @@ if(USE_ASCEND_DRAM_TIER)
 endif()
 
 target_sources(mooncake_store PRIVATE
-    ${MOONCAKE_STORE_P2P_SOURCES}
-    client/p2p_real_client.cpp
+    ${MOONCAKE_STORE_P2P_SHARED_SOURCES}
+    ${MOONCAKE_STORE_P2P_MASTER_SOURCES}
+    ${MOONCAKE_STORE_P2P_CLIENT_SOURCES}
 )
-target_sources(mooncake_master_core PRIVATE ${MOONCAKE_P2P_MASTER_SOURCES})
+target_sources(mooncake_master_support PRIVATE
+    ${MOONCAKE_STORE_P2P_SHARED_SOURCES}
+)
+target_compile_definitions(mooncake_master_support PUBLIC MOONCAKE_STORE_CLIENT_P2P)
+target_sources(mooncake_master_core PRIVATE
+    ${MOONCAKE_STORE_P2P_MASTER_SOURCES}
+)
 target_sources(mooncake_master PRIVATE master/p2p_master_main.cpp)
 target_sources(mooncake_client PRIVATE client/p2p_real_client_main.cpp)
 
@@ -132,7 +144,7 @@ else()
   )
 endif()
 
-# Both targets compile OpLog; neutral master support does not consume xxHash.
+# Both targets compile OpLog; the shared source group does not consume xxHash.
 # PUBLIC usage requirements also reach the P2P test consumers.
 foreach(target mooncake_store mooncake_master_core)
     target_compile_definitions(${target} PUBLIC MOONCAKE_STORE_CLIENT_P2P)
