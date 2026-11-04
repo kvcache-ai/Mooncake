@@ -110,6 +110,26 @@ class SparseReadOpLogStore : public MockOpLogStore {
     }
 };
 
+class MissingOnlyProgressOpLogStore : public MockOpLogStore {
+   public:
+    ErrorCode ReadOpLogSinceWithProgress(uint64_t start_sequence_id,
+                                         size_t limit,
+                                         std::vector<OpLogEntry>& entries,
+                                         OpLogReadProgress& progress) override {
+        ++read_count_;
+        entries.clear();
+        progress.last_scanned_sequence_id = start_sequence_id < 3000
+                                                ? start_sequence_id + limit
+                                                : start_sequence_id;
+        return ErrorCode::OK;
+    }
+
+    int ReadCount() const { return read_count_.load(); }
+
+   private:
+    std::atomic<int> read_count_{0};
+};
+
 class BatchRecordingOpLogStore : public MockOpLogStore {
    public:
     ErrorCode ReadOpLogSinceWithProgress(uint64_t start_sequence_id,
@@ -288,6 +308,23 @@ TEST(PollingOpLogChangeNotifierTest, ReportsMiddleAndTrailingGaps) {
 
     EXPECT_GT(maintenance_count.load(), 0);
     EXPECT_EQ(2u, max_missing_count.load());
+}
+
+TEST(PollingOpLogChangeNotifierTest, DoesNotSleepWhenOnlyMissingRangeAdvances) {
+    MissingOnlyProgressOpLogStore store;
+    PollingOpLogChangeNotifier notifier(&store, /*poll_interval_ms=*/1000);
+
+    ASSERT_EQ(
+        ErrorCode::OK,
+        notifier.Start(/*start_sequence_id=*/0, [](const OpLogEntry&) {},
+                       [](ErrorCode) {}, [](const std::vector<uint64_t>&) {}));
+
+    for (int i = 0; i < 50 && store.ReadCount() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    notifier.Stop();
+
+    EXPECT_GE(store.ReadCount(), 2);
 }
 
 TEST(PollingOpLogChangeNotifierTest, UsesConfiguredBatchSize) {

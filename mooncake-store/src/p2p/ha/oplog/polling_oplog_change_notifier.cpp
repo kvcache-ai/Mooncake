@@ -70,18 +70,14 @@ void PollingOpLogChangeNotifier::PollLoop() {
             }
         }
 
+        const bool made_progress = err == ErrorCode::OK &&
+                                   progress.last_scanned_sequence_id > last_seq;
+
         if (err == ErrorCode::OK && !entries.empty()) {
             for (const auto& entry : entries) {
                 if (!running_.load()) break;
                 on_entry_(entry);
             }
-            last_scanned_sequence_id_.store(progress.last_scanned_sequence_id);
-            healthy_.store(true);
-            if (on_maintenance_) {
-                on_maintenance_(missing_sequence_ids);
-            }
-            // Data available — poll again immediately to drain backlog
-            continue;
         } else if (err != ErrorCode::OK) {
             HAMetricManager::instance().inc_oplog_read_failures();
             if (on_error_) {
@@ -92,9 +88,15 @@ void PollingOpLogChangeNotifier::PollLoop() {
 
         if (err == ErrorCode::OK) {
             last_scanned_sequence_id_.store(progress.last_scanned_sequence_id);
+            healthy_.store(true);
         }
         if (on_maintenance_) {
             on_maintenance_(missing_sequence_ids);
+        }
+        if (made_progress) {
+            // Keep draining backlog even when the scanned range only contained
+            // confirmed missing entries.
+            continue;
         }
 
         // Interruptible sleep: wakes immediately on Stop()
