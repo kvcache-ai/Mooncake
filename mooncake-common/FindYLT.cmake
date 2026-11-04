@@ -11,6 +11,14 @@ if(APPLE)
   set(YLT_ENABLE_IBV
       OFF
       CACHE BOOL "Enable yalantinglibs ibverbs support")
+elseif(USE_SHCA)
+  # SHCA redefines IB LID as u17, which stock yalanting ib_socket.hpp cannot
+  # compile against. Control-plane RPC stays on TCP here; data-plane RDMA goes
+  # through Transfer Engine / SHCA, not yalanting ibverbs.
+  set(YLT_ENABLE_IBV
+      OFF
+      CACHE BOOL "Enable yalantinglibs ibverbs support" FORCE)
+  message(STATUS "USE_SHCA=ON: forcing YLT_ENABLE_IBV=OFF")
 else()
   set(YLT_ENABLE_IBV
       ON
