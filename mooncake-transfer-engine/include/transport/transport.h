@@ -360,7 +360,22 @@ class Transport {
                                                      std::memory_order_acq_rel);
 #else
             // EDC waiters can freeBatchID after the CV without a walk.
-            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
+#ifdef WITH_METRICS
+            // Save the outcome only for tasks the metrics record.
+            if (task->start_time.time_since_epoch().count() != 0) {
+                __atomic_store_n(
+                    &task->end_ticks,
+                    std::chrono::steady_clock::now().time_since_epoch().count(),
+                    __ATOMIC_RELAXED);
+                const bool failed = __atomic_load_n(&task->failed_slice_count,
+                                                    __ATOMIC_ACQUIRE) != 0;
+                __atomic_store_n(&task->end_status,
+                                 failed ? TransferStatusEnum::FAILED
+                                        : TransferStatusEnum::COMPLETED,
+                                 __ATOMIC_RELAXED);
+            }
+#endif
+            __atomic_store_n(&task->is_finished, true, __ATOMIC_RELEASE);
 
             auto prev = batch_desc.finished_task_count.fetch_add(
                 1, std::memory_order_acq_rel);
@@ -499,7 +514,19 @@ class Transport {
         Transport *transport_ = nullptr;
 
 #ifdef WITH_METRICS
+        // Stamped once at submit and never cleared; zero means not stamped.
         std::chrono::steady_clock::time_point start_time;
+        TransferRequest::OpCode metrics_opcode = TransferRequest::READ;
+        // Separate flags until export and log collection are unified.
+        // Accessed with __atomic builtins like is_finished (std::atomic would
+        // make the task non-movable).
+        volatile bool export_metrics_recorded = false;
+        volatile bool log_metrics_recorded = false;
+        // Set by the event-driven completion callback when it finishes the
+        // task: steady_clock ticks (else 0) and COMPLETED or FAILED (else
+        // WAITING). Atomic: a poll may read them while the callback writes.
+        volatile int64_t end_ticks = 0;
+        volatile int end_status = WAITING;
 #endif
 
         // record the origin request

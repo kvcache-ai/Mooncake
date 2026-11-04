@@ -66,6 +66,7 @@ namespace mooncake {
 class ShardAllocator;
 class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
+class KvcsCapacityProvider;
 
 // Forward declarations
 class AllocationStrategy;
@@ -555,7 +556,8 @@ class MasterService {
      * caller's query and this call is left untouched.
      * @param client_id The client performing the eviction
      * @param key The object key whose disk replica was evicted
-     * @param replica_type DISK or LOCAL_DISK
+     * @param replica_type DISK, LOCAL_DISK, or DFS. DFS is accepted only for
+     * a KVCS object-storage replica through this conditional API.
      * @param expected_replica_id The replica id the caller failed on
      * @return true if the replica was evicted, false if the precondition did
      * not hold (the replica was replaced or is already gone), or an error
@@ -1458,6 +1460,7 @@ class MasterService {
     auto InsertMetadata(MetadataAccessorRW& accessor, const UUID& client_id,
                         uint64_t value_length, const ReplicateConfig& config,
                         const std::string& group_id,
+                        const std::string& residency_affinity_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
@@ -1472,6 +1475,7 @@ class MasterService {
         MetadataAccessorRW& accessor, const UUID& client_id,
         uint64_t value_length, const ReplicateConfig& config,
         const std::string& writer_host_id, const std::string& group_id,
+        const std::string& residency_affinity_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
@@ -1485,6 +1489,7 @@ class MasterService {
         // The writer's host, for same-node placement; empty when unused.
         std::string writer_host_id;
         std::string group_id;
+        std::string residency_affinity_id;
     };
     // The checks and setup PutStart and UpsertStart share before they take the
     // key: validates `config` for a write of `slice_length` bytes, records the
@@ -1530,6 +1535,9 @@ class MasterService {
     void RunDfsEviction();
     void RunShardDfsEviction();
     void RunBucketDfsEviction();
+    void InitKvcsDfsEviction();
+    void RefreshKvcsDfsUsage();
+    void RunKvcsDfsEviction(const DfsUsageSnapshot& usage);
     bool RunBucketDfsEvictionInternal(bool force_one);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
@@ -1572,6 +1580,7 @@ class MasterService {
     DeadlineScheduler<GracefulUnmountDeadlineRecord>
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
+    BackgroundWorker kvcs_capacity_refresh_worker_;
     const bool enable_async_segment_cleanup_;
 
     /**
@@ -1637,6 +1646,8 @@ class MasterService {
     // starts.
     struct MemoryEviction;
     std::unique_ptr<MemoryEviction> memory_eviction_;
+    struct KvcsDfsEviction;
+    std::unique_ptr<KvcsDfsEviction> kvcs_dfs_eviction_;
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -2060,6 +2071,14 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
+    bool use_kvcs_{false};
+    std::unique_ptr<KvcsCapacityProvider> dfs_kvcs_capacity_provider_;
+    std::chrono::seconds dfs_kvcs_capacity_check_interval_{5};
+    bool dfs_kvcs_eviction_enabled_{false};
+    double dfs_kvcs_eviction_high_watermark_{0.9};
+    double dfs_kvcs_eviction_low_watermark_{0.7};
+    mutable std::mutex dfs_kvcs_usage_mutex_;
+    DfsUsageSnapshot dfs_kvcs_usage_;
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     ShardAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
