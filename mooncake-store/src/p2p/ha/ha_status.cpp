@@ -15,6 +15,7 @@ namespace {
 
 constexpr auto kElectionWindow = std::chrono::seconds(300);
 constexpr int kElectionChangeThreshold = 3;
+constexpr size_t kOpLogQueuePressurePercent = 80;
 
 int64_t RoleMetricValue(const HAStatusSnapshot& status) {
     if (status.role == "failed" || status.state == "FAILED") {
@@ -62,6 +63,7 @@ void HAStatusManager::Reset() {
     doctor_issues_.clear();
     oplog_writer_ = {};
     oplog_catchup_ = {};
+    oplog_poll_ = {};
     status_.oplog_pending_writes = 0;
     oplog_latest_stall_timeout_sec_ = 10;
     oplog_catchup_stall_timeout_sec_ = 10;
@@ -89,6 +91,7 @@ void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
     if (!ha_enabled) {
         oplog_writer_ = {};
         oplog_catchup_ = {};
+        oplog_poll_ = {};
         status_.oplog_latest_read_ok = false;
         status_.oplog_pending_writes = 0;
         status_.role = "disabled";
@@ -107,6 +110,7 @@ void HAStatusManager::SetRoleState(std::string role, std::string state) {
     changed = status_.role != role || status_.state != state;
     if (role != "standby" || state != "WATCHING") {
         oplog_catchup_ = {};
+        oplog_poll_ = {};
     }
     if (changed) {
         old_role = status_.role;
@@ -345,6 +349,7 @@ void HAStatusManager::ClearDoctorIssues() {
     doctor_issues_.clear();
     oplog_writer_ = {};
     oplog_catchup_ = {};
+    oplog_poll_ = {};
     status_.oplog_pending_writes = 0;
 }
 
@@ -356,7 +361,7 @@ void HAStatusManager::SetOpLogWriterRunning(bool running) {
 }
 
 void HAStatusManager::SetOpLogWriteProgress(uint64_t committed_sequence_id,
-                                            size_t pending) {
+                                            size_t pending, size_t capacity) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!oplog_writer_.running) return;
     status_.oplog_pending_writes = static_cast<uint64_t>(pending);
@@ -368,6 +373,16 @@ void HAStatusManager::SetOpLogWriteProgress(uint64_t committed_sequence_id,
     }
     oplog_writer_.committed_sequence_id = committed_sequence_id;
     oplog_writer_.pending = pending;
+    oplog_writer_.capacity = capacity;
+}
+
+void HAStatusManager::SetOpLogPollSuccess() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    oplog_poll_.last_success_at = std::chrono::steady_clock::now();
+    oplog_poll_.last_success_ms = NowMs();
+    status_.oplog_last_successful_poll_timestamp_ms =
+        oplog_poll_.last_success_ms;
+    TouchLocked();
 }
 
 std::string HAStatusManager::OpLogLatestStallMessageLocked() const {
@@ -408,6 +423,43 @@ std::string HAStatusManager::OpLogCatchUpStallMessageLocked() const {
                    .count());
 }
 
+std::string HAStatusManager::OpLogQueuePressureMessageLocked() const {
+    if (!status_.ha_enabled || status_.role != "primary" ||
+        status_.state != "RUNNING" || !oplog_writer_.running ||
+        oplog_writer_.capacity == 0 || oplog_writer_.pending == 0) {
+        return {};
+    }
+    const size_t usage_percent =
+        oplog_writer_.pending * 100 / oplog_writer_.capacity;
+    if (usage_percent < kOpLogQueuePressurePercent) {
+        return {};
+    }
+    return "pending=" + std::to_string(oplog_writer_.pending) +
+           ", capacity=" + std::to_string(oplog_writer_.capacity) +
+           ", usage_percent=" + std::to_string(usage_percent) +
+           ", threshold_percent=" + std::to_string(kOpLogQueuePressurePercent);
+}
+
+std::string HAStatusManager::OpLogPollStaleMessageLocked() const {
+    if (!status_.ha_enabled || status_.role != "standby" ||
+        status_.state != "WATCHING" || oplog_catchup_stall_timeout_sec_ == 0 ||
+        !oplog_poll_.last_success_at ||
+        doctor_issues_.find("OPLOG_READ_FAILED") != doctor_issues_.end()) {
+        return {};
+    }
+    const auto elapsed =
+        std::chrono::steady_clock::now() - *oplog_poll_.last_success_at;
+    if (elapsed < std::chrono::seconds(oplog_catchup_stall_timeout_sec_)) {
+        return {};
+    }
+    return "last_successful_poll_ms=" +
+           std::to_string(oplog_poll_.last_success_ms) + ", stale_ms=" +
+           std::to_string(
+               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                   .count()) +
+           ", timeout_sec=" + std::to_string(oplog_catchup_stall_timeout_sec_);
+}
+
 std::string HAStatusManager::SerializeDoctorJson() const {
     HADoctorReport report;
     {
@@ -425,6 +477,11 @@ std::string HAStatusManager::SerializeDoctorJson() const {
             for (const auto& [code, message] : doctor_issues_) {
                 report.issues.push_back({code, message});
             }
+            if (auto issue = OpLogQueuePressureMessageLocked();
+                !issue.empty()) {
+                report.issues.push_back(
+                    {"OPLOG_QUEUE_PRESSURE", std::move(issue)});
+            }
             if (auto stall = OpLogLatestStallMessageLocked(); !stall.empty()) {
                 report.issues.push_back(
                     {"OPLOG_LATEST_STALLED", std::move(stall)});
@@ -432,6 +489,9 @@ std::string HAStatusManager::SerializeDoctorJson() const {
             if (auto stall = OpLogCatchUpStallMessageLocked(); !stall.empty()) {
                 report.issues.push_back(
                     {"OPLOG_CATCHUP_STALLED", std::move(stall)});
+            }
+            if (auto issue = OpLogPollStaleMessageLocked(); !issue.empty()) {
+                report.issues.push_back({"OPLOG_POLL_STALE", std::move(issue)});
             }
             if (status_.state == "FAILED") {
                 report.issues.push_back(
@@ -482,9 +542,17 @@ HAStatusSnapshot HAStatusManager::BuildSnapshotLocked(int64_t now_ms) const {
     snapshot.oplog_gc_cursor_sequence_id = snapshot.gc_cursor_sequence_id;
     snapshot.oplog_apply_lag = snapshot.oplog_lag;
     snapshot.oplog_writer_pending_writes = snapshot.oplog_pending_writes;
+    snapshot.oplog_writer_queue_capacity =
+        static_cast<uint64_t>(oplog_writer_.capacity);
     snapshot.oplog_writer_running = oplog_writer_.running;
     snapshot.oplog_writer_last_committed_sequence_id =
         oplog_writer_.committed_sequence_id;
+    snapshot.oplog_last_successful_poll_timestamp_ms =
+        oplog_poll_.last_success_ms;
+    if (oplog_poll_.last_success_ms > 0) {
+        snapshot.oplog_poll_success_age_ms =
+            std::max<int64_t>(0, now_ms - oplog_poll_.last_success_ms);
+    }
     return snapshot;
 }
 

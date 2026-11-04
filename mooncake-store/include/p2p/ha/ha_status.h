@@ -59,8 +59,11 @@ struct HAStatusSnapshot {
     uint64_t oplog_apply_lag{0};
     uint64_t oplog_pending_writes{0};
     uint64_t oplog_writer_pending_writes{0};
+    uint64_t oplog_writer_queue_capacity{0};
     bool oplog_writer_running{false};
     uint64_t oplog_writer_last_committed_sequence_id{0};
+    int64_t oplog_last_successful_poll_timestamp_ms{0};
+    int64_t oplog_poll_success_age_ms{0};
     bool snapshot_ready{false};
     bool registry_heartbeat_ok{false};
     int64_t registry_heartbeat_last_success_ms{0};
@@ -79,7 +82,9 @@ struct HAStatusSnapshot {
              trimmed_sequence_id, oplog_trimmed_sequence_id,
              gc_cursor_sequence_id, oplog_gc_cursor_sequence_id, oplog_lag,
              oplog_apply_lag, oplog_pending_writes, oplog_writer_pending_writes,
-             oplog_writer_running, oplog_writer_last_committed_sequence_id,
+             oplog_writer_queue_capacity, oplog_writer_running,
+             oplog_writer_last_committed_sequence_id,
+             oplog_last_successful_poll_timestamp_ms, oplog_poll_success_age_ms,
              snapshot_ready, registry_heartbeat_ok,
              registry_heartbeat_last_success_ms,
              registry_heartbeat_last_failure_ms, registry_heartbeat_last_error,
@@ -124,7 +129,9 @@ class HAStatusManager {
     // Writer events publish under its queue lock; diagnostics never take it.
     // Stopping disables late progress callbacks until the next writer starts.
     void SetOpLogWriterRunning(bool running);
-    void SetOpLogWriteProgress(uint64_t committed_sequence_id, size_t pending);
+    void SetOpLogWriteProgress(uint64_t committed_sequence_id, size_t pending,
+                               size_t capacity = 0);
+    void SetOpLogPollSuccess();
 
    private:
     friend struct HAStatusTestPeer;
@@ -139,6 +146,8 @@ class HAStatusManager {
     std::string MasterViewMismatchMessageLocked() const;
     std::string OpLogLatestStallMessageLocked() const;
     std::string OpLogCatchUpStallMessageLocked() const;
+    std::string OpLogQueuePressureMessageLocked() const;
+    std::string OpLogPollStaleMessageLocked() const;
 
     mutable std::mutex mutex_;
     HAStatusSnapshot status_;
@@ -155,6 +164,7 @@ class HAStatusManager {
         bool running{false};
         uint64_t committed_sequence_id{0};
         size_t pending{0};
+        size_t capacity{0};
         std::optional<std::chrono::steady_clock::time_point> stalled_since;
     } oplog_writer_;
     uint32_t oplog_latest_stall_timeout_sec_{10};
@@ -164,6 +174,10 @@ class HAStatusManager {
         std::chrono::steady_clock::time_point last_observed_at;
     } oplog_catchup_;
     uint32_t oplog_catchup_stall_timeout_sec_{10};
+    struct OpLogPollProgress {
+        std::optional<std::chrono::steady_clock::time_point> last_success_at;
+        int64_t last_success_ms{0};
+    } oplog_poll_;
 };
 
 }  // namespace mooncake

@@ -302,8 +302,9 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
                             /*trimmed_sequence_id=*/3,
                             /*gc_cursor_sequence_id=*/2);
     status.SetOpLogWriterRunning(true);
-    status.SetOpLogWriteProgress(/*committed_sequence_id=*/15,
-                                 /*pending=*/4);
+    status.SetOpLogWriteProgress(/*committed_sequence_id=*/15, /*pending=*/4,
+                                 /*capacity=*/100);
+    status.SetOpLogPollSuccess();
     status.SetSnapshotReady(true);
     status.RecordRegistryHeartbeat(ErrorCode::OK, "");
 
@@ -336,8 +337,11 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
     EXPECT_EQ(body["oplog_apply_lag"].asUInt64(), 3u);
     EXPECT_EQ(body["oplog_pending_writes"].asUInt64(), 4u);
     EXPECT_EQ(body["oplog_writer_pending_writes"].asUInt64(), 4u);
+    EXPECT_EQ(body["oplog_writer_queue_capacity"].asUInt64(), 100u);
     EXPECT_TRUE(body["oplog_writer_running"].asBool());
     EXPECT_EQ(body["oplog_writer_last_committed_sequence_id"].asUInt64(), 15u);
+    EXPECT_GT(body["oplog_last_successful_poll_timestamp_ms"].asInt64(), 0);
+    EXPECT_GE(body["oplog_poll_success_age_ms"].asInt64(), 0);
     EXPECT_EQ(body["snapshot_ready"].asBool(), true);
     EXPECT_EQ(body["registry_heartbeat_ok"].asBool(), true);
     EXPECT_GT(body["updated_at_ms"].asInt64(), 0);

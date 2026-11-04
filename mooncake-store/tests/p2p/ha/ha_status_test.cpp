@@ -23,6 +23,14 @@ struct HAStatusTestPeer {
         std::lock_guard<std::mutex> lock(status.mutex_);
         status.election_.changes.front() -= std::chrono::seconds(301);
     }
+    static void AgeLastPollSuccess(HAStatusManager& status,
+                                   std::chrono::seconds age) {
+        std::lock_guard<std::mutex> lock(status.mutex_);
+        ASSERT_TRUE(status.oplog_poll_.last_success_at.has_value());
+        *status.oplog_poll_.last_success_at -= age;
+        status.oplog_poll_.last_success_ms -=
+            std::chrono::duration_cast<std::chrono::milliseconds>(age).count();
+    }
 };
 
 class HAStatusTest : public ::testing::Test {
@@ -158,17 +166,80 @@ TEST_F(HAStatusTest, StatusTracksPendingWrites) {
     status.SetLeader("local", 1);
     status.SetRoleState("primary", "RUNNING");
     status.SetOpLogWriterRunning(true);
-    status.SetOpLogWriteProgress(1, 3);
+    status.SetOpLogWriteProgress(1, 3, 10);
     auto snapshot = status.Snapshot();
     EXPECT_EQ(snapshot.oplog_pending_writes, 3u);
+    EXPECT_EQ(snapshot.oplog_writer_pending_writes, 3u);
+    EXPECT_EQ(snapshot.oplog_writer_queue_capacity, 10u);
     EXPECT_EQ(snapshot.oplog_writer_running, true);
     EXPECT_EQ(snapshot.oplog_writer_last_committed_sequence_id, 1u);
-    EXPECT_EQ(snapshot.oplog_writer_pending_writes, 3u);
+
     status.SetOpLogWriterRunning(false);
     snapshot = status.Snapshot();
     EXPECT_EQ(snapshot.oplog_pending_writes, 0u);
+    EXPECT_EQ(snapshot.oplog_writer_pending_writes, 0u);
+    EXPECT_EQ(snapshot.oplog_writer_queue_capacity, 0u);
     EXPECT_EQ(snapshot.oplog_writer_running, false);
     EXPECT_EQ(snapshot.oplog_writer_last_committed_sequence_id, 0u);
+
+    status.SetOpLogWriteProgress(1, 5);
+    EXPECT_EQ(status.Snapshot().oplog_writer_pending_writes, 0u);
+}
+
+TEST_F(HAStatusTest, DoctorReportsOpLogQueuePressure) {
+    status.SetLeader("local", 1);
+    status.SetRoleState("primary", "RUNNING");
+    status.SetOpLogWriterRunning(true);
+    status.SetOpLogWriteProgress(10, 79, 100);
+    EXPECT_EQ(doctor().status, "ok");
+
+    status.SetOpLogWriteProgress(10, 80, 100);
+    auto report = doctor();
+    EXPECT_EQ(report.status, "degraded");
+    const auto* issue = FindIssue(report, "OPLOG_QUEUE_PRESSURE");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_NE(issue->message.find("pending=80"), std::string::npos);
+    EXPECT_NE(issue->message.find("capacity=100"), std::string::npos);
+    EXPECT_NE(issue->message.find("usage_percent=80"), std::string::npos);
+    EXPECT_NE(issue->message.find("threshold_percent=80"), std::string::npos);
+
+    status.SetRoleState("standby", "WATCHING");
+    EXPECT_EQ(FindIssue(doctor(), "OPLOG_QUEUE_PRESSURE"), nullptr);
+
+    status.SetRoleState("primary", "RUNNING");
+    status.SetOpLogWriteProgress(10, 80);
+    EXPECT_EQ(FindIssue(doctor(), "OPLOG_QUEUE_PRESSURE"), nullptr);
+}
+
+TEST_F(HAStatusTest, DoctorReportsOpLogPollStale) {
+    status.Configure(true, "test_cluster", "local", 10, 10);
+    status.SetRoleState("standby", "WATCHING");
+    status.SetOpLogPollSuccess();
+    auto snapshot = status.Snapshot();
+    EXPECT_GT(snapshot.oplog_last_successful_poll_timestamp_ms, 0);
+    EXPECT_GE(snapshot.oplog_poll_success_age_ms, 0);
+    EXPECT_EQ(doctor().status, "ok");
+
+    HAStatusTestPeer::AgeLastPollSuccess(status, std::chrono::seconds(11));
+    auto report = doctor();
+    EXPECT_EQ(report.status, "degraded");
+    const auto* issue = FindIssue(report, "OPLOG_POLL_STALE");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_NE(issue->message.find("last_successful_poll_ms="),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("stale_ms="), std::string::npos);
+    EXPECT_NE(issue->message.find("timeout_sec=10"), std::string::npos);
+
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "Read after seq=10: TIMEOUT");
+    report = doctor();
+    EXPECT_NE(FindIssue(report, "OPLOG_READ_FAILED"), nullptr);
+    EXPECT_EQ(FindIssue(report, "OPLOG_POLL_STALE"), nullptr);
+
+    status.SetDoctorIssue("OPLOG_READ_FAILED");
+    status.SetLeader("local", 1);
+    status.SetMasterView("local", 1);
+    status.SetRoleState("primary", "RUNNING");
+    EXPECT_EQ(doctor().status, "ok");
 }
 
 TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {

@@ -64,8 +64,14 @@ Primary async writer fields use the `oplog_writer_` prefix:
   currently running.
 - `oplog_writer_pending_writes`: primary writer entries that are still queued,
   retrying, or persisted-but-uncommitted.
+- `oplog_writer_queue_capacity`: configured async writer queue capacity. A
+  value of 0 means the local process has not published a capacity sample.
 - `oplog_writer_last_committed_sequence_id`: writer's last locally confirmed
   committed sequence ID.
+- `oplog_last_successful_poll_timestamp_ms`: local Unix timestamp for the most
+  recent successful standby OpLog poll.
+- `oplog_poll_success_age_ms`: local age of the most recent successful standby
+  OpLog poll.
 
 The older fields `applied_sequence_id`, `latest_sequence_id`,
 `trimmed_sequence_id`, `gc_cursor_sequence_id`, `oplog_lag`, and
@@ -88,9 +94,9 @@ request.
   recorded.
 - `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect,
   snapshot recovery, registry heartbeat, master view mismatch, or fatal HA
-  failure is recorded, or pending OpLogs
-  exceed the configured latest stall timeout, or a watching standby stops applying
-  known pending OpLogs beyond the catch-up stall timeout.
+  failure is recorded, or pending OpLogs have exceeded the latest stall timeout,
+  or a primary writer queue is near capacity, or a watching standby has stopped
+  polling or applying known pending OpLogs beyond the catch-up stall timeout.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
   recorded failure. This endpoint is not a readiness or cluster health check.
 
@@ -120,6 +126,15 @@ Empty instance IDs are not treated as a mismatch by themselves, so older paths
 and non-Redis election backends do not degrade solely because they do not publish
 an instance ID.
 
+`OPLOG_QUEUE_PRESSURE` means a `role=primary,state=RUNNING` Redis writer has
+pending work at or above 80% of its configured async queue capacity. The message
+is `pending=80, capacity=100, usage_percent=80, threshold_percent=80`. Pending
+matches `oplog_writer_pending_writes` and includes queued, retrying and
+persisted-but-uncommitted entries. This detects current queue pressure, not a
+stall; `OPLOG_LATEST_STALLED` separately reports pending work whose committed
+latest has stopped advancing. HTTP reads cached writer state and does not take
+the writer queue lock.
+
 `OPLOG_LATEST_STALLED` means the Redis writer has pending work and its locally
 confirmed committed latest has not advanced for
 `oplog_latest_stall_timeout_sec` (default 10 seconds; 0 disables this check).
@@ -141,6 +156,15 @@ retains the last successful sample. The message is concise, for example
 
 `OPLOG_READ_FAILED` persists across reader reconnects until an actual poll
 succeeds (including an empty poll), or the standby stops or is promoted.
+
+`OPLOG_POLL_STALE` means a `role=standby,state=WATCHING` process has not had a
+successful OpLog poll for `oplog_catchup_stall_timeout_sec` (default 10 seconds;
+0 disables this check). The same timeout as catch-up stall is reused to avoid a
+separate doctor-only knob. The message is
+`last_successful_poll_ms=1700000000000, stale_ms=12000, timeout_sec=10`.
+If `OPLOG_READ_FAILED` is active, doctor reports that explicit read failure
+instead of also reporting poll stale. Initial sync and standby phases before the
+first successful poll do not trigger this diagnosis.
 
 ### Data Management Endpoints
 

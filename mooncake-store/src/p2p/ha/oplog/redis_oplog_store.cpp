@@ -650,7 +650,8 @@ void RedisOpLogStore::UpdateWriteProgressUnlocked() {
         !inflight_writes_.empty() &&
         inflight_writes_.rbegin()->first > committed_sequence_id_;
     HAStatusManager::instance().SetOpLogWriteProgress(
-        committed_sequence_id_, needs_commit ? inflight_writes_.size() : 0);
+        committed_sequence_id_, needs_commit ? inflight_writes_.size() : 0,
+        async_queue_max_entries_);
     HAMetricManager::instance().set_oplog_async_queue_size(
         static_cast<int64_t>(inflight_writes_.size()));
 }

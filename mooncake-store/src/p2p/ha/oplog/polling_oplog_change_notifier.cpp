@@ -61,6 +61,7 @@ void PollingOpLogChangeNotifier::PollLoop() {
             // Keep the issue active until an actual poll succeeds, even if it
             // returns no entries. Restarting the reader must not clear it.
             HAStatusManager::instance().SetDoctorIssue("OPLOG_READ_FAILED");
+            HAStatusManager::instance().SetOpLogPollSuccess();
             missing_sequence_ids = FindMissingSequenceIds(
                 last_seq, entries, progress.last_scanned_sequence_id);
             HAMetricManager::instance()
