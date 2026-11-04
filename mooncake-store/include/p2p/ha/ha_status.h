@@ -25,10 +25,31 @@ struct HADoctorIssue {
     YLT_REFL(HADoctorIssue, code, message, category, component, severity);
 };
 
+struct HADoctorStatus {
+    std::string role{"unknown"};
+    std::string state{"unknown"};
+    std::string local_endpoint;
+    std::string leader_endpoint;
+    uint64_t epoch{0};
+    std::string instance_id;
+    uint64_t applied_sequence_id{0};
+    uint64_t latest_sequence_id{0};
+    uint64_t trimmed_sequence_id{0};
+    uint64_t gc_cursor_sequence_id{0};
+    uint64_t oplog_lag{0};
+    bool snapshot_ready{false};
+    int64_t heartbeat_age_ms{0};
+    YLT_REFL(HADoctorStatus, role, state, local_endpoint, leader_endpoint,
+             epoch, instance_id, applied_sequence_id, latest_sequence_id,
+             trimmed_sequence_id, gc_cursor_sequence_id, oplog_lag,
+             snapshot_ready, heartbeat_age_ms);
+};
+
 struct HADoctorReport {
-    std::string status{"unknown"};
+    std::string health{"unknown"};
+    HADoctorStatus status;
     std::vector<HADoctorIssue> issues;
-    YLT_REFL(HADoctorReport, status, issues);
+    YLT_REFL(HADoctorReport, health, status, issues);
 };
 
 struct HAStatusSnapshot {

@@ -58,17 +58,17 @@ TEST_F(HAStatusTest, CountsObservedTermsAcrossSupervisorRounds) {
     status.SetLeader("leader", 11);
     status.SetMasterView("", 100);
     status.SetMasterView("leader", 12);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
     status.SetMasterView("leader", 11);
     status.SetMasterView("leader", 12);
     status.ClearDoctorIssues();
     status.Configure(true, "test_cluster", "local");
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
     status.SetLeader("local", 20);
     status.SetMasterView("local", 20);
     status.SetRoleState("primary", "RUNNING");
     auto report = doctor();
-    EXPECT_EQ(report.status, "degraded");
+    EXPECT_EQ(report.health, "degraded");
     ASSERT_EQ(report.issues.size(), 1u);
     EXPECT_EQ(report.issues[0].code, "ELECTION_UNSTABLE");
     EXPECT_NE(report.issues[0].message.find("window_sec=300, changes=3"),
@@ -78,22 +78,22 @@ TEST_F(HAStatusTest, CountsObservedTermsAcrossSupervisorRounds) {
     status.SetDoctorIssue("ELECTION_FAILED", "Redis unavailable");
     EXPECT_EQ(doctor().issues.size(), 2u);
     status.ClearDoctorIssues();
-    EXPECT_EQ(doctor().status, "degraded");
+    EXPECT_EQ(doctor().health, "degraded");
 }
 
 TEST_F(HAStatusTest, ElectionWindowExpiresAndResets) {
     for (uint64_t epoch = 17; epoch <= 20; ++epoch) {
         status.SetLeader("other", epoch);
     }
-    ASSERT_EQ(doctor().status, "degraded");
+    ASSERT_EQ(doctor().health, "degraded");
     HAStatusTestPeer::ExpireOldestChange(status);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
     status.SetLeader("other", 21);
-    EXPECT_EQ(doctor().status, "degraded");
+    EXPECT_EQ(doctor().health, "degraded");
 
     status.Configure(false, "test_cluster", "local");
     status.SetLeader("other", 22);
-    EXPECT_EQ(doctor().status, "unknown");
+    EXPECT_EQ(doctor().health, "unknown");
     status.Configure(true, "test_cluster", "local");
     status.SetRoleState("standby", "WATCHING");
     status.SetLeader("other", 23);
@@ -107,7 +107,7 @@ TEST_F(HAStatusTest, ElectionWindowExpiresAndResets) {
     EXPECT_TRUE(doctor().issues.empty());
     status.SetLeader("new", 3);
     status.SetLeader("new", 4);
-    EXPECT_EQ(doctor().status, "degraded");
+    EXPECT_EQ(doctor().health, "degraded");
     status.Reset();
     status.Configure(true, "new_cluster", "local");
     status.SetRoleState("standby", "WATCHING");
@@ -120,7 +120,7 @@ TEST_F(HAStatusTest, DoctorReportsPrimaryMasterViewMismatch) {
     status.SetMasterView("remote", 7, 1000, 10, "remote-instance");
     status.SetRoleState("primary", "RUNNING");
     auto report = doctor();
-    EXPECT_EQ(report.status, "degraded");
+    EXPECT_EQ(report.health, "degraded");
     const auto* issue = FindIssue(report, "MASTER_VIEW_MISMATCH");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("local=local"), std::string::npos);
@@ -133,32 +133,32 @@ TEST_F(HAStatusTest, DoctorReportsPrimaryMasterViewMismatch) {
 
     status.SetMasterView("local", 8, 1000, 10, "local-instance");
     report = doctor();
-    EXPECT_EQ(report.status, "ok");
+    EXPECT_EQ(report.health, "ok");
     EXPECT_EQ(FindIssue(report, "MASTER_VIEW_MISMATCH"), nullptr);
 }
 
 TEST_F(HAStatusTest, DoctorHandlesMissingViewAndEmptyInstanceConservatively) {
     status.SetRoleState("primary", "RUNNING");
     auto report = doctor();
-    EXPECT_EQ(report.status, "degraded");
+    EXPECT_EQ(report.health, "degraded");
     const auto* issue = FindIssue(report, "MASTER_VIEW_MISMATCH");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("view=<empty>"), std::string::npos);
 
     status.SetRoleState("standby", "WATCHING");
     report = doctor();
-    EXPECT_EQ(report.status, "ok");
+    EXPECT_EQ(report.health, "ok");
     EXPECT_EQ(FindIssue(report, "MASTER_VIEW_MISMATCH"), nullptr);
 
     status.SetRoleState("primary", "STARTING");
     report = doctor();
-    EXPECT_EQ(report.status, "unknown");
+    EXPECT_EQ(report.health, "unknown");
     EXPECT_EQ(FindIssue(report, "MASTER_VIEW_MISMATCH"), nullptr);
 
     status.SetRoleState("primary", "RUNNING");
     status.SetMasterView("local", 1, 1000, 10, "remote-instance");
     report = doctor();
-    EXPECT_EQ(report.status, "ok");
+    EXPECT_EQ(report.health, "ok");
     EXPECT_EQ(FindIssue(report, "MASTER_VIEW_MISMATCH"), nullptr);
 }
 
@@ -191,11 +191,11 @@ TEST_F(HAStatusTest, DoctorReportsOpLogQueuePressure) {
     status.SetRoleState("primary", "RUNNING");
     status.SetOpLogWriterRunning(true);
     status.SetOpLogWriteProgress(10, 79, 100);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
 
     status.SetOpLogWriteProgress(10, 80, 100);
     auto report = doctor();
-    EXPECT_EQ(report.status, "degraded");
+    EXPECT_EQ(report.health, "degraded");
     const auto* issue = FindIssue(report, "OPLOG_QUEUE_PRESSURE");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("pending=80"), std::string::npos);
@@ -218,11 +218,11 @@ TEST_F(HAStatusTest, DoctorReportsOpLogPollStale) {
     auto snapshot = status.Snapshot();
     EXPECT_GT(snapshot.oplog_last_successful_poll_timestamp_ms, 0);
     EXPECT_GE(snapshot.oplog_poll_success_age_ms, 0);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
 
     HAStatusTestPeer::AgeLastPollSuccess(status, std::chrono::seconds(11));
     auto report = doctor();
-    EXPECT_EQ(report.status, "degraded");
+    EXPECT_EQ(report.health, "degraded");
     const auto* issue = FindIssue(report, "OPLOG_POLL_STALE");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("last_successful_poll_ms="),
@@ -239,7 +239,7 @@ TEST_F(HAStatusTest, DoctorReportsOpLogPollStale) {
     status.SetLeader("local", 1);
     status.SetMasterView("local", 1);
     status.SetRoleState("primary", "RUNNING");
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
 }
 
 TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
@@ -276,13 +276,77 @@ TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
     EXPECT_EQ(snapshot.oplog_apply_lag, 2u);
 }
 
+TEST_F(HAStatusTest, DoctorContextMirrorsCurrentStatusSnapshot) {
+    const auto before_heartbeat_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    status.SetInstanceId("local-instance");
+    status.SetMasterView("local", 9, before_heartbeat_ms - 1000, 10,
+                         "local-instance");
+    status.SetRoleState("primary", "RUNNING");
+    status.SetSnapshotReady(true);
+    status.SetOpLogProgress(/*applied_sequence_id=*/12,
+                            /*latest_sequence_id=*/15,
+                            /*trimmed_sequence_id=*/2,
+                            /*gc_cursor_sequence_id=*/3);
+    status.RecordRegistryHeartbeat(ErrorCode::OK, "");
+
+    auto report = doctor();
+    EXPECT_EQ(report.health, "ok");
+    EXPECT_EQ(report.status.role, "primary");
+    EXPECT_EQ(report.status.state, "RUNNING");
+    EXPECT_EQ(report.status.local_endpoint, "local");
+    EXPECT_EQ(report.status.leader_endpoint, "local");
+    EXPECT_EQ(report.status.epoch, 9u);
+    EXPECT_EQ(report.status.instance_id, "local-instance");
+    EXPECT_EQ(report.status.applied_sequence_id, 12u);
+    EXPECT_EQ(report.status.latest_sequence_id, 15u);
+    EXPECT_EQ(report.status.trimmed_sequence_id, 2u);
+    EXPECT_EQ(report.status.gc_cursor_sequence_id, 3u);
+    EXPECT_EQ(report.status.oplog_lag, 3u);
+    EXPECT_TRUE(report.status.snapshot_ready);
+    EXPECT_GE(report.status.heartbeat_age_ms, 0);
+}
+
+TEST_F(HAStatusTest, SetRoleStateClearsIssuesScopedToPreviousRole) {
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "old standby read failure");
+    status.SetDoctorIssue("OPLOG_RECONNECT_FAILED",
+                          "old standby reconnect failure");
+    status.SetDoctorIssue("SNAPSHOT_RECOVERY_FAILED",
+                          "old standby snapshot failure");
+    status.SetDoctorIssue("REGISTRY_HEARTBEAT_FAILED", "shared registry issue");
+    status.SetLeader("local", 1);
+    status.SetRoleState("primary", "RUNNING");
+
+    auto report = doctor();
+    EXPECT_EQ(FindIssue(report, "OPLOG_READ_FAILED"), nullptr);
+    EXPECT_EQ(FindIssue(report, "OPLOG_RECONNECT_FAILED"), nullptr);
+    EXPECT_EQ(FindIssue(report, "SNAPSHOT_RECOVERY_FAILED"), nullptr);
+    EXPECT_NE(FindIssue(report, "REGISTRY_HEARTBEAT_FAILED"), nullptr);
+
+    status.ClearDoctorIssues();
+    status.SetDoctorIssue("OPLOG_WRITE_FAILED", "old primary write failure");
+    status.SetDoctorIssue("OPLOG_COMMIT_FAILED", "old primary commit failure");
+    status.SetDoctorIssue("PROMOTION_CATCHUP_INCOMPLETE",
+                          "old primary catch-up issue");
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "new standby read failure");
+    status.SetRoleState("standby", "WATCHING");
+
+    report = doctor();
+    EXPECT_EQ(FindIssue(report, "OPLOG_WRITE_FAILED"), nullptr);
+    EXPECT_EQ(FindIssue(report, "OPLOG_COMMIT_FAILED"), nullptr);
+    EXPECT_EQ(FindIssue(report, "PROMOTION_CATCHUP_INCOMPLETE"), nullptr);
+    EXPECT_NE(FindIssue(report, "OPLOG_READ_FAILED"), nullptr);
+}
+
 TEST_F(HAStatusTest, DoctorReportsStandbyBehindTrim) {
     status.SetOpLogProgress(/*applied_sequence_id=*/99,
                             /*latest_sequence_id=*/150,
                             /*trimmed_sequence_id=*/100,
                             /*gc_cursor_sequence_id=*/100);
     auto report = doctor();
-    EXPECT_EQ(report.status, "degraded");
+    EXPECT_EQ(report.health, "degraded");
     const auto* issue = FindIssue(report, "STANDBY_BEHIND_TRIM");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("oplog_applied_sequence_id=99"),
@@ -297,10 +361,10 @@ TEST_F(HAStatusTest, DoctorReportsStandbyBehindTrim) {
     EXPECT_EQ(FindIssue(report, "OPLOG_TRIM_RISK"), nullptr);
 
     status.SetRoleState("standby", "SYNCING");
-    EXPECT_EQ(doctor().status, "unknown");
+    EXPECT_EQ(doctor().health, "unknown");
     status.SetRoleState("primary", "RUNNING");
     status.SetMasterView("local", 1);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
 }
 
 TEST_F(HAStatusTest, DoctorReportsOpLogTrimRiskNearHorizon) {
@@ -309,7 +373,7 @@ TEST_F(HAStatusTest, DoctorReportsOpLogTrimRiskNearHorizon) {
                             /*trimmed_sequence_id=*/100,
                             /*gc_cursor_sequence_id=*/100);
     auto report = doctor();
-    EXPECT_EQ(report.status, "degraded");
+    EXPECT_EQ(report.health, "degraded");
     const auto* issue = FindIssue(report, "OPLOG_TRIM_RISK");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("oplog_applied_sequence_id=105"),
@@ -328,12 +392,12 @@ TEST_F(HAStatusTest, DoctorReportsOpLogTrimRiskNearHorizon) {
                             /*latest_sequence_id=*/150,
                             /*trimmed_sequence_id=*/100,
                             /*gc_cursor_sequence_id=*/100);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
     status.SetOpLogProgress(/*applied_sequence_id=*/100,
                             /*latest_sequence_id=*/100,
                             /*trimmed_sequence_id=*/100,
                             /*gc_cursor_sequence_id=*/100);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
 }
 
 TEST_F(HAStatusTest, DoctorReportsInsufficientStandbySnapshotSources) {
@@ -343,7 +407,7 @@ TEST_F(HAStatusTest, DoctorReportsInsufficientStandbySnapshotSources) {
     status.SetStandbySnapshotAvailability(/*available=*/0, /*required=*/1);
 
     auto report = doctor();
-    EXPECT_EQ(report.status, "degraded");
+    EXPECT_EQ(report.health, "degraded");
     const auto* issue = FindIssue(report, "STANDBY_SNAPSHOT_INSUFFICIENT");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("standby_snapshot_available=0"),
@@ -356,14 +420,14 @@ TEST_F(HAStatusTest, DoctorReportsInsufficientStandbySnapshotSources) {
               std::string::npos);
 
     status.SetStandbySnapshotAvailability(/*available=*/1, /*required=*/1);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
 
     status.SetStandbySnapshotAvailability(/*available=*/0, /*required=*/0);
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
 
     status.SetStandbySnapshotAvailability(/*available=*/0, /*required=*/1);
     status.SetRoleState("standby", "WATCHING");
-    EXPECT_EQ(doctor().status, "ok");
+    EXPECT_EQ(doctor().health, "ok");
 }
 
 }  // namespace mooncake

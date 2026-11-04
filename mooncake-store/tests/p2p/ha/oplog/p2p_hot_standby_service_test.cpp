@@ -1,5 +1,8 @@
 #include "p2p/ha/oplog/p2p_hot_standby_service.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -116,6 +119,25 @@ class ControlledReaderStore : public MockOpLogStore {
 
    private:
     std::shared_ptr<ControlledNotifierState> state_;
+};
+
+class ForcedTrimLocalFsOpLogStore : public LocalFsOpLogStore {
+   public:
+    ForcedTrimLocalFsOpLogStore(const std::string& cluster_id,
+                                const std::string& root_dir,
+                                uint64_t trimmed_sequence_id)
+        : LocalFsOpLogStore(cluster_id, root_dir,
+                            /*enable_batch_write=*/false,
+                            /*poll_interval_ms=*/10),
+          trimmed_sequence_id_(trimmed_sequence_id) {}
+
+    ErrorCode GetTrimmedSequenceId(uint64_t& sequence_id) override {
+        sequence_id = trimmed_sequence_id_;
+        return ErrorCode::OK;
+    }
+
+   private:
+    uint64_t trimmed_sequence_id_;
 };
 
 void InjectNotifierErrors(const std::shared_ptr<ControlledNotifierState>& state,
@@ -242,6 +264,60 @@ class SnapshotServer {
     P2PStandbySnapshotService service_;
     coro_rpc::coro_rpc_server server_;
 };
+
+class SnapshotSourceServer {
+   public:
+    SnapshotSourceServer(uint16_t port,
+                         P2PStandbySnapshotService::Source source)
+        : service_(std::move(source)), server_(1, port), port_(port) {
+        RegisterP2PStandbySnapshotRpcHandlers(server_, &service_);
+    }
+
+    ~SnapshotSourceServer() {
+        if (started_) {
+            server_.stop();
+        }
+    }
+
+    bool Start() {
+        auto start_result = server_.async_start();
+        started_ = !start_result.hasResult();
+        return started_;
+    }
+
+    std::string Endpoint() const {
+        return "127.0.0.1:" + std::to_string(port_);
+    }
+
+   private:
+    P2PStandbySnapshotService service_;
+    coro_rpc::coro_rpc_server server_;
+    uint16_t port_{0};
+    bool started_{false};
+};
+
+uint16_t AllocateLoopbackPort() {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return 0;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return 0;
+    }
+    socklen_t len = sizeof(addr);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        ::close(fd);
+        return 0;
+    }
+    const uint16_t port = ntohs(addr.sin_port);
+    ::close(fd);
+    return port;
+}
 
 class P2PHotStandbyServiceTest : public ::testing::Test {
    protected:
@@ -498,6 +574,110 @@ TEST_F(P2PHotStandbyServiceTest,
 }
 
 TEST_F(P2PHotStandbyServiceTest,
+       HandoffBehindTrimFallsBackToPrimarySnapshotAndReplacesInitialMetadata) {
+    P2PMasterService primary(MakeMasterConfig());
+    const UUID client_id{13, 13};
+    const UUID segment_id{14, 14};
+    RegisterClient(primary, client_id, MakeSegment(segment_id));
+    PublishRoute(primary, "primary-snapshot-key", client_id, segment_id, 8192);
+    ASSERT_EQ(primary.GetLatestOpLogSequenceId(), 2u);
+
+    P2PStandbyMetadataStore stale_store;
+    const UUID stale_client_id{15, 15};
+    const UUID stale_segment_id{16, 16};
+    stale_store.RegisterClient(stale_client_id, "127.0.0.1", 50052,
+                               {MakeSegment(stale_segment_id)});
+    stale_store.PublishRoute("stale-handoff-key",
+                             {stale_client_id, stale_segment_id}, 1024, 1);
+    {
+        auto stale_metadata = stale_store.ExportMetadata();
+        P2PHotStandbyService current_target(
+            MakeStandbyConfig(), [&]() -> std::unique_ptr<OpLogStore> {
+                auto store = std::make_unique<ForcedTrimLocalFsOpLogStore>(
+                    kClusterId, test_dir_.string(), /*trimmed_sequence_id=*/2);
+                if (store->Init() != ErrorCode::OK) {
+                    return nullptr;
+                }
+                return store;
+            });
+        ASSERT_EQ(current_target.Start(/*baseline_sequence_id=*/2u,
+                                       std::move(stale_metadata)),
+                  ErrorCode::OK);
+        auto exported = current_target.ExportMetadata();
+        EXPECT_NE(exported.routes.find("stale-handoff-key"),
+                  exported.routes.end());
+        EXPECT_EQ(exported.routes.find("primary-snapshot-key"),
+                  exported.routes.end());
+        current_target.Stop();
+    }
+
+    const auto port = AllocateLoopbackPort();
+    ASSERT_NE(port, 0u);
+    SnapshotSourceServer server(
+        port, MakeP2PPrimarySnapshotSource(kClusterId, &primary));
+    ASSERT_TRUE(server.Start());
+
+    auto target_config = MakeStandbyConfig();
+    target_config.snapshot_source_endpoints = {server.Endpoint()};
+    target_config.snapshot_chunk_size = 1;
+    P2PHotStandbyService target(target_config, [&]() {
+        auto store = std::make_unique<ForcedTrimLocalFsOpLogStore>(
+            kClusterId, test_dir_.string(), /*trimmed_sequence_id=*/2);
+        if (store->Init() != ErrorCode::OK) {
+            return std::unique_ptr<OpLogStore>();
+        }
+        return std::unique_ptr<OpLogStore>(std::move(store));
+    });
+
+    auto stale_metadata = stale_store.ExportMetadata();
+    ASSERT_EQ(
+        target.Start(/*baseline_sequence_id=*/1u, std::move(stale_metadata)),
+        ErrorCode::OK);
+    EXPECT_GE(target.GetLatestAppliedSequenceId(), 2u);
+    auto exported = target.ExportMetadata();
+    EXPECT_EQ(exported.routes.find("stale-handoff-key"), exported.routes.end());
+    EXPECT_EQ(exported.clients.find(stale_client_id), exported.clients.end());
+    EXPECT_NE(exported.routes.find("primary-snapshot-key"),
+              exported.routes.end());
+    EXPECT_NE(exported.clients.find(client_id), exported.clients.end());
+
+    target.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       SnapshotBootstrapRetriesUntilPrimarySourceBecomesAvailable) {
+    P2PMasterService primary(MakeMasterConfig());
+    const UUID client_id{17, 17};
+    const UUID segment_id{18, 18};
+    RegisterClient(primary, client_id, MakeSegment(segment_id));
+    PublishRoute(primary, "delayed-primary-snapshot-key", client_id, segment_id,
+                 4096);
+
+    const auto port = AllocateLoopbackPort();
+    ASSERT_NE(port, 0u);
+    SnapshotSourceServer server(
+        port, MakeP2PPrimarySnapshotSource(kClusterId, &primary));
+    auto target_config = MakeStandbyConfig();
+    target_config.snapshot_source_endpoints = {server.Endpoint()};
+    P2PHotStandbyService target(target_config);
+    auto start_future =
+        std::async(std::launch::async, [&] { return target.Start(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ASSERT_NE(start_future.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::ready);
+
+    ASSERT_TRUE(server.Start());
+    ASSERT_EQ(start_future.wait_for(std::chrono::seconds(10)),
+              std::future_status::ready);
+    ASSERT_EQ(start_future.get(), ErrorCode::OK);
+    auto exported = target.ExportMetadata();
+    EXPECT_NE(exported.routes.find("delayed-primary-snapshot-key"),
+              exported.routes.end());
+
+    target.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest,
        SnapshotKeepsFixedInventoryWhileSourceContinuesApplying) {
     P2PMasterService master(MakeMasterConfig());
     const UUID client_id{21, 21};
@@ -527,6 +707,71 @@ TEST_F(P2PHotStandbyServiceTest,
     ASSERT_EQ(chunk.objects.size(), 1);
     EXPECT_EQ(chunk.objects.front().key, "before-snapshot");
     EXPECT_EQ(snapshot.EndSnapshot({begin.session_id}), toInt(ErrorCode::OK));
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       PrimarySnapshotFallbackReplaysWriteAfterSnapshotBegin) {
+    P2PMasterService primary(MakeMasterConfig());
+    const UUID client_id{21, 21};
+    const UUID segment_id{22, 22};
+    RegisterClient(primary, client_id, MakeSegment(segment_id));
+    PublishRoute(primary, "before-primary-snapshot", client_id, segment_id,
+                 4096);
+
+    std::atomic<bool> wrote_after_begin{false};
+    P2PStandbySnapshotService::Source source;
+    source.get_cluster_id = [] { return std::string(kClusterId); };
+    source.is_ready = [] { return true; };
+    source.get_baseline_sequence_id = [&primary] {
+        return primary.GetLatestOpLogSequenceId();
+    };
+    source.list_object_keys = [&] {
+        auto keys = primary.ListSnapshotObjectKeys();
+        bool expected = false;
+        if (wrote_after_begin.compare_exchange_strong(expected, true)) {
+            P2PPublishRouteRequest req;
+            req.key = "after-primary-snapshot";
+            req.client_id = client_id;
+            req.segment_id = segment_id;
+            req.object_size = 8192;
+            auto result = primary.PublishRoute(req);
+            EXPECT_TRUE(result.has_value()) << toString(result.error());
+        }
+        return keys;
+    };
+    source.list_client_ids = [&primary] {
+        return primary.ListSnapshotClientIds();
+    };
+    source.get_object_metadata = [&primary](const std::string& key) {
+        return primary.GetSnapshotObjectMetadata(key);
+    };
+    source.get_client_info = [&primary](const UUID& id) {
+        return primary.GetSnapshotClientInfo(id);
+    };
+
+    const auto port = AllocateLoopbackPort();
+    ASSERT_NE(port, 0u);
+    SnapshotSourceServer server(port, std::move(source));
+    ASSERT_TRUE(server.Start());
+
+    auto target_config = MakeStandbyConfig();
+    target_config.snapshot_source_endpoints = {server.Endpoint()};
+    target_config.snapshot_chunk_size = 1;
+    P2PHotStandbyService target(target_config);
+    ASSERT_EQ(target.Start(), ErrorCode::OK);
+    ASSERT_TRUE(wrote_after_begin.load());
+    ASSERT_TRUE(
+        target.WaitForAppliedSequence(3, std::chrono::milliseconds(2000)));
+
+    auto exported = target.ExportMetadata();
+    auto before = exported.routes.find("before-primary-snapshot");
+    ASSERT_NE(before, exported.routes.end());
+    EXPECT_EQ(before->second.object_size, 4096u);
+    auto after = exported.routes.find("after-primary-snapshot");
+    ASSERT_NE(after, exported.routes.end());
+    EXPECT_EQ(after->second.object_size, 8192u);
+
+    target.Stop();
 }
 
 TEST_F(P2PHotStandbyServiceTest, PrimarySnapshotSourceServesCurrentMetadata) {
@@ -603,6 +848,93 @@ TEST_F(P2PHotStandbyServiceTest,
     EXPECT_EQ(after->second.object_size, 8192);
 
     standby.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       LocalCommittedHandoffRollsBackReversibleUncommittedMetadata) {
+    P2PMasterService primary(MakeMasterConfig());
+    const UUID base_client_id{101, 101};
+    const UUID base_segment_id{102, 102};
+    const UUID uncommitted_segment_id{103, 103};
+    const UUID uncommitted_client_id{104, 104};
+    const UUID uncommitted_client_segment_id{105, 105};
+
+    RegisterClient(primary, base_client_id, MakeSegment(base_segment_id));
+    PublishRoute(primary, "committed-key", base_client_id, base_segment_id,
+                 2048);
+    const uint64_t committed_sequence_id = primary.GetLatestOpLogSequenceId();
+    ASSERT_EQ(committed_sequence_id, 2u);
+
+    auto mount_result = primary.MountSegment(
+        MakeSegment(uncommitted_segment_id), base_client_id);
+    ASSERT_TRUE(mount_result.has_value()) << toString(mount_result.error());
+    PublishRoute(primary, "uncommitted-segment-key", base_client_id,
+                 uncommitted_segment_id, 4096);
+    RegisterClient(primary, uncommitted_client_id,
+                   MakeSegment(uncommitted_client_segment_id));
+    PublishRoute(primary, "uncommitted-client-key", uncommitted_client_id,
+                 uncommitted_client_segment_id, 8192);
+    ASSERT_GT(primary.GetLatestOpLogSequenceId(), committed_sequence_id);
+
+    auto handoff =
+        primary.ExportLocalCommittedMetadataForStandby(committed_sequence_id);
+    ASSERT_TRUE(handoff.has_value()) << toString(handoff.error());
+
+    ASSERT_EQ(handoff->clients.size(), 1u);
+    auto base_client = handoff->clients.find(base_client_id);
+    ASSERT_NE(base_client, handoff->clients.end());
+    ASSERT_EQ(base_client->second.segments.size(), 1u);
+    EXPECT_EQ(base_client->second.segments.front().id, base_segment_id);
+    EXPECT_EQ(handoff->clients.find(uncommitted_client_id),
+              handoff->clients.end());
+
+    ASSERT_EQ(handoff->routes.size(), 1u);
+    auto committed_object = handoff->routes.find("committed-key");
+    ASSERT_NE(committed_object, handoff->routes.end());
+    EXPECT_EQ(committed_object->second.object_size, 2048u);
+    EXPECT_EQ(committed_object->second.last_sequence_id, committed_sequence_id);
+    ASSERT_EQ(committed_object->second.locations.size(), 1u);
+    const auto& location = committed_object->second.locations.front();
+    EXPECT_EQ(location.client_id, base_client_id);
+    EXPECT_EQ(location.segment_id, base_segment_id);
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       LocalCommittedHandoffRejectsUncommittedWithdrawLikeOplog) {
+    P2PMasterService primary(MakeMasterConfig());
+    const UUID client_id{111, 111};
+    const UUID segment_id{112, 112};
+
+    RegisterClient(primary, client_id, MakeSegment(segment_id));
+    PublishRoute(primary, "withdraw-like-key", client_id, segment_id, 2048);
+    const uint64_t committed_sequence_id = primary.GetLatestOpLogSequenceId();
+    ASSERT_EQ(committed_sequence_id, 2u);
+
+    WithdrawRoute(primary, "withdraw-like-key", client_id, segment_id);
+    ASSERT_EQ(primary.GetLatestOpLogSequenceId(), committed_sequence_id + 1);
+
+    auto handoff =
+        primary.ExportLocalCommittedMetadataForStandby(committed_sequence_id);
+    ASSERT_FALSE(handoff.has_value());
+    EXPECT_EQ(handoff.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       LocalCommittedHandoffRejectsWhenBufferedEntriesAreUnavailable) {
+    P2PMasterService primary(MakeMasterConfig());
+    auto* manager = primary.GetOpLogManager();
+    ASSERT_NE(manager, nullptr);
+    manager->SetOpLogStore(nullptr);
+
+    constexpr size_t kEntriesToExhaustBoundedBuffer = 100001;
+    for (size_t i = 0; i < kEntriesToExhaustBoundedBuffer; ++i) {
+        manager->Append(OpType_PUBLISH_ROUTE, "buffered-entry");
+    }
+
+    auto handoff =
+        primary.ExportLocalCommittedMetadataForStandby(/*sequence_id=*/0);
+    ASSERT_FALSE(handoff.has_value());
+    EXPECT_EQ(handoff.error(), ErrorCode::OPLOG_ENTRY_NOT_FOUND);
 }
 
 #ifdef STORE_USE_REDIS

@@ -388,7 +388,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     status.SetDoctorIssue("OPLOG_APPLY_FAILED", "seq=123: invalid payload");
     status.RecordRegistryHeartbeat(ErrorCode::INTERNAL_ERROR, "Redis timeout");
     auto report = doctor();
-    EXPECT_EQ(report["status"].asString(), "degraded");
+    EXPECT_EQ(report["health"].asString(), "degraded");
     ASSERT_EQ(report["issues"].size(), 2u);
     EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_APPLY_FAILED");
     EXPECT_EQ(report["issues"][0]["message"].asString(),
@@ -412,7 +412,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
               "seq=124: invalid payload");
     status.SetDoctorIssue("OPLOG_APPLY_FAILED");
     report = doctor();
-    EXPECT_EQ(report["status"].asString(), "ok");
+    EXPECT_EQ(report["health"].asString(), "ok");
     EXPECT_TRUE(report["issues"].empty());
 }
 
@@ -430,7 +430,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
         ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
         auto report = ParseJson(response.resp_body, "/ha/doctor");
         EXPECT_TRUE(report["issues"].empty());
-        EXPECT_EQ(report["status"].asString(),
+        EXPECT_EQ(report["health"].asString(),
                   std::string(state) == "WATCHING" ? "ok" : "unknown");
     }
 }
@@ -447,7 +447,7 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorReturnsElectionInstability) {
     auto response = HttpGet(http_base_url_ + "/ha/doctor");
     ASSERT_EQ(response.status, 200) << response.resp_body;
     const auto report = ParseJson(response.resp_body, "/ha/doctor");
-    EXPECT_EQ(report["status"].asString(), "degraded");
+    EXPECT_EQ(report["health"].asString(), "degraded");
     ASSERT_EQ(report["issues"].size(), 1u);
     EXPECT_EQ(report["issues"][0]["code"].asString(), "ELECTION_UNSTABLE");
 }
@@ -462,14 +462,14 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorHandlesLifecycleAndFatalFailure) {
     };
 
     status.Reset();
-    EXPECT_EQ(doctor()["status"].asString(), "unknown");
+    EXPECT_EQ(doctor()["health"].asString(), "unknown");
     status.Configure(false, "test_cluster", "127.0.0.1:50051");
-    EXPECT_EQ(doctor()["status"].asString(), "unknown");
+    EXPECT_EQ(doctor()["health"].asString(), "unknown");
     status.Configure(true, "test_cluster", "127.0.0.1:50051");
     status.SetRoleState("promoting", "FAILED");
     status.SetLastError("Failed to promote: INTERNAL_ERROR");
     auto report = doctor();
-    EXPECT_EQ(report["status"].asString(), "degraded");
+    EXPECT_EQ(report["health"].asString(), "degraded");
     ASSERT_EQ(report["issues"].size(), 1u);
     EXPECT_EQ(report["issues"][0]["code"].asString(), "HA_FAILED");
     EXPECT_EQ(report["issues"][0]["message"].asString(),
@@ -479,11 +479,11 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorHandlesLifecycleAndFatalFailure) {
     status.ClearLastError();
     status.SetRoleState("starting", "INITIALIZING");
     report = doctor();
-    EXPECT_EQ(report["status"].asString(), "unknown");
+    EXPECT_EQ(report["health"].asString(), "unknown");
     EXPECT_TRUE(report["issues"].empty());
     status.SetLeader("127.0.0.1:50051", 1);
     status.SetRoleState("primary", "RUNNING");
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,
@@ -508,7 +508,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     status.SetOpLogProgress(201, 201);
     status.RecordRegistryHeartbeat(ErrorCode::OK, "");
     auto report = doctor();
-    EXPECT_EQ(report["status"].asString(), "degraded");
+    EXPECT_EQ(report["health"].asString(), "degraded");
     ASSERT_EQ(report["issues"].size(), 1u);
     EXPECT_EQ(report["issues"][0]["code"].asString(),
               "PROMOTION_CATCHUP_INCOMPLETE");
@@ -521,7 +521,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     ASSERT_EQ(report["issues"].size(), 1u);
     EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_READ_FAILED");
     status.ClearDoctorIssues();
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
@@ -543,15 +543,15 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
     status.SetOpLogWriterRunning(true);
     status.SetOpLogWriteProgress(10, 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     // New pending work begins a fresh timer. Idle time is excluded.
     status.SetOpLogWriteProgress(10, 1);
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     // Additional work cannot reset the timer while confirmed latest stalls.
     status.SetOpLogWriteProgress(10, 2);
     auto report = doctor();
-    EXPECT_EQ(report["status"].asString(), "degraded");
+    EXPECT_EQ(report["health"].asString(), "degraded");
     ASSERT_EQ(report["issues"].size(), 1u);
     EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_LATEST_STALLED");
     EXPECT_NE(report["issues"][0]["message"].asString().find(
@@ -559,19 +559,19 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
               std::string::npos);
 
     status.Configure(true, "test_cluster", "test-primary", 0);
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     status.Configure(true, "test_cluster", "test-primary", 1);
-    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
 
     // Confirmed progress restarts the timer while work remains busy.
     status.SetOpLogWriteProgress(11, 1);
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
 
     // Draining work disarms the timer.
     status.SetOpLogWriteProgress(12, 0);
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
 
     // A stopped writer clears cache and rejects late callbacks from the
     // previous worker.
@@ -579,7 +579,7 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
     status.SetOpLogWriterRunning(false);
     status.SetOpLogWriteProgress(12, 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, HADoctorDetectsCatchupStallAndRecovery) {
@@ -596,26 +596,26 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorDetectsCatchupStallAndRecovery) {
 
     status.SetOpLogProgress(100, 100);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     status.SetOpLogProgress(100, 200);
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     // More backlog cannot restart the timer.
     status.SetOpLogProgress(100, 300);
     auto report = doctor();
-    EXPECT_EQ(report["status"].asString(), "degraded");
+    EXPECT_EQ(report["health"].asString(), "degraded");
     ASSERT_EQ(report["issues"].size(), 1u);
     EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_CATCHUP_STALLED");
     EXPECT_NE(report["issues"][0]["message"].asString().find(
                   "oplog_applied_sequence_id=100, "
                   "oplog_latest_sequence_id=300, stalled_ms="),
               std::string::npos);
-    EXPECT_NE(report["status"].asString(), "ok");
+    EXPECT_NE(report["health"].asString(), "ok");
 
     // A failed latest read retains the last known latest.
     status.SetOpLogProgress(100, std::nullopt);
     EXPECT_EQ(status.Snapshot().latest_sequence_id, 300u);
-    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
     status.SetDoctorIssue("OPLOG_READ_FAILED", "Redis read failed");
     report = doctor();
     EXPECT_EQ(report["issues"].size(), 2u);
@@ -630,13 +630,13 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorDetectsCatchupStallAndRecovery) {
 
     // Applied progress restarts the timer without requiring a new latest.
     status.SetOpLogProgress(101, std::nullopt);
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     status.SetOpLogProgress(101, std::nullopt);
-    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
     status.SetOpLogProgress(300, 300);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,
@@ -660,18 +660,18 @@ TEST_F(P2PMasterHttpEndpointsTest,
     // Unknown latest cannot initialize the timer.
     status.SetOpLogProgress(10, std::nullopt);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     status.SetOpLogProgress(10, 20);
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     // No newer sample means the stall is not confirmed yet.
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     status.SetOpLogProgress(10, 20);
-    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
 
     status.SetLeader("test-standby", 1);
     status.SetRoleState("primary", "RUNNING");
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     status.SetRoleState("standby", "WATCHING");
     status.SetOpLogProgress(10, 20);
 
@@ -680,7 +680,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     status.SetOpLogProgress(10, std::nullopt);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     status.SetOpLogProgress(10, std::nullopt);
-    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
     status.SetOpLogProgress(10, 20);
 
     status.Configure(false, "test_cluster", "test-standby", 10, 1);

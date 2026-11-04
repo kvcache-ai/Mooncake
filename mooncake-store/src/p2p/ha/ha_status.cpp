@@ -127,6 +127,54 @@ HADoctorIssue MakeDoctorIssue(std::string code, std::string message) {
     return issue;
 }
 
+bool IsDoctorIssueScopedToRole(const std::string& code,
+                               const std::string& role) {
+    if (role == "primary") {
+        return StartsWith(code, "OPLOG_WRITE_") ||
+               StartsWith(code, "OPLOG_COMMIT_") ||
+               code == "PROMOTION_CATCHUP_INCOMPLETE";
+    }
+    if (role == "standby") {
+        return StartsWith(code, "OPLOG_READ_") ||
+               StartsWith(code, "OPLOG_RECONNECT_") ||
+               StartsWith(code, "OPLOG_APPLY_") ||
+               code == "SNAPSHOT_RECOVERY_FAILED";
+    }
+    if (role == "promoting") {
+        return StartsWith(code, "PROMOTION_");
+    }
+    return false;
+}
+
+int64_t HeartbeatAgeMs(const HAStatusSnapshot& status, int64_t now_ms) {
+    const int64_t last_heartbeat_ms =
+        std::max(status.registry_heartbeat_last_success_ms,
+                 status.registry_heartbeat_last_failure_ms);
+    if (last_heartbeat_ms <= 0) {
+        return 0;
+    }
+    return std::max<int64_t>(0, now_ms - last_heartbeat_ms);
+}
+
+HADoctorStatus MakeDoctorStatus(const HAStatusSnapshot& status,
+                                int64_t now_ms) {
+    HADoctorStatus doctor_status;
+    doctor_status.role = status.role;
+    doctor_status.state = status.state;
+    doctor_status.local_endpoint = status.local_endpoint;
+    doctor_status.leader_endpoint = status.leader_endpoint;
+    doctor_status.epoch = status.epoch;
+    doctor_status.instance_id = status.instance_id;
+    doctor_status.applied_sequence_id = status.applied_sequence_id;
+    doctor_status.latest_sequence_id = status.latest_sequence_id;
+    doctor_status.trimmed_sequence_id = status.trimmed_sequence_id;
+    doctor_status.gc_cursor_sequence_id = status.gc_cursor_sequence_id;
+    doctor_status.oplog_lag = status.oplog_lag;
+    doctor_status.snapshot_ready = status.snapshot_ready;
+    doctor_status.heartbeat_age_ms = HeartbeatAgeMs(status, now_ms);
+    return doctor_status;
+}
+
 }  // namespace
 
 HAStatusManager& HAStatusManager::instance() {
@@ -202,6 +250,15 @@ void HAStatusManager::SetRoleState(std::string role, std::string state) {
     }
     if (status_.role == "primary" && role != "primary") {
         doctor_issues_.erase("PROMOTION_CATCHUP_INCOMPLETE");
+    }
+    if (changed && status_.role != role) {
+        for (auto it = doctor_issues_.begin(); it != doctor_issues_.end();) {
+            if (IsDoctorIssueScopedToRole(it->first, status_.role)) {
+                it = doctor_issues_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
     status_.role = std::move(role);
     status_.state = std::move(state);
@@ -618,6 +675,8 @@ std::string HAStatusManager::SerializeDoctorJson() const {
     HADoctorReport report;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        const auto now_ms = NowMs();
+        report.status = MakeDoctorStatus(BuildSnapshotLocked(now_ms), now_ms);
         if (status_.ha_enabled) {
             if (auto issue = ElectionUnstableMessageLocked(); !issue.empty()) {
                 report.issues.push_back(
@@ -668,14 +727,14 @@ std::string HAStatusManager::SerializeDoctorJson() const {
                                      : status_.last_error));
             }
             if (!report.issues.empty()) {
-                report.status = "degraded";
+                report.health = "degraded";
             } else if ((status_.role == "primary" &&
                         status_.state == "RUNNING") ||
                        (status_.role == "standby" &&
                         status_.state == "WATCHING")) {
                 // Sequence gaps, lag, and historical last_error are not
                 // evidence of a current failure. Transitions stay unknown.
-                report.status = "ok";
+                report.health = "ok";
             }
         }
     }
