@@ -242,8 +242,14 @@ class UringFile : public StorageFile {
     void unregister_buffer();
     bool is_buffer_registered() const;
 
+    // Largest contiguous write that goes out as one SQE; 0 if every write is
+    // split (detail::single_sqe_write_max).
+    size_t single_sqe_write_max() const { return single_sqe_write_max_; }
+
    private:
     bool use_direct_io_;
+    // Largest write that goes out as one SQE (detail::single_sqe_write_max).
+    size_t single_sqe_write_max_;
     static constexpr size_t ALIGNMENT_ = 4096;
 
     /// Allocate / free an O_DIRECT aligned bounce buffer.
