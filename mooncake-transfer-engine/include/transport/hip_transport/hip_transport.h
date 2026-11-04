@@ -67,6 +67,7 @@ class HipTransport : public Transport {
     const char* getName() const override { return "hip"; }
 
    private:
+    friend class HipTransportTestPeer;
     struct OpenedShmEntry {
         void* shm_addr;
         uint64_t length;

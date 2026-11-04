@@ -701,7 +701,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                           << ", leaving it to other transports";
             }
             skipped_addrs_.insert((uint64_t)addr);
-            return 0;
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Resolve the true hipMalloc base address. Framework caching
@@ -716,6 +716,14 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                                             &alloc_size, (hipDeviceptr_t)addr),
                       "HipTransport: hipMemGetAddressRange failed")) {
             return -1;
+        }
+        const auto offset = (uint64_t)addr - (uint64_t)base_ptr;
+        if (offset > alloc_size || length > alloc_size - offset) {
+            LOG(WARNING) << "HipTransport: skipping buffer " << addr << " + "
+                         << length << " outside allocation " << base_ptr
+                         << " + " << alloc_size;
+            skipped_addrs_.insert((uint64_t)addr);
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Re-registering the same address is idempotent; a new sub-range of
@@ -771,7 +779,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                          << " is not allocated by hipMemCreate, "
                          << "but it can be used as local buffer";
             skipped_addrs_.insert((uint64_t)addr);
-            return 0;
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Find whole physical page for memory registration
@@ -944,12 +952,15 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
 int HipTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry>& buffer_list,
     const std::string& location) {
+    bool skipped = false;
     for (auto& buffer : buffer_list) {
         int rc = registerLocalMemory(buffer.addr, buffer.length, location, true,
                                      false);
-        if (rc) return rc;
+        if (rc < 0) return rc;
+        skipped |= rc == REGISTER_MEMORY_SKIPPED;
     }
-    return metadata_->updateLocalSegmentDesc();
+    int rc = metadata_->updateLocalSegmentDesc();
+    return rc == 0 && skipped ? REGISTER_MEMORY_SKIPPED : rc;
 }
 
 int HipTransport::unregisterLocalMemoryBatch(

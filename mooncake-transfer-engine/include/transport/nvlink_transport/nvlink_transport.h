@@ -145,9 +145,13 @@ class NvlinkTransport : public Transport {
     std::atomic_bool running_;
 
     struct OpenedShmEntry {
-        void* shm_addr;
+        void* shm_addr;  // what cudaIpcOpenMemHandle / the fabric map returned
         uint64_t length;
         int device_id{-1};
+        // Byte offset of the registered buffer inside the mapping at
+        // shm_addr. An IPC handle maps its whole allocation, so a buffer that
+        // starts inside the allocation is at shm_addr + offset.
+        uint64_t offset = 0;
     };
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
@@ -157,6 +161,14 @@ class NvlinkTransport : public Transport {
     std::shared_ptr<GpuIpcTransportPolicy> policy_;
 
     std::mutex register_mutex_;
+    struct FabricRegistration {
+        void* base;
+        std::string handle;
+        bool metadata_removed = false;
+    };
+    std::unordered_map<void*, FabricRegistration> fabric_registrations_;
+    // Caller holds register_mutex_.
+    int removeLocalBufferLocked(void* addr, bool update_metadata);
 #if MOONCAKE_NVLINK_HOST_NUMA_ENABLED
     using AddLocalMemoryBufferOp = std::function<int(const BufferDesc&, bool)>;
     using RemoveLocalMemoryBufferOp = std::function<int(void*, bool)>;

@@ -51,6 +51,9 @@ class Transport {
     friend class MultiTransport;
 
    public:
+    // Registration may skip a range that another installed transport can use.
+    // The engine rejects the range when every transport skips it.
+    static constexpr int REGISTER_MEMORY_SKIPPED = 1;
     using SegmentID = uint64_t;
     using SegmentHandle = SegmentID;
 
