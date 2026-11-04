@@ -77,8 +77,10 @@ The older fields `applied_sequence_id`, `latest_sequence_id`,
 `trimmed_sequence_id`, `gc_cursor_sequence_id`, `oplog_lag`, and
 `oplog_pending_writes` remain in the response for compatibility.
 `master_view_endpoint` and `master_view_updated_at_ms` are clearer aliases for
-`master_view_address` and `master_view_timestamp_ms`. `master_view_age_ms` and
-`master_view_expires_in_ms` are computed from the cached view timestamp and TTL.
+`master_view_address` and `master_view_timestamp_ms`. `master_view_age_ms` is
+computed from the cached view timestamp. `master_view_expires_in_ms` is the
+remaining lease based on the most recent local refresh and is clamped to zero
+after expiry; a negative expiry is not reported by `/ha/status`.
 `registry_heartbeat_last_success_timestamp_ms`,
 `registry_heartbeat_last_failure_timestamp_ms`, and `status_updated_at_ms` are
 clearer aliases for `registry_heartbeat_last_success_ms`,
@@ -134,6 +136,14 @@ instance IDs are present and differ, or when both epochs are present and differ.
 Empty instance IDs are not treated as a mismatch by themselves, so older paths
 and non-Redis election backends do not degrade solely because they do not publish
 an instance ID.
+
+`MASTER_VIEW_LEASE_EXPIRED` means a `primary,state=RUNNING` has not refreshed its
+cached master view within the TTL, excluding a one-second grace window. It is
+suppressed when `LEADERSHIP_LOST` is already present and recomputed on every
+doctor request. The signed remaining time stays in the doctor message because a
+negative value there is diagnostic; `/ha/status` clamps the corresponding value
+to zero. Standbys do not receive TTL renewal notifications, so this issue is
+primary-only and a stale standby view must be judged with `master_view_age_ms`.
 
 `OPLOG_QUEUE_PRESSURE` means a `role=primary,state=RUNNING` Redis writer has
 pending work at or above 80% of its configured async queue capacity. The message

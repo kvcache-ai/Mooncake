@@ -815,9 +815,15 @@ HAStatusSnapshot HAStatusManager::BuildSnapshotLocked(int64_t now_ms) const {
         // stale/expired view rather than normal operation.
         if (snapshot.master_view_ttl_sec > 0 &&
             master_view_refreshed_at_ms_ > 0) {
+            const int64_t remaining_ms = master_view_refreshed_at_ms_ +
+                                         snapshot.master_view_ttl_sec * 1000 -
+                                         now_ms;
+            // Expose a lease remaining time, not a signed age. Standbys can
+            // retain a stale local view because only the leader observes TTL
+            // renewals, so use master_view_age_ms and doctor diagnostics for
+            // staleness instead of reporting a negative value.
             snapshot.master_view_expires_in_ms =
-                master_view_refreshed_at_ms_ +
-                snapshot.master_view_ttl_sec * 1000 - now_ms;
+                std::max<int64_t>(0, remaining_ms);
         }
     }
 

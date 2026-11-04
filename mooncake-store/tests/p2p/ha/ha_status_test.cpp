@@ -55,6 +55,12 @@ class HAStatusTest : public ::testing::Test {
         struct_json::from_json(report, status.SerializeDoctorJson());
         return report;
     }
+
+    HAStatusSnapshot parsed_status() {
+        HAStatusSnapshot parsed;
+        struct_json::from_json(parsed, status.SerializeJson());
+        return parsed;
+    }
 };
 
 TEST_F(HAStatusTest, CountsObservedTermsAcrossSupervisorRounds) {
@@ -294,6 +300,9 @@ TEST_F(HAStatusTest, DoctorFlagsMasterViewLeaseExpiredForStuckPrimary) {
     // the grace window). The lease has elapsed without LEADERSHIP_LOST firing.
     HAStatusTestPeer::AgeMasterViewRefresh(status,
                                            std::chrono::milliseconds(4000));
+    // /ha/status reports a lease remaining time and therefore clamps an
+    // expired estimate to zero; doctor retains the signed diagnostic detail.
+    EXPECT_EQ(status.Snapshot().master_view_expires_in_ms, 0);
     const auto* issue = FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("expires_in_ms=-"), std::string::npos);
@@ -335,7 +344,19 @@ TEST_F(HAStatusTest, MasterViewLeaseExpiredDoctorIsPrimaryOnly) {
     status.SetRoleState("standby", "WATCHING");
     HAStatusTestPeer::AgeMasterViewRefresh(status,
                                            std::chrono::milliseconds(5000));
+    EXPECT_EQ(status.Snapshot().master_view_expires_in_ms, 0);
     EXPECT_EQ(FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED"), nullptr);
+}
+
+TEST_F(HAStatusTest, SerializedStatusClampsExpiredMasterViewExpiry) {
+    status.SetMasterView("leader", 7, /*timestamp_ms=*/1,
+                         /*ttl_sec=*/2, "leader-instance");
+    HAStatusTestPeer::AgeMasterViewRefresh(status,
+                                           std::chrono::milliseconds(5000));
+    const auto parsed = parsed_status();
+    EXPECT_EQ(parsed.master_view_expires_in_ms, 0);
+    EXPECT_EQ(parsed.master_view_ttl_sec, 2);
+    EXPECT_EQ(parsed.master_view_epoch, 7u);
 }
 
 TEST_F(HAStatusTest, MasterViewExpiryFollowsLeaseRenewalNotElectionTime) {
