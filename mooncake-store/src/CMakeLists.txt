@@ -30,6 +30,7 @@ set(MOONCAKE_STORE_SOURCES
     client_buffer.cpp
     real_client.cpp
     dummy_client.cpp
+    shm_helper.cpp
 )
 
 set(EXTRA_LIBS "")

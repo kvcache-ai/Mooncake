@@ -10,6 +10,7 @@
 #include "allocator.h"
 #include "pyclient.h"
 #include "dummy_client.h"
+#include "shm_helper.h"
 #include "real_client.h"
 #include "types.h"
 
