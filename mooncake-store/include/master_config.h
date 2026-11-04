@@ -91,6 +91,21 @@ inline std::string ResolveConfiguredHABackendConnstring(
     return {};
 }
 
+// Picks the RPC listen port: a positive --rpc_port, then a nonzero rpc_port
+// from the config file, then the deprecated --port (default 50051). In both
+// rpc_port sources 0 means unset; binding it would pick an ephemeral port.
+inline uint32_t ResolveMasterRpcPort(int32_t rpc_port_flag,
+                                     uint32_t config_file_rpc_port,
+                                     int32_t legacy_port_flag) {
+    if (rpc_port_flag > 0) {
+        return static_cast<uint32_t>(rpc_port_flag);
+    }
+    if (config_file_rpc_port != 0) {
+        return config_file_rpc_port;
+    }
+    return static_cast<uint32_t>(legacy_port_flag);
+}
+
 // The configuration for the master server
 struct MasterConfig {
     MetricsBootstrapConfig metrics;

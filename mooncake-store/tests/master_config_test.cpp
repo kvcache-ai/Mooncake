@@ -80,5 +80,21 @@ TEST(HALeaseTtlConfigTest, SupervisorConfigCarriesMasterConfigTtl) {
     EXPECT_EQ(17, supervisor_config.ha_leader_lease_ttl_sec);
 }
 
+// A config file that omits rpc_port yields 0, the same as no config file.
+TEST(MasterRpcPortConfigTest, UnsetRpcPortFallsBackToLegacyPort) {
+    EXPECT_EQ(50051u, ResolveMasterRpcPort(0, 0, 50051));
+    EXPECT_EQ(50060u, ResolveMasterRpcPort(0, 0, 50060));
+}
+
+TEST(MasterRpcPortConfigTest, ConfigFileRpcPortOverridesLegacyPort) {
+    EXPECT_EQ(50052u, ResolveMasterRpcPort(0, 50052, 50051));
+    EXPECT_EQ(50052u, ResolveMasterRpcPort(0, 50052, 50060));
+}
+
+TEST(MasterRpcPortConfigTest, RpcPortFlagTakesPrecedence) {
+    EXPECT_EQ(50053u, ResolveMasterRpcPort(50053, 50052, 50060));
+    EXPECT_EQ(50053u, ResolveMasterRpcPort(50053, 0, 50051));
+}
+
 }  // namespace
 }  // namespace mooncake::test
