@@ -1753,6 +1753,36 @@ void bind_coro_rpc_interface(py::module_& m) {
 }
 
 PYBIND11_MODULE(engine, m) {
+#ifdef MOONCAKE_TENT_HAS_REDIS
+    m.attr("SUPPORT_TENT_REDIS") = true;
+#else
+    m.attr("SUPPORT_TENT_REDIS") = false;
+#endif
+#ifdef MOONCAKE_TENT_HAS_HTTP
+    m.attr("SUPPORT_TENT_HTTP") = true;
+#else
+    m.attr("SUPPORT_TENT_HTTP") = false;
+#endif
+#ifdef USE_TENT
+    m.attr("SUPPORT_TENT") = true;
+#else
+    m.attr("SUPPORT_TENT") = false;
+#endif
+#ifdef USE_ETCD
+    m.attr("SUPPORT_ETCD") = true;
+#else
+    m.attr("SUPPORT_ETCD") = false;
+#endif
+#ifdef USE_REDIS
+    m.attr("SUPPORT_REDIS") = true;
+#else
+    m.attr("SUPPORT_REDIS") = false;
+#endif
+#ifdef USE_HTTP
+    m.attr("SUPPORT_HTTP") = true;
+#else
+    m.attr("SUPPORT_HTTP") = false;
+#endif
 #ifdef USE_EFA
     m.attr("SUPPORT_EFA") = true;
 #else

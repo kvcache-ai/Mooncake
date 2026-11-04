@@ -24,6 +24,7 @@
 // under TSAN.
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -31,6 +32,7 @@
 #include <thread>
 #include <vector>
 
+#include "tent/runtime/metastore.h"
 #include "tent/runtime/segment_manager.h"
 #include "tent/runtime/segment_registry.h"
 #include "tent/runtime/segment_tracker.h"
@@ -75,6 +77,32 @@ const std::vector<BufferDesc>& buffersOf(const SegmentDescRef& snapshot) {
 }
 
 }  // namespace
+
+// TENT has a separate metadata factory from the classic Transfer Engine.
+// A misconfigured backend must not abort its embedding application.
+TEST(CentralSegmentRegistryTest, UnsupportedPluginReturnsAnError) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        {
+            const std::string servers = "127.0.0.1:1";
+            if (MetaStore::Create("unsupported", servers)) _exit(1);
+            {
+                CentralSegmentRegistry registry("unsupported", servers);
+                const std::string name = "unavailable-metadata-test";
+                auto desc = std::make_shared<SegmentDesc>();
+                desc->name = name;
+                if (registry.available()) _exit(2);
+                if (!registry.putSegmentDesc(desc).IsMetadataError()) _exit(3);
+                SegmentDescRef fetched;
+                if (!registry.getSegmentDesc(fetched, name).IsMetadataError())
+                    _exit(4);
+                if (!registry.deleteSegmentDesc(name).IsMetadataError())
+                    _exit(5);
+            }
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0), "");
+}
 
 TEST(SegmentManagerTest, UpdateLocalPublishesImmutableSnapshots) {
     auto manager = makeManager();

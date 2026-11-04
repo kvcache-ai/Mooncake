@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -125,8 +126,9 @@ uint16_t reserveUnusedTcpPort() {
 
 class TestHttpMetadataServer {
    public:
-    explicit TestHttpMetadataServer(uint16_t port)
+    explicit TestHttpMetadataServer(uint16_t port, bool reject_writes = false)
         : port_(port),
+          reject_writes_(reject_writes),
           server_(std::make_unique<coro_http::coro_http_server>(1, port)) {
         initServer();
     }
@@ -160,6 +162,13 @@ class TestHttpMetadataServer {
         started_ = false;
         running_ = false;
     }
+
+    void seed(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lock(store_mutex_);
+        store_[key] = value;
+    }
+
+    size_t deleteRequests() const { return delete_requests_.load(); }
 
     std::optional<std::string> getStoredValue(const std::string& key) const {
         std::lock_guard<std::mutex> lock(store_mutex_);
@@ -211,6 +220,11 @@ class TestHttpMetadataServer {
                     return;
                 }
 
+                if (reject_writes_) {
+                    resp.set_status_and_content(
+                        status_type::service_unavailable, "unavailable");
+                    return;
+                }
                 std::lock_guard<std::mutex> lock(store_mutex_);
                 store_[key] = std::string(req.get_body());
                 resp.set_status_and_content(status_type::ok,
@@ -220,6 +234,7 @@ class TestHttpMetadataServer {
         server_->set_http_handler<coro_http::http_method::DEL>(
             "/metadata",
             [this](coro_http_request& req, coro_http_response& resp) {
+                ++delete_requests_;
                 auto key = req.get_decode_query_value("key");
                 if (key.empty()) {
                     resp.set_status_and_content(status_type::bad_request,
@@ -253,6 +268,8 @@ class TestHttpMetadataServer {
 
    private:
     uint16_t port_;
+    bool reject_writes_;
+    std::atomic<size_t> delete_requests_{0};
     bool started_ = false;
     bool running_ = false;
     std::unique_ptr<coro_http::coro_http_server> server_;
@@ -755,6 +772,37 @@ TEST(TransferEngineConfigOverrideTest,
         << "caller 'segments:' must not leak into buffer location";
 
     engine.unregisterLocalMemory(buf.data(), kBufSize);
+#endif
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     FailedInitialPublicationStopsRpcAndPreservesMetadata) {
+#ifndef _WIN32
+    EnvVarGuard force_tcp("MC_FORCE_TCP", "1");
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port, true);
+    ASSERT_TRUE(server.start());
+    const std::string key = buildMetadataKey(kSegmentName);
+    const std::string original = "existing-owner-metadata";
+    server.seed(key, original);
+    auto conf = std::make_shared<Config>();
+    conf->set("metadata_type", "http");
+    conf->set("metadata_servers", buildHttpMetadataEndpoint(port));
+    conf->set("local_segment_name", kSegmentName);
+    conf->set("rpc_server_hostname", kLoopbackHostname);
+    conf->set("rpc_server_port", 0);
+    configureTcpOnlyTransports(*conf);
+    {
+        TransferEngine engine(conf);
+        EXPECT_FALSE(engine.available());
+        EXPECT_EQ(engine.getRpcServerPort(), 0);
+        EXPECT_EQ(server.getStoredValue(key), original);
+        EXPECT_EQ(server.deleteRequests(), 0);
+    }
+    EXPECT_EQ(server.getStoredValue(key), original);
+    EXPECT_EQ(server.deleteRequests(), 0);
+#else
+    GTEST_SKIP() << "Requires the local HTTP metadata fixture";
 #endif
 }
 

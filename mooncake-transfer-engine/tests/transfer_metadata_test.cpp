@@ -31,6 +31,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -1395,13 +1396,27 @@ TEST_F(TransferMetadataStaleSegmentInvalidationTest,
 
 namespace {
 
-int openDescriptorCount() {
+int openSocketCount() {
+#ifdef __linux__
     DIR *directory = opendir("/proc/self/fd");
     if (!directory) return -1;
     int count = 0;
-    while (readdir(directory)) ++count;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != nullptr) {
+        if (entry->d_name[0] == '.') continue;
+        const std::string link = std::string("/proc/self/fd/") + entry->d_name;
+        char target[128];
+        const ssize_t len = readlink(link.c_str(), target, sizeof(target));
+        // Go initializes poller FDs and opens/closes cgroup files
+        // asynchronously. Count sockets for the RPC resource invariant.
+        if (len >= 8 && std::memcmp(target, "socket:[", 8) == 0) ++count;
+    }
     closedir(directory);
     return count;
+#else
+    // /proc is Linux-specific; retain the initialization checks elsewhere.
+    return 0;
+#endif
 }
 
 int rejectUnavailablePlugin(const std::string &connection) {
@@ -1409,6 +1424,7 @@ int rejectUnavailablePlugin(const std::string &connection) {
     setrlimit(RLIMIT_CORE, &limit);
     unsetenv("MC_USE_TENT");
     unsetenv("MC_USE_TEV1");
+    (void)globalConfig();  // Honor MC_LOG_DIR in this subprocess too.
     if (MetadataStoragePlugin::Create(connection)) return 1;
     try {
         TransferMetadata metadata(connection);
@@ -1417,13 +1433,13 @@ int rejectUnavailablePlugin(const std::string &connection) {
     }
 
     TransferEngine engine(false);
-    const int before = openDescriptorCount();
+    const int before = openSocketCount();
     if (before < 0) return 3;
     for (int attempt = 0; attempt < 16; ++attempt) {
         if (engine.init(connection, "127.0.0.1:12345") != ERR_INVALID_ARGUMENT)
             return 4;
     }
-    if (openDescriptorCount() != before) return 5;
+    if (openSocketCount() != before) return 5;
     return 0;
 }
 
@@ -1450,13 +1466,52 @@ class MetadataPluginInitDeathTest
 TEST_P(MetadataPluginInitDeathTest, ReturnsErrorWithoutAbortingOrLeaking) {
     // Run in a subprocess: the regression used to abort inside LOG(FATAL).
     GTEST_FLAG_SET(death_test_style, "threadsafe");
+    // MC_LOG_DIR may redirect glog to files; only the exit code is contractual.
     ASSERT_EXIT(_exit(rejectUnavailablePlugin(GetParam())),
-                ::testing::ExitedWithCode(0),
-                "Unable to find metadata storage plugin");
+                ::testing::ExitedWithCode(0), "");
 }
 
 INSTANTIATE_TEST_SUITE_P(Unavailable, MetadataPluginInitDeathTest,
                          ::testing::ValuesIn(unavailableConnections()));
+
+#ifdef USE_TENT
+int rejectTentMetadataAndRetry() {
+    const rlimit limit{0, 0};
+    setrlimit(RLIMIT_CORE, &limit);
+    for (const char *selector : {"MC_USE_TENT", "MC_USE_TEV1"}) {
+        unsetenv("MC_USE_TENT");
+        unsetenv("MC_USE_TEV1");
+        setenv(selector, "1", 1);
+        setenv("MC_FORCE_TCP", "1", 1);
+        TransferEngine engine(false);
+        if (!engine.isUsingTent()) return 1;
+        auto connections = unavailableConnections();
+#ifdef MOONCAKE_TENT_HAS_REDIS
+        std::erase(connections, "redis://127.0.0.1:1");
+#endif
+#ifdef MOONCAKE_TENT_HAS_HTTP
+        std::erase(connections, "http://127.0.0.1:1/metadata");
+#endif
+        for (const auto &connection : connections) {
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                if (engine.init(connection, "127.0.0.1", "", 0, "tcp") !=
+                    ERR_CONTEXT)
+                    return 2;
+                if (engine.getRpcPort() != 0) return 3;
+            }
+        }
+        if (engine.init(P2PHANDSHAKE, "127.0.0.1", "", 0, "tcp") != 0) return 4;
+        if (!engine.isUsingTent() || engine.getRpcPort() == 0) return 5;
+    }
+    return 0;
+}
+
+TEST(TentMetadataInitDeathTest, RejectsBeforeStartingRpcAndCanRetry) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(_exit(rejectTentMetadataAndRetry()),
+                ::testing::ExitedWithCode(0), "");
+}
+#endif
 
 TEST(MetadataPluginInitTest, EnabledHttpPluginCanBeConstructed) {
 #ifdef USE_HTTP
