@@ -18,6 +18,7 @@ MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES:-}
 MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS:-}
 MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE:-}
 MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX:-}
+RUN_STORE_RS_TESTS=${RUN_STORE_RS_TESTS:-false}
 USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-true}
 MOONCAKE_RENDER_DEVICES=${MOONCAKE_RENDER_DEVICES:-}
 MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES:-}
@@ -57,6 +58,13 @@ All_TEST_SCRIPTS_VLLM=(
     "test_vllm_1p1d_erdma.sh"
 )
 
+# Store-RS uses a wheel built by scripts/build_store_rs_wheel.sh. It remains
+# opt-in so ordinary release-wheel jobs keep their established six cases; the
+# Nightly combined-wheel jobs append this case to those six.
+All_TEST_SCRIPTS_STORE_RS_SGLANG=(
+    "test_hicache_storage_mooncake_store_rs.sh"
+)
+
 list_tests() {
     case "${1:-default}" in
         default)
@@ -68,15 +76,29 @@ list_tests() {
         VLLM)
             printf '%s\n' "${All_TEST_SCRIPTS_VLLM[@]}"
             ;;
+        STORE_RS)
+            printf '%s\n' "${All_TEST_SCRIPTS_STORE_RS_SGLANG[@]}"
+            ;;
+        STORE_RS_SGLANG)
+            printf '%s\n' "${All_TEST_SCRIPTS_STORE_RS_SGLANG[@]}"
+            ;;
         *)
-            echo "ERROR: Unknown framework '$1'. Use SGLANG or VLLM." >&2
+            echo "ERROR: Unknown framework '$1'. Use SGLANG, VLLM, STORE_RS, or STORE_RS_SGLANG." >&2
             return 1
             ;;
     esac
 }
 
 if [ "${1:-}" = "list-tests" ]; then
-    list_tests "${2:-default}"
+    if [ "${RUN_STORE_RS_TESTS}" = "true" ]; then
+        # The combined Nightly lane always runs the established six cases and
+        # then the Store-RS case. Ignore a legacy framework argument so the
+        # T-One parser tracks the same seven cases that run-all executes.
+        list_tests default
+        list_tests STORE_RS
+    else
+        list_tests "${2:-default}"
+    fi
     exit $?
 fi
 
@@ -95,6 +117,25 @@ E2E_DIR=$(cd "$SUITE_DIR/../e2e" && pwd)
 REMOTE_WORK_ROOT=/tmp/Mooncake_tone/mooncake_ci_test
 source "$E2E_DIR/scripts/controller.sh"
 
+run_requested_suite() {
+    if [ "${RUN_STORE_RS_TESTS}" = "true" ] && [ "${1:-}" = "run-all" ]; then
+        # The T-One template may invoke `run-all` with a legacy framework
+        # argument. The combined lane intentionally runs all six established
+        # cases, then appends the Store-RS SGLang case.
+        combined_status=0
+        main run-all || combined_status=$?
+        if $MOONCAKE_ENV_UNHEALTHY; then
+            echo "ERROR: Skipping Store-RS because the shared environment is unhealthy" >&2
+            combined_status=1
+        else
+            main run-store-rs || combined_status=1
+        fi
+        return "$combined_status"
+    else
+        main "$@"
+    fi
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-    main "$@"
+    run_requested_suite "$@"
 fi

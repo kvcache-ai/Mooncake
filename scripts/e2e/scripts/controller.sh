@@ -87,7 +87,7 @@ prepare_single_env(){
         MOONCAKE_SGLANG_BASE_GPU_ID MOONCAKE_EPD_ENCODER_GPU_ID MOONCAKE_EPD_PREFILL_GPU_ID MOONCAKE_EPD_DECODE_GPU_ID
         MOONCAKE_VLLM_VISIBLE_DEVICES MOONCAKE_SGLANG_MEM_FRACTION_STATIC MOONCAKE_RDMA_DEVICES MOONCAKE_RDMA_NETDEVS
         MOONCAKE_TRANSFER_DEVICE MOONCAKE_GID_INDEX AINIC_VERSION REMOTE_SSH_TARGET
-        SSH_CMD RSYNC_RSH SCP_CMD
+        SSH_CMD RSYNC_RSH SCP_CMD RUN_STORE_RS_TESTS
     )
     # Quote values once, for both local and remote shells.
     for variable in "${environment_vars[@]}"; do
@@ -326,6 +326,16 @@ run_all_tests(){
     $all_passed && return 0 || return 1
 }
 
+run_store_rs_tests() {
+    local all_passed=true
+    local test_name
+    for test_name in "${All_TEST_SCRIPTS_STORE_RS_SGLANG[@]}"; do
+        run_single_test "$test_name" || all_passed=false
+    done
+
+    $all_passed
+}
+
 show_help(){
     echo "Mooncake CI Controller"
     echo "Usage: $0 <command> [args]"
@@ -336,6 +346,7 @@ show_help(){
     echo "  run-all                            - Run all tests for both SGLANG and VLLM frameworks"
     echo "  run-all SGLANG                     - Run all SGLANG tests (using SGLANG image)"
     echo "  run-all VLLM                       - Run all VLLM tests (using VLLM image)"
+    echo "  run-store-rs                       - Run the Store-RS SGLang integration test"
 }
 
 main() {
@@ -371,6 +382,9 @@ main() {
                     return 1
                 fi
             fi
+            ;;
+        "run-store-rs")
+            run_store_rs_tests
             ;;
         *)
             show_help
