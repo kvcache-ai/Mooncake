@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -88,7 +89,9 @@ class P2PHotStandbyService {
     P2PHotStandbyService(const P2PHotStandbyService&) = delete;
     P2PHotStandbyService& operator=(const P2PHotStandbyService&) = delete;
 
-    ErrorCode Start(uint64_t baseline_sequence_id = 0);
+    ErrorCode Start(uint64_t baseline_sequence_id = 0,
+                    std::optional<P2PStandbyMetadataStore::ExportedMetadata>
+                        initial_metadata = std::nullopt);
     void Stop();
     // TODO(P2P HA): Expose force promotion only through an explicit operator
     // CLI/RPC that reports the failed sequence/type/reason and requires

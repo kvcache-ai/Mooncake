@@ -387,6 +387,44 @@ TEST_F(P2PHotStandbyServiceTest, PrimarySnapshotSourceServesCurrentMetadata) {
               segment_id);
 }
 
+TEST_F(P2PHotStandbyServiceTest,
+       StartsFromDemotedPrimaryMetadataAndCatchesUpFromOplog) {
+    P2PMasterService primary(MakeMasterConfig());
+    const UUID client_id{25, 25};
+    const UUID segment_id{26, 26};
+    RegisterClient(primary, client_id, MakeSegment(segment_id));
+    PublishRoute(primary, "handoff-before", client_id, segment_id, 4096);
+
+    auto handoff_metadata = primary.ExportMetadataForStandby();
+    const uint64_t handoff_sequence_id = primary.GetLatestOpLogSequenceId();
+    ASSERT_GT(handoff_sequence_id, 0u);
+    ASSERT_NE(handoff_metadata.clients.find(client_id),
+              handoff_metadata.clients.end());
+    ASSERT_NE(handoff_metadata.routes.find("handoff-before"),
+              handoff_metadata.routes.end());
+
+    PublishRoute(primary, "handoff-after", client_id, segment_id, 8192);
+    const uint64_t catch_up_target = primary.GetLatestOpLogSequenceId();
+    ASSERT_GT(catch_up_target, handoff_sequence_id);
+
+    P2PHotStandbyService standby(MakeStandbyConfig());
+    ASSERT_EQ(standby.Start(handoff_sequence_id, std::move(handoff_metadata)),
+              ErrorCode::OK);
+    ASSERT_TRUE(standby.WaitForAppliedSequence(
+        catch_up_target, std::chrono::milliseconds(2000)));
+
+    auto exported = standby.ExportMetadata();
+    ASSERT_NE(exported.clients.find(client_id), exported.clients.end());
+    auto before = exported.routes.find("handoff-before");
+    ASSERT_NE(before, exported.routes.end());
+    EXPECT_EQ(before->second.object_size, 4096);
+    auto after = exported.routes.find("handoff-after");
+    ASSERT_NE(after, exported.routes.end());
+    EXPECT_EQ(after->second.object_size, 8192);
+
+    standby.Stop();
+}
+
 #ifdef STORE_USE_REDIS
 TEST_F(P2PHotStandbyServiceTest,
        SelectSnapshotSourcesPrefersStandbyAndFallsBackToPrimary) {

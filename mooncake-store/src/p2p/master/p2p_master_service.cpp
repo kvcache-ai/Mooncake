@@ -471,6 +471,43 @@ std::optional<P2PStandbyClientInfo> P2PMasterService::GetSnapshotClientInfo(
     return info;
 }
 
+P2PStandbyMetadataStore::ExportedMetadata
+P2PMasterService::ExportMetadataForStandby() const {
+    P2PStandbyMetadataStore::ExportedMetadata exported;
+
+    const auto client_ids = ListSnapshotClientIds();
+    exported.clients.reserve(client_ids.size());
+    for (const auto& client_id : client_ids) {
+        auto info = GetSnapshotClientInfo(client_id);
+        if (!info.has_value()) {
+            LOG(WARNING) << "P2PMasterService: skip client while exporting "
+                            "standby handoff"
+                         << ", client_id=" << client_id;
+            continue;
+        }
+        exported.clients.emplace(client_id, std::move(info.value()));
+    }
+
+    const auto object_keys = ListSnapshotObjectKeys();
+    exported.routes.reserve(object_keys.size());
+    for (const auto& key : object_keys) {
+        auto route = GetSnapshotObjectMetadata(key);
+        if (!route.has_value()) {
+            VLOG(2) << "P2PMasterService: skip route while exporting standby "
+                       "handoff"
+                    << ", key=" << key;
+            continue;
+        }
+        exported.routes.emplace(key, std::move(route.value()));
+    }
+
+    LOG(INFO) << "P2PMasterService: exported standby handoff metadata"
+              << ", routes=" << exported.routes.size()
+              << ", clients=" << exported.clients.size()
+              << ", last_sequence_id=" << GetLatestOpLogSequenceId();
+    return exported;
+}
+
 auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
     -> tl::expected<ViewVersionId, ErrorCode> {
     if (req.ip_address.empty() || req.rpc_port == 0) {

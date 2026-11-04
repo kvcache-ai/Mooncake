@@ -1,6 +1,7 @@
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 
 #include <algorithm>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -206,6 +207,14 @@ P2PStandbyMetadataStore::ExportMetadata() const {
     result.routes = routes_;
     result.clients = clients_;
     return result;
+}
+
+void P2PStandbyMetadataStore::RestoreMetadata(ExportedMetadata metadata) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    routes_ = std::move(metadata.routes);
+    clients_ = std::move(metadata.clients);
+    VLOG(2) << "P2PStandbyMetadataStore: restored metadata"
+            << ", routes=" << routes_.size() << ", clients=" << clients_.size();
 }
 
 std::vector<std::string> P2PStandbyMetadataStore::ListRouteKeys() const {

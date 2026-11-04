@@ -145,6 +145,7 @@ class P2PMasterService final {
     ErrorCode RestoreFromStandbyMetadata(
         const P2PStandbyMetadataStore::ExportedMetadata& metadata,
         uint64_t last_applied_sequence_id = 0);
+    P2PStandbyMetadataStore::ExportedMetadata ExportMetadataForStandby() const;
 
     uint64_t GetLatestOpLogSequenceId() const;
     std::vector<std::string> ListSnapshotObjectKeys() const;

@@ -59,7 +59,9 @@ P2PHotStandbyService::P2PHotStandbyService(
 
 P2PHotStandbyService::~P2PHotStandbyService() { Stop(); }
 
-ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
+ErrorCode P2PHotStandbyService::Start(
+    uint64_t baseline_sequence_id,
+    std::optional<P2PStandbyMetadataStore::ExportedMetadata> initial_metadata) {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (state_machine_.IsRunning()) {
@@ -76,7 +78,14 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
 
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
     snapshot_resync_required_.store(false);
-    metadata_store_->RemoveAllMetadata();
+    const bool has_initial_metadata = initial_metadata.has_value();
+    if (has_initial_metadata) {
+        metadata_store_->RestoreMetadata(std::move(*initial_metadata));
+        LOG(INFO) << "P2PHotStandbyService: restored initial standby metadata"
+                  << ", baseline_sequence_id=" << baseline_sequence_id;
+    } else {
+        metadata_store_->RemoveAllMetadata();
+    }
     oplog_applier_ = std::make_unique<P2POpLogApplier>(
         metadata_store_.get(), config_.cluster_id, nullptr,
         config_.oplog_pending_max_entries);
@@ -91,13 +100,19 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
         return ErrorCode::INTERNAL_ERROR;
     }
     std::vector<std::string> discovered_snapshot_sources;
-    if (config_.snapshot_source_endpoints.empty()) {
+    if (!has_initial_metadata && config_.snapshot_source_endpoints.empty()) {
         discovered_snapshot_sources = DiscoverSnapshotSources();
     }
     const bool bootstrap_requested =
         !config_.snapshot_source_endpoints.empty() ||
         !discovered_snapshot_sources.empty() ||
         baseline_sequence_id < trimmed_sequence_id;
+    if (has_initial_metadata && !bootstrap_requested) {
+        LOG(INFO) << "P2PHotStandbyService: continuing from initial metadata "
+                     "via OpLog without snapshot"
+                  << ", baseline_sequence_id=" << baseline_sequence_id
+                  << ", trimmed_sequence_id=" << trimmed_sequence_id;
+    }
     bool snapshot_bootstrap_succeeded = false;
     if (bootstrap_requested) {
         ErrorCode bootstrap_err = ErrorCode::INTERNAL_ERROR;

@@ -120,6 +120,11 @@ std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     return service;
 }
 
+struct P2PPrimaryDemotionHandoff {
+    P2PStandbyMetadataStore::ExportedMetadata metadata;
+    uint64_t sequence_id{0};
+};
+
 }  // namespace
 
 int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
@@ -176,6 +181,7 @@ int P2PMaster::RunStandalone() {
 int P2PMaster::RunWithHA() {
     const std::string local_endpoint =
         config_.rpc.address + ":" + std::to_string(config_.rpc.port);
+    std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
     while (true) {
         auto server = CreateRpcServer(config_);
         std::unique_ptr<P2PMasterView> master_view;
@@ -264,7 +270,23 @@ int P2PMaster::RunWithHA() {
                     config_.ha.snapshot_sources, ',', /*trim=*/true);
             }
             standby = std::make_unique<P2PHotStandbyService>(standby_config);
-            auto start_result = standby->Start();
+            uint64_t standby_baseline_sequence_id = 0;
+            std::optional<P2PStandbyMetadataStore::ExportedMetadata>
+                standby_initial_metadata;
+            if (demoted_primary_handoff.has_value()) {
+                standby_baseline_sequence_id =
+                    demoted_primary_handoff->sequence_id;
+                standby_initial_metadata =
+                    std::move(demoted_primary_handoff->metadata);
+                demoted_primary_handoff.reset();
+                LOG(INFO) << "Starting P2P standby from demoted primary "
+                             "handoff"
+                          << ", baseline_sequence_id="
+                          << standby_baseline_sequence_id;
+            }
+            auto start_result =
+                standby->Start(standby_baseline_sequence_id,
+                               std::move(standby_initial_metadata));
             if (start_result != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to start P2P standby: "
                            << toString(start_result);
@@ -435,6 +457,28 @@ int P2PMaster::RunWithHA() {
             master_registry_heartbeat->SetSnapshotReadyProvider({});
         }
 #endif
+        auto* active_p2p_service = &active_service->GetMasterService();
+        if (config_.oplog.enabled &&
+            leadership_lost.load(std::memory_order_acquire)) {
+            demoted_primary_handoff.emplace();
+            demoted_primary_handoff->sequence_id =
+                active_p2p_service->GetLatestOpLogSequenceId();
+            // TODO(P2P HA): Avoid a full metadata copy on demotion by moving
+            // primary metadata into the next standby or by supporting an
+            // in-place role transition.
+            demoted_primary_handoff->metadata =
+                active_p2p_service->ExportMetadataForStandby();
+            LOG(INFO) << "Captured P2P primary demotion handoff"
+                      << ", baseline_sequence_id="
+                      << demoted_primary_handoff->sequence_id << ", routes="
+                      << demoted_primary_handoff->metadata.routes.size()
+                      << ", clients="
+                      << demoted_primary_handoff->metadata.clients.size();
+        } else {
+            demoted_primary_handoff.reset();
+            LOG(WARNING) << "Skip P2P primary demotion handoff because master "
+                            "service stopped without losing leadership";
+        }
         active_service.reset();
         master_view->CancelKeepAlive(lease_id);
         keep_leader_thread.join();
