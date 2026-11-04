@@ -360,6 +360,57 @@ TEST(ConfigLifecycleTest, MnnvlEgmDefaultsOffAndFollowsEnv) {
     }
 }
 
+TEST(MnnvlConfigTest, DefaultsAndBootstrapLifecycle) {
+    Config config;
+    MnnvlConfig options;
+    ASSERT_TRUE(parseMnnvlConfig(config, options).ok());
+    EXPECT_FALSE(options.require_fabric);
+    for (const auto* key : {"require_fabric"}) {
+        EXPECT_EQ(classifyConfigPath(std::string("transports/mnnvl/") + key),
+                  ConfigLifecycle::kBootstrapOnly);
+    }
+}
+
+TEST(MnnvlConfigTest, RejectsMalformedControlsWithoutUpdatingOptions) {
+    for (const auto& entry : std::vector<std::pair<std::string, json>>{
+             {"require_fabric", "true"}, {"require_fabric", nullptr}}) {
+        Config config;
+        config.set("transports/mnnvl/" + entry.first, entry.second);
+        MnnvlConfig options;
+        options.egm_enabled = true;
+        EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument())
+            << entry.first;
+        EXPECT_TRUE(options.egm_enabled);
+    }
+}
+
+TEST(MnnvlConfigTest, StrictRejectsDisabledAndNonFabricConfigurations) {
+    for (const auto& entry : std::vector<std::pair<std::string, json>>{
+             {"transports/mnnvl/enable", false},
+             {"transports/mnnvl/enable", "true"},
+             {"transports/force_tcp", true},
+             {"transports/force_tcp", "false"},
+             {"transports/nvlink/handle_type", "posix_fd"},
+             {"transports/nvlink/handle_type", 0}}) {
+        Config config;
+        config.set("transports/mnnvl/require_fabric", true);
+        config.set(entry.first, entry.second);
+        MnnvlConfig options;
+        EXPECT_TRUE(parseMnnvlConfig(config, options).IsInvalidArgument())
+            << entry.first;
+    }
+}
+
+TEST(MnnvlConfigTest, EnvironmentOverridesAndMalformedBooleans) {
+    EnvVarGuard conf_guard("MC_TENT_CONF", "{}");
+    EnvVarGuard strict_guard("MC_MNNVL_REQUIRE_FABRIC", "1");
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+    EXPECT_TRUE(config.get("transports/mnnvl/require_fabric", false));
+    EnvVarGuard invalid_guard("MC_MNNVL_REQUIRE_FABRIC", "tru");
+    EXPECT_TRUE(ConfigHelper().loadFromEnv(config).IsInvalidArgument());
+}
+
 TEST(ConfigLifecycleTest, PreservesLegacyEnvironmentPrecedence) {
     EnvVarGuard conf_guard(
         "MC_TENT_CONF",

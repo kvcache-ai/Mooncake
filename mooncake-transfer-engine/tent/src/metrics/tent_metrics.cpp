@@ -534,9 +534,10 @@ void TentMetrics::recordInflightAttemptFinished(TransportType tp) {
 void TentMetrics::recordMnnvlEvent(MnnvlEvent event) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
-    static constexpr const char* names[] = {"fabric_fallback"};
+    static constexpr const char* names[] = {"fabric_fallback",
+                                            "strict_failure"};
     const size_t slot = static_cast<size_t>(event);
-    if (slot >= 1) return;
+    if (slot >= 2) return;
     mnnvl_events_total_.incCached(
         slot, [slot] { return std::array<std::string, 1>{names[slot]}; });
 }

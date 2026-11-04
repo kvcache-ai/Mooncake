@@ -211,6 +211,7 @@ class MnnvlTransport : public Transport {
     // explicit MNNVL registration (MemoryOptions::type == MNNVL) of a host
     // buffer that cannot be exported fails instead of staying local-only.
     bool egm_strict_ = false;
+    MnnvlConfig options_;
 };
 }  // namespace tent
 }  // namespace mooncake

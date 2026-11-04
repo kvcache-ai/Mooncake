@@ -78,6 +78,10 @@ namespace mooncake {
 namespace tent {
 
 Status TransferEngineImpl::loadTransports() {
+#ifndef USE_CUDA
+    if (mnnvl_config_.require_fabric)
+        return Status::InvalidArgument("Strict MNNVL requires a CUDA build");
+#endif
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
 
@@ -110,7 +114,8 @@ Status TransferEngineImpl::loadTransports() {
 #endif
 
 #ifdef USE_CUDA
-    bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
+    bool enable_mnnvl =
+        mnnvl_config_.require_fabric || getenv("MC_ENABLE_MNNVL") != nullptr;
     if (enable_mnnvl) {
         if (conf_->get("transports/mnnvl/enable", true))
             transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();

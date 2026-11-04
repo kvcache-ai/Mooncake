@@ -201,8 +201,8 @@ The following protocols are available at the C++ Transfer Engine level for speci
 **Description:** NVIDIA MNNVL (Multi-Node NVLink) protocol for high-bandwidth, low-latency GPU-to-GPU communication across nodes.
 
 See [MNNVL Architecture and PD Hardening](../design/transfer-engine/transport/mnnvl_transport.md)
-for classic versus native TENT selection, memory export/import, configuration,
-and compatibility boundaries.
+for classic versus native TENT selection, memory export/import, F5
+optimizations, configuration, and compatibility boundaries.
 
 **Use When:**
 - Inter-node GPU communication is required

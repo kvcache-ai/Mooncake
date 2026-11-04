@@ -9,8 +9,8 @@ completion overhead. They do not establish that this branch has passed
 production acceptance, nor imply that previously deployed MNNVL systems were
 unusable.
 
-This page describes the workspace-root implementation, including the
-registration and completion repairs. The classic implementation,
+This page describes the workspace-root implementation, including the F5
+changes and the registration/routing repairs. The classic implementation,
 serving-framework connectors, public Transfer Engine requests, and Python
 bindings are unchanged by this work.
 
@@ -25,11 +25,11 @@ Implementation entry points:
 | Path | Implementation | Build/runtime selection | Memory sharing |
 | --- | --- | --- | --- |
 | Classic MNNVL | `NvlinkTransport`, protocol `nvlink` | `USE_MNNVL=ON`; `MC_FORCE_MNNVL=1` influences automatic discovery | CUDA VMM and FABRIC exports; classic IPC handling where applicable |
-| Native TENT MNNVL | `MnnvlTransport`, type `MNNVL` | `USE_TENT=ON`, `USE_CUDA=ON`; public wrapper selects TENT with `MC_USE_TENT=1` or `MC_USE_TEV1=1`; native loader selects MNNVL with `MC_ENABLE_MNNVL` | CUDA VMM, normally FABRIC handles |
+| Native TENT MNNVL | `MnnvlTransport`, type `MNNVL` | `USE_TENT=ON`, `USE_CUDA=ON`; public wrapper selects TENT with `MC_USE_TENT=1` or `MC_USE_TEV1=1`; native loader selects MNNVL with `MC_ENABLE_MNNVL` or strict mode | CUDA VMM, normally FABRIC handles |
 | Same-host NVLink | Classic `IntraNodeNvlinkTransport` or native TENT `NVLinkTransport` | Separate intra-node/NVLINK selection | Same-machine CUDA IPC/P2P; not proof of cross-node MNNVL |
 
-`MC_FORCE_MNNVL` and `MC_ENABLE_MNNVL` are not interchangeable. The
-`MC_MNNVL_*` controls below apply to native TENT, not classic
+`MC_FORCE_MNNVL` and `MC_ENABLE_MNNVL` are not interchangeable. The new
+`MC_MNNVL_*` hardening controls below apply to native TENT, not classic
 `NvlinkTransport`. Installing a transport is also distinct from selecting it
 for a particular request.
 
@@ -155,12 +155,40 @@ accepted work and report terminal task failure. They do not return an error
 that invites blind resubmission of an already accepted copy prefix. A failed
 CUDA drain is logged and cannot be treated as confirmed safe reuse.
 
+## F5: Strict FABRIC, No Silent Downgrade
+
+`require_fabric=true` makes native TENT fail closed for MNNVL-relevant memory
+transfers: CUDA on either endpoint, an explicit MNNVL hint, or EGM-enabled
+memory transfers. It is not a blanket ban on all control-plane TCP traffic or
+unrelated host-only/non-memory operations.
+
+- Bootstrap requires a CUDA build/platform and usable MNNVL installation.
+  Disabled MNNVL, non-FABRIC handle selection, and forced TCP conflict with
+  strict configuration.
+- Relevant transport-owned allocations must succeed through CUDA VMM rather
+  than silently falling back to `cudaMalloc` or ordinary host allocation.
+- Remotely accessible registration requires an actual FABRIC export and an
+  MNNVL transport tag; a backend's success without an export is insufficient.
+- Routing requires policy authorization and MNNVL capability. A conflicting
+  transport hint or policy exclusion fails instead of overriding policy.
+- Relevant remote targets require an accessible export. Process-local targets
+  are exempt from **remote-export** checks, but still require registration,
+  policy authorization, and a valid opcode/permission. WRITE to a locally known
+  `kGlobalReadOnly` target remains rejected.
+- Submit-stage and poll-stage failover cannot downgrade a strict MNNVL task to
+  RDMA/TCP. Failures surface to the caller.
+
+These checks prevent unintended data-path downgrade; they do not prove that an
+external allocator, serving framework, or a historical peer is correctly
+configured. Verify the actual allocation, engine, and per-transfer route.
+
 ## Reviewed P1/P2 Repairs
 
 | Severity | Defect | Repair and regression coverage |
 | --- | --- | --- |
 | P1 | Exporting an owned allocation replaced the logical registered range with the full mapping, widening metadata and breaking exact duplicate/unregister identity | Keep logical address/length; encode mapping extent/offset separately; test prefix/interior registrations, duplicate refcounts, original-range unregister, import readback, and cache bounds |
 | P2 | Defensive cleanup after a failed host registration could unpin an earlier successful registration at the same address | Attach a local-only shared ownership token to successful pins; cleanup checks address, length, and owner identity; test partial batch rollback and stale snapshots against a later owner |
+| P2 | Strict routing treated a process-local target as though it needed a remote export | Exempt only `LOCAL_SEGMENT_ID` from remote-export requirements; test READ/WRITE, implicit/explicit MNNVL hints, both selectors, policy exclusion, invalid target range, and no TCP submission |
 
 The host-pin token is copied through local registry snapshots but is not
 serialized into peer metadata. A failed registration gets no ownership token
@@ -172,15 +200,19 @@ Native TENT bootstrap defaults remain conservative:
 
 | JSON path | Environment override | Default |
 | --- | --- | --- |
+| `transports/mnnvl/require_fabric` | `MC_MNNVL_REQUIRE_FABRIC` | `false` |
 | `transports/mnnvl/egm` | `MC_MNNVL_EGM` | `false` |
 
-Use actual JSON booleans in configuration files. Recreate the engine to change
-these bootstrap settings.
+The new boolean environment controls accept `true/false`, `1/0`, `yes/no`,
+and `on/off`; malformed new controls fail configuration. Use actual JSON
+booleans in configuration files. Recreate the engine to change these
+bootstrap settings.
 
 MNNVL retains some legacy-named tuning keys under `transports/nvlink`, including
 `handle_type` (normally `fabric`) and `host_register` (default `true`).
 `MC_ENABLE_MNNVL` is presence-based in the native loader; setting it to `0`
-still enables loading.
+still enables loading. `MC_FORCE_TCP` is also presence-based and conflicts with
+strict mode, even when its text is `0`.
 
 An opt-in native configuration, supplied through `MC_TENT_CONF` as an inline
 JSON object or a file path:
@@ -190,6 +222,7 @@ JSON object or a file path:
   "transports": {
     "mnnvl": {
       "enable": true,
+      "require_fabric": true,
       "egm": false
     },
     "nvlink": { "handle_type": "fabric" }
@@ -197,14 +230,16 @@ JSON object or a file path:
 }
 ```
 
-For native use, set `MC_ENABLE_MNNVL=1`; the `enable` key alone is not a
-substitute for the current loader's activation condition.
+Strict mode causes native MNNVL loading without needing `MC_ENABLE_MNNVL`.
+For non-strict native use, set `MC_ENABLE_MNNVL=1`; the `enable` key alone is
+not a substitute for the current loader's activation condition.
 
 ### Metrics
 
 With compile-time and runtime TENT metrics enabled, observe
-`tent_mnnvl_events_total{event="..."}` with event `fabric_fallback`. JSON
-output has corresponding `tent_mnnvl_<event>_total` aliases.
+`tent_mnnvl_events_total{event="..."}` with events `fabric_fallback` and
+`strict_failure`. JSON output has corresponding `tent_mnnvl_<event>_total`
+aliases.
 
 Compare host submission latency, CPU utilization, throughput, and PD p95/p99
 latency against defaults.
@@ -237,6 +272,7 @@ For testing this branch's native TENT optimizations on compatible peers:
 export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_USE_TENT=1
 export MC_ENABLE_MNNVL=1
+export MC_MNNVL_REQUIRE_FABRIC=1
 ```
 
 Do not use `MC_FORCE_MNNVL` as a substitute for native activation. These
@@ -261,12 +297,14 @@ membership, and usable control-plane addresses remain required.
   importers. Exact whole-allocation raw handles retain their previous format,
   but that is not a blanket classic/TENT interoperability guarantee.
 - External caller-created VMM mappings are not in `allocate_set_`.
-  `cuMemGetAddressRange` need not discover their extent. This work does not
-  add an external allocator extent API. An SGLang custom pool can expose this
-  limitation.
-- External-VMM handling retains the prior best-effort extent fallback.
-  Correct arbitrary interior-subrange discovery is not guaranteed when the
-  underlying allocation extent is unknown.
+  `cuMemGetAddressRange` need not discover their extent. If authoritative
+  extent discovery fails, strict registration rejects with
+  `Strict MNNVL cannot determine export allocation extent`. This work does
+  not add an external allocator extent API. An SGLang custom pool can expose
+  this limitation; allocator fallback is not a remedy for strict FABRIC.
+- Non-strict external-VMM handling retains the prior best-effort extent
+  fallback. Correct arbitrary interior-subrange discovery is not guaranteed
+  when the underlying allocation extent is unknown.
 - Logical TE range validation is not hardware isolation from an untrusted
   peer: a CUDA FABRIC handle grants allocation-level access. Use trusted peers
   and appropriate fabric isolation.
@@ -308,8 +346,9 @@ Hardware acceptance still requires:
 1. Two-node FABRIC READ/WRITE with whole allocations and interior logical
    ranges, plus byte-level KV checks. Same-host POSIX-FD readback is not a
    substitute for this test.
-2. Negative cases: malformed or out-of-range exports and copy/poll errors
-   surfacing as terminal task failures.
+2. Strict negative cases: unavailable FABRIC/IMEX, unsupported/nonexportable
+   allocation, absent export, conflicting policy/hint, and copy/poll errors;
+   no unintended RDMA/TCP payload fallback.
 3. Delayed producers on the existing PD stream/event path, concurrent batches,
    repeated appends, polling progress, and teardown.
 4. SGLang PD correctness and sustained p95/p99 latency/CPU/throughput comparison
