@@ -35,6 +35,15 @@ if(USE_XPU)
   target_link_libraries(_ep PRIVATE glog::glog ${MOONCAKE_EP_ZE_LOADER})
   set_target_properties(_ep PROPERTIES POSITION_INDEPENDENT_CODE ON
                                        INSTALL_RPATH "$ORIGIN")
+
+  # Peer bandwidth through the EP's own IPC buffer (not built by default).
+  add_executable(xpu_peer_bw EXCLUDE_FROM_ALL ../benchmarks/xpu_peer_bw.cpp
+                                              xpu/xpu_ipc.cpp)
+  target_include_directories(xpu_peer_bw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/xpu)
+  target_compile_options(xpu_peer_bw PRIVATE ${_ep_xpu_sycl_flags})
+  target_link_options(xpu_peer_bw PRIVATE ${_ep_xpu_sycl_flags})
+  target_link_libraries(xpu_peer_bw PRIVATE glog::glog ${MOONCAKE_EP_ZE_LOADER}
+                                            pthread)
   return()
 endif()
 
