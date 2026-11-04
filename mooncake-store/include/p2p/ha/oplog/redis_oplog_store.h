@@ -156,6 +156,7 @@ class RedisOpLogStore : public OpLogStore {
     uint64_t committed_sequence_id_ GUARDED_BY(async_mutex_) = 0;
     size_t failed_write_count_ GUARDED_BY(async_mutex_) = 0;
     std::atomic<bool> async_running_{false};
+    std::atomic<int64_t> consecutive_write_failures_{0};
     std::vector<std::thread> async_workers_;
     std::mutex async_stop_mutex_;
     size_t async_queue_max_entries_;

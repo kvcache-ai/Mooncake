@@ -18,6 +18,18 @@
 
 namespace mooncake {
 
+namespace {
+
+std::string GetMasterMetricsSummary() {
+    std::string summary =
+        P2PMasterMetricManager::instance().get_summary_string();
+    summary += " | ";
+    summary += HAMetricManager::instance().get_summary_string();
+    return summary;
+}
+
+}  // namespace
+
 P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
                                          ViewVersionId view_version)
     : master_service_(config, view_version),
@@ -49,8 +61,7 @@ void P2PMasterRpcService::init() {
     if (metric_report_running_) {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_) {
-                std::string metrics_summary =
-                    P2PMasterMetricManager::instance().get_summary_string();
+                const std::string metrics_summary = GetMasterMetricsSummary();
                 LOG(INFO) << "Master Metrics: " << metrics_summary;
                 std::this_thread::sleep_for(
                     std::chrono::seconds(kP2PMetricReportIntervalSeconds));
@@ -89,8 +100,7 @@ void P2PMasterRpcService::init_http_server() {
     http_server_.set_http_handler<GET>(
         "/metrics/summary",
         [](coro_http_request& req, coro_http_response& resp) {
-            std::string summary =
-                P2PMasterMetricManager::instance().get_summary_string();
+            std::string summary = GetMasterMetricsSummary();
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, std::move(summary));
         });

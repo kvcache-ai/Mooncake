@@ -47,6 +47,12 @@ std::string GenerateInstanceId() {
     return stream.str();
 }
 
+int64_t CurrentTimestampMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 std::string FormatPollLeaderError(const redisContext* context,
                                   const redisReply* reply) {
     std::ostringstream stream;
@@ -693,10 +699,14 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
             HAStatusManager::instance().SetDoctorIssue(
                 "LEADERSHIP_LOST",
                 "Leadership renewal failed or lease ownership changed");
+            HAMetricManager::instance().inc_election_renew_failures();
             HAMetricManager::instance().inc_election_leadership_lost();
             break;  // Lost leadership
         }
 
+        HAMetricManager::instance()
+            .set_election_last_successful_renew_timestamp_ms(
+                CurrentTimestampMs());
         HAStatusManager::instance().SetDoctorIssue("LEADERSHIP_LOST");
         // Refresh the reported remaining lease so /ha/status does not drift
         // negative under ongoing renewals.

@@ -290,9 +290,17 @@ class RedisOpLogStoreTest : public ::testing::Test {
 };
 
 TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
+    HAMetricManager::instance().set_oplog_last_successful_write_timestamp_ms(0);
+    HAMetricManager::instance().set_oplog_consecutive_write_failures(7);
+
     auto writer = CreateWriter();
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
+    EXPECT_GT(HAMetricManager::instance()
+                  .get_oplog_last_successful_write_timestamp_ms(),
+              0);
+    EXPECT_EQ(
+        0, HAMetricManager::instance().get_oplog_consecutive_write_failures());
 
     auto reader = CreateReader();
     OpLogEntry entry;

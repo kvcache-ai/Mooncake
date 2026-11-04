@@ -11,6 +11,7 @@
 #include <sstream>
 #include <utility>
 
+#include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/oplog_store.h"
 #include "p2p/ha/redis_util.h"
@@ -46,6 +47,15 @@ std::unique_ptr<redisContext, decltype(&redisFree)> CreateRedisConnection(
         &redisFree};
 }
 
+bool IsSnapshotTrimEligibleStandby(const RedisMasterRegistryEntry& entry,
+                                   const std::string& self_instance_id) {
+    if (!self_instance_id.empty() && entry.instance_id == self_instance_id) {
+        return false;
+    }
+    return entry.role == "standby" && entry.snapshot_ready &&
+           !entry.snapshot_endpoint.empty();
+}
+
 }  // namespace
 
 uint64_t ComputeRedisOpLogTrimTarget(
@@ -65,12 +75,7 @@ uint64_t ComputeRedisOpLogTrimTarget(
 
     std::vector<uint64_t> snapshot_sequences;
     for (const auto& entry : registry_entries) {
-        if (!self_instance_id.empty() &&
-            entry.instance_id == self_instance_id) {
-            continue;
-        }
-        if (entry.role == "standby" && entry.snapshot_ready &&
-            !entry.snapshot_endpoint.empty()) {
+        if (IsSnapshotTrimEligibleStandby(entry, self_instance_id)) {
             snapshot_sequences.push_back(entry.applied_sequence_id);
         }
     }
@@ -304,15 +309,13 @@ ErrorCode RedisOpLogTrimWorker::TrimOnce() {
             return err;
         }
 
-        size_t snapshot_ready_count = 0;
-        for (const auto& entry : entries) {
-            if (entry.role == "standby" && entry.snapshot_ready &&
-                !entry.snapshot_endpoint.empty() &&
-                (config_.self_instance_id.empty() ||
-                 entry.instance_id != config_.self_instance_id)) {
-                ++snapshot_ready_count;
-            }
-        }
+        size_t snapshot_ready_count = std::count_if(
+            entries.begin(), entries.end(), [&](const auto& entry) {
+                return IsSnapshotTrimEligibleStandby(entry,
+                                                     config_.self_instance_id);
+            });
+        HAMetricManager::instance().set_oplog_snapshot_ready_standby_count(
+            static_cast<int64_t>(snapshot_ready_count));
         HAStatusManager::instance().SetStandbySnapshotAvailability(
             static_cast<uint32_t>(snapshot_ready_count),
             config_.min_snapshot_ready_standby_count);

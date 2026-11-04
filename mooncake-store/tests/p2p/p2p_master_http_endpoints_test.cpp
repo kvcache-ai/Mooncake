@@ -32,6 +32,7 @@
 
 #include <ylt/coro_http/coro_http_client.hpp>
 
+#include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "types.h"
@@ -848,6 +849,44 @@ TEST_F(P2PMasterHttpEndpointsTest, BatchQueryRoutesRejectsEmptyKeyList) {
     // Empty `keys` query parameter.
     auto resp_empty = HttpGet(http_base_url_ + "/batch_query_routes?keys=");
     ASSERT_EQ(resp_empty.status, 400) << "body=" << resp_empty.resp_body;
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, MetricsEndpointsExposeRedisHAHealthMetrics) {
+    auto& ha_metrics = HAMetricManager::instance();
+    ha_metrics.set_election_last_successful_renew_timestamp_ms(70);
+    ha_metrics.set_oplog_last_successful_write_timestamp_ms(60);
+    ha_metrics.set_oplog_consecutive_write_failures(1);
+    ha_metrics.set_oplog_snapshot_ready_standby_count(2);
+    ha_metrics.inc_election_renew_failures();
+
+    auto metrics_response = HttpGet(http_base_url_ + "/metrics");
+    ASSERT_EQ(metrics_response.status, 200)
+        << "body=" << metrics_response.resp_body;
+    for (const char* name : {
+             "ha_election_last_successful_renew_timestamp_ms",
+             "ha_oplog_last_successful_write_timestamp_ms",
+             "ha_oplog_consecutive_write_failures",
+             "ha_oplog_snapshot_ready_standby_count",
+             "ha_election_renew_failures_total",
+         }) {
+        EXPECT_NE(metrics_response.resp_body.find(name), std::string::npos)
+            << name;
+    }
+
+    auto summary_response = HttpGet(http_base_url_ + "/metrics/summary");
+    ASSERT_EQ(summary_response.status, 200)
+        << "body=" << summary_response.resp_body;
+    EXPECT_NE(summary_response.resp_body.find("HA Metrics Summary:"),
+              std::string::npos);
+    EXPECT_NE(summary_response.resp_body.find("consecutive_write_fail=1"),
+              std::string::npos);
+    EXPECT_NE(summary_response.resp_body.find("snapshot_ready_standby=2"),
+              std::string::npos);
+
+    ha_metrics.set_election_last_successful_renew_timestamp_ms(0);
+    ha_metrics.set_oplog_last_successful_write_timestamp_ms(0);
+    ha_metrics.set_oplog_consecutive_write_failures(0);
+    ha_metrics.set_oplog_snapshot_ready_standby_count(0);
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,

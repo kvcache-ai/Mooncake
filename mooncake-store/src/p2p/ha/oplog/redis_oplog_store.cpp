@@ -28,6 +28,12 @@ bool IsRedisOkStatus(const redisReply* reply) {
            reply->len == 2 && std::memcmp(reply->str, "OK", 2) == 0;
 }
 
+int64_t CurrentTimestampMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 bool SetTimeoutUntil(redisContext* ctx,
                      std::chrono::steady_clock::time_point deadline) {
     const auto remaining_us =
@@ -464,6 +470,10 @@ bool RedisOpLogStore::FinishOrRetryWrite(
         write_latency_us);
     if (err != ErrorCode::OK) {
         HAMetricManager::instance().inc_oplog_write_failures();
+        const int64_t consecutive_failures =
+            consecutive_write_failures_.fetch_add(1) + 1;
+        HAMetricManager::instance().set_oplog_consecutive_write_failures(
+            consecutive_failures);
         if (err == ErrorCode::INVALID_PARAMS) {
             CompleteWrite(pending, err);
             return false;
@@ -509,6 +519,10 @@ bool RedisOpLogStore::FinishOrRetryWrite(
         return true;
     }
 
+    consecutive_write_failures_.store(0);
+    HAMetricManager::instance().set_oplog_consecutive_write_failures(0);
+    HAMetricManager::instance().set_oplog_last_successful_write_timestamp_ms(
+        CurrentTimestampMs());
     CompleteWrite(pending, ErrorCode::OK);
     return false;
 }

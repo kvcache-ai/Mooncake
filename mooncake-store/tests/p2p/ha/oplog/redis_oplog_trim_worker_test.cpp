@@ -56,6 +56,14 @@ TEST(RedisOpLogTrimWorkerTest, IgnoresSelfInstance) {
                         {StandbyWithId("self", 1000000)}, "self"));
 }
 
+TEST(RedisOpLogTrimWorkerTest, RequiresSnapshotEndpoint) {
+    auto standby = Standby(1000000);
+    standby.snapshot_endpoint.clear();
+
+    EXPECT_EQ(100u,
+              ComputeRedisOpLogTrimTarget(1000000, 100, 100000, 1, {standby}));
+}
+
 }  // namespace
 }  // namespace mooncake
 
