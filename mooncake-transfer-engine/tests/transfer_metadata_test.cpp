@@ -1400,6 +1400,7 @@ TEST_F(TransferMetadataRpcOwnershipTest, RejectedHttpPublicationAndRetry) {
                     EXPECT_EQ(rpcSocketInode(server.rpc_port), 0);
 #endif
                     EXPECT_EQ(engine.getMetadata()->localRpcMeta().sockfd, -1);
+                    EXPECT_EQ(engine.getRpcPort(), 0);
                     EXPECT_EQ(server.value(key), original);
                     EXPECT_EQ(server.rpc_deletes, 0);
                 }
