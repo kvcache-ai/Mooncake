@@ -291,17 +291,25 @@ class TransferEngine {
 
     // Engine-owned counter-mode eventfd for batch completion. -1 on
     // non-Linux, when eventfd() failed, or when this engine is the TENT
-    // runtime (classic BatchDesc completion is not on that path). The
-    // caller may dup the fd. Destroying the engine closes the original.
+    // runtime. The caller may dup the fd. Destroying the engine closes
+    // the original.
     //
-    // The fd wakes only for counter-eligible batches: every submitted task
-    // uses a transport that publishes completion without foreground
-    // polling. Mixed or legacy batches never write the fd; keep polling
-    // getBatchTransferStatus for those. A second submit on the same
-    // BatchID starts a new terminal wave after the prior one.
+    // A non-negative fd means the engine has a notification facility. It
+    // does not mean a particular batch can finish without polling. Call
+    // enableBatchCompletionNotification after allocateBatchID and before
+    // the single submitTransfer. Only that opted-in, counter-capable path
+    // writes the fd. See RFC #5164. Timeout still requires
+    // getTransferStatus; an application deadline ends the wait only.
     int completionFd() const;
 
+    // Opt in before the first submitTransfer. Fails when the facility is
+    // unavailable, when slice timeouts require foreground polling, or when
+    // the batch already has submitted tasks. A second submitTransfer on an
+    // event-enabled batch is rejected.
+    Status enableBatchCompletionNotification(BatchID batch_id);
+
     // Non-blocking drain of terminal batches. See BatchCompletion.
+    // Does not free batch handles and does not send peer notify.
     // NotSupportedTransport when completionFd() is -1.
     Status drainCompletions(std::vector<BatchCompletion>& out);
 

@@ -1209,7 +1209,8 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
     const std::vector<size_t>& lengths, TransferOpcode opcode,
-    const std::string& transport_hint, const std::string& nic_hint) {
+    const std::string& transport_hint, const std::string& nic_hint,
+    bool enable_completion_notification) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -1260,6 +1261,17 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 
         auto start_ts = getCurrentTimeInNano();
         batch_desc->start_timestamp = start_ts;
+
+        if (enable_completion_notification) {
+            Status enable =
+                engine_->enableBatchCompletionNotification(batch_id);
+            if (!enable.ok()) {
+                engine_->freeBatchID(batch_id);
+                LOG(ERROR) << "enableBatchCompletionNotification failed: "
+                           << enable.ToString();
+                return 0;
+            }
+        }
 
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
@@ -1965,7 +1977,8 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("opcode"), py::arg("transport_hint") = "",
-                 py::arg("nic_hint") = "")
+                 py::arg("nic_hint") = "",
+                 py::arg("enable_completion_notification") = false)
 #ifdef USE_CUDA
             .def("transfer_write_on_cuda",
                  &TransferEnginePy::transferWriteOnCuda,
@@ -2037,9 +2050,59 @@ PYBIND11_MODULE(engine, m) {
                 return engine ? engine->completionFd() : -1;
             },
             "Engine-owned completion eventfd. -1 when the wake is unavailable. "
-            "Wakes only for counter-eligible batches (every submitted task "
-            "publishes completion without foreground polling). Mixed or "
-            "legacy batches never write the fd.")
+            "A non-negative fd means the facility exists; call "
+            "enable_batch_completion_notification before one submitTransfer "
+            "to wait on it. See RFC #5164.")
+        .def(
+            "enable_batch_completion_notification",
+            [](TransferEnginePy& self, batch_id_t batch_id) {
+                auto engine = self.getEngine();
+                if (!engine) {
+                    throw std::runtime_error(
+                        "transfer engine is not initialized");
+                }
+                auto status =
+                    engine->enableBatchCompletionNotification(batch_id);
+                if (!status.ok()) {
+                    throw std::runtime_error(status.ToString());
+                }
+            },
+            py::arg("batch_id"),
+            "Opt in before the first submit. Fails when the facility is "
+            "unavailable, when slice timeouts require polling, or when the "
+            "batch already has submitted tasks.")
+        .def(
+            "allocate_batch_id",
+            [](TransferEnginePy& self, size_t batch_size) {
+                auto engine = self.getEngine();
+                if (!engine) {
+                    throw std::runtime_error(
+                        "transfer engine is not initialized");
+                }
+                return static_cast<batch_id_t>(
+                    engine->allocateBatchID(batch_size));
+            },
+            py::arg("batch_size"),
+            "Allocate a classic TE batch handle for async submit + eventfd.")
+        .def(
+            "free_batch_id",
+            [](TransferEnginePy& self, batch_id_t batch_id) {
+                auto engine = self.getEngine();
+                if (!engine) {
+                    throw std::runtime_error(
+                        "transfer engine is not initialized");
+                }
+                // Non-blocking ownership release: OK or BatchCleanupDeferred
+                // both invalidate the handle. Does not poll status in a loop.
+                auto status = engine->freeBatchID(batch_id);
+                if (!status.ok() && !status.IsBatchCleanupDeferred()) {
+                    throw std::runtime_error(status.ToString());
+                }
+                return status.IsBatchCleanupDeferred() ? 1 : 0;
+            },
+            py::arg("batch_id"),
+            "Release a batch handle without a blocking status loop. Returns "
+            "0 on immediate free, 1 when cleanup was deferred.")
         .def(
             "drain_completions",
             [](TransferEnginePy& self) {
@@ -2049,7 +2112,8 @@ PYBIND11_MODULE(engine, m) {
                         "transfer engine is not initialized");
                 }
                 // GIL stays on the caller thread. Completion only writes the
-                // eventfd.
+                // eventfd. Drain does not free handles and does not send
+                // peer notify.
                 std::vector<BatchCompletion> done;
                 auto status = engine->drainCompletions(done);
                 if (!status.ok()) {
@@ -2066,7 +2130,7 @@ PYBIND11_MODULE(engine, m) {
                 return out;
             },
             "Non-blocking drain of terminal batches. Each item has batch_id, "
-            "status, and transferred_bytes.");
+            "status, and transferred_bytes. Does not free batch handles.");
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 

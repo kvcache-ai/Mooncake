@@ -335,6 +335,14 @@ class TransferEngineImpl {
         return multi_transports_->completionFd();
     }
 
+    Status enableBatchCompletionNotification(BatchID batch_id) {
+        if (!multi_transports_) {
+            return Status::NotSupportedTransport(
+                "transfer engine is not initialized");
+        }
+        return multi_transports_->enableBatchCompletionNotification(batch_id);
+    }
+
     Status drainCompletions(std::vector<BatchCompletion>& out) {
         if (!multi_transports_) {
             out.clear();
@@ -446,9 +454,9 @@ class TransferEngineImpl {
 
     void eraseMemoryRegionLocked(void* addr);
 
-    // Posts a pending submitTransferWithNotify message once. Safe from the
-    // terminal eventfd path and from getBatchTransferStatus; the map erase
-    // makes a second call a no-op.
+    // Posts a pending submitTransferWithNotify message once. Called from
+    // getBatchTransferStatus when the batch is COMPLETED. Not invoked from
+    // the eventfd / CQ completion path (RFC #5164).
     void flushPendingNotify(BatchID batch_id) {
         std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
         {

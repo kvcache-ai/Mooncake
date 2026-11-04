@@ -573,6 +573,13 @@ class Transport {
         // As with task_list, submission and polling must be serialized.
         bool counter_eligible = false;
 
+        // Opt-in for the engine-owned completion eventfd (RFC #5164 v1).
+        // Set by enableBatchCompletionNotification before the first submit.
+        // Only an event-enabled, counter-eligible batch installs
+        // terminal_notify and writes the fd. Legacy batches leave this false
+        // and keep today's submit/status path with no eventfd write.
+        bool event_enabled = false;
+
         // Number of completion callbacks currently holding a pin on this
         // BatchDesc and therefore still allowed to read or update it and the
         // TransferTask objects in task_list. freeBatchID() must not delete
@@ -594,7 +601,8 @@ class Transport {
         // number of submitted tasks (task_list.size()), matching
         // getBatchTransferStatus and completion_cv. batch_size is capacity
         // only. The notify target drops the event if freeBatchID already
-        // suppressed it.
+        // suppressed it. Status is COMPLETED or FAILED only; v1 does not
+        // publish TIMEOUT or CANCELED onto the fd.
         void publishTerminalIfDone(uint64_t prev) {
             if (terminal_notify == nullptr || prev + 1 != task_list.size())
                 return;

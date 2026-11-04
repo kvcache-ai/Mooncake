@@ -134,8 +134,9 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     batch_desc->batch_size = batch_size;
     batch_desc->task_list.reserve(batch_size);
     batch_desc->context = NULL;
-    // terminal_notify is installed in syncTerminalNotify after submit, once
-    // counter_eligible is known. Non-counter batches must not hook the wake.
+    // terminal_notify is installed in syncTerminalNotify after an opted-in
+    // submit on a counter-capable path. Non-opted-in batches never hook the
+    // wake (RFC #5164).
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_lock_.lock();
     batch_desc_set_[batch_desc->id] = batch_desc;
@@ -220,19 +221,12 @@ Status MultiTransport::tryFreeBatchID(
     }
     // A terminal status is visible to pollers before CompletionCallbackPin
     // drops: publishTerminalIfDone (eventfd wake) still runs under that pin.
-    // freeBatchID right after COMPLETED must wait for the pin to drain, or
-    // it spuriously defers cleanup (TCPTransportTest) and can race the
-    // destructor with the notify path.
-    constexpr auto kPinWait = std::chrono::milliseconds(100);
-    const auto deadline = std::chrono::steady_clock::now() + kPinWait;
-    while (batch_desc.active_completion_callbacks.load(
-               std::memory_order_acquire) != 0) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            return Status::BatchBusy(
-                "BatchID cannot be freed until completion callbacks are "
-                "quiescent");
-        }
-        std::this_thread::yield();
+    // Return BatchBusy so the deferred-cleanup path retries; do not spin.
+    if (batch_desc.active_completion_callbacks.load(
+            std::memory_order_acquire) != 0) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until completion callbacks are "
+            "quiescent");
     }
     // Remove the id before the descriptor is deleted. A completion callback
     // still holding a pin cannot pass the pin check above; one that runs
@@ -259,7 +253,7 @@ void MultiTransport::discardQueuedCompletion(BatchID batch_id) {
                  ready_.end());
 }
 
-void MultiTransport::resetTerminalWave(BatchID batch_id) {
+void MultiTransport::clearQueuedTerminal(BatchID batch_id) {
     std::lock_guard<std::mutex> lock(completion_mu_);
     auto& batch = Transport::toBatchDesc(batch_id);
     if (batch.terminal_suppressed) return;
@@ -271,8 +265,31 @@ void MultiTransport::resetTerminalWave(BatchID batch_id) {
                  ready_.end());
 }
 
+Status MultiTransport::enableBatchCompletionNotification(BatchID batch_id) {
+    if (completion_fd_ < 0) {
+        return Status::NotSupportedTransport(
+            "completion eventfd is not available");
+    }
+    if (globalConfig().slice_timeout > 0) {
+        return Status::NotSupportedTransport(
+            "completion notification requires slice_timeout disabled; "
+            "timeouts are enforced only by foreground status polling");
+    }
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    if (!batch_desc.task_list.empty()) {
+        return Status::InvalidArgument(
+            "enableBatchCompletionNotification must be called before "
+            "submitTransfer");
+    }
+    batch_desc.event_enabled = true;
+    return Status::OK();
+}
+
 void MultiTransport::syncTerminalNotify(BatchDesc& batch_desc) {
-    if (batch_desc.counter_eligible && completion_fd_ >= 0) {
+    // Opt-in plus a counter-capable submit path. Non-opted-in batches keep
+    // the legacy fast path and never write the eventfd.
+    if (batch_desc.event_enabled && batch_desc.counter_eligible &&
+        completion_fd_ >= 0) {
         batch_desc.terminal_notify = &MultiTransport::onTerminal;
         batch_desc.terminal_notify_ctx = this;
     } else {
@@ -288,8 +305,6 @@ void MultiTransport::onTerminal(void* ctx, BatchID batch_id,
 
 void MultiTransport::enqueueTerminal(BatchID batch_id, TransferStatus status) {
     bool wake = false;
-    bool invoke_hook = false;
-    TransferStatusEnum outcome = status.s;
     {
         std::lock_guard<std::mutex> lock(completion_mu_);
         auto& batch = Transport::toBatchDesc(batch_id);
@@ -297,9 +312,9 @@ void MultiTransport::enqueueTerminal(BatchID batch_id, TransferStatus status) {
         batch.terminal_enqueued = true;
         ready_.push_back(BatchCompletion{batch_id, status});
         wake = completion_fd_ >= 0;
-        invoke_hook = static_cast<bool>(on_batch_terminal_);
     }
-    if (invoke_hook) on_batch_terminal_(batch_id, outcome);
+    // Local completion only. Peer notify stays on getBatchTransferStatus;
+    // do not sendNotify from the CQ / completion path (RFC #5164).
 #ifdef __linux__
     if (!wake) return;
     const uint64_t one = 1;
@@ -498,18 +513,27 @@ Status MultiTransport::submitTransfer(
     if (entries.empty()) return Status::OK();
     auto& task_list = batch_desc.task_list;
     const bool append = !task_list.empty();
-    batch_desc.counter_eligible =
-        (task_list.empty() || batch_desc.counter_eligible) &&
+    // RFC #5164: an event-enabled batch is one submit and at most one
+    // completion record. Legacy (non-opted-in) append stays unchanged.
+    if (batch_desc.event_enabled && append) {
+        return Status::InvalidArgument(
+            "event-enabled batch allows only one submitTransfer; "
+            "freeBatchID and allocateBatchID again");
+    }
+    const bool all_counter =
         std::all_of(transports.begin(), transports.end(), [](Transport* t) {
             return t->supportsBatchCompletionCounter();
         });
+    if (batch_desc.event_enabled && !all_counter) {
+        return Status::NotSupportedTransport(
+            "event-enabled batch requires a transport that publishes "
+            "completion without foreground polling");
+    }
+    batch_desc.counter_eligible =
+        (task_list.empty() || batch_desc.counter_eligible) && all_counter;
     batch_desc.status_cached.store(false, std::memory_order_relaxed);
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
-    // A second submit starts a new terminal wave: drop a stale ready entry
-    // and allow publishTerminalIfDone to enqueue again when the new size
-    // is reached.
-    if (append) resetTerminalWave(batch_id);
     // Install before transport work so a seal-time publish (empty task) can
     // wake. syncTerminalNotify at the end clears the hook if demoted.
     syncTerminalNotify(batch_desc);
@@ -565,7 +589,9 @@ Status MultiTransport::submitTransfer(
         }
     }
     syncTerminalNotify(batch_desc);
-    if (!batch_desc.counter_eligible) resetTerminalWave(batch_id);
+    if (!batch_desc.counter_eligible || !batch_desc.event_enabled) {
+        clearQueuedTerminal(batch_id);
+    }
     return overall_status;
 }
 
@@ -593,13 +619,18 @@ Status MultiTransport::mp_submitTransfer(
     }
 
     if (entries.empty()) return Status::OK();
-    // Explicit-protocol dispatch retains transport-specific polling.
+    // Explicit-protocol dispatch retains transport-specific polling and is
+    // not a polling-free eventfd path.
+    if (batch_desc.event_enabled) {
+        return Status::NotSupportedTransport(
+            "event-enabled batch does not support mp_submitTransfer");
+    }
     const bool append = !batch_desc.task_list.empty();
     batch_desc.counter_eligible = false;
     batch_desc.status_cached.store(false, std::memory_order_relaxed);
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
-    if (append) resetTerminalWave(batch_id);
+    (void)append;
     syncTerminalNotify(batch_desc);
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
@@ -640,7 +671,7 @@ Status MultiTransport::mp_submitTransfer(
         }
     }
     syncTerminalNotify(batch_desc);
-    if (!batch_desc.counter_eligible) resetTerminalWave(batch_id);
+    clearQueuedTerminal(batch_id);
     return overall_status;
 }
 #endif

@@ -305,6 +305,10 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
 
 int TransferEngine::completionFd() const { return impl_->completionFd(); }
 
+Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
+    return impl_->enableBatchCompletionNotification(batch_id);
+}
+
 Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
     return impl_->drainCompletions(out);
 }
@@ -1078,9 +1082,17 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
 
 int TransferEngine::completionFd() const {
     // TENT batches do not use classic BatchDesc, so the eventfd stays off
-    // until that runtime publishes through the same queue.
+    // until that runtime publishes through its own progress path.
     if (use_tent_) return -1;
     return impl_->completionFd();
+}
+
+Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
+    if (use_tent_) {
+        return Status::NotSupportedTransport(
+            "completion notification is not available for the TENT runtime");
+    }
+    return impl_->enableBatchCompletionNotification(batch_id);
 }
 
 Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
