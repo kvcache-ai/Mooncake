@@ -5,6 +5,7 @@ set(MOONCAKE_MASTER_SUPPORT_SOURCES
     common_types.cpp
     utils.cpp
     common/client_buffer_allocation.cpp
+    common/file_util.cpp
     common/mmap_buffer.cpp
     common/network.cpp
     etcd_helper.cpp

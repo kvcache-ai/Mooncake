@@ -396,9 +396,6 @@ class MasterService {
         const UUID& client_id, const TaskCompleteRequest& request);
 
    private:
-    // Resolve the key to a sanitized format for storage
-    std::string SanitizeKey(const std::string& key) const;
-    std::string ResolvePath(const std::string& key) const;
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
     // evicts objects without soft pin. The second pass prioritizes objects
