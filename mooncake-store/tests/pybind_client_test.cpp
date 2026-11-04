@@ -2185,6 +2185,78 @@ TEST_F(RealClientTest, TestPutSessionStartRejectsReliableNofConfig) {
     EXPECT_EQ(rcs[0], kInvalidParams);
 }
 
+// Session put never writes DFS, so DFS configs must not reserve anything.
+TEST_F(RealClientTest, TestPutSessionStartRejectsDfsConfig) {
+    // Enable DFS so the master would accept the DFS reservation if the client
+    // forwarded it.
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_session_dfs_reject_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17825", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    struct TestCase {
+        std::string name;
+        size_t replica_num;
+    };
+    const std::vector<TestCase> test_cases = {
+        {.name = "memory_and_dfs", .replica_num = 1},
+        {.name = "dfs_only", .replica_num = 0},
+    };
+    for (const auto& test_case : test_cases) {
+        SCOPED_TRACE(test_case.name);
+        const std::string key = "session_dfs_" + test_case.name;
+        ReplicateConfig config;
+        config.replica_num = test_case.replica_num;
+        config.dfs_replica_num = 1;
+
+        auto rcs = py_client_->batch_put_session_start({key}, {128}, config);
+        ASSERT_EQ(rcs.size(), 1u);
+        EXPECT_EQ(rcs[0], kInvalidParams);
+        // Rejected before PutStart: no local session to revoke.
+        EXPECT_EQ(py_client_->batch_put_session_revoke({key})[0],
+                  kInvalidParams);
+        EXPECT_EQ(py_client_->isExist(key), 0);
+    }
+
+    // A leftover PutStart reservation would make this start fail with
+    // OBJECT_ALREADY_EXISTS until the discard timeout.
+    const std::string key = "session_dfs_memory_and_dfs";
+    std::string src(128, 'D');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->batch_put_session_start({key}, {src.size()})[0], 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  {key}, {{src.data()}}, {{src.size()}}, {{0}})[0],
+              static_cast<int>(src.size()));
+    ASSERT_EQ(py_client_->batch_put_session_end({key})[0], 0);
+    EXPECT_EQ(py_client_->isExist(key), 1);
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+}
+
 // Skip existing sessions while keeping every per-key field aligned.
 TEST_F(RealClientTest, TestPutSessionStartFiltersSessionGroupAndHcaHints) {
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
@@ -2536,22 +2608,31 @@ TEST_F(RealClientTest, NvlinkConfigHonorsDiscoveryOverride) {
          {"localhost:" + std::to_string(getFreeTcpPort()),
           std::string("localhost")}) {
         SCOPED_TRACE(hostname);
-        auto client = RealClient::create();
-        ConfigDict config = MakeConfigDict(hostname, "0", "0");
-        config[CONFIG_KEY_PROTOCOL] = "nvlink";
-        config[CONFIG_KEY_RDMA_DEVICES] = "";
-        config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "false";
-        config[CONFIG_KEY_EGM_NUMA_NODES] = "invalid";
+        for (const auto* local_buffer_size : {"0", "16MB"}) {
+            SCOPED_TRACE(local_buffer_size);
+            auto client = RealClient::create();
+            ConfigDict config =
+                MakeConfigDict(hostname, "0", local_buffer_size);
+            config[CONFIG_KEY_PROTOCOL] = "nvlink";
+            config[CONFIG_KEY_RDMA_DEVICES] = "";
+            config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "false";
+            config[CONFIG_KEY_EGM_NUMA_NODES] = "invalid";
 
-        // Disabled EGM ignores its node selection, and the explicit discovery
-        // override still permits TCP for the requested nvlink protocol.
-        ASSERT_TRUE(client->setup_internal(config).has_value());
-        ASSERT_NE(client->client_, nullptr);
-        EXPECT_TRUE(hasExplicitPort(client->get_hostname()));
-        auto details = master_.service()->GetSegmentsDetailForAdmin();
-        ASSERT_TRUE(details.has_value());
-        EXPECT_TRUE(details->empty());
-        EXPECT_EQ(client->tearDownAll(), 0);
+            // Disabled EGM ignores its node selection, and the explicit
+            // discovery override still permits TCP for the requested nvlink
+            // protocol.
+            ASSERT_TRUE(client->setup_internal(config).has_value());
+            ASSERT_NE(client->client_, nullptr);
+            ASSERT_NE(client->client_buffer_allocator_, nullptr);
+            EXPECT_EQ(
+                client->client_buffer_allocator_->size(),
+                std::string(local_buffer_size) == "0" ? 0 : 16 * 1024 * 1024);
+            EXPECT_TRUE(hasExplicitPort(client->get_hostname()));
+            auto details = master_.service()->GetSegmentsDetailForAdmin();
+            ASSERT_TRUE(details.has_value());
+            EXPECT_TRUE(details->empty());
+            EXPECT_EQ(client->tearDownAll(), 0);
+        }
     }
 }
 
@@ -2570,33 +2651,39 @@ TEST_F(RealClientTest, EgmConfigRejectsDiscoveredTcpBeforeAllocating) {
              {"localhost:" + std::to_string(getFreeTcpPort()),
               std::string("localhost")}) {
             SCOPED_TRACE(hostname);
-            auto client = RealClient::create();
-            ConfigDict config = MakeConfigDict(hostname, "16MB", "0");
-            config[CONFIG_KEY_PROTOCOL] = "nvlink";
-            config[CONFIG_KEY_RDMA_DEVICES] = "";
-            config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
-            if (nodes) config[CONFIG_KEY_EGM_NUMA_NODES] = nodes;
+            for (const auto* local_buffer_size : {"0", "16MB"}) {
+                SCOPED_TRACE(local_buffer_size);
+                auto client = RealClient::create();
+                ConfigDict config =
+                    MakeConfigDict(hostname, "16MB", local_buffer_size);
+                config[CONFIG_KEY_PROTOCOL] = "nvlink";
+                config[CONFIG_KEY_RDMA_DEVICES] = "";
+                config[CONFIG_KEY_ENABLE_EGM_STORE_POOL] = "true";
+                if (nodes) config[CONFIG_KEY_EGM_NUMA_NODES] = nodes;
 
-            ::testing::internal::CaptureStderr();
-            auto result = client->setup_internal(config);
-            const std::string logs = ::testing::internal::GetCapturedStderr();
+                ::testing::internal::CaptureStderr();
+                auto result = client->setup_internal(config);
+                const std::string logs =
+                    ::testing::internal::GetCapturedStderr();
 
-            ASSERT_FALSE(result.has_value());
-            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-            EXPECT_NE(
-                logs.find("EGM Store requires the classic NVLink transport"),
-                std::string::npos)
-                << logs;
-            // Failed EGM setup must leave neither a live client nor host-backed
-            // capacity behind.
-            EXPECT_EQ(client->client_, nullptr);
-            EXPECT_EQ(client->client_buffer_allocator_, nullptr);
-            EXPECT_TRUE(client->segment_ptrs_.empty());
-            EXPECT_TRUE(client->hugepage_segment_ptrs_.empty());
-            auto details = master_.service()->GetSegmentsDetailForAdmin();
-            ASSERT_TRUE(details.has_value());
-            EXPECT_TRUE(details->empty());
-            EXPECT_EQ(client->tearDownAll(), 0);
+                ASSERT_FALSE(result.has_value());
+                EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+                EXPECT_NE(
+                    logs.find(
+                        "EGM Store requires the classic NVLink transport"),
+                    std::string::npos)
+                    << logs;
+                // Failed EGM setup must leave neither a live client nor
+                // host-backed capacity behind.
+                EXPECT_EQ(client->client_, nullptr);
+                EXPECT_EQ(client->client_buffer_allocator_, nullptr);
+                EXPECT_TRUE(client->segment_ptrs_.empty());
+                EXPECT_TRUE(client->hugepage_segment_ptrs_.empty());
+                auto details = master_.service()->GetSegmentsDetailForAdmin();
+                ASSERT_TRUE(details.has_value());
+                EXPECT_TRUE(details->empty());
+                EXPECT_EQ(client->tearDownAll(), 0);
+            }
         }
     }
 }

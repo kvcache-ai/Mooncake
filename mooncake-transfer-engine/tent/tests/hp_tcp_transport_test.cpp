@@ -48,6 +48,19 @@ class HighPerformanceTcpTransportTestPeer {
         const HighPerformanceTcpTransport& transport) {
         return transport.server_->activeSessionsForTest();
     }
+
+    // Outstanding operations per lane towards `target` (empty if none planned).
+    static std::vector<int32_t> laneLoad(HighPerformanceTcpTransport& transport,
+                                         SegmentID target) {
+        std::lock_guard<std::mutex> lock(transport.lane_sequence_mutex_);
+        std::vector<int32_t> out;
+        auto it = transport.lane_load_.find(target);
+        if (it == transport.lane_load_.end() || !it->second) return out;
+        for (const auto& lane : *it->second) {
+            out.push_back(lane.load(std::memory_order_relaxed));
+        }
+        return out;
+    }
 };
 
 namespace {
@@ -930,6 +943,127 @@ TEST_P(HighPerformanceTcpLaneDistributionTest,
 INSTANTIATE_TEST_SUITE_P(WriteAndSlicedRead,
                          HighPerformanceTcpLaneDistributionTest,
                          ::testing::Bool());
+
+// Lane selection counts outstanding operations per lane. Commands that are
+// planned but never run must give their count back, or the lane is avoided
+// forever: an admission rejection (the normal backpressure path) and a batch
+// whose later request fails to plan both drop already planned commands.
+TEST(HighPerformanceTcpTransportTest, LaneLoadReturnsToZeroOnRejectedSubmits) {
+    constexpr size_t kLength = 768ULL << 10;
+    auto params = MakeParams();
+    params.connections_per_peer = 4;
+    params.max_outstanding_bytes = 1ULL << 20;  // two requests do not fit
+    params.max_transfer_bytes = 1ULL << 20;
+
+    std::vector<uint8_t> remote(2 * kLength, 0);
+    std::vector<uint8_t> local(2 * kLength, 0x5a);
+    std::vector<uint8_t> unregistered(kLength, 0x11);
+
+    auto server_metadata = MakeLocalMetadata();
+    uint16_t rpc_port = 0;
+    ASSERT_TRUE(server_metadata->start(rpc_port).ok());
+    const std::string server_name = "127.0.0.1:" + std::to_string(rpc_port);
+    ASSERT_TRUE(server_metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) -> Status {
+                        segment.name = server_name;
+                        segment.rpc_server_addr = server_name;
+                        return Status::OK();
+                    })
+                    .ok());
+    HighPerformanceTcpTransport server(params);
+    std::string installed_server_name = server_name;
+    ASSERT_TRUE(
+        server.install(installed_server_name, server_metadata, nullptr, nullptr)
+            .ok());
+    BufferDesc remote_buffer;
+    remote_buffer.addr = reinterpret_cast<uint64_t>(remote.data());
+    remote_buffer.length = remote.size();
+    remote_buffer.location = "cpu:0";
+    MemoryOptions remote_options;
+    remote_options.perm = kGlobalReadWrite;
+    ASSERT_TRUE(server.addMemoryBuffer(remote_buffer, remote_options).ok());
+    ASSERT_TRUE(PublishBuffers(server_metadata, {remote_buffer}).ok());
+
+    auto client_metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport client(params);
+    std::string client_name = "hp_lane_load_client";
+    ASSERT_TRUE(
+        client.install(client_name, client_metadata, nullptr, nullptr).ok());
+    SegmentID target = 0;
+    ASSERT_TRUE(
+        client_metadata->segmentManager().openRemote(target, server_name).ok());
+    SegmentDescRef remote_desc;
+    Status resolved =
+        client_metadata->segmentManager().getRemoteCached(remote_desc, target);
+    if (resolved.IsRpcServiceError()) {
+        resolved = client_metadata->segmentManager().getRemoteCached(
+            remote_desc, target);
+    }
+    ASSERT_TRUE(resolved.ok()) << resolved.ToString();
+    BufferDesc local_buffer;
+    local_buffer.addr = reinterpret_cast<uint64_t>(local.data());
+    local_buffer.length = local.size();
+    local_buffer.location = "cpu:0";
+    MemoryOptions local_options;
+    local_options.perm = kLocalReadWrite;
+    ASSERT_TRUE(client.addMemoryBuffer(local_buffer, local_options).ok());
+
+    const auto write = [&](void* source, size_t offset) {
+        Request request{};
+        request.opcode = Request::WRITE;
+        request.source = source;
+        request.target_id = target;
+        request.target_offset =
+            reinterpret_cast<uint64_t>(remote.data()) + offset;
+        request.length = kLength;
+        return request;
+    };
+    const auto all_zero = [&] {
+        for (int32_t load :
+             HighPerformanceTcpTransportTestPeer::laneLoad(client, target)) {
+            if (load != 0) return false;
+        }
+        return true;
+    };
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(client.allocateSubBatch(batch, 2).ok());
+
+    // Admission rejection: both requests plan (taking two lane counts), then
+    // the batch's 1.5 MB do not fit the 1 MB budget.
+    Status rejected = client.submitTransferTasks(
+        batch,
+        {write(local.data(), 0), write(local.data() + kLength, kLength)});
+    ASSERT_TRUE(rejected.IsTooManyRequests()) << rejected.ToString();
+    EXPECT_FALSE(
+        HighPerformanceTcpTransportTestPeer::laneLoad(client, target).empty());
+    EXPECT_TRUE(WaitUntil(all_zero));
+
+    // Mid-batch planning failure: the first request plans, the second has an
+    // unregistered source and fails to plan.
+    Status failed = client.submitTransferTasks(
+        batch, {write(local.data(), 0), write(unregistered.data(), kLength)});
+    ASSERT_FALSE(failed.ok());
+    EXPECT_TRUE(WaitUntil(all_zero));
+
+    // The transport still works, and completed operations give their counts
+    // back as well.
+    ASSERT_TRUE(
+        client.submitTransferTasks(batch, {write(local.data(), 0)}).ok());
+    TransferStatus status{};
+    ASSERT_TRUE(WaitForTransportResult(client, batch, status).ok());
+    ASSERT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(std::memcmp(remote.data(), local.data(), kLength), 0);
+    EXPECT_TRUE(WaitUntil(all_zero));
+
+    ASSERT_TRUE(client.freeSubBatch(batch).ok());
+    ASSERT_TRUE(client.removeMemoryBuffer(local_buffer).ok());
+    ASSERT_TRUE(server.removeMemoryBuffer(remote_buffer).ok());
+    ASSERT_TRUE(client.quiesce().ok());
+    ASSERT_TRUE(server.quiesce().ok());
+    ASSERT_TRUE(client.uninstall().ok());
+    ASSERT_TRUE(server.uninstall().ok());
+}
 
 }  // namespace
 }  // namespace mooncake::tent

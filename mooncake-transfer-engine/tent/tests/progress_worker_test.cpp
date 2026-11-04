@@ -50,6 +50,18 @@
 #include "remote_stage_operation.h"
 
 namespace mooncake {
+
+class TransferEngineImplTestPeer {
+   public:
+    static constexpr size_t kBatchLockShards =
+        tent::TransferEngineImpl::kBatchLockShards;
+
+    static size_t batchShardIndex(tent::TransferEngineImpl& engine,
+                                  tent::BatchID batch_id) {
+        return &engine.batchShard(batch_id) - engine.batch_shards_.data();
+    }
+};
+
 namespace tent {
 
 namespace {
@@ -1782,6 +1794,36 @@ TEST(ProgressLockShard, ConcurrentIndependentBatchPolls) {
 
     EXPECT_EQ(failures.load(), 0);
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+TEST(ProgressLockShard, BatchesSpreadAcrossShards) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // Batches live side by side in one slab, so their addresses step by
+    // sizeof(Batch). The shard choice must not depend on that stride, or
+    // threads polling their own batches share a few shard locks.
+    constexpr size_t kBatches = 64;
+    std::vector<BatchID> batches;
+    std::vector<bool> used(TransferEngineImplTestPeer::kBatchLockShards, false);
+    size_t distinct = 0;
+    for (size_t i = 0; i < kBatches; ++i) {
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, 0u);
+        batches.push_back(batch_id);
+        size_t shard =
+            TransferEngineImplTestPeer::batchShardIndex(engine, batch_id);
+        ASSERT_LT(shard, used.size());
+        if (!used[shard]) {
+            used[shard] = true;
+            ++distinct;
+        }
+    }
+    EXPECT_GT(distinct, kBatches * 3 / 8);
+    for (BatchID batch_id : batches) {
+        EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    }
 }
 
 TEST(ProgressLockShard, PollRacesWithFreeSameBatch) {

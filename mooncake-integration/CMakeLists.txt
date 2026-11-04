@@ -21,7 +21,6 @@ endif()
 if(WITH_STORE)
   include_directories("../mooncake-store/include")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
-  include_directories("../mooncake-store/include/engram")
 
   include_directories(
     "../mooncake-store/include/cachelib_memory_allocator/include")
@@ -83,6 +82,23 @@ if(WITH_TE)
   if(USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)
+
+    if(BUILD_UNIT_TESTS)
+      find_package(
+        Python3
+        COMPONENTS Development.Embed
+        REQUIRED)
+      add_executable(on_cuda_transport_guard_test
+                     tests/on_cuda_transport_guard_test.cpp)
+      target_include_directories(
+        on_cuda_transport_guard_test
+        PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>
+      )
+      target_link_libraries(on_cuda_transport_guard_test
+                            PRIVATE pybind11::headers Python3::Python)
+      add_test(NAME on_cuda_transport_guard_test
+               COMMAND on_cuda_transport_guard_test)
+    endif()
   endif()
 
   if(BUILD_UNIT_TESTS AND USE_TENT)
@@ -146,16 +162,15 @@ if(USE_UBSHMEM)
 endif()
 
 if(WITH_STORE)
+  if(USE_CUDA)
+    add_subdirectory(../mooncake-store/src/engram
+                     ${CMAKE_BINARY_DIR}/mooncake-store/src/engram)
+  endif()
   pybind11_add_module(
-    store
-    ${SOURCES}
-    ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp
-    store/buffer_pool.cpp
-    store/engram_store_py.cpp
-    integration_utils.h)
-  set_target_properties(
-    store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH "$ORIGIN")
+    store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
+    store/buffer_pool.cpp integration_utils.h)
+  set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
+                                                              "$ORIGIN")
   if(USE_TENT)
     target_link_libraries(store PRIVATE tent)
   endif()
@@ -296,8 +311,8 @@ if(WITH_TE)
                                  COMPONENT python)
   # Co-locate libtent_metrics.so with the Python C extensions so engine.so and
   # _store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
-  # must be loadable wherever the extensions are installed; otherwise
-  # `import mooncake.engine` / `mooncake.store` fails with a missing library.
+  # must be loadable wherever the extensions are installed; otherwise `import
+  # mooncake.engine` / `mooncake.store` fails with a missing library.
   if(TARGET tent_metrics)
     install(TARGETS tent_metrics
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
@@ -315,6 +330,16 @@ if(WITH_EP)
       COMPONENT python
       FILES_MATCHING
       PATTERN "*.so")
+
+    # The CUDA EP JIT runs nvcc on the user's machine, so nvcc needs the kernel
+    # headers there too. Put them in the wheel, in a mooncake_ep_jit/ directory
+    # next to libmooncake_ep_device.so.
+    if(USE_CUDA)
+      install(
+        DIRECTORY "${CMAKE_BINARY_DIR}/mooncake_ep_jit/"
+        DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/mooncake_ep_jit"
+        COMPONENT python)
+    endif()
   endif()
   install(
     FILES

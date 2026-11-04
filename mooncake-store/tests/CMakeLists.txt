@@ -48,6 +48,7 @@ add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
+add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
@@ -211,6 +212,13 @@ if(USE_TENT)
   )
   set_tests_properties(transfer_task_tent_completion_test
                        PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
+  add_test(
+    NAME transfer_task_tent_shared_segment_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.NativeScatterPreservesSharedRemoteSegment)
+  set_tests_properties(transfer_task_tent_shared_segment_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
 endif()
 add_store_test(transfer_submitter_config_test
                transfer_submitter_config_test.cpp)
@@ -286,6 +294,7 @@ add_store_test(client_object_checksum_config_test
                client_object_checksum_config_test.cpp)
 add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
+add_store_test(numa_allowed_nodes_test numa_allowed_nodes_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(local_hot_cache_concurrency_test
@@ -392,6 +401,15 @@ add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
+add_store_test(kvcs_object_storage_adapter_test
+               kvcs_object_storage_adapter_test.cpp)
+if(NOT MOONCAKE_KVCS_SDK_FOUND)
+  target_compile_definitions(kvcs_object_storage_adapter_test
+                             PRIVATE MOONCAKE_KVCS_TEST_NO_SDK=1)
+else()
+  target_compile_definitions(kvcs_object_storage_adapter_test
+                             PRIVATE MOONCAKE_KVCS_TEST_SDK=1)
+endif()
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
@@ -553,3 +571,14 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+# Compile the production resource manager against a USRBIO test double, even
+# when USE_3FS is disabled. Keep it separate from mooncake_store's real client.
+add_executable(
+  hf3fs_resource_manager_test hf3fs_resource_manager_test.cpp
+                              ../src/hf3fs/hf3fs_resource_manager.cpp)
+target_include_directories(hf3fs_resource_manager_test BEFORE
+                           PRIVATE hf3fs_stub ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
+                                                          pthread)
+add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)

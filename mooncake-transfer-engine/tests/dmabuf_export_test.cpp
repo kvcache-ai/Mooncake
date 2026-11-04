@@ -188,6 +188,49 @@ TEST(ExportDmabuf, GpuSubRangeExportsOnlyTheRequestedRange) {
     RdmaContext::closeDmabufExport(exp);
     cudaFree(base);
 }
+
+// Needs a CUDA device and DMA-BUF support; skipped otherwise. Registering a
+// whole cudaMalloc allocation whose size is not a page multiple must still
+// export it: cuMemGetAddressRange() reports the unrounded size, and
+// cuMemGetHandleForAddressRange() rejects a size that is not page-aligned.
+TEST(ExportDmabuf, GpuWholeAllocationWithUnalignedSize) {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        GTEST_SKIP() << "no CUDA device";
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+
+    // A page-aligned allocation first, so that a missing DMA-BUF path skips
+    // the test instead of hiding the unaligned case below.
+    constexpr size_t kAligned = 4ULL << 20;
+    void *aligned = nullptr;
+    ASSERT_EQ(cudaMalloc(&aligned, kAligned), cudaSuccess);
+    DmabufExport control;
+    int ret = RdmaContext::exportDmabuf(aligned, kAligned, control);
+    const bool dmabuf =
+        ret == 0 && control.method == DmabufExport::Method::kDmabufReg;
+    RdmaContext::closeDmabufExport(control);
+    cudaFree(aligned);
+    if (!dmabuf)
+        GTEST_SKIP() << "DMA-BUF path not taken (no DMA-BUF support, or "
+                        "WITH_NVIDIA_PEERMEM selects ibv_reg_mr)";
+
+    const size_t kAlloc = (4ULL << 20) + 12345;
+    ASSERT_NE(kAlloc % page, 0u);
+    void *base = nullptr;
+    ASSERT_EQ(cudaMalloc(&base, kAlloc), cudaSuccess);
+    DmabufExport exp;
+    ret = RdmaContext::exportDmabuf(base, kAlloc, exp);
+    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(exp.method, DmabufExport::Method::kDmabufReg);
+    EXPECT_EQ(exp.offset, 0u);
+    if (exp.fd >= 0) {
+        off_t exported = lseek(exp.fd, 0, SEEK_END);
+        EXPECT_GE(exported, static_cast<off_t>(kAlloc));
+        EXPECT_EQ(static_cast<size_t>(exported) % page, 0u);
+    }
+    RdmaContext::closeDmabufExport(exp);
+    cudaFree(base);
+}
 #endif
 
 }  // namespace
