@@ -1,17 +1,20 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include "file_interface.h"
 #include "../src/uring_submit.h"
@@ -368,6 +371,60 @@ TEST_F(PosixFileTest, UringBatchReadRejectsMisalignedDirectIoDescriptors) {
     expect_invalid(UringFile::ReadDesc{aligned + 1, 4096, 0});
     expect_invalid(UringFile::ReadDesc{aligned, 4095, 0});
     expect_invalid(UringFile::ReadDesc{aligned, 4096, 1});
+}
+
+// Counts failed per-ring fixed-buffer registrations.
+class RegisterFailureLogSink : public google::LogSink {
+   public:
+    RegisterFailureLogSink() { google::AddLogSink(this); }
+    ~RegisterFailureLogSink() override { google::RemoveLogSink(this); }
+    void send(google::LogSeverity, const char*, const char*, int,
+              const struct ::tm*, const char* message,
+              size_t message_len) override {
+        if (std::string_view(message, message_len)
+                .find("io_uring_register_buffers failed") !=
+            std::string_view::npos) {
+            failures.fetch_add(1);
+        }
+    }
+    std::atomic<int> failures{0};
+};
+
+// A buffer whose global registration failed must not be retried by every
+// other thread on its first I/O; reads still work without fixed buffers.
+TEST_F(PosixFileTest, UringFailedGlobalRegistrationIsNotRetriedByOtherThreads) {
+    // One iovec larger than 1 GiB is rejected by io_uring_register() with
+    // EFAULT before any page is pinned, so the mapping is never touched
+    // beyond the bytes read below.
+    constexpr size_t kBufSize = (size_t{1} << 30) + 4096;
+    void* mem = mmap(nullptr, kBufSize, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+
+    RegisterFailureLogSink sink;
+    EXPECT_FALSE(UringFile::register_global_buffer(mem, kBufSize));
+    const int failures_after_register = sink.failures.load();
+
+    constexpr std::string_view data = "read-without-fixed-buffer";
+    ASSERT_EQ(pwrite(test_fd, data.data(), data.size(), 0),
+              static_cast<ssize_t>(data.size()));
+    bool read_ok = false;
+    std::thread reader([&] {
+        UringFile file(test_filename, dup(test_fd), 32, false);
+        UringFile::ReadDesc desc{mem, data.size(), 0};
+        auto result = file.batch_read(&desc, 1);
+        read_ok = result.has_value() && desc.bytes_read == data.size();
+        EXPECT_FALSE(file.is_buffer_registered());
+    });
+    reader.join();
+
+    EXPECT_TRUE(read_ok);
+    EXPECT_EQ(std::string_view(static_cast<char*>(mem), data.size()), data);
+    EXPECT_EQ(sink.failures.load(), failures_after_register)
+        << "another thread retried the failed registration";
+
+    UringFile::unregister_global_buffer();
+    munmap(mem, kBufSize);
 }
 
 TEST_F(PosixFileTest, UringBatchReadDrainsErrorsBeforeNextOperation) {
