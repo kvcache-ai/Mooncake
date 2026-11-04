@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from heapq import merge
 from itertools import pairwise
 
 from ..contracts import RuntimeInstanceId
@@ -133,6 +135,18 @@ def _validate_address_ranges(binding: KVCacheRuntimeBindingManifest) -> None:
     _validate_shared_instance_ranges((binding,))
 
 
+def _payload_ranges(fragment: KVCacheRuntimeBuffer) -> Iterator[tuple[int, int]]:
+    # Geometry was validated above: heads/dimensions form a contiguous row.
+    row_bytes = fragment.local_shape[1] * fragment.local_shape[2] * fragment.itemsize
+    row_stride = fragment.strides_bytes[0]
+    if row_stride == row_bytes:
+        yield fragment.address, fragment.address + fragment.nbytes
+        return
+    for row in range(fragment.local_shape[0]):
+        start = fragment.address + row * row_stride
+        yield start, start + row_bytes
+
+
 def _validate_shared_instance_ranges(
     bindings: tuple[KVCacheRuntimeBindingManifest, ...],
 ) -> None:
@@ -148,9 +162,13 @@ def _validate_shared_instance_ranges(
             (fragment.address, fragment.address + fragment.nbytes)
             for fragment in fragments
         )
-        for previous, current in pairwise(views):
-            if current[0] < previous[1]:
-                raise ValueError("runtime KV buffers overlap in one address space")
+        # Disjoint bounding spans need no row expansion. When spans overlap,
+        # merge each view's sorted payload rows lazily; padding is not data.
+        if any(current[0] < previous[1] for previous, current in pairwise(views)):
+            payloads = merge(*(_payload_ranges(f) for f in fragments))
+            for previous, current in pairwise(payloads):
+                if current[0] < previous[1]:
+                    raise ValueError("runtime KV buffers overlap in one address space")
         # Several disjoint views may share the same complete allocation. Distinct
         # allocation claims may not overlap, including unequal nested claims.
         allocations = sorted(
