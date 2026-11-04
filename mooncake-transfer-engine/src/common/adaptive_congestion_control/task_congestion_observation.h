@@ -20,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "task_congestion_status.h"
@@ -37,7 +38,25 @@ struct TaskCongestionEvidence {
     std::optional<uint64_t> inflight_bytes;
     std::optional<uint64_t> retry_after_ns;
 
-    bool operator==(const TaskCongestionEvidence&) const = default;
+    // Only immutable strings from the process-lifetime NIC path pool qualify.
+    const std::string* interned_path = nullptr;
+
+    std::optional<std::string_view> effectivePath() const {
+        if (path) return *path;
+        if (interned_path) return *interned_path;
+        return std::nullopt;
+    }
+
+    bool operator==(const TaskCongestionEvidence& other) const {
+        return reason == other.reason && failure_scope == other.failure_scope &&
+               effectivePath() == other.effectivePath() &&
+               observed_at_ns == other.observed_at_ns &&
+               controller_mode == other.controller_mode &&
+               controller_generation == other.controller_generation &&
+               window_bytes == other.window_bytes &&
+               inflight_bytes == other.inflight_bytes &&
+               retry_after_ns == other.retry_after_ns;
+    }
 };
 
 // A logical task owns this record until its batch is freed. Slice state is
@@ -58,6 +77,10 @@ class TaskCongestionObservation {
                const TaskCongestionEvidence& evidence);
     bool avoid(size_t slice_id, uint64_t attempt_id,
                const TaskCongestionEvidence& evidence);
+    bool defer(size_t slice_id, uint64_t attempt_id,
+               TaskCongestionEvidence&& evidence, size_t submitted_slice_count);
+    bool avoid(size_t slice_id, uint64_t attempt_id,
+               TaskCongestionEvidence&& evidence, size_t submitted_slice_count);
     bool resolve(size_t slice_id, uint64_t attempt_id);
 
     TaskCongestionState state() const;
@@ -76,6 +99,9 @@ class TaskCongestionObservation {
 
     bool record(size_t slice_id, uint64_t attempt_id, TaskCongestionState state,
                 const TaskCongestionEvidence& evidence);
+    bool recordOwned(size_t slice_id, uint64_t attempt_id,
+                     TaskCongestionState state, TaskCongestionEvidence evidence,
+                     std::optional<size_t> submitted_slice_count);
     bool currentAttempt(uint64_t attempt_id) const;
     TaskCongestionState stateLocked() const;
 

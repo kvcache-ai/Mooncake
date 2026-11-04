@@ -235,11 +235,22 @@ DomainState::DomainState(Config config, uint32_t generation)
 
 Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
                     AdmissionEvidence* evidence) {
+    return tryAcquire(path, bytes, permit, evidence, true);
+}
+
+Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
+                    AdmissionEvidence* evidence, bool capture_snapshot) {
     const auto reject = [&](Decision decision, AdmissionDomain domain,
                             AdmissionReason reason, DomainState* state) {
         if (evidence != nullptr) {
-            *evidence = {domain, reason,
-                         state == nullptr ? Snapshot{} : snapshot(*state)};
+            evidence->domain = domain;
+            evidence->reason = reason;
+            if (capture_snapshot)
+                evidence->snapshot =
+                    state == nullptr ? Snapshot{} : snapshot(*state);
+            else
+                evidence->snapshot.generation =
+                    state == nullptr ? 0 : generation(*state);
         }
         return decision;
     };

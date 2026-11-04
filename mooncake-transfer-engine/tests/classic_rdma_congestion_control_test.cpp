@@ -529,6 +529,16 @@ TEST(ClassicRdmaCongestionControlTest,
     ASSERT_TRUE(detail.failure_scope.observed);
     EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kDevice);
 
+    ASSERT_TRUE(detail.observed_at_ns.observed);
+    const auto episode = detail;
+    for (int retry = 0; retry < 8; ++retry) {
+        ASSERT_EQ(adapter.gate(target_queue), 0u);
+        ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+        EXPECT_EQ(detail.observed_at_ns.value, episode.observed_at_ns.value);
+        EXPECT_EQ(detail.window_bytes.value, episode.window_bytes.value);
+        EXPECT_EQ(detail.inflight_bytes.value, episode.inflight_bytes.value);
+    }
+
     auto c_engine = static_cast<transfer_engine_t>(&engine);
     int c_state = TASK_CONGESTION_UNKNOWN;
     ASSERT_EQ(::getTaskCongestionState(c_engine, batch_id, 0, &c_state), 0);
@@ -557,8 +567,164 @@ TEST(ClassicRdmaCongestionControlTest,
     EXPECT_STREQ(path.data(), "peer@nic");
 
     adapter.releaseUnposted(&first);
+    ASSERT_EQ(adapter.gate(target_queue), 1u);
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.state, TaskCongestionState::kNormal);
+    EXPECT_TRUE(detail.resolved);
+    adapter.releaseUnposted(deferred);
+    ASSERT_EQ(adapter.gate(first_queue), 1u);
+    ASSERT_EQ(adapter.gate(target_queue), 0u);
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.state, TaskCongestionState::kCongested);
+    EXPECT_GT(detail.observed_at_ns.value, episode.observed_at_ns.value);
+    adapter.releaseUnposted(&first);
     task.is_finished = true;
     EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
+}
+
+TEST(ClassicRdmaCongestionControlTest,
+     WindowEpisodeRefreshesAfterUnavailablePathOwnerAndGenerationChanges) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = 64;
+    config.max_window_bytes = 64;
+    ClassicRdmaCongestionControl first(config), second(config);
+    std::string local_name = "local";
+    MultiTransport transports(nullptr, local_name);
+    const auto batch_id = transports.allocateBatchID(1);
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    task.batch_id = batch_id;
+    auto *slice = new Transport::Slice{};
+    slice->task = &task;
+    slice->length = 64;
+    task.slice_list.push_back(slice);
+    task.slice_count = 1;
+    Transport::Slice blocker_a{}, blocker_b{};
+    blocker_a.length = blocker_b.length = 64;
+    first.prepare(&blocker_a, "path-a");
+    second.prepare(&blocker_b, "path-b");
+    std::vector<Transport::Slice *> queue_a{&blocker_a}, queue_b{&blocker_b};
+    std::vector<Transport::Slice *> queued{slice};
+    ASSERT_EQ(first.gate(queue_a), 1u);
+    ASSERT_EQ(second.gate(queue_b), 1u);
+    first.prepare(slice, "path-a");
+    ASSERT_EQ(first.gate(queued), 0u);
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    auto previous = detail;
+
+    first.observeUnavailable(slice, "path-a",
+                             TaskCongestionFailureScope::kRoute, 1000);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kPathQuarantined);
+    EXPECT_GT(detail.observed_at_ns.value, previous.observed_at_ns.value);
+    previous = detail;
+    ASSERT_EQ(first.gate(queued), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.state, TaskCongestionState::kCongested);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+    EXPECT_GT(detail.observed_at_ns.value, previous.observed_at_ns.value);
+    previous = detail;
+
+    first.prepare(slice, "path-b");
+    ASSERT_EQ(first.gate(queued), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.affected_path.value, "path-b");
+    EXPECT_GT(detail.observed_at_ns.value, previous.observed_at_ns.value);
+    previous = detail;
+    second.prepare(slice, "path-b");
+    ASSERT_EQ(second.gate(queued), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_GT(detail.observed_at_ns.value, previous.observed_at_ns.value);
+    previous = detail;
+
+    second.resetDevice();
+    second.releaseUnposted(&blocker_b);
+    ASSERT_EQ(second.gate(queue_b), 1u);
+    ASSERT_EQ(second.gate(queued), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kDevice);
+    EXPECT_NE(detail.controller_generation.value,
+              previous.controller_generation.value);
+    EXPECT_GT(detail.observed_at_ns.value, previous.observed_at_ns.value);
+    const auto refreshed = detail;
+    ASSERT_EQ(second.gate(queued), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.observed_at_ns.value, refreshed.observed_at_ns.value);
+    second.releaseUnposted(&blocker_b);
+    blocker_b.length = 32;
+    ASSERT_EQ(second.gate(queue_b), 1u);
+    slice->length = 16;
+    Transport::Slice tail{}, other_route{};
+    tail.length = 32;
+    other_route.length = 32;
+    second.prepare(&tail, "path-b");
+    std::vector<Transport::Slice *> partial{slice, &tail};
+    // The 16-byte admission leaves 16 bytes free, so the 32-byte tail defers.
+    // Together they are below one 64-byte replenishment group and roll back.
+    ASSERT_EQ(second.gate(partial), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kRoute);
+    previous = detail;
+    second.prepare(&other_route, "path-c");
+    std::vector<Transport::Slice *> other_queue{&other_route};
+    ASSERT_EQ(second.gate(other_queue), 1u);
+    ASSERT_EQ(second.gate(queued), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kDevice);
+    EXPECT_EQ(detail.controller_generation.value,
+              refreshed.controller_generation.value);
+    EXPECT_GT(detail.observed_at_ns.value, previous.observed_at_ns.value);
+    second.releaseUnposted(&other_route);
+    first.releaseUnposted(&blocker_a);
+    second.releaseUnposted(&blocker_b);
+    task.is_finished = true;
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+TEST(ClassicRdmaCongestionControlTest,
+     RecycledSliceRecordsANewTasksWindowEpisode) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.min_window_bytes = config.max_window_bytes = 64;
+    ClassicRdmaCongestionControl adapter(config);
+    std::string local_name = "local";
+    MultiTransport transports(nullptr, local_name);
+    const auto batch_id = transports.allocateBatchID(2);
+    auto &tasks = Transport::toBatchDesc(batch_id).task_list;
+    tasks.emplace_back();
+    tasks.emplace_back();
+    Transport::ThreadLocalSliceCache cache;
+    auto *slice = cache.allocate();
+    slice->task = &tasks[0];
+    slice->length = 64;
+    tasks[0].slice_count = 1;
+    tasks[1].slice_count = 1;
+    Transport::Slice blocker{};
+    blocker.length = 64;
+    adapter.prepare(&blocker, "peer@nic");
+    adapter.prepare(slice, "peer@nic");
+    std::vector<Transport::Slice *> blocking{&blocker}, queued{slice};
+    ASSERT_EQ(adapter.gate(blocking), 1u);
+    ASSERT_EQ(adapter.gate(queued), 0u);
+    TaskCongestionDetail before, after;
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, before).ok());
+    cache.deallocate(slice);
+    auto *recycled = cache.allocate();
+    ASSERT_EQ(recycled, slice);
+    EXPECT_EQ(recycled->rdma_congestion_control_window_episode, 0u);
+    EXPECT_FALSE(recycled->rdma_congestion_control_observed_blocked.load());
+    recycled->task = &tasks[1];
+    adapter.prepare(recycled, "peer@nic");
+    ASSERT_EQ(adapter.gate(queued), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 1, after).ok());
+    EXPECT_EQ(after.state, TaskCongestionState::kCongested);
+    EXPECT_GT(after.observed_at_ns.value, before.observed_at_ns.value);
+    adapter.releaseUnposted(&blocker);
+    cache.deallocate(recycled);
+    tasks[0].is_finished = true;
+    tasks[1].is_finished = true;
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
 }
 
 TEST(ClassicRdmaCongestionControlTest,
@@ -815,14 +981,137 @@ TEST(ClassicRdmaCongestionControlTest,
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kCongested);
     EXPECT_EQ(detail.slice_id.value, 0u);
+    EXPECT_FALSE(detail.resolved);
+    ASSERT_TRUE(detail.reason.observed);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+    ASSERT_TRUE(detail.affected_path.observed);
+    EXPECT_EQ(detail.affected_path.value, "peer-a@nic");
     adapter.releaseUnposted(unavailable);
     queued = {deferred};
     ASSERT_EQ(adapter.gate(queued), 1u);
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kNormal);
+    EXPECT_TRUE(detail.resolved);
+    EXPECT_EQ(detail.slice_id.value, 0u);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+    EXPECT_EQ(detail.affected_path.value, "peer-a@nic");
     adapter.releaseUnposted(deferred);
     task.is_finished = true;
     EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+TEST(ClassicRdmaCongestionControlTest,
+     InternedPathHistorySurvivesMetadataRefreshAndRouteChange) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    ClassicRdmaCongestionControl adapter(config);
+    std::string local_name = "local";
+    MultiTransport transports(nullptr, local_name);
+    const auto batch_id = transports.allocateBatchID(1);
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.slice_count = 1;
+    auto *slice = new Transport::Slice{};
+    slice->task = &task;
+    slice->length = 64;
+    task.slice_list.push_back(slice);
+    std::string original_path;
+    {
+        TransferMetadata::SegmentDesc desc;
+        desc.name = "history-peer";
+        desc.devices.push_back({"history-nic", 1, "", ""});
+        desc.rebuildInternedNicPaths();
+        slice->interned_peer_nic_path = &desc.internedNicPath(0);
+        original_path = *slice->interned_peer_nic_path;
+        adapter.prepare(slice, original_path);
+        adapter.observeUnavailable(slice, original_path,
+                                   TaskCongestionFailureScope::kRoute, 1000);
+        for (size_t i = 0; i < 256; ++i) {
+            desc.name = "refreshed-peer-" + std::to_string(i);
+            ++desc.metadata_version;
+            desc.rebuildInternedNicPaths();
+        }
+        slice->interned_peer_nic_path = &desc.internedNicPath(0);
+        adapter.prepare(slice, *slice->interned_peer_nic_path);
+    }
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    ASSERT_TRUE(detail.affected_path.observed);
+    EXPECT_EQ(detail.affected_path.value, original_path);
+    EXPECT_FALSE(detail.resolved);
+    {
+        const std::string fallback_path(256, 'f');
+        ASSERT_NE(*slice->interned_peer_nic_path, fallback_path);
+        adapter.observeUnavailable(slice, fallback_path,
+                                   TaskCongestionFailureScope::kDevice,
+                                   std::nullopt);
+    }
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    ASSERT_TRUE(detail.affected_path.observed);
+    EXPECT_EQ(detail.affected_path.value, std::string(256, 'f'));
+    EXPECT_FALSE(detail.retry_after_ns.observed);
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kDevice);
+    task.is_finished = true;
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+TEST(ClassicRdmaCongestionControlTest,
+     FreedBatchObservationDoesNotFollowCachedSlice) {
+    struct SliceCacheAccess : Transport {
+        using Transport::getSliceCache;
+    };
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    ClassicRdmaCongestionControl adapter(config);
+    std::string local_name = "local";
+    MultiTransport transports(nullptr, local_name);
+    auto &cache = SliceCacheAccess::getSliceCache();
+    std::vector<Transport::Slice *> held;
+    auto *slice = cache.allocate();
+    while (slice->from_cache) {
+        held.push_back(slice);
+        slice = cache.allocate();
+    }
+    const auto old_batch = transports.allocateBatchID(1);
+    auto &old_task = Transport::toBatchDesc(old_batch).task_list.emplace_back();
+    old_task.batch_id = old_batch;
+    old_task.slice_count = 1;
+    old_task.slice_list.push_back(slice);
+    slice->task = &old_task;
+    slice->length = 64;
+    adapter.prepare(slice, "old-peer@nic");
+    adapter.observeUnavailable(slice, "old-peer@nic",
+                               TaskCongestionFailureScope::kRoute, 1000);
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(transports.getTaskCongestionDetail(old_batch, 0, detail).ok());
+    ASSERT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
+    old_task.is_finished = true;
+    ASSERT_TRUE(transports.freeBatchID(old_batch).ok());
+
+    auto *recycled = cache.allocate();
+    ASSERT_EQ(recycled, slice);
+    const auto new_batch = transports.allocateBatchID(1);
+    auto &new_task = Transport::toBatchDesc(new_batch).task_list.emplace_back();
+    new_task.batch_id = new_batch;
+    new_task.slice_count = 1;
+    new_task.slice_list.push_back(recycled);
+    new_task.rdma_congestion_control_mode = {
+        true, TaskCongestionControllerMode::kEnforce};
+    recycled->task = &new_task;
+    adapter.prepare(recycled, "new-peer@nic");
+    TaskCongestionState state;
+    ASSERT_TRUE(transports.getTaskCongestionState(new_batch, 0, state).ok());
+    EXPECT_EQ(state, TaskCongestionState::kNormal);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(new_batch, 0, detail).ok());
+    EXPECT_EQ(detail.state, state);
+    EXPECT_FALSE(detail.reason.observed);
+    EXPECT_FALSE(detail.affected_path.observed);
+    EXPECT_FALSE(detail.observed_at_ns.observed);
+    EXPECT_FALSE(detail.retry_after_ns.observed);
+    EXPECT_FALSE(detail.resolved);
+    new_task.is_finished = true;
+    EXPECT_TRUE(transports.freeBatchID(new_batch).ok());
+    for (auto *held_slice : held) cache.deallocate(held_slice);
 }
 
 TEST(ClassicRdmaCongestionControlTest,

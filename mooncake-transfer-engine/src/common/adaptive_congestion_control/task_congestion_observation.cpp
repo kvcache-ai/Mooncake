@@ -14,6 +14,8 @@
 
 #include "task_congestion_observation.h"
 
+#include <utility>
+
 namespace mooncake::adaptive_congestion_control {
 
 TaskCongestionObservation::TaskCongestionObservation(
@@ -49,8 +51,34 @@ bool TaskCongestionObservation::avoid(size_t slice_id, uint64_t attempt_id,
 bool TaskCongestionObservation::record(size_t slice_id, uint64_t attempt_id,
                                        TaskCongestionState state,
                                        const TaskCongestionEvidence& evidence) {
+    return recordOwned(slice_id, attempt_id, state, evidence, std::nullopt);
+}
+
+bool TaskCongestionObservation::defer(size_t slice_id, uint64_t attempt_id,
+                                      TaskCongestionEvidence&& evidence,
+                                      size_t submitted_slice_count) {
+    return recordOwned(slice_id, attempt_id, TaskCongestionState::kCongested,
+                       std::move(evidence), submitted_slice_count);
+}
+
+bool TaskCongestionObservation::avoid(size_t slice_id, uint64_t attempt_id,
+                                      TaskCongestionEvidence&& evidence,
+                                      size_t submitted_slice_count) {
+    return recordOwned(slice_id, attempt_id,
+                       TaskCongestionState::kLongUnavailable,
+                       std::move(evidence), submitted_slice_count);
+}
+
+bool TaskCongestionObservation::recordOwned(
+    size_t slice_id, uint64_t attempt_id, TaskCongestionState state,
+    TaskCongestionEvidence evidence,
+    std::optional<size_t> submitted_slice_count) {
     std::lock_guard lock(mutex_);
     if (!currentAttempt(attempt_id)) return false;
+    if (submitted_slice_count && *submitted_slice_count > slice_count_) {
+        if (!slices_.empty()) slices_.resize(*submitted_slice_count);
+        slice_count_ = *submitted_slice_count;
+    }
     if (slice_id >= slice_count_) {
         invalid_observation_ = true;
         return false;
@@ -62,10 +90,13 @@ bool TaskCongestionObservation::record(size_t slice_id, uint64_t attempt_id,
     if (slice.state == TaskCongestionState::kLongUnavailable)
         --unavailable_count_;
     slice.state = state;
-    slice.evidence = evidence;
+    slice.evidence = std::move(evidence);
     if (state == TaskCongestionState::kCongested) ++congested_count_;
     if (state == TaskCongestionState::kLongUnavailable) ++unavailable_count_;
-    last_event_ = EventRecord{slice_id, evidence, false};
+    if (!last_event_) last_event_.emplace();
+    last_event_->slice_id = slice_id;
+    last_event_->evidence = slice.evidence;
+    last_event_->resolved = false;
     return true;
 }
 
@@ -83,7 +114,7 @@ bool TaskCongestionObservation::resolve(size_t slice_id, uint64_t attempt_id) {
     if (slice.state == TaskCongestionState::kLongUnavailable)
         --unavailable_count_;
     slice.state = TaskCongestionState::kNormal;
-    slice.evidence = TaskCongestionEvidence{};
+    // Inactive evidence is ignored by detail() and retained until overwrite.
     if (last_event_ && last_event_->slice_id == slice_id)
         last_event_->resolved = true;
     return true;
@@ -132,8 +163,8 @@ TaskCongestionDetail TaskCongestionObservation::detail() const {
     detail.resolved = selected->resolved;
     if (selected->evidence.failure_scope)
         detail.failure_scope = {true, *selected->evidence.failure_scope};
-    if (selected->evidence.path)
-        detail.affected_path = {true, *selected->evidence.path};
+    if (const auto path = selected->evidence.effectivePath())
+        detail.affected_path = {true, std::string(*path)};
     if (selected->evidence.observed_at_ns)
         detail.observed_at_ns = {true, *selected->evidence.observed_at_ns};
     if (selected->evidence.controller_mode)

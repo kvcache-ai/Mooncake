@@ -27,6 +27,13 @@ live NIC counters. `resolved` means that retained evidence has been resolved.
 Fields with `observed=false` in C++, or without their `TASK_CONGESTION_HAS_*`
 bit in C, have no observed value. A zero is not a substitute for missing data.
 
+Repeated byte-window denials for the same slice, worker, path, selected domain
+and controller generation retain the first event's timestamp, window and
+inflight values for that episode. They are not refreshed on every retry.
+Successful admission resolves the episode. A later denial records fresh
+evidence after resolution, a worker/path/domain/generation change, or an
+intervening unavailable-path or recorded completion-error evidence.
+
 The queries reuse the existing admission controller and rail/context health;
 they do not add another recovery state machine or change window parameters.
 They do not change PUT APIs or caller retry policies.
