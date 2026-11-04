@@ -165,6 +165,7 @@ class MnnvlTransport : public Transport {
     // transports/mnnvl/egm: export HOST_NUMA (EGM) allocations so peers can
     // read/write host memory over NVLink; adds dram_to_dram / gpu_to_dram.
     bool egm_enabled_ = false;
+    MnnvlConfig options_;
 };
 }  // namespace tent
 }  // namespace mooncake
