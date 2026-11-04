@@ -1,10 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <mutex>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -111,6 +113,8 @@ class P2PMasterRpcService final {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
+    std::mutex metric_report_mutex_;
+    std::condition_variable metric_report_cv_;
     std::function<void()> stepdown_callback_;
     std::atomic<bool> stepdown_requested_{false};
     uint32_t heartbeat_rpc_port_ = 0;

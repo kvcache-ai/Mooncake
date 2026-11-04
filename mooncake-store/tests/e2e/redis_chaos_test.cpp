@@ -400,6 +400,7 @@ class RedisChaosTest : public ::testing::Test {
         config.oplog_data_dir = FLAGS_redis_endpoint;
         config.max_client_per_key = 0;
         config.standby_snapshot_service_port_base = kSnapshotPortBase;
+        ConfigureMasters(config);
 
         for (int i = 0; i < kMasterNum; ++i) {
             masters_.emplace_back(std::make_unique<MasterProcessHandler>(
@@ -408,6 +409,8 @@ class RedisChaosTest : public ::testing::Test {
             ASSERT_TRUE(masters_.back()->start());
         }
     }
+
+    virtual void ConfigureMasters(MasterRunnerConfig& config) {}
 
     void TearDown() override {
         masters_.clear();
@@ -649,6 +652,143 @@ class RedisChaosTest : public ::testing::Test {
     std::unique_ptr<P2PRedisMasterView> master_view_;
     inline static struct sigaction old_sigpipe_action_ = {};
 };
+
+class RedisGracefulShutdownTest : public RedisChaosTest {
+   protected:
+    void SetUp() override {
+        // Longer than shutdown timeout so lease expiry cannot make it pass.
+        FLAGS_redis_master_view_ttl_sec = 10;
+        RedisChaosTest::SetUp();
+    }
+
+    void ConfigureMasters(MasterRunnerConfig& config) override {
+        config.metrics_port_base = 54051;
+        config.heartbeat_rpc_port_base = 55051;
+    }
+
+    std::string RegistryInstance(int index) {
+        RedisMasterRegistry registry(FLAGS_redis_cluster_id,
+                                     FLAGS_redis_endpoint, FLAGS_redis_username,
+                                     FLAGS_redis_password, 0);
+        std::vector<RedisMasterRegistryEntry> entries;
+        EXPECT_EQ(registry.DiscoverAlive(std::chrono::seconds(10), entries),
+                  ErrorCode::OK);
+        const std::string endpoint =
+            "127.0.0.1:" + std::to_string(kMasterPortBase + index);
+        for (const auto& entry : entries) {
+            if (entry.master_endpoint == endpoint) {
+                return entry.instance_id;
+            }
+        }
+        return {};
+    }
+
+    void ExpectRegistryRemoved(const std::string& instance_id) {
+        auto [host, port] = ParseRedisEndpoint();
+        auto ctx = std::unique_ptr<redisContext, decltype(&redisFree)>(
+            redisConnect(host.c_str(), port), redisFree);
+        ASSERT_TRUE(AuthenticateRedisContext(ctx.get(), FLAGS_redis_username,
+                                             FLAGS_redis_password));
+        const std::string prefix =
+            "mooncake:{" + FLAGS_redis_cluster_id + "}:masters:";
+        const std::string metadata_key = prefix + "metadata";
+        const std::string heartbeat_key = prefix + "heartbeat";
+        RedisReplyPtr metadata((redisReply*)redisCommand(
+            ctx.get(), "HEXISTS %b %b", metadata_key.data(),
+            metadata_key.size(), instance_id.data(), instance_id.size()));
+        ASSERT_TRUE(metadata && metadata->type == REDIS_REPLY_INTEGER);
+        EXPECT_EQ(metadata->integer, 0);
+        RedisReplyPtr heartbeat((redisReply*)redisCommand(
+            ctx.get(), "ZSCORE %b %b", heartbeat_key.data(),
+            heartbeat_key.size(), instance_id.data(), instance_id.size()));
+        ASSERT_TRUE(heartbeat);
+        EXPECT_EQ(heartbeat->type, REDIS_REPLY_NIL);
+        const auto epoch_key = MasterEpochKey();
+        RedisReplyPtr epoch((redisReply*)redisCommand(
+            ctx.get(), "EXISTS %b", epoch_key.data(), epoch_key.size()));
+        ASSERT_TRUE(epoch && epoch->type == REDIS_REPLY_INTEGER);
+        EXPECT_EQ(epoch->integer, 1);
+    }
+
+    void ExpectPromptSuccessor(int old_leader, ViewVersionId old_version,
+                               std::chrono::steady_clock::time_point start) {
+        const auto deadline = start + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            int next_leader = -1;
+            ViewVersionId next_version = 0;
+            if (WaitForLeader(next_leader, next_version,
+                              std::chrono::seconds(1)) &&
+                next_leader != old_leader && next_version > old_version) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        FAIL() << "No successor within 5s after SIGTERM (lease TTL is 10s)";
+    }
+
+    gflags::FlagSaver saved_flags_;
+};
+
+TEST_F(RedisGracefulShutdownTest, PrimarySigtermReleasesLeaseAndRegistry) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    ASSERT_TRUE(TcpPortAccepting("127.0.0.1:" +
+                                 std::to_string(kMasterPortBase + leader)));
+    ASSERT_TRUE(
+        TcpPortAccepting("127.0.0.1:" + std::to_string(55051 + leader)));
+    const auto instance_id = RegistryInstance(leader);
+    ASSERT_FALSE(instance_id.empty());
+
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(60)));
+    ExpectPromptSuccessor(leader, version, start);
+    ExpectRegistryRemoved(instance_id);
+    EXPECT_FALSE(TcpPortAccepting("127.0.0.1:" +
+                                  std::to_string(kMasterPortBase + leader)));
+    EXPECT_FALSE(
+        TcpPortAccepting("127.0.0.1:" + std::to_string(55051 + leader)));
+    EXPECT_TRUE(
+        WaitForMasterLog(leader, "released=1", std::chrono::seconds(1)));
+    EXPECT_TRUE(WaitForMasterLog(leader, "HA shutdown completed",
+                                 std::chrono::seconds(1)));
+}
+
+TEST_F(RedisGracefulShutdownTest, StandbySigtermPreservesLeader) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    const int standby = (leader + 1) % kMasterNum;
+    ASSERT_TRUE(WaitForMasterLog(standby, "Trying to elect self as leader",
+                                 std::chrono::seconds(10)));
+    const auto instance_id = RegistryInstance(standby);
+    ASSERT_FALSE(instance_id.empty());
+
+    ASSERT_TRUE(masters_[standby]->terminate(std::chrono::seconds(5)));
+    ExpectRegistryRemoved(instance_id);
+    int remaining_leader = -1;
+    ViewVersionId remaining_version = 0;
+    ASSERT_TRUE(WaitForLeader(remaining_leader, remaining_version,
+                              std::chrono::seconds(1)));
+    EXPECT_EQ(remaining_leader, leader);
+    EXPECT_EQ(remaining_version, version);
+}
+
+TEST_F(RedisGracefulShutdownTest, SigtermBeforePromotionReleasesLease) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    const auto instance_id = RegistryInstance(leader);
+    ASSERT_FALSE(instance_id.empty());
+    ASSERT_FALSE(TcpPortAccepting("127.0.0.1:" +
+                                  std::to_string(kMasterPortBase + leader)));
+
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(5)));
+    ExpectRegistryRemoved(instance_id);
+    ExpectPromptSuccessor(leader, version, start);
+}
 
 TEST_F(RedisChaosTest, LeaderKilledFailover) {
     int leader_index = -1;

@@ -45,11 +45,15 @@ P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
 }
 
 P2PMasterRpcService::~P2PMasterRpcService() {
-    metric_report_running_ = false;
+    http_server_.stop();
+    {
+        std::lock_guard<std::mutex> lock(metric_report_mutex_);
+        metric_report_running_ = false;
+    }
+    metric_report_cv_.notify_all();
     if (metric_report_thread_.joinable()) {
         metric_report_thread_.join();
     }
-    http_server_.stop();
 }
 
 void P2PMasterRpcService::SetStepdownCallback(std::function<void()> callback) {
@@ -64,8 +68,10 @@ void P2PMasterRpcService::init() {
             while (metric_report_running_) {
                 const std::string metrics_summary = GetMasterMetricsSummary();
                 LOG(INFO) << "Master Metrics: " << metrics_summary;
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(kP2PMetricReportIntervalSeconds));
+                std::unique_lock<std::mutex> lock(metric_report_mutex_);
+                metric_report_cv_.wait_for(
+                    lock, std::chrono::seconds(kP2PMetricReportIntervalSeconds),
+                    [this] { return !metric_report_running_.load(); });
             }
         });
     }

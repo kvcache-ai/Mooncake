@@ -91,6 +91,15 @@ class RedisElectionHelper {
     void Shutdown();
 
     /**
+     * @brief Release our current Redis leadership.
+     *
+     * Call after stopping primary writes and joining the keep-alive thread.
+     * Deletes only our leader value and wakes waiting candidates. Ownership
+     * is validated before deletion, so a replacement view is never removed.
+     */
+    ErrorCode ReleaseLeader();
+
+    /**
      * @brief Get current leader's address and version from Redis.
      * @param master_address Output: leader address.
      * @param version Output: leader epoch.
@@ -154,9 +163,8 @@ class RedisElectionHelper {
     // owns ctx and retries on its normal, cancellable polling interval.
     bool PollLeaderOnce(redisContext*& ctx);
 
-    /** Publish a best-effort wake-up after a successful election. */
-    void PublishLeaderEvent(const std::string& master_address,
-                            ViewVersionId epoch);
+    /** Publish a best-effort wake-up after an ownership change. */
+    void PublishLeaderEvent(const std::string& event);
 
     /**
      * @brief Reconnect a broken redisContext.
