@@ -420,6 +420,15 @@ uint64_t P2PMasterService::GetLatestOpLogSequenceId() const {
     return manager ? manager->GetLastSequenceId() : 0;
 }
 
+tl::expected<uint64_t, ErrorCode>
+P2PMasterService::GetLocalCommittedOpLogSequenceId() const {
+    auto* manager = GetOpLogManager();
+    if (manager == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return manager->GetLocalCommittedSequenceId();
+}
+
 std::vector<std::string> P2PMasterService::ListSnapshotObjectKeys() const {
     return ListRouteKeys();
 }
@@ -505,6 +514,87 @@ P2PMasterService::ExportMetadataForStandby() const {
               << ", routes=" << exported.routes.size()
               << ", clients=" << exported.clients.size()
               << ", last_sequence_id=" << GetLatestOpLogSequenceId();
+    return exported;
+}
+
+tl::expected<P2PStandbyMetadataStore::ExportedMetadata, ErrorCode>
+P2PMasterService::ExportLocalCommittedMetadataForStandby(
+    uint64_t local_committed_sequence_id) const {
+    auto* manager = GetOpLogManager();
+    if (manager == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto entries =
+        manager->GetBufferedEntriesAfter(local_committed_sequence_id);
+    if (!entries.has_value()) {
+        return tl::make_unexpected(entries.error());
+    }
+
+    P2PStandbyMetadataStore rollback_store;
+    rollback_store.RestoreMetadata(ExportMetadataForStandby());
+    size_t rolled_back_entries = 0;
+    for (auto it = entries->rbegin(); it != entries->rend(); ++it) {
+        const auto& entry = *it;
+        if (entry.op_type == OpType_PUBLISH_ROUTE) {
+            PublishRoutePayload payload;
+            if (!DeserializeP2PPayload(entry.payload, payload)) {
+                LOG(ERROR) << "P2PMasterService: failed to rollback "
+                              "uncommitted PUBLISH_ROUTE"
+                           << ", sequence_id=" << entry.sequence_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            rollback_store.WithdrawRoute(
+                payload.object_key, {payload.client_id, payload.segment_id});
+            ++rolled_back_entries;
+        } else if (entry.op_type == OpType_REGISTER_CLIENT) {
+            RegisterClientPayload payload;
+            if (!DeserializeP2PPayload(entry.payload, payload)) {
+                LOG(ERROR) << "P2PMasterService: failed to rollback "
+                              "uncommitted REGISTER_CLIENT"
+                           << ", sequence_id=" << entry.sequence_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            rollback_store.UnregisterClient(payload.client_id);
+            ++rolled_back_entries;
+        } else if (entry.op_type == OpType_MOUNT_SEGMENT) {
+            MountSegmentPayload payload;
+            if (!DeserializeP2PPayload(entry.payload, payload)) {
+                LOG(ERROR) << "P2PMasterService: failed to rollback "
+                              "uncommitted MOUNT_SEGMENT"
+                           << ", sequence_id=" << entry.sequence_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            rollback_store.UnmountSegment(
+                {payload.segment.id, payload.client_id});
+            ++rolled_back_entries;
+        } else {
+            // Delete-like P2P OpLog entries do not carry pre-image metadata,
+            // so exporting a guessed rollback state is unsafe. Fall back to the
+            // regular snapshot path instead.
+            LOG(WARNING) << "P2PMasterService: cannot rollback uncommitted "
+                            "P2P OpLog entry for standby handoff"
+                         << ", sequence_id=" << entry.sequence_id
+                         << ", op_type=" << static_cast<int>(entry.op_type)
+                         << ", local_committed_sequence_id="
+                         << local_committed_sequence_id;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    auto exported = rollback_store.ExportMetadata();
+    for (auto& [key, route] : exported.routes) {
+        if (route.last_sequence_id > local_committed_sequence_id) {
+            route.last_sequence_id = local_committed_sequence_id;
+        }
+    }
+
+    LOG(INFO) << "P2PMasterService: exported local-committed standby handoff "
+                 "metadata"
+              << ", local_committed_sequence_id=" << local_committed_sequence_id
+              << ", rolled_back_entries=" << rolled_back_entries
+              << ", clients=" << exported.clients.size()
+              << ", routes=" << exported.routes.size();
     return exported;
 }
 

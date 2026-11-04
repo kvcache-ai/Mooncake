@@ -917,6 +917,12 @@ ErrorCode RedisOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
     return ErrorCode::OK;
 }
 
+ErrorCode RedisOpLogStore::GetLocalCommittedSequenceId(uint64_t& sequence_id) {
+    std::lock_guard<std::mutex> lock(async_mutex_);
+    sequence_id = committed_sequence_id_;
+    return ErrorCode::OK;
+}
+
 ErrorCode RedisOpLogStore::GetMaxSequenceId(uint64_t& sequence_id) {
     auto err = GetLatestSequenceId(sequence_id);
     if (err != ErrorCode::OK) {

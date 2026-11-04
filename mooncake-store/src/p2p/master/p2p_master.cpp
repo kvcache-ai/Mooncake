@@ -460,20 +460,52 @@ int P2PMaster::RunWithHA() {
         auto* active_p2p_service = &active_service->GetMasterService();
         if (config_.oplog.enabled &&
             leadership_lost.load(std::memory_order_acquire)) {
-            demoted_primary_handoff.emplace();
-            demoted_primary_handoff->sequence_id =
+            const uint64_t local_assigned_sequence_id =
                 active_p2p_service->GetLatestOpLogSequenceId();
-            // TODO(P2P HA): Avoid a full metadata copy on demotion by moving
-            // primary metadata into the next standby or by supporting an
-            // in-place role transition.
-            demoted_primary_handoff->metadata =
-                active_p2p_service->ExportMetadataForStandby();
-            LOG(INFO) << "Captured P2P primary demotion handoff"
-                      << ", baseline_sequence_id="
-                      << demoted_primary_handoff->sequence_id << ", routes="
-                      << demoted_primary_handoff->metadata.routes.size()
-                      << ", clients="
-                      << demoted_primary_handoff->metadata.clients.size();
+            auto local_committed_sequence_id =
+                active_p2p_service->GetLocalCommittedOpLogSequenceId();
+            demoted_primary_handoff.reset();
+            if (!local_committed_sequence_id.has_value()) {
+                LOG(WARNING)
+                    << "Skip P2P primary demotion handoff because local "
+                       "committed OpLog sequence is unavailable"
+                    << ", local_assigned_sequence_id="
+                    << local_assigned_sequence_id << ", error="
+                    << toString(local_committed_sequence_id.error());
+            } else {
+                auto metadata =
+                    active_p2p_service->ExportLocalCommittedMetadataForStandby(
+                        local_committed_sequence_id.value());
+                if (!metadata.has_value()) {
+                    LOG(WARNING) << "Skip P2P primary demotion handoff because "
+                                    "uncommitted metadata rollback failed"
+                                 << ", local_committed_sequence_id="
+                                 << local_committed_sequence_id.value()
+                                 << ", local_assigned_sequence_id="
+                                 << local_assigned_sequence_id
+                                 << ", error=" << toString(metadata.error());
+                } else {
+                    demoted_primary_handoff.emplace();
+                    demoted_primary_handoff->sequence_id =
+                        local_committed_sequence_id.value();
+                    // TODO(P2P HA): Avoid a full metadata copy on demotion by
+                    // moving primary metadata into the next standby or by
+                    // supporting an in-place role transition.
+                    demoted_primary_handoff->metadata =
+                        std::move(metadata.value());
+                    LOG(INFO)
+                        << "Captured P2P primary demotion handoff"
+                        << ", baseline_sequence_id="
+                        << demoted_primary_handoff->sequence_id
+                        << ", local_committed_sequence_id="
+                        << local_committed_sequence_id.value()
+                        << ", local_assigned_sequence_id="
+                        << local_assigned_sequence_id << ", routes="
+                        << demoted_primary_handoff->metadata.routes.size()
+                        << ", clients="
+                        << demoted_primary_handoff->metadata.clients.size();
+                }
+            }
         } else {
             demoted_primary_handoff.reset();
             LOG(WARNING) << "Skip P2P primary demotion handoff because master "

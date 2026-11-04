@@ -127,6 +127,48 @@ uint64_t OpLogManager::GetLastSequenceId() const {
     return last_seq_id_;
 }
 
+tl::expected<uint64_t, ErrorCode> OpLogManager::GetLocalCommittedSequenceId()
+    const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto store = oplog_store_;
+    lock.unlock();
+    if (!store) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    uint64_t sequence_id = 0;
+    ErrorCode err = store->GetLocalCommittedSequenceId(sequence_id);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return sequence_id;
+}
+
+tl::expected<std::vector<OpLogEntry>, ErrorCode>
+OpLogManager::GetBufferedEntriesAfter(uint64_t sequence_id) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (sequence_id >= last_seq_id_) {
+        return std::vector<OpLogEntry>();
+    }
+    if (buffer_.empty() || sequence_id + 1 < first_seq_id_) {
+        LOG(WARNING) << "OpLogManager: requested buffered OpLog range is no "
+                        "longer available"
+                     << ", sequence_id=" << sequence_id
+                     << ", first_seq_id=" << first_seq_id_
+                     << ", last_seq_id=" << last_seq_id_;
+        return tl::make_unexpected(ErrorCode::OPLOG_ENTRY_NOT_FOUND);
+    }
+
+    std::vector<OpLogEntry> entries;
+    entries.reserve(last_seq_id_ - sequence_id);
+    for (const auto& entry : buffer_) {
+        if (entry.sequence_id > sequence_id) {
+            entries.push_back(entry);
+        }
+    }
+    return entries;
+}
+
 void OpLogManager::SetInitialSequenceId(uint64_t sequence_id) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (last_seq_id_ == 0 && buffer_.empty()) {

@@ -146,8 +146,12 @@ class P2PMasterService final {
         const P2PStandbyMetadataStore::ExportedMetadata& metadata,
         uint64_t last_applied_sequence_id = 0);
     P2PStandbyMetadataStore::ExportedMetadata ExportMetadataForStandby() const;
+    tl::expected<P2PStandbyMetadataStore::ExportedMetadata, ErrorCode>
+    ExportLocalCommittedMetadataForStandby(
+        uint64_t local_committed_sequence_id) const;
 
     uint64_t GetLatestOpLogSequenceId() const;
+    tl::expected<uint64_t, ErrorCode> GetLocalCommittedOpLogSequenceId() const;
     std::vector<std::string> ListSnapshotObjectKeys() const;
     std::vector<UUID> ListSnapshotClientIds() const;
     std::optional<P2PStandbyRouteEntry> GetSnapshotObjectMetadata(

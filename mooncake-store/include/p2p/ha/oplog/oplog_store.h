@@ -80,6 +80,13 @@ class OpLogStore {
 
     // Sequence ID management
     virtual ErrorCode GetLatestSequenceId(uint64_t& sequence_id) = 0;
+    // Return the latest sequence this store instance has locally confirmed as
+    // committed. For single-writer/local backends this is equivalent to latest;
+    // shared backends may override it to avoid observing another writer's
+    // later progress.
+    virtual ErrorCode GetLocalCommittedSequenceId(uint64_t& sequence_id) {
+        return GetLatestSequenceId(sequence_id);
+    }
     virtual ErrorCode GetMaxSequenceId(uint64_t& sequence_id) = 0;
     virtual ErrorCode GetTrimmedSequenceId(uint64_t& sequence_id) {
         sequence_id = 0;

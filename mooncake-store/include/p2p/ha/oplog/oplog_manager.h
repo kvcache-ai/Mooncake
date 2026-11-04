@@ -106,6 +106,15 @@ class OpLogManager {
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;
 
+    // Get the latest sequence id locally committed by this OpLog store
+    // instance.
+    tl::expected<uint64_t, ErrorCode> GetLocalCommittedSequenceId() const;
+
+    // Copy buffered entries after sequence_id. Returns OPLOG_ENTRY_NOT_FOUND
+    // if the bounded in-memory buffer can no longer cover the requested range.
+    tl::expected<std::vector<OpLogEntry>, ErrorCode> GetBufferedEntriesAfter(
+        uint64_t sequence_id) const;
+
     // Set the initial sequence ID (used when promoting Standby to Primary).
     // This ensures the new Primary's OpLogManager continues from the correct
     // sequence_id.

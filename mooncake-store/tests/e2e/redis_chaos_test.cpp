@@ -764,6 +764,9 @@ TEST_F(RedisChaosTest, DemotedPrimaryCatchesUpFromOplogWithoutSnapshot) {
         leader_index, "Captured P2P primary demotion handoff",
         demoted_log_offset, std::chrono::seconds(30)));
     ASSERT_TRUE(WaitForMasterLogSince(
+        leader_index, "local_committed_sequence_id=", demoted_log_offset,
+        std::chrono::seconds(30)));
+    ASSERT_TRUE(WaitForMasterLogSince(
         leader_index, "Starting P2P standby from demoted primary handoff",
         demoted_log_offset, std::chrono::seconds(30)));
     ASSERT_TRUE(WaitForMasterLogSince(
