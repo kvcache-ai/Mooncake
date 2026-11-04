@@ -262,8 +262,8 @@ Status FencedSessions::revokeWriter(SessionId session_id, uint32_t writer_id,
     return Status::OK();
 }
 
-std::vector<BatchID> FencedSessions::submittedBatches(SessionId session_id,
-                                                      uint32_t writer_id) const {
+std::vector<BatchID> FencedSessions::submittedBatches(
+    SessionId session_id, uint32_t writer_id) const {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = cache_.find(WriterKey{session_id, writer_id});
     if (it == cache_.end()) return {};

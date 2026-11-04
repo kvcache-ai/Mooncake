@@ -38,8 +38,8 @@ Status Open(FencedSessions& sessions, SessionHandle& handle) {
 TEST(FencedSession, DisabledRejectsWithoutAdmitting) {
     FencedSessions sessions(false);
     SessionHandle handle = 0;
-    EXPECT_TRUE(sessions.openSession(handle, 1, {{1, 1}}, Opts())
-                    .IsNotImplemented());
+    EXPECT_TRUE(
+        sessions.openSession(handle, 1, {{1, 1}}, Opts()).IsNotImplemented());
     WriterLease lease;
     EXPECT_TRUE(sessions.admitSubmission(lease, kNow, 1).IsNotImplemented());
     EXPECT_TRUE(sessions.submittedBatches(lease.session_id, 1).empty());
@@ -102,8 +102,7 @@ TEST(FencedSession, FanInWritersAreIndependent) {
     EXPECT_NE(first.writer_id, second.writer_id);
     ASSERT_TRUE(sessions.admitSubmission(first, kNow, 1).ok());
     ASSERT_TRUE(sessions.admitSubmission(second, kNow, 2).ok());
-    EXPECT_TRUE(
-        sessions.getLease(handle, first, kNow).IsTooManyRequests());
+    EXPECT_TRUE(sessions.getLease(handle, first, kNow).IsTooManyRequests());
 }
 
 TEST(FencedSession, ZeroTtlDoesNotExpire) {
