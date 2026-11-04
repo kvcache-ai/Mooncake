@@ -237,7 +237,14 @@ elseif(USE_MUSA)
   # object below leaves C++ constructor calls at address 0, which crashes _ep
   # on import.
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
-  set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
+  # Keep the current AOT kernels while exposing the runtime compiler/module
+  # loader used by the MUSA JIT path. The JIT helper is host-only and does not
+  # add device objects or fatbin registration symbols to the Python binding.
+  set(MOONCAKE_EP_SOURCES
+      ${MOONCAKE_EP_HOST_SOURCES}
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/musa_jit.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/musa_dispatch_jit.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/jit/musa_combine_jit.cpp")
   if(DEFINED ENV{MUSA_HOME} AND NOT "$ENV{MUSA_HOME}" STREQUAL "")
     set(_ep_musa_compiler_hint "$ENV{MUSA_HOME}/bin")
   else()
@@ -346,7 +353,10 @@ endif()
 set_target_properties(_ep PROPERTIES POSITION_INDEPENDENT_CODE ON)
 set_target_properties(_ep PROPERTIES INSTALL_RPATH "$ORIGIN")
 if(USE_MUSA)
-  target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_MUSA=1)
+  target_compile_definitions(
+    _ep PRIVATE MOONCAKE_EP_USE_MUSA=1
+    MOONCAKE_EP_JIT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    MOONCAKE_EP_JIT_TRANSFER_ENGINE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine")
 endif()
 if(USE_MACA)
   target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_MACA=1)
