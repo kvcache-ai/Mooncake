@@ -114,6 +114,15 @@ For standard TCP, `transports/tcp/max_concurrent_tasks` controls the worker
 thread count and must be greater than zero. A zero value makes TCP installation
 return `InvalidArgument`; it does not select an automatic worker count.
 
+Standard TCP data RPCs use process and buffer-registration identities. Legacy
+v1 clients cannot send those identities, so a new server rejects v1 data RPCs
+by default. For a rolling upgrade, set
+`transports/tcp/allow_unsafe_legacy_data_rpc` to `true` on servers before
+upgrading them, upgrade all clients, and then restore the default `false`.
+Compatibility mode still requires every server-local buffer to have a current
+TCP registration and holds its lease for the full copy; it relaxes wire
+identity only, not unregister lifetime safety.
+
 (custom-nic-priority-matrix)=
 ### Custom NIC Priority Matrix
 
