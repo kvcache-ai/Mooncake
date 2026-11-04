@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <random>
 #include <sstream>
+#include <utility>
 
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
@@ -230,6 +231,10 @@ ErrorCode RedisElectionHelper::Connect() {
     return ErrorCode::OK;
 }
 
+void RedisElectionHelper::SetShouldElect(ShouldElect should_elect) {
+    should_elect_ = std::move(should_elect);
+}
+
 // ============================================================
 // ElectLeader — blocks until this node wins election
 // ============================================================
@@ -242,6 +247,14 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
     ScopeGuard operation([this] { EndBlockingOperation(); });
     const auto election_start = std::chrono::steady_clock::now();
     while (!cancel_election_) {
+        if (should_elect_ && !should_elect_()) {
+            HAStatusManager::instance().SetDoctorIssue(
+                "ELECTION_NOT_READY", "ShouldElect rejected this leader attempt");
+            WaitForElectionCancellation(std::chrono::milliseconds(200));
+            continue;
+        }
+        HAStatusManager::instance().SetDoctorIssue("ELECTION_NOT_READY");
+
         HAMetricManager::instance().inc_election_attempts();
         bool connected = false;
         {

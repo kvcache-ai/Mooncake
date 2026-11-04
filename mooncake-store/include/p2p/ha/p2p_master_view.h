@@ -54,6 +54,7 @@ class P2PRedisMasterView final : public P2PMasterView {
                        const std::string& instance_id = "");
 
     ErrorCode Connect();
+    void SetShouldElect(RedisElectionHelper::ShouldElect should_elect);
     void ElectLeader(const std::string& master_address, ViewVersionId& version,
                      EtcdLeaseId& lease_id) override;
     void KeepLeader(EtcdLeaseId lease_id) override;

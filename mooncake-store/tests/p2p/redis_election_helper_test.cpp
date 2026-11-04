@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <string>
@@ -173,6 +174,43 @@ TEST_F(RedisElectionHelperTest, ElectLeaderUsesConfiguredInstanceId) {
     EXPECT_NE(value.find("\"instance_id\":\"" + instance_id + "\""),
               std::string::npos);
     redisFree(ctx);
+}
+
+TEST_F(RedisElectionHelperTest, ShouldElectBlocksUntilReady) {
+    std::atomic<bool> ready{false};
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username);
+    helper.SetShouldElect([&ready] { return ready.load(); });
+    ASSERT_EQ(ErrorCode::OK, helper.Connect());
+
+    ViewVersionId version = 0;
+    int lease_id = 0;
+    std::promise<void> elected;
+    auto elected_future = elected.get_future();
+    std::thread elect_thread([&] {
+        helper.ElectLeader("10.0.0.2:50051", version, lease_id);
+        elected.set_value();
+    });
+
+    EXPECT_EQ(elected_future.wait_for(std::chrono::milliseconds(300)),
+              std::future_status::timeout);
+
+    std::string current_leader;
+    ViewVersionId current_version = 0;
+    EXPECT_NE(helper.GetMasterView(current_leader, current_version),
+              ErrorCode::OK);
+
+    ready.store(true);
+    if (elected_future.wait_for(std::chrono::seconds(5)) !=
+        std::future_status::ready) {
+        helper.CancelElection();
+        elect_thread.join();
+        FAIL() << "Timed out waiting for guarded Redis leader election";
+    }
+    elect_thread.join();
+    EXPECT_GT(version, 0u);
+    EXPECT_GT(lease_id, 0);
 }
 
 TEST_F(RedisElectionHelperTest, ContentionDoesNotAdvanceEpoch) {

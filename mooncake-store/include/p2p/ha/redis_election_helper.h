@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -34,6 +35,8 @@ class RedisElectionHelperTestPeer;
  */
 class RedisElectionHelper {
    public:
+    using ShouldElect = std::function<bool()>;
+
     RedisElectionHelper(const std::string& cluster_id,
                         const std::string& redis_endpoint,
                         const std::string& password = "", int db_index = 0,
@@ -60,6 +63,12 @@ class RedisElectionHelper {
      */
     void ElectLeader(const std::string& master_address, ViewVersionId& version,
                      int& lease_id);
+
+    /**
+     * @brief Optional check called immediately before each Redis election
+     *        attempt. Returning false skips the Redis CAS and retries later.
+     */
+    void SetShouldElect(ShouldElect should_elect);
 
     /**
      * @brief Keep leadership by periodically renewing TTL. Blocks until
@@ -205,6 +214,7 @@ class RedisElectionHelper {
     int ttl_sec_ = 4;                 // redis_master_view_ttl_sec
     int heartbeat_interval_sec_ = 1;  // KeepLeader renewal interval
     std::string instance_id_;         // Stable Redis master instance ID
+    ShouldElect should_elect_;
     int connect_timeout_ms_ = 5000;
     int command_timeout_ms_ = 3000;
 

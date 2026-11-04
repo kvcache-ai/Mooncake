@@ -118,6 +118,11 @@ ErrorCode P2PRedisMasterView::Connect() {
     return redis_election_helper_.Connect();
 }
 
+void P2PRedisMasterView::SetShouldElect(
+    RedisElectionHelper::ShouldElect should_elect) {
+    redis_election_helper_.SetShouldElect(std::move(should_elect));
+}
+
 void P2PRedisMasterView::ElectLeader(const std::string& master_address,
                                      ViewVersionId& version,
                                      EtcdLeaseId& lease_id) {

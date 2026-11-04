@@ -411,6 +411,48 @@ int P2PMaster::RunWithHA() {
 #endif
         }
 
+#ifdef STORE_USE_REDIS
+        if (standby && config_.ha.election_backend == ElectionBackend::REDIS) {
+            auto* redis_view =
+                dynamic_cast<P2PRedisMasterView*>(master_view.get());
+            if (redis_view) {
+                redis_view->SetShouldElect(
+                    [this, self_instance_id = master_instance_id,
+                     standby = standby.get()] {
+                        const auto self_status = standby->GetSyncStatus();
+                        auto readiness_decision =
+                            EvaluateP2PElectionStandbyReadiness(
+                                self_status.state,
+                                self_status.primary_seq_id_known,
+                                self_status.primary_seq_id,
+                                self_status.applied_seq_id,
+                                config_.oplog
+                                    .election_max_standby_lag_entries);
+                        if (!readiness_decision.should_wait) {
+                            return true;
+                        }
+                        LOG_EVERY_N(WARNING, 30)
+                            << "P2P election attempt blocked by standby readiness"
+                            << ", self_instance_id=" << self_instance_id
+                            << ", self_endpoint=" << config_.rpc.address
+                            << ", standby_state="
+                            << StandbyStateToString(self_status.state)
+                            << ", self_applied_sequence_id="
+                            << self_status.applied_seq_id
+                            << ", latest_sequence_id_known="
+                            << self_status.primary_seq_id_known
+                            << ", latest_sequence_id="
+                            << self_status.primary_seq_id
+                            << ", lag_entries="
+                            << readiness_decision.lag_entries
+                            << ", max_lag_entries="
+                            << config_.oplog
+                                   .election_max_standby_lag_entries;
+                        return false;
+                    });
+            }
+        }
+#endif
         if (standby) {
             const std::function<bool()> not_stopping = [] { return false; };
             if (!WaitForP2PElectionReadiness(config_, master_instance_id,
