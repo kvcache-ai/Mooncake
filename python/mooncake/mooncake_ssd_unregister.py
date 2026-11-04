@@ -7,7 +7,7 @@ import json
 import shlex
 from typing import List, Dict, Any
 
-from mooncake._administration import require_paramiko
+from mooncake._administration import read_ssh_output, require_paramiko
 
 from mooncake.store import MooncakeDistributedNoFRegister
 
@@ -107,13 +107,12 @@ class MooncakeNoFUnregister:
             for test_path in possible_paths:
                 full_command = f"cd {shlex.quote(test_path)} && test -f scripts/rpc.py"
                 stdin, stdout, stderr = ssh.exec_command(full_command, timeout=5)
-                if stdout.channel.recv_exit_status() == 0:
+                status, _, _ = read_ssh_output(stdout, stderr)
+                if status == 0:
                     # Found the script, execute the actual command
                     full_command = f"cd {shlex.quote(test_path)} && {command}"
                     stdin, stdout, stderr = ssh.exec_command(full_command, timeout=30)
-                    exit_status = stdout.channel.recv_exit_status()
-                    output = stdout.read().decode("utf-8")
-                    error = stderr.read().decode("utf-8")
+                    exit_status, output, error = read_ssh_output(stdout, stderr)
                     if exit_status != 0:
                         logging.error(f"SSH command error on {ip}: {error}")
                         raise RuntimeError(f"SSH command failed: {error or output}")
