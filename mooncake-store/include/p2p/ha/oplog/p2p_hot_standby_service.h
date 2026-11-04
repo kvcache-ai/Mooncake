@@ -1,6 +1,7 @@
 // mooncake-store/include/ha/oplog/p2p_hot_standby_service.h
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -70,6 +71,10 @@ P2PSnapshotSourceSelection SelectP2PSnapshotSources(
     const std::string& self_instance_id, uint64_t trimmed_sequence_id);
 #endif
 
+namespace test {
+struct P2PHotStandbyServiceTestAccess;
+}  // namespace test
+
 // NOTE: P2PHotStandbyService intentionally does not inherit from the
 // centralized HotStandbyService. The centralized service owns centralized
 // metadata/apply/export semantics, while P2P promotion needs
@@ -115,6 +120,8 @@ class P2PHotStandbyService {
     bool IsReadyForSnapshot() const;
 
    private:
+    friend struct mooncake::test::P2PHotStandbyServiceTestAccess;
+
     ErrorCode StartOplogFollowingLocked(
         uint64_t baseline_sequence_id,
         std::unique_ptr<OpLogStore> prepared_reader_store = nullptr);
@@ -125,7 +132,6 @@ class P2PHotStandbyService {
     void OnWatcherEvent(StandbyEvent event);
     void StartRecoveryWorker();
     void StopRecoveryWorker();
-    void RestoreRecoveryWorker();
     void RequestRecovery();
     void RecoveryLoop();
     ErrorCode BootstrapFromSnapshotSources(
@@ -159,7 +165,8 @@ class P2PHotStandbyService {
     std::condition_variable recovery_cv_;
     std::thread recovery_thread_;
     bool recovery_requested_{false};
-    bool recovery_stopping_{false};
+    // Writes still hold recovery_mutex_ to synchronize with CV waiters.
+    std::atomic<bool> recovery_stopping_{false};
     std::atomic<bool> snapshot_resync_required_{false};
 
     std::unique_ptr<P2PStandbySnapshotService> snapshot_service_;

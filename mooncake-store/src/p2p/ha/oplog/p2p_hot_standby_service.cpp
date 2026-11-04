@@ -235,14 +235,15 @@ ErrorCode P2PHotStandbyService::Start(
     }
 
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
-    StartRecoveryWorker();
     auto snapshot_server_err = StartSnapshotServer();
     if (snapshot_server_err != ErrorCode::OK) {
-        StopRecoveryWorker();
         ResetOplogFollowingLocked();
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         return snapshot_server_err;
     }
+    // Finish fallible setup before the worker can wait for mutex_: startup
+    // failure must not join that worker while still holding the same mutex.
+    StartRecoveryWorker();
     LOG(INFO) << "P2PHotStandbyService started"
               << ", cluster_id=" << config_.cluster_id
               << ", baseline_sequence_id=" << baseline_sequence_id;
@@ -363,7 +364,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
         LOG(ERROR) << "P2PHotStandbyService: not ready for promotion"
                    << ", state=" << StandbyStateToString(GetState())
                    << ", apply_healthy=" << !apply_failed;
-        RestoreRecoveryWorker();
+        StartRecoveryWorker();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
@@ -373,7 +374,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
     if (!promote_result.allowed) {
         LOG(ERROR) << "P2PHotStandbyService: cannot promote: "
                    << promote_result.reason;
-        RestoreRecoveryWorker();
+        StartRecoveryWorker();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
@@ -844,14 +845,17 @@ void P2PHotStandbyService::StartRecoveryWorker() {
     if (recovery_thread_.joinable()) {
         return;
     }
-    recovery_stopping_ = false;
+    recovery_stopping_.store(false);
+    // Recheck pending reconnect/snapshot recovery on every worker start.
+    // RecoveryLoop leaves a healthy reader running and waits for new events.
+    recovery_requested_ = true;
     recovery_thread_ = std::thread(&P2PHotStandbyService::RecoveryLoop, this);
 }
 
 void P2PHotStandbyService::StopRecoveryWorker() {
     {
         std::lock_guard<std::mutex> lock(recovery_mutex_);
-        recovery_stopping_ = true;
+        recovery_stopping_.store(true);
         recovery_requested_ = false;
     }
     recovery_cv_.notify_all();
@@ -860,17 +864,10 @@ void P2PHotStandbyService::StopRecoveryWorker() {
     }
 }
 
-void P2PHotStandbyService::RestoreRecoveryWorker() {
-    StartRecoveryWorker();
-    if (state_machine_.GetState() == StandbyState::RECONNECTING) {
-        RequestRecovery();
-    }
-}
-
 void P2PHotStandbyService::RequestRecovery() {
     {
         std::lock_guard<std::mutex> lock(recovery_mutex_);
-        if (recovery_stopping_) {
+        if (recovery_stopping_.load()) {
             return;
         }
         recovery_requested_ = true;
@@ -882,9 +879,9 @@ void P2PHotStandbyService::RecoveryLoop() {
     std::unique_lock<std::mutex> recovery_lock(recovery_mutex_);
     while (true) {
         recovery_cv_.wait(recovery_lock, [this] {
-            return recovery_stopping_ || recovery_requested_;
+            return recovery_stopping_.load() || recovery_requested_;
         });
-        if (recovery_stopping_) {
+        if (recovery_stopping_.load()) {
             return;
         }
         recovery_requested_ = false;
@@ -893,7 +890,7 @@ void P2PHotStandbyService::RecoveryLoop() {
         int backoff_ms = std::min(
             std::max(1, config_.reconnect_initial_backoff_ms), max_backoff_ms);
 
-        while (!recovery_stopping_) {
+        while (!recovery_stopping_.load()) {
             recovery_lock.unlock();
 
             ErrorCode err = ErrorCode::INTERNAL_ERROR;
@@ -901,6 +898,9 @@ void P2PHotStandbyService::RecoveryLoop() {
             bool attempted_snapshot_resync = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                // Stop may arrive while we wait for metadata access. Check
+                // again before reconnecting or fetching a snapshot.
+                if (recovery_stopping_.load()) return;
                 const bool snapshot_resync = snapshot_resync_required_.load();
                 if (!snapshot_resync &&
                     state_machine_.GetState() != StandbyState::RECONNECTING) {
@@ -967,7 +967,7 @@ void P2PHotStandbyService::RecoveryLoop() {
             }
 
             recovery_lock.lock();
-            if (recovery_stopping_) {
+            if (recovery_stopping_.load()) {
                 return;
             }
             if (err == ErrorCode::OK) {
@@ -993,7 +993,7 @@ void P2PHotStandbyService::RecoveryLoop() {
                          << ", retry_in_ms=" << backoff_ms;
             recovery_cv_.wait_for(recovery_lock,
                                   std::chrono::milliseconds(backoff_ms),
-                                  [this] { return recovery_stopping_; });
+                                  [this] { return recovery_stopping_.load(); });
             backoff_ms += std::min(backoff_ms, max_backoff_ms - backoff_ms);
         }
     }

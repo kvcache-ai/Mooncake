@@ -22,6 +22,34 @@
 #include "p2p/common/p2p_rpc_types.h"
 
 namespace mooncake::test {
+
+struct P2PHotStandbyServiceTestAccess {
+    static void StartRecoveryWorker(P2PHotStandbyService& service) {
+        std::lock_guard<std::mutex> lock(service.mutex_);
+        service.StartRecoveryWorker();
+    }
+
+    static std::unique_lock<std::mutex> StartWorkerWithMetadataLocked(
+        P2PHotStandbyService& service) {
+        std::unique_lock<std::mutex> lock(service.mutex_);
+        service.StartRecoveryWorker();
+        return lock;
+    }
+
+    static bool RecoveryRequested(P2PHotStandbyService& service) {
+        std::lock_guard<std::mutex> lock(service.recovery_mutex_);
+        return service.recovery_requested_;
+    }
+
+    static void StopRecoveryWorker(P2PHotStandbyService& service) {
+        service.StopRecoveryWorker();
+    }
+
+    static bool RecoveryStopping(P2PHotStandbyService& service) {
+        return service.recovery_stopping_.load();
+    }
+};
+
 namespace {
 
 struct ControlledNotifierState {
@@ -573,6 +601,117 @@ TEST_F(P2PHotStandbyServiceTest, TrimSignalSwitchesToSnapshotResync) {
     EXPECT_EQ(target.GetState(), StandbyState::WATCHING);
     auto exported = target.ExportMetadata();
     EXPECT_NE(exported.routes.find("trim-resync-key"), exported.routes.end());
+}
+
+TEST_F(P2PHotStandbyServiceTest, RestartedWorkerResumesPendingSnapshotResync) {
+    P2PMasterService master(MakeMasterConfig());
+    const UUID client_id{35, 35};
+    const UUID segment_id{36, 36};
+    RegisterClient(master, client_id, MakeSegment(segment_id));
+    PublishRoute(master, "before-resync", client_id, segment_id);
+
+    P2PHotStandbyService source(MakeStandbyConfig());
+    ASSERT_EQ(source.Start(), ErrorCode::OK);
+    ASSERT_TRUE(source.WaitForAppliedSequence(2));
+    SnapshotServer snapshot(source);
+    ASSERT_TRUE(snapshot.Start());
+
+    auto initial_state = std::make_shared<ControlledNotifierState>();
+    auto config = MakeStandbyConfig();
+    config.snapshot_source_endpoints = {snapshot.Endpoint()};
+    P2PHotStandbyService standby(config, [&] {
+        return std::make_unique<ControlledReaderStore>(initial_state);
+    });
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    ASSERT_TRUE(standby.GetMetadataStore()->RouteExists("before-resync"));
+
+    // A trim event can arrive while promotion has stopped the recovery worker.
+    // Restart must recover from the retained state without another
+    // notification.
+    P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby);
+    PublishRoute(master, "after-resync", client_id, segment_id);
+    ASSERT_TRUE(source.WaitForAppliedSequence(3));
+    InjectNotifierErrors(initial_state, ErrorCode::OPLOG_TRIMMED);
+    ASSERT_EQ(standby.GetState(), StandbyState::SYNCING);
+    ASSERT_FALSE(standby.GetMetadataStore()->RouteExists("after-resync"));
+    P2PHotStandbyServiceTestAccess::StartRecoveryWorker(standby);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (standby.GetState() != StandbyState::WATCHING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    EXPECT_EQ(standby.GetLatestAppliedSequenceId(), 3);
+    EXPECT_TRUE(standby.GetMetadataStore()->RouteExists("before-resync"));
+    EXPECT_TRUE(standby.GetMetadataStore()->RouteExists("after-resync"));
+}
+
+TEST_F(P2PHotStandbyServiceTest, RestartedWorkerResumesPendingReconnect) {
+    auto initial_state = std::make_shared<ControlledNotifierState>();
+    std::atomic<int> readers_created{0};
+    P2PHotStandbyService standby(MakeStandbyConfig(), [&] {
+        ++readers_created;
+        return std::make_unique<ControlledReaderStore>(initial_state);
+    });
+    ASSERT_EQ(standby.Start(/*baseline_sequence_id=*/7), ErrorCode::OK);
+    P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby);
+    EXPECT_EQ(readers_created.load(), 1);
+    InjectNotifierErrors(initial_state, ErrorCode::INTERNAL_ERROR);
+    ASSERT_EQ(standby.GetState(), StandbyState::RECONNECTING);
+    P2PHotStandbyServiceTestAccess::StartRecoveryWorker(standby);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (standby.GetState() != StandbyState::WATCHING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    EXPECT_EQ(readers_created.load(), 2);
+    std::lock_guard<std::mutex> lock(initial_state->mutex);
+    EXPECT_EQ(initial_state->start_sequence_id, 7);
+    EXPECT_TRUE(initial_state->healthy);
+}
+
+TEST_F(P2PHotStandbyServiceTest, StopBeforeRecoveryAcquiresMetadataLock) {
+    auto initial_state = std::make_shared<ControlledNotifierState>();
+    std::atomic<int> readers_created{0};
+    P2PHotStandbyService standby(MakeStandbyConfig(), [&] {
+        ++readers_created;
+        return std::make_unique<ControlledReaderStore>(initial_state);
+    });
+    ASSERT_EQ(standby.Start(/*baseline_sequence_id=*/7), ErrorCode::OK);
+    P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby);
+    InjectNotifierErrors(initial_state, ErrorCode::INTERNAL_ERROR);
+    ASSERT_EQ(standby.GetState(), StandbyState::RECONNECTING);
+
+    auto wait_until = [](auto predicate) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return predicate();
+    };
+    auto metadata_lock =
+        P2PHotStandbyServiceTestAccess::StartWorkerWithMetadataLocked(standby);
+    ASSERT_TRUE(wait_until([&] {
+        return !P2PHotStandbyServiceTestAccess::RecoveryRequested(standby);
+    }));
+    // The worker consumed its startup request but cannot begin recovery yet.
+    std::thread stop_worker(
+        [&] { P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby); });
+    EXPECT_TRUE(wait_until([&] {
+        return P2PHotStandbyServiceTestAccess::RecoveryStopping(standby);
+    }));
+    metadata_lock.unlock();
+    stop_worker.join();
+
+    EXPECT_EQ(readers_created.load(), 1);
+    EXPECT_EQ(standby.GetState(), StandbyState::RECONNECTING);
+    EXPECT_EQ(standby.GetLatestAppliedSequenceId(), 7);
 }
 
 TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
