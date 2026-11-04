@@ -31,6 +31,10 @@ P2PMasterRpcService::~P2PMasterRpcService() {
     http_server_.stop();
 }
 
+void P2PMasterRpcService::SetStepdownCallback(std::function<void()> callback) {
+    stepdown_callback_ = std::move(callback);
+}
+
 void P2PMasterRpcService::init() {
     init_http_server();
 
@@ -98,6 +102,29 @@ void P2PMasterRpcService::init_http_server() {
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    http_server_.set_http_handler<POST>(
+        "/ha/stepdown",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            if (!stepdown_callback_) {
+                resp.set_status_and_content(
+                    status_type::service_unavailable,
+                    "{\"success\":false,\"error\":\"stepdown callback is not installed\"}");
+                return;
+            }
+            if (stepdown_requested_.exchange(true)) {
+                resp.set_status_and_content(
+                    status_type::service_unavailable,
+                    "{\"success\":false,\"error\":\"stepdown already requested\"}");
+                return;
+            }
+            LOG(INFO) << "P2P master stepdown requested";
+            stepdown_callback_();
+            resp.set_status_and_content(
+                status_type::ok,
+                "{\"success\":true,\"message\":\"stepdown accepted\"}");
         });
 
     http_server_.set_http_handler<GET>(

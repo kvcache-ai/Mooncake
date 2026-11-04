@@ -115,8 +115,12 @@ class ScopedStandbyRegistryProviders final {
 #endif
 
 std::unique_ptr<P2PMasterRpcService> CreateActiveService(
-    const P2PMasterConfig& config, ViewVersionId view_version) {
+    const P2PMasterConfig& config, ViewVersionId view_version,
+    std::function<void()> stepdown_callback = {}) {
     auto service = std::make_unique<P2PMasterRpcService>(config, view_version);
+    if (stepdown_callback) {
+        service->SetStepdownCallback(std::move(stepdown_callback));
+    }
     service->init();
     return service;
 }
@@ -358,7 +362,8 @@ int P2PMaster::RunWithHA() {
             standby.reset();
         }
 
-        auto active_service = CreateActiveService(config_, view_version);
+        auto active_service =
+            CreateActiveService(config_, view_version, stop_primary_rpc);
         {
             auto* manager =
                 active_service->GetMasterService().GetOpLogManager();

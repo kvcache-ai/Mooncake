@@ -13,6 +13,7 @@
 #include <json/json.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -109,6 +110,12 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
     static HttpResponse HttpGet(const std::string& url) {
         coro_http::coro_http_client client;
         auto resp = client.get(url);
+        return {resp.status, std::string(resp.resp_body)};
+    }
+
+    static HttpResponse HttpPost(const std::string& url) {
+        coro_http::coro_http_client client;
+        auto resp = client.post(url, "", coro_http::req_content_type::octet_stream);
         return {resp.status, std::string(resp.resp_body)};
     }
 
@@ -249,6 +256,19 @@ TEST_F(P2PMasterHttpEndpointsTest, HealthEndpointReturnsOk) {
     auto resp = HttpGet(http_base_url_ + "/health");
     ASSERT_EQ(resp.status, 200) << "body=" << resp.resp_body;
     EXPECT_EQ(resp.resp_body, "OK");
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
+    std::atomic<bool> stepdown_called{false};
+    wrapped_->SetStepdownCallback([&stepdown_called] {
+        stepdown_called.store(true);
+    });
+
+    const auto response = HttpPost(http_base_url_ + "/ha/stepdown");
+    ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
+    const auto body = ParseJson(response.resp_body, "stepdown");
+    EXPECT_TRUE(body["success"].asBool());
+    EXPECT_TRUE(stepdown_called.load());
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,
