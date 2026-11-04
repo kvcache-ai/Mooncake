@@ -86,7 +86,7 @@ int tent_open_segment(tent_engine_t engine, tent_segment_id_t* handle,
     auto status = CAST(engine)->openSegment(*handle, segment_name);
     if (!status.ok()) {
         LOG(ERROR) << "tent_open_segment: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -96,7 +96,7 @@ int tent_close_segment(tent_engine_t engine, tent_segment_id_t handle) {
     auto status = CAST(engine)->closeSegment(handle);
     if (!status.ok()) {
         LOG(ERROR) << "tent_close_segment: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -109,7 +109,7 @@ int tent_get_segment_info(tent_engine_t engine, tent_segment_id_t handle,
     auto status = CAST(engine)->getSegmentInfo(handle, pinfo);
     if (!status.ok()) {
         LOG(ERROR) << "tent_get_segment_info: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     if (pinfo.type == mooncake::tent::SegmentInfo::Memory)
         info->type = TYPE_MEMORY;
@@ -123,7 +123,7 @@ int tent_get_segment_info(tent_engine_t engine, tent_segment_id_t handle,
         (tent_buffer_info*)malloc(sizeof(tent_buffer_info) * info->num_buffers);
     if (!info->buffers) {
         LOG(ERROR) << "tent_get_segment_info: out of memory";
-        return -1;
+        return -static_cast<int>(mooncake::tent::Status::Code::kInternalError);
     }
 
     for (int i = 0; i < info->num_buffers; ++i) {
@@ -150,7 +150,7 @@ int tent_allocate_memory(tent_engine_t engine, void** addr, size_t size,
     auto status = CAST(engine)->allocateLocalMemory(addr, size, options);
     if (!status.ok()) {
         LOG(ERROR) << "tent_allocate_memory: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -161,7 +161,7 @@ int tent_free_memory(tent_engine_t engine, void* addr) {
     auto status = CAST(engine)->freeLocalMemory(addr);
     if (!status.ok()) {
         LOG(ERROR) << "tent_free_memory: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -172,7 +172,7 @@ int tent_register_memory(tent_engine_t engine, void* addr, size_t size) {
     auto status = CAST(engine)->registerLocalMemory(addr, size);
     if (!status.ok()) {
         LOG(ERROR) << "tent_register_memory: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -183,7 +183,7 @@ int tent_unregister_memory(tent_engine_t engine, void* addr, size_t size) {
     auto status = CAST(engine)->unregisterLocalMemory(addr, size);
     if (!status.ok()) {
         LOG(ERROR) << "tent_unregister_memory: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -198,7 +198,7 @@ int tent_free_batch(tent_engine_t engine, tent_batch_id_t batch_id) {
     auto status = CAST(engine)->freeBatch(batch_id);
     if (!status.ok()) {
         LOG(ERROR) << "tent_free_batch: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -223,7 +223,7 @@ int tent_submit(tent_engine_t engine, tent_batch_id_t batch_id,
     auto status = CAST(engine)->submitTransfer(batch_id, req_list);
     if (!status.ok()) {
         LOG(ERROR) << "tent_submit: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -254,7 +254,7 @@ int tent_submit_notif(tent_engine_t engine, tent_batch_id_t batch_id,
     auto status = CAST(engine)->submitTransfer(batch_id, req_list, notifi);
     if (!status.ok()) {
         LOG(ERROR) << "tent_submit_notifi: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -269,7 +269,7 @@ int tent_send_notifs(tent_engine_t engine, tent_segment_id_t handle,
     auto status = CAST(engine)->sendNotification(handle, notifi);
     if (!status.ok()) {
         LOG(ERROR) << "tent_send_notifs: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -283,14 +283,15 @@ int tent_recv_notifs(tent_engine_t engine, tent_notifi_info* info) {
     auto status = CAST(engine)->receiveNotification(notify_list);
     if (!status.ok()) {
         LOG(ERROR) << "tent_recv_notifs: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     if (!notify_list.empty()) {
         info->records = (tent_notifi_record*)malloc(sizeof(tent_notifi_record) *
                                                     notify_list.size());
         if (!info->records) {
             LOG(ERROR) << "tent_recv_notifs: out of memory";
-            return -1;
+            return -static_cast<int>(
+                mooncake::tent::Status::Code::kInternalError);
         }
 
         info->num_records = (int)notify_list.size();
@@ -322,7 +323,7 @@ int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
         CAST(engine)->getTransferStatus(batch_id, task_id, internal_status);
     if (!status.ok()) {
         LOG(ERROR) << "tent_overall_status: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     xfer_status->status = (int)internal_status.s;
     xfer_status->transferred_bytes = internal_status.transferred_bytes;
@@ -336,7 +337,7 @@ int tent_cancel_task(tent_engine_t engine, tent_batch_id_t batch_id,
     auto status = CAST(engine)->cancelTransfer(batch_id, task_id);
     if (!status.ok()) {
         LOG(ERROR) << "tent_cancel_task: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -350,7 +351,7 @@ int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
     auto status = CAST(engine)->getTransferStatus(batch_id, internal_status);
     if (!status.ok()) {
         LOG(ERROR) << "tent_overall_status: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     xfer_status->status = (int)internal_status.s;
     xfer_status->transferred_bytes = internal_status.transferred_bytes;
@@ -394,7 +395,7 @@ int tent_register_memory_with_perm(tent_engine_t engine, void* addr,
     auto status = CAST(engine)->registerLocalMemory({addr}, {size}, perm);
     if (!status.ok()) {
         LOG(ERROR) << "tent_register_memory_with_perm: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -410,7 +411,7 @@ int tent_register_memory_batch(tent_engine_t engine, void** addrs,
     auto status = CAST(engine)->registerLocalMemory(addr_list, size_list, perm);
     if (!status.ok()) {
         LOG(ERROR) << "tent_register_memory_batch: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -427,7 +428,7 @@ int tent_unregister_memory_batch(tent_engine_t engine, void** addrs,
     auto status = CAST(engine)->unregisterLocalMemory(addr_list, size_list);
     if (!status.ok()) {
         LOG(ERROR) << "tent_unregister_memory_batch: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -441,7 +442,7 @@ int tent_allocate_memory_ex(tent_engine_t engine, void** addr, size_t size,
     auto status = CAST(engine)->allocateLocalMemory(addr, size, options);
     if (!status.ok()) {
         LOG(ERROR) << "tent_allocate_memory_ex: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -455,7 +456,7 @@ int tent_register_memory_ex(tent_engine_t engine, void* addr, size_t size,
     auto status = CAST(engine)->registerLocalMemory({addr}, {size}, options);
     if (!status.ok()) {
         LOG(ERROR) << "tent_register_memory_ex: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -474,7 +475,7 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
         CAST(engine)->registerLocalMemory(addr_list, size_list, options);
     if (!status.ok()) {
         LOG(ERROR) << "tent_register_memory_batch_ex: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     return 0;
 }
@@ -489,7 +490,7 @@ int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
     auto status = CAST(engine)->getTransferStatus(batch_id, status_list);
     if (!status.ok()) {
         LOG(ERROR) << "tent_task_status_list: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     size_t to_copy = std::min(status_list.size(), *count);
     for (size_t i = 0; i < to_copy; ++i) {
@@ -509,7 +510,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
     auto status = CAST(engine)->getNicLoadStats(native_stats);
     if (!status.ok()) {
         LOG(ERROR) << "tent_get_nic_load_stats: " << status.ToString();
-        return -1;
+        return -static_cast<int>(status.code());
     }
     size_t to_copy = std::min(native_stats.size(), *count);
     for (size_t i = 0; i < to_copy; ++i) {
