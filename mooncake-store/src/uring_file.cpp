@@ -5,6 +5,8 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -31,8 +33,133 @@ namespace mooncake {
 struct GlobalBufInfo {
     std::atomic<void*> base{nullptr};
     std::atomic<size_t> size{0};
+    // Multi-iovec registration: the whole buffer split into <=1GiB chunks so
+    // it registers on kernels whose per-buffer cap is 1GiB (e.g. Linux 5.4).
+    std::vector<struct iovec> chunks;  // built at init, before any I/O thread
+    size_t chunk_size = 0;
+    size_t nchunks = 0;
 };
 static GlobalBufInfo g_buf;
+
+// Max size of a single registered iovec.  Linux 5.4 rejects any single
+// registered buffer > SZ_1G (io_uring.c: iov.iov_len > SZ_1G → -EFAULT); the
+// upstream check is 1TiB.  Default 1GiB works on both.  The per-iovec cap is
+// overridable via MOONCAKE_OFFLOAD_URING_MULTI_IOVEC_CHUNK_SIZE (bytes) so a
+// large buffer can be registered as fewer/larger chunks on upstream (1TiB cap).
+static constexpr size_t kMaxRegChunkDefault = 1024UL * 1024 * 1024;  // 1 GiB
+static constexpr size_t kMaxRegChunkCeiling =
+    1024UL * 1024 * 1024 * 1024;  // 1 TiB (upstream cap)
+
+// Per-iovec chunk size for multi-iovec registration (see build_global_chunks).
+// Env override MOONCAKE_OFFLOAD_URING_MULTI_IOVEC_CHUNK_SIZE, in bytes; clamped
+// to [4096, kMaxRegChunkCeiling].  Values > 1GiB register fine on upstream but
+// fall back to non-fixed on Linux 5.4 (its 1GiB cap) — handled gracefully.
+static size_t uring_multi_iovec_chunk_size() {
+    static const size_t v = [] {
+        const char* e =
+            std::getenv("MOONCAKE_OFFLOAD_URING_MULTI_IOVEC_CHUNK_SIZE");
+        if (!e) return kMaxRegChunkDefault;
+        size_t val = 0;
+        try {
+            val = std::stoull(e);
+        } catch (...) {
+            LOG(WARNING) << "[SharedUringRing] invalid "
+                         << "MOONCAKE_OFFLOAD_URING_MULTI_IOVEC_CHUNK_SIZE='"
+                         << e << "', using default " << kMaxRegChunkDefault;
+            return kMaxRegChunkDefault;
+        }
+        if (val < 4096) val = 4096;
+        if (val > kMaxRegChunkCeiling) {
+            LOG(WARNING) << "[SharedUringRing] "
+                         << "MOONCAKE_OFFLOAD_URING_MULTI_IOVEC_CHUNK_SIZE="
+                         << val << " exceeds upstream 1TiB cap, clamping to "
+                         << kMaxRegChunkCeiling;
+            val = kMaxRegChunkCeiling;
+        } else if (val > kMaxRegChunkDefault) {
+            LOG(INFO) << "[SharedUringRing] chunk_size=" << val
+                      << " > 1GiB: OK on upstream (1TiB cap), but will fall "
+                      << "back to non-fixed on Linux 5.4 (1GiB cap)";
+        }
+        return val;
+    }();
+    return v;
+}
+
+// Env switch: MOONCAKE_OFFLOAD_URING_MULTI_IOVEC.
+//   "1"/"true"/"yes"/"on" (default) -> split the buffer into <=1GiB iovecs so
+//       it registers on kernels whose per-buffer cap is 1GiB (e.g. Linux 5.4).
+//   "0"/"false"/"no"/"off"          -> legacy single-iovec registration
+//       (original behavior; keeps working on kernels without the 1GiB cap).
+// Read once at first use; registration happens during init, single-threaded.
+static bool uring_multi_iovec_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("MOONCAKE_OFFLOAD_URING_MULTI_IOVEC");
+        if (!v) return true;  // default ON
+        std::string s(v);
+        for (auto& c : s) c = static_cast<char>(std::tolower(c));
+        return s == "1" || s == "true" || s == "yes" || s == "on";
+    }();
+    return enabled;
+}
+
+// Split [buffer, buffer+length) into contiguous <=chunk-size iovecs and publish
+// them on g_buf.  Called once during init (before any I/O thread starts) from
+// register_global_buffer().  With the env switch OFF this publishes a single
+// iovec covering the whole buffer, i.e. the legacy behavior.
+static void build_global_chunks(void* buffer, size_t length) {
+    g_buf.chunks.clear();
+    if (!uring_multi_iovec_enabled()) {
+        // Legacy single-iovec registration.
+        g_buf.chunks.push_back({static_cast<char*>(buffer), length});
+        g_buf.chunk_size = length;
+        g_buf.nchunks = 1;
+        return;
+    }
+    const size_t total = length;
+    size_t chunk = std::min(uring_multi_iovec_chunk_size(), total);
+    size_t n = (total + chunk - 1) / chunk;
+    if (n > 1024) {  // UIO_MAXIOV ceiling for IORING_REGISTER_BUFFERS
+        chunk = (total + 1023) / 1024;
+        n = (total + chunk - 1) / chunk;
+        if (chunk > kMaxRegChunkDefault)
+            LOG(WARNING) << "[SharedUringRing] buffer of " << total
+                         << " bytes needs more than 1024 registered iovecs: "
+                            "chunk size raised to "
+                         << chunk
+                         << " bytes (>1GiB). Registration fails on kernels "
+                            "with a 1GiB per-buffer cap (e.g. Linux 5.4); I/O "
+                            "then falls back to non-fixed buffers.";
+    }
+    g_buf.chunks.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t off = i * chunk;
+        const size_t len = std::min(chunk, total - off);
+        g_buf.chunks.push_back({static_cast<char*>(buffer) + off, len});
+    }
+    g_buf.chunk_size = chunk;
+    g_buf.nchunks = n;
+}
+
+// Return the index of the registered chunk that fully contains
+// [buf, buf+len), or -1 if the range is not fully inside one chunk (e.g. it
+// straddles a chunk boundary, or lies outside the registered buffer).
+// A fixed-buffer request must not cross a registered-buffer boundary, so the
+// caller falls back to a non-fixed operation when this returns -1.
+// Kept a free function (no ring state) so the math is unit-testable.
+static int fixed_buffer_index(const void* base, size_t buf_size,
+                              size_t chunk_size, size_t nchunks,
+                              const void* buf, size_t len) {
+    if (!base || !chunk_size || !nchunks) return -1;
+    uintptr_t a = reinterpret_cast<uintptr_t>(buf);
+    uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    if (a < b) return -1;
+    uintptr_t rel = a - b;
+    if (rel + len > buf_size) return -1;
+    size_t idx = rel / chunk_size;
+    if (idx >= nchunks) return -1;
+    if (rel + len <= (idx + 1) * chunk_size) return static_cast<int>(idx);
+    return -1;
+}
 
 // ============================================================================
 // SharedUringRing — per-thread io_uring ring.
@@ -79,14 +206,23 @@ class SharedUringRing {
         void* b = g_buf.base.load(std::memory_order_acquire);
         size_t s = g_buf.size.load(std::memory_order_acquire);
         if (!b || !s) return false;
-        struct iovec iov{b, s};
-        int ret = io_uring_register_buffers(&ring_, &iov, 1);
+        // Register the whole buffer as N <=1GiB iovecs (see
+        // build_global_chunks) so it also registers on kernels whose
+        // per-buffer cap is 1GiB (e.g. Linux 5.4).  If no chunk was published
+        // -- a registration path that does not go through
+        // register_global_buffer() -- fall back to the legacy single iovec.
+        struct iovec legacy_iov{b, s};
+        const bool chunked = !g_buf.chunks.empty();
+        struct iovec* iovs = chunked ? g_buf.chunks.data() : &legacy_iov;
+        const unsigned nr = chunked ? static_cast<unsigned>(g_buf.nchunks) : 1u;
+        int ret = io_uring_register_buffers(&ring_, iovs, nr);
         if (ret < 0) {
             int err = -ret;
             LOG(WARNING) << "[SharedUringRing] io_uring_register_buffers failed"
                          << " errno=" << err << " (" << strerror(err) << ")"
                          << " buf=" << b << " size=" << s
-                         << " pages=" << (s >> 12)
+                         << " pages=" << (s >> 12) << " nchunks=" << nr
+                         << " chunk_size=" << (chunked ? g_buf.chunk_size : s)
                          << " — falling back to non-fixed-buffer I/O";
             buf_register_failed_ = true;
             return false;
@@ -94,8 +230,13 @@ class SharedUringRing {
         buf_registered_ = true;
         buf_base_ = b;
         buf_size_ = s;
+        buf_chunk_size_ = chunked ? g_buf.chunk_size : s;
+        buf_nchunks_ = chunked ? g_buf.nchunks : 1;
         LOG(INFO) << "[SharedUringRing] tid registered buffer addr=" << b
-                  << " size=" << s;
+                  << " size=" << s
+                  << " multi_iovec=" << (chunked ? "on" : "off")
+                  << " nchunks=" << buf_nchunks_
+                  << " chunk_size=" << buf_chunk_size_;
         return true;
     }
 
@@ -105,6 +246,8 @@ class SharedUringRing {
         buf_registered_ = false;
         buf_base_ = nullptr;
         buf_size_ = 0;
+        buf_chunk_size_ = 0;
+        buf_nchunks_ = 0;
     }
 
     // -----------------------------------------------------------------
@@ -176,8 +319,12 @@ class SharedUringRing {
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
                 auto& d = descs[idx + i];
-                if (buf_registered_ && in_registered_buf(d.buf, d.len))
-                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off, 0);
+                int bidx = (buf_registered_ && in_registered_buf(d.buf, d.len))
+                               ? fixed_index_for(d.buf, d.len)
+                               : -1;
+                if (bidx >= 0)
+                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off,
+                                             bidx);
                 else
                     io_uring_prep_read(sqe, fd, d.buf, d.len, d.off);
                 sqe->user_data = op | static_cast<uint64_t>(i + 1);
@@ -313,6 +460,12 @@ class SharedUringRing {
         uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buf);
         uintptr_t rb = reinterpret_cast<uintptr_t>(buf_base_);
         return buf_addr >= rb && (buf_addr + len) <= (rb + buf_size_);
+    }
+
+    int fixed_index_for(const void* buf, size_t len) const {
+        if (!buf_registered_) return -1;
+        return fixed_buffer_index(buf_base_, buf_size_, buf_chunk_size_,
+                                  buf_nchunks_, buf, len);
     }
 
     static size_t next_pow2(size_t n) {
@@ -461,6 +614,16 @@ class SharedUringRing {
 
             for (unsigned i = 0; i < n; ++i) {
                 size_t chunk = std::min({cs, remaining, max_rw_count()});
+                // A fixed-buffer request must not cross a registered-chunk
+                // boundary, so keep this SQE inside the current chunk instead
+                // of falling back to a non-fixed operation for it.
+                if (fix_buf && buf_chunk_size_) {
+                    const size_t off_in_buf = static_cast<size_t>(
+                        ptr - static_cast<const char*>(buf_base_));
+                    const size_t to_boundary =
+                        buf_chunk_size_ - (off_in_buf % buf_chunk_size_);
+                    chunk = std::min(chunk, to_boundary);
+                }
 
                 struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
                 if (!sqe) {
@@ -468,14 +631,17 @@ class SharedUringRing {
                     return tl::make_unexpected(err_code);
                 }
 
+                const int bidx = fix_buf ? fixed_index_for(ptr, chunk) : -1;
                 if (is_write) {
-                    if (fix_buf)
-                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur, 0);
+                    if (bidx >= 0)
+                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur,
+                                                  bidx);
                     else
                         io_uring_prep_write(sqe, fd, ptr, chunk, cur);
                 } else {
-                    if (fix_buf)
-                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur, 0);
+                    if (bidx >= 0)
+                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur,
+                                                 bidx);
                     else
                         io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
@@ -569,7 +735,9 @@ class SharedUringRing {
     bool buf_register_failed_ = false;  // set on first failure; skip retries
     void* buf_base_ = nullptr;
     size_t buf_size_ = 0;
-    uint64_t op_id_ = 0;  // monotonic ID for stale CQE filtering
+    uint64_t op_id_ = 0;         // monotonic ID for stale CQE filtering
+    size_t buf_chunk_size_ = 0;  // registration chunk size (<=1GiB)
+    size_t buf_nchunks_ = 0;     // number of registered chunks
 };
 
 // ============================================================================
@@ -994,6 +1162,7 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
             << " failed errno=" << errno << " (" << strerror(errno)
             << ") — continuing anyway";
     }
+    build_global_chunks(buffer, length);
     g_buf.base.store(buffer, std::memory_order_release);
     g_buf.size.store(length, std::memory_order_release);
     bool ok = SharedUringRing::instance().ensure_buf_registered();
@@ -1014,6 +1183,11 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
 void UringFile::unregister_global_buffer() {
     g_buf.base.store(nullptr, std::memory_order_release);
     g_buf.size.store(0, std::memory_order_release);
+    // g_buf.chunks is intentionally left in place: it is only written by
+    // build_global_chunks() on the (single-threaded) init path, so no I/O
+    // thread can ever observe a vector being mutated.  ensure_buf_registered()
+    // bails out on the null base above, so stale chunk data is unreachable
+    // until the next register_buffer() rebuilds it.
     SharedUringRing::instance().unregister_buf_local();
 }
 
@@ -1033,6 +1207,7 @@ bool UringFile::register_buffer(void* buffer, size_t length) {
         }
     }
     // Publish globally; each thread-local ring registers lazily on first I/O.
+    build_global_chunks(buffer, length);
     g_buf.base.store(buffer, std::memory_order_release);
     g_buf.size.store(length, std::memory_order_release);
     // Register on the calling thread's ring immediately.
@@ -1046,6 +1221,7 @@ void UringFile::unregister_buffer() {
     // Clear the global state so no new thread picks it up.
     g_buf.base.store(nullptr, std::memory_order_release);
     g_buf.size.store(0, std::memory_order_release);
+    // See unregister_global_buffer(): chunk metadata is not touched here.
     // Unregister on the calling thread's ring.
     SharedUringRing::instance().unregister_buf_local();
 }
