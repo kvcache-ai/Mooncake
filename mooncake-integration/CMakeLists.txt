@@ -63,13 +63,9 @@ if(WITH_TE)
     target_compile_definitions(engine PRIVATE USE_CXI)
   endif()
 
-  # TENT discovers metadata backends independently of classic USE_* flags.
+  # Propagate USE_TENT compile definition to engine target
   if(USE_TENT)
-    target_compile_definitions(
-      engine
-      PRIVATE USE_TENT
-              $<$<TARGET_EXISTS:metastore_redis>:MOONCAKE_TENT_HAS_REDIS>
-              $<$<TARGET_EXISTS:metastore_http>:MOONCAKE_TENT_HAS_HTTP>)
+    target_compile_definitions(engine PRIVATE USE_TENT)
   endif()
 
   target_link_libraries(engine PRIVATE $<TARGET_OBJECTS:rpc_communicator>)

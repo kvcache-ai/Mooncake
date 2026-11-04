@@ -1486,12 +1486,15 @@ int rejectTentMetadataAndRetry() {
         TransferEngine engine(false);
         if (!engine.isUsingTent()) return 1;
         auto connections = unavailableConnections();
-#ifdef MOONCAKE_TENT_HAS_REDIS
-        std::erase(connections, "redis://127.0.0.1:1");
-#endif
-#ifdef MOONCAKE_TENT_HAS_HTTP
-        std::erase(connections, "http://127.0.0.1:1/metadata");
-#endif
+        // Keep a bound, non-listening socket to exercise connection failures
+        // as well as compiled-out backends, without an external service.
+        int refused_socket = -1;
+        const auto refused_port = findAvailableTcpPort(refused_socket);
+        if (refused_port == 0) return 8;
+        const auto refused_address =
+            "127.0.0.1:" + std::to_string(refused_port);
+        connections.emplace_back("redis://" + refused_address);
+        connections.emplace_back("http://" + refused_address + "/metadata");
         const int before = openSocketCount();
         if (before < 0) return 6;
         for (const auto &connection : connections) {
@@ -1503,6 +1506,7 @@ int rejectTentMetadataAndRetry() {
                 if (openSocketCount() != before) return 7;
             }
         }
+        close(refused_socket);
         if (engine.init(P2PHANDSHAKE, "127.0.0.1", "", 0, "tcp") != 0) return 4;
         if (!engine.isUsingTent() || engine.getRpcPort() == 0) return 5;
     }

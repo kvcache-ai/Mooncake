@@ -564,12 +564,7 @@ endif()
 
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 if(USE_TENT)
-  # TENT targets are added after this directory; evaluate availability at generate time.
-  target_compile_definitions(
-    transfer_metadata_test
-    PRIVATE USE_TENT
-            $<$<TARGET_EXISTS:metastore_redis>:MOONCAKE_TENT_HAS_REDIS>
-            $<$<TARGET_EXISTS:metastore_http>:MOONCAKE_TENT_HAS_HTTP>)
+  target_compile_definitions(transfer_metadata_test PRIVATE USE_TENT)
 endif()
 
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest

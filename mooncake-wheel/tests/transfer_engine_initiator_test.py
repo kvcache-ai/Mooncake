@@ -3,12 +3,6 @@ import json
 import subprocess
 import sys
 import textwrap
-import socket
-import threading
-from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
-from mooncake import engine as engine_module
 import os
 import ctypes
 from mooncake.engine import TransferEngine
@@ -538,83 +532,60 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
 
 
 class TestTransferEngineInitialization(unittest.TestCase):
-    @contextmanager
-    def metadata_server(self, *, reject_writes=False):
-        entries, deleted = {}, []
+    """Run against a known build with MC_TEST_ENGINE=classic (default) or tent.
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_args):
-                pass
+    Native tests cover build-specific plugins and HTTP publication/cleanup.
+    """
 
-            def respond(self, status, body=b"OK"):
-                self.send_response(status)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def key(self):
-                return parse_qs(urlsplit(self.path).query).get("key", [""])[0]
-
-            def do_GET(self):
-                value = entries.get(self.key())
-                self.respond(404 if value is None else 200, value or b"")
-
-            def do_PUT(self):
-                value = self.rfile.read(int(self.headers["Content-Length"]))
-                if reject_writes:
-                    self.respond(503)
-                else:
-                    entries[self.key()] = value
-                    self.respond(200)
-
-            def do_DELETE(self):
-                key = self.key()
-                deleted.append(key)
-                entries.pop(key, None)
-                self.respond(200)
-
-        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-            worker = threading.Thread(target=server.serve_forever, daemon=True)
-            worker.start()  # The constructor has already bound/listened.
-            try:
-                yield (
-                    f"http://127.0.0.1:{server.server_port}/metadata",
-                    entries,
-                    deleted,
+    @classmethod
+    def setUpClass(cls):
+        mode = os.environ.get("MC_TEST_ENGINE", "classic")
+        if mode not in ("classic", "tent"):
+            raise RuntimeError("MC_TEST_ENGINE must be classic or tent")
+        cls.selectors = ("MC_USE_TENT", "MC_USE_TEV1") if mode == "tent" else (None,)
+        if mode == "tent":
+            # A separate dispatch canary: Classic ignores this existing TENT
+            # setting and would succeed, exposing a silent Classic fallback.
+            probe = cls()
+            for selector in cls.selectors:
+                probe.assertEqual(
+                    probe.initialize(
+                        ["P2PHANDSHAKE"], selector=selector, rpc_threads="0"
+                    ),
+                    [-1],
+                    "TENT selection fell back to Classic",
                 )
-            finally:
-                server.shutdown()
-                worker.join(timeout=5)
-                self.assertFalse(worker.is_alive())
+                probe.assertEqual(
+                    probe.initialize(["P2PHANDSHAKE"], selector=selector), [0]
+                )
 
-    def initialize(self, connections, *, selector=None):
+    def initialize(self, connections, *, selector=None, rpc_threads=None):
         # Fatal native regressions must not kill the test runner.
         code = textwrap.dedent("""
             import json
-            import os
             import resource
             import sys
-            from mooncake import engine as module
+            from mooncake.engine import TransferEngine
 
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            use_tent = any(os.getenv(name) == "1" for name in
-                           ("MC_USE_TENT", "MC_USE_TEV1"))
-            assert not use_tent or module.SUPPORT_TENT
-            engine = module.TransferEngine()
-            results, ports = [], []
-            for connection in sys.argv[1:]:
-                results.append(engine.initialize("127.0.0.1", connection, "tcp", ""))
-                if use_tent:
-                    ports.append(engine.get_rpc_port())
+            engine = TransferEngine()
+            results = [engine.initialize("127.0.0.1", connection, "tcp", "")
+                       for connection in sys.argv[1:]]
             del engine
-            print(json.dumps([results, ports]), flush=True)
+            print(json.dumps(results), flush=True)
         """)
         environment = {**os.environ, "MC_FORCE_TCP": "1"}
-        for name in ("MC_USE_TENT", "MC_USE_TEV1"):
+        for name in (
+            "MC_USE_TENT",
+            "MC_USE_TEV1",
+            "MC_TENT_CONF",
+            "MC_TENT_RPC_THREADS",
+        ):
             environment.pop(name, None)
         if selector:
-            self.assertTrue(engine_module.SUPPORT_TENT)
             environment[selector] = "1"
+        if rpc_threads is not None:
+            environment["MC_TENT_RPC_THREADS"] = rpc_threads
         process = subprocess.run(
             [sys.executable, "-X", "faulthandler", "-c", code, *connections],
             env=environment,
@@ -623,127 +594,23 @@ class TestTransferEngineInitialization(unittest.TestCase):
             timeout=60,
         )
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
-        results, ports = json.loads(process.stdout.splitlines()[-1])
-        if selector:
-            for result, port in zip(results, ports):
-                if result != 0:
-                    self.assertEqual(
-                        port, 0, "failed TENT engine retained an RPC service"
-                    )
-        return results
+        return json.loads(process.stdout.splitlines()[-1])
 
-    def supports(self, backend, selector=None):
-        prefix = (
-            "SUPPORT_TENT_" if selector and backend in ("HTTP", "REDIS") else "SUPPORT_"
-        )
-        return getattr(engine_module, prefix + backend)
-
-    def unavailable_connections(self, selector=None):
-        connections = ["unsupported://127.0.0.1:1"]
-        if not self.supports("ETCD", selector):
-            connections += ["127.0.0.1:1", "etcd://127.0.0.1:1"]
-        if not self.supports("REDIS", selector):
-            connections.append("redis://127.0.0.1:1")
-        return connections
-
-    def selectors(self):
-        return [None] + (
-            ["MC_USE_TENT", "MC_USE_TEV1"] if engine_module.SUPPORT_TENT else []
-        )
-
-    def test_unavailable_metadata_returns_error(self):
-        connections = self.unavailable_connections()
-        self.assertEqual(self.initialize(connections), [-1] * len(connections))
-
-    def test_tent_unavailable_metadata_returns_error(self):
-        if not engine_module.SUPPORT_TENT:
-            self.skipTest("TENT is not compiled into this binding")
-        for selector in ("MC_USE_TENT", "MC_USE_TEV1"):
-            connections = self.unavailable_connections(selector)
+    def test_unsupported_plugin_returns_error(self):
+        for selector in self.selectors:
             with self.subTest(selector=selector):
                 self.assertEqual(
-                    self.initialize(connections, selector=selector),
-                    [-1] * len(connections),
+                    self.initialize(["unsupported://127.0.0.1:1"], selector=selector),
+                    [-1],
                 )
 
     def test_can_initialize_p2p_after_rejected_configuration(self):
         connections = ["unsupported://127.0.0.1:1"] * 4 + ["P2PHANDSHAKE"]
-        for selector in self.selectors():
+        for selector in self.selectors:
             with self.subTest(selector=selector):
                 self.assertEqual(
                     self.initialize(connections, selector=selector), [-1] * 4 + [0]
                 )
-
-    def test_http_metadata_initialization(self):
-        selectors = [
-            selector for selector in self.selectors() if self.supports("HTTP", selector)
-        ]
-        if not selectors:
-            self.skipTest("HTTP metadata is not compiled into this binding")
-        with self.metadata_server() as (connection, _entries, deleted):
-            for selector in selectors:
-                with self.subTest(selector=selector):
-                    before = len(deleted)
-                    self.assertEqual(
-                        self.initialize([connection], selector=selector), [0]
-                    )
-                    self.assertGreater(len(deleted), before)
-
-    def test_http_connection_failure(self):
-        selectors = [
-            selector for selector in self.selectors() if self.supports("HTTP", selector)
-        ]
-        if not selectors:
-            self.skipTest("HTTP metadata is not compiled into this binding")
-        # A bound socket without listen() guarantees a local refused connection.
-        with socket.socket() as reserved:
-            reserved.bind(("127.0.0.1", 0))
-            connection = f"http://127.0.0.1:{reserved.getsockname()[1]}/metadata"
-            for selector in selectors:
-                with self.subTest(selector=selector):
-                    self.assertEqual(
-                        self.initialize(
-                            [connection, "P2PHANDSHAKE"], selector=selector
-                        ),
-                        [-1, 0],
-                    )
-
-    def test_redis_connection_failure(self):
-        selectors = [
-            selector
-            for selector in self.selectors()
-            if self.supports("REDIS", selector)
-        ]
-        if not selectors:
-            self.skipTest("Redis is not compiled into this binding")
-        with socket.socket() as reserved:
-            reserved.bind(("127.0.0.1", 0))
-            connection = f"redis://127.0.0.1:{reserved.getsockname()[1]}"
-            for selector in selectors:
-                with self.subTest(selector=selector):
-                    self.assertEqual(
-                        self.initialize(
-                            [connection, "P2PHANDSHAKE"], selector=selector
-                        ),
-                        [-1, 0],
-                    )
-
-    def test_tent_failed_publication_preserves_existing_metadata(self):
-        if not (engine_module.SUPPORT_TENT and engine_module.SUPPORT_TENT_HTTP):
-            self.skipTest("Requires TENT and HTTP metadata")
-        with self.metadata_server(reject_writes=True) as (connection, entries, deleted):
-            key = "mooncake/tent/127.0.0.1"
-            entries[key] = b'{"owner":"existing"}'
-            for selector in ("MC_USE_TENT", "MC_USE_TEV1"):
-                with self.subTest(selector=selector):
-                    self.assertEqual(
-                        self.initialize(
-                            [connection, "P2PHANDSHAKE"], selector=selector
-                        ),
-                        [-1, 0],
-                    )
-                    self.assertEqual(entries, {key: b'{"owner":"existing"}'})
-                    self.assertEqual(deleted, [])
 
 
 if __name__ == "__main__":
