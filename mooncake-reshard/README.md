@@ -345,6 +345,23 @@ cache lifetime, coordinating all resources, and withholding request completion
 until every required resource writer succeeds. Mooncake does not infer model
 architecture or treat recurrent state as token-indexed KV.
 
+For a recurrent-state operation, the snapshot's row interval identifies the
+selected state slots in a framework-defined logical order, not all tokens of
+the requests. Source and target must agree on that order and on the state
+checkpoint; the framework supplies fingerprints that bind those semantics.
+Physical slot IDs can differ: export resolved ranges mapping each logical row
+to its local slot, or use `resolve_contiguous_runtime_binding` with an explicit
+`first_token_offset` for a contiguous run of rows, including `NHD_STRIDED` views.
+Only the selected payload bytes are copied; padding and other fused groups
+remain untouched. One operation covers one resource, so a hybrid request with
+K/V, convolution and recurrent state needs a framework-level completion barrier
+across those resources.
+
+These extensions apply to runtime-to-runtime transfers. Store reshard currently
+accepts only `(KEY, VALUE)` with an `NHD` descriptor and rejects state resources
+and `NHD_STRIDED` descriptors. Existing K/V model-domain keys, Store layout and
+manifest identities, and JSON encodings are preserved.
+
 The KV-cache implementation is split by responsibility:
 
 - `snapshot.py` defines content identity;

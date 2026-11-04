@@ -29,8 +29,8 @@ from mooncake.reshard.kv_cache import (
     kv_cache_writer_receipt_to_json,
     plan_kv_cache_transfer_to_local_target,
 )
-from test_kv_cache_reshard import _placement, _snapshot
 from test_cache_components import resource
+from test_kv_cache_reshard import _placement, _snapshot
 from test_runtime_transfer import assert_content, memory_binding
 
 pytestmark = pytest.mark.skipif(
@@ -43,7 +43,12 @@ def _native_placement(role, tp, component):
     if component is None:
         return _placement(role, ((0, 1),), tp)
     return resource(
-        role, tp, component, heads=1 if component is KVCacheComponent.LATENT else 4
+        role,
+        tp,
+        component,
+        heads=1 if component is KVCacheComponent.LATENT else 4,
+        dtype="float32" if component is KVCacheComponent.SSM else "bfloat16",
+        itemsize=4 if component is KVCacheComponent.SSM else 2,
     )
 
 
@@ -144,6 +149,9 @@ def _receive(connection, expected, timeout=90):
         (1, 1, True, None),
         (1, 2, False, KVCacheComponent.LATENT),
         (2, 1, False, KVCacheComponent.SSM),
+        (1, 2, False, KVCacheComponent.SSM),
+        (1, 2, False, KVCacheComponent.CONV),
+        (2, 1, False, KVCacheComponent.CONV),
     ],
 )
 def test_native_content_and_peer_failure(source_tp, target_tp, kill_peer, component):

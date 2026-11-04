@@ -1,5 +1,6 @@
 """Non-K/V resources use the same placement, preparation and wire contracts."""
 
+import ctypes
 import json
 from dataclasses import replace
 
@@ -7,21 +8,35 @@ import pytest
 from mooncake.reshard.kv_cache import (
     KVCacheComponent,
     KVCacheLayout,
+    KVCacheModelDomain,
     KVCachePlacementManifest,
+    KVCacheRuntimeTransferPlan,
+    KVCacheStoreFormat,
+    KVCacheStoreRuntimeBinding,
+    KVCacheTransferLimits,
     kv_cache_placement_from_json,
     kv_cache_placement_to_json,
+    kv_cache_runtime_transfer_from_json,
+    kv_cache_runtime_transfer_to_json,
+    plan_kv_cache_store_upload,
     plan_kv_cache_transfer_to_local_target,
     prepare_kv_cache_transfer,
+    resolve_contiguous_runtime_binding,
     validate_runtime_binding,
 )
-from test_kv_cache_reshard import _binding, _placement
+from mooncake.reshard.kv_cache._store.binding import validate_store_binding
+from test_kv_cache_reshard import _binding, _placement, _snapshot
 
 
-def resource(prefix, tp, component, heads=4, strided=False):
+def resource(
+    prefix, tp, component, heads=4, strided=False, dtype="float16", itemsize=2
+):
     placement = _placement(prefix, ((1, 3),), tp, total_kv_heads=heads, page_size=1)
     descriptor = replace(
         placement.descriptor,
         components=(component,),
+        dtype=dtype,
+        itemsize=itemsize,
         key_head_dim=6,
         value_head_dim=1,
         layout=KVCacheLayout.NHD_STRIDED if strided else KVCacheLayout.NHD,
@@ -123,16 +138,184 @@ def test_legacy_descriptor_wire_is_unchanged():
 
 
 @pytest.mark.parametrize(
+    "strides", [(47, 12, 2), (145, 12, 2), (144, 14, 2), (144, 12, 4)]
+)
+def test_strided_state_rejects_overlapping_or_noncontiguous_rows(strides):
+    placement = resource("state", 1, KVCacheComponent.SSM, strided=True)
+    binding = _binding(
+        placement,
+        placement.parts[0].participant_id,
+        base_address=1000000,
+        capacity_tokens=3,
+    )
+    first = binding.buffers[0]
+    binding = replace(
+        binding,
+        buffers=(
+            replace(first, fragment=replace(first.fragment, strides_bytes=strides)),
+            *binding.buffers[1:],
+        ),
+    )
+    with pytest.raises(ValueError, match="disjoint contiguous NHD rows"):
+        validate_runtime_binding(placement, binding)
+
+
+@pytest.mark.parametrize(
     "component", [KVCacheComponent.LATENT, KVCacheComponent.CONV, KVCacheComponent.SSM]
 )
-def test_resolved_executor_copies_non_kv_components(component):
+@pytest.mark.parametrize("dtype,itemsize", [("bfloat16", 2), ("float32", 4)])
+@pytest.mark.parametrize("source_tp,target_tp", [(1, 2), (2, 1)])
+def test_resolved_executor_copies_non_kv_components(
+    component, dtype, itemsize, source_tp, target_tp
+):
     from test_runtime_transfer import assert_content, execute_all, make_operation
 
     heads = 1 if component is KVCacheComponent.LATENT else 4
-    source = resource("source", 2, component, heads)
-    target = resource("target", 1, component, heads)
+    source = resource(
+        "source", source_tp, component, heads, dtype=dtype, itemsize=itemsize
+    )
+    target = resource(
+        "target", target_tp, component, heads, dtype=dtype, itemsize=itemsize
+    )
     operation, keepalive = make_operation(source, target)
+    operation = kv_cache_runtime_transfer_from_json(
+        kv_cache_runtime_transfer_to_json(operation)
+    )
     receipts, _, executors = execute_all(operation)
     assert receipts and keepalive and executors
+    assert all(receipt.success for receipt in receipts)
     for binding in operation.target_bindings:
         assert_content(target, binding)
+
+
+@pytest.mark.parametrize("component", [KVCacheComponent.CONV, KVCacheComponent.SSM])
+def test_strided_state_adapter_copies_only_selected_rows(component):
+    from test_runtime_transfer import execute_all
+
+    snapshot = _snapshot(token_start=13, token_count=2)
+    source = resource("source", 2, component, strided=True, dtype="float32", itemsize=4)
+    target = resource("target", 1, component, strided=True, dtype="float32", itemsize=4)
+    bindings, keepalive, expected_targets = [], [], []
+    for placement, first_row, is_source in ((source, 1, True), (target, 2, False)):
+        resolved = []
+        for part in placement.parts:
+            binding = _binding(
+                placement,
+                part.participant_id,
+                base_address=1000000,
+                snapshot=snapshot,
+                capacity_tokens=5,
+            )
+            buffers = []
+            for item in binding.buffers:
+                f = item.fragment
+                row_bytes = f.strides_bytes[0]
+                stride = row_bytes * 3
+                # A middle group in a fused allocation; other groups are sentinels.
+                allocation = ctypes.create_string_buffer(
+                    b"\xa5" * (5 * stride), 5 * stride
+                )
+                expected = bytearray(allocation.raw)
+                for row in range(snapshot.token_count):
+                    for head in range(part.head_count):
+                        value = (
+                            0x12340000
+                            + item.global_layer_id * 100
+                            + row * 10
+                            + part.head_start
+                            + head
+                        )
+                        payload = value.to_bytes(4, "little") * 6
+                        offset = row_bytes + (first_row + row) * stride + head * 24
+                        expected[offset : offset + 24] = payload
+                if is_source:
+                    allocation.raw = bytes(expected)
+                else:
+                    expected_targets.append((allocation, bytes(expected)))
+                address = ctypes.addressof(allocation)
+                buffers.append(
+                    replace(
+                        item,
+                        fragment=replace(
+                            f,
+                            address=address + row_bytes,
+                            storage_address=address,
+                            storage_offset_bytes=row_bytes,
+                            storage_nbytes=len(allocation),
+                            nbytes=4 * stride + row_bytes,
+                            strides_bytes=(stride, *f.strides_bytes[1:]),
+                        ),
+                    )
+                )
+                keepalive.append(allocation)
+            resolved.append(
+                resolve_contiguous_runtime_binding(
+                    placement,
+                    snapshot,
+                    replace(binding, buffers=tuple(buffers)),
+                    operation_id="state-copy",
+                    first_token_offset=first_row,
+                )
+            )
+        bindings.append(tuple(resolved))
+    plan = KVCacheRuntimeTransferPlan(
+        "state-copy",
+        tuple(
+            plan_kv_cache_transfer_to_local_target(
+                source, target, p.participant_id, snapshot=snapshot
+            )
+            for p in target.parts
+        ),
+        *bindings,
+    )
+    receipts, _, executors = execute_all(plan)
+    assert keepalive and executors and all(r.success for r in receipts)
+    for allocation, expected in expected_targets:
+        assert allocation.raw == expected
+
+
+def test_component_types_are_part_of_semantic_identity():
+    domains = [
+        KVCacheModelDomain(
+            "cache", "model", "revision", "semantic", resource("state", 1, c).descriptor
+        ).digest
+        for c in (KVCacheComponent.LATENT, KVCacheComponent.CONV, KVCacheComponent.SSM)
+    ]
+    assert len(set(domains)) == 3
+
+
+@pytest.mark.parametrize(
+    "component", [KVCacheComponent.LATENT, KVCacheComponent.CONV, KVCacheComponent.SSM]
+)
+def test_store_rejects_r2r_only_state_resources(component):
+    from test_runtime_transfer import memory_binding
+
+    placement = resource("state", 1, component)
+    with pytest.raises(ValueError, match="Store.*K/V"):
+        plan_kv_cache_store_upload(placement, object_format=KVCacheStoreFormat.PLHD)
+    snapshot = _snapshot(token_count=1)
+    resolved, buffers = memory_binding(
+        placement, placement.parts[0].participant_id, snapshot
+    )
+    binding = KVCacheStoreRuntimeBinding(
+        **{
+            name: getattr(resolved, name)
+            for name in KVCacheStoreRuntimeBinding.__dataclass_fields__
+        }
+    )
+    assert buffers
+    with pytest.raises(ValueError, match="Store.*K/V"):
+        validate_store_binding(
+            placement, binding, "operation-1", 0, 1, KVCacheTransferLimits()
+        )
+
+
+def test_store_rejects_r2r_only_strided_descriptor():
+    from _store_test_utils import _layout
+
+    layout = _layout()
+    with pytest.raises(ValueError, match="Store.*NHD"):
+        replace(
+            layout,
+            descriptor=replace(layout.descriptor, layout=KVCacheLayout.NHD_STRIDED),
+        )
