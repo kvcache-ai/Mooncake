@@ -19,7 +19,10 @@ namespace mooncake {
 struct HADoctorIssue {
     std::string code;
     std::string message;
-    YLT_REFL(HADoctorIssue, code, message);
+    std::string category;
+    std::string component;
+    std::string severity;
+    YLT_REFL(HADoctorIssue, code, message, category, component, severity);
 };
 
 struct HADoctorReport {
@@ -67,10 +70,13 @@ struct HAStatusSnapshot {
     bool snapshot_ready{false};
     bool registry_heartbeat_ok{false};
     int64_t registry_heartbeat_last_success_ms{0};
+    int64_t registry_heartbeat_last_success_timestamp_ms{0};
     int64_t registry_heartbeat_last_failure_ms{0};
+    int64_t registry_heartbeat_last_failure_timestamp_ms{0};
     std::string registry_heartbeat_last_error;
     std::string last_error;
     int64_t updated_at_ms{0};
+    int64_t status_updated_at_ms{0};
 
     YLT_REFL(HAStatusSnapshot, ha_enabled, cluster_id, local_endpoint, role,
              state, instance_id, leader_endpoint, epoch, master_view_address,
@@ -87,8 +93,11 @@ struct HAStatusSnapshot {
              oplog_last_successful_poll_timestamp_ms, oplog_poll_success_age_ms,
              snapshot_ready, registry_heartbeat_ok,
              registry_heartbeat_last_success_ms,
-             registry_heartbeat_last_failure_ms, registry_heartbeat_last_error,
-             last_error, updated_at_ms);
+             registry_heartbeat_last_success_timestamp_ms,
+             registry_heartbeat_last_failure_ms,
+             registry_heartbeat_last_failure_timestamp_ms,
+             registry_heartbeat_last_error, last_error, updated_at_ms,
+             status_updated_at_ms);
 };
 
 class HAStatusManager {

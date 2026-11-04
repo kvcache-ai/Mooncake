@@ -344,6 +344,12 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
     EXPECT_GE(body["oplog_poll_success_age_ms"].asInt64(), 0);
     EXPECT_EQ(body["snapshot_ready"].asBool(), true);
     EXPECT_EQ(body["registry_heartbeat_ok"].asBool(), true);
+    EXPECT_EQ(body["registry_heartbeat_last_success_timestamp_ms"].asInt64(),
+              body["registry_heartbeat_last_success_ms"].asInt64());
+    EXPECT_EQ(body["registry_heartbeat_last_failure_timestamp_ms"].asInt64(),
+              body["registry_heartbeat_last_failure_ms"].asInt64());
+    EXPECT_EQ(body["status_updated_at_ms"].asInt64(),
+              body["updated_at_ms"].asInt64());
     EXPECT_GT(body["updated_at_ms"].asInt64(), 0);
 
     auto metrics_response = HttpGet(http_base_url_ + "/metrics");
@@ -387,6 +393,15 @@ TEST_F(P2PMasterHttpEndpointsTest,
     EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_APPLY_FAILED");
     EXPECT_EQ(report["issues"][0]["message"].asString(),
               "seq=123: invalid payload");
+    EXPECT_EQ(report["issues"][0]["category"].asString(), "oplog");
+    EXPECT_EQ(report["issues"][0]["component"].asString(), "oplog_applier");
+    EXPECT_EQ(report["issues"][0]["severity"].asString(), "error");
+    EXPECT_EQ(report["issues"][1]["code"].asString(),
+              "REGISTRY_HEARTBEAT_FAILED");
+    EXPECT_EQ(report["issues"][1]["category"].asString(), "registry");
+    EXPECT_EQ(report["issues"][1]["component"].asString(),
+              "registry_heartbeat");
+    EXPECT_EQ(report["issues"][1]["severity"].asString(), "error");
 
     // Repeated failures replace the current message without accumulating.
     status.SetDoctorIssue("OPLOG_APPLY_FAILED", "seq=124: invalid payload");

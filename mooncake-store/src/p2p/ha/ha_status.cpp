@@ -52,6 +52,81 @@ void UpdateMetrics(const HAStatusSnapshot& status) {
     metrics.set_status_updated_timestamp_ms(status.updated_at_ms);
 }
 
+bool StartsWith(const std::string& value, const std::string& prefix) {
+    return value.rfind(prefix, 0) == 0;
+}
+
+std::string IssueCategory(const std::string& code) {
+    if (StartsWith(code, "OPLOG_") || StartsWith(code, "PROMOTION_") ||
+        code == "STANDBY_BEHIND_TRIM") {
+        return "oplog";
+    }
+    if (StartsWith(code, "ELECTION_") || code == "LEADERSHIP_LOST" ||
+        code == "MASTER_VIEW_MISMATCH") {
+        return "election";
+    }
+    if (StartsWith(code, "SNAPSHOT_") ||
+        StartsWith(code, "STANDBY_SNAPSHOT_")) {
+        return "snapshot";
+    }
+    if (StartsWith(code, "REGISTRY_")) {
+        return "registry";
+    }
+    return "ha";
+}
+
+std::string IssueComponent(const std::string& code) {
+    if (StartsWith(code, "OPLOG_WRITE_") || StartsWith(code, "OPLOG_COMMIT_") ||
+        StartsWith(code, "OPLOG_LATEST_") || code == "OPLOG_QUEUE_PRESSURE") {
+        return "oplog_writer";
+    }
+    if (StartsWith(code, "OPLOG_READ_") || code == "OPLOG_POLL_STALE" ||
+        StartsWith(code, "OPLOG_RECONNECT_")) {
+        return "oplog_reader";
+    }
+    if (StartsWith(code, "OPLOG_APPLY_") || code == "OPLOG_CATCHUP_STALLED" ||
+        code == "STANDBY_BEHIND_TRIM" || code == "OPLOG_TRIM_RISK" ||
+        StartsWith(code, "PROMOTION_")) {
+        return "oplog_applier";
+    }
+    if (StartsWith(code, "ELECTION_WATCH_")) {
+        return "leader_watch";
+    }
+    if (StartsWith(code, "ELECTION_") || code == "LEADERSHIP_LOST" ||
+        code == "MASTER_VIEW_MISMATCH") {
+        return "leader_election";
+    }
+    if (StartsWith(code, "SNAPSHOT_") ||
+        StartsWith(code, "STANDBY_SNAPSHOT_")) {
+        return "snapshot";
+    }
+    if (StartsWith(code, "REGISTRY_")) {
+        return "registry_heartbeat";
+    }
+    return "ha";
+}
+
+std::string IssueSeverity(const std::string& code) {
+    if (code == "ELECTION_UNSTABLE" || code == "MASTER_VIEW_MISMATCH" ||
+        code == "STANDBY_SNAPSHOT_INSUFFICIENT" || code == "OPLOG_TRIM_RISK" ||
+        code == "OPLOG_QUEUE_PRESSURE" || code == "OPLOG_LATEST_STALLED" ||
+        code == "OPLOG_CATCHUP_STALLED" || code == "OPLOG_POLL_STALE" ||
+        code == "PROMOTION_CATCHUP_INCOMPLETE") {
+        return "warning";
+    }
+    return "error";
+}
+
+HADoctorIssue MakeDoctorIssue(std::string code, std::string message) {
+    HADoctorIssue issue;
+    issue.code = std::move(code);
+    issue.message = std::move(message);
+    issue.category = IssueCategory(issue.code);
+    issue.component = IssueComponent(issue.code);
+    issue.severity = IssueSeverity(issue.code);
+    return issue;
+}
+
 }  // namespace
 
 HAStatusManager& HAStatusManager::instance() {
@@ -543,49 +618,51 @@ std::string HAStatusManager::SerializeDoctorJson() const {
         if (status_.ha_enabled) {
             if (auto issue = ElectionUnstableMessageLocked(); !issue.empty()) {
                 report.issues.push_back(
-                    {"ELECTION_UNSTABLE", std::move(issue)});
+                    MakeDoctorIssue("ELECTION_UNSTABLE", std::move(issue)));
             }
             if (auto issue = MasterViewMismatchMessageLocked();
                 !issue.empty()) {
                 report.issues.push_back(
-                    {"MASTER_VIEW_MISMATCH", std::move(issue)});
+                    MakeDoctorIssue("MASTER_VIEW_MISMATCH", std::move(issue)));
             }
             if (auto issue = StandbySnapshotInsufficientMessageLocked();
                 !issue.empty()) {
-                report.issues.push_back(
-                    {"STANDBY_SNAPSHOT_INSUFFICIENT", std::move(issue)});
+                report.issues.push_back(MakeDoctorIssue(
+                    "STANDBY_SNAPSHOT_INSUFFICIENT", std::move(issue)));
             }
             if (auto issue = StandbyBehindTrimMessageLocked(); !issue.empty()) {
                 report.issues.push_back(
-                    {"STANDBY_BEHIND_TRIM", std::move(issue)});
+                    MakeDoctorIssue("STANDBY_BEHIND_TRIM", std::move(issue)));
             } else if (auto issue = OpLogTrimRiskMessageLocked();
                        !issue.empty()) {
-                report.issues.push_back({"OPLOG_TRIM_RISK", std::move(issue)});
+                report.issues.push_back(
+                    MakeDoctorIssue("OPLOG_TRIM_RISK", std::move(issue)));
             }
             for (const auto& [code, message] : doctor_issues_) {
-                report.issues.push_back({code, message});
+                report.issues.push_back(MakeDoctorIssue(code, message));
             }
             if (auto issue = OpLogQueuePressureMessageLocked();
                 !issue.empty()) {
                 report.issues.push_back(
-                    {"OPLOG_QUEUE_PRESSURE", std::move(issue)});
+                    MakeDoctorIssue("OPLOG_QUEUE_PRESSURE", std::move(issue)));
             }
             if (auto stall = OpLogLatestStallMessageLocked(); !stall.empty()) {
                 report.issues.push_back(
-                    {"OPLOG_LATEST_STALLED", std::move(stall)});
+                    MakeDoctorIssue("OPLOG_LATEST_STALLED", std::move(stall)));
             }
             if (auto stall = OpLogCatchUpStallMessageLocked(); !stall.empty()) {
                 report.issues.push_back(
-                    {"OPLOG_CATCHUP_STALLED", std::move(stall)});
+                    MakeDoctorIssue("OPLOG_CATCHUP_STALLED", std::move(stall)));
             }
             if (auto issue = OpLogPollStaleMessageLocked(); !issue.empty()) {
-                report.issues.push_back({"OPLOG_POLL_STALE", std::move(issue)});
+                report.issues.push_back(
+                    MakeDoctorIssue("OPLOG_POLL_STALE", std::move(issue)));
             }
             if (status_.state == "FAILED") {
-                report.issues.push_back(
-                    {"HA_FAILED", status_.last_error.empty()
-                                      ? "HA failed, role=" + status_.role
-                                      : status_.last_error});
+                report.issues.push_back(MakeDoctorIssue(
+                    "HA_FAILED", status_.last_error.empty()
+                                     ? "HA failed, role=" + status_.role
+                                     : status_.last_error));
             }
             if (!report.issues.empty()) {
                 report.status = "degraded";
@@ -637,6 +714,11 @@ HAStatusSnapshot HAStatusManager::BuildSnapshotLocked(int64_t now_ms) const {
         oplog_writer_.committed_sequence_id;
     snapshot.oplog_last_successful_poll_timestamp_ms =
         oplog_poll_.last_success_ms;
+    snapshot.registry_heartbeat_last_success_timestamp_ms =
+        snapshot.registry_heartbeat_last_success_ms;
+    snapshot.registry_heartbeat_last_failure_timestamp_ms =
+        snapshot.registry_heartbeat_last_failure_ms;
+    snapshot.status_updated_at_ms = snapshot.updated_at_ms;
     if (oplog_poll_.last_success_ms > 0) {
         snapshot.oplog_poll_success_age_ms =
             std::max<int64_t>(0, now_ms - oplog_poll_.last_success_ms);

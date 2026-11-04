@@ -79,6 +79,10 @@ The older fields `applied_sequence_id`, `latest_sequence_id`,
 `master_view_endpoint` and `master_view_updated_at_ms` are clearer aliases for
 `master_view_address` and `master_view_timestamp_ms`. `master_view_age_ms` and
 `master_view_expires_in_ms` are computed from the cached view timestamp and TTL.
+`registry_heartbeat_last_success_timestamp_ms`,
+`registry_heartbeat_last_failure_timestamp_ms`, and `status_updated_at_ms` are
+clearer aliases for `registry_heartbeat_last_success_ms`,
+`registry_heartbeat_last_failure_ms`, and `updated_at_ms`.
 
 #### `/ha/doctor`
 
@@ -87,7 +91,7 @@ port as `/ha/status`. It does not probe Redis or other nodes while handling the
 request.
 
 ```json
-{"status":"degraded","issues":[{"code":"OPLOG_WRITE_FAILED","message":"seq=123: Redis command failed"}]}
+{"status":"degraded","issues":[{"code":"OPLOG_WRITE_FAILED","message":"seq=123: Redis command failed","category":"oplog","component":"oplog_writer","severity":"error"}]}
 ```
 
 - `ok`: the primary is running or a standby is watching, and no active issue is
@@ -101,9 +105,12 @@ request.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
   recorded failure. This endpoint is not a readiness or cluster health check.
 
-An empty issue list is `[]`. Each issue contains only a stable `code` and a
-`message`; successful operations clear the corresponding issue, repeated issues
-replace their previous message instead of accumulating, and a new HA round clears
+An empty issue list is `[]`. Each issue contains a stable `code` and `message`,
+plus `category`, `component`, and `severity` for grouping. `severity` is
+`error` for recorded failures and `warning` for derived risks, pressure, stale
+progress, or mismatch diagnoses. Successful operations clear the corresponding
+issue, repeated issues replace their previous message instead of accumulating,
+and a new HA round clears
 active issues from the preceding round, while retaining the election instability
 window described below. OpLog holes, sequence lag, catch-up, optional
 snapshot fallback, and historical `last_error` alone are not failures. The
