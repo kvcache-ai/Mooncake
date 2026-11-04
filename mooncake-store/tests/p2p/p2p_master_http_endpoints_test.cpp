@@ -323,6 +323,9 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
     EXPECT_EQ(body["master_view_epoch"].asUInt64(), 7u);
     EXPECT_EQ(body["master_view_timestamp_ms"].asInt64(), 123456789);
     EXPECT_EQ(body["master_view_ttl_sec"].asInt64(), 4);
+    // A freshly set/refreshed master_view has positive remaining lease; the
+    // old fixed-timestamp computation drifted negative under renewals.
+    EXPECT_GT(body["master_view_expires_in_ms"].asInt64(), 0);
     EXPECT_EQ(body["master_view_instance_id"].asString(), "candidate-1");
     EXPECT_EQ(body["applied_sequence_id"].asUInt64(), 12u);
     EXPECT_EQ(body["oplog_applied_sequence_id"].asUInt64(), 12u);

@@ -139,6 +139,11 @@ class HAStatusManager {
     void SetMasterView(std::string address, uint64_t epoch,
                        int64_t timestamp_ms = 0, int64_t ttl_sec = 0,
                        std::string instance_id = "");
+    // Marks the master_view lease as freshly renewed/re-observed without
+    // changing the stored view. Called by the leader renewal loop so the
+    // reported remaining lease reflects the most recent TTL refresh rather
+    // than the original election timestamp.
+    void MarkMasterViewRefreshed();
     void SetSnapshotReady(bool snapshot_ready);
     void SetStandbySnapshotAvailability(uint32_t available, uint32_t required);
     void SetOpLogProgress(uint64_t applied_sequence_id,
@@ -175,6 +180,7 @@ class HAStatusManager {
     void ObserveLeaderLocked(const std::string& address, uint64_t epoch);
     std::string ElectionUnstableMessageLocked() const;
     std::string MasterViewMismatchMessageLocked() const;
+    std::string MasterViewLeaseExpiredMessageLocked() const;
     std::string StandbySnapshotInsufficientMessageLocked() const;
     std::string StandbyBehindTrimMessageLocked() const;
     std::string OpLogTrimRiskMessageLocked() const;
@@ -185,6 +191,10 @@ class HAStatusManager {
 
     mutable std::mutex mutex_;
     HAStatusSnapshot status_;
+    // When the master_view was last refreshed locally: set on every
+    // SetMasterView call (election/observation) and on lease renewal. Basis
+    // for master_view_expires_in_ms instead of the fixed election timestamp.
+    int64_t master_view_refreshed_at_ms_{0};
     std::map<std::string, std::string> doctor_issues_;
     // Survives supervisor rounds; the first observation only establishes a
     // baseline.

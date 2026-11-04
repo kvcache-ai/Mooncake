@@ -689,6 +689,9 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
         }
 
         HAStatusManager::instance().SetDoctorIssue("LEADERSHIP_LOST");
+        // Refresh the reported remaining lease so /ha/status does not drift
+        // negative under ongoing renewals.
+        HAStatusManager::instance().MarkMasterViewRefreshed();
         WaitForKeepAliveCancellation(
             std::chrono::seconds(heartbeat_interval_sec_));
     }

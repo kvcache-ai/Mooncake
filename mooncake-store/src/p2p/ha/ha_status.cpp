@@ -187,6 +187,7 @@ HAStatusManager::HAStatusManager() { TouchLocked(); }
 void HAStatusManager::Reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     status_ = HAStatusSnapshot{};
+    master_view_refreshed_at_ms_ = 0;
     election_ = {};
     doctor_issues_.clear();
     oplog_writer_ = {};
@@ -298,7 +299,18 @@ void HAStatusManager::SetMasterView(std::string address, uint64_t epoch,
     status_.master_view_timestamp_ms = timestamp_ms;
     status_.master_view_ttl_sec = ttl_sec;
     status_.master_view_instance_id = std::move(instance_id);
+    master_view_refreshed_at_ms_ = NowMs();
     TouchLocked();
+}
+
+void HAStatusManager::MarkMasterViewRefreshed() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Only refresh an active view; avoids carrying a stale refresh base for a
+    // non-existent leader.
+    if (status_.master_view_ttl_sec > 0) {
+        master_view_refreshed_at_ms_ = NowMs();
+        TouchLocked();
+    }
 }
 
 void HAStatusManager::ObserveLeaderLocked(const std::string& address,
@@ -366,6 +378,39 @@ std::string HAStatusManager::MasterViewMismatchMessageLocked() const {
            (status_.master_view_instance_id.empty()
                 ? "<empty>"
                 : status_.master_view_instance_id) +
+           ", view_epoch=" + std::to_string(status_.master_view_epoch);
+}
+
+std::string HAStatusManager::MasterViewLeaseExpiredMessageLocked() const {
+    if (!status_.ha_enabled || status_.role != "primary" ||
+        status_.state != "RUNNING") {
+        return {};
+    }
+    // The renew-failure path already reports LEADERSHIP_LOST; suppress here so
+    // this issue only surfaces the sticky-loop blind spot where renewal never
+    // reached the failure branch.
+    if (doctor_issues_.find("LEADERSHIP_LOST") != doctor_issues_.end()) {
+        return {};
+    }
+    if (status_.master_view_ttl_sec <= 0 || master_view_refreshed_at_ms_ <= 0) {
+        return {};
+    }
+    const auto now_ms = NowMs();
+    const int64_t expires_in_ms = master_view_refreshed_at_ms_ +
+                                  status_.master_view_ttl_sec * 1000 - now_ms;
+    // Grace below zero absorbs short clock jitter; normal renewals keep the
+    // value comfortably positive because heartbeat < ttl.
+    constexpr int64_t kGraceMs = 1000;
+    if (expires_in_ms > -kGraceMs) {
+        return {};
+    }
+    return "primary master_view lease expired: expires_in_ms=" +
+           std::to_string(expires_in_ms) + ", last_refresh_age_ms=" +
+           std::to_string(now_ms - master_view_refreshed_at_ms_) +
+           ", ttl_sec=" + std::to_string(status_.master_view_ttl_sec) +
+           ", view=" +
+           (status_.master_view_address.empty() ? "<empty>"
+                                                : status_.master_view_address) +
            ", view_epoch=" + std::to_string(status_.master_view_epoch);
 }
 
@@ -687,6 +732,11 @@ std::string HAStatusManager::SerializeDoctorJson() const {
                 report.issues.push_back(
                     MakeDoctorIssue("MASTER_VIEW_MISMATCH", std::move(issue)));
             }
+            if (auto issue = MasterViewLeaseExpiredMessageLocked();
+                !issue.empty()) {
+                report.issues.push_back(MakeDoctorIssue(
+                    "MASTER_VIEW_LEASE_EXPIRED", std::move(issue)));
+            }
             if (auto issue = StandbySnapshotInsufficientMessageLocked();
                 !issue.empty()) {
                 report.issues.push_back(MakeDoctorIssue(
@@ -756,9 +806,17 @@ HAStatusSnapshot HAStatusManager::BuildSnapshotLocked(int64_t now_ms) const {
     if (snapshot.master_view_timestamp_ms > 0) {
         snapshot.master_view_age_ms =
             std::max<int64_t>(0, now_ms - snapshot.master_view_timestamp_ms);
-        if (snapshot.master_view_ttl_sec > 0) {
+        // The leader renews the master_view key TTL without rewriting the
+        // stored election timestamp, so using that timestamp for the
+        // remaining lease would drift negative under normal renewals. Use
+        // the most recent local refresh (election, observation, or lease
+        // renewal) instead: it advances while the leader is healthy and
+        // freezes once observation stops, so a negative value signals a
+        // stale/expired view rather than normal operation.
+        if (snapshot.master_view_ttl_sec > 0 &&
+            master_view_refreshed_at_ms_ > 0) {
             snapshot.master_view_expires_in_ms =
-                snapshot.master_view_timestamp_ms +
+                master_view_refreshed_at_ms_ +
                 snapshot.master_view_ttl_sec * 1000 - now_ms;
         }
     }

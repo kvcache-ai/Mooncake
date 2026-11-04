@@ -31,6 +31,11 @@ struct HAStatusTestPeer {
         status.oplog_poll_.last_success_ms -=
             std::chrono::duration_cast<std::chrono::milliseconds>(age).count();
     }
+    static void AgeMasterViewRefresh(HAStatusManager& status,
+                                     std::chrono::milliseconds age) {
+        std::lock_guard<std::mutex> lock(status.mutex_);
+        status.master_view_refreshed_at_ms_ -= age.count();
+    }
 };
 
 class HAStatusTest : public ::testing::Test {
@@ -274,6 +279,82 @@ TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
     EXPECT_FALSE(snapshot.oplog_latest_read_ok);
     EXPECT_EQ(snapshot.oplog_lag, 2u);
     EXPECT_EQ(snapshot.oplog_apply_lag, 2u);
+}
+
+TEST_F(HAStatusTest, DoctorFlagsMasterViewLeaseExpiredForStuckPrimary) {
+    status.SetInstanceId("local-instance");
+    status.SetMasterView("local", 7, /*timestamp_ms=*/1, /*ttl_sec=*/2,
+                         "local-instance");
+    status.SetRoleState("primary", "RUNNING");
+
+    // Freshly refreshed lease: no expiry issue.
+    EXPECT_EQ(FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED"), nullptr);
+
+    // Simulate a stuck renewal loop: no refresh for longer than the TTL (plus
+    // the grace window). The lease has elapsed without LEADERSHIP_LOST firing.
+    HAStatusTestPeer::AgeMasterViewRefresh(status,
+                                           std::chrono::milliseconds(4000));
+    const auto* issue = FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_NE(issue->message.find("expires_in_ms=-"), std::string::npos);
+    EXPECT_NE(issue->message.find("view_epoch=7"), std::string::npos);
+
+    // The renew-failure path already raises LEADERSHIP_LOST; that should mask
+    // this time-based issue to avoid a duplicate alarm.
+    status.SetDoctorIssue("LEADERSHIP_LOST",
+                          "Leadership renewal failed or lost");
+    EXPECT_EQ(FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED"), nullptr);
+}
+
+TEST_F(HAStatusTest, MasterViewLeaseExpiredDoctorIsGraceBoundedAndSelfHealing) {
+    status.SetInstanceId("local-instance");
+    status.SetMasterView("local", 7, /*timestamp_ms=*/1, /*ttl_sec=*/2,
+                         "local-instance");
+    status.SetRoleState("primary", "RUNNING");
+
+    // Past the lease but still inside the grace window: not yet flagged.
+    HAStatusTestPeer::AgeMasterViewRefresh(status,
+                                           std::chrono::milliseconds(2500));
+    EXPECT_EQ(FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED"), nullptr);
+
+    // Crossing the grace threshold once the lap is real flags it.
+    HAStatusTestPeer::AgeMasterViewRefresh(status,
+                                           std::chrono::milliseconds(2000));
+    EXPECT_NE(FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED"), nullptr);
+
+    // A successful renewal refreshes the base and the issue self-heals
+    // (recomputed each poll, not a sticky SetDoctorIssue).
+    status.MarkMasterViewRefreshed();
+    EXPECT_EQ(FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED"), nullptr);
+}
+
+TEST_F(HAStatusTest, MasterViewLeaseExpiredDoctorIsPrimaryOnly) {
+    status.SetInstanceId("local-instance");
+    status.SetMasterView("local", 7, /*timestamp_ms=*/1, /*ttl_sec=*/2,
+                         "local-instance");
+    status.SetRoleState("standby", "WATCHING");
+    HAStatusTestPeer::AgeMasterViewRefresh(status,
+                                           std::chrono::milliseconds(5000));
+    EXPECT_EQ(FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED"), nullptr);
+}
+
+TEST_F(HAStatusTest, MasterViewExpiryFollowsLeaseRenewalNotElectionTime) {
+    // Simulate a long-running leader elected at a prehistoric timestamp with
+    // a small TTL. The old fixed-timestamp formula reported a deeply negative
+    // remaining lease; the refresh-based value must track renewals and stay
+    // positive instead.
+    status.SetMasterView("local", 7, /*timestamp_ms=*/1, /*ttl_sec=*/5,
+                         "local-instance");
+    EXPECT_EQ(status.Snapshot().master_view_timestamp_ms, 1);
+    auto after_election = status.Snapshot();
+    EXPECT_GT(after_election.master_view_expires_in_ms, 0);
+
+    // Renewing the lease (as KeepLeader does) must keep the remaining lease
+    // positive and anchored to the renewal, not the stale election timestamp.
+    status.MarkMasterViewRefreshed();
+    auto after_renew = status.Snapshot();
+    EXPECT_GT(after_renew.master_view_expires_in_ms, 0);
+    EXPECT_EQ(after_renew.master_view_timestamp_ms, 1);
 }
 
 TEST_F(HAStatusTest, DoctorContextMirrorsCurrentStatusSnapshot) {
