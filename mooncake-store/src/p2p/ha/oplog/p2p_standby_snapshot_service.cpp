@@ -26,6 +26,7 @@ namespace {
 constexpr auto kSnapshotSessionIdleTimeout = std::chrono::minutes(5);
 constexpr auto kSnapshotSessionCleanupInterval = std::chrono::minutes(1);
 constexpr int kSnapshotChunkMaxRetries = 3;
+constexpr auto kSnapshotConnectTimeout = std::chrono::seconds(5);
 constexpr auto kSnapshotChunkRetryInitialBackoff =
     std::chrono::milliseconds(200);
 constexpr auto kSnapshotChunkRetryMaxBackoff = std::chrono::milliseconds(2000);
@@ -327,7 +328,7 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
 
     coro_rpc::coro_rpc_client client;
     auto connect_error = async_simple::coro::syncAwait(
-        client.connect(host, port, std::chrono::seconds(5)));
+        client.connect(host, port, kSnapshotConnectTimeout));
     if (connect_error) {
         LOG(WARNING) << "Standby snapshot: connect failed"
                      << ", endpoint=" << endpoint
@@ -360,6 +361,20 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
 
     ErrorCode result = ErrorCode::OK;
     uint32_t chunk_retries = 0;
+    auto reconnect_snapshot_client = [&]() {
+        auto reconnect_error = async_simple::coro::syncAwait(
+            client.connect(host, port, kSnapshotConnectTimeout));
+        if (reconnect_error) {
+            LOG(WARNING) << "Standby snapshot: reconnect failed"
+                         << ", endpoint=" << endpoint
+                         << ", session_id=" << session_id
+                         << ", error=" << reconnect_error.message();
+            return false;
+        }
+        VLOG(1) << "Standby snapshot: reconnected"
+                << ", endpoint=" << endpoint << ", session_id=" << session_id;
+        return true;
+    };
     // Retry transient RPC failures on the same session_id + offset before
     // giving up, so a single network blip does not abort the whole bootstrap.
     auto fetch_chunk_with_retry =
@@ -372,10 +387,12 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
             if (chunk && fromInt(chunk->error_code) == ErrorCode::OK) {
                 return std::optional(std::move(*chunk));
             }
-            result = chunk ? fromInt(chunk->error_code) : ErrorCode::RPC_FAIL;
-            const bool transient = result == ErrorCode::RPC_FAIL ||
-                                   result == ErrorCode::INTERNAL_ERROR;
+            const ErrorCode chunk_error =
+                chunk ? fromInt(chunk->error_code) : ErrorCode::RPC_FAIL;
+            const bool transient = chunk_error == ErrorCode::RPC_FAIL ||
+                                   chunk_error == ErrorCode::INTERNAL_ERROR;
             if (!transient || attempt == kSnapshotChunkMaxRetries) {
+                result = chunk_error;
                 LOG(WARNING) << "Standby snapshot: GetSnapshotChunk failed"
                              << ", endpoint=" << endpoint
                              << ", session_id=" << session_id
@@ -394,11 +411,14 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
                     << ", session_id=" << session_id
                     << ", object_offset=" << object_offset
                     << ", client_offset=" << client_offset
-                    << ", error=" << toString(result)
+                    << ", error=" << toString(chunk_error)
                     << ", retry=" << attempt + 1 << "/"
                     << kSnapshotChunkMaxRetries
                     << ", backoff_ms=" << backoff.count();
             std::this_thread::sleep_for(backoff);
+            if (chunk_error == ErrorCode::RPC_FAIL) {
+                reconnect_snapshot_client();
+            }
         }
         return std::nullopt;
     };

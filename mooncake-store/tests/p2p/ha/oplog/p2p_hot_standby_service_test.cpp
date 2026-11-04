@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <xxhash.h>
+#include <ylt/util/utils.hpp>
 
 #include "p2p/ha/oplog/localfs_oplog_store.h"
 #include "mock_oplog_store.h"
@@ -135,6 +136,79 @@ void InjectNotifierErrors(const std::shared_ptr<ControlledNotifierState>& state,
     }
     state->cv.notify_all();
 }
+
+class FlakySnapshotRpcService {
+   public:
+    BeginStandbySnapshotResponse BeginSnapshot(
+        const BeginStandbySnapshotRequest& request) {
+        BeginStandbySnapshotResponse response;
+        if (request.cluster_id != kClusterId) {
+            response.error_code = toInt(ErrorCode::INVALID_PARAMS);
+            return response;
+        }
+        response.session_id = kSessionId;
+        response.baseline_sequence_id = kBaselineSequenceId;
+        response.object_count = 1;
+        response.client_count = 1;
+        return response;
+    }
+
+    StandbySnapshotChunkResponse GetSnapshotChunk(
+        const StandbySnapshotChunkRequest& request) {
+        EXPECT_EQ(request.session_id, kSessionId);
+        EXPECT_EQ(request.object_offset, 0u);
+        EXPECT_EQ(request.client_offset, 0u);
+        ++chunk_requests;
+        if (fail_first_chunk.exchange(false)) {
+            StandbySnapshotChunkResponse response;
+            response.error_code = toInt(ErrorCode::INTERNAL_ERROR);
+            return response;
+        }
+
+        StandbySnapshotChunkResponse response;
+        response.done = true;
+        response.next_object_offset = 1;
+        response.next_client_offset = 1;
+
+        P2PStandbyClientInfo client;
+        client.client_id = kClientId;
+        client.ip_address = "127.0.0.1";
+        client.rpc_port = 50051;
+        client.segments.push_back(kSegment);
+        response.clients.push_back({kClientId, std::move(client)});
+
+        P2PStandbyRouteEntry route;
+        route.object_size = kObjectSize;
+        route.last_sequence_id = kBaselineSequenceId;
+        response.objects.push_back({kObjectKey, std::move(route)});
+        return response;
+    }
+
+    int32_t EndSnapshot(const EndStandbySnapshotRequest& request) {
+        EXPECT_EQ(request.session_id, kSessionId);
+        ++end_requests;
+        return toInt(ErrorCode::OK);
+    }
+
+    static constexpr const char* kClusterId = "p2p-hot-standby-test";
+    static constexpr uint64_t kBaselineSequenceId = 123;
+    static constexpr size_t kObjectSize = 8192;
+    static inline const std::string kSessionId = "flaky-session";
+    static inline const std::string kObjectKey = "flaky-snapshot-key";
+    static inline const UUID kClientId{101, 101};
+    static inline const UUID kSegmentId{102, 102};
+    static inline const P2PSegment kSegment{
+        .id = kSegmentId,
+        .name = "segment-102-102",
+        .size = 1024 * 1024,
+        .priority = 1,
+        .tags = {},
+    };
+
+    std::atomic<bool> fail_first_chunk{true};
+    std::atomic<int> chunk_requests{0};
+    std::atomic<int> end_requests{0};
+};
 
 // Bind once on port 0 and keep the listener alive for the entire test. A
 // PID-derived port can be in use by another test or an outgoing connection.
@@ -343,6 +417,44 @@ TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
 
     target.Stop();
     source.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       SnapshotBootstrapSucceedsAfterTransientChunkError) {
+    FlakySnapshotRpcService rpc_service;
+    coro_rpc::coro_rpc_server server(1, 0, "127.0.0.1");
+    server.register_handler<&FlakySnapshotRpcService::BeginSnapshot>(
+        &rpc_service,
+        coro_rpc::func_id<&P2PStandbySnapshotService::BeginSnapshot>());
+    server.register_handler<&FlakySnapshotRpcService::GetSnapshotChunk>(
+        &rpc_service,
+        coro_rpc::func_id<&P2PStandbySnapshotService::GetSnapshotChunk>());
+    server.register_handler<&FlakySnapshotRpcService::EndSnapshot>(
+        &rpc_service,
+        coro_rpc::func_id<&P2PStandbySnapshotService::EndSnapshot>());
+    auto start_result = server.async_start();
+    ASSERT_FALSE(start_result.hasResult());
+
+    P2PStandbyMetadataStore target;
+    uint64_t baseline_sequence_id = 0;
+    P2PStandbySnapshotClient client;
+    const auto result = client.Bootstrap(
+        "127.0.0.1:" + std::to_string(server.port()), kClusterId, &target,
+        baseline_sequence_id, /*chunk_size=*/1);
+    server.stop();
+
+    EXPECT_EQ(result, ErrorCode::OK);
+    EXPECT_EQ(baseline_sequence_id,
+              FlakySnapshotRpcService::kBaselineSequenceId);
+    EXPECT_EQ(rpc_service.chunk_requests.load(), 2);
+    EXPECT_EQ(rpc_service.end_requests.load(), 1);
+
+    auto exported = target.ExportMetadata();
+    ASSERT_NE(exported.clients.find(FlakySnapshotRpcService::kClientId),
+              exported.clients.end());
+    auto object = exported.routes.find(FlakySnapshotRpcService::kObjectKey);
+    ASSERT_NE(object, exported.routes.end());
+    EXPECT_EQ(object->second.object_size, FlakySnapshotRpcService::kObjectSize);
 }
 
 TEST_F(P2PHotStandbyServiceTest,
