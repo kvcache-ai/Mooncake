@@ -191,6 +191,13 @@ int P2PMaster::RunStandalone() {
 int P2PMaster::RunWithHA() {
     HAStatusManager::instance().Configure(/*ha_enabled=*/true,
                                           config_.cluster_id, "");
+#ifdef STORE_USE_REDIS
+    std::string master_instance_id;
+    if (config_.oplog.enabled &&
+        config_.ha.election_backend == ElectionBackend::REDIS) {
+        master_instance_id = GenerateMasterInstanceId();
+    }
+#endif  // STORE_USE_REDIS
     const std::string local_endpoint =
         config_.rpc.address + ":" + std::to_string(config_.rpc.port);
     std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
@@ -205,7 +212,7 @@ int P2PMaster::RunWithHA() {
                 config_.redis.password, config_.redis.db_index,
                 config_.redis.master_view_ttl_seconds,
                 config_.redis.heartbeat_interval_seconds,
-                config_.redis.username);
+                config_.redis.username, master_instance_id);
             connect_result = redis_view->Connect();
             master_view = std::move(redis_view);
 #else
@@ -232,8 +239,6 @@ int P2PMaster::RunWithHA() {
         std::string p2p_snapshot_endpoint;
         if (config_.oplog.enabled &&
             config_.ha.election_backend == ElectionBackend::REDIS) {
-            master_instance_id = GenerateMasterInstanceId();
-            HAStatusManager::instance().SetInstanceId(master_instance_id);
             RedisMasterRegistryEntry entry;
             entry.instance_id = master_instance_id;
             entry.master_endpoint = local_endpoint;

@@ -38,7 +38,8 @@ class RedisElectionHelper {
                         const std::string& redis_endpoint,
                         const std::string& password = "", int db_index = 0,
                         int ttl_sec = 4, int heartbeat_interval_sec = 1,
-                        const std::string& username = "");
+                        const std::string& username = "",
+                        const std::string& instance_id = "");
     ~RedisElectionHelper();
 
     RedisElectionHelper(const RedisElectionHelper&) = delete;
@@ -203,6 +204,7 @@ class RedisElectionHelper {
 
     int ttl_sec_ = 4;                 // redis_master_view_ttl_sec
     int heartbeat_interval_sec_ = 1;  // KeepLeader renewal interval
+    std::string instance_id_;          // Stable Redis master instance ID
     int connect_timeout_ms_ = 5000;
     int command_timeout_ms_ = 3000;
 

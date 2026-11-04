@@ -15,6 +15,7 @@
 #include <sstream>
 
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 
 namespace mooncake {
 
@@ -37,7 +38,7 @@ class ScopeGuard {
     std::function<void()> callback_;
 };
 
-std::string GenerateCandidateId() {
+std::string GenerateInstanceId() {
     std::random_device random;
     std::mt19937_64 generator(random());
     std::ostringstream stream;
@@ -69,7 +70,9 @@ std::string FormatPollLeaderError(const redisContext* context,
 }
 
 bool ParseElectionValue(const std::string& value, std::string& address,
-                        ViewVersionId& epoch, std::string* candidate_id) {
+                        ViewVersionId& epoch, std::string* instance_id,
+                        int64_t* timestamp_ms = nullptr,
+                        int64_t* ttl_sec = nullptr) {
     Json::Value root;
     Json::CharReaderBuilder builder;
     std::istringstream stream(value);
@@ -86,12 +89,28 @@ bool ParseElectionValue(const std::string& value, std::string& address,
 
     address = root["address"].asString();
     epoch = root["epoch"].asInt64();
-    if (candidate_id) {
-        if (!root.isMember("candidate_id") ||
-            !root["candidate_id"].isString()) {
-            return false;
+    if (instance_id) {
+        instance_id->clear();
+        if (root.isMember("instance_id")) {
+            if (!root["instance_id"].isString()) {
+                return false;
+            }
+            *instance_id = root["instance_id"].asString();
         }
-        *candidate_id = root["candidate_id"].asString();
+    }
+    if (timestamp_ms) {
+        *timestamp_ms = 0;
+        if (root.isMember("ts")) {
+            if (!root["ts"].isIntegral()) return false;
+            *timestamp_ms = root["ts"].asInt64();
+        }
+    }
+    if (ttl_sec) {
+        *ttl_sec = 0;
+        if (root.isMember("ttl")) {
+            if (!root["ttl"].isIntegral()) return false;
+            *ttl_sec = root["ttl"].asInt64();
+        }
     }
     return true;
 }
@@ -107,13 +126,15 @@ RedisElectionHelper::RedisElectionHelper(const std::string& cluster_id,
                                          const std::string& password,
                                          int db_index, int ttl_sec,
                                          int heartbeat_interval_sec,
-                                         const std::string& username)
+                                         const std::string& username,
+                                         const std::string& instance_id)
     : redis_endpoint_(redis_endpoint),
       username_(username),
       password_(password),
       db_index_(db_index),
       ttl_sec_(ttl_sec),
       heartbeat_interval_sec_(heartbeat_interval_sec),
+      instance_id_(instance_id.empty() ? GenerateInstanceId() : instance_id),
       cluster_id_(cluster_id) {
     const std::string& cid = cluster_id_;
     // Use {cid} with braces as hash tag for Redis cluster slot affinity
@@ -260,8 +281,16 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
         }
 
         std::string current_addr;
+        std::string current_instance_id;
+        int64_t current_timestamp_ms = 0;
+        int64_t current_ttl_sec = 0;
         ViewVersionId current_epoch = 0;
-        if (ParseLeaderValue(existing_value, current_addr, current_epoch)) {
+        if (ParseElectionValue(existing_value, current_addr, current_epoch,
+                               &current_instance_id, &current_timestamp_ms,
+                               &current_ttl_sec)) {
+            HAStatusManager::instance().SetMasterView(
+                current_addr, current_epoch, current_timestamp_ms,
+                current_ttl_sec, current_instance_id);
             LOG(INFO) << "ElectLeader: current leader=" << current_addr
                       << " epoch=" << current_epoch << ", waiting...";
         } else {
@@ -282,11 +311,11 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         "local epoch = redis.call('INCR', KEYS[2]) "
         "local value = cjson.encode({address=ARGV[1], epoch=epoch, "
         "  ts=tonumber(ARGV[2]), ttl=tonumber(ARGV[3]), "
-        "  candidate_id=ARGV[4]}) "
+        "  instance_id=ARGV[4]}) "
         "redis.call('SET', KEYS[1], value, 'EX', ARGV[3]) "
         "return {1, tostring(epoch), value}";
 
-    const std::string candidate_id = GenerateCandidateId();
+    const std::string& instance_id = instance_id_;
     const auto timestamp_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
@@ -296,8 +325,8 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         master_view_key_.data(), master_view_key_.size(),
         master_epoch_key_.data(), master_epoch_key_.size(),
         master_address.data(), master_address.size(),
-        static_cast<long long>(timestamp_ms), ttl_sec_, candidate_id.data(),
-        candidate_id.size()));
+        static_cast<long long>(timestamp_ms), ttl_sec_, instance_id.data(),
+        instance_id.size()));
 
     if (!reply) {
         HAMetricManager::instance().inc_election_failures();
@@ -320,12 +349,18 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         }
         std::string value(current->str, current->len);
         std::string address;
-        std::string stored_candidate_id;
+        std::string stored_instance_id;
+        int64_t stored_timestamp_ms = 0;
+        int64_t stored_ttl_sec = 0;
         ViewVersionId epoch = 0;
-        if (ParseElectionValue(value, address, epoch, &stored_candidate_id) &&
-            stored_candidate_id == candidate_id) {
+        if (ParseElectionValue(value, address, epoch, &stored_instance_id,
+                               &stored_timestamp_ms, &stored_ttl_sec) &&
+            stored_instance_id == instance_id) {
             out_epoch = epoch;
             our_value_ = std::move(value);
+            HAStatusManager::instance().SetMasterView(
+                address, epoch, stored_timestamp_ms, stored_ttl_sec,
+                stored_instance_id);
             LOG(WARNING) << "TryElectOnce: election script response was lost; "
                             "confirmed election after reconnect";
             return ElectionAttemptResult::ELECTED;
@@ -383,6 +418,16 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
         return ElectionAttemptResult::ERROR;
     }
     our_value_.assign(reply->element[2]->str, reply->element[2]->len);
+    int64_t written_timestamp_ms = 0;
+    int64_t written_ttl_sec = 0;
+    std::string address;
+    ViewVersionId parsed_epoch = 0;
+    if (ParseElectionValue(our_value_, address, parsed_epoch, nullptr,
+                           &written_timestamp_ms, &written_ttl_sec)) {
+        HAStatusManager::instance().SetMasterView(
+            master_address, parsed_epoch, written_timestamp_ms,
+            written_ttl_sec, instance_id);
+    }
     return ElectionAttemptResult::ELECTED;
 }
 
@@ -698,6 +743,15 @@ ErrorCode RedisElectionHelper::GetMasterView(std::string& master_address,
     if (reply->type == REDIS_REPLY_STRING) {
         std::string value(reply->str, reply->len);
         if (ParseLeaderValue(value, master_address, version)) {
+            std::string instance_id;
+            int64_t timestamp_ms = 0;
+            int64_t ttl_sec = 0;
+            if (ParseElectionValue(value, master_address, version, &instance_id,
+                                   &timestamp_ms, &ttl_sec)) {
+                HAStatusManager::instance().SetMasterView(
+                    master_address, version, timestamp_ms, ttl_sec,
+                    instance_id);
+            }
             return ErrorCode::OK;
         }
         LOG(ERROR) << "GetMasterView: failed to parse leader value: " << value;

@@ -115,7 +115,7 @@ void HAStatusManager::SetLeader(std::string leader_endpoint, uint64_t epoch) {
 
 void HAStatusManager::SetMasterView(std::string address, uint64_t epoch,
                                     int64_t timestamp_ms, int64_t ttl_sec,
-                                    std::string candidate_id) {
+                                    std::string instance_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     status_.leader_endpoint = address;
     status_.epoch = epoch;
@@ -123,7 +123,7 @@ void HAStatusManager::SetMasterView(std::string address, uint64_t epoch,
     status_.master_view_epoch = epoch;
     status_.master_view_timestamp_ms = timestamp_ms;
     status_.master_view_ttl_sec = ttl_sec;
-    status_.master_view_candidate_id = std::move(candidate_id);
+    status_.master_view_instance_id = std::move(instance_id);
     TouchLocked();
 }
 

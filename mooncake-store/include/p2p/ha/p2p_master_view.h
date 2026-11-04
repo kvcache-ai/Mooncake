@@ -50,7 +50,8 @@ class P2PRedisMasterView final : public P2PMasterView {
                        const std::string& redis_endpoint,
                        const std::string& password, int db_index,
                        int ttl_seconds, int heartbeat_interval_seconds,
-                       const std::string& username = "");
+                       const std::string& username = "",
+                       const std::string& instance_id = "");
 
     ErrorCode Connect();
     void ElectLeader(const std::string& master_address, ViewVersionId& version,

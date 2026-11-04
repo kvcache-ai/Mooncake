@@ -23,7 +23,7 @@ struct HAStatusSnapshot {
     uint64_t master_view_epoch{0};
     int64_t master_view_timestamp_ms{0};
     int64_t master_view_ttl_sec{0};
-    std::string master_view_candidate_id;
+    std::string master_view_instance_id;
     uint64_t applied_sequence_id{0};
     uint64_t latest_sequence_id{0};
     uint64_t trimmed_sequence_id{0};
@@ -40,7 +40,7 @@ struct HAStatusSnapshot {
     YLT_REFL(HAStatusSnapshot, ha_enabled, cluster_id, local_endpoint, role,
              state, instance_id, leader_endpoint, epoch, master_view_address,
              master_view_epoch, master_view_timestamp_ms, master_view_ttl_sec,
-             master_view_candidate_id, applied_sequence_id, latest_sequence_id,
+             master_view_instance_id, applied_sequence_id, latest_sequence_id,
              trimmed_sequence_id, gc_cursor_sequence_id, oplog_lag,
              snapshot_ready, registry_heartbeat_ok,
              registry_heartbeat_last_success_ms,
@@ -63,7 +63,7 @@ class HAStatusManager {
     void SetLeader(std::string leader_endpoint, uint64_t epoch);
     void SetMasterView(std::string address, uint64_t epoch,
                        int64_t timestamp_ms = 0, int64_t ttl_sec = 0,
-                       std::string candidate_id = "");
+                       std::string instance_id = "");
     void SetSnapshotReady(bool snapshot_ready);
     void SetOpLogProgress(uint64_t applied_sequence_id,
                           uint64_t latest_sequence_id,

@@ -288,7 +288,7 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
     status.SetMasterView("127.0.0.1:50051", 7,
                          /*timestamp_ms=*/123456789,
                          /*ttl_sec=*/4,
-                         /*candidate_id=*/"candidate-1");
+                         /*instance_id=*/"candidate-1");
     status.SetOpLogProgress(/*applied_sequence_id=*/12,
                            /*latest_sequence_id=*/15,
                            /*trimmed_sequence_id=*/3,
@@ -311,7 +311,7 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
     EXPECT_EQ(body["master_view_epoch"].asUInt64(), 7u);
     EXPECT_EQ(body["master_view_timestamp_ms"].asInt64(), 123456789);
     EXPECT_EQ(body["master_view_ttl_sec"].asInt64(), 4);
-    EXPECT_EQ(body["master_view_candidate_id"].asString(), "candidate-1");
+    EXPECT_EQ(body["master_view_instance_id"].asString(), "candidate-1");
     EXPECT_EQ(body["applied_sequence_id"].asUInt64(), 12u);
     EXPECT_EQ(body["latest_sequence_id"].asUInt64(), 15u);
     EXPECT_EQ(body["trimmed_sequence_id"].asUInt64(), 3u);

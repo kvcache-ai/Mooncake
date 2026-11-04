@@ -140,7 +140,35 @@ TEST_F(RedisElectionHelperTest, ElectLeaderAndGetMasterView) {
     RedisReplyPtr raw((redisReply*)redisCommand(
         ctx, "GET %b", master_view_key.data(), master_view_key.size()));
     ASSERT_TRUE(raw && raw->type == REDIS_REPLY_STRING);
-    EXPECT_NE(std::string(raw->str, raw->len).find("candidate_id"),
+    EXPECT_NE(std::string(raw->str, raw->len).find("instance_id"),
+              std::string::npos);
+    redisFree(ctx);
+}
+
+TEST_F(RedisElectionHelperTest, ElectLeaderUsesConfiguredInstanceId) {
+    const std::string instance_id = "master-instance-for-election";
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username, instance_id);
+    ASSERT_EQ(ErrorCode::OK, helper.Connect());
+
+    ViewVersionId version = 0;
+    int lease_id = 0;
+    helper.ElectLeader("10.0.0.10:50051", version, lease_id);
+    ASSERT_GT(version, 0u);
+    ASSERT_GT(lease_id, 0);
+
+    auto [host, port] = ParseRedisEndpoint();
+    redisContext* ctx = redisConnect(host.c_str(), port);
+    ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,
+                                         FLAGS_redis_password));
+    std::string master_view_key =
+        "mooncake:{" + FLAGS_cluster_id + "}:master_view";
+    RedisReplyPtr raw((redisReply*)redisCommand(
+        ctx, "GET %b", master_view_key.data(), master_view_key.size()));
+    ASSERT_TRUE(raw && raw->type == REDIS_REPLY_STRING);
+    const std::string value(raw->str, raw->len);
+    EXPECT_NE(value.find("\"instance_id\":\"" + instance_id + "\""),
               std::string::npos);
     redisFree(ctx);
 }
