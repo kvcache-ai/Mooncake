@@ -56,6 +56,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
     offload_teardown_test PRIVATE
     "LINKER:--wrap=_ZN8mooncake6Client21unregisterLocalMemoryEPvb")
 endif()
+add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
@@ -408,6 +409,15 @@ add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
+add_store_test(kvcs_object_storage_adapter_test
+               kvcs_object_storage_adapter_test.cpp)
+if(NOT MOONCAKE_KVCS_SDK_FOUND)
+  target_compile_definitions(kvcs_object_storage_adapter_test
+                             PRIVATE MOONCAKE_KVCS_TEST_NO_SDK=1)
+else()
+  target_compile_definitions(kvcs_object_storage_adapter_test
+                             PRIVATE MOONCAKE_KVCS_TEST_SDK=1)
+endif()
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
@@ -569,3 +579,14 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+# Compile the production resource manager against a USRBIO test double, even
+# when USE_3FS is disabled. Keep it separate from mooncake_store's real client.
+add_executable(
+  hf3fs_resource_manager_test hf3fs_resource_manager_test.cpp
+                              ../src/hf3fs/hf3fs_resource_manager.cpp)
+target_include_directories(hf3fs_resource_manager_test BEFORE
+                           PRIVATE hf3fs_stub ${MOONCAKE_STORE_INCLUDE_ROOT})
+target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
+                                                          pthread)
+add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)

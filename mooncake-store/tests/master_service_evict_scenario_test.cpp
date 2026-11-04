@@ -278,6 +278,29 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtLowRatio) {
         .Then(IndexedObjects(kExpectedEvicted, kObjectCount).AreReadable());
 }
 
+// A put of an object the store already holds renews its lease, as a read does:
+// the oldest object, put again, is no longer the first to go.
+TEST_F(MasterServiceEvictScenarioTest, PutOfHeldObjectRenewsItsEvictionRank) {
+    constexpr size_t kObjectCount = 400;
+    constexpr size_t kExpectedEvicted = 20;
+
+    MasterScenario scenario("a put of a held object renews its rank",
+                            EvictConfig());
+    scenario.Given(MemoryNode("memory").Capacity(256 * 1024 * 1024))
+        .Given(IndexedObjects(0, kObjectCount)
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        .When(PutStart(Key(0), kObjectSize)
+                  .ExpectError(ErrorCode::OBJECT_ALREADY_EXISTS))
+        .When(EvictMemory(0.05))
+        .Then(ReadableCount(IndexedObjects(0, kObjectCount),
+                            kObjectCount - kExpectedEvicted))
+        .Then(Object(Key(0)).IsReadable())
+        .Then(IndexedObjects(1, kExpectedEvicted + 1).DoNotExist())
+        .Then(IndexedObjects(kExpectedEvicted + 1, kObjectCount).AreReadable());
+}
+
 TEST_F(MasterServiceEvictScenarioTest, TargetEqualsLowerBoundEvictsExactCount) {
     constexpr size_t kObjectCount = 250;
     constexpr size_t kExpectedEvicted = 25;
@@ -399,6 +422,35 @@ TEST_F(MasterServiceEvictScenarioTest,
         .When(ExpireAt("leased_b", ExpiredBase()))
         .When(EvictMemory(1.0))
         .Then(Objects({"leased_a", "leased_b"}).DoNotExist());
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       LastHitOnlyLeasesOnlyTheSelectedCandidate) {
+    auto config = EvictConfig();
+    config.default_kv_lease_ttl = 60 * 60 * 1000;
+    MasterScenario scenario("last hit only leases one candidate", config);
+    scenario.Given(MemoryNode("memory"))
+        .Given(Objects({"p0_state", "p0_conv", "p1_state", "p2_state",
+                        "p2_conv", "p3_conv"})
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        // Candidates are pairs in caller order and every result still reports
+        // existence. p1 and p3 are incomplete, so the last all-true pair is
+        // p2: only its two keys are leased, and the complete p0 pair is not.
+        .Then(BatchProbe({"p0_state", "p0_conv", "p1_state", "p1_conv",
+                          "p2_state", "p2_conv", "p3_state", "p3_conv"})
+                  .LastHitOnly(2)
+                  .Returns({true, true, true, false, true, true, false, true}))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"p2_state", "p2_conv"}).AreReadable())
+        .Then(Objects({"p0_state", "p0_conv", "p1_state", "p3_conv"})
+                  .DoNotExist())
+        // Once that lease expires, the same pass reclaims the candidate.
+        .When(ExpireAt("p2_state", ExpiredBase()))
+        .When(ExpireAt("p2_conv", ExpiredBase()))
+        .When(EvictMemory(1.0))
+        .Then(Objects({"p2_state", "p2_conv"}).DoNotExist());
 }
 
 TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {

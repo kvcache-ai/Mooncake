@@ -411,6 +411,31 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
 }
 
+// "1" is how most MC_* switches are set; setFromString() would store it as an
+// integer, which get(..., false) cannot read as a bool.
+TEST(TransferEngineConfigOverrideTest, LegacyBoolEnvAcceptsNumericValues) {
+    const std::pair<const char*, const char*> cases[] = {
+        {"MC_DISABLE_GPU_DIRECT_RDMA",
+         "transports/rdma/disable_gpu_direct_rdma"},
+        {"MC_LOG_RDMA_SLICE_AFFINITY", "transports/rdma/log_slice_affinity"},
+    };
+    for (const auto& [env, key] : cases) {
+        SCOPED_TRACE(env);
+        {
+            EnvVarGuard guard(env, "1");
+            Config config;
+            ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+            EXPECT_TRUE(config.get(key, false));
+        }
+        {
+            EnvVarGuard guard(env, "0");
+            Config config;
+            ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+            EXPECT_FALSE(config.get(key, true));
+        }
+    }
+}
+
 TEST(TransferEngineConfigOverrideTest, InvalidConstructorFilePreventsStartup) {
     TempConfigFile file("{invalid-json");
     EnvVarGuard conf_guard("MC_TENT_CONF", "");
