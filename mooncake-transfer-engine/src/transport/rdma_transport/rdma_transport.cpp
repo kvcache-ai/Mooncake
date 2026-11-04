@@ -57,7 +57,7 @@ bool isOwnRdmaDesc(const TransferMetadata::BufferDesc &desc) {
 #ifdef ENABLE_MULTI_PROTOCOL
     return desc.protocol.empty() || desc.protocol == "rdma";
 #else
-    return true;
+    return desc.shm_name.empty();
 #endif
 }
 
