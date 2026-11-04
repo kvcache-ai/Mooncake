@@ -1755,6 +1755,109 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
     }
 }
 
+int TransferMetadata::invalidateSegmentCacheByID(SegmentID segment_id) {
+    // Never evict the local segment: it is authoritative, not a remote cache.
+    if (segment_id == LOCAL_SEGMENT_ID) return 0;
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    // IMPORTANT: only drop the name->id mapping(s); DO NOT erase id->desc.
+    //
+    // In-flight transfers hold the numeric segment id, and transport workers
+    // re-read getSegmentDescByID(id) for every post/retry. A request may fail
+    // with a missing descriptor / uncovered offset merely because ITS offset
+    // is not (yet) covered (e.g. the peer announced its segment before it
+    // finished registering memory) while OTHER in-flight requests to the SAME
+    // segment target valid, already-registered ranges. Erasing id->desc here
+    // would make those valid in-flight transfers suddenly read null and fail
+    // (and force_update could not recover, since it needs the name stored in
+    // id->desc, which would be gone) -- turning one bad offset into a
+    // segment-wide avalanche.
+    //
+    // Dropping only name->id is enough to self-heal NEW requests: the next
+    // openSegment()/getSegmentID() misses the name cache, re-handshakes, and
+    // installs a fresh, complete descriptor under a NEW id (ids are handed
+    // out monotonically and never reused). The old id->desc stays valid for
+    // in-flight holders and becomes an orphan (no name points at it); those
+    // orphans are reclaimed lazily by reclaimOrphanSegmentsLocked() once no
+    // in-flight transfer references the descriptor anymore.
+    //
+    // The descriptor pointer is intentionally never dereferenced, so a
+    // null/corrupt cache entry is handled safely here.
+    std::string mapped_names;
+    int removed_name = 0;
+    for (auto it = segment_name_to_id_map_.begin();
+         it != segment_name_to_id_map_.end();) {
+        if (it->second == segment_id) {
+            mapped_names += it->first + ";";
+            it = segment_name_to_id_map_.erase(it);
+            ++removed_name;
+        } else {
+            ++it;
+        }
+    }
+    // Track this id as an orphan (name->id gone, id->desc kept) so it can be
+    // reclaimed later once no in-flight transfer references it anymore. Only
+    // if the descriptor entry actually still exists.
+    if (removed_name && segment_id_to_desc_map_.count(segment_id)) {
+        orphan_segment_ids_.insert(segment_id);
+    }
+
+    if (removed_name) {
+        LOG(WARNING)
+            << "[invalidateSegmentCache] dropped name->id mapping(s) for id="
+            << segment_id << " removed_name=" << removed_name
+            << " mapped_names=[" << mapped_names
+            << "]; id->desc kept for in-flight holders, next openSegment "
+               "re-handshakes under a new id";
+    } else {
+        LOG(WARNING) << "[invalidateSegmentCache] id=" << segment_id
+                     << " has no name->id mapping (nothing to evict)";
+    }
+
+    // Lazy GC: this is the natural trigger point -- every time we create an
+    // orphan we also try to reclaim previously created ones that in-flight
+    // transfers have since finished with. Cheap: only walks the orphan set.
+    reclaimOrphanSegmentsLocked();
+    return removed_name;
+}
+
+int TransferMetadata::reclaimOrphanSegmentsLocked() {
+    // Caller MUST hold a segment_lock_ write guard (see header). Because the
+    // reader path (getSegmentDescByID) takes a read guard that is mutually
+    // exclusive with our write guard, no new reference to a cached descriptor
+    // can be taken while we are here -- so shared_ptr::use_count() cannot rise
+    // under us, and use_count() <= 1 reliably means "only this map holds it,
+    // no in-flight transfer references it" and the entry is safe to erase.
+    //
+    // Note: an id, once orphaned, is never re-attached to any name (segment
+    // ids are handed out monotonically and never reused, see
+    // next_segment_id_), so reclaiming it can never drop a live entry.
+    int reclaimed = 0;
+    for (auto it = orphan_segment_ids_.begin();
+         it != orphan_segment_ids_.end();) {
+        auto desc_it = segment_id_to_desc_map_.find(*it);
+        if (desc_it == segment_id_to_desc_map_.end()) {
+            // Already gone (e.g. removed elsewhere) -- drop from the set.
+            it = orphan_segment_ids_.erase(it);
+        } else if (desc_it->second.use_count() <= 1) {
+            // Only this map holds the descriptor (or it is null): no
+            // in-flight holder remains -> safe to reclaim.
+            segment_id_to_desc_map_.erase(desc_it);
+            it = orphan_segment_ids_.erase(it);
+            ++reclaimed;
+        } else {
+            // Still referenced by an in-flight transfer: keep it, retry
+            // later.
+            ++it;
+        }
+    }
+    if (reclaimed) {
+        LOG(INFO) << "[invalidateSegmentCache] reclaimed " << reclaimed
+                  << " orphan id->desc ent(ies), " << orphan_segment_ids_.size()
+                  << " still pending in-flight";
+    }
+    return reclaimed;
+}
+
 TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     const std::string &segment_name) {
     {
@@ -1767,10 +1870,36 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     auto segment_desc = this->getSegmentDesc(segment_name);
     if (!segment_desc) return -1;
 
+    // ADMISSION FILTER: reject a freshly-fetched descriptor that has NO
+    // buffers. This means the peer announced the segment (mount) before it
+    // registered its memory regions -- an unusable, transient state. Caching
+    // it would poison the cache: with metacache enabled the descriptor is
+    // never re-fetched, so a later submitTransfer() would find no buffer
+    // covering the target offset ("No matching buffer") and stay broken until
+    // the process restarts. By NOT caching it and returning -1 (==
+    // ERR_INVALID_ARGUMENT), openSegment() fails now (the caller retries) and
+    // the NEXT openSegment() fetches again -- so once the peer finishes
+    // registering memory, the retry caches a complete descriptor. Same "fails
+    // now, heals on retry" contract, but the bad entry never enters the cache
+    // in the first place.
+    if (segment_desc->buffers.empty()) {
+        LOG(WARNING) << "[getSegmentID] refusing to cache descriptor for "
+                     << segment_name
+                     << " that has NO buffers yet (peer mounted but not "
+                        "registered?); openSegment fails now, retry will "
+                        "re-fetch once the peer is ready";
+        return -1;
+    }
+
     // Update cache with write lock, double-check to avoid duplicate
     RWSpinlock::WriteGuard guard(segment_lock_);
     if (segment_name_to_id_map_.count(segment_name))
         return segment_name_to_id_map_[segment_name];
+    // A new segment is being (re)opened here -- typically the reconnect that
+    // follows an invalidateSegmentCacheByID(). Piggyback a lazy reclaim so
+    // orphans get collected even if no further invalidate ever happens (double
+    // insurance on top of the reclaim inside invalidateSegmentCacheByID).
+    if (!orphan_segment_ids_.empty()) reclaimOrphanSegmentsLocked();
     SegmentID id = next_segment_id_.fetch_add(1);
     segment_id_to_desc_map_[id] = segment_desc;
     segment_name_to_id_map_[segment_name] = id;

@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "buffer_range_index.h"
 #include "common.h"
@@ -254,6 +255,26 @@ class TransferMetadata {
     std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
                                                     bool force_update = false);
 
+    // Recovery hook the transport layer calls when it detects an unusable
+    // cached descriptor (null, or buffers not covering the request). Drops
+    // ONLY the name->id mapping(s) for this id so the next getSegmentID()/
+    // openSegment() misses the name cache and re-handshakes, rebuilding a
+    // fresh, complete descriptor under a NEW id -- turning "stuck until
+    // process restart" into "fails once, heals on retry".
+    //
+    // Deliberately does NOT erase id->desc: in-flight transfers hold the
+    // numeric id and re-read getSegmentDescByID(id) on every post/retry, so
+    // evicting id->desc would kill valid concurrent transfers to already-
+    // registered ranges of the same segment (and force_update could not
+    // recover either, as it needs the name stored in id->desc). The old
+    // id->desc is kept for those in-flight holders and becomes a harmless
+    // orphan afterwards, reclaimed lazily by reclaimOrphanSegmentsLocked().
+    //
+    // Returns the number of name->id entries removed. Safe on a missing id
+    // (no-op). The descriptor pointer is never dereferenced, so a null/
+    // corrupt entry is handled safely.
+    int invalidateSegmentCacheByID(SegmentID segment_id);
+
     int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
 
     int updateSegmentDesc(const std::string &segment_name,
@@ -360,6 +381,21 @@ class TransferMetadata {
     // segment's backend fetch fails; reset to 0 on a successful fetch. Once it
     // reaches kStaleSegmentFailureThreshold the cached entry is invalidated.
     std::unordered_map<std::string, int> segment_failure_counts_;
+
+    // Ids whose name->id mapping was dropped by invalidateSegmentCacheByID()
+    // but whose id->desc entry is intentionally kept alive for in-flight
+    // transfers still holding the numeric id. These are reclaimed lazily once
+    // no one references the descriptor anymore. MUST be accessed under
+    // segment_lock_. See reclaimOrphanSegmentsLocked().
+    std::unordered_set<SegmentID> orphan_segment_ids_;
+
+    // Reclaim orphan id->desc entries whose descriptor has no remaining
+    // in-flight holder (shared_ptr use_count <= 1, i.e. only this map holds
+    // it). MUST be called while holding a segment_lock_ write guard: that
+    // excludes the reader path (getSegmentDescByID holds a read guard), so no
+    // new reference can be taken concurrently and use_count is a reliable
+    // "nobody is using it" signal. Returns the number of entries reclaimed.
+    int reclaimOrphanSegmentsLocked();
 
     RWSpinlock notify_lock_;
     std::vector<NotifyDesc> notifys;
