@@ -335,7 +335,14 @@ ErrorCode RedisOpLogTrimWorker::TrimOnce() {
 
 void RedisOpLogTrimWorker::Run() {
     while (running_.load()) {
-        (void)TrimOnce();
+        const auto err = TrimOnce();
+        if (err != ErrorCode::OK) {
+            LOG_EVERY_N(WARNING, 10)
+                << "RedisOpLogTrimWorker: trim cycle failed"
+                << ", cluster_id=" << config_.cluster_id
+                << ", error=" << toString(err)
+                << ", interval_sec=" << config_.interval.count();
+        }
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait_for(lock, config_.interval, [this] { return stopping_; });
         if (stopping_) {
