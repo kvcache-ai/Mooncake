@@ -547,8 +547,7 @@ bool RedisElectionHelper::PollLeaderOnce(redisContext*& context) {
     }
 
     RedisReplyPtr reply((redisReply*)redisCommand(
-        context, "GET %b", master_view_key_.data(),
-        master_view_key_.size()));
+        context, "GET %b", master_view_key_.data(), master_view_key_.size()));
     if (!reply ||
         (reply->type != REDIS_REPLY_STRING && reply->type != REDIS_REPLY_NIL)) {
         const auto error = FormatPollLeaderError(context, reply.get());
