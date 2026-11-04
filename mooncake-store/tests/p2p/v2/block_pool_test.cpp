@@ -1150,5 +1150,102 @@ TEST_F(BlockPoolTest, InvalidSsdConfigurationIsRejected) {
               ErrorCode::INVALID_PARAMS);
 }
 
+// Use a small node budget to exhaust metadata while byte usage is still tiny.
+// Repeat with a larger budget: more blocks must fit without changing capacity.
+TEST_F(BlockPoolTest, PerTargetNodeBudgetControlsExhaustionAndReuse) {
+    for (bool ssd : {false, true}) {
+        for (uint32_t max_nodes : {2u, 4u, 8u}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "ssd=" << ssd << ", max_nodes=" << max_nodes);
+            BlockPoolConfig config;
+            if (ssd) {
+                auto device = SsdDevice("node-budget.data", kArenaCapacity);
+                device.allocator_init_capacity = 1;
+                device.allocator_max_capacity = max_nodes;
+                config = SSDBlockPoolConfig{{device}};
+            } else {
+                auto arena = Arena(kArenaCapacity);
+                arena.allocator_init_capacity = 1;
+                arena.allocator_max_capacity = max_nodes;
+                config = DramBlockPoolConfig{{arena}};
+            }
+            auto pool = CreateBlockPool(config, nullptr);
+            ASSERT_TRUE(pool.has_value());
+            std::vector<BlockAllocation> blocks;
+            for (uint32_t i = 0; i < max_nodes - 1; ++i) {
+                auto block = (*pool)->Allocate(kBlockSize, 1);
+                ASSERT_TRUE(block.has_value()) << "block " << i;
+                const auto payload = Pattern(kBlockSize, i);
+                ASSERT_TRUE(
+                    block->Data().Write(0, AsBytes(payload)).has_value());
+                blocks.push_back(std::move(*block));
+            }
+            auto full = (*pool)->Allocate(kBlockSize, 1);
+            ASSERT_FALSE(full.has_value());
+            EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+            EXPECT_LT((*pool)->Usage(), (*pool)->Capacity() / 10);
+
+            // Exhaustion never evicts or corrupts an existing block.
+            for (uint32_t i = 0; i < blocks.size(); ++i) {
+                std::vector<uint8_t> readback(kBlockSize);
+                ASSERT_TRUE(blocks[i]
+                                .Data()
+                                .Read(0, AsWritableBytes(readback))
+                                .has_value());
+                EXPECT_EQ(readback, Pattern(kBlockSize, i));
+            }
+            blocks.pop_back();  // merge the last allocation with the free tail
+            {
+                auto reused = (*pool)->Allocate(kBlockSize, 1);
+                ASSERT_TRUE(reused.has_value());
+            }
+            blocks.clear();
+            EXPECT_EQ((*pool)->Usage(), 0u);
+        }
+    }
+}
+
+TEST_F(BlockPoolTest, InvalidNodeBudgetsFailBeforeAllocatingOrOpeningFiles) {
+    for (const auto [init, max] :
+         {std::pair{0u, 8u}, std::pair{1u, 1u}, std::pair{9u, 8u},
+          std::pair{1u, std::numeric_limits<uint32_t>::max()}}) {
+        auto arena = Arena(kArenaCapacity);
+        arena.allocator_init_capacity = init;
+        arena.allocator_max_capacity = max;
+        EXPECT_EQ(InitErrorOf({arena}), ErrorCode::INVALID_PARAMS);
+
+        auto device = SsdDevice("invalid-nodes.data", kArenaCapacity);
+        device.allocator_init_capacity = init;
+        device.allocator_max_capacity = max;
+        EXPECT_EQ(SSDBlockPool(SSDBlockPoolConfig{{device}}).Init().error(),
+                  ErrorCode::INVALID_PARAMS);
+        EXPECT_FALSE(std::filesystem::exists(device.file_path));
+    }
+}
+
+TEST_F(BlockPoolTest, SsdNodeBudgetCanExceedTheLegacyMillionNodeLimit) {
+    constexpr uint32_t kBlocks = (1u << 20) + 1;
+    auto device = SsdDevice("million-nodes.data", 2 * kBlocks);
+    device.alignment = 1;
+    device.allocator_init_capacity = 2;
+    device.allocator_max_capacity = kBlocks + 1;  // one free tail node
+    auto pool = MakeSsdPool({device});
+    ASSERT_NE(pool, nullptr);
+    // Tiny extents and a sparse backing file keep this a metadata regression,
+    // rather than writing gigabytes just to cross the old allocation limit.
+    std::vector<BlockAllocation> blocks;
+    blocks.reserve(kBlocks);
+    for (uint32_t i = 0; i < kBlocks; ++i) {
+        auto block = pool->Allocate(1, 1);
+        ASSERT_TRUE(block.has_value()) << "block " << i;
+        blocks.push_back(std::move(*block));
+    }
+    EXPECT_EQ(pool->Usage(), kBlocks);
+    EXPECT_EQ(pool->Allocate(1, 1).error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    blocks.clear();
+    EXPECT_EQ(pool->Usage(), 0u);
+    EXPECT_TRUE(pool->Allocate(1, 1).has_value());
+}
+
 }  // namespace
 }  // namespace mooncake::v2

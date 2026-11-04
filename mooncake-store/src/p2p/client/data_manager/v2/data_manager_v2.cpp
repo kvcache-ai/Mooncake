@@ -6,6 +6,7 @@
 #include <limits>
 #include <span>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -28,6 +29,31 @@ size_t ParseByteSize(const Json::Value& value) {
         return static_cast<size_t>(string_to_byte_size(value.asString()));
     }
     return static_cast<size_t>(value.asUInt64());
+}
+
+/** Parse integer node counts without accepting byte strings or truncation. */
+tl::expected<void, ErrorCode> ApplyAllocatorCapacityConfig(
+    const Json::Value& entry, uint32_t& init_capacity, uint32_t& max_capacity) {
+    for (const char* field :
+         {"allocator_init_capacity", "allocator_max_capacity"}) {
+        if (!entry.isMember(field)) continue;
+        const auto& value = entry[field];
+        // JsonCpp's numeric predicates can accept integral-valued doubles;
+        // require an integer JSON representation before converting to uint32.
+        if ((value.type() != Json::intValue &&
+             value.type() != Json::uintValue) ||
+            !value.isUInt()) {
+            LOG(ERROR) << field << " must be a uint32 node count";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    if (entry.isMember("allocator_init_capacity")) {
+        init_capacity = entry["allocator_init_capacity"].asUInt();
+    }
+    if (entry.isMember("allocator_max_capacity")) {
+        max_capacity = entry["allocator_max_capacity"].asUInt();
+    }
+    return ValidateAllocatorCapacity(init_capacity, max_capacity);
 }
 
 /** Apply only fields present in one global or per-tier JSON object. */
@@ -182,6 +208,12 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
             tiler.logical.memory_type = MemoryType::DRAM;
             DramArenaConfig arena;
             arena.capacity_bytes = capacity;
+            auto allocator_valid = ApplyAllocatorCapacityConfig(
+                entry, arena.allocator_init_capacity,
+                arena.allocator_max_capacity);
+            if (!allocator_valid) {
+                return tl::make_unexpected(allocator_valid.error());
+            }
             if (entry.isMember("numa_node") && !entry["numa_node"].isNull()) {
                 arena.numa_node = entry["numa_node"].asInt();
             }
@@ -192,6 +224,12 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
             tiler.logical.memory_type = MemoryType::NVME;
             SSDDeviceConfig device;
             device.capacity_bytes = capacity;
+            auto allocator_valid = ApplyAllocatorCapacityConfig(
+                entry, device.allocator_init_capacity,
+                device.allocator_max_capacity);
+            if (!allocator_valid) {
+                return tl::make_unexpected(allocator_valid.error());
+            }
             if (entry.isMember("alignment")) {
                 device.alignment =
                     static_cast<size_t>(entry["alignment"].asUInt64());
@@ -419,6 +457,28 @@ tl::expected<void, ErrorCode> ValidateDataManagerV2Config(
         ValidateFrequencyTrackerConfig(config.frequency_tracker);
     if (!frequency_valid) return frequency_valid;
     for (const auto& tiler : config.tilers) {
+        // C++ callers bypass the JSON parser. Validate before pool creation
+        // can allocate memory or open/resize any backing files.
+        auto allocator_valid = std::visit(
+            [](const auto& pool) -> tl::expected<void, ErrorCode> {
+                const auto& targets = [&]() -> const auto& {
+                    if constexpr (std::is_same_v<std::decay_t<decltype(pool)>,
+                                                 DramBlockPoolConfig>) {
+                        return pool.arenas;
+                    } else {
+                        return pool.devices;
+                    }
+                }();
+                for (const auto& target : targets) {
+                    auto valid = ValidateAllocatorCapacity(
+                        target.allocator_init_capacity,
+                        target.allocator_max_capacity);
+                    if (!valid) return valid;
+                }
+                return {};
+            },
+            tiler.pool);
+        if (!allocator_valid) return allocator_valid;
         const double watermark =
             tiler.placement_policy.EffectiveOffloadHighWatermark(
                 config.movement.offload_high_watermark);

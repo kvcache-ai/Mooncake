@@ -118,6 +118,103 @@ TEST_F(V2ConfigTest, EachTierEntryBecomesOneIndependentTiler) {
     ASSERT_EQ(ssd.devices.size(), 1U);
     EXPECT_EQ(ssd.devices[0].capacity_bytes, 4194304U);
     EXPECT_EQ(ssd.devices[0].file_path, "/tmp/mooncake_v2_config_test.data");
+    EXPECT_EQ(dram.arenas[0].allocator_init_capacity, 128u * 1024);
+    EXPECT_EQ(dram.arenas[0].allocator_max_capacity, 1u << 20);
+    EXPECT_EQ(ssd.devices[0].allocator_init_capacity, 128u * 1024);
+    EXPECT_EQ(ssd.devices[0].allocator_max_capacity, 1u << 20);
+}
+
+TEST_F(V2ConfigTest, AllocatorNodeBudgetsAreIndependentPerTier) {
+    auto config = Parse(R"({"tiers": [
+        {"type": "DRAM", "capacity": "1MB"},
+        {"type": "SSD", "capacity": "8TB", "file_path": "/tmp/ssd.data",
+         "allocator_max_capacity": 16777216},
+        {"type": "DRAM", "capacity": "1MB",
+         "allocator_init_capacity": 1, "allocator_max_capacity": 8}
+    ]})");
+    ASSERT_TRUE(config.has_value());
+    const auto& dram = std::get<DramBlockPoolConfig>(config->tilers[0].pool);
+    const auto& ssd = std::get<SSDBlockPoolConfig>(config->tilers[1].pool);
+    const auto& small = std::get<DramBlockPoolConfig>(config->tilers[2].pool);
+    EXPECT_EQ(dram.arenas[0].allocator_max_capacity, 1u << 20);
+    EXPECT_EQ(ssd.devices[0].allocator_init_capacity, 128u * 1024);
+    EXPECT_EQ(ssd.devices[0].allocator_max_capacity, 1u << 24);
+
+    // Exercise parser -> pool -> allocator, including growth from init=1.
+    auto pool = CreateBlockPool(small, nullptr);
+    ASSERT_TRUE(pool.has_value());
+    std::vector<BlockAllocation> blocks;
+    for (int i = 0; i < 7; ++i) {
+        auto block = (*pool)->Allocate(64, 1);
+        ASSERT_TRUE(block.has_value()) << "block " << i;
+        blocks.push_back(std::move(*block));
+    }
+    auto full = (*pool)->Allocate(64, 1);
+    ASSERT_FALSE(full.has_value());
+    EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_LT((*pool)->Usage(), (*pool)->Capacity() / 100);
+}
+
+TEST_F(V2ConfigTest, InvalidAllocatorNodeBudgetsAreRejected) {
+    for (const char* type : {"DRAM", "SSD", "STORAGE", "NVME"}) {
+        for (const char* fields :
+             {R"("allocator_init_capacity": 0)",
+              R"("allocator_max_capacity": 0)",
+              R"("allocator_init_capacity": 1, "allocator_max_capacity": 1)",
+              R"("allocator_init_capacity": 9, "allocator_max_capacity": 8)",
+              R"("allocator_max_capacity": 8)",           // below default init
+              R"("allocator_max_capacity": 4294967295)",  // sentinel
+              R"("allocator_max_capacity": 4294967296)",  // overflow
+              R"("allocator_init_capacity": 4294967296)",
+              R"("allocator_max_capacity": -1)",
+              R"("allocator_init_capacity": -1)",
+              R"("allocator_max_capacity": 1.5)",
+              R"("allocator_init_capacity": 128.0)",
+              R"("allocator_max_capacity": "16MB")",
+              R"("allocator_init_capacity": "128")",
+              R"("allocator_max_capacity": true)",
+              R"("allocator_init_capacity": false)",
+              R"("allocator_max_capacity": null)",
+              R"("allocator_init_capacity": [])"}) {
+            auto config = Parse(std::string(R"({"tiers": [{"type": ")") + type +
+                                R"(", "capacity": "1MB",
+                                "file_path": "/tmp/ssd.data", )" +
+                                fields + "}]}");
+            ASSERT_FALSE(config.has_value()) << type << ": " << fields;
+            EXPECT_EQ(config.error(), ErrorCode::INVALID_PARAMS);
+        }
+    }
+}
+
+TEST_F(V2ConfigTest, AllocatorNodeBudgetValidationAlsoCoversCppConfigs) {
+    auto config = Parse(R"({"tiers": [
+        {"type": "DRAM", "capacity": "1MB"},
+        {"type": "SSD", "capacity": "1MB", "file_path": "/tmp/ssd.data"}
+    ]})");
+    ASSERT_TRUE(config.has_value());
+    auto& dram = std::get<DramBlockPoolConfig>(config->tilers[0].pool);
+    dram.arenas[0].allocator_init_capacity = 0;
+    EXPECT_EQ(ValidateDataManagerV2Config(*config).error(),
+              ErrorCode::INVALID_PARAMS);
+    dram.arenas[0].allocator_init_capacity = 128 * 1024;
+    auto& ssd = std::get<SSDBlockPoolConfig>(config->tilers[1].pool);
+    ssd.devices[0].allocator_max_capacity = 4;
+    EXPECT_EQ(ValidateDataManagerV2Config(*config).error(),
+              ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(V2ConfigTest,
+       AllocatorNodeBudgetBoundariesAreAcceptedWithoutAllocating) {
+    for (const char* type : {"DRAM", "SSD"}) {
+        for (uint32_t max : {2u, std::numeric_limits<uint32_t>::max() - 1}) {
+            auto config =
+                Parse(std::string(R"({"tiers": [{"type": ")") + type +
+                      R"(", "capacity": "1MB", "file_path": "/tmp/ssd.data",
+                "allocator_init_capacity": 1, "allocator_max_capacity": )" +
+                      std::to_string(max) + "}]}");
+            EXPECT_TRUE(config.has_value()) << type << ": max=" << max;
+        }
+    }
 }
 
 // Skipping the tier would be the dangerous outcome: the deployment would look

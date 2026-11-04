@@ -25,6 +25,8 @@
             "alignment": 4096,
             "fsync_on_commit": false,
             "file_path": "/data/mooncake-v2/ssd.data",
+            "allocator_init_capacity": 131072,
+            "allocator_max_capacity": 16777216,
             "placement_policy": {
                 "offload_high_watermark": 0.90
             },

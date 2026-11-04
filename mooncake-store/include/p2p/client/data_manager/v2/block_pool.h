@@ -19,6 +19,7 @@
 // TieredBackend::NotifyBucketEviction. V2 has no such upward channel.
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,6 +38,15 @@ class TransferEngine;
 namespace mooncake::v2 {
 
 /**
+ * Validate the per-allocator metadata budget. Nodes describe both live extents
+ * and free regions, so max_capacity is not a maximum key count. Reserve at
+ * least two nodes for an allocation and its remainder; UINT32_MAX is reserved
+ * as the allocator's unused-node sentinel.
+ */
+tl::expected<void, ErrorCode> ValidateAllocatorCapacity(uint32_t init_capacity,
+                                                        uint32_t max_capacity);
+
+/**
  * @struct DramArenaConfig
  * @brief One contiguous DRAM region inside a DramBlockPool.
  */
@@ -44,6 +54,9 @@ struct DramArenaConfig {
     std::optional<int> numa_node;
     size_t capacity_bytes = 0;
     size_t alignment = 64;
+    // Counts of metadata nodes, not bytes. Keep OffsetAllocator's defaults.
+    uint32_t allocator_init_capacity = 128 * 1024;
+    uint32_t allocator_max_capacity = 1u << 20;
 };
 
 struct DramBlockPoolConfig {
@@ -59,6 +72,10 @@ struct SSDDeviceConfig {
     size_t capacity_bytes = 0;
     size_t alignment = 4096;
     bool fsync_on_commit = false;
+    // Large devices holding small blocks may need more than 1M nodes. This
+    // budget is per device: increasing it does not enlarge any DRAM allocator.
+    uint32_t allocator_init_capacity = 128 * 1024;
+    uint32_t allocator_max_capacity = 1u << 20;
 };
 
 struct SSDBlockPoolConfig {
