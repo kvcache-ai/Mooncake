@@ -428,6 +428,63 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorHandlesLifecycleAndFatalFailure) {
     EXPECT_EQ(doctor()["status"].asString(), "ok");
 }
 
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "test-primary", 1);
+    status.SetRoleState("primary", "RUNNING");
+    // This is the assigned primary watermark, not the writer's committed
+    // latest. The stall diagnosis must use the latter.
+    status.SetOpLogProgress(999, 999);
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetOpLogWriterRunning(true);
+    status.SetOpLogWriteProgress(10, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    // New pending work begins a fresh timer. Idle time is excluded.
+    status.SetOpLogWriteProgress(10, 1);
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Additional work cannot reset the timer while confirmed latest stalls.
+    status.SetOpLogWriteProgress(10, 2);
+    auto report = doctor();
+    EXPECT_EQ(report["status"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_LATEST_STALLED");
+    EXPECT_NE(report["issues"][0]["message"].asString().find(
+                  "latest=10, pending=2, stalled_ms="),
+              std::string::npos);
+
+    status.Configure(true, "test_cluster", "test-primary", 0);
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    status.Configure(true, "test_cluster", "test-primary", 1);
+    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+
+    // Confirmed progress restarts the timer while work remains busy.
+    status.SetOpLogWriteProgress(11, 1);
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["status"].asString(), "degraded");
+
+    // Draining work disarms the timer.
+    status.SetOpLogWriteProgress(12, 0);
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+
+    // A stopped writer clears cache and rejects late callbacks from the
+    // previous worker.
+    status.SetOpLogWriteProgress(12, 1);
+    status.SetOpLogWriterRunning(false);
+    status.SetOpLogWriteProgress(12, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["status"].asString(), "ok");
+}
+
 TEST_F(P2PMasterHttpEndpointsTest,
        GetKeyCountTracksReplicaAdditionsAndRemovals) {
     const int64_t baseline = HttpGetKeyCount();

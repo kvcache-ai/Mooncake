@@ -55,13 +55,17 @@ void HAStatusManager::Reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     status_ = HAStatusSnapshot{};
     doctor_issues_.clear();
+    oplog_writer_ = {};
+    oplog_latest_stall_timeout_sec_ = 10;
     TouchLocked();
 }
 
 void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
-                                std::string local_endpoint) {
+                                std::string local_endpoint,
+                                uint32_t oplog_latest_stall_timeout_sec) {
     std::lock_guard<std::mutex> lock(mutex_);
     status_.ha_enabled = ha_enabled;
+    oplog_latest_stall_timeout_sec_ = oplog_latest_stall_timeout_sec;
     if (!cluster_id.empty()) {
         status_.cluster_id = std::move(cluster_id);
     }
@@ -69,6 +73,7 @@ void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
         status_.local_endpoint = std::move(local_endpoint);
     }
     if (!ha_enabled) {
+        oplog_writer_ = {};
         status_.role = "disabled";
         status_.state = "disabled";
     }
@@ -192,6 +197,12 @@ void HAStatusManager::RecordRegistryHeartbeat(ErrorCode result,
         status_.last_error = status_.registry_heartbeat_last_error;
     }
     TouchLocked();
+    // The heartbeat drives aggregate stall logging; HTTP diagnosis evaluates
+    // the cached timer independently and does not need this background loop.
+    if (auto stall = OpLogLatestStallMessageLocked(); !stall.empty()) {
+        LOG_EVERY_N(WARNING, 30)
+            << "OpLog latest stalled: " << stall << ", sample_every_n=30";
+    }
     if (recovered) {
         LOG(INFO) << "Redis Master registry heartbeat recovered"
                   << ", instance_id=" << status_.instance_id
@@ -222,6 +233,45 @@ void HAStatusManager::SetDoctorIssue(std::string code, std::string message) {
 void HAStatusManager::ClearDoctorIssues() {
     std::lock_guard<std::mutex> lock(mutex_);
     doctor_issues_.clear();
+    oplog_writer_ = {};
+}
+
+void HAStatusManager::SetOpLogWriterRunning(bool running) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    oplog_writer_ = {};
+    oplog_writer_.running = running;
+}
+
+void HAStatusManager::SetOpLogWriteProgress(uint64_t committed_sequence_id,
+                                            size_t pending) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!oplog_writer_.running) return;
+    if (pending == 0) {
+        oplog_writer_.stalled_since.reset();
+    } else if (!oplog_writer_.stalled_since ||
+               committed_sequence_id != oplog_writer_.committed_sequence_id) {
+        oplog_writer_.stalled_since = std::chrono::steady_clock::now();
+    }
+    oplog_writer_.committed_sequence_id = committed_sequence_id;
+    oplog_writer_.pending = pending;
+}
+
+std::string HAStatusManager::OpLogLatestStallMessageLocked() const {
+    if (!status_.ha_enabled || !oplog_writer_.stalled_since ||
+        oplog_latest_stall_timeout_sec_ == 0) {
+        return {};
+    }
+    const auto elapsed =
+        std::chrono::steady_clock::now() - *oplog_writer_.stalled_since;
+    if (elapsed < std::chrono::seconds(oplog_latest_stall_timeout_sec_)) {
+        return {};
+    }
+    return "latest=" + std::to_string(oplog_writer_.committed_sequence_id) +
+           ", pending=" + std::to_string(oplog_writer_.pending) +
+           ", stalled_ms=" +
+           std::to_string(
+               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                   .count());
 }
 
 std::string HAStatusManager::SerializeDoctorJson() const {
@@ -231,6 +281,10 @@ std::string HAStatusManager::SerializeDoctorJson() const {
         if (status_.ha_enabled) {
             for (const auto& [code, message] : doctor_issues_) {
                 report.issues.push_back({code, message});
+            }
+            if (auto stall = OpLogLatestStallMessageLocked(); !stall.empty()) {
+                report.issues.push_back(
+                    {"OPLOG_LATEST_STALLED", std::move(stall)});
             }
             if (status_.state == "FAILED") {
                 report.issues.push_back(

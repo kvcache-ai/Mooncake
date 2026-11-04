@@ -50,6 +50,7 @@ struct P2PMasterConfig {
         uint32_t async_write_batch_size = kDefaultRedisOpLogWriteBatchSize;
         std::string async_queue_overflow_mode = "reject";
         uint64_t best_effort_max_retries = 3;
+        uint32_t latest_stall_timeout_sec = 10;
         bool enable_auto_trim = false;
         uint32_t auto_trim_interval_sec = 60;
         uint64_t trim_retention_entries = 100000;

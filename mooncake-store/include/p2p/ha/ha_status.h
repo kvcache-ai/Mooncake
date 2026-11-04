@@ -1,8 +1,11 @@
 #pragma once
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -71,7 +74,8 @@ class HAStatusManager {
 
     void Reset();
     void Configure(bool ha_enabled, std::string cluster_id,
-                   std::string local_endpoint);
+                   std::string local_endpoint,
+                   uint32_t oplog_latest_stall_timeout_sec = 10);
     void SetRoleState(std::string role, std::string state);
     void SetInstanceId(std::string instance_id);
     void SetLeader(std::string leader_endpoint, uint64_t epoch);
@@ -95,16 +99,28 @@ class HAStatusManager {
     void SetDoctorIssue(std::string code, std::string message = {});
     void ClearDoctorIssues();
     std::string SerializeDoctorJson() const;
+    // Writer events publish under its queue lock; diagnostics never take it.
+    // Stopping disables late progress callbacks until the next writer starts.
+    void SetOpLogWriterRunning(bool running);
+    void SetOpLogWriteProgress(uint64_t committed_sequence_id, size_t pending);
 
    private:
     HAStatusManager();
 
     static int64_t NowMs();
     void TouchLocked();
+    std::string OpLogLatestStallMessageLocked() const;
 
     mutable std::mutex mutex_;
     HAStatusSnapshot status_;
     std::map<std::string, std::string> doctor_issues_;
+    struct OpLogWriterProgress {
+        bool running{false};
+        uint64_t committed_sequence_id{0};
+        size_t pending{0};
+        std::optional<std::chrono::steady_clock::time_point> stalled_since;
+    } oplog_writer_;
+    uint32_t oplog_latest_stall_timeout_sec_{10};
 };
 
 }  // namespace mooncake

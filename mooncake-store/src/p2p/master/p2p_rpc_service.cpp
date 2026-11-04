@@ -26,7 +26,8 @@ P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
       heartbeat_rpc_port_(config.rpc.heartbeat_port) {
     HAStatusManager::instance().Configure(
         config.ha.enabled, config.cluster_id,
-        config.rpc.address + ":" + std::to_string(config.rpc.port));
+        config.rpc.address + ":" + std::to_string(config.rpc.port),
+        config.oplog.latest_stall_timeout_sec);
 }
 
 P2PMasterRpcService::~P2PMasterRpcService() {

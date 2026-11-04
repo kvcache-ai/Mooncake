@@ -53,7 +53,8 @@ request.
 - `ok`: the primary is running or a standby is watching, and no active issue is
   recorded.
 - `degraded`: an election/renewal, OpLog read/write/commit/apply/reconnect, snapshot
-  recovery, registry heartbeat, or fatal HA failure is recorded.
+  recovery, registry heartbeat, or fatal HA failure is recorded, or pending OpLogs
+  exceed the configured latest stall timeout.
 - `unknown`: HA is disabled, uninitialized, or in a transitional state without a
   recorded failure. This endpoint is not a readiness or cluster health check.
 
@@ -65,6 +66,16 @@ snapshot fallback, and historical `last_error` alone are not failures. The
 doctor only reports failures observed by the live process and does not retain
 history across restarts. It returns HTTP 200 even when `status` is `degraded`
 or `unknown`.
+
+`OPLOG_LATEST_STALLED` means the Redis writer has pending work and its locally
+confirmed committed latest has not advanced for
+`oplog_latest_stall_timeout_sec` (default 10 seconds; 0 disables this check).
+The timer starts when idle work is admitted, restarts only on confirmed latest
+progress while work remains, and stops when work drains, is dropped, or the
+writer stops. New entries and retries do not restart it. Idle time,
+dropped-only tails, and rewrites at or below the committed latest are excluded.
+This diagnoses stalled commits, not slow but continuing progress. The message is
+concise, for example `latest=100, pending=3, stalled_ms=12000`.
 
 `OPLOG_READ_FAILED` persists across reader reconnects until an actual poll
 succeeds (including an empty poll), or the standby stops or is promoted.

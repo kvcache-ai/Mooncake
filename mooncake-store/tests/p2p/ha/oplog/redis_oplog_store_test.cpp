@@ -24,6 +24,7 @@
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/p2p_standby_snapshot_service.h"
 #include "p2p/master/p2p_master_service.h"
 #include "p2p/ha/redis_util.h"
@@ -540,6 +541,43 @@ TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
     uint64_t latest = 0;
     ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
     EXPECT_EQ(1u, latest);
+}
+
+TEST_F(RedisOpLogStoreTest, LatestStallOnlyTimesBusyPendingWork) {
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, cluster_id_, "test-primary", 1);
+    status.SetRoleState("primary", "RUNNING");
+    auto has_stall_issue = [&] {
+        return status.SerializeDoctorJson().find("OPLOG_LATEST_STALLED") !=
+               std::string::npos;
+    };
+    auto writer = CreateWriter();
+    // Seq=3 is persisted but cannot commit latest without seq=1 and seq=2.
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(3), false), ErrorCode::OK);
+    const auto stall_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!has_stall_issue() &&
+           std::chrono::steady_clock::now() < stall_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(has_stall_issue());
+
+    // Additional work does not restart the timer.
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    EXPECT_TRUE(has_stall_issue());
+
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
+    uint64_t latest = 0;
+    ASSERT_EQ(writer->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 3u);
+    EXPECT_FALSE(has_stall_issue());
+
+    // Rewriting an already committed entry cannot arm a new timer.
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(3), true), ErrorCode::OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    EXPECT_FALSE(has_stall_issue());
+    status.Reset();
 }
 
 TEST_F(RedisOpLogStoreTest, RejectsInvalidWriteBatchSize) {

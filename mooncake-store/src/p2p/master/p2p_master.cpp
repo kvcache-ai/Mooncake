@@ -199,7 +199,8 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
 int P2PMaster::RunStandalone() {
     HAStatusManager::instance().Configure(
         /*ha_enabled=*/false, config_.cluster_id,
-        config_.rpc.address + ":" + std::to_string(config_.rpc.port));
+        config_.rpc.address + ":" + std::to_string(config_.rpc.port),
+        config_.oplog.latest_stall_timeout_sec);
     HAStatusManager::instance().SetRoleState("disabled", "STANDALONE");
     auto server = CreateRpcServer(config_);
     auto active_service = CreateActiveService(config_, /*view_version=*/0);
@@ -207,8 +208,9 @@ int P2PMaster::RunStandalone() {
 }
 
 int P2PMaster::RunWithHA() {
-    HAStatusManager::instance().Configure(/*ha_enabled=*/true,
-                                          config_.cluster_id, "");
+    HAStatusManager::instance().Configure(
+        /*ha_enabled=*/true, config_.cluster_id, "",
+        config_.oplog.latest_stall_timeout_sec);
 #ifdef STORE_USE_REDIS
     std::string master_instance_id;
     if (config_.oplog.enabled &&

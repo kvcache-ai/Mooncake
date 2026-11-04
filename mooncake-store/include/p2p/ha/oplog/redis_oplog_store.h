@@ -109,6 +109,7 @@ class RedisOpLogStore : public OpLogStore {
     ErrorCode AdvanceCommittedLatestUnlocked(redisContext* ctx);
     void CompleteWrite(const std::shared_ptr<PendingWrite>& pending,
                        ErrorCode result);
+    void UpdateWriteProgressUnlocked();
 
     std::string EntryKey(uint64_t sequence_id) const;
     std::string SnapshotKey(const std::string& snapshot_id) const;
