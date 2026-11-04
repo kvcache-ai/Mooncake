@@ -1,0 +1,221 @@
+#include "p2p/ha/ha_status.h"
+
+#include <chrono>
+#include <utility>
+
+#include <glog/logging.h>
+#include <ylt/struct_json/json_writer.h>
+
+#include "p2p/ha/ha_metric_manager.h"
+
+namespace mooncake {
+
+namespace {
+
+int64_t RoleMetricValue(const HAStatusSnapshot& status) {
+    if (status.role == "failed" || status.state == "FAILED") {
+        return 6;
+    }
+    if (!status.ha_enabled || status.role == "disabled") {
+        return 1;
+    }
+    if (status.role == "primary") {
+        return 5;
+    }
+    if (status.role == "promoting") {
+        return 4;
+    }
+    if (status.role == "standby") {
+        return 3;
+    }
+    if (status.role == "starting") {
+        return 2;
+    }
+    return 0;
+}
+
+void UpdateMetrics(const HAStatusSnapshot& status) {
+    auto& metrics = HAMetricManager::instance();
+    metrics.set_master_role(RoleMetricValue(status));
+    metrics.set_snapshot_ready(status.snapshot_ready);
+    metrics.set_registry_heartbeat_ok(status.registry_heartbeat_ok);
+    metrics.set_status_updated_timestamp_ms(status.updated_at_ms);
+}
+
+}  // namespace
+
+HAStatusManager& HAStatusManager::instance() {
+    static HAStatusManager manager;
+    return manager;
+}
+
+HAStatusManager::HAStatusManager() { TouchLocked(); }
+
+void HAStatusManager::Reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_ = HAStatusSnapshot{};
+    TouchLocked();
+}
+
+void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
+                                std::string local_endpoint) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.ha_enabled = ha_enabled;
+    if (!cluster_id.empty()) {
+        status_.cluster_id = std::move(cluster_id);
+    }
+    if (!local_endpoint.empty()) {
+        status_.local_endpoint = std::move(local_endpoint);
+    }
+    if (!ha_enabled) {
+        status_.role = "disabled";
+        status_.state = "disabled";
+    }
+    TouchLocked();
+}
+
+void HAStatusManager::SetRoleState(std::string role, std::string state) {
+    bool changed = false;
+    std::string old_role;
+    std::string old_state;
+    std::string new_role;
+    std::string new_state;
+    std::lock_guard<std::mutex> lock(mutex_);
+    changed = status_.role != role || status_.state != state;
+    if (changed) {
+        old_role = status_.role;
+        old_state = status_.state;
+        new_role = role;
+        new_state = state;
+    }
+    status_.role = std::move(role);
+    status_.state = std::move(state);
+    TouchLocked();
+    if (changed && status_.ha_enabled) {
+        LOG(INFO) << "HA status transition: role=" << old_role
+                  << ", state=" << old_state << " -> role=" << new_role
+                  << ", state=" << new_state;
+    }
+}
+
+void HAStatusManager::SetInstanceId(std::string instance_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.instance_id = std::move(instance_id);
+    TouchLocked();
+}
+
+void HAStatusManager::SetLeader(std::string leader_endpoint, uint64_t epoch) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.leader_endpoint = leader_endpoint;
+    status_.epoch = epoch;
+    status_.master_view_address = std::move(leader_endpoint);
+    status_.master_view_epoch = epoch;
+    TouchLocked();
+}
+
+void HAStatusManager::SetMasterView(std::string address, uint64_t epoch,
+                                    int64_t timestamp_ms, int64_t ttl_sec,
+                                    std::string candidate_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.leader_endpoint = address;
+    status_.epoch = epoch;
+    status_.master_view_address = std::move(address);
+    status_.master_view_epoch = epoch;
+    status_.master_view_timestamp_ms = timestamp_ms;
+    status_.master_view_ttl_sec = ttl_sec;
+    status_.master_view_candidate_id = std::move(candidate_id);
+    TouchLocked();
+}
+
+void HAStatusManager::SetSnapshotReady(bool snapshot_ready) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.snapshot_ready = snapshot_ready;
+    TouchLocked();
+}
+
+void HAStatusManager::SetOpLogProgress(uint64_t applied_sequence_id,
+                                       uint64_t latest_sequence_id,
+                                       uint64_t trimmed_sequence_id,
+                                       uint64_t gc_cursor_sequence_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.applied_sequence_id = applied_sequence_id;
+    status_.latest_sequence_id = latest_sequence_id;
+    status_.trimmed_sequence_id = trimmed_sequence_id;
+    status_.gc_cursor_sequence_id = gc_cursor_sequence_id;
+    status_.oplog_lag = latest_sequence_id > applied_sequence_id
+                            ? latest_sequence_id - applied_sequence_id
+                            : 0;
+    TouchLocked();
+}
+
+void HAStatusManager::SetLastError(std::string error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.last_error = std::move(error);
+    TouchLocked();
+}
+
+void HAStatusManager::ClearLastError() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    status_.last_error.clear();
+    TouchLocked();
+}
+
+void HAStatusManager::ClearLastErrorIfPrefix(std::string prefix) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (status_.last_error.rfind(prefix, 0) != 0) {
+        return;
+    }
+    status_.last_error.clear();
+    TouchLocked();
+}
+
+void HAStatusManager::RecordRegistryHeartbeat(ErrorCode result,
+                                              std::string error) {
+    bool recovered = false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (result == ErrorCode::OK) {
+        recovered = !status_.registry_heartbeat_ok &&
+                    status_.registry_heartbeat_last_failure_ms > 0;
+        status_.registry_heartbeat_ok = true;
+        status_.registry_heartbeat_last_success_ms = NowMs();
+        if (status_.last_error == status_.registry_heartbeat_last_error) {
+            status_.last_error.clear();
+        }
+        status_.registry_heartbeat_last_error.clear();
+    } else {
+        status_.registry_heartbeat_ok = false;
+        status_.registry_heartbeat_last_failure_ms = NowMs();
+        status_.registry_heartbeat_last_error = std::move(error);
+        status_.last_error = status_.registry_heartbeat_last_error;
+    }
+    TouchLocked();
+    if (recovered) {
+        LOG(INFO) << "Redis Master registry heartbeat recovered"
+                  << ", instance_id=" << status_.instance_id
+                  << ", role=" << status_.role;
+    }
+}
+
+HAStatusSnapshot HAStatusManager::Snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return status_;
+}
+
+std::string HAStatusManager::SerializeJson() const {
+    std::string json;
+    struct_json::to_json(Snapshot(), json);
+    return json;
+}
+
+int64_t HAStatusManager::NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+void HAStatusManager::TouchLocked() {
+    status_.updated_at_ms = NowMs();
+    UpdateMetrics(status_);
+}
+
+}  // namespace mooncake

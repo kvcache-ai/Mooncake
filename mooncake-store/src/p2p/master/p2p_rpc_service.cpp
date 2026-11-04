@@ -9,6 +9,8 @@
 #include <glog/logging.h>
 #include <json/json.h>
 
+#include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "rpc_helper.h"
 #include "utils/scoped_vlog_timer.h"
@@ -21,7 +23,11 @@ P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
     : master_service_(config, view_version),
       http_server_(4, static_cast<uint16_t>(config.metrics.http_port)),
       metric_report_running_(config.metrics.enable_reporting),
-      heartbeat_rpc_port_(config.rpc.heartbeat_port) {}
+      heartbeat_rpc_port_(config.rpc.heartbeat_port) {
+    HAStatusManager::instance().Configure(
+        config.ha.enabled, config.cluster_id,
+        config.rpc.address + ":" + std::to_string(config.rpc.port));
+}
 
 P2PMasterRpcService::~P2PMasterRpcService() {
     metric_report_running_ = false;
@@ -56,10 +62,18 @@ void P2PMasterRpcService::init_http_server() {
 
     http_server_.set_http_handler<GET>(
         "/metrics", [](coro_http_request& req, coro_http_response& resp) {
-            std::string metrics =
+            auto metrics =
                 P2PMasterMetricManager::instance().serialize_metrics();
+            metrics += HAMetricManager::instance().serialize_metrics();
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, std::move(metrics));
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/ha/status", [](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            resp.set_status_and_content(
+                status_type::ok, HAStatusManager::instance().SerializeJson());
         });
 
     http_server_.set_http_handler<GET>(

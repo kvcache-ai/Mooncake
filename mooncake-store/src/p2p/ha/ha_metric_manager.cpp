@@ -47,6 +47,17 @@ HAMetricManager::HAMetricManager()
       p2p_bootstrap_catchup_target_sequence_id_(
           "ha_p2p_bootstrap_catchup_target_sequence_id",
           "Latest OpLog target sequence ID used after P2P snapshot bootstrap"),
+      master_role_("ha_master_role",
+                   "Current HA master role (0=unknown, 1=disabled, 2=starting, "
+                   "3=standby, 4=promoting, 5=primary, 6=failed)"),
+      snapshot_ready_("ha_snapshot_ready",
+                      "Whether this master can serve HA snapshot requests"),
+      registry_heartbeat_ok_(
+          "ha_registry_heartbeat_ok",
+          "Whether the latest Redis Master registry heartbeat succeeded"),
+      status_updated_timestamp_ms_(
+          "ha_status_updated_timestamp_ms",
+          "Unix timestamp of the latest HA status update"),
 
       // Error Counters
       oplog_skipped_entries_total_(
@@ -208,6 +219,10 @@ HAMetricManager::HAMetricManager()
     oplog_last_successful_poll_timestamp_ms_.update(0);
     p2p_snapshot_bootstrap_baseline_sequence_id_.update(0);
     p2p_bootstrap_catchup_target_sequence_id_.update(0);
+    master_role_.update(0);
+    snapshot_ready_.update(0);
+    registry_heartbeat_ok_.update(0);
+    status_updated_timestamp_ms_.update(0);
     standby_state_.update(0);
 }
 
@@ -282,6 +297,38 @@ void HAMetricManager::set_p2p_snapshot_bootstrap_baseline_sequence_id(
 void HAMetricManager::set_p2p_bootstrap_catchup_target_sequence_id(
     int64_t seq_id) {
     p2p_bootstrap_catchup_target_sequence_id_.update(seq_id);
+}
+
+void HAMetricManager::set_master_role(int64_t role) {
+    master_role_.update(role);
+}
+
+int64_t HAMetricManager::get_master_role() {
+    return static_cast<int64_t>(master_role_.value());
+}
+
+void HAMetricManager::set_snapshot_ready(bool value) {
+    snapshot_ready_.update(value ? 1 : 0);
+}
+
+int64_t HAMetricManager::get_snapshot_ready() {
+    return static_cast<int64_t>(snapshot_ready_.value());
+}
+
+void HAMetricManager::set_registry_heartbeat_ok(bool value) {
+    registry_heartbeat_ok_.update(value ? 1 : 0);
+}
+
+int64_t HAMetricManager::get_registry_heartbeat_ok() {
+    return static_cast<int64_t>(registry_heartbeat_ok_.value());
+}
+
+void HAMetricManager::set_status_updated_timestamp_ms(int64_t timestamp_ms) {
+    status_updated_timestamp_ms_.update(timestamp_ms);
+}
+
+int64_t HAMetricManager::get_status_updated_timestamp_ms() {
+    return static_cast<int64_t>(status_updated_timestamp_ms_.value());
 }
 
 // ========== Error Counters ==========
@@ -545,6 +592,10 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_last_successful_poll_timestamp_ms_);
     serialize_metric(p2p_snapshot_bootstrap_baseline_sequence_id_);
     serialize_metric(p2p_bootstrap_catchup_target_sequence_id_);
+    serialize_metric(master_role_);
+    serialize_metric(snapshot_ready_);
+    serialize_metric(registry_heartbeat_ok_);
+    serialize_metric(status_updated_timestamp_ms_);
     serialize_metric(standby_state_);
 
     // Counters
@@ -614,6 +665,9 @@ std::string HAMetricManager::get_summary_string() {
     ss << ", write_fail=" << get_oplog_write_failures_total();
     ss << ", watch_disconn=" << get_oplog_watch_disconnections_total();
     ss << ", state=" << get_standby_state();
+    ss << ", role=" << get_master_role();
+    ss << ", snapshot_ready=" << get_snapshot_ready();
+    ss << ", registry_heartbeat_ok=" << get_registry_heartbeat_ok();
     return ss.str();
 }
 

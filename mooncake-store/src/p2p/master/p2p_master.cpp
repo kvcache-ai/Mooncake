@@ -20,6 +20,7 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/p2p_hot_standby_service.h"
 #include "p2p/ha/p2p_master_view.h"
 #include "p2p/master/p2p_rpc_service.h"
@@ -178,12 +179,18 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
 }
 
 int P2PMaster::RunStandalone() {
+    HAStatusManager::instance().Configure(
+        /*ha_enabled=*/false, config_.cluster_id,
+        config_.rpc.address + ":" + std::to_string(config_.rpc.port));
+    HAStatusManager::instance().SetRoleState("disabled", "STANDALONE");
     auto server = CreateRpcServer(config_);
     auto active_service = CreateActiveService(config_, /*view_version=*/0);
     return RunActiveRpcServers(*server, *active_service);
 }
 
 int P2PMaster::RunWithHA() {
+    HAStatusManager::instance().Configure(/*ha_enabled=*/true,
+                                          config_.cluster_id, "");
     const std::string local_endpoint =
         config_.rpc.address + ":" + std::to_string(config_.rpc.port);
     std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
@@ -218,12 +225,15 @@ int P2PMaster::RunWithHA() {
         }
 
 #ifdef STORE_USE_REDIS
+        HAStatusManager::instance().SetRoleState(
+            config_.oplog.enabled ? "standby" : "starting", "INITIALIZING");
         std::unique_ptr<RedisMasterRegistryHeartbeat> master_registry_heartbeat;
         std::string master_instance_id;
         std::string p2p_snapshot_endpoint;
         if (config_.oplog.enabled &&
             config_.ha.election_backend == ElectionBackend::REDIS) {
             master_instance_id = GenerateMasterInstanceId();
+            HAStatusManager::instance().SetInstanceId(master_instance_id);
             RedisMasterRegistryEntry entry;
             entry.instance_id = master_instance_id;
             entry.master_endpoint = local_endpoint;
@@ -306,6 +316,11 @@ int P2PMaster::RunWithHA() {
                 standby_registry_providers =
                     std::make_unique<ScopedStandbyRegistryProviders>(
                         *master_registry_heartbeat, *standby);
+                const auto sync_status = standby->GetSyncStatus();
+                HAStatusManager::instance().SetRoleState(
+                    "standby", StandbyStateToString(sync_status.state));
+                HAStatusManager::instance().SetOpLogProgress(
+                    sync_status.applied_seq_id, sync_status.primary_seq_id);
                 master_registry_heartbeat->UpdateRole(
                     "standby", standby->IsReadyForSnapshot());
             }
@@ -337,6 +352,7 @@ int P2PMaster::RunWithHA() {
             std::chrono::seconds(master_view->GetLeaderLeaseTTLSeconds()));
 
 #ifdef STORE_USE_REDIS
+        HAStatusManager::instance().SetRoleState("promoting", "PROMOTING");
         if (master_registry_heartbeat) {
             master_registry_heartbeat->UpdateRole("promoting", false);
         }
@@ -356,12 +372,15 @@ int P2PMaster::RunWithHA() {
             }
             promoted_sequence_id = standby->GetLatestAppliedSequenceId();
             promoted_metadata = standby->ExportMetadata();
+            HAStatusManager::instance().SetOpLogProgress(
+                promoted_sequence_id, promoted_sequence_id);
 #ifdef STORE_USE_REDIS
             standby_registry_providers.reset();
 #endif
             standby.reset();
         }
 
+        HAStatusManager::instance().SetRoleState("primary", "STARTING");
         auto stepdown_callback = [&stop_primary_rpc, &primary_oplog_manager] {
             if (auto* manager =
                     primary_oplog_manager.load(std::memory_order_acquire)) {
@@ -492,10 +511,19 @@ int P2PMaster::RunWithHA() {
         auto mark_primary = [&master_registry_heartbeat,
                              primary_service =
                                  &active_service->GetMasterService()] {
-            if (master_registry_heartbeat) {
+            const uint64_t latest_sequence_id =
+                primary_service->GetLatestOpLogSequenceId();
+            HAStatusManager::instance().SetOpLogProgress(
+                latest_sequence_id, latest_sequence_id);
+            HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+            {
                 master_registry_heartbeat->SetAppliedSequenceProvider(
-                    [primary_service] {
-                        return primary_service->GetLatestOpLogSequenceId();
+                    [primary_service, latest_sequence_id] {
+                        const uint64_t sequence_id =
+                            primary_service->GetLatestOpLogSequenceId();
+                        HAStatusManager::instance().SetOpLogProgress(
+                            sequence_id, sequence_id);
+                        return sequence_id;
                     });
                 master_registry_heartbeat->SetSnapshotReadyProvider({});
                 master_registry_heartbeat->UpdateRole("primary", false);
@@ -507,6 +535,11 @@ int P2PMaster::RunWithHA() {
 #else
         const int run_result = RunActiveRpcServers(*server, *active_service);
 #endif
+        HAStatusManager::instance().SetRoleState(
+            leadership_lost.load(std::memory_order_acquire) ? "standby"
+                                                           : "primary",
+            leadership_lost.load(std::memory_order_acquire) ? "LEADERSHIP_LOST"
+                                                            : "STOPPED");
         if (auto* manager =
                 primary_oplog_manager.load(std::memory_order_acquire)) {
             manager->StopWriting();

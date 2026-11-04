@@ -70,6 +70,14 @@ class HAMetricManager {
     void set_oplog_last_successful_poll_timestamp_ms(int64_t timestamp_ms);
     void set_p2p_snapshot_bootstrap_baseline_sequence_id(int64_t seq_id);
     void set_p2p_bootstrap_catchup_target_sequence_id(int64_t seq_id);
+    void set_master_role(int64_t role);
+    int64_t get_master_role();
+    void set_snapshot_ready(bool value);
+    int64_t get_snapshot_ready();
+    void set_registry_heartbeat_ok(bool value);
+    int64_t get_registry_heartbeat_ok();
+    void set_status_updated_timestamp_ms(int64_t timestamp_ms);
+    int64_t get_status_updated_timestamp_ms();
 
     // ========== Error Counters ==========
 
@@ -241,6 +249,10 @@ class HAMetricManager {
     ylt::metric::gauge_t oplog_last_successful_poll_timestamp_ms_;
     ylt::metric::gauge_t p2p_snapshot_bootstrap_baseline_sequence_id_;
     ylt::metric::gauge_t p2p_bootstrap_catchup_target_sequence_id_;
+    ylt::metric::gauge_t master_role_;
+    ylt::metric::gauge_t snapshot_ready_;
+    ylt::metric::gauge_t registry_heartbeat_ok_;
+    ylt::metric::gauge_t status_updated_timestamp_ms_;
 
     // Error Counters
     ylt::metric::counter_t oplog_skipped_entries_total_;

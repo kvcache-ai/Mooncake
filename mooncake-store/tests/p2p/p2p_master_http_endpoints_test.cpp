@@ -2,7 +2,7 @@
  * @file p2p_master_http_endpoints_test.cpp
  * @brief Integration tests for the P2P master HTTP endpoints
  *        (GET /health, GET /get_key_count, GET /get_all_keys,
- *         GET /batch_query_routes, GET /metrics).
+ *         GET /batch_query_routes, GET /metrics, GET /ha/status).
  *
  * Brings up an in-process P2PMasterRpcService with the embedded HTTP
  * server bound to a kernel-assigned port (no RPC server)
@@ -31,6 +31,7 @@
 
 #include <ylt/coro_http/coro_http_client.hpp>
 
+#include "p2p/ha/ha_status.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "types.h"
 #include "utils.h"
@@ -246,6 +247,12 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
     static UUID segment_id_b_;
 };
 
+namespace {
+struct HAStatusResetGuard {
+    ~HAStatusResetGuard() { HAStatusManager::instance().Reset(); }
+};
+}  // namespace
+
 std::unique_ptr<P2PMasterRpcService> P2PMasterHttpEndpointsTest::wrapped_;
 std::string P2PMasterHttpEndpointsTest::http_base_url_;
 UUID P2PMasterHttpEndpointsTest::client_id_;
@@ -269,6 +276,69 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
     const auto body = ParseJson(response.resp_body, "stepdown");
     EXPECT_TRUE(body["success"].asBool());
     EXPECT_TRUE(stepdown_called.load());
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Configure(/*ha_enabled=*/true, "test_cluster",
+                    "127.0.0.1:50051");
+    status.SetInstanceId("test-instance");
+    status.SetRoleState("primary", "RUNNING");
+    status.SetMasterView("127.0.0.1:50051", 7,
+                         /*timestamp_ms=*/123456789,
+                         /*ttl_sec=*/4,
+                         /*candidate_id=*/"candidate-1");
+    status.SetOpLogProgress(/*applied_sequence_id=*/12,
+                           /*latest_sequence_id=*/15,
+                           /*trimmed_sequence_id=*/3,
+                           /*gc_cursor_sequence_id=*/2);
+    status.SetSnapshotReady(true);
+    status.RecordRegistryHeartbeat(ErrorCode::OK, "");
+
+    auto response = HttpGet(http_base_url_ + "/ha/status");
+    ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
+    const auto body = ParseJson(response.resp_body, "/ha/status");
+    EXPECT_EQ(body["ha_enabled"].asBool(), true);
+    EXPECT_EQ(body["cluster_id"].asString(), "test_cluster");
+    EXPECT_EQ(body["local_endpoint"].asString(), "127.0.0.1:50051");
+    EXPECT_EQ(body["instance_id"].asString(), "test-instance");
+    EXPECT_EQ(body["role"].asString(), "primary");
+    EXPECT_EQ(body["state"].asString(), "RUNNING");
+    EXPECT_EQ(body["leader_endpoint"].asString(), "127.0.0.1:50051");
+    EXPECT_EQ(body["epoch"].asUInt64(), 7u);
+    EXPECT_EQ(body["master_view_address"].asString(), "127.0.0.1:50051");
+    EXPECT_EQ(body["master_view_epoch"].asUInt64(), 7u);
+    EXPECT_EQ(body["master_view_timestamp_ms"].asInt64(), 123456789);
+    EXPECT_EQ(body["master_view_ttl_sec"].asInt64(), 4);
+    EXPECT_EQ(body["master_view_candidate_id"].asString(), "candidate-1");
+    EXPECT_EQ(body["applied_sequence_id"].asUInt64(), 12u);
+    EXPECT_EQ(body["latest_sequence_id"].asUInt64(), 15u);
+    EXPECT_EQ(body["trimmed_sequence_id"].asUInt64(), 3u);
+    EXPECT_EQ(body["gc_cursor_sequence_id"].asUInt64(), 2u);
+    EXPECT_EQ(body["oplog_lag"].asUInt64(), 3u);
+    EXPECT_EQ(body["snapshot_ready"].asBool(), true);
+    EXPECT_EQ(body["registry_heartbeat_ok"].asBool(), true);
+    EXPECT_GT(body["updated_at_ms"].asInt64(), 0);
+
+    auto metrics_response = HttpGet(http_base_url_ + "/metrics");
+    ASSERT_EQ(metrics_response.status, 200)
+        << "body=" << metrics_response.resp_body;
+    EXPECT_EQ(ParseMetricValue(metrics_response.resp_body, "ha_master_role")
+                  .value_or(0),
+              5);
+    EXPECT_EQ(ParseMetricValue(metrics_response.resp_body, "ha_snapshot_ready")
+                  .value_or(0),
+              1);
+    EXPECT_EQ(
+        ParseMetricValue(metrics_response.resp_body,
+                         "ha_registry_heartbeat_ok")
+            .value_or(0),
+        1);
+    EXPECT_GT(ParseMetricValue(metrics_response.resp_body,
+                              "ha_status_updated_timestamp_ms")
+                  .value_or(0),
+              0);
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,
