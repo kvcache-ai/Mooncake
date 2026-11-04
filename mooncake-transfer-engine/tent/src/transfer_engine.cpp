@@ -157,6 +157,27 @@ Status TransferEngine::submitTransfer(BatchID batch_id,
     return impl_->submitTransfer(batch_id, request_list, notifi);
 }
 
+Status TransferEngine::openSession(SessionHandle& out, SegmentID dst_segment,
+                                   const std::vector<BufferRange>& dst_ranges,
+                                   const SessionOptions& opts) {
+    return fenced_.openSession(out, dst_segment, dst_ranges, opts);
+}
+
+Status TransferEngine::getLease(SessionHandle session, WriterLease& out) {
+    return fenced_.getLease(session, out);
+}
+
+Status TransferEngine::submitTransfer(BatchID batch_id,
+                                      const std::vector<Request>& request_list,
+                                      const WriterLease& lease) {
+    Status admitted =
+        fenced_.admitSubmission(lease, FencedSessions::NowNs(), batch_id);
+    if (!admitted.ok()) return admitted;
+    Status submitted = impl_->submitTransfer(batch_id, request_list);
+    if (!submitted.ok()) fenced_.forgetSubmission(lease, batch_id);
+    return submitted;
+}
+
 Status TransferEngine::cancelTransfer(BatchID batch_id, size_t task_id) {
     return impl_->cancelTransfer(batch_id, task_id);
 }
