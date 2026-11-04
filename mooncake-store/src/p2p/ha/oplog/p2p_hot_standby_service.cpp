@@ -700,6 +700,10 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
         return ErrorCode::OPLOG_TRIMMED;
     }
 
+    // The trusted snapshot replaces metadata affected by earlier local
+    // rejections. A rejection during the new replay will set this again.
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_PENDING_REJECTED", "");
+    HAStatusManager::instance().ResetOpLogLagGrowth();
     oplog_applier_ = std::make_unique<P2POpLogApplier>(
         metadata_store_.get(), config_.cluster_id, nullptr,
         config_.oplog_pending_max_entries);

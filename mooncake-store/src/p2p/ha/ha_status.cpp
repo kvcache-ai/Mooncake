@@ -16,6 +16,8 @@ namespace {
 constexpr auto kElectionWindow = std::chrono::seconds(300);
 constexpr int kElectionChangeThreshold = 3;
 constexpr size_t kOpLogQueuePressurePercent = 80;
+constexpr uint64_t kOpLogLagGrowthMinEntries = 1000;
+constexpr auto kOpLogLagGrowthDuration = std::chrono::seconds(30);
 constexpr uint64_t kOpLogTrimRiskThresholdPercent = 10;
 
 uint64_t CeilPercent(uint64_t value, uint64_t percent) {
@@ -85,6 +87,7 @@ std::string IssueComponent(const std::string& code) {
         return "oplog_reader";
     }
     if (StartsWith(code, "OPLOG_APPLY_") || code == "OPLOG_CATCHUP_STALLED" ||
+        code == "OPLOG_PENDING_REJECTED" || code == "OPLOG_LAG_GROWING" ||
         code == "STANDBY_BEHIND_TRIM" || code == "OPLOG_TRIM_RISK" ||
         StartsWith(code, "PROMOTION_")) {
         return "oplog_applier";
@@ -111,7 +114,7 @@ std::string IssueSeverity(const std::string& code) {
         code == "STANDBY_SNAPSHOT_INSUFFICIENT" || code == "OPLOG_TRIM_RISK" ||
         code == "OPLOG_QUEUE_PRESSURE" || code == "OPLOG_LATEST_STALLED" ||
         code == "OPLOG_CATCHUP_STALLED" || code == "OPLOG_POLL_STALE" ||
-        code == "PROMOTION_CATCHUP_INCOMPLETE") {
+        code == "OPLOG_LAG_GROWING" || code == "PROMOTION_CATCHUP_INCOMPLETE") {
         return "warning";
     }
     return "error";
@@ -138,6 +141,7 @@ bool IsDoctorIssueScopedToRole(const std::string& code,
         return StartsWith(code, "OPLOG_READ_") ||
                StartsWith(code, "OPLOG_RECONNECT_") ||
                StartsWith(code, "OPLOG_APPLY_") ||
+               code == "OPLOG_PENDING_REJECTED" ||
                code == "SNAPSHOT_RECOVERY_FAILED";
     }
     if (role == "promoting") {
@@ -192,6 +196,7 @@ void HAStatusManager::Reset() {
     doctor_issues_.clear();
     oplog_writer_ = {};
     oplog_catchup_ = {};
+    oplog_lag_growth_ = {};
     standby_snapshot_ = {};
     oplog_poll_ = {};
     status_.oplog_pending_writes = 0;
@@ -221,6 +226,7 @@ void HAStatusManager::Configure(bool ha_enabled, std::string cluster_id,
     if (!ha_enabled) {
         oplog_writer_ = {};
         oplog_catchup_ = {};
+        oplog_lag_growth_ = {};
         oplog_poll_ = {};
         standby_snapshot_ = {};
         status_.oplog_latest_read_ok = false;
@@ -241,6 +247,7 @@ void HAStatusManager::SetRoleState(std::string role, std::string state) {
     changed = status_.role != role || status_.state != state;
     if (role != "standby" || state != "WATCHING") {
         oplog_catchup_ = {};
+        oplog_lag_growth_ = {};
         oplog_poll_ = {};
     }
     if (changed) {
@@ -507,8 +514,23 @@ void HAStatusManager::SetOpLogProgress(
                    applied_sequence_id > status_.applied_sequence_id) {
             oplog_catchup_.stalled_since = oplog_catchup_.last_observed_at;
         }
+        if (latest_sequence_id) {
+            const uint64_t lag = *latest_sequence_id > applied_sequence_id
+                                     ? *latest_sequence_id - applied_sequence_id
+                                     : 0;
+            if (!oplog_lag_growth_.since ||
+                lag <= oplog_lag_growth_.baseline_lag) {
+                oplog_lag_growth_.since = oplog_catchup_.last_observed_at;
+                oplog_lag_growth_.baseline_lag = lag;
+            }
+            oplog_lag_growth_.last_observed_at =
+                oplog_catchup_.last_observed_at;
+        } else {
+            oplog_lag_growth_ = {};
+        }
     } else {
         oplog_catchup_ = {};
+        oplog_lag_growth_ = {};
     }
     status_.applied_sequence_id = applied_sequence_id;
     status_.trimmed_sequence_id = trimmed_sequence_id;
@@ -572,6 +594,10 @@ void HAStatusManager::RecordRegistryHeartbeat(ErrorCode result,
         LOG_EVERY_N(WARNING, 30)
             << "OpLog catch-up stalled: " << stall << ", sample_every_n=30";
     }
+    if (auto issue = OpLogLagGrowingMessageLocked(); !issue.empty()) {
+        LOG_EVERY_N(WARNING, 30)
+            << "OpLog lag growing: " << issue << ", sample_every_n=30";
+    }
     if (recovered) {
         LOG(INFO) << "Redis Master registry heartbeat recovered"
                   << ", instance_id=" << status_.instance_id
@@ -604,8 +630,31 @@ void HAStatusManager::ClearDoctorIssues() {
     doctor_issues_.clear();
     oplog_writer_ = {};
     oplog_catchup_ = {};
+    oplog_lag_growth_ = {};
     oplog_poll_ = {};
     status_.oplog_pending_writes = 0;
+}
+
+void HAStatusManager::RecordOpLogPendingRejection(uint64_t sequence_id,
+                                                  uint64_t expected_sequence_id,
+                                                  size_t pending,
+                                                  size_t capacity) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!status_.ha_enabled) {
+        return;
+    }
+    doctor_issues_.try_emplace(
+        "OPLOG_PENDING_REJECTED",
+        "first_rejected_sequence_id=" + std::to_string(sequence_id) +
+            ", expected_sequence_id=" + std::to_string(expected_sequence_id) +
+            ", pending=" + std::to_string(pending) + ", capacity=" +
+            std::to_string(capacity) + ", values=snapshot_at_first_rejection" +
+            ", action=verify_replay_before_promotion");
+}
+
+void HAStatusManager::ResetOpLogLagGrowth() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    oplog_lag_growth_ = {};
 }
 
 void HAStatusManager::SetOpLogWriterRunning(bool running) {
@@ -674,6 +723,29 @@ std::string HAStatusManager::OpLogCatchUpStallMessageLocked() const {
            std::to_string(status_.applied_sequence_id) +
            ", oplog_latest_sequence_id=" +
            std::to_string(status_.latest_sequence_id) + ", stalled_ms=" +
+           std::to_string(
+               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+                   .count());
+}
+
+std::string HAStatusManager::OpLogLagGrowingMessageLocked() const {
+    if (!status_.ha_enabled || status_.role != "standby" ||
+        status_.state != "WATCHING" || !status_.oplog_latest_read_ok ||
+        !oplog_lag_growth_.since ||
+        status_.oplog_lag < oplog_lag_growth_.baseline_lag ||
+        status_.oplog_lag - oplog_lag_growth_.baseline_lag <
+            kOpLogLagGrowthMinEntries) {
+        return {};
+    }
+    const auto elapsed =
+        oplog_lag_growth_.last_observed_at - *oplog_lag_growth_.since;
+    if (elapsed < kOpLogLagGrowthDuration) {
+        return {};
+    }
+    return "baseline_lag=" + std::to_string(oplog_lag_growth_.baseline_lag) +
+           ", current_lag=" + std::to_string(status_.oplog_lag) + ", growth=" +
+           std::to_string(status_.oplog_lag - oplog_lag_growth_.baseline_lag) +
+           ", duration_ms=" +
            std::to_string(
                std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
                    .count());
@@ -765,6 +837,10 @@ std::string HAStatusManager::SerializeDoctorJson() const {
             if (auto stall = OpLogCatchUpStallMessageLocked(); !stall.empty()) {
                 report.issues.push_back(
                     MakeDoctorIssue("OPLOG_CATCHUP_STALLED", std::move(stall)));
+            }
+            if (auto issue = OpLogLagGrowingMessageLocked(); !issue.empty()) {
+                report.issues.push_back(
+                    MakeDoctorIssue("OPLOG_LAG_GROWING", std::move(issue)));
             }
             if (auto issue = OpLogPollStaleMessageLocked(); !issue.empty()) {
                 report.issues.push_back(

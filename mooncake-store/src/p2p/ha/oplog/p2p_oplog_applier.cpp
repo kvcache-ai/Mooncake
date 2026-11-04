@@ -8,6 +8,7 @@
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/oplog/oplog_store.h"
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/common/p2p_types.h"
 
 namespace mooncake {
@@ -235,13 +236,15 @@ bool P2POpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         std::lock_guard<std::mutex> lock(pending_mutex_);
 
         if (pending_entries_.size() >= max_pending_entries_) {
-            LOG(ERROR) << "OpLogApplier: pending full, rejected entry "
-                          "sequence_id="
-                       << entry.sequence_id
-                       << ", expected_sequence_id=" << expected
-                       << ", key=" << entry.object_key
-                       << ", pending=" << pending_entries_.size()
-                       << ", capacity=" << max_pending_entries_;
+            HAStatusManager::instance().RecordOpLogPendingRejection(
+                entry.sequence_id, expected, pending_entries_.size(),
+                max_pending_entries_);
+            LOG_EVERY_N(WARNING, 100)
+                << "OpLogApplier: pending full, rejected entry sequence_id="
+                << entry.sequence_id << ", expected_sequence_id=" << expected
+                << ", pending=" << pending_entries_.size()
+                << ", capacity=" << max_pending_entries_
+                << ", sample_every_n=100";
             return false;
         }
 

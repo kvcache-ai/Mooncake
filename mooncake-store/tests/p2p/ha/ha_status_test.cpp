@@ -31,6 +31,12 @@ struct HAStatusTestPeer {
         status.oplog_poll_.last_success_ms -=
             std::chrono::duration_cast<std::chrono::milliseconds>(age).count();
     }
+    static void AgeLagGrowthStart(HAStatusManager& status,
+                                  std::chrono::seconds age) {
+        std::lock_guard<std::mutex> lock(status.mutex_);
+        ASSERT_TRUE(status.oplog_lag_growth_.since.has_value());
+        *status.oplog_lag_growth_.since -= age;
+    }
     static void AgeMasterViewRefresh(HAStatusManager& status,
                                      std::chrono::milliseconds age) {
         std::lock_guard<std::mutex> lock(status.mutex_);
@@ -220,6 +226,50 @@ TEST_F(HAStatusTest, DoctorReportsOpLogQueuePressure) {
     status.SetRoleState("primary", "RUNNING");
     status.SetOpLogWriteProgress(10, 80);
     EXPECT_EQ(FindIssue(doctor(), "OPLOG_QUEUE_PRESSURE"), nullptr);
+}
+
+TEST_F(HAStatusTest, DoctorReportsPendingRejectionUntilReinitialization) {
+    status.RecordOpLogPendingRejection(1201, 100, 1000, 1000);
+    status.RecordOpLogPendingRejection(1202, 100, 1000, 1000);
+    auto report = doctor();
+    EXPECT_EQ(report.health, "degraded");
+    const auto* issue = FindIssue(report, "OPLOG_PENDING_REJECTED");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_EQ(issue->component, "oplog_applier");
+    EXPECT_EQ(issue->severity, "error");
+    EXPECT_NE(issue->message.find("first_rejected_sequence_id=1201"),
+              std::string::npos);
+    EXPECT_NE(issue->message.find("capacity=1000"), std::string::npos);
+    EXPECT_NE(issue->message.find("values=snapshot_at_first_rejection"),
+              std::string::npos);
+    status.SetRoleState("primary", "RUNNING");
+    EXPECT_EQ(FindIssue(doctor(), "OPLOG_PENDING_REJECTED"), nullptr);
+}
+
+TEST_F(HAStatusTest, DoctorReportsGrowingLagDespiteApplyProgress) {
+    status.SetOpLogProgress(100, 200);
+    status.SetOpLogProgress(200, 1200);
+    HAStatusTestPeer::AgeLagGrowthStart(status, std::chrono::seconds(31));
+    status.SetOpLogProgress(300, 2300);
+    auto report = doctor();
+    EXPECT_EQ(report.health, "degraded");
+    const auto* issue = FindIssue(report, "OPLOG_LAG_GROWING");
+    ASSERT_NE(issue, nullptr);
+    EXPECT_EQ(issue->severity, "warning");
+    EXPECT_NE(issue->message.find("baseline_lag=100"), std::string::npos);
+    EXPECT_NE(issue->message.find("current_lag=2000"), std::string::npos);
+    EXPECT_EQ(FindIssue(report, "OPLOG_CATCHUP_STALLED"), nullptr);
+
+    status.ResetOpLogLagGrowth();
+    EXPECT_EQ(FindIssue(doctor(), "OPLOG_LAG_GROWING"), nullptr);
+
+    status.SetOpLogProgress(2250, 2300);
+    EXPECT_EQ(FindIssue(doctor(), "OPLOG_LAG_GROWING"), nullptr);
+
+    status.SetOpLogProgress(2250, 3300);
+    HAStatusTestPeer::AgeLagGrowthStart(status, std::chrono::seconds(31));
+    status.SetOpLogProgress(2250, std::nullopt);
+    EXPECT_EQ(FindIssue(doctor(), "OPLOG_LAG_GROWING"), nullptr);
 }
 
 TEST_F(HAStatusTest, DoctorReportsOpLogPollStale) {

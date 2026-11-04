@@ -168,6 +168,13 @@ class HAStatusManager {
     void SetOpLogWriteProgress(uint64_t committed_sequence_id, size_t pending,
                                size_t capacity = 0);
     void SetOpLogPollSuccess();
+    // A rejected standby entry may have been passed by the scan cursor.
+    // Keep the first rejection visible until the standby is reinitialized.
+    void RecordOpLogPendingRejection(uint64_t sequence_id,
+                                     uint64_t expected_sequence_id,
+                                     size_t pending, size_t capacity);
+    // A trusted snapshot starts a new standby lag observation window.
+    void ResetOpLogLagGrowth();
 
    private:
     friend struct HAStatusTestPeer;
@@ -186,6 +193,7 @@ class HAStatusManager {
     std::string OpLogTrimRiskMessageLocked() const;
     std::string OpLogLatestStallMessageLocked() const;
     std::string OpLogCatchUpStallMessageLocked() const;
+    std::string OpLogLagGrowingMessageLocked() const;
     std::string OpLogQueuePressureMessageLocked() const;
     std::string OpLogPollStaleMessageLocked() const;
 
@@ -221,6 +229,11 @@ class HAStatusManager {
         std::optional<std::chrono::steady_clock::time_point> stalled_since;
         std::chrono::steady_clock::time_point last_observed_at;
     } oplog_catchup_;
+    struct OpLogLagGrowth {
+        std::optional<std::chrono::steady_clock::time_point> since;
+        std::chrono::steady_clock::time_point last_observed_at;
+        uint64_t baseline_lag{0};
+    } oplog_lag_growth_;
     uint32_t oplog_catchup_stall_timeout_sec_{10};
     struct OpLogPollProgress {
         std::optional<std::chrono::steady_clock::time_point> last_success_at;
