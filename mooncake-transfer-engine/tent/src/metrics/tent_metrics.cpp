@@ -47,6 +47,14 @@ namespace {
 constexpr std::array<std::string_view, 2> kSerializationFormatNames{
     "prometheus", "json"};
 
+bool equivalentMetricsConfig(const MetricsConfig& lhs,
+                             const MetricsConfig& rhs) {
+    return lhs.enabled == rhs.enabled && lhs.http_host == rhs.http_host &&
+           lhs.http_port == rhs.http_port &&
+           lhs.http_server_threads == rhs.http_server_threads &&
+           lhs.report_interval_seconds == rhs.report_interval_seconds;
+}
+
 uint64_t unixTimestampSeconds() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
@@ -113,8 +121,7 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     // Validate configuration before touching initialized_. An invalid config
     // (e.g. port 0, zero HTTP threads) would otherwise cause confusing
     // failures inside initHttpServer(); fail fast with a clear error instead.
-    // Validating before the compare_exchange avoids a window where
-    // initialized_ is set to true and then rolled back on failure.
+    // Validate before taking the lifecycle lock to keep invalid calls cheap.
     std::string error_msg;
     if (!MetricsConfigLoader::validateConfig(config, &error_msg)) {
         LOG(ERROR) << "Invalid TENT metrics config: " << error_msg
@@ -123,10 +130,15 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
             "Invalid TENT metrics config: " + error_msg + LOC_MARK);
     }
 
-    // Use compare_exchange to prevent race condition during initialization
-    bool expected = false;
-    if (!initialized_.compare_exchange_strong(expected, true)) {
-        return Status::OK();  // Already initialized by another thread
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    if (initialized_.load(std::memory_order_acquire)) {
+        if (equivalentMetricsConfig(config_, config)) return Status::OK();
+
+        LOG(WARNING) << "TENT metrics already initialized with a different "
+                        "configuration";
+        return Status::InvalidArgument(
+            "TENT metrics already initialized with a different "
+            "configuration" LOC_MARK);
     }
 
     config_ = config;
@@ -134,8 +146,10 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     // Set runtime enabled state from config
     runtime_enabled_.store(config_.enabled, std::memory_order_relaxed);
 
-    // Register all metrics to vectors for unified serialization
-    registerMetrics();
+    // The metric objects and pointer registries live for the process lifetime.
+    // Build them once so a late serializer from the previous lifecycle cannot
+    // race with vector reassignment during re-initialization.
+    if (counters_.empty()) registerMetrics();
 
     // Initialize and start HTTP server on the configured port. If the port is
     // busy (e.g. another rank was given the same port), degrade to log-only
@@ -149,6 +163,12 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
                      << http_status.ToString()
                      << "); continuing with log-only metrics";
     }
+
+    // Publish initialized only after config, runtime state, metric registries,
+    // and HTTP state are ready. Accounting starts are released last so every
+    // successful start can safely reach its matching finish path.
+    initialized_.store(true, std::memory_order_release);
+    accounting_ready_.store(true, std::memory_order_release);
 
     // Start periodic metric reporting thread if interval > 0
     if (config_.report_interval_seconds > 0) {
@@ -263,6 +283,7 @@ void TentMetrics::registerHttpHandlers() {
 }
 
 void TentMetrics::shutdown() {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     if (!initialized_) return;
 
     // Reject new accounting starts before teardown. Already-started pairs can
@@ -282,10 +303,10 @@ void TentMetrics::shutdown() {
         http_server_.reset();
     }
 
-    // Clear metric vectors
-    counters_.clear();
-    histograms_.clear();
-    gauges_.clear();
+    // Keep the process-lifetime metric pointer registries intact. Public
+    // serializers that observed initialized_ before shutdown may still be
+    // finishing, and the metric objects themselves remain valid. A later
+    // initialize() reuses these immutable registries.
 
     // Reset bound port so httpPort() returns 0 after shutdown, not a stale
     // port from a previous initialization. Without this, a re-initialize
@@ -336,7 +357,6 @@ void TentMetrics::registerMetrics() {
     };
 
     preResolveAccountingMetrics();
-    accounting_ready_.store(true, std::memory_order_release);
 }
 
 size_t TentMetrics::outcomeIndex(TransferStatusEnum status) noexcept {
@@ -1105,14 +1125,20 @@ std::string TentMetrics::getSummaryString() {
 
 // Stub implementations when metrics are disabled at compile time
 Status TentMetrics::initialize(const MetricsConfig& config) {
+    // No backend exists in this build, so every configuration remains a
+    // successful no-op; the mutex only preserves lifecycle thread safety.
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     config_ = config;
-    initialized_ = true;
+    initialized_.store(true, std::memory_order_release);
     LOG(INFO)
         << "TENT metrics disabled at compile time (TENT_METRICS_ENABLED=0)";
     return Status::OK();
 }
 
-void TentMetrics::shutdown() { initialized_ = false; }
+void TentMetrics::shutdown() {
+    std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+    initialized_.store(false, std::memory_order_release);
+}
 
 void TentMetrics::recordReadCompleted(TransportType, size_t, double) {}
 void TentMetrics::recordWriteCompleted(TransportType, size_t, double) {}
