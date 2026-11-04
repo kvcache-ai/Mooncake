@@ -197,7 +197,7 @@ class WorkerPoolTestPeer {
     }
 
     static void setPendingRedispatch(WorkerPool &pool,
-                                    std::future<int> result) {
+                                     std::future<int> result) {
         pool.pending_redispatch_[0][77].result = std::move(result);
     }
 
@@ -705,7 +705,7 @@ TEST_F(WorkerPoolRailStateTest, PendingControlWorkPreventsIdleWithoutSlices) {
 
     std::promise<int> redispatch;
     WorkerPoolTestPeer::setPendingRedispatch(*worker_pool_,
-                                           redispatch.get_future());
+                                             redispatch.get_future());
     EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
     redispatch.set_value(0);
     EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));

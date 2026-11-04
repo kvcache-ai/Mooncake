@@ -776,8 +776,8 @@ void WorkerPool::enqueueSliceToOwner(Transport::Slice *slice) {
             worker_slice_queue_lock_[owner_thread]);
         worker_slice_queue_[owner_thread][slice->peerNicPath()].push_back(
             slice);
-        pending_slice_state_[owner_thread].fetch_add(
-            kQueuedSliceCountUnit, std::memory_order_release);
+        pending_slice_state_[owner_thread].fetch_add(kQueuedSliceCountUnit,
+                                                     std::memory_order_release);
     }
 }
 
@@ -1097,8 +1097,8 @@ void WorkerPool::performPostSend(int thread_id) {
             local_slice_queue.begin(), local_slice_queue.end(),
             [](const auto &entry) { return !entry.second.empty(); });
         if (pending) {
-            pending_slice_state_[thread_id].fetch_or(
-                kCollectiveSlicePendingBit, std::memory_order_release);
+            pending_slice_state_[thread_id].fetch_or(kCollectiveSlicePendingBit,
+                                                     std::memory_order_release);
         } else {
             pending_slice_state_[thread_id].fetch_and(
                 ~kCollectiveSlicePendingBit, std::memory_order_release);
@@ -1119,8 +1119,8 @@ void WorkerPool::performPostSend(int thread_id) {
             pending_slice_state_[thread_id].fetch_sub(
                 queued_slice_count * kQueuedSliceCountUnit,
                 std::memory_order_acq_rel);
-            pending_slice_state_[thread_id].fetch_or(
-                kCollectiveSlicePendingBit, std::memory_order_release);
+            pending_slice_state_[thread_id].fetch_or(kCollectiveSlicePendingBit,
+                                                     std::memory_order_release);
         }
     }
 
@@ -1181,8 +1181,8 @@ void WorkerPool::performPostSend(int thread_id) {
     if (!context_.active()) {
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
-        pending_slice_state_[thread_id].fetch_and(
-            ~kCollectiveSlicePendingBit, std::memory_order_release);
+        pending_slice_state_[thread_id].fetch_and(~kCollectiveSlicePendingBit,
+                                                  std::memory_order_release);
         for (auto &entry : local_slice_queue_clone) {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
             if (adaptive_congestion_control_.enabled()) {
@@ -1208,8 +1208,8 @@ void WorkerPool::performPostSend(int thread_id) {
             redispatch_counter_.load(std::memory_order_relaxed);
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
-        pending_slice_state_[thread_id].fetch_and(
-            ~kCollectiveSlicePendingBit, std::memory_order_release);
+        pending_slice_state_[thread_id].fetch_and(~kCollectiveSlicePendingBit,
+                                                  std::memory_order_release);
         bool handoff_to_local_worker = !context_.active();
         for (auto &entry : local_slice_queue_clone)
             redispatch(entry.second, thread_id, handoff_to_local_worker);
@@ -2022,7 +2022,8 @@ bool WorkerPool::hasOutstandingCq(int thread_id) {
 bool WorkerPool::hasPendingWork(int thread_id) const {
     // Only the posting worker reads its asynchronous setup/redispatch maps.
     // These tasks can remain pending after the slice queue and CQ are empty.
-    return pending_slice_state_[thread_id].load(std::memory_order_acquire) != 0 ||
+    return pending_slice_state_[thread_id].load(std::memory_order_acquire) !=
+               0 ||
            !pending_setups_[thread_id].empty() ||
            !pending_redispatch_[thread_id].empty();
 }
