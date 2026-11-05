@@ -42,6 +42,8 @@ struct BucketBackendEnvironment {
     ScopedEnvVar keys_limit{"MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT"};
     ScopedEnvVar size_limit{"MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES"};
     ScopedEnvVar max_total_size{"MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE"};
+    ScopedEnvVar max_total_size_list{
+        "MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST"};
     ScopedEnvVar legacy_max_total_size{"MOONCAKE_BUCKET_MAX_TOTAL_SIZE"};
     ScopedEnvVar max_physical_bytes{
         "MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES"};
@@ -59,7 +61,7 @@ class BucketBackendConfigTest : public ::testing::Test {
 };
 
 TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
-    const auto config = BucketBackendConfig::FromEnvironment();
+    const auto config = BucketBackendConfig::FromEnvironment().value();
 
     EXPECT_EQ(config.bucket_keys_limit, 500);
     EXPECT_EQ(config.bucket_size_limit, 256 * 1024 * 1024);
@@ -80,19 +82,22 @@ TEST_F(BucketBackendConfigTest, ReadsPartialFlushBooleanValues) {
           Case{"FALSE", false}, Case{"invalid", false}}) {
         SCOPED_TRACE(entry.value);
         env.flush_partial_buckets.Set(entry.value);
-        EXPECT_EQ(BucketBackendConfig::FromEnvironment().flush_partial_buckets,
-                  entry.enabled);
+        EXPECT_EQ(
+            BucketBackendConfig::FromEnvironment().value().flush_partial_buckets,
+            entry.enabled);
     }
 }
 
 TEST_F(BucketBackendConfigTest, PartialFlushIsReadPerConfiguration) {
     env.flush_partial_buckets.Set("1");
-    const auto enabled = BucketBackendConfig::FromEnvironment();
+    const auto enabled = BucketBackendConfig::FromEnvironment().value();
     EXPECT_TRUE(enabled.flush_partial_buckets);
     env.flush_partial_buckets.Set("0");
-    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().flush_partial_buckets);
+    EXPECT_FALSE(
+        BucketBackendConfig::FromEnvironment().value().flush_partial_buckets);
     env.flush_partial_buckets.Unset();
-    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().flush_partial_buckets);
+    EXPECT_FALSE(
+        BucketBackendConfig::FromEnvironment().value().flush_partial_buckets);
     EXPECT_TRUE(enabled.flush_partial_buckets);
 }
 
@@ -104,7 +109,7 @@ TEST_F(BucketBackendConfigTest, ReadsIndependentValidValues) {
     env.disk_scan_cache_ms.Set("250");
     env.eviction_policy.Set("lru");
 
-    const auto config = BucketBackendConfig::FromEnvironment();
+    const auto config = BucketBackendConfig::FromEnvironment().value();
 
     EXPECT_EQ(config.bucket_keys_limit, 1000);
     EXPECT_EQ(config.bucket_size_limit, 536870912);
@@ -120,7 +125,7 @@ TEST_F(BucketBackendConfigTest, PreservesAcceptedIntegerSyntax) {
     env.max_physical_bytes.Set("0");
     env.disk_scan_cache_ms.Set("-1");
 
-    const auto config = BucketBackendConfig::FromEnvironment();
+    const auto config = BucketBackendConfig::FromEnvironment().value();
 
     EXPECT_EQ(config.bucket_keys_limit, 7);
     EXPECT_EQ(config.bucket_size_limit, -8);
@@ -137,7 +142,7 @@ TEST_F(BucketBackendConfigTest, InvalidIntegersUseIndividualDefaults) {
         env.disk_scan_cache_ms.Set(value);
         ::testing::internal::CaptureStderr();
 
-        const auto config = BucketBackendConfig::FromEnvironment();
+        const auto config = BucketBackendConfig::FromEnvironment().value();
         const std::string logs = ::testing::internal::GetCapturedStderr();
 
         EXPECT_EQ(config.bucket_keys_limit, 500) << value;
@@ -158,10 +163,12 @@ TEST_F(BucketBackendConfigTest, InvalidIntegersUseIndividualDefaults) {
 
 TEST_F(BucketBackendConfigTest, PreferredTotalSizeOverridesLegacyAlias) {
     env.legacy_max_total_size.Set("111");
-    EXPECT_EQ(BucketBackendConfig::FromEnvironment().max_total_size, 111);
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().max_total_size,
+              111);
 
     env.max_total_size.Set("222");
-    EXPECT_EQ(BucketBackendConfig::FromEnvironment().max_total_size, 222);
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().max_total_size,
+              222);
 }
 
 TEST_F(BucketBackendConfigTest,
@@ -169,7 +176,8 @@ TEST_F(BucketBackendConfigTest,
     env.legacy_max_total_size.Set("111");
     for (const char* value : {"", "invalid", "9223372036854775808"}) {
         env.max_total_size.Set(value);
-        EXPECT_EQ(BucketBackendConfig::FromEnvironment().max_total_size, 111)
+        EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().max_total_size,
+                  111)
             << value;
     }
 }
@@ -179,7 +187,7 @@ TEST_F(BucketBackendConfigTest, PreservesTotalSizeAliasWarningOrder) {
     env.max_total_size.Set("invalid-preferred");
     ::testing::internal::CaptureStderr();
 
-    const auto config = BucketBackendConfig::FromEnvironment();
+    const auto config = BucketBackendConfig::FromEnvironment().value();
     const std::string logs = ::testing::internal::GetCapturedStderr();
 
     EXPECT_EQ(config.max_total_size, 0);
@@ -193,11 +201,11 @@ TEST_F(BucketBackendConfigTest, PreservesTotalSizeAliasWarningOrder) {
 
 TEST_F(BucketBackendConfigTest, PreservesEvictionPolicyAliasPrecedence) {
     env.legacy_eviction_policy.Set("lru");
-    EXPECT_EQ(BucketBackendConfig::FromEnvironment().eviction_policy,
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().eviction_policy,
               BucketEvictionPolicy::LRU);
 
     env.eviction_policy.Set("fifo");
-    EXPECT_EQ(BucketBackendConfig::FromEnvironment().eviction_policy,
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().eviction_policy,
               BucketEvictionPolicy::FIFO);
 }
 
@@ -207,7 +215,7 @@ TEST_F(BucketBackendConfigTest, UnknownPolicyDisablesEvictionWithoutWarning) {
         env.eviction_policy.Set(value);
         ::testing::internal::CaptureStderr();
 
-        const auto config = BucketBackendConfig::FromEnvironment();
+        const auto config = BucketBackendConfig::FromEnvironment().value();
         const std::string logs = ::testing::internal::GetCapturedStderr();
 
         EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::NONE) << value;
@@ -235,10 +243,12 @@ TEST_F(BucketBackendConfigTest, ValidationPreservesExistingBounds) {
 
 TEST_F(BucketBackendConfigTest, EachConstructionReadsCurrentEnvironment) {
     env.keys_limit.Set("700");
-    EXPECT_EQ(BucketBackendConfig::FromEnvironment().bucket_keys_limit, 700);
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().bucket_keys_limit,
+              700);
 
     env.keys_limit.Unset();
-    EXPECT_EQ(BucketBackendConfig::FromEnvironment().bucket_keys_limit, 500);
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().bucket_keys_limit,
+              500);
 }
 
 }  // namespace

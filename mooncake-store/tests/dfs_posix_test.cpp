@@ -708,6 +708,49 @@ TEST(ShardAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     EXPECT_EQ(evicted.front().key, "B");
 }
 
+TEST(ShardAllocatorTest, LruIndexOutlivesCallerKeys) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    TempDir tmp("dfs_lru_long_keys");
+
+    ShardAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
+
+    // Keys longer than the small-string buffer live on the heap, so a view
+    // into a destroyed caller string would be caught by ASan.
+    auto long_key = [](int i) {
+        return std::string(64, 'k') + std::to_string(i);
+    };
+    std::vector<DistributedFSDescriptor> descs;
+    for (int i = 0; i < 4; ++i) {
+        auto desc = alloc.Allocate(long_key(i), 8192);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess(long_key(i), desc->shard_idx, desc->offset);
+        descs.push_back(*desc);
+    }
+
+    // Restore explicitly, by PendingEviction destruction, and by rejecting
+    // every candidate; each path re-inserts the keys into the index.
+    auto initial = alloc.PrepareEviction();
+    ASSERT_EQ(initial.Candidates().size(), 2u);
+    alloc.RestorePreparedEviction(std::move(initial));
+    {
+        auto dropped = alloc.PrepareEviction();
+    }
+    alloc.ResolvePreparedEviction(alloc.PrepareEviction(), {false, false});
+
+    alloc.Free(descs[0].offset, descs[0].aligned_size, descs[0].shard_idx,
+               long_key(0));
+
+    auto pending = alloc.PrepareEviction();
+    ASSERT_FALSE(pending.Empty());
+    EXPECT_EQ(pending.Candidates().front().key, long_key(1));
+    alloc.CommitPreparedEviction(std::move(pending));
+}
+
 TEST(ShardAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     EnvGuard env;
     ConfigurePosixDfs(env);

@@ -502,12 +502,17 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
     EXPECT_GE(service_->GetMetadataCount(), 1u);
     service_->Stop();
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    auto& metrics = HAMetricManager::instance();
+    metrics.set_oplog_applied_sequence_id(0);
 
     ASSERT_EQ(ErrorCode::OK,
               service_->Start("primary", oplog_endpoints_, cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
     EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
     EXPECT_GE(service_->GetMetadataCount(), 1u);
+    // No new entries after restart, so only the recovered baseline can have
+    // restored the gauge.
+    EXPECT_EQ(1, metrics.get_oplog_applied_sequence_id());
 }
 
 TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
@@ -520,12 +525,17 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
     config_.enable_snapshot_bootstrap = false;
     config_.oplog_poll_interval_ms = 1;
     service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+    auto& metrics = HAMetricManager::instance();
+    metrics.set_oplog_applied_sequence_id(42);
 
     ASSERT_EQ(ErrorCode::OK,
               service_->Start("primary", oplog_endpoints_, cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
     EXPECT_EQ(0u, service_->GetLatestAppliedSequenceId());
     EXPECT_EQ(0u, service_->GetMetadataCount());
+    // A zero baseline must overwrite a stale gauge value.
+    EXPECT_EQ(0u, service_->GetSyncStatus().applied_seq_id);
+    EXPECT_EQ(0, metrics.get_oplog_applied_sequence_id());
 }
 
 // ========== 6.1.6 Metadata operation tests ==========

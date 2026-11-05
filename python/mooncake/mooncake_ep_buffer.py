@@ -1398,10 +1398,12 @@ class Buffer:
         m, n = x.shape
         x_view = x.view(m, -1, 128)
         x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-        x_fp8 = (
-            (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n)
-        )
-        x_scales = (x_amax / 448.0).view(m, -1)
+        # Match the native kernels bit-for-bit: true division for the scale
+        # (`448.0 / t` lowers to `t.reciprocal() * 448`) and multiply by 1/448
+        # for the inverse scale.
+        x_scale = torch.full_like(x_amax, 448.0) / x_amax
+        x_fp8 = (x_view * x_scale.unsqueeze(2)).to(torch.float8_e4m3fn).view(m, n)
+        x_scales = (x_amax * (1.0 / 448.0)).view(m, -1)
         return x_fp8, x_scales
 
     def _fallback_dispatch(
