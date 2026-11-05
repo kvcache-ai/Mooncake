@@ -624,9 +624,8 @@ Status MultiTransport::submitTransfer(
     // Non-event batches stop here. They must not take completion_mu_ or
     // scan ready_, and the callback pointer is left untouched.
     if (!batch_desc.event_enabled) return overall_status;
-    const bool publish =
-        overall_status.ok() && batch_desc.counter_eligible &&
-        completion_fd_ >= 0;
+    const bool publish = overall_status.ok() && batch_desc.counter_eligible &&
+                         completion_fd_ >= 0;
     {
         std::lock_guard<std::mutex> lock(completion_mu_);
         if (!publish) {
