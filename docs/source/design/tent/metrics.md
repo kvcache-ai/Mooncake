@@ -394,6 +394,7 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_rdma_endpoint_events_total` | Counter | `event` | RDMA endpoint construction, ready, retirement and destruction transitions |
 | `tent_rdma_qp_transition_failures_total` | Counter | `qp_type`, `transition` | Failed data or notification QP state transitions |
 | `tent_rdma_notification_events_total` | Counter | `event` | Notification receive posting/delivery, send posting/completion and channel failures |
+| `tent_rdma_gdr_events_total` | Counter | `scope`, `event` | Local and remote GPUDirect reachability failures, exclusions, cooldown probes, and recoveries |
 | `tent_stream_events_total` | Counter | `transport`, `operation`, `event` | TCP and HP-TCP queue, physical attempt, connection, retry and terminal events |
 | `tent_stream_failures_total` | Counter | `transport`, `operation`, `phase`, `reason` | TCP and HP-TCP socket/RPC failures classified by bounded connection phase and cause |
 | `tent_protocol_errors_total` | Counter | `transport`, `kind` | Malformed or inconsistent HP-TCP frames, including header fields, request IDs, and committed lengths |
@@ -412,6 +413,7 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_staging_cleanup_pending` | Gauge | `kind` | Deferred cleanup groups, child batches, or remote operations still awaiting safe release |
 | `tent_rdma_worker_inflight_slices` | Gauge | `operation` | RDMA slices owned by worker queues or completion processing |
 | `tent_rdma_posted_inflight_slices` | Gauge | `operation` | RDMA slices reserved for posting or posted and not yet resolved |
+| `tent_rdma_gdr_excluded_paths` | Gauge | `scope` | NIC-to-GPU GPUDirect paths currently excluded from RDMA selection |
 | `tent_admission_queue_owners` | Gauge | `owner_kind` | Owners currently accounted by runtime admission control |
 | `tent_admission_queue_bytes` | Gauge | `owner_kind` | Bytes currently accounted by runtime admission control |
 | `tent_engine_ready` | Gauge | - | `1` when the bounded readiness snapshot has no blocker, otherwise `0` |
@@ -511,7 +513,8 @@ addresses, segment names, or other unbounded values are accepted.
 | `owner_kind` | `user`, `staging`, `all` | Runtime admission owner class; `all` is the aggregate capacity domain |
 | `method` | `get_segment_desc`, `bootstrap_rdma`, `bootstrap_ub`, `send_data`, `recv_data`, `notify`, `probe`, `delegate`, `pin`, `unpin`, `subscribe_segment_update`, `notify_segment_updated`, `unknown` | TENT RPC method; `unknown` safely bounds extension methods |
 | `direction` | `request`, `response` | RPC application attachment direction |
-| `event` | RDMA slice: `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout`; endpoint: `constructed`, `construct_failure`, `ready_active`, `ready_passive`, `retiring`, `destroyed`, `destroy_error`; notification: `recv_posted`, `recv_post_error`, `recv_delivered`, `recv_invalid`, `recv_dropped`, `send_posted`, `send_completed`, `send_unavailable`, `send_encode_error`, `send_post_error`, `completion_error`, `cq_poll_error`, `unknown_qp`, `channel_disabled`; stream: `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted`; selection and admission use the closed decision names documented by their counters | Family-specific bounded lifecycle event or decision |
+| `scope` | `local`, `remote` | Whether a GPUDirect reachability decision applies to this host's NIC-to-GPU path or the peer-side path |
+| `event` | RDMA slice: `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout`; endpoint: `constructed`, `construct_failure`, `ready_active`, `ready_passive`, `retiring`, `destroyed`, `destroy_error`; notification: `recv_posted`, `recv_post_error`, `recv_delivered`, `recv_invalid`, `recv_dropped`, `send_posted`, `send_completed`, `send_unavailable`, `send_encode_error`, `send_post_error`, `completion_error`, `cq_poll_error`, `unknown_qp`, `channel_disabled`; GDR reachability: `failure_observed`, `excluded`, `probe_allowed`, `recovered`; stream: `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted`; selection and admission use the closed decision names documented by their counters | Family-specific bounded lifecycle event or decision |
 | `cause` | `endpoint`, `post`, `completion` | RDMA retry or retry-exhaustion source |
 | `qp_type` | `data`, `notification` | RDMA queue-pair role; QP numbers are never labels |
 | `transition` | `create`, `reset`, `init`, `rtr`, `rts`, `error`, `destroy` | Queue-pair transition that failed |
@@ -560,6 +563,15 @@ from the posted gauge. `late_completion` is a CQE for a slice already resolved
 by timeout, cancellation, or an adjacent queue-pair sweep. A retry is counted
 only when the slice is actually re-enqueued; an exhausted attempt increments
 only `tent_rdma_retry_exhausted_total`.
+
+GPUDirect reachability adds at most 2x4 = 8 scope/event series and two gauge
+series. `failure_observed` counts each data-plane error used by the learner;
+`excluded` is emitted only when a path transitions out of selection. When its
+cooldown expires, `probe_allowed` removes the path from the excluded gauge
+until the probe either succeeds (`recovered`) or fails and excludes the path
+again. NIC names, GPU ordinals, machine IDs, and peer addresses remain out of
+metric labels; use the corresponding exclusion, probe, and recovery logs when
+an individual path must be identified.
 
 Stuck-event labels are bounded to three phases, the `TransportType` enum, and
 two operations. Request, batch, peer, address, and attempt identifiers remain

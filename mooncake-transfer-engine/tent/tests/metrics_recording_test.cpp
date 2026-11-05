@@ -53,6 +53,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/rdma/gdr_reachability.h"
 
 namespace mooncake {
 namespace tent {
@@ -518,6 +519,10 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
         TentMetrics::RdmaQpTransition::Rtr);
     metrics.recordRdmaNotificationEvent(
         TentMetrics::RdmaNotificationEvent::RecvPosted);
+    metrics.recordRdmaGdrEvent(TentMetrics::RdmaGdrScope::Local,
+                               TentMetrics::RdmaGdrEvent::FailureObserved);
+    metrics.recordRdmaGdrExcludedPath(TentMetrics::RdmaGdrScope::Remote, 1);
+    metrics.recordRdmaGdrExcludedPath(TentMetrics::RdmaGdrScope::Remote, -1);
     metrics.recordStreamEvent(TCP, Request::READ,
                               TentMetrics::StreamEvent::Queued);
     metrics.recordStreamAttempt(
@@ -561,7 +566,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 87>
+    const std::array<std::pair<std::string_view, std::string_view>, 89>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -596,6 +601,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_endpoint_events_total", "counter"},
             {"tent_rdma_qp_transition_failures_total", "counter"},
             {"tent_rdma_notification_events_total", "counter"},
+            {"tent_rdma_gdr_events_total", "counter"},
             {"tent_stream_events_total", "counter"},
             {"tent_stream_failures_total", "counter"},
             {"tent_protocol_errors_total", "counter"},
@@ -614,6 +620,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_staging_cleanup_pending", "gauge"},
             {"tent_rdma_worker_inflight_slices", "gauge"},
             {"tent_rdma_posted_inflight_slices", "gauge"},
+            {"tent_rdma_gdr_excluded_paths", "gauge"},
             {"tent_admission_queue_owners", "gauge"},
             {"tent_admission_queue_bytes", "gauge"},
             {"tent_engine_ready", "gauge"},
@@ -941,6 +948,63 @@ TEST_F(MetricsRecordingTest, RdmaLifecycleSignalsUseBoundedLabels) {
                   before.series("tent_rdma_notification_events_total{event="
                                 "\"recv_post_error\"}"),
               2);
+}
+
+TEST_F(MetricsRecordingTest, GdrReachabilityRecordsStateTransitions) {
+    Config test_config;
+    test_config.set("transports/rdma/gdr_error_threshold", 1);
+    test_config.set("transports/rdma/gdr_error_window_secs", 10);
+    test_config.set("transports/rdma/gdr_cooldown_secs", 0);
+
+    auto& gdr = GdrReachability::instance();
+    gdr.configure(&test_config);
+    constexpr int kTestGpu = 9876;
+    const std::string test_nic = "metrics_gdr_test_nic";
+    gdr.reportLocalSuccess(test_nic, kTestGpu);
+
+    const auto before = MetricsSnapshot(TentMetrics::instance());
+    gdr.reportLocalFailure(test_nic, kTestGpu);
+    const auto excluded = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(excluded.series("tent_rdma_gdr_events_total{scope=\"local\","
+                              "event=\"failure_observed\"}") -
+                  before.series("tent_rdma_gdr_events_total{scope=\"local\","
+                                "event=\"failure_observed\"}"),
+              1);
+    EXPECT_EQ(excluded.series("tent_rdma_gdr_events_total{scope=\"local\","
+                              "event=\"excluded\"}") -
+                  before.series("tent_rdma_gdr_events_total{scope=\"local\","
+                                "event=\"excluded\"}"),
+              1);
+    EXPECT_EQ(
+        excluded.series("tent_rdma_gdr_excluded_paths{scope=\"local\"}") -
+            before.series("tent_rdma_gdr_excluded_paths{scope=\"local\"}"),
+        1);
+
+    EXPECT_TRUE(gdr.localReachable(test_nic, kTestGpu));
+    const auto probing = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(probing.series("tent_rdma_gdr_events_total{scope=\"local\","
+                             "event=\"probe_allowed\"}") -
+                  before.series("tent_rdma_gdr_events_total{scope=\"local\","
+                                "event=\"probe_allowed\"}"),
+              1);
+    EXPECT_EQ(
+        probing.series("tent_rdma_gdr_excluded_paths{scope=\"local\"}") -
+            before.series("tent_rdma_gdr_excluded_paths{scope=\"local\"}"),
+        0);
+
+    gdr.reportLocalSuccess(test_nic, kTestGpu);
+    const auto recovered = MetricsSnapshot(TentMetrics::instance());
+    EXPECT_EQ(recovered.series("tent_rdma_gdr_events_total{scope=\"local\","
+                               "event=\"recovered\"}") -
+                  before.series("tent_rdma_gdr_events_total{scope=\"local\","
+                                "event=\"recovered\"}"),
+              1);
+
+    Config default_config;
+    default_config.set("transports/rdma/gdr_error_threshold", 2);
+    default_config.set("transports/rdma/gdr_error_window_secs", 10);
+    default_config.set("transports/rdma/gdr_cooldown_secs", 30);
+    gdr.configure(&default_config);
 }
 
 TEST_F(MetricsRecordingTest, StreamSignalsSeparateQueueAndPhysicalAttempts) {
@@ -2745,6 +2809,8 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_rdma_endpoint_events_total"));
     EXPECT_TRUE(json.contains("tent_rdma_qp_transition_failures_total"));
     EXPECT_TRUE(json.contains("tent_rdma_notification_events_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_gdr_events_total"));
+    EXPECT_TRUE(json.contains("tent_rdma_gdr_excluded_paths"));
     EXPECT_TRUE(json.contains("tent_stream_events_total"));
     EXPECT_TRUE(json.contains("tent_stream_failures_total"));
     EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));

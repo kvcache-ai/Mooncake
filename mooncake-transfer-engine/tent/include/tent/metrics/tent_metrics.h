@@ -346,6 +346,13 @@ class TentMetrics {
         UnknownQp,
         ChannelDisabled,
     };
+    enum class RdmaGdrScope { Local, Remote };
+    enum class RdmaGdrEvent {
+        FailureObserved,
+        Excluded,
+        ProbeAllowed,
+        Recovered,
+    };
 
     // RDMA data-path metrics count slices, not logical requests. Retry
     // counters advance only when another worker-queue attempt is actually
@@ -367,6 +374,11 @@ class TentMetrics {
                                        RdmaQpTransition transition);
     void recordRdmaNotificationEvent(RdmaNotificationEvent event,
                                      int64_t count = 1);
+    // GDR path identities are deliberately not labels. The gauge tracks paths
+    // that are currently excluded; a cooldown probe removes one from the
+    // gauge until that probe either recovers or excludes the path again.
+    void recordRdmaGdrEvent(RdmaGdrScope scope, RdmaGdrEvent event);
+    void recordRdmaGdrExcludedPath(RdmaGdrScope scope, int64_t delta);
 
     enum class StreamEvent {
         Queued,
@@ -714,6 +726,9 @@ class TentMetrics {
         "qp_type", "transition"};
     static inline const std::array<std::string, 1> kRdmaNotificationEventLabel{
         "event"};
+    static inline const std::array<std::string, 2> kRdmaGdrEventLabels{"scope",
+                                                                       "event"};
+    static inline const std::array<std::string, 1> kRdmaGdrScopeLabel{"scope"};
     static inline const std::array<std::string, 3> kStreamEventLabels{
         "transport", "operation", "event"};
     static inline const std::array<std::string, 3> kStreamAttemptLabels{
@@ -774,6 +789,10 @@ class TentMetrics {
     static constexpr size_t kRdmaQpFailureDomain =
         kRdmaQpTypeDomain * kRdmaQpTransitionDomain;
     static constexpr size_t kRdmaNotificationEventDomain = 14;
+    static constexpr size_t kRdmaGdrScopeDomain = 2;
+    static constexpr size_t kRdmaGdrEventValueDomain = 4;
+    static constexpr size_t kRdmaGdrEventDomain =
+        kRdmaGdrScopeDomain * kRdmaGdrEventValueDomain;
     static constexpr size_t kStreamEventValueDomain = 13;
     static constexpr size_t kStreamOutcomeDomain = 7;
     static constexpr size_t kStreamOperationDomain = kTransportDomain * 2;
@@ -860,6 +879,10 @@ class TentMetrics {
                                     RdmaQpTransition transition) {
         return static_cast<size_t>(qp_type) * kRdmaQpTransitionDomain +
                static_cast<size_t>(transition);
+    }
+    static size_t rdmaGdrEventSlot(RdmaGdrScope scope, RdmaGdrEvent event) {
+        return static_cast<size_t>(scope) * kRdmaGdrEventValueDomain +
+               static_cast<size_t>(event);
     }
     static size_t streamOperationSlot(TransportType transport,
                                       Request::OpCode operation) {
@@ -1038,6 +1061,10 @@ class TentMetrics {
         "tent_rdma_notification_events_total",
         "RDMA notification channel events", kRdmaNotificationEventLabel,
         kRdmaNotificationEventDomain};
+    metrics::CachedDynamicCounter<2> rdma_gdr_events_total_{
+        "tent_rdma_gdr_events_total",
+        "RDMA GPUDirect reachability lifecycle events", kRdmaGdrEventLabels,
+        kRdmaGdrEventDomain};
     metrics::CachedDynamicCounter<3> stream_events_total_{
         "tent_stream_events_total",
         "TCP and HP-TCP queue, attempt, connection, retry and terminal events",
@@ -1130,6 +1157,10 @@ class TentMetrics {
         "tent_rdma_posted_inflight_slices",
         "RDMA slices reserved for posting or awaiting completion",
         kOperationLabel, kOperationDomain};
+    metrics::CachedDynamicCounter<1> rdma_gdr_excluded_paths_{
+        "tent_rdma_gdr_excluded_paths",
+        "GPUDirect NIC-to-GPU paths currently excluded from RDMA selection",
+        kRdmaGdrScopeLabel, kRdmaGdrScopeDomain};
     metrics::CachedDynamicCounter<1> admission_queue_owners_{
         "tent_admission_queue_owners",
         "Runtime admission queue owners charged as outstanding",

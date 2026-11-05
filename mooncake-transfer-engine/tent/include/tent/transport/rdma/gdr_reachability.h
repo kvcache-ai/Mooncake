@@ -85,11 +85,13 @@ class GdrReachability {
         std::chrono::steady_clock::time_point last_error{};
         std::chrono::steady_clock::duration cooldown{std::chrono::seconds(0)};
         std::chrono::steady_clock::time_point resume_time{};  // paused until
+        bool excluded = false;
+        bool was_excluded = false;
     };
 
-    bool reachable(const std::string &key);
-    void markFailed(const std::string &key);
-    void markRecovered(const std::string &key);
+    bool reachable(const std::string &key, bool remote);
+    void markFailed(const std::string &key, bool remote);
+    void markRecovered(const std::string &key, bool remote);
 
     static std::string localKey(const std::string &nic_name, int gpu_ordinal);
     static std::string remoteKey(const std::string &machine_id,

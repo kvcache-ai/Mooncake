@@ -553,6 +553,30 @@ const char* rdmaNotificationEventName(
     return "unknown";
 }
 
+const char* rdmaGdrScopeName(TentMetrics::RdmaGdrScope scope) {
+    switch (scope) {
+        case TentMetrics::RdmaGdrScope::Local:
+            return "local";
+        case TentMetrics::RdmaGdrScope::Remote:
+            return "remote";
+    }
+    return "unknown";
+}
+
+const char* rdmaGdrEventName(TentMetrics::RdmaGdrEvent event) {
+    switch (event) {
+        case TentMetrics::RdmaGdrEvent::FailureObserved:
+            return "failure_observed";
+        case TentMetrics::RdmaGdrEvent::Excluded:
+            return "excluded";
+        case TentMetrics::RdmaGdrEvent::ProbeAllowed:
+            return "probe_allowed";
+        case TentMetrics::RdmaGdrEvent::Recovered:
+            return "recovered";
+    }
+    return "unknown";
+}
+
 const char* streamEventName(TentMetrics::StreamEvent event) {
     switch (event) {
         case TentMetrics::StreamEvent::Queued:
@@ -1112,6 +1136,7 @@ void TentMetrics::registerMetrics() {
         &rdma_endpoint_events_total_,
         &rdma_qp_transition_failures_total_,
         &rdma_notification_events_total_,
+        &rdma_gdr_events_total_,
         &stream_events_total_,
         &stream_failures_total_,
         &protocol_errors_total_,
@@ -1130,8 +1155,8 @@ void TentMetrics::registerMetrics() {
         &registered_buffer_bytes_,     &worker_last_progress_timestamp_seconds_,
         &staging_inflight_tasks_,      &staging_inflight_bytes_,
         &staging_cleanup_pending_,     &rdma_worker_inflight_slices_,
-        &rdma_posted_inflight_slices_, &admission_queue_owners_,
-        &admission_queue_bytes_,
+        &rdma_posted_inflight_slices_, &rdma_gdr_excluded_paths_,
+        &admission_queue_owners_,      &admission_queue_bytes_,
     };
 
     // Register the N=1 per-transport histograms for unified serialization.
@@ -1568,6 +1593,24 @@ void TentMetrics::recordRdmaNotificationEvent(RdmaNotificationEvent event,
                 rdmaNotificationEventName(event)};
         },
         count);
+}
+
+void TentMetrics::recordRdmaGdrEvent(RdmaGdrScope scope, RdmaGdrEvent event) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rdma_gdr_events_total_.incCached(
+        rdmaGdrEventSlot(scope, event), [scope, event] {
+            return std::array<std::string, 2>{rdmaGdrScopeName(scope),
+                                              rdmaGdrEventName(event)};
+        });
+}
+
+void TentMetrics::recordRdmaGdrExcludedPath(RdmaGdrScope scope, int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    rdma_gdr_excluded_paths_.incCached(
+        static_cast<size_t>(scope),
+        [scope] { return std::array<std::string, 1>{rdmaGdrScopeName(scope)}; },
+        delta);
 }
 
 void TentMetrics::recordStreamEvent(TransportType transport,
@@ -2484,6 +2527,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&rdma_qp_transition_failures_total_);
             root[rdma_notification_events_total_.str_name()] =
                 sumCounterValues(&rdma_notification_events_total_);
+            root[rdma_gdr_events_total_.str_name()] =
+                sumCounterValues(&rdma_gdr_events_total_);
             root[stream_events_total_.str_name()] =
                 sumCounterValues(&stream_events_total_);
             root[stream_failures_total_.str_name()] =
@@ -2524,6 +2569,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&rdma_worker_inflight_slices_);
             root[rdma_posted_inflight_slices_.str_name()] =
                 sumCounterValues(&rdma_posted_inflight_slices_);
+            root[rdma_gdr_excluded_paths_.str_name()] =
+                sumCounterValues(&rdma_gdr_excluded_paths_);
             root[admission_queue_owners_.str_name()] =
                 sumCounterValues(&admission_queue_owners_);
             root[admission_queue_bytes_.str_name()] =
@@ -2744,6 +2791,8 @@ void TentMetrics::recordRdmaWcError(Request::OpCode, RdmaWcErrorCategory) {}
 void TentMetrics::recordRdmaEndpointEvent(RdmaEndpointEvent) {}
 void TentMetrics::recordRdmaQpTransitionFailure(RdmaQpType, RdmaQpTransition) {}
 void TentMetrics::recordRdmaNotificationEvent(RdmaNotificationEvent, int64_t) {}
+void TentMetrics::recordRdmaGdrEvent(RdmaGdrScope, RdmaGdrEvent) {}
+void TentMetrics::recordRdmaGdrExcludedPath(RdmaGdrScope, int64_t) {}
 void TentMetrics::recordStreamEvent(TransportType, Request::OpCode, StreamEvent,
                                     int64_t) {}
 void TentMetrics::recordStreamAttempt(TransportType, Request::OpCode,
