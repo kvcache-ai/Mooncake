@@ -15,7 +15,8 @@
 // CP-3: prepareSubmit reuses SelectionResult for owners that share
 // (peer, local MR, remote MR, hint, intent, length, priority, policy).
 // Strided descriptors in one MR must not call getTransportType once per
-// request. policy_name nullopt is not the same key as "".
+// request. Reuse is the findBuffer buffer, not any range that contains the
+// address. policy_name nullopt is not the same key as "".
 
 #include <gtest/gtest.h>
 
@@ -211,6 +212,36 @@ TEST(TransportRouteCache, SameMrReusesRoute) {
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// A starts lower and is sorted first. B starts inside A and extends past it.
+// An address past A is B; an address in the overlap is still A, even though B
+// contains that address too.
+TEST(TransportRouteCache, OverlappingMrsDoNotReuseByContainment) {
+    auto cfg = makeConfig(true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    std::vector<uint8_t> buf(32 * 1024, 0x41);
+    uint8_t* base = buf.data();
+    ASSERT_TRUE(engine.registerLocalMemory(base, 8192).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(base + 4096, 16384).ok());
+
+    std::vector<Request> reqs;
+    reqs.push_back(makeLocalWrite(base + 8192, kChunk));
+    reqs.push_back(makeLocalWrite(base + 4096, kChunk));
+
+    engine.resetTransportResolveCallsForTest();
+    BatchID batch_id = engine.allocateBatch(reqs.size());
+    ASSERT_TRUE(engine.submitTransfer(batch_id, reqs).ok());
+    EXPECT_EQ(engine.transportResolveCallsForTest(), 2u);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(base + 4096, 16384).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(base, 8192).ok());
 }
 
 TEST(TransportRouteCache, SameMrReusesRouteWithoutMerge) {

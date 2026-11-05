@@ -1895,12 +1895,6 @@ struct RouteCacheKeyHash {
     }
 };
 
-bool bufferCovers(const BufferKey& key, uint64_t addr, uint64_t len) {
-    if (len != 0 && addr + len < addr) return false;
-    if (key.length != 0 && key.addr + key.length < key.addr) return false;
-    return key.addr <= addr && addr + len <= key.addr + key.length;
-}
-
 RouteCacheKey makeRouteCacheKey(const Request& req, const BufferKey& source,
                                 const BufferKey& target) {
     RouteCacheKey key;
@@ -2431,43 +2425,48 @@ Status TransferEngineImpl::prepareSubmit(
             target_key = merge_boundaries[pub].target_key;
         }
 
-        const uint64_t src = requestSourceAddr(owner.request);
-        const uint64_t dst = owner.request.target_offset;
         const uint64_t len = owner.request.length;
-        if (last_valid && last_key.target_id == owner.request.target_id &&
-            last_key.hint == owner.request.transport_hint &&
-            last_key.intent == owner.request.intent_type &&
-            last_key.priority == owner.request.priority &&
-            last_key.length == len &&
-            last_key.policy_name == owner.request.policy_name &&
-            bufferCovers(last_key.source, src, len) &&
-            bufferCovers(last_key.target, dst, len)) {
-            owner.route = last_route;
-        } else {
+        // Same findBuffer result, not geometric containment. Overlapping
+        // registrations are first-match: a later, larger MR can cover an
+        // address whose findBuffer buffer is an earlier one.
+        auto sameResolvedBuffers = [&]() {
+            return last_valid && source_key && target_key &&
+                   last_key.target_id == owner.request.target_id &&
+                   last_key.hint == owner.request.transport_hint &&
+                   last_key.intent == owner.request.intent_type &&
+                   last_key.priority == owner.request.priority &&
+                   last_key.length == len &&
+                   last_key.policy_name == owner.request.policy_name &&
+                   last_key.source == *source_key &&
+                   last_key.target == *target_key;
+        };
+        if (!sameResolvedBuffers()) {
             if (!source_key) source_key = lookupSourceKey(owner.request);
             if (!target_key) target_key = lookupTargetKey(owner.request);
-            if (source_key && target_key) {
-                auto key =
-                    makeRouteCacheKey(owner.request, *source_key, *target_key);
-                if (auto it = route_cache.find(key); it != route_cache.end()) {
-                    owner.route = it->second;
-                } else {
-                    owner.route = resolveTransport(owner.request, 0);
-                    if (owner.route.transport != UNSPEC) {
-                        route_cache.emplace(key, owner.route);
-                    }
-                }
-                if (owner.route.transport != UNSPEC) {
-                    last_key = std::move(key);
-                    last_route = owner.route;
-                    last_valid = true;
-                } else {
-                    last_valid = false;
-                }
+        }
+        if (sameResolvedBuffers()) {
+            owner.route = last_route;
+        } else if (source_key && target_key) {
+            auto key =
+                makeRouteCacheKey(owner.request, *source_key, *target_key);
+            if (auto it = route_cache.find(key); it != route_cache.end()) {
+                owner.route = it->second;
             } else {
                 owner.route = resolveTransport(owner.request, 0);
+                if (owner.route.transport != UNSPEC) {
+                    route_cache.emplace(key, owner.route);
+                }
+            }
+            if (owner.route.transport != UNSPEC) {
+                last_key = std::move(key);
+                last_route = owner.route;
+                last_valid = true;
+            } else {
                 last_valid = false;
             }
+        } else {
+            owner.route = resolveTransport(owner.request, 0);
+            last_valid = false;
         }
         if (require_post_submit_cancellation) {
             const auto type = owner.route.transport;
