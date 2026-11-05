@@ -5,6 +5,7 @@
 #include <unordered_set>
 
 #include "client_service.h"
+#include "cold_write_journal.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
@@ -23,6 +24,11 @@ class FileStorage {
     tl::expected<void, ErrorCode> Init();
 
     void RemoveAll();
+    tl::expected<void, ErrorCode> PrepareColdWrite(const ColdWriteRequest& request);
+    tl::expected<void, ErrorCode> RecoverOffloadedObjects(
+        const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas);
+
     tl::expected<int64_t, ErrorCode> OffloadStream(
         const std::string& key, uint64_t size,
         const StorageBackendInterface::StreamWriter& writer,
@@ -393,6 +399,7 @@ class FileStorage {
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
 
+    std::unique_ptr<ColdWriteJournal> cold_write_journal_;
     std::mutex disk_write_mutex_;
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;

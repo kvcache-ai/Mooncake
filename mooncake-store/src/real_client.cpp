@@ -1958,6 +1958,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         prefetcher_->Shutdown();
     }
 
+    if (client_) client_->SetColdWriteHandler({});
     StopColdWrites();
     if (offload_rpc_server_) {
         offload_rpc_server_->stop();
@@ -2745,6 +2746,13 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (config.data_type == ObjectDataType::WEIGHT) {
+        auto slices = split_into_slices(const_cast<char*>(value.data()), value.size_bytes());
+        std::vector<BufferHandle> staging_handles;
+        return client_->Put(key, slices, config, [&](const auto& raw_slices) {
+            return StageWriteSlices(client_buffer_allocator, raw_slices, staging_handles);
+        });
+    }
     auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for put operation, key: "
@@ -2824,6 +2832,17 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     if (!client_buffer_allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.data_type == ObjectDataType::WEIGHT) {
+        std::vector<std::vector<Slice>> raw_slices;
+        for (const auto& value : values)
+            raw_slices.push_back(split_into_slices(const_cast<char*>(value.data()), value.size_bytes()));
+        std::vector<BufferHandle> staging_handles;
+        auto results = client_->BatchPut(keys, raw_slices, config, [&](const auto& slices) {
+            return StageWriteSlices(client_buffer_allocator, slices, staging_handles);
+        });
+        for (const auto& result : results) if (!result) return tl::make_unexpected(result.error());
+        return {};
     }
     std::vector<BufferHandle> buffer_handles;
     std::unordered_map<std::string, std::vector<Slice>> batched_slices;
@@ -9488,6 +9507,8 @@ RealClient::cold_write_begin(const ColdWriteRequest &request) {
             return tl::make_unexpected(ErrorCode::INVALID_WRITE);
         auto valid = client_->ValidateColdWrite(request);
         if (!valid) return valid;
+        auto journaled = file_storage_->PrepareColdWrite(request);
+        if (!journaled) return journaled;
         auto session = std::make_shared<ColdWriteSession>();
         session->request = request;
         {
@@ -9497,7 +9518,7 @@ RealClient::cold_write_begin(const ColdWriteRequest &request) {
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
             std::erase_if(cold_write_sessions_, [](const auto &entry) {
                 std::lock_guard lock(entry.second->mutex);
-                return entry.second->completed;
+                return entry.second->completed && !entry.second->transfer_unknown;
             });
             if (cold_write_sessions_.size() >= kColdWriteSlots ||
                 cold_write_sessions_.contains(request.reservation))
@@ -9662,7 +9683,7 @@ RealClient::cold_write_cancel(const ColdWriteRequest &request) {
         {
             std::lock_guard lock(cold_write_mutex_);
             auto found = cold_write_sessions_.find(request.reservation);
-            if (found == cold_write_sessions_.end()) return {};
+            if (found == cold_write_sessions_.end()) return tl::make_unexpected(ErrorCode::INVALID_WRITE);
             session = found->second;
         }
         // The TE read and pwrite hold this lock. Acquiring it fences every
@@ -9779,6 +9800,8 @@ tl::expected<void, ErrorCode> RealClient::WriteColdObject(
         }
         auto valid = client_->ValidateColdWrite(request);
         if (!valid) return valid;
+        auto journaled = file_storage_->PrepareColdWrite(request);
+        if (!journaled) return journaled;
         auto result = file_storage_->OffloadStream(
             TenantId(request.tenant).MakeScopedKey(key), request.size,
             [&](int fd, uint64_t offset, uint64_t) {

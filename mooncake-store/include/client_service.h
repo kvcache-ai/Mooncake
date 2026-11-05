@@ -324,7 +324,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
                                       std::vector<Slice>& slices,
-                                      const ReplicateConfig& config);
+                                      const ReplicateConfig& config,
+                                      const WriteBufferStager& prepare_memory = {});
 
     /**
      * @brief Batch put data with replication

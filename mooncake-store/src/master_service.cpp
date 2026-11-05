@@ -2120,6 +2120,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
     dynamic_replication_.RecordReplicaRemoval(metadata, erased_replica_ids);
     if (!replicas.empty()) {
         FreeDfsReplicas(metadata.user_key, replicas);
+        ReleaseLocalDiskUsage(replicas);
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(std::move(replicas), ttl);
     }
@@ -5509,6 +5510,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     metadata.GrantReadLease(
                         std::chrono::milliseconds(default_kv_lease_ttl_));
                 }
+                if (*member_tier == WeightResidencyState::COLD && !HasReadableReplica(metadata))
+                    return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
             if (enable_oplog_ && ordered_oplog_writer_) {
@@ -5522,6 +5525,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 metadata, &Replica::fn_is_processing);
             if (!replicas.empty()) {
                 FreeDfsReplicas(key, replicas);
+                ReleaseLocalDiskUsage(replicas);
                 std::lock_guard lock(discarded_replicas_mutex_);
                 discarded_replicas_.emplace_back(
                     std::move(replicas),

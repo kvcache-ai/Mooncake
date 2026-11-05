@@ -2082,7 +2082,8 @@ ErrorCode Client::ReadColdStagingChunk(const std::string& endpoint,
 
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
-                                          const ReplicateConfig& config) {
+                                          const ReplicateConfig& config,
+                                          const WriteBufferStager& prepare_memory) {
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -2145,6 +2146,15 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             }
             return {};
         }
+    }
+
+    if (prepare_memory) {
+        auto prepared = prepare_memory(slices);
+        if (!prepared) {
+            auto ignored = master_client_.PutRevoke(key, ReplicaType::ALL);
+            return tl::make_unexpected(prepared.error());
+        }
+        slices = std::move(*prepared);
     }
 
     ReplicaTransferSummary transfer_summary;
