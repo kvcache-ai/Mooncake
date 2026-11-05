@@ -5601,8 +5601,6 @@ tl::expected<void, ErrorCode> MasterService::ValidateColdWrite(
                    replica.get_local_disk_client_id() == request.owner;
         }))
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-    weight_manager_.RecordImportWrite(TenantId(request.tenant),
-                                      metadata.group_id);
     return {};
 }
 

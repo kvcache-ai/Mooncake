@@ -175,13 +175,52 @@ The managed upload sequence is:
 5. `GetWeightRevision` or bounded `ListWeightRevisions` can discover it.
 
 An import can specify its policy. When omitted, it uses the
-`WeightStoragePolicy` defaults (MIXED, a 0.5 hot ratio, and MANUAL). Commit publishes
-READY with readable HOT payloads; it does not wait for preferred placement.
-For COLD or MIXED preference, that same commit records an initial migration,
-including under MANUAL or PINNED policy. The background worker finishes that
-declared placement asynchronously. MANUAL does not subsequently choose targets
+`WeightStoragePolicy` defaults (MIXED, a 0.5 hot ratio, and MANUAL). COLD and
+MIXED imports declare the complete physical payload layout before writing.
+The Master fixes placement per affinity from that declaration. HOT units use
+ordinary memory segments; COLD units go directly to the selected SSD owner.
+Commit waits for every required payload and the in-memory manifest, then
+publishes the observed READY/HOT, READY/COLD, or READY/MIXED placement.
+Cold payloads do not first allocate ordinary HOT segment space.
+MANUAL does not subsequently choose targets
 from memory pressure or access recency; later migrations require explicit
 requests. Policy preference and observed residency are separate query fields.
+
+The declared layout lives in the import metadata until commit, so the same
+placement can be rebuilt after Master failover. Commit validates the actual
+physical mapping digest and removes this temporary declaration. It does not
+create independently managed tensor records.
+
+The concrete data-plane entry points are `RealClient::put` and
+`RealClient::batch_put_from`, also used by the Python Store facade. The
+lower-level `Client` control RPCs alone do not start a disk-owner RPC service.
+Each disk owner must enable local SSD offload. Its write dispatcher uses:
+
+| Source relative to the disk owner | Path |
+| --- | --- |
+| Locally addressable host memory | direct file write |
+| Locally addressable GPU memory, aligned and compatible GDS available | synchronous cuFile write |
+| Locally addressable GPU memory without that capability | pinned-host staging, then file write |
+| Another client endpoint | Transfer Engine into the disk owner's staging, then file write |
+
+Both source and destination staging pools have eight 4 MiB slots per process,
+independent of ordinary Store segments. The native storage format is written
+incrementally. Backend serialization admits one active stream per owner; lack
+of staging or admission capacity returns an explicit error. A transport result
+that does not prove completion quarantines the affected slots within the same
+fixed budget instead of reusing their memory.
+
+Cold write tokens are persisted before payload writes. Publication is fenced
+by the exact disk-replica reservation, and publication RPC uncertainty retains
+the durable payload. Recovery never registers these records through an
+unfenced ordinary metadata scan. Automatic reassociation after a disk owner
+restarts with a different UUID is not implemented; the revision can remain
+DEGRADED until the required payload is recovered or replaced.
+
+Updating a policy to PINNED atomically records initial convergence when the
+new placement is not already satisfied. A MIXED update always confirms the
+affinity plan rather than comparing the observed ratio with the requested
+ratio exactly. A single-affinity revision cannot select MIXED.
 
 `READY` is never inferred from key prefixes. An abandoned import is handled by
 the explicit abort/reconciliation policy. `weight_import_idle_timeout_ms`
@@ -224,6 +263,11 @@ per-object primitives:
 - busy or incomplete members keep the operation in progress;
 - deletion blocks new leases, waits for live leases, removes payload objects,
   removes the manifest last, verifies absence, and retains a tombstone.
+
+Explicit migration currently uses the source segment owner's configured SSD.
+Selecting a different SSD owner for an existing HOT replica is not part of
+this stage. Direct COLD imports can select another disk owner and transfer
+through the network path described above.
 
 An explicit COLD or MIXED request may queue payload offloads before memory
 eviction. Acceptance records pending work, not completion; missing cold copies
