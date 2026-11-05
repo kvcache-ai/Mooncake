@@ -474,6 +474,15 @@ WeightMetadataStore::PrepareUpdatePolicy(
         revision->second.availability != WeightAvailabilityState::DEGRADED) {
         return tl::make_unexpected(WeightManagementError::NOT_READY);
     }
+    if ((request.policy.preferred_residency == WeightResidencyState::MIXED &&
+         revision->second.affinity_count < 2) ||
+        (request.policy.migration_mode == WeightMigrationMode::PINNED &&
+         (revision->second.residency != request.policy.preferred_residency ||
+          (request.policy.preferred_residency == WeightResidencyState::MIXED &&
+           revision->second.observed_hot_ratio !=
+               request.policy.mixed_hot_ratio)))) {
+        return tl::make_unexpected(WeightManagementError::POLICY_UNSATISFIABLE);
+    }
     if (!CanAdvanceWeightMetadataGeneration(
             revision->second.metadata_generation)) {
         return tl::make_unexpected(WeightManagementError::GENERATION_EXHAUSTED);

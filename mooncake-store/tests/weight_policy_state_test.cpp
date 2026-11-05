@@ -157,6 +157,123 @@ TEST(WeightPolicyStateTest, PinnedPolicyRejectsExplicitMigration) {
     EXPECT_FALSE(unchanged->metadata.operation_id.has_value());
 }
 
+TEST(WeightPolicyStateTest, UpdateRejectsPinnedPolicyWithUnmetTarget) {
+    WeightMetadataStore metadata_store;
+    const auto ready = PublishPolicyCommit(
+        metadata_store, WeightStoragePolicy{
+                            .preferred_residency = WeightResidencyState::HOT,
+                        });
+    for (const auto target :
+         {WeightResidencyState::COLD, WeightResidencyState::MIXED}) {
+        auto update = metadata_store.PrepareUpdatePolicy(
+            UpdateWeightPolicyRequest{
+                .identity = ready.identity,
+                .expected_metadata_generation = ready.metadata_generation,
+                .policy =
+                    WeightStoragePolicy{
+                        .preferred_residency = target,
+                        .migration_mode = WeightMigrationMode::PINNED,
+                    },
+            },
+            300);
+        ASSERT_FALSE(update.has_value());
+        EXPECT_EQ(WeightManagementError::POLICY_UNSATISFIABLE, update.error());
+    }
+    const auto unchanged = metadata_store.Get(ready.identity, 301);
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(ready, unchanged->metadata);
+}
+
+TEST(WeightPolicyStateTest, UpdateAcceptsPinnedPolicyWithSatisfiedTarget) {
+    WeightMetadataStore metadata_store;
+    const auto ready = PublishPolicyCommit(
+        metadata_store, WeightStoragePolicy{
+                            .preferred_residency = WeightResidencyState::HOT,
+                        });
+    const UpdateWeightPolicyRequest request{
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::PINNED,
+            },
+    };
+    auto update = metadata_store.PrepareUpdatePolicy(request, 300);
+    ASSERT_TRUE(update.has_value());
+    auto published = metadata_store.Publish(*update);
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ(request.policy, published->policy);
+    auto retry = metadata_store.PrepareUpdatePolicy(request, 301);
+    ASSERT_TRUE(retry.has_value());
+    EXPECT_TRUE(retry->no_op);
+}
+
+TEST(WeightPolicyStateTest, UpdateRejectsMixedPolicyWithSingleAffinity) {
+    WeightMetadataStore metadata_store;
+    auto request = PolicyBeginRequest(WeightStoragePolicy{
+        .preferred_residency = WeightResidencyState::HOT,
+    });
+    request.affinity_summary.affinity_count = 1;
+    auto importing = metadata_store.PrepareBeginImport(request, 100);
+    ASSERT_TRUE(importing.has_value());
+    ASSERT_TRUE(metadata_store.Publish(*importing).has_value());
+    auto commit = metadata_store.PrepareCommitImport(
+        CommitWeightImportRequest{
+            .identity = request.identity,
+            .expected_metadata_generation =
+                importing->next->metadata_generation,
+            .manifest = PolicyManifest(),
+        },
+        200);
+    ASSERT_TRUE(commit.has_value());
+    auto ready = metadata_store.Publish(*commit);
+    ASSERT_TRUE(ready.has_value());
+    auto update = metadata_store.PrepareUpdatePolicy(
+        UpdateWeightPolicyRequest{
+            .identity = ready->identity,
+            .expected_metadata_generation = ready->metadata_generation,
+            .policy = WeightStoragePolicy{},
+        },
+        300);
+    ASSERT_FALSE(update.has_value());
+    EXPECT_EQ(WeightManagementError::POLICY_UNSATISFIABLE, update.error());
+    const auto unchanged = metadata_store.Get(ready->identity, 301);
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(*ready, unchanged->metadata);
+}
+
+TEST(WeightPolicyStateTest, UpdatePinnedMixedRequiresObservedRatio) {
+    WeightMetadataStore metadata_store;
+    const auto migrating = PublishPolicyCommit(metadata_store);
+    ASSERT_TRUE(migrating.operation_id.has_value());
+    auto finish = metadata_store.PrepareFinishOperation(
+        *migrating.operation_id, WeightResidencyState::MIXED, 0.5, 250);
+    ASSERT_TRUE(finish.has_value());
+    ASSERT_TRUE(metadata_store.Publish(*finish).has_value());
+    const auto ready = metadata_store.Get(migrating.identity, 251);
+    ASSERT_TRUE(ready.has_value());
+    UpdateWeightPolicyRequest request{
+        .identity = migrating.identity,
+        .expected_metadata_generation = ready->metadata.metadata_generation,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::MIXED,
+                .mixed_hot_ratio = 0.25,
+                .migration_mode = WeightMigrationMode::PINNED,
+            },
+    };
+    auto rejected = metadata_store.PrepareUpdatePolicy(request, 300);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(WeightManagementError::POLICY_UNSATISFIABLE, rejected.error());
+    request.policy.mixed_hot_ratio = 0.5;
+    auto accepted = metadata_store.PrepareUpdatePolicy(request, 301);
+    ASSERT_TRUE(accepted.has_value());
+    auto published = metadata_store.Publish(*accepted);
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ(request.policy, published->policy);
+}
+
 TEST(WeightPolicyStateTest, UpdatePolicyIsCasFencedIdempotentAndExclusive) {
     WeightMetadataStore metadata_store;
     auto ready = PublishPolicyCommit(
