@@ -5747,28 +5747,12 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    std::unordered_map<std::string, std::vector<mooncake::Slice>> all_slices;
-
-    // Create slices from user buffers
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const std::string &key = keys[i];
-        void *buffer = buffers[i];
-        size_t size = sizes[i];
-
-        all_slices[key] = split_into_slices(buffer, size);
-    }
-
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
     ordered_batched_slices.reserve(keys.size());
-    for (const auto &key : keys) {
-        auto it = all_slices.find(key);
-        if (it != all_slices.end()) {
-            ordered_batched_slices.emplace_back(it->second);
-        } else {
-            LOG(ERROR) << "Missing slices for key: " << key;
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
+    // Preserve each input's source even when keys are duplicated.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ordered_batched_slices.emplace_back(
+            split_into_slices(buffers[i], sizes[i]));
     }
 
     // Call client BatchPut and return the vector<expected> directly
