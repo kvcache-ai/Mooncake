@@ -373,8 +373,8 @@ class MasterService {
     /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
-     * @param regex_pattern The regular expression string to match against object
-     * keys.
+     * @param regex_pattern The regular expression string to match against
+     * object keys.
      * @return An expected object containing a map from object keys to their
      * replica descriptors on success, or an ErrorCode on failure.
      */
