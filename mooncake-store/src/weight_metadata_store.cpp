@@ -251,7 +251,8 @@ WeightMetadataStore::PrepareBeginImport(const BeginWeightImportRequest& request,
 
 WeightMetadataStore::Result<WeightMetadataMutation>
 WeightMetadataStore::PrepareCommitImport(
-    const CommitWeightImportRequest& request, uint64_t now_ms) {
+    const CommitWeightImportRequest& request, uint64_t now_ms,
+    std::optional<WeightResidencyObservation> observation) {
     if (!ValidateWeightRevisionIdentity(request.identity).ok() ||
         !ValidateWeightManifestReference(request.manifest).ok() ||
         request.manifest.payload_group_id !=
@@ -290,6 +291,20 @@ WeightMetadataStore::PrepareCommitImport(
     if (current->second.availability != WeightAvailabilityState::IMPORTING) {
         return tl::make_unexpected(WeightManagementError::CONFLICT);
     }
+    if (observation &&
+        (!IsWeightResidencyTarget(observation->residency) ||
+         !std::isfinite(observation->hot_ratio) ||
+         (observation->residency == WeightResidencyState::HOT &&
+          observation->hot_ratio != 1.0) ||
+         (observation->residency == WeightResidencyState::COLD &&
+          observation->hot_ratio != 0.0) ||
+         (observation->residency == WeightResidencyState::MIXED &&
+          (observation->hot_ratio <= 0.0 || observation->hot_ratio >= 1.0)) ||
+         (observation->preferred_placement_satisfied &&
+          observation->residency !=
+              current->second.policy.preferred_residency))) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
     if (current->second.manifest.payload_group_id !=
             request.manifest.payload_group_id ||
         current->second.manifest.payload_count !=
@@ -307,12 +322,17 @@ WeightMetadataStore::PrepareCommitImport(
     next.manifest = request.manifest;
     next.availability = WeightAvailabilityState::READY;
     next.import_layout.clear();
-    next.residency = WeightResidencyState::HOT;
-    next.observed_hot_ratio = 1.0;
+    next.residency =
+        observation ? observation->residency : WeightResidencyState::HOT;
+    next.observed_hot_ratio = observation ? observation->hot_ratio : 1.0;
     ++next.metadata_generation;
     next.updated_at_ms = std::max(next.updated_at_ms, now_ms);
     std::optional<WeightResidencyOperation> operation;
-    if (next.policy.preferred_residency != WeightResidencyState::HOT) {
+    const bool needs_convergence =
+        observation
+            ? !observation->preferred_placement_satisfied
+            : next.policy.preferred_residency != WeightResidencyState::HOT;
+    if (needs_convergence) {
         if (next_operation_id_ == 0 ||
             next_operation_id_ == std::numeric_limits<uint64_t>::max()) {
             return tl::make_unexpected(

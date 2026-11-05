@@ -15,6 +15,12 @@ namespace mooncake {
 
 inline constexpr uint32_t kWeightMetadataSchemaVersion = 3;
 
+struct WeightResidencyObservation {
+    WeightResidencyState residency{WeightResidencyState::UNKNOWN};
+    double hot_ratio{0.0};
+    bool preferred_placement_satisfied{false};
+};
+
 enum class WeightMetadataMutationKind : uint8_t {
     UPSERT = 0,
     ERASE = 1,
@@ -69,7 +75,8 @@ class WeightMetadataStore {
     Result<WeightMetadataMutation> PrepareBeginImport(
         const BeginWeightImportRequest& request, uint64_t now_ms) const;
     Result<WeightMetadataMutation> PrepareCommitImport(
-        const CommitWeightImportRequest& request, uint64_t now_ms);
+        const CommitWeightImportRequest& request, uint64_t now_ms,
+        std::optional<WeightResidencyObservation> observation = std::nullopt);
     Result<WeightMetadataMutation> PrepareAbortImport(
         const AbortWeightImportRequest& request, uint64_t now_ms) const;
     Result<WeightRevisionMetadata> Publish(
