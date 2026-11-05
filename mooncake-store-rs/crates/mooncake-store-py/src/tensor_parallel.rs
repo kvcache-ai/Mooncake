@@ -224,6 +224,48 @@ fn extract_tensor_info(tensor: &Bound<'_, PyAny>) -> PyResult<TensorInfo> {
     })
 }
 
+fn validate_tensor_read_destination(
+    tensor: &Bound<'_, PyAny>,
+    parsed: &ParsedTensorMetadata,
+) -> PyResult<TensorInfo> {
+    let device: String = tensor.getattr("device")?.getattr("type")?.extract()?;
+    if device != "cpu" {
+        return Err(PyValueError::new_err(
+            "tensor read destination must be on CPU",
+        ));
+    }
+
+    let info = extract_tensor_info(tensor)?;
+    // Check the view's byte size independently of shape/dtype: parsed metadata
+    // bounds the payload, but does not check its size against the local shape.
+    if info.data_bytes != parsed.data_bytes {
+        return Err(PyValueError::new_err(format!(
+            "tensor read destination byte size mismatch: expected {}, got {}",
+            parsed.data_bytes, info.data_bytes
+        )));
+    }
+    if info.dtype as i32 != parsed.metadata.header.dtype {
+        return Err(PyValueError::new_err(
+            "tensor read destination dtype mismatch",
+        ));
+    }
+    let shape = parsed
+        .metadata
+        .layout
+        .local_shape
+        .to_vec(parsed.metadata.header.ndim as usize);
+    if info.shape != shape {
+        return Err(PyValueError::new_err(format!(
+            "tensor read destination shape mismatch: expected {shape:?}, got {:?}",
+            info.shape
+        )));
+    }
+    if info.data_bytes != 0 {
+        let _ = pointer_from_usize(info.data_ptr)?;
+    }
+    Ok(info)
+}
+
 // ─── Write route ───────────────────────────────────────────────────────────
 
 enum WriteRoute {
@@ -1562,13 +1604,19 @@ impl PyMooncakeDistributedStore {
         if let Some(tensor_obj) = tensor {
             if let Some(parsed) = &parsed {
                 let tensor_data = &data[parsed.data_offset..parsed.data_offset + parsed.data_bytes];
-                let data_ptr: usize = tensor_obj.call_method0("data_ptr")?.extract()?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        tensor_data.as_ptr(),
-                        data_ptr as *mut u8,
-                        tensor_data.len(),
-                    );
+                let info = validate_tensor_read_destination(tensor_obj, parsed)?;
+                // Empty CPU tensors can have a null data_ptr, which is not a
+                // valid argument to copy_nonoverlapping even for a zero count.
+                if !tensor_data.is_empty() {
+                    // The destination is a contiguous CPU view with matching
+                    // dtype, local shape and byte size, held alive by tensor_obj.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            tensor_data.as_ptr(),
+                            info.data_ptr as *mut u8,
+                            tensor_data.len(),
+                        );
+                    }
                 }
                 return Ok(tensor_obj.clone().unbind());
             }
