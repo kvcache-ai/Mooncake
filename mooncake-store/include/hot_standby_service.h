@@ -287,6 +287,9 @@ class HotStandbyService {
     std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
     std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
     std::optional<DurablePrefix> batch_snapshot_baseline_;
+    // Batch cursor of the previous reader, kept so that a warm start resumes
+    // the scan after the last applied batch.
+    std::optional<DurablePrefix> warm_start_cursor_;
     ViewVersionId batch_snapshot_producer_view_version_{0};
     std::vector<StandbySegmentInfo> preserved_segments_;
     bool preserve_promotion_baseline_{false};
