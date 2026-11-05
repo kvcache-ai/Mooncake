@@ -147,6 +147,8 @@ class UbWorkers final {
 
     Status start();
     Status stop();
+    Status submitBatch(const std::vector<UbTask::Ptr>& tasks,
+                       uint64_t device_mask = ~0ULL);
     Status submit(const UbTask::Ptr& task, uint64_t device_mask = ~0ULL);
     Status cancel(const UbTask::Ptr& task);
 

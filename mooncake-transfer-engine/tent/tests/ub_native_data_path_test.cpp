@@ -547,6 +547,30 @@ TEST(UbNativeDataPathTest,
                           (void)endpoints.retire(endpoint);
                       });
     ASSERT_TRUE(workers.start().ok());
+
+    Request invalid_batch_request{};
+    invalid_batch_request.opcode = Request::WRITE;
+    invalid_batch_request.source = source.data();
+    invalid_batch_request.target_id = LOCAL_SEGMENT_ID;
+    invalid_batch_request.target_offset =
+        reinterpret_cast<uint64_t>(target.data());
+    invalid_batch_request.length = 16;
+    auto valid_task = UbTask::create(invalid_batch_request);
+    auto valid_slice = valid_task->addSlice(UbSliceSpec{
+        source.data(), reinterpret_cast<uint64_t>(target.data()), 16, 0, 1});
+    ASSERT_NE(valid_slice, nullptr);
+    ASSERT_TRUE(valid_task->seal());
+    auto unsealed_task = UbTask::create(invalid_batch_request);
+    ASSERT_NE(unsealed_task->addSlice(UbSliceSpec{
+                  source.data(), reinterpret_cast<uint64_t>(target.data()), 16,
+                  0, 1}),
+              nullptr);
+
+    EXPECT_FALSE(workers.submitBatch({valid_task, unsealed_task}).ok());
+    EXPECT_EQ(workers.queuedCount(), 0U);
+    EXPECT_EQ(workers.inflightCount(), 0U);
+    EXPECT_EQ(valid_slice->snapshot().state, UbSliceState::kInitial);
+
     adapter->holdNextCompletion();
     adapter->dropNextQuiescedCompletion();
 
@@ -913,6 +937,11 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     request.target_id = LOCAL_SEGMENT_ID;
     request.target_offset = reinterpret_cast<uint64_t>(target.data());
     request.length = source.size();
+    auto invalid_request = request;
+    invalid_request.length = 0;
+    EXPECT_FALSE(
+        transport.submitTransferTasks(batch, {request, invalid_request}).ok());
+    EXPECT_EQ(batch->size(), 0U);
     ASSERT_TRUE(transport.submitTransferTasks(batch, {request}).ok());
 
     TransferStatus transfer{PENDING, 0};
