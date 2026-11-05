@@ -2067,6 +2067,19 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
+ErrorCode Client::ReadColdStagingChunk(const std::string& endpoint,
+                                       uint64_t address, void* destination,
+                                       size_t size) {
+    Replica::Descriptor source;
+    MemoryDescriptor memory;
+    memory.buffer_descriptor.buffer_address_ = address;
+    memory.buffer_descriptor.size_ = size;
+    memory.buffer_descriptor.transport_endpoint_ = endpoint;
+    source.descriptor_variant = std::move(memory);
+    std::vector<Slice> slices{Slice{destination, size}};
+    return TransferRead(source, slices);
+}
+
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
@@ -2117,6 +2130,21 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                        << ": " << toString(err);
         }
         return tl::unexpected(err);
+    }
+
+    for (const auto& replica : *start_result) {
+        if (replica.is_local_disk_replica()) {
+            if (!cold_write_handler_)
+                return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
+            auto result =
+                cold_write_handler_(key, replica, slices, object_checksum);
+            if (!result) {
+                // An unknown remote completion retains the reservation until
+                // its timeout.
+                return result;
+            }
+            return {};
+        }
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -4346,9 +4374,9 @@ WeightRpcResult<WeightRevisionMetadata> Client::DeleteWeightRevision(
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
-    bool enable_offloading) {
-    auto response =
-        master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
+    bool enable_offloading, const std::string& write_endpoint) {
+    auto response = master_client_.MountLocalDiskSegment(
+        client_id_, enable_offloading, write_endpoint);
 
     if (!response) {
         LOG(ERROR) << "MountLocalDiskSegment failed, error code is "

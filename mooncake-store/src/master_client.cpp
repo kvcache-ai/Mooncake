@@ -233,6 +233,15 @@ struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ValidateColdWrite> {
+    static constexpr const char* value = "ValidateColdWrite";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::FinishColdWrite> {
+    static constexpr const char* value = "FinishColdWrite";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
     static constexpr const char* value = "MountLocalDiskSegment";
 };
@@ -825,6 +834,15 @@ MasterClient::BatchPutStart(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::ValidateColdWrite(
+    const ColdWriteRequest& request) {
+    return invoke_rpc<&WrappedMasterService::ValidateColdWrite, void>(request);
+}
+tl::expected<void, ErrorCode> MasterClient::FinishColdWrite(
+    const ColdWriteRequest& request) {
+    return invoke_rpc<&WrappedMasterService::FinishColdWrite, void>(request);
+}
+
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
     const ObjectMeta& object_meta, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
@@ -1162,14 +1180,15 @@ MasterClient::GetStorageConfig() {
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
-    const UUID& client_id, bool enable_offloading) {
+    const UUID& client_id, bool enable_offloading,
+    const std::string& write_endpoint) {
     ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegment");
     timer.LogRequest("client_id=", client_id,
                      ", enable_offloading=", enable_offloading);
 
     auto result =
         invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
-            client_id, enable_offloading);
+            client_id, enable_offloading, write_endpoint);
     timer.LogResponseExpected(result);
     return result;
 }

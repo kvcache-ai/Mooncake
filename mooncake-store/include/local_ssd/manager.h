@@ -79,6 +79,7 @@ class LocalSsdManager {
         const UUID& client_id, int64_t bytes);
 
     std::optional<Usage> GetUsage(const UUID& client_id) const;
+    bool TryReserveBytes(const UUID& client_id, uint64_t bytes);
     bool AdjustUsedBytes(const UUID& client_id, int64_t delta);
 
     ErrorCode EnqueueOffload(const UUID& client_id, OffloadTaskItem task,

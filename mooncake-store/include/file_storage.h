@@ -23,6 +23,12 @@ class FileStorage {
     tl::expected<void, ErrorCode> Init();
 
     void RemoveAll();
+    tl::expected<int64_t, ErrorCode> OffloadStream(
+        const std::string& key, uint64_t size,
+        const StorageBackendInterface::StreamWriter& writer,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>
+            complete);
 
     /**
      * @brief Deregisters this store's disk tier from the master, then waits out
@@ -387,6 +393,7 @@ class FileStorage {
     std::unordered_map<std::string, OffloadTaskItem>
         deferred_task_by_storage_key_;
 
+    std::mutex disk_write_mutex_;
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
     std::atomic<bool> heartbeat_running_;

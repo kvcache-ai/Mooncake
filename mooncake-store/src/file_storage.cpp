@@ -174,7 +174,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
         auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
+            client_->MountLocalDiskSegment(enable_offloading_, local_rpc_addr_);
         if (!mount_file_storage_result) {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
@@ -464,11 +464,46 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (offloading_objects.empty() && deferred_task_by_storage_key_.empty()) {
         return {};
     }
+    for (const auto& task : offloading_objects) {
+        if (!task.managed_weight) continue;
+        std::unordered_map<std::string, std::vector<Slice>> sources;
+        auto queried =
+            BatchQuerySegmentSlices({task.key}, task.tenant_id, sources);
+        bool success = false;
+        auto found = sources.find(task.key);
+        if (queried && found != sources.end()) {
+            auto result = OffloadStream(
+                TenantId(task.tenant_id).MakeScopedKey(task.key), task.size,
+                [&](int fd, uint64_t offset, uint64_t) {
+                    auto deadline =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() +
+                        300000;
+                    return WriteColdLocalSlices(client_, fd, offset,
+                                                found->second, deadline);
+                },
+                [this, &task](const auto&, auto& metadatas) {
+                    for (auto& metadata : metadatas)
+                        metadata.transport_endpoint = local_rpc_addr_;
+                    auto notified =
+                        client_->NotifyOffloadSuccess({task}, metadatas);
+                    return notified ? ErrorCode::OK : notified.error();
+                });
+            success = result.has_value();
+        }
+        if (!success) {
+            StorageObjectMetadata metadata;
+            metadata.data_size = -1;
+            auto ignored = client_->NotifyOffloadSuccess({task}, {metadata});
+        }
+    }
     std::unordered_map<std::string, int64_t> storage_object_sizes;
     std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
     storage_object_sizes.reserve(offloading_objects.size());
     task_by_storage_key.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
+        if (task.managed_weight) continue;
         const auto storage_key =
             TenantId(task.tenant_id).MakeScopedKey(task.key);
         storage_object_sizes.emplace(storage_key, task.size);
@@ -684,6 +719,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
+        std::unique_lock disk_write_lock(disk_write_mutex_);
         auto offload_res = storage_backend_->BatchOffload(
             host_batch_object, bucket_complete_handler,
             [this](const std::vector<std::string>& evicted_keys) {
@@ -932,8 +968,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
+                auto remount_result = client_->MountLocalDiskSegment(
+                    enable_offloading_, local_rpc_addr_);
                 if (remount_result) {
                     // Report configured SSD capacity so the Master can
                     // restore file_total_capacity_ (the denominator in
@@ -1015,7 +1051,22 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     return {};
 }
 
+tl::expected<int64_t, ErrorCode> FileStorage::OffloadStream(
+    const std::string& key, uint64_t size,
+    const StorageBackendInterface::StreamWriter& writer,
+    std::function<ErrorCode(const std::vector<std::string>&,
+                            std::vector<StorageObjectMetadata>&)>
+        complete) {
+    std::unique_lock lock(disk_write_mutex_);
+    return storage_backend_->OffloadStream(
+        key, size, writer, std::move(complete),
+        [this](const std::vector<std::string>& keys) {
+            return NotifyEvictedDiskReplicas(keys);
+        });
+}
+
 void FileStorage::RemoveAll() {
+    std::unique_lock disk_write_lock(disk_write_mutex_);
     // Explicit physical reset: this bypasses per-object metadata protection
     // and clears every tenant sharing the backend. Generic Client::RemoveAll
     // must not request it; callers must ensure no live object depends on the

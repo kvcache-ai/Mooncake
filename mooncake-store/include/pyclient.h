@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cold_write.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -154,6 +156,15 @@ class ClientRequester {
      * Transfer Engine service.
      * @param keys Map from object key to size (bytes);
      */
+    tl::expected<void, ErrorCode> cold_write_begin(
+        const std::string &endpoint, const ColdWriteRequest &request);
+    tl::expected<void, ErrorCode> cold_write_chunk(const std::string &endpoint,
+                                                   const ColdWriteChunk &chunk);
+    tl::expected<void, ErrorCode> cold_write_cancel(
+        const std::string &endpoint, const ColdWriteRequest &request);
+    tl::expected<void, ErrorCode> cold_write_finish(
+        const std::string &endpoint, const ColdWriteRequest &request);
+
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object(const std::string &client_addr,
                              const std::vector<std::string> &keys,

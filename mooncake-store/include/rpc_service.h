@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cold_write.h"
+
 #include <csignal>
 
 #include <string>
@@ -104,6 +106,11 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
         const std::string& tenant_id = "default");
+
+    tl::expected<void, ErrorCode> ValidateColdWrite(
+        const ColdWriteRequest& request);
+    tl::expected<void, ErrorCode> FinishColdWrite(
+        const ColdWriteRequest& request);
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
@@ -238,8 +245,9 @@ class WrappedMasterService {
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
 
-    tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
-                                                        bool enable_offloading);
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading,
+        const std::string& write_endpoint);
 
     tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
         const UUID& client_id);

@@ -214,5 +214,25 @@ TEST(LocalSsdManagerTest, CancelsOffloadMirrorsOnlyWhenAllArePending) {
     EXPECT_TRUE(manager.SetOffloadingAndTakePending(client_b, true)->empty());
 }
 
+TEST(LocalSsdManagerTest, ColdReservationsCannotOversubscribeCapacity) {
+    LocalSsdManager manager;
+    const UUID owner{987, 654};
+    ASSERT_EQ(manager.RegisterClient(owner, true), ErrorCode::OK);
+    ASSERT_TRUE(manager.ReportCapacity(owner, 17));
+    std::atomic<int> admitted{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 64; ++i)
+        threads.emplace_back([&] {
+            if (manager.TryReserveBytes(owner, 1)) ++admitted;
+        });
+    for (auto& thread : threads) thread.join();
+    EXPECT_EQ(admitted.load(), 17);
+    EXPECT_EQ(manager.GetUsage(owner)->used_bytes, 17);
+    EXPECT_FALSE(manager.TryReserveBytes(owner, 1));
+    EXPECT_TRUE(manager.AdjustUsedBytes(owner, -1));
+    EXPECT_TRUE(manager.TryReserveBytes(owner, 1));
+    EXPECT_FALSE(manager.TryReserveBytes(owner, UINT64_MAX));
+}
+
 }  // namespace
 }  // namespace mooncake

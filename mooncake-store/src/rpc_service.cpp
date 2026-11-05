@@ -494,6 +494,16 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
     return result;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::ValidateColdWrite(
+    const ColdWriteRequest& request) {
+    return master_service_.ValidateColdWrite(request);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::FinishColdWrite(
+    const ColdWriteRequest& request) {
+    return master_service_.FinishColdWrite(request);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
     ReplicaType replica_type, const std::string& tenant_id) {
@@ -1717,13 +1727,14 @@ WrappedMasterService::QuerySegmentForAdmin(const std::string& segment) {
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
-    const UUID& client_id, bool enable_offloading) {
+    const UUID& client_id, bool enable_offloading,
+    const std::string& write_endpoint) {
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");
     timer.LogRequest("action=mount_local_disk_segment");
     LOG(INFO) << "Mount local disk segment with client id is : " << client_id
               << ", enable offloading is: " << enable_offloading;
-    auto result =
-        master_service_.MountLocalDiskSegment(client_id, enable_offloading);
+    auto result = master_service_.MountLocalDiskSegment(
+        client_id, enable_offloading, write_endpoint);
 
     timer.LogResponseExpected(result);
     return result;
@@ -2090,7 +2101,9 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
-        &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
+        &WrappedMasterService::PutStart,
+        &WrappedMasterService::ValidateColdWrite,
+        &WrappedMasterService::FinishColdWrite, &WrappedMasterService::PutEnd,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
         &WrappedMasterService::BatchPutRevoke,

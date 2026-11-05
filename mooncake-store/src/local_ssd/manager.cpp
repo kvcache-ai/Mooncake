@@ -208,11 +208,26 @@ std::optional<LocalSsdManager::Usage> LocalSsdManager::GetUsage(
                  record.used_bytes.load(std::memory_order_relaxed)};
 }
 
+bool LocalSsdManager::TryReserveBytes(const UUID& client_id, uint64_t bytes) {
+    auto client = FindClient(client_id);
+    if (!client) return false;
+    auto& record = *client->record;
+    MutexLocker lock(&record.stats_mutex);
+    auto used = record.used_bytes.load(std::memory_order_relaxed);
+    if (used < 0 || used > record.total_capacity_bytes ||
+        bytes > static_cast<uint64_t>(record.total_capacity_bytes - used))
+        return false;
+    record.used_bytes.fetch_add(static_cast<int64_t>(bytes),
+                                std::memory_order_relaxed);
+    return true;
+}
+
 bool LocalSsdManager::AdjustUsedBytes(const UUID& client_id, int64_t delta) {
     auto client = FindClient(client_id);
     if (!client) {
         return false;
     }
+    MutexLocker lock(&client->record->stats_mutex);
     client->record->used_bytes.fetch_add(delta, std::memory_order_relaxed);
     return true;
 }
