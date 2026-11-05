@@ -9549,8 +9549,15 @@ RealClient::cold_write_begin(const ColdWriteRequest &request) {
                 return tl::make_unexpected(
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
             std::erase_if(state->sessions, [](const auto &entry) {
-                std::lock_guard lock(entry.second->mutex);
-                return entry.second->completed && !entry.second->transfer_unknown;
+                bool completed = false;
+                {
+                    std::lock_guard lock(entry.second->mutex);
+                    completed = entry.second->completed &&
+                                !entry.second->transfer_unknown;
+                }
+                if (completed && entry.second->worker.joinable())
+                    entry.second->worker.join();
+                return completed;
             });
             const bool active_stream =
                 std::any_of(state->sessions.begin(), state->sessions.end(),
