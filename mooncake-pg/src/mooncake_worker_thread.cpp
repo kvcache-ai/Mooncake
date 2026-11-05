@@ -100,6 +100,8 @@ void MooncakeWorker::startWorker() {
         // Per-slot state owned exclusively by this worker thread.
         clock::time_point activeTime[kNumTasks_];
         BatchID batchIDs[kNumTasks_]{};
+        // Offset of the task's sync flag set within its half's flag region.
+        size_t syncFlagOffset[kNumTasks_]{};
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
         int32_t failedRanks[kNumTasks_][kMaxNumRanks]{};
         int32_t attemptedRanks[kNumTasks_][kMaxNumRanks]{};
@@ -147,6 +149,12 @@ void MooncakeWorker::startWorker() {
                     }
                     task_detected_failure[i] = false;
                     active_failed_ranks_hint[i] = task.failedRanksHint;
+                    // Consecutive runs of a half alternate between its two
+                    // sets of sync flags.
+                    syncFlagOffset[i] =
+                        group->bufferHalfRuns[task.bufferOffset].fetch_add(
+                            1, std::memory_order_relaxed) %
+                        2 * kMaxNumRanks;
 
                     if (task.resetFailedRanksHint &&
                         active_failed_ranks_hint[i]) {
@@ -318,7 +326,8 @@ void MooncakeWorker::startWorker() {
                             .target_id = group->segmentIDs[j],
                             .target_offset = group->segmentInfos[j]
                                                  .recv_sync[task.bufferOffset] +
-                                             group->rank * sizeof(int32_t),
+                                             (syncFlagOffset[i] + group->rank) *
+                                                 sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
                         markAttempted(i, j);
@@ -332,7 +341,8 @@ void MooncakeWorker::startWorker() {
                            SIGNALED_1) {
                     bool task_done = true;
                     auto signal_ptr = (int32_t*)group->segmentInfos[group->rank]
-                                          .recv_sync[task.bufferOffset];
+                                          .recv_sync[task.bufferOffset] +
+                                      syncFlagOffset[i];
 
                     auto now = clock::now();
                     auto diff =

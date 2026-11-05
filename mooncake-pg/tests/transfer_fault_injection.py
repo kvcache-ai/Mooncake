@@ -170,6 +170,9 @@ class TransferFault:
         self._get_count = self._library.mooncakePgTestGetFailureCount
         self._get_count.argtypes = []
         self._get_count.restype = ctypes.c_uint64
+        self._delay_flags = self._library.mooncakePgTestDelayFlagCompletion
+        self._delay_flags.argtypes = [ctypes.c_int64]
+        self._delay_flags.restype = None
         if local_rank < 0:
             raise ValueError("local rank must be non-negative")
         self._local_rank = local_rank
@@ -231,6 +234,10 @@ class TransferFault:
         """Fail one directed global-rank link within this scope."""
         with self.failing_links(((source_rank, target_rank),)):
             yield
+
+    def delay_flag_completion(self, seconds: float) -> None:
+        """Make this rank's sync flag writes report completion late."""
+        self._delay_flags(int(seconds * 1_000_000))
 
     @property
     def injected_count(self) -> int:

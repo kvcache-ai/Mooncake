@@ -621,14 +621,17 @@ PGResult<void> MooncakeCommunicator::initialize(
         PG_TRY_TE(context_.engine->registerLocalMemory(recv_buffer_[index],
                                                        kBufferSize, location));
 
-        // Register CPU synchronization regions.
+        // Register CPU synchronization regions. A half receives into two sets
+        // of flags, used by its consecutive runs in turn: a rank clears a run's
+        // flags when it finishes that run, and a faster peer may already have
+        // written its flag for the next run.
         cpu_sync_send_region_[index] = new int32_t[kMaxNumRanks]{};
-        cpu_sync_recv_region_[index] = new int32_t[kMaxNumRanks]{};
+        cpu_sync_recv_region_[index] = new int32_t[2 * kMaxNumRanks]{};
         PG_TRY_TE(context_.engine->registerLocalMemory(
             cpu_sync_send_region_[index], kMaxNumRanks * sizeof(int32_t),
             kWildcardLocation));
         PG_TRY_TE(context_.engine->registerLocalMemory(
-            cpu_sync_recv_region_[index], kMaxNumRanks * sizeof(int32_t),
+            cpu_sync_recv_region_[index], 2 * kMaxNumRanks * sizeof(int32_t),
             kWildcardLocation));
     }
 
@@ -1833,6 +1836,28 @@ void MooncakeCommunicator::applyGroupState(
     std::vector<bool> previous_active_ranks(meta_->maxGroupSize);
     for (int local_rank = 0; local_rank < meta_->maxGroupSize; ++local_rank) {
         previous_active_ranks[local_rank] = meta_->activeRanks[local_rank];
+    }
+
+    // A rank being admitted counts a half's runs from zero, so every rank
+    // restarts the counts at this view. A view that only removes ranks does not
+    // restart them: it lands between chunks, the ranks that stay can be one run
+    // apart when they apply it, and they must not pick different flag sets.
+    if (next_mode == CollectiveExtensionState::Normal) {
+        const bool self_admitted =
+            self_active && (mode != CollectiveExtensionState::Normal ||
+                            !previous_active_ranks[rank_]);
+        bool any_admitted = self_admitted;
+        for (size_t local_rank = 0; local_rank < view.rank_order.size();
+             ++local_rank) {
+            const auto global_rank = view.rank_order[local_rank];
+            any_admitted |= view.members[global_rank].isActive() &&
+                            !previous_active_ranks[local_rank];
+        }
+        if (any_admitted) {
+            for (auto& runs : meta_->bufferHalfRuns) {
+                runs.store(0, std::memory_order_relaxed);
+            }
+        }
     }
 
     // The execution mode determines the effective active ranks consumed by
