@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <condition_variable>
 #include <optional>
 #include <unordered_set>
 
@@ -20,6 +21,7 @@ class FileStorage {
                 const std::string& local_rpc_addr,
                 SsdMetric* ssd_metric = nullptr);
     ~FileStorage();
+    void Shutdown();
 
     tl::expected<void, ErrorCode> Init();
 
@@ -408,6 +410,9 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
+    std::mutex shutdown_mutex_;
+    std::mutex worker_wait_mutex_;
+    std::condition_variable worker_wait_cv_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
     // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the

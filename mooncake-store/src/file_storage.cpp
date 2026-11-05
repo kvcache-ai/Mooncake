@@ -117,12 +117,19 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 }
 
 FileStorage::~FileStorage() {
+    Shutdown();
+}
+
+void FileStorage::Shutdown() {
+    std::lock_guard shutdown_lock(shutdown_mutex_);
     LOG(INFO) << "Shutdown FileStorage...";
+    draining_.store(true);
     heartbeat_running_ = false;
+    client_buffer_gc_running_ = false;
+    worker_wait_cv_.notify_all();
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
-    client_buffer_gc_running_ = false;
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
@@ -232,8 +239,10 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                   << "s, running is: " << heartbeat_running_.load();
         while (heartbeat_running_.load()) {
             Heartbeat();
-            std::this_thread::sleep_for(
-                std::chrono::seconds(config_.heartbeat_interval_seconds));
+            std::unique_lock wait_lock(worker_wait_mutex_);
+            worker_wait_cv_.wait_for(
+                wait_lock, std::chrono::seconds(config_.heartbeat_interval_seconds),
+                [this] { return !heartbeat_running_.load(); });
         }
     });
     client_buffer_gc_running_.store(true);
@@ -1627,8 +1636,11 @@ void FileStorage::ClientBufferGCThreadFunc() {
                 }
             }
         }
-        std::this_thread::sleep_for(
-            std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
+        std::unique_lock wait_lock(worker_wait_mutex_);
+        worker_wait_cv_.wait_for(
+            wait_lock,
+            std::chrono::seconds(config_.client_buffer_gc_interval_seconds),
+            [this] { return !client_buffer_gc_running_.load(); });
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
 }

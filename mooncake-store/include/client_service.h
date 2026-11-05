@@ -847,6 +847,9 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    std::function<tl::expected<void, ErrorCode>()> WeightMemoryRelease(
+        void* address) const;
+
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
     [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
