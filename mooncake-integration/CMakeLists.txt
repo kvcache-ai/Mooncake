@@ -183,6 +183,16 @@ if(USE_UBSHMEM)
     COMPONENT python)
 endif()
 
+if(USE_TPU)
+  # tpu.default_adapter_path() expects the adapter next to mooncake/tpu.py.
+  message(
+    STATUS
+      "USE_TPU is enabled, libmooncake_tpu_pjrt.so will be installed in the Python package"
+  )
+  install(TARGETS tent_tpu_pjrt_adapter
+          LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
+endif()
+
 if(WITH_STORE)
   if(USE_CUDA)
     add_subdirectory(../mooncake-store/src/engram

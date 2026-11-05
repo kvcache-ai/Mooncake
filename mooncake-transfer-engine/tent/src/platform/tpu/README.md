@@ -78,8 +78,7 @@ rather than accidentally producing the right answer.
 
 ## Not yet included (follow-ups)
 
-- Serving-framework (JAX / PyTorch-XLA) integration that registers TPU buffers.
+- Serving-engine connectors that call `mooncake.tpu`.
 - DMA-mapped (pinned) staging buffers for true async device DMA, and the
   interaction between device DMA-mapping and RDMA memory registration on the
   same host buffer.
-- Benchmarks on real TPU hardware.

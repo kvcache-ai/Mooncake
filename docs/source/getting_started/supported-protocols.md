@@ -548,26 +548,76 @@ The two stages are chained automatically by the TENT staging pipeline
 (`ProxyManager`), so no separate networked TPU transport is required.
 
 **Status:** Experimental. The C++/TENT data path is gated behind `-DUSE_TPU=ON`
-(OFF by default). A serving-framework (JAX / PyTorch-XLA) integration layer is
-planned as a follow-up.
+(OFF by default). Mooncake ships a built-in adapter that delegates device
+copies to a pluggable TPU buffer provider; PyTorch (TorchTPU) and JAX providers
+are available in [tpu-sync](https://github.com/google/tpu-sync).
 
 **Use When:**
 - Disaggregated prefill/decode serving on TPU hosts
 - KV-cache transfer between TPU nodes over RDMA/TCP
 
 **Requirements:**
-- Built with `-DUSE_TPU=ON -DUSE_TENT=ON`
-- A PJRT device-copy adapter shared library exposing the `mc_tpu_pjrt_*` C ABI
-  (see `tpu_pjrt_abi.h`). The adapter is resolved at runtime via `dlopen`; its
-  path defaults to `libmooncake_tpu_pjrt.so` and can be overridden with the
-  `MC_TPU_PJRT_LIB` environment variable. No PJRT/TPU SDK is required at build
-  time.
+- Built with `-DUSE_TPU=ON -DUSE_TENT=ON`. This also builds the adapter,
+  `libmooncake_tpu_pjrt.so`, and installs it in the `mooncake` Python package.
+- A TPU buffer provider library implementing `tpu_buffer_provider.h`, built
+  with the ML framework so that it can reach the framework's device buffers.
+  No PJRT/TPU SDK is required to build Mooncake.
 - An RDMA (or TCP) transport enabled for the host ↔ host hop.
+
+**Usage:** register the framework's device arrays with the adapter *before*
+creating the `TransferEngine` (TENT reads the TPU device topology from the
+adapter once, at construction), then register the returned fake addresses with the
+engine:
+
+```python
+import os
+from mooncake import tpu
+
+# Defaults to tpu-sync's PyTorch provider; pass framework="jax" for JAX,
+# or provider=... for a custom TPU buffer provider.
+shards = tpu.prepare(kv_caches)
+
+os.environ["MC_USE_TENT"] = "1"
+from mooncake.engine import TransferEngine
+engine = TransferEngine()
+engine.initialize(...)
+tpu.register_with_engine(engine, shards)  # TENT records each as "tpu:N"
+```
+
+Fake addresses are for Mooncake's bookkeeping only and must never be
+dereferenced. Byte offsets within a fake address index the buffer's on-device layout,
+so both ends of a transfer must use identical shapes, dtypes and shardings.
+
+A provider may accept only some device offsets. tpu-sync accepts offsets that
+are multiples of 32 bytes, with any length and any host buffer, so with
+tpu-sync each TPU side of a transfer must start at a 32-byte-aligned offset.
+Transfers at offsets the provider rejects fail; Mooncake never rounds them.
+
+**Lifecycle:**
+
+1. While a transfer may use an array, do not write to it from the framework or
+   donate it: the provider's copies are not ordered with framework
+   computations.
+2. Wait for every transfer that uses a buffer to finish before unregistering
+   it.
+3. Unregister the fake addresses from the engine first, then from the adapter,
+   and only then shut down the framework runtime that owns the device memory:
+
+   ```python
+   flat = [shard for per_array in shards for shard in per_array]
+   engine.batch_unregister_memory([shard.fake_addr for shard in flat])
+   tpu.unregister(flat)  # The adapter then releases the provider handles.
+   ```
 
 **Design notes:**
 - TPU memory is reported as a distinct memory type (`tpu:N` locations); the
   staging policy routes the local HBM ↔ host copy to the TPU device-copy
   transport and the cross-node hop to RDMA/TCP.
+- The adapter implements the `mc_tpu_pjrt_*` C ABI (`tpu_pjrt_abi.h`) that TENT
+  resolves via `dlopen`; its path defaults to `libmooncake_tpu_pjrt.so` and can
+  be overridden with `MC_TPU_PJRT_LIB`, which `mooncake.tpu` sets to the
+  packaged adapter so that TENT and Python share one registry. A custom adapter
+  implementing the same ABI can still be used instead.
 - DMA-mapped (pinned) staging buffers for true async device DMA are a planned
   performance follow-up.
 
