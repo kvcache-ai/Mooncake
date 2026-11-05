@@ -154,6 +154,41 @@ class TentMetrics {
     // the only failure metric that records TIMEOUT/CANCELED outcomes.
     void recordTaskFailure(TransportType tp, TaskFailureReason reason);
 
+    enum class StreamEvent {
+        Queued,
+        AttemptStarted,
+        AttemptSuccess,
+        ConnectStarted,
+        ConnectSuccess,
+        ConnectionError,
+        IoError,
+        Timeout,
+        PeerClosed,
+        Canceled,
+        RemoteError,
+        RetryIssued,
+        RetryExhausted,
+    };
+    enum class StreamOutcome {
+        Success,
+        ConnectionError,
+        IoError,
+        Timeout,
+        PeerClosed,
+        Canceled,
+        RemoteError,
+    };
+
+    // Stream metrics cover TCP and HP-TCP. A queued event belongs to a
+    // logical task for TCP and a physical slice operation for HP-TCP; attempt
+    // events and latency always describe a physical network attempt.
+    void recordStreamEvent(TransportType transport, Request::OpCode operation,
+                           StreamEvent event, int64_t count = 1);
+    void recordStreamAttempt(TransportType transport, Request::OpCode operation,
+                             StreamOutcome outcome, double latency_us);
+    void recordStreamQueueWait(TransportType transport,
+                               Request::OpCode operation, double latency_us);
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -287,6 +322,10 @@ class TentMetrics {
         "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 3> kStreamEventLabels{
+        "transport", "operation", "event"};
+    static inline const std::array<std::string, 3> kStreamAttemptLabels{
+        "transport", "operation", "outcome"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -302,6 +341,13 @@ class TentMetrics {
     static constexpr size_t kAttemptOutcomeDomain =
         kAttemptDomain * kOutcomeValueDomain;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+    static constexpr size_t kStreamEventValueDomain = 13;
+    static constexpr size_t kStreamOutcomeDomain = 7;
+    static constexpr size_t kStreamOperationDomain = kTransportDomain * 2;
+    static constexpr size_t kStreamEventDomain =
+        kStreamOperationDomain * kStreamEventValueDomain;
+    static constexpr size_t kStreamAttemptDomain =
+        kStreamOperationDomain * kStreamOutcomeDomain;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -327,6 +373,24 @@ class TentMetrics {
     }
     static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
+    static size_t streamOperationSlot(TransportType transport,
+                                      Request::OpCode operation) {
+        return attemptSlot(transport, operation);
+    }
+    static size_t streamEventSlot(TransportType transport,
+                                  Request::OpCode operation,
+                                  StreamEvent event) {
+        return streamOperationSlot(transport, operation) *
+                   kStreamEventValueDomain +
+               static_cast<size_t>(event);
+    }
+    static size_t streamAttemptSlot(TransportType transport,
+                                    Request::OpCode operation,
+                                    StreamOutcome outcome) {
+        return streamOperationSlot(transport, operation) *
+                   kStreamOutcomeDomain +
+               static_cast<size_t>(outcome);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -390,6 +454,10 @@ class TentMetrics {
         "tent_quarantined_batches_total",
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
+    metrics::CachedDynamicCounter<3> stream_events_total_{
+        "tent_stream_events_total",
+        "TCP and HP-TCP queue, attempt, connection, retry and terminal events",
+        kStreamEventLabels, kStreamEventDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -463,6 +531,14 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicHistogram<3> stream_attempt_latency_{
+        "tent_stream_attempt_latency_us",
+        "Physical TCP and HP-TCP attempt latency in microseconds",
+        kLatencyBuckets, kStreamAttemptLabels, kStreamAttemptDomain};
+    metrics::CachedDynamicHistogram<2> stream_queue_wait_{
+        "tent_stream_queue_wait_us",
+        "TCP logical-task and HP-TCP physical-slice queue wait in microseconds",
+        kLatencyBuckets, kAttemptLabels, kStreamOperationDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
     // transport_attempt_latency_ histogram is serialized separately (see

@@ -55,6 +55,9 @@ struct TcpTask {
     std::atomic<size_t> transferred_bytes{0};
     bool non_replayable_failure{false};  // Published by status_word.
     uint64_t target_addr = 0;
+#if TENT_METRICS_ENABLED
+    uint64_t enqueue_ts_ns{0};
+#endif
 
     TcpTask() = default;
     TcpTask(TcpTask &&other) noexcept
@@ -64,8 +67,16 @@ struct TcpTask {
           status_word(other.status_word.load(std::memory_order_relaxed)),
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),
+#if TENT_METRICS_ENABLED
           non_replayable_failure(other.non_replayable_failure),
-          target_addr(other.target_addr) {}
+          target_addr(other.target_addr),
+          enqueue_ts_ns(other.enqueue_ts_ns) {
+    }
+#else
+          non_replayable_failure(other.non_replayable_failure),
+          target_addr(other.target_addr) {
+    }
+#endif
     TcpTask(const TcpTask &) = delete;
     TcpTask &operator=(const TcpTask &) = delete;
 };

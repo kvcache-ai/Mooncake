@@ -441,6 +441,11 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordDeadlineInfeasible(TCP);
     metrics.recordBatchQuarantined();
     metrics.recordTaskFailure(RDMA, TentMetrics::TaskFailureReason::Timeout);
+    metrics.recordStreamEvent(TCP, Request::READ,
+                              TentMetrics::StreamEvent::Queued);
+    metrics.recordStreamAttempt(HP_TCP, Request::WRITE,
+                                TentMetrics::StreamOutcome::Success, 45.0);
+    metrics.recordStreamQueueWait(TCP, Request::READ, 12.0);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -450,7 +455,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 34>
+    const std::array<std::pair<std::string_view, std::string_view>, 37>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -467,6 +472,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_task_failures_total", "counter"},
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
+            {"tent_stream_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_logical_requests_inflight", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
@@ -479,6 +485,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stage_dispatch_us", "histogram"},
             {"tent_stage_transport_us", "histogram"},
             {"tent_transport_attempt_latency_us", "histogram"},
+            {"tent_stream_attempt_latency_us", "histogram"},
+            {"tent_stream_queue_wait_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -503,6 +511,39 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
                         "json\"}"),
               std::string::npos);
+}
+
+TEST_F(MetricsRecordingTest, StreamSignalsSeparateQueueAndPhysicalAttempts) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::Queued, 2);
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::AttemptStarted);
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::RetryIssued);
+    metrics.recordStreamAttempt(HP_TCP, Request::READ,
+                                TentMetrics::StreamOutcome::PeerClosed, 51.0);
+    metrics.recordStreamQueueWait(HP_TCP, Request::READ, 17.0);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                           "operation=\"read\",event=\"queued\"}") -
+                  before.series("tent_stream_events_total{transport=\"hp_tcp\","
+                                "operation=\"read\",event=\"queued\"}"),
+              2);
+    EXPECT_EQ(after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                           "operation=\"read\",event=\"peer_closed\"}") -
+                  before.series("tent_stream_events_total{transport=\"hp_tcp\","
+                                "operation=\"read\",event=\"peer_closed\"}"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_stream_attempt_latency_us") -
+                  before.histogramCount("tent_stream_attempt_latency_us"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_stream_queue_wait_us") -
+                  before.histogramCount("tent_stream_queue_wait_us"),
+              1);
 }
 
 TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {
@@ -1882,6 +1923,9 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_deadline_infeasible_total"));
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
     EXPECT_TRUE(json.contains("tent_task_failures_total"));
+    EXPECT_TRUE(json.contains("tent_stream_events_total"));
+    EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));
+    EXPECT_TRUE(json.contains("tent_stream_queue_wait_us"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_FALSE(
         json["tent_metrics_build_info"].contains("compile_time_enabled"));

@@ -267,6 +267,7 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
+| `tent_stream_events_total` | Counter | `transport`, `operation`, `event` | TCP and HP-TCP queue, physical attempt, connection, retry and terminal events |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_logical_requests_inflight` | Gauge | `operation` | Counted logical requests without a terminal outcome |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
@@ -279,6 +280,8 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
+| `tent_stream_attempt_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end latency of physical TCP or HP-TCP network attempts |
+| `tent_stream_queue_wait_us` | Histogram | `transport`, `operation` | TCP logical-task and HP-TCP physical-slice queue wait before an attempt starts |
 
 ### Metrics pipeline self-observability
 
@@ -335,17 +338,19 @@ Transfer and attempt metrics carry a `transport` label (the
 `tent_transport_failover_total` counter uses `from` and `to` instead) so they
 can be sliced by transport without grepping logs. Attempt and logical
 accounting carry an `operation` label; terminal accounting also carries the
-four-valued `outcome` label. Task failures add a closed-set `reason` label and
-metrics serialization adds a two-valued `format` label. Label values come from
-bounded sets; no request IDs, addresses, segment names, or other unbounded
-values are accepted.
+four-valued `outcome` label. Stream-attempt latency reuses `outcome` with its
+seven-valued, stream-specific closed set. Task failures add a closed-set
+`reason` label and metrics serialization adds a two-valued `format` label.
+Label values come from bounded sets; no request IDs, addresses, segment names,
+or other unbounded values are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
 | `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
 | `operation` | `read`, `write` | Attempt operation |
-| `outcome` | `success`, `failed`, `timeout`, `canceled` | Bounded terminal outcome |
+| `outcome` | accounting: `success`, `failed`, `timeout`, `canceled`; stream attempts: `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` | Family-specific bounded terminal outcome |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
+| `event` | `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted` | Bounded stream lifecycle event |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -364,6 +369,15 @@ attempt outcomes have at most 19x2x4 = 152, task failures have at most 19x4 =
 labels are constant for the life of the process; a served
 `tent_metrics_build_info` series itself confirms that metrics were compiled
 in. Total series across all metrics is bounded by these closed sets.
+
+Stream metrics are emitted only for `tcp` and `hp_tcp`. Classic TCP queue
+events represent logical tasks; each control-plane data RPC started by its
+retry loop is a physical attempt. HP-TCP queue and attempt events represent
+physical slice operations, while `retry_issued` is counted once when a logical
+task retry is successfully admitted. Queue wait has at most 2x2 = 4
+transport/operation series, the event counter has at most 2x2x13 = 52 series,
+and attempt latency has at most 2x2x7 = 28 series. Peer identity, socket
+address, lane and request ID are never metric labels.
 
 ### Per-rail load (`getNicLoadStats`)
 
