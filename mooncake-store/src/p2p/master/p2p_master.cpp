@@ -548,9 +548,9 @@ int P2PMaster::RunWithHA() {
             LOG(WARNING) << "Skip P2P primary demotion handoff because master "
                             "service stopped without losing leadership";
         }
-        active_service.reset();
         master_view->CancelKeepAlive(lease_id);
         keep_leader_thread.join();
+        active_service.reset();
         if (run_result != 0) {
             return run_result;
         }
