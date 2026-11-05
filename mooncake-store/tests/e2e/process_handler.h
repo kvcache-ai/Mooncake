@@ -77,6 +77,10 @@ class MasterProcessHandler {
     // Kill the master process.
     bool kill();
 
+    // Pause/resume the process without destroying its memory state.
+    bool suspend();
+    bool resume();
+
     // Check if the process is started and is not killed yet.
     bool is_running() const;
 

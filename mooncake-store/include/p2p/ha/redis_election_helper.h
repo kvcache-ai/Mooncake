@@ -16,6 +16,8 @@
 
 namespace mooncake {
 
+class RedisElectionHelperTestPeer;
+
 /**
  * @brief Redis helper for leader election, mirroring EtcdHelper's election
  * role.
@@ -103,6 +105,8 @@ class RedisElectionHelper {
                                  ViewVersionId& out_epoch);
 
    private:
+    friend class RedisElectionHelperTestPeer;
+
     // === Internal helpers ===
 
     enum class ElectionAttemptResult { ELECTED, CONTENDED, ERROR };
@@ -135,6 +139,10 @@ class RedisElectionHelper {
      *        Blocks until the leader key expires or cancel is requested.
      */
     void WatchLeaderPolling();
+
+    // True only when a successful GET confirms the key is absent. The caller
+    // owns ctx and retries on its normal, cancellable polling interval.
+    bool PollLeaderOnce(redisContext*& ctx);
 
     /** Publish a best-effort wake-up after a successful election. */
     void PublishLeaderEvent(const std::string& master_address,

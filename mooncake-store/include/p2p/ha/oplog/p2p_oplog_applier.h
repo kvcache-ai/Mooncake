@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -31,7 +32,8 @@ class P2POpLogApplier {
     /// @param oplog_store     Optional OpLogStore for gap resolution.
     explicit P2POpLogApplier(P2PStandbyMetadataStore* p2p_store,
                              const std::string& cluster_id = std::string(),
-                             OpLogStore* oplog_store = nullptr);
+                             OpLogStore* oplog_store = nullptr,
+                             size_t max_pending_entries = 1000);
 
     /**
      * @brief Set or replace the OpLogStore used for requesting missing entries
@@ -121,6 +123,7 @@ class P2POpLogApplier {
     // OpLogStore for requesting missing OpLog entries (optional, not owned)
     std::string cluster_id_;
     OpLogStore* oplog_store_{nullptr};
+    const size_t max_pending_entries_;
 
     // Note: key_sequence_map_ has been removed.
     // Global sequence_id is sufficient for ordering guarantee.
@@ -157,8 +160,6 @@ class P2POpLogApplier {
         1;  // request from the store after 1s
     static constexpr int kMissingEntrySkipSeconds =
         3;  // skip after 3s (avoid global stall)
-    static constexpr int kMaxPendingEntries =
-        1000;  // Max pending entries before giving up
 
     P2PStandbyMetadataStore* p2p_store_;
 };

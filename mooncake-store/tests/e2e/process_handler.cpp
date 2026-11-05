@@ -247,6 +247,38 @@ bool MasterProcessHandler::kill() {
     return success;
 }
 
+bool MasterProcessHandler::suspend() {
+    if (master_pid_ == 0) {
+        LOG(ERROR) << "[m" << index_ << "] Master process not running";
+        return false;
+    }
+    if (::kill(master_pid_, SIGSTOP) != 0) {
+        LOG(ERROR) << "[m" << index_
+                   << "] Failed to suspend master process with PID: "
+                   << master_pid_ << ": " << strerror(errno);
+        return false;
+    }
+    LOG(INFO) << "[m" << index_
+              << "] Suspended master process with PID: " << master_pid_;
+    return true;
+}
+
+bool MasterProcessHandler::resume() {
+    if (master_pid_ == 0) {
+        LOG(ERROR) << "[m" << index_ << "] Master process not running";
+        return false;
+    }
+    if (::kill(master_pid_, SIGCONT) != 0) {
+        LOG(ERROR) << "[m" << index_
+                   << "] Failed to resume master process with PID: "
+                   << master_pid_ << ": " << strerror(errno);
+        return false;
+    }
+    LOG(INFO) << "[m" << index_
+              << "] Resumed master process with PID: " << master_pid_;
+    return true;
+}
+
 bool MasterProcessHandler::is_running() const { return master_pid_ != 0; }
 
 ClientProcessHandler::ClientProcessHandler(const std::string& path,

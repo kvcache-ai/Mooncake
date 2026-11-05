@@ -6,15 +6,24 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <string_view>
 #include <vector>
 #include <string>
 #include <thread>
+#include <future>
 
 #include <unistd.h>
 #include <hiredis/hiredis.h>
+#include <xxhash.h>
 
+#include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/oplog/oplog_store_factory.h"
 #include "p2p/ha/oplog/redis_oplog_store.h"
+#include "p2p/ha/oplog/oplog_replicator.h"
+#include "p2p/ha/oplog/p2p_oplog_applier.h"
+#include "p2p/ha/oplog/p2p_oplog_types.h"
+#include "p2p/ha/oplog/p2p_standby_metadata_store.h"
+#include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/oplog/p2p_standby_snapshot_service.h"
 #include "p2p/master/p2p_master_service.h"
 #include "p2p/ha/redis_util.h"
@@ -22,6 +31,82 @@
 
 namespace mooncake {
 namespace {
+
+std::atomic<bool> fail_one_latest_write{false};
+std::atomic<size_t> max_pipelined_sets{0};
+std::atomic<bool> fail_one_pipelined_reply{false};
+std::atomic<bool> fail_one_pipelined_status{false};
+thread_local size_t appended_sets = 0;
+thread_local size_t pipeline_replies_total = 0;
+thread_local size_t pipeline_replies_remaining = 0;
+
+extern "C" void* __wrap_redisCommand(redisContext* ctx, const char* format,
+                                     ...) {
+    va_list args;
+    va_start(args, format);
+    va_list copy;
+    va_copy(copy, args);
+    if (std::strcmp(format, "SET %b %b") == 0) {
+        const auto* key = va_arg(copy, const char*);
+        const auto length = va_arg(copy, size_t);
+        if (std::string_view(key, length).ends_with(":latest") &&
+            fail_one_latest_write.exchange(false)) {
+            va_end(copy);
+            va_end(args);
+            return nullptr;
+        }
+    }
+    va_end(copy);
+    void* return_value = redisvCommand(ctx, format, args);
+    va_end(args);
+    return return_value;
+}
+
+extern "C" int __wrap_redisAppendCommand(redisContext* ctx, const char* format,
+                                         ...) {
+    va_list args;
+    va_start(args, format);
+    const int result = redisvAppendCommand(ctx, format, args);
+    va_end(args);
+    if (result == REDIS_OK && std::strcmp(format, "SET %b %b") == 0) {
+        const size_t count = ++appended_sets;
+        size_t previous = max_pipelined_sets.load();
+        while (count > previous &&
+               !max_pipelined_sets.compare_exchange_weak(previous, count)) {
+        }
+    }
+    return result;
+}
+
+extern "C" int __real_redisGetReply(redisContext* ctx, void** reply);
+extern "C" int __wrap_redisGetReply(redisContext* ctx, void** reply) {
+    if (appended_sets > 0) {
+        pipeline_replies_total = appended_sets;
+        pipeline_replies_remaining = appended_sets;
+        appended_sets = 0;
+    }
+    const int result = __real_redisGetReply(ctx, reply);
+    if (result == REDIS_OK && pipeline_replies_remaining > 0) {
+        const size_t reply_number =
+            pipeline_replies_total - pipeline_replies_remaining + 1;
+        --pipeline_replies_remaining;
+        if (pipeline_replies_total > 1 && reply_number == 2 &&
+            fail_one_pipelined_reply.exchange(false)) {
+            freeReplyObject(*reply);
+            *reply = nullptr;
+            ctx->err = REDIS_ERR_IO;
+            return REDIS_ERR;
+        }
+        if (pipeline_replies_total > 1 && reply_number == 2 &&
+            fail_one_pipelined_status.exchange(false)) {
+            auto* status = static_cast<redisReply*>(*reply);
+            if (status->type == REDIS_REPLY_STATUS && status->len >= 2) {
+                std::memcpy(status->str, "NO", 2);
+            }
+        }
+    }
+    return result;
+}
 
 TEST(RedisOpLogStoreStandaloneTest, InvalidEndpointReturnsError) {
     RedisOpLogStore store("invalid_endpoint_test", "127.0.0.1:notaport",
@@ -168,13 +253,31 @@ class RedisOpLogStoreTest : public ::testing::Test {
     }
 
     OpLogEntry MakeEntry(uint64_t sequence_id,
-                         const std::string& key = "redis_key") const {
+                         const std::string& key = "redis_key",
+                         OpType op_type = OpType::PUT_END) const {
         OpLogEntry entry;
         entry.sequence_id = sequence_id;
-        entry.op_type = OpType::PUT_END;
+        entry.op_type = op_type;
         entry.object_key = key;
         entry.payload = "payload_" + std::to_string(sequence_id);
         entry.timestamp_ms = sequence_id * 10;
+        return entry;
+    }
+
+    OpLogEntry MakeWithdrawEntry(uint64_t sequence_id,
+                                 const std::string& key = "redis_key") const {
+        WithdrawRoutePayload payload;
+        payload.object_key = key;
+        payload.client_id = {1, 2};
+        payload.segment_id = {3, 4};
+        OpLogEntry entry = MakeEntry(sequence_id, key, OpType_WITHDRAW_ROUTE);
+        entry.payload = SerializeP2PPayload(payload);
+        entry.checksum = static_cast<uint32_t>(
+            XXH32(entry.payload.data(), entry.payload.size(), 0));
+        entry.prefix_hash =
+            key.empty()
+                ? 0
+                : static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
         return entry;
     }
 
@@ -311,6 +414,148 @@ TEST_F(RedisOpLogStoreTest, AsyncWriteDoesNotAdvanceLatestPastGap) {
     EXPECT_EQ(2u, latest);
 }
 
+TEST_F(RedisOpLogStoreTest, StopWritingAbortsSyncWaitAndRejectsNewWrites) {
+    std::shared_ptr<RedisOpLogStore> writer(CreateWriter());
+    OpLogManager manager;
+    manager.SetOpLogStore(writer);
+    auto pending = std::async(std::launch::async, [&] {
+        // seq=2 cannot commit while seq=1 is missing.
+        return manager.PersistEntry(MakeEntry(2), true);
+    });
+    OpLogEntry stored;
+    for (int i = 0; i < 200; ++i) {
+        if (writer->ReadOpLog(2, stored) == ErrorCode::OK) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(2u, stored.sequence_id);
+    ASSERT_EQ(1, HAMetricManager::instance().get_oplog_async_queue_size());
+    EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+
+    manager.RequestStopWriting();
+    ASSERT_EQ(pending.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_EQ(pending.get(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(manager.PersistEntry(MakeEntry(1), true),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(manager.PersistEntry(MakeEntry(1), false),
+              ErrorCode::INTERNAL_ERROR);
+
+    // Concurrent blocking stops and destruction must still join after
+    // RequestStopWriting().
+    auto stop = std::async(std::launch::async, [&] { manager.StopWriting(); });
+    manager.StopWriting();
+    stop.get();
+    uint64_t latest = 99;
+    ASSERT_EQ(writer->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(0u, latest);
+    EXPECT_EQ(writer->ReadOpLog(1, stored), ErrorCode::OPLOG_ENTRY_NOT_FOUND);
+    EXPECT_EQ(0, HAMetricManager::instance().get_oplog_async_queue_size());
+}
+
+TEST_F(RedisOpLogStoreTest, StopRacesWithSyncWaitAndIdleWorkers) {
+    for (int i = 0; i < 50; ++i) {
+        SCOPED_TRACE(i);
+        auto writer = CreateWriter();
+        // A missing seq=1 keeps seq=2 uncommitted, even if it reaches Redis.
+        auto pending = std::async(std::launch::async, [&] {
+            return writer->WriteOpLog(MakeEntry(2), true);
+        });
+        std::this_thread::yield();
+        writer->RequestStopWriting();
+        EXPECT_EQ(pending.wait_for(std::chrono::seconds(1)),
+                  std::future_status::ready);
+        writer->StopWriting();
+        EXPECT_EQ(pending.get(), ErrorCode::INTERNAL_ERROR);
+    }
+}
+
+TEST_F(RedisOpLogStoreTest, PipelineRetriesAndCommitsEveryEntry) {
+    max_pipelined_sets.store(0);
+    fail_one_pipelined_reply.store(true);
+    fail_one_pipelined_status.store(true);
+    auto writer = CreateWriter();
+
+    // Queue entries beyond the gap so workers can pipeline batches before
+    // seq=1 allows latest to advance.
+    for (uint64_t seq = 2; seq <= 40; ++seq) {
+        ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(seq), false));
+    }
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    EXPECT_GT(max_pipelined_sets.load(), 1u);
+    EXPECT_FALSE(fail_one_pipelined_reply.load());
+    EXPECT_FALSE(fail_one_pipelined_status.load());
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    do {
+        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
+        if (latest == 40u) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    EXPECT_EQ(40u, latest);
+    for (uint64_t seq = 1; seq <= 40; ++seq) {
+        OpLogEntry entry;
+        ASSERT_EQ(ErrorCode::OK, reader->ReadOpLog(seq, entry)) << seq;
+        EXPECT_EQ("payload_" + std::to_string(seq), entry.payload);
+    }
+}
+
+TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
+    auto writer = CreateWriter();
+    fail_one_latest_write.store(true);
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    EXPECT_FALSE(fail_one_latest_write.load());
+
+    uint64_t latest = 0;
+    ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+    EXPECT_EQ(1u, latest);
+}
+
+TEST_F(RedisOpLogStoreTest, RejectsInvalidWriteBatchSize) {
+    for (size_t batch_size : {size_t{0}, kMaxRedisOpLogWriteBatchSize + 1}) {
+        auto writer = OpLogStoreFactory::Create(
+            OpLogStoreType::REDIS, cluster_id_, OpLogStoreRole::WRITER,
+            redis_endpoint_, /*poll_interval_ms=*/10, redis_password_,
+            redis_username_, /*db_index=*/0,
+            /*async_queue_max_entries=*/100000, /*overflow_mode=*/"reject",
+            /*best_effort_max_retries=*/3, batch_size);
+        EXPECT_EQ(nullptr, writer) << "batch_size=" << batch_size;
+    }
+}
+
+TEST_F(RedisOpLogStoreTest, ConfiguredBatchSizeAboveDefaultIsUsed) {
+    max_pipelined_sets.store(0);
+    RedisOpLogStore store(cluster_id_, redis_endpoint_, /*enable_write=*/true,
+                          /*poll_interval_ms=*/10, redis_password_,
+                          redis_username_, /*db_index=*/0,
+                          /*async_queue_max_entries=*/100000,
+                          OpLogAsyncQueueOverflowMode::REJECT,
+                          /*best_effort_max_retries=*/3,
+                          /*async_write_batch_size=*/128);
+    ASSERT_EQ(ErrorCode::OK, store.Init());
+
+    for (uint64_t seq = 2; seq <= 1000; ++seq) {
+        ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(MakeEntry(seq), false));
+    }
+    ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(MakeEntry(1), true));
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    do {
+        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
+        if (latest == 1000u) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    EXPECT_EQ(1000u, latest);
+    EXPECT_GT(max_pipelined_sets.load(), 64u);
+    EXPECT_LE(max_pipelined_sets.load(), 128u);
+}
+
 TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
     auto writer = std::make_unique<RedisOpLogStore>(
         cluster_id_, redis_endpoint_, /*enable_write=*/true,
@@ -322,7 +567,8 @@ TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
 
     // seq=2 is persisted but retained in-flight because seq=1 is missing,
     // making the one-entry queue deterministically full.
-    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), false));
+    const auto remove = MakeWithdrawEntry(2);
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(remove, false));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), false));
 
@@ -335,14 +581,93 @@ TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {
 
     std::vector<OpLogEntry> entries;
     ASSERT_EQ(ErrorCode::OK, writer->ReadOpLogSince(0, 10, entries));
-    ASSERT_EQ(1u, entries.size());
-    EXPECT_EQ(2u, entries.front().sequence_id);
+    ASSERT_EQ(2u, entries.size());
+    EXPECT_EQ(1u, entries[0].sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries[0].op_type);
+    EXPECT_EQ(2u, entries[1].sequence_id);
 
     OpLogReadProgress progress;
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(0, 10, entries, progress));
-    ASSERT_EQ(1u, entries.size());
+    ASSERT_EQ(2u, entries.size());
+    EXPECT_EQ(OpType_NOOP, entries[0].op_type);
     EXPECT_EQ(2u, progress.last_scanned_sequence_id);
+    EXPECT_TRUE(
+        FindMissingSequenceIds(0, entries, progress.last_scanned_sequence_id)
+            .empty());
+
+    auto reader = CreateReader();
+    P2PStandbyMetadataStore metadata_store;
+    const P2PRouteLocation location{UUID{1, 2}, UUID{3, 4}};
+    ASSERT_TRUE(metadata_store.PublishRoute("redis_key", location,
+                                            /*object_size=*/1024,
+                                            /*sequence_id=*/0));
+    P2POpLogApplier applier(&metadata_store, cluster_id_);
+    auto notifier = reader->CreateChangeNotifier(cluster_id_);
+    OpLogReplicator replicator(notifier.get(), &applier);
+    const auto noops_before =
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total();
+    ASSERT_TRUE(replicator.StartFromSequenceId(0));
+    for (int i = 0; i < 100 && replicator.GetLastProcessedSequenceId() < 2;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    replicator.Stop();
+    EXPECT_EQ(2u, replicator.GetLastProcessedSequenceId());
+    EXPECT_TRUE(applier.IsHealthy());
+    EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(metadata_store.RouteExists("redis_key"));
+    EXPECT_EQ(
+        noops_before + 1,
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total());
+}
+
+TEST_F(RedisOpLogStoreTest, DroppedSequenceNeedsLaterPersistedEntry) {
+    auto writer = std::make_unique<RedisOpLogStore>(
+        cluster_id_, redis_endpoint_, /*enable_write=*/true,
+        /*poll_interval_ms=*/10, redis_password_, redis_username_,
+        /*db_index=*/0, /*async_queue_max_entries=*/1,
+        OpLogAsyncQueueOverflowMode::BYPASS,
+        /*best_effort_max_retries=*/3);
+    ASSERT_EQ(ErrorCode::OK, writer->Init());
+
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(3), false));
+    OpLogEntry stored;
+    for (int i = 0; i < 100; ++i) {
+        if (writer->ReadOpLog(3, stored) == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(3u, stored.sequence_id);
+
+    ASSERT_EQ(ErrorCode::OK,
+              writer->WriteOpLog(
+                  MakeEntry(1, "best_effort", OpType_PUBLISH_ROUTE), false));
+
+    uint64_t latest = 0;
+    for (int i = 0; i < 20; ++i) {
+        ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+        EXPECT_EQ(0u, latest);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
+    ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+    EXPECT_EQ(3u, latest);
+
+    std::vector<OpLogEntry> entries;
+    OpLogReadProgress progress;
+    ASSERT_EQ(ErrorCode::OK,
+              writer->ReadOpLogSinceWithProgress(0, 10, entries, progress));
+    ASSERT_EQ(3u, entries.size());
+    EXPECT_EQ(1u, entries[0].sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries[0].op_type);
+    EXPECT_EQ(2u, entries[1].sequence_id);
+    EXPECT_EQ(3u, entries[2].sequence_id);
+    EXPECT_TRUE(
+        FindMissingSequenceIds(0, entries, progress.last_scanned_sequence_id)
+            .empty());
 }
 
 TEST_F(RedisOpLogStoreTest, SparseReadLimitsScannedSequenceRange) {
@@ -363,21 +688,75 @@ TEST_F(RedisOpLogStoreTest, SparseReadLimitsScannedSequenceRange) {
     OpLogReadProgress progress;
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(0, 1000, entries, progress));
-    EXPECT_TRUE(entries.empty());
+    ASSERT_EQ(1000u, entries.size());
+    EXPECT_EQ(1u, entries.front().sequence_id);
+    EXPECT_EQ(1000u, entries.back().sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries.front().op_type);
     EXPECT_EQ(1000u, progress.last_scanned_sequence_id);
 
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(
                   progress.last_scanned_sequence_id, 1000, entries, progress));
-    EXPECT_TRUE(entries.empty());
+    ASSERT_EQ(1000u, entries.size());
+    EXPECT_EQ(1001u, entries.front().sequence_id);
+    EXPECT_EQ(2000u, entries.back().sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries.back().op_type);
     EXPECT_EQ(2000u, progress.last_scanned_sequence_id);
 
     ASSERT_EQ(ErrorCode::OK,
               writer->ReadOpLogSinceWithProgress(
                   progress.last_scanned_sequence_id, 1000, entries, progress));
-    ASSERT_EQ(1u, entries.size());
-    EXPECT_EQ(2500u, entries.front().sequence_id);
+    ASSERT_EQ(500u, entries.size());
+    EXPECT_EQ(2001u, entries.front().sequence_id);
+    EXPECT_EQ(OpType_NOOP, entries.front().op_type);
+    EXPECT_EQ(2500u, entries.back().sequence_id);
     EXPECT_EQ(2500u, progress.last_scanned_sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, ReplaysLargeSparseRangeAcrossPollBatches) {
+    constexpr uint64_t kNoopCount = 1500;
+    constexpr uint64_t kLastSequence = kNoopCount + 1;
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(kLastSequence));
+    ASSERT_EQ(ErrorCode::OK,
+              writer->WriteOpLog(MakeWithdrawEntry(kLastSequence), false));
+
+    OpLogEntry stored;
+    for (int i = 0; i < 100; ++i) {
+        if (writer->ReadOpLog(kLastSequence, stored) == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(kLastSequence, stored.sequence_id);
+
+    auto reader = CreateReader();
+    P2PStandbyMetadataStore metadata_store;
+    const P2PRouteLocation location{UUID{1, 2}, UUID{3, 4}};
+    ASSERT_TRUE(metadata_store.PublishRoute("redis_key", location,
+                                            /*object_size=*/1024,
+                                            /*sequence_id=*/0));
+    P2POpLogApplier applier(&metadata_store, cluster_id_);
+    auto notifier = reader->CreateChangeNotifier(cluster_id_);
+    OpLogReplicator replicator(notifier.get(), &applier);
+    const auto noops_before =
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total();
+    ASSERT_TRUE(replicator.StartFromSequenceId(0));
+    for (int i = 0;
+         i < 500 && replicator.GetLastProcessedSequenceId() < kLastSequence;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    replicator.Stop();
+
+    EXPECT_EQ(kLastSequence, replicator.GetLastProcessedSequenceId());
+    EXPECT_TRUE(applier.IsHealthy());
+    EXPECT_EQ(kLastSequence + 1, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(metadata_store.RouteExists("redis_key"));
+    EXPECT_EQ(0, HAMetricManager::instance().get_oplog_pending_entries());
+    EXPECT_EQ(
+        noops_before + kNoopCount,
+        HAMetricManager::instance().get_oplog_applied_noop_entries_total());
 }
 
 TEST_F(RedisOpLogStoreTest, FactoryRejectsInvalidAsyncConfiguration) {
@@ -585,6 +964,139 @@ TEST_F(RedisOpLogStoreTest, RejectsInvalidDatabaseIndex) {
                           /*poll_interval_ms=*/10, redis_password_,
                           redis_username_, /*db_index=*/-1);
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, store.Init());
+}
+
+TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
+    {
+        auto old_writer = CreateWriter();
+        for (uint64_t sequence_id = 1; sequence_id <= 3; ++sequence_id) {
+            ASSERT_EQ(old_writer->WriteOpLog(MakeEntry(sequence_id), true),
+                      ErrorCode::OK);
+        }
+    }
+
+    P2PMasterConfig config;
+    config.oplog.enabled = true;
+    config.oplog.store_type = "redis";
+    config.cluster_id = cluster_id_;
+    config.redis.endpoint = redis_endpoint_;
+    config.redis.username = redis_username_;
+    config.redis.password = redis_password_;
+    config.oplog.data_dir = "127.0.0.1:notaport";
+
+    P2PMasterService promoted(config);
+    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 0),
+              ErrorCode::OK);
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 3);
+
+    auto sequence = promoted.GetOpLogManager()->AppendAndPersist(
+        OpType::PUT_END, "new-primary", "new-payload", true);
+    ASSERT_TRUE(sequence.has_value());
+    EXPECT_EQ(sequence.value(), 4);
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 4);
+    for (uint64_t sequence_id = 1; sequence_id <= 3; ++sequence_id) {
+        OpLogEntry entry;
+        ASSERT_EQ(reader->ReadOpLog(sequence_id, entry), ErrorCode::OK);
+        EXPECT_EQ(entry.object_key, MakeEntry(sequence_id).object_key);
+        EXPECT_EQ(entry.payload, MakeEntry(sequence_id).payload);
+    }
+    OpLogEntry new_entry;
+    ASSERT_EQ(reader->ReadOpLog(4, new_entry), ErrorCode::OK);
+    EXPECT_EQ(new_entry.object_key, "new-primary");
+    EXPECT_EQ(new_entry.payload, "new-payload");
+}
+
+TEST_F(RedisOpLogStoreTest, PromotionWriterStartSkipsSnapshotCoveredGap) {
+    std::shared_ptr<RedisOpLogStore> writer(CreateWriter());
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(100));
+
+    OpLogManager manager;
+    manager.SetOpLogStore(writer);
+    ASSERT_EQ(manager.SetInitialSequenceId(101), ErrorCode::OK);
+    ASSERT_EQ(manager.GetLastSequenceId(), 101u);
+
+    {
+        auto reader = CreateReader();
+        uint64_t latest = 0;
+        ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+        EXPECT_EQ(latest, 100u);
+    }
+
+    const auto sequence = manager.AppendAndPersist(
+        OpType::PUT_END, "promoted-key", "promoted-payload", /*sync=*/true);
+    ASSERT_TRUE(sequence.has_value());
+    EXPECT_EQ(sequence.value(), 102u);
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 102u);
+
+    std::vector<OpLogEntry> entries;
+    ASSERT_EQ(reader->ReadOpLogSince(100, 10, entries), ErrorCode::OK);
+    ASSERT_EQ(entries.size(), 2u);
+    EXPECT_EQ(entries[0].sequence_id, 101u);
+    EXPECT_EQ(entries[0].op_type, OpType_NOOP);
+    EXPECT_EQ(entries[1].sequence_id, 102u);
+    EXPECT_EQ(entries[1].object_key, "promoted-key");
+    EXPECT_EQ(entries[1].payload, "promoted-payload");
+}
+
+TEST_F(RedisOpLogStoreTest, PromotionRejectsUnreadableOrChangedLatest) {
+    {
+        auto old_writer = CreateWriter();
+        ASSERT_EQ(old_writer->UpdateLatestSequenceId(200), ErrorCode::OK);
+    }
+
+    P2PMasterConfig config;
+    config.oplog.enabled = true;
+    config.oplog.store_type = "redis";
+    config.cluster_id = cluster_id_;
+    config.redis.endpoint = redis_endpoint_;
+    config.redis.username = redis_username_;
+    config.redis.password = redis_password_;
+    config.oplog.data_dir = "127.0.0.1:notaport";
+
+    P2PMasterService promoted(config);
+    auto [host, port] = ParseEndpoint();
+    std::unique_ptr<redisContext, decltype(&redisFree)> admin(
+        redisConnect(host.c_str(), port), &redisFree);
+    ASSERT_TRUE(testing::AuthenticateRedisContext(admin.get(), redis_username_,
+                                                  redis_password_));
+    const auto key = "mooncake:" + cluster_id_ + ":oplog:latest";
+
+    RedisReplyPtr corrupt(
+        (redisReply*)redisCommand(admin.get(), "SET %s invalid", key.c_str()));
+    ASSERT_TRUE(corrupt);
+    EXPECT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 0),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 0);
+
+    RedisReplyPtr changed(
+        (redisReply*)redisCommand(admin.get(), "SET %s 300", key.c_str()));
+    ASSERT_TRUE(changed);
+    EXPECT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 100),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 0);
+
+    RedisReplyPtr repair(
+        (redisReply*)redisCommand(admin.get(), "SET %s 200", key.c_str()));
+    ASSERT_TRUE(repair);
+    ASSERT_EQ(promoted.RestoreFromStandbyMetadata(/*metadata=*/{}, 100),
+              ErrorCode::OK);
+    auto sequence = promoted.GetOpLogManager()->AppendAndPersist(
+        OpType::PUT_END, "new-key", "new-payload", true);
+    ASSERT_TRUE(sequence.has_value());
+    EXPECT_EQ(sequence.value(), 201);
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 201);
 }
 
 TEST_F(RedisOpLogStoreTest, MasterServiceUsesRedisEndpointForRedisOpLog) {

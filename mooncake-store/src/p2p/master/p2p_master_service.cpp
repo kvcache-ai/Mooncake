@@ -36,7 +36,8 @@ P2PMasterService::P2PMasterService(const P2PMasterConfig& config,
             config.redis.username, config.redis.db_index,
             config.oplog.async_queue_max_entries,
             config.oplog.async_queue_overflow_mode,
-            config.oplog.best_effort_max_retries);
+            config.oplog.best_effort_max_retries,
+            config.oplog.async_write_batch_size);
         if (!store) {
             LOG(ERROR) << "P2PMasterService: failed to initialize OpLogStore"
                        << ", type=" << config.oplog.store_type
@@ -70,6 +71,26 @@ void P2PMasterService::InitializeClientManager() {
         [this](const P2PRouteLocation& location) {
             OnSegmentRemoved(location);
         });
+    client_manager_->SetClientCrashedCallback([this](const UUID& client_id) {
+        auto* manager = GetOpLogManager();
+        if (!manager) return;
+
+        UnregisterClientPayload payload;
+        payload.client_id = client_id;
+        // Only enqueue here: failed admission must not prevent local
+        // cleanup. Admitted entries use the existing required-entry retry
+        // policy.
+        auto result = manager->AppendAndPersist(OpType_UNREGISTER_CLIENT, "",
+                                                SerializeP2PPayload(payload),
+                                                /*sync=*/false);
+        if (!result) {
+            LOG_EVERY_N(WARNING, 100)
+                << "P2P client crash: failed to enqueue unregister oplog; "
+                   "continuing local cleanup without retry"
+                << ", client_id=" << client_id
+                << ", error=" << toString(result.error());
+        }
+    });
 }
 
 std::optional<P2PRouteEntry> P2PMasterService::GetRouteSnapshot(
@@ -412,6 +433,189 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
         return result.error();
     }
     return ErrorCode::OK;
+}
+
+uint64_t P2PMasterService::GetLatestOpLogSequenceId() const {
+    auto* manager = GetOpLogManager();
+    return manager ? manager->GetLastSequenceId() : 0;
+}
+
+tl::expected<uint64_t, ErrorCode>
+P2PMasterService::GetLocalCommittedOpLogSequenceId() const {
+    auto* manager = GetOpLogManager();
+    if (manager == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return manager->GetLocalCommittedSequenceId();
+}
+
+std::vector<std::string> P2PMasterService::ListSnapshotObjectKeys() const {
+    return ListRouteKeys();
+}
+
+std::vector<UUID> P2PMasterService::ListSnapshotClientIds() const {
+    auto clients = client_manager_->GetAllClients();
+    std::vector<UUID> ids;
+    ids.reserve(clients.size());
+    for (const auto& client : clients) {
+        ids.push_back(client->get_client_id());
+    }
+    return ids;
+}
+
+std::optional<P2PStandbyRouteEntry> P2PMasterService::GetSnapshotObjectMetadata(
+    const std::string& key) const {
+    auto route = GetRouteSnapshot(key);
+    if (!route) {
+        return std::nullopt;
+    }
+
+    P2PStandbyRouteEntry snapshot_route;
+    snapshot_route.object_size = route->object_size;
+    snapshot_route.locations = std::move(route->locations);
+    snapshot_route.last_sequence_id = GetLatestOpLogSequenceId();
+    return snapshot_route;
+}
+
+std::optional<P2PStandbyClientInfo> P2PMasterService::GetSnapshotClientInfo(
+    const UUID& client_id) const {
+    auto client = client_manager_->GetClient(client_id);
+    if (!client) {
+        return std::nullopt;
+    }
+    auto segments = client->GetSegments();
+    if (!segments.has_value()) {
+        LOG(WARNING) << "P2PMasterService: failed to list client segments "
+                        "for snapshot"
+                     << ", client_id=" << client_id
+                     << ", error=" << toString(segments.error());
+        return std::nullopt;
+    }
+
+    P2PStandbyClientInfo info;
+    info.client_id = client_id;
+    info.ip_address = client->get_ip_address();
+    info.rpc_port = client->get_rpc_port();
+    info.segments = std::move(segments.value());
+    return info;
+}
+
+P2PStandbyMetadataStore::ExportedMetadata
+P2PMasterService::ExportMetadataForStandby() const {
+    P2PStandbyMetadataStore::ExportedMetadata exported;
+
+    const auto client_ids = ListSnapshotClientIds();
+    exported.clients.reserve(client_ids.size());
+    for (const auto& client_id : client_ids) {
+        auto info = GetSnapshotClientInfo(client_id);
+        if (!info.has_value()) {
+            LOG(WARNING) << "P2PMasterService: skip client while exporting "
+                            "standby handoff"
+                         << ", client_id=" << client_id;
+            continue;
+        }
+        exported.clients.emplace(client_id, std::move(info.value()));
+    }
+
+    const auto object_keys = ListSnapshotObjectKeys();
+    exported.routes.reserve(object_keys.size());
+    for (const auto& key : object_keys) {
+        auto route = GetSnapshotObjectMetadata(key);
+        if (!route.has_value()) {
+            VLOG(2) << "P2PMasterService: skip route while exporting standby "
+                       "handoff"
+                    << ", key=" << key;
+            continue;
+        }
+        exported.routes.emplace(key, std::move(route.value()));
+    }
+
+    LOG(INFO) << "P2PMasterService: exported standby handoff metadata"
+              << ", routes=" << exported.routes.size()
+              << ", clients=" << exported.clients.size()
+              << ", last_sequence_id=" << GetLatestOpLogSequenceId();
+    return exported;
+}
+
+tl::expected<P2PStandbyMetadataStore::ExportedMetadata, ErrorCode>
+P2PMasterService::ExportLocalCommittedMetadataForStandby(
+    uint64_t local_committed_sequence_id) const {
+    auto* manager = GetOpLogManager();
+    if (manager == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto entries =
+        manager->GetBufferedEntriesAfter(local_committed_sequence_id);
+    if (!entries.has_value()) {
+        return tl::make_unexpected(entries.error());
+    }
+
+    P2PStandbyMetadataStore rollback_store;
+    rollback_store.RestoreMetadata(ExportMetadataForStandby());
+    size_t rolled_back_entries = 0;
+    for (auto it = entries->rbegin(); it != entries->rend(); ++it) {
+        const auto& entry = *it;
+        if (entry.op_type == OpType_PUBLISH_ROUTE) {
+            PublishRoutePayload payload;
+            if (!DeserializeP2PPayload(entry.payload, payload)) {
+                LOG(ERROR) << "P2PMasterService: failed to rollback "
+                              "uncommitted PUBLISH_ROUTE"
+                           << ", sequence_id=" << entry.sequence_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            rollback_store.WithdrawRoute(
+                payload.object_key, {payload.client_id, payload.segment_id});
+            ++rolled_back_entries;
+        } else if (entry.op_type == OpType_REGISTER_CLIENT) {
+            RegisterClientPayload payload;
+            if (!DeserializeP2PPayload(entry.payload, payload)) {
+                LOG(ERROR) << "P2PMasterService: failed to rollback "
+                              "uncommitted REGISTER_CLIENT"
+                           << ", sequence_id=" << entry.sequence_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            rollback_store.UnregisterClient(payload.client_id);
+            ++rolled_back_entries;
+        } else if (entry.op_type == OpType_MOUNT_SEGMENT) {
+            MountSegmentPayload payload;
+            if (!DeserializeP2PPayload(entry.payload, payload)) {
+                LOG(ERROR) << "P2PMasterService: failed to rollback "
+                              "uncommitted MOUNT_SEGMENT"
+                           << ", sequence_id=" << entry.sequence_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            rollback_store.UnmountSegment(
+                {payload.client_id, payload.segment.id});
+            ++rolled_back_entries;
+        } else {
+            // Delete-like P2P OpLog entries do not carry pre-image metadata,
+            // so exporting a guessed rollback state is unsafe. Fall back to the
+            // regular snapshot path instead.
+            LOG(WARNING) << "P2PMasterService: cannot rollback uncommitted "
+                            "P2P OpLog entry for standby handoff"
+                         << ", sequence_id=" << entry.sequence_id
+                         << ", op_type=" << static_cast<int>(entry.op_type)
+                         << ", local_committed_sequence_id="
+                         << local_committed_sequence_id;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    auto exported = rollback_store.ExportMetadata();
+    for (auto& [key, route] : exported.routes) {
+        if (route.last_sequence_id > local_committed_sequence_id) {
+            route.last_sequence_id = local_committed_sequence_id;
+        }
+    }
+
+    LOG(INFO) << "P2PMasterService: exported local-committed standby handoff "
+                 "metadata"
+              << ", local_committed_sequence_id=" << local_committed_sequence_id
+              << ", rolled_back_entries=" << rolled_back_entries
+              << ", clients=" << exported.clients.size()
+              << ", routes=" << exported.routes.size();
+    return exported;
 }
 
 auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
@@ -1075,15 +1279,31 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    if (last_applied_sequence_id > 0) {
-        if (auto* manager = GetOpLogManager()) {
-            manager->SetInitialSequenceId(last_applied_sequence_id);
-        } else {
-            LOG(WARNING)
-                << "RestoreFromStandbyMetadata: cannot set initial OpLog "
-                   "sequence without OpLogManager"
-                << ", last_applied_sequence_id=" << last_applied_sequence_id;
+    // Even an empty standby may be behind an existing Redis latest watermark.
+    // Seed the allocator before restoring metadata or admitting new writes.
+    if (auto* manager = GetOpLogManager()) {
+        auto err = manager->SetInitialSequenceId(last_applied_sequence_id);
+        if (err != ErrorCode::OK) {
+            HAMetricManager::instance().inc_promotion_restore_failures();
+            LOG(ERROR) << "RestoreFromStandbyMetadata: OpLog sequence "
+                          "initialization failed"
+                       << ", last_applied_sequence_id="
+                       << last_applied_sequence_id
+                       << ", error=" << toString(err);
+            return err;
         }
+        if (manager->GetLastSequenceId() > last_applied_sequence_id) {
+            LOG(WARNING)
+                << "RestoreFromStandbyMetadata: promoted with incomplete "
+                   "OpLog catch-up"
+                << ", applied=" << last_applied_sequence_id
+                << ", latest=" << manager->GetLastSequenceId();
+        }
+    } else if (last_applied_sequence_id > 0) {
+        LOG(WARNING) << "RestoreFromStandbyMetadata: cannot set initial OpLog "
+                        "sequence without OpLogManager"
+                     << ", last_applied_sequence_id="
+                     << last_applied_sequence_id;
     }
 
     size_t restored_clients = 0;

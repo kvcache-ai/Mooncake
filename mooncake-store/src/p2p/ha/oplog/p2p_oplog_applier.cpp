@@ -14,14 +14,17 @@ namespace mooncake {
 
 P2POpLogApplier::P2POpLogApplier(P2PStandbyMetadataStore* p2p_store,
                                  const std::string& cluster_id,
-                                 OpLogStore* oplog_store)
+                                 OpLogStore* oplog_store,
+                                 size_t max_pending_entries)
     : cluster_id_(cluster_id),
       oplog_store_(oplog_store),
+      max_pending_entries_(max_pending_entries),
       p2p_store_(p2p_store) {
+    CHECK_GT(max_pending_entries_, 0);
     HAMetricManager::instance().set_standby_degraded(false);
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for OpLogApplier: '" << cluster_id_
-                   << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
+                   << "'. Allowed chars: [A-Za-z0-9_.-/], max_len=128.";
     }
 
     if (p2p_store_ == nullptr) {
@@ -42,6 +45,8 @@ bool P2POpLogApplier::ApplyOpLogEntryInternal(const OpLogEntry& entry) {
         return ApplyRegisterClient(entry);
     } else if (entry.op_type == OpType_UNREGISTER_CLIENT) {
         return ApplyUnregisterClient(entry);
+    } else if (entry.op_type == OpType_NOOP) {
+        return true;
     }
     LOG(ERROR) << "P2POpLogApplier: unsupported operation"
                << ", op_type=" << static_cast<int>(entry.op_type)
@@ -229,12 +234,14 @@ bool P2POpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         // Future entry - store into pending, wait for the gap to be filled.
         std::lock_guard<std::mutex> lock(pending_mutex_);
 
-        if (pending_entries_.size() >=
-            static_cast<size_t>(kMaxPendingEntries)) {
-            LOG(ERROR) << "OpLogApplier: too many pending entries ("
-                       << pending_entries_.size()
-                       << "), discarding entry sequence_id="
-                       << entry.sequence_id << ", key=" << entry.object_key;
+        if (pending_entries_.size() >= max_pending_entries_) {
+            LOG(ERROR) << "OpLogApplier: pending full, rejected entry "
+                          "sequence_id="
+                       << entry.sequence_id
+                       << ", expected_sequence_id=" << expected
+                       << ", key=" << entry.object_key
+                       << ", pending=" << pending_entries_.size()
+                       << ", capacity=" << max_pending_entries_;
             return false;
         }
 
@@ -260,7 +267,11 @@ bool P2POpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     expected_sequence_id_.store(entry.sequence_id + 1);
 
     // Update metrics
-    HAMetricManager::instance().inc_oplog_applied_entries();
+    if (entry.op_type == OpType_NOOP) {
+        HAMetricManager::instance().inc_oplog_applied_noop_entries();
+    } else {
+        HAMetricManager::instance().inc_oplog_applied_entries();
+    }
     HAMetricManager::instance().set_oplog_applied_sequence_id(
         static_cast<int64_t>(entry.sequence_id));
 
@@ -318,7 +329,7 @@ size_t P2POpLogApplier::ApplyOpLogEntries(
     const std::vector<OpLogEntry>& entries) {
     size_t applied_count = 0;
     for (const auto& entry : entries) {
-        if (ApplyOpLogEntry(entry)) {
+        if (ApplyOpLogEntry(entry) && entry.op_type != OpType_NOOP) {
             applied_count++;
         }
     }
@@ -481,7 +492,11 @@ size_t P2POpLogApplier::ProcessPendingEntries() {
         }
 
         expected_sequence_id_.store(entry_copy.sequence_id + 1);
-        HAMetricManager::instance().inc_oplog_applied_entries();
+        if (entry_copy.op_type == OpType_NOOP) {
+            HAMetricManager::instance().inc_oplog_applied_noop_entries();
+        } else {
+            HAMetricManager::instance().inc_oplog_applied_entries();
+        }
         HAMetricManager::instance().set_oplog_applied_sequence_id(
             static_cast<int64_t>(entry_copy.sequence_id));
 

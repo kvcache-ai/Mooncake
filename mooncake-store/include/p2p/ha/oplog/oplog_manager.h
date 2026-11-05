@@ -59,6 +59,12 @@ class OpLogManager {
     // If not set, OpLog will only be stored in memory buffer.
     void SetOpLogStore(std::shared_ptr<OpLogStore> oplog_store);
 
+    // Close write admission and wake waiters without waiting for workers.
+    void RequestStopWriting();
+
+    // Request cancellation, clean up pending writes, and wait for workers.
+    void StopWriting();
+
     // Append a new entry and return the assigned sequence_id.
     // This is a best-effort (async) path: the entry is buffered in memory
     // and enqueued to etcd without waiting for persistence.
@@ -100,10 +106,19 @@ class OpLogManager {
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;
 
-    // Set the initial sequence ID (used when promoting Standby to Primary).
-    // This ensures the new Primary's OpLogManager continues from the correct
-    // sequence_id.
-    void SetInitialSequenceId(uint64_t sequence_id);
+    // Get the latest sequence id locally committed by this OpLog store
+    // instance.
+    tl::expected<uint64_t, ErrorCode> GetLocalCommittedSequenceId() const;
+
+    // Copy buffered entries after sequence_id. Returns OPLOG_ENTRY_NOT_FOUND
+    // if the bounded in-memory buffer can no longer cover the requested range.
+    tl::expected<std::vector<OpLogEntry>, ErrorCode> GetBufferedEntriesAfter(
+        uint64_t sequence_id) const;
+
+    // Initialize an unused manager above both the restored metadata sequence
+    // and the store's latest watermark. Reading latest must succeed before
+    // promotion can continue; this does not replay missing metadata changes.
+    ErrorCode SetInitialSequenceId(uint64_t sequence_id);
 
     // Current number of entries in the buffer.
     size_t GetEntryCount() const;

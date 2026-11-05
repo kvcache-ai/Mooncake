@@ -117,6 +117,9 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
     M().inc_oplog_best_effort_dropped();
     M().inc_promotion_skipped_replicas();
     M().inc_oplog_sync_batch_commits();
+    M().observe_oplog_redis_pipeline_batch_size(64);
+    M().inc_oplog_redis_pipeline_batch_failures();
+    M().inc_oplog_redis_pipeline_batch_retries();
 
     std::string text = M().serialize_metrics();
     EXPECT_FALSE(text.empty());
@@ -132,6 +135,12 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
               text.find("ha_promotion_skipped_replicas_total"));
     EXPECT_NE(std::string::npos,
               text.find("ha_oplog_sync_batch_commits_total"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_redis_pipeline_batch_size_bucket"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_redis_pipeline_batch_failures_total"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_redis_pipeline_batch_retries_total"));
     EXPECT_EQ(std::string::npos, text.find("ha_oplog_etcd_write"));
 }
 

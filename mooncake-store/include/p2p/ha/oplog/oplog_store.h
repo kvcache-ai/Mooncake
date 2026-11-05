@@ -1,6 +1,7 @@
 // mooncake-store/include/oplog_store.h
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -33,13 +34,10 @@ inline std::vector<uint64_t> FindMissingSequenceIds(
     return missing_sequence_ids;
 }
 
-// Normalize and validate cluster_id for OpLog key prefix construction.
-// Strips trailing slashes, then validates the remaining string.
-// Returns true if valid (or empty after normalization), false otherwise.
+// Validate cluster_id for OpLog key prefix construction.
+// Returns true if valid or empty; empty is later replaced by
+// DEFAULT_CLUSTER_ID.
 inline bool NormalizeAndValidateClusterId(std::string& cluster_id) {
-    while (!cluster_id.empty() && cluster_id.back() == '/') {
-        cluster_id.pop_back();
-    }
     return cluster_id.empty() || IsValidClusterIdComponent(cluster_id);
 }
 
@@ -52,6 +50,15 @@ class OpLogStore {
 
     // Write
     virtual ErrorCode WriteOpLog(const OpLogEntry& entry, bool sync = true) = 0;
+
+    // Close write admission and wake waiters without waiting for workers.
+    // Backends without an async stop keep their existing shutdown behavior.
+    virtual void RequestStopWriting() {}
+
+    // Request cancellation, clean up pending writes, and wait for workers.
+    // Must complete before exporting a demotion handoff or destroying the
+    // store.
+    virtual void StopWriting() {}
 
     // Read
     virtual ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) = 0;
@@ -70,12 +77,27 @@ class OpLogStore {
 
     // Sequence ID management
     virtual ErrorCode GetLatestSequenceId(uint64_t& sequence_id) = 0;
+    // Return the latest sequence this store instance has locally confirmed as
+    // committed. For single-writer/local backends this is equivalent to latest;
+    // shared backends may override it to avoid observing another writer's
+    // later progress.
+    virtual ErrorCode GetLocalCommittedSequenceId(uint64_t& sequence_id) {
+        return GetLatestSequenceId(sequence_id);
+    }
     virtual ErrorCode GetMaxSequenceId(uint64_t& sequence_id) = 0;
     virtual ErrorCode GetTrimmedSequenceId(uint64_t& sequence_id) {
         sequence_id = 0;
         return ErrorCode::OK;
     }
     virtual ErrorCode UpdateLatestSequenceId(uint64_t sequence_id) = 0;
+
+    // Advance a writer's local checkpoint after promotion. Backends with a
+    // persisted latest watermark may keep it unchanged and advance only their
+    // local state, then allow intentional holes up to this checkpoint.
+    virtual ErrorCode SetLocalCommittedSequenceId(uint64_t sequence_id) {
+        (void)sequence_id;
+        return ErrorCode::OK;
+    }
 
     // Snapshot
     virtual ErrorCode RecordSnapshotSequenceId(const std::string& snapshot_id,
@@ -90,8 +112,9 @@ class OpLogStore {
     // Each backend provides its own notifier (e.g., etcd watch, polling).
     // Returns nullptr if the backend does not support change notification.
     virtual std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
-        const std::string& cluster_id) {
+        const std::string& cluster_id, size_t poll_batch_size = 1000) {
         (void)cluster_id;
+        (void)poll_batch_size;
         return nullptr;
     }
 };

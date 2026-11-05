@@ -1,13 +1,16 @@
 // mooncake-store/include/ha/oplog/p2p_hot_standby_service.h
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,10 +36,14 @@ struct P2PHotStandbyConfig {
     std::string redis_password;
     int redis_db_index{0};
     int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
+    size_t oplog_pending_max_entries{1000};
+    size_t oplog_poll_batch_size{1000};
     int reconnect_initial_backoff_ms{100};
     int reconnect_max_backoff_ms{5000};
     uint16_t snapshot_service_port{0};
     std::string master_instance_id;
+    std::string local_master_endpoint;
+    std::string local_snapshot_endpoint;
     std::vector<std::string> snapshot_source_endpoints;
     uint32_t snapshot_chunk_size{256};
     int master_registry_ttl_sec{10};
@@ -54,6 +61,23 @@ struct P2PStandbySyncStatus {
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
 };
+
+#ifdef STORE_USE_REDIS
+struct P2PSnapshotSourceSelection {
+    std::vector<std::string> endpoints;
+    bool used_primary_fallback{false};
+};
+
+P2PSnapshotSourceSelection SelectP2PSnapshotSources(
+    std::vector<RedisMasterRegistryEntry> masters,
+    const std::string& self_instance_id,
+    const std::string& self_master_endpoint,
+    const std::string& self_snapshot_endpoint, uint64_t trimmed_sequence_id);
+#endif
+
+namespace test {
+struct P2PHotStandbyServiceTestAccess;
+}  // namespace test
 
 // NOTE: P2PHotStandbyService intentionally does not inherit from the
 // centralized HotStandbyService. The centralized service owns centralized
@@ -74,7 +98,9 @@ class P2PHotStandbyService {
     P2PHotStandbyService(const P2PHotStandbyService&) = delete;
     P2PHotStandbyService& operator=(const P2PHotStandbyService&) = delete;
 
-    ErrorCode Start(uint64_t baseline_sequence_id = 0);
+    ErrorCode Start(uint64_t baseline_sequence_id = 0,
+                    std::optional<P2PStandbyMetadataStore::ExportedMetadata>
+                        initial_metadata = std::nullopt);
     void Stop();
     // TODO(P2P HA): Expose force promotion only through an explicit operator
     // CLI/RPC that reports the failed sequence/type/reason and requires
@@ -98,6 +124,8 @@ class P2PHotStandbyService {
     bool IsReadyForSnapshot() const;
 
    private:
+    friend struct mooncake::test::P2PHotStandbyServiceTestAccess;
+
     ErrorCode StartOplogFollowingLocked(
         uint64_t baseline_sequence_id,
         std::unique_ptr<OpLogStore> prepared_reader_store = nullptr);
@@ -108,7 +136,6 @@ class P2PHotStandbyService {
     void OnWatcherEvent(StandbyEvent event);
     void StartRecoveryWorker();
     void StopRecoveryWorker();
-    void RestoreRecoveryWorker();
     void RequestRecovery();
     void RecoveryLoop();
     ErrorCode BootstrapFromSnapshotSources(
@@ -142,7 +169,8 @@ class P2PHotStandbyService {
     std::condition_variable recovery_cv_;
     std::thread recovery_thread_;
     bool recovery_requested_{false};
-    bool recovery_stopping_{false};
+    // Writes still hold recovery_mutex_ to synchronize with CV waiters.
+    std::atomic<bool> recovery_stopping_{false};
     std::atomic<bool> snapshot_resync_required_{false};
 
     std::unique_ptr<P2PStandbySnapshotService> snapshot_service_;

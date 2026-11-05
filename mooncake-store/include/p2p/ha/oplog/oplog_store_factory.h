@@ -6,6 +6,7 @@
 #include <string>
 
 #include "p2p/ha/oplog/oplog_store.h"
+#include "p2p/ha/oplog/redis_oplog_limits.h"
 
 namespace mooncake {
 
@@ -78,7 +79,8 @@ class OpLogStoreFactory {
         const std::string& password = "", const std::string& username = "",
         int db_index = 0, size_t async_queue_max_entries = 100000,
         const std::string& async_queue_overflow_mode = "reject",
-        size_t best_effort_max_retries = 3);
+        size_t best_effort_max_retries = 3,
+        size_t async_write_batch_size = kDefaultRedisOpLogWriteBatchSize);
 };
 
 }  // namespace mooncake

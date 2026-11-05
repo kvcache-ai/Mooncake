@@ -1,10 +1,12 @@
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/common/p2p_types.h"
+#include "mock_oplog_store.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -92,21 +94,79 @@ TEST_F(OpLogManagerTest, SetInitialSequenceIdOnEmptyManager) {
     EXPECT_EQ(0u, M().GetLastSequenceId());
     EXPECT_EQ(0u, M().GetEntryCount());
 
-    M().SetInitialSequenceId(100);
+    ASSERT_EQ(M().SetInitialSequenceId(100), ErrorCode::OK);
     EXPECT_EQ(100u, M().GetLastSequenceId());
 
-    // The first appended entry should have sequence_id 101
-    uint64_t id = M().Append(OpType::PUT_END, "key", "value");
+    // The first appended entry should have sequence_id 101.
+    const uint64_t id = M().Append(OpType::PUT_END, "key", "value");
     EXPECT_EQ(101u, id);
 }
 
-TEST_F(OpLogManagerTest, SetInitialSequenceIdIgnoredWhenNotEmpty) {
-    uint64_t id1 = M().Append(OpType::PUT_END, "key1", "value1");
+TEST_F(OpLogManagerTest, SetInitialSequenceIdRejectsUsedManager) {
+    const uint64_t id1 = M().Append(OpType::PUT_END, "key1", "value1");
     EXPECT_EQ(id1, M().GetLastSequenceId());
 
-    // Setting initial sequence id on a non-empty manager should be ignored
-    M().SetInitialSequenceId(500);
+    // Reject reinitialization without changing allocated sequence IDs.
+    EXPECT_EQ(M().SetInitialSequenceId(500), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(id1, M().GetLastSequenceId());
+}
+
+TEST_F(OpLogManagerTest, InitialSequenceUsesBothWatermarks) {
+    for (const uint64_t restored : {0, 50, 100, 200}) {
+        OpLogManager manager;
+        auto store = std::make_shared<MockOpLogStore>();
+        ASSERT_EQ(store->UpdateLatestSequenceId(100), ErrorCode::OK);
+        manager.SetOpLogStore(store);
+        ASSERT_EQ(manager.SetInitialSequenceId(restored), ErrorCode::OK);
+
+        const uint64_t expected = std::max(restored, uint64_t{100}) + 1;
+        const auto entry = manager.AllocateEntry(OpType::PUT_END, "new-key");
+        EXPECT_EQ(entry.sequence_id, expected);
+    }
+}
+
+TEST_F(OpLogManagerTest, InitialSequenceRejectsExhaustionWithoutMutation) {
+    auto store = std::make_shared<MockOpLogStore>();
+    M().SetOpLogStore(store);
+    const auto maximum = std::numeric_limits<uint64_t>::max();
+    EXPECT_EQ(M().SetInitialSequenceId(maximum), ErrorCode::INVALID_PARAMS);
+    ASSERT_EQ(store->UpdateLatestSequenceId(maximum), ErrorCode::OK);
+    EXPECT_EQ(M().SetInitialSequenceId(0), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(M().GetLastSequenceId(), 0);
+    EXPECT_EQ(M().GetEntryCount(), 0);
+}
+
+TEST_F(OpLogManagerTest, InitialLatestReadDoesNotBlockStopWriting) {
+    class BlockingLatestStore : public MockOpLogStore {
+       public:
+        std::promise<void> entered;
+        std::promise<void> release;
+        ErrorCode GetLocalCommittedSequenceId(uint64_t& sequence_id) override {
+            sequence_id = 200;
+            return ErrorCode::OK;
+        }
+        ErrorCode GetLatestSequenceId(uint64_t& sequence_id) override {
+            sequence_id = 200;
+            entered.set_value();
+            release.get_future().wait();
+            return ErrorCode::OK;
+        }
+    };
+
+    auto store = std::make_shared<BlockingLatestStore>();
+    auto entered = store->entered.get_future();
+    M().SetOpLogStore(store);
+    auto initialize = std::async(std::launch::async,
+                                 [&] { return M().SetInitialSequenceId(100); });
+    ASSERT_EQ(entered.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    auto stop =
+        std::async(std::launch::async, [&] { M().RequestStopWriting(); });
+    ASSERT_EQ(stop.wait_for(std::chrono::milliseconds(200)),
+              std::future_status::ready);
+    store->release.set_value();
+    stop.get();
+    EXPECT_EQ(initialize.get(), ErrorCode::OK);
 }
 
 // ========== Checksum tests ==========
