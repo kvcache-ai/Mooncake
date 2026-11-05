@@ -518,6 +518,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
                               TentMetrics::StreamEvent::Queued);
     metrics.recordStreamAttempt(
         HP_TCP, Request::WRITE, TentMetrics::StreamOutcome::Success, 45.0);
+    metrics.recordStreamFailure(
+        HP_TCP, Request::WRITE, TentMetrics::StreamFailurePhase::Io,
+        TentMetrics::StreamFailureReason::ConnectionReset);
     metrics.recordStreamQueueWait(TCP, Request::READ, 12.0);
     metrics.recordStreamQueueDepth(TCP, 1);
     metrics.recordStreamBusyWorkers(TCP, 1);
@@ -554,7 +557,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 82>
+    const std::array<std::pair<std::string_view, std::string_view>, 83>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -587,6 +590,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_rdma_qp_transition_failures_total", "counter"},
             {"tent_rdma_notification_events_total", "counter"},
             {"tent_stream_events_total", "counter"},
+            {"tent_stream_failures_total", "counter"},
             {"tent_protocol_errors_total", "counter"},
             {"tent_tcp_retransmissions_total", "counter"},
             {"tent_shm_mapping_events_total", "counter"},
@@ -750,6 +754,25 @@ TEST_F(MetricsRecordingTest, RpcRetryRecordsEachConnectionAttempt) {
               2);
 }
 
+TEST_F(MetricsRecordingTest, TcpRpcConnectFailureUsesBoundedReason) {
+    const uint16_t unused_port = getFreeTcpPort();
+    ASSERT_NE(unused_port, 0);
+
+    const auto before = MetricsSnapshot(TentMetrics::instance());
+    CoroRpcAgent client;
+    std::string response;
+    EXPECT_FALSE(client
+                     .call("127.0.0.1:" + std::to_string(unused_port), SendData,
+                           "", response)
+                     .ok());
+    const auto after = MetricsSnapshot(TentMetrics::instance());
+
+    const std::string series =
+        "tent_stream_failures_total{transport=\"tcp\",operation=\"write\","
+        "phase=\"connect\",reason=\"unavailable\"}";
+    EXPECT_EQ(after.series(series) - before.series(series), 1);
+}
+
 TEST_F(MetricsRecordingTest, RdmaDataPathSignalsUseBoundedLabels) {
     auto& metrics = TentMetrics::instance();
     auto before = MetricsSnapshot(metrics);
@@ -886,6 +909,33 @@ TEST_F(MetricsRecordingTest, StreamSignalsSeparateQueueAndPhysicalAttempts) {
     EXPECT_EQ(after.histogramCount("tent_stream_queue_wait_us") -
                   before.histogramCount("tent_stream_queue_wait_us"),
               1);
+}
+
+TEST_F(MetricsRecordingTest, StreamFailuresKeepBoundedSocketCauses) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    metrics.recordStreamFailure(HP_TCP, Request::READ,
+                                TentMetrics::StreamFailurePhase::Io,
+                                TentMetrics::StreamFailureReason::Eof);
+    metrics.recordStreamFailure(TCP, Request::WRITE,
+                                TentMetrics::StreamFailurePhase::Connect,
+                                TentMetrics::StreamFailureReason::Unavailable);
+
+    const auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_stream_failures_total{transport=\"hp_tcp\","
+                     "operation=\"read\",phase=\"io\",reason=\"eof\"}") -
+            before.series("tent_stream_failures_total{transport=\"hp_tcp\","
+                          "operation=\"read\",phase=\"io\",reason=\"eof\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_stream_failures_total{transport=\"tcp\",operation="
+                     "\"write\",phase=\"connect\",reason=\"unavailable\"}") -
+            before.series(
+                "tent_stream_failures_total{transport=\"tcp\",operation="
+                "\"write\",phase=\"connect\",reason=\"unavailable\"}"),
+        1);
 }
 
 TEST_F(MetricsRecordingTest, NetworkAndProtocolSignalsUseBoundedLabels) {
@@ -2625,6 +2675,7 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_rdma_qp_transition_failures_total"));
     EXPECT_TRUE(json.contains("tent_rdma_notification_events_total"));
     EXPECT_TRUE(json.contains("tent_stream_events_total"));
+    EXPECT_TRUE(json.contains("tent_stream_failures_total"));
     EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));
     EXPECT_TRUE(json.contains("tent_stream_queue_wait_us"));
     EXPECT_TRUE(json.contains("tent_protocol_errors_total"));

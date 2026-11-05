@@ -17,6 +17,7 @@
 #include <async_simple/executors/SimpleExecutor.h>
 
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 
 #include "tent/metrics/tent_metrics.h"
@@ -74,6 +75,36 @@ TentMetrics::RpcMethod rpcMethodForFuncId(int func_id) {
         default:
             return TentMetrics::RpcMethod::Unknown;
     }
+}
+
+std::optional<Request::OpCode> streamOperationForFuncId(int func_id) {
+    if (func_id == SendData) return Request::WRITE;
+    if (func_id == RecvData) return Request::READ;
+    return std::nullopt;
+}
+
+TentMetrics::StreamFailureReason rpcStreamFailureReason(coro_rpc::errc error) {
+    switch (error) {
+        case coro_rpc::errc::timed_out:
+            return TentMetrics::StreamFailureReason::Timeout;
+        case coro_rpc::errc::operation_canceled:
+            return TentMetrics::StreamFailureReason::OperationAborted;
+        case coro_rpc::errc::io_error:
+        case coro_rpc::errc::not_connected:
+            // YLT intentionally collapses the native socket errno at this
+            // boundary. Preserve that uncertainty instead of guessing.
+            return TentMetrics::StreamFailureReason::Unavailable;
+        default:
+            return TentMetrics::StreamFailureReason::Other;
+    }
+}
+
+void recordRpcStreamFailure(int func_id, TentMetrics::StreamFailurePhase phase,
+                            coro_rpc::errc error) {
+    const auto operation = streamOperationForFuncId(func_id);
+    if (!operation.has_value()) return;
+    TentMetrics::instance().recordStreamFailure(
+        TransportType::TCP, *operation, phase, rpcStreamFailureReason(error));
 }
 
 void recordRpcAttempt(TentMetrics::RpcMethod method,
@@ -320,6 +351,9 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
             if (conn_result.val() != 0) {
                 lease.broken = true;
 #if TENT_METRICS_ENABLED
+                recordRpcStreamFailure(func_id,
+                                       TentMetrics::StreamFailurePhase::Connect,
+                                       conn_result.ec);
                 recordRpcAttempt(metric_method,
                                  TentMetrics::RpcOutcome::ConnectionError,
                                  attempt_started);
@@ -342,6 +376,11 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         if (!call_result.has_value()) {
             lease.broken = true;
 #if TENT_METRICS_ENABLED
+            if (!peerAnswered(call_result.error().code)) {
+                recordRpcStreamFailure(func_id,
+                                       TentMetrics::StreamFailurePhase::Io,
+                                       call_result.error().code.ec);
+            }
             recordRpcAttempt(metric_method, TentMetrics::RpcOutcome::RpcError,
                              attempt_started);
 #endif

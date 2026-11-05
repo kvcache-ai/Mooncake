@@ -385,6 +385,20 @@ class TentMetrics {
         Canceled,
         RemoteError,
     };
+    enum class StreamFailurePhase { Resolve, Connect, Io };
+    enum class StreamFailureReason {
+        Timeout,
+        ConnectionRefused,
+        NetworkUnreachable,
+        HostUnreachable,
+        HostNotFound,
+        ConnectionReset,
+        Eof,
+        BrokenPipe,
+        OperationAborted,
+        Unavailable,
+        Other,
+    };
 
     // Stream metrics cover TCP and HP-TCP. A queued event belongs to a
     // logical task for TCP and a physical slice operation for HP-TCP; attempt
@@ -396,6 +410,12 @@ class TentMetrics {
                              double latency_us);
     void recordStreamQueueWait(TransportType transport,
                                Request::OpCode operation, double latency_us);
+    // Records the bounded cause available at the socket/RPC boundary. Native
+    // numeric errno values stay in logs; dependencies that collapse errno to
+    // a generic connection error use Unavailable instead of guessing.
+    void recordStreamFailure(TransportType transport, Request::OpCode operation,
+                             StreamFailurePhase phase,
+                             StreamFailureReason reason);
     enum class StreamConnectionRole { Client, Server };
     enum class ProtocolErrorKind {
         InvalidSize,
@@ -687,6 +707,8 @@ class TentMetrics {
         "transport", "operation", "event"};
     static inline const std::array<std::string, 3> kStreamAttemptLabels{
         "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 4> kStreamFailureLabels{
+        "transport", "operation", "phase", "reason"};
     static inline const std::array<std::string, 2> kStreamConnectionLabels{
         "transport", "role"};
     static inline const std::array<std::string, 2> kProtocolErrorLabels{
@@ -982,6 +1004,10 @@ class TentMetrics {
         "tent_stream_events_total",
         "TCP and HP-TCP queue, attempt, connection, retry and terminal events",
         kStreamEventLabels, kStreamEventDomain};
+    ylt::metric::basic_dynamic_counter<int64_t, 4> stream_failures_total_{
+        "tent_stream_failures_total",
+        "TCP and HP-TCP failures by bounded connection phase and reason",
+        kStreamFailureLabels};
     metrics::CachedDynamicCounter<2> protocol_errors_total_{
         "tent_protocol_errors_total",
         "Rejected or inconsistent transport protocol frames",

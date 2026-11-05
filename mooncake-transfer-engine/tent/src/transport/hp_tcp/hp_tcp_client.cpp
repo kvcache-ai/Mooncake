@@ -29,6 +29,28 @@ bool isPeerClosedError(const std::error_code& error) {
            error == asio::error::broken_pipe;
 }
 
+TentMetrics::StreamFailureReason streamFailureReason(
+    const std::error_code& error) {
+    if (error == asio::error::timed_out)
+        return TentMetrics::StreamFailureReason::Timeout;
+    if (error == asio::error::connection_refused)
+        return TentMetrics::StreamFailureReason::ConnectionRefused;
+    if (error == asio::error::network_unreachable)
+        return TentMetrics::StreamFailureReason::NetworkUnreachable;
+    if (error == asio::error::host_unreachable)
+        return TentMetrics::StreamFailureReason::HostUnreachable;
+    if (error == asio::error::host_not_found)
+        return TentMetrics::StreamFailureReason::HostNotFound;
+    if (error == asio::error::connection_reset)
+        return TentMetrics::StreamFailureReason::ConnectionReset;
+    if (error == asio::error::eof) return TentMetrics::StreamFailureReason::Eof;
+    if (error == asio::error::broken_pipe)
+        return TentMetrics::StreamFailureReason::BrokenPipe;
+    if (error == asio::error::operation_aborted)
+        return TentMetrics::StreamFailureReason::OperationAborted;
+    return TentMetrics::StreamFailureReason::Other;
+}
+
 TentMetrics::ProtocolErrorKind protocolErrorKind(
     HighPerformanceTcpFrameError error) {
     switch (error) {
@@ -232,6 +254,11 @@ class HighPerformanceTcpClient::Lane
                     if (error) {
                         if (error == asio::error::host_not_found) {
 #if TENT_METRICS_ENABLED
+                            TentMetrics::instance().recordStreamFailure(
+                                TransportType::HP_TCP,
+                                streamOperation(self->current_->opcode),
+                                TentMetrics::StreamFailurePhase::Resolve,
+                                streamFailureReason(error));
                             self->attempt_outcome_ =
                                 TentMetrics::StreamOutcome::RemoteError;
 #endif
@@ -239,7 +266,9 @@ class HighPerformanceTcpClient::Lane
                                 FAILED, 0, false,
                                 HighPerformanceTcpStatus::kStaleRegistration);
                         } else {
-                            self->finishConnectionError(error);
+                            self->finishConnectionError(
+                                error,
+                                TentMetrics::StreamFailurePhase::Resolve);
                         }
                         return;
                     }
@@ -286,6 +315,11 @@ class HighPerformanceTcpClient::Lane
                 if (error) {
                     if (error == asio::error::connection_refused) {
 #if TENT_METRICS_ENABLED
+                        TentMetrics::instance().recordStreamFailure(
+                            TransportType::HP_TCP,
+                            streamOperation(self->current_->opcode),
+                            TentMetrics::StreamFailurePhase::Connect,
+                            streamFailureReason(error));
                         self->attempt_outcome_ =
                             TentMetrics::StreamOutcome::ConnectionError;
 #endif
@@ -574,8 +608,13 @@ class HighPerformanceTcpClient::Lane
         finishCurrent(FAILED, 0, false, status);
     }
 
-    void finishConnectionError(const std::error_code&) {
+    void finishConnectionError(const std::error_code& error,
+                               TentMetrics::StreamFailurePhase phase =
+                                   TentMetrics::StreamFailurePhase::Connect) {
 #if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordStreamFailure(
+            TransportType::HP_TCP, streamOperation(current_->opcode), phase,
+            streamFailureReason(error));
         attempt_outcome_ = TentMetrics::StreamOutcome::ConnectionError;
 #endif
         const TransferStatusEnum terminal = forced_terminal_.value_or(FAILED);
@@ -584,6 +623,9 @@ class HighPerformanceTcpClient::Lane
 
     void finishIoError(const std::error_code& error) {
 #if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordStreamFailure(
+            TransportType::HP_TCP, streamOperation(current_->opcode),
+            TentMetrics::StreamFailurePhase::Io, streamFailureReason(error));
         attempt_outcome_ = isPeerClosedError(error)
                                ? TentMetrics::StreamOutcome::PeerClosed
                                : TentMetrics::StreamOutcome::IoError;

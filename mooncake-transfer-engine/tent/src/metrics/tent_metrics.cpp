@@ -593,6 +593,46 @@ const char* streamOutcomeName(TentMetrics::StreamOutcome outcome) {
     return "unknown";
 }
 
+const char* streamFailurePhaseName(TentMetrics::StreamFailurePhase phase) {
+    switch (phase) {
+        case TentMetrics::StreamFailurePhase::Resolve:
+            return "resolve";
+        case TentMetrics::StreamFailurePhase::Connect:
+            return "connect";
+        case TentMetrics::StreamFailurePhase::Io:
+            return "io";
+    }
+    return "unknown";
+}
+
+const char* streamFailureReasonName(TentMetrics::StreamFailureReason reason) {
+    switch (reason) {
+        case TentMetrics::StreamFailureReason::Timeout:
+            return "timeout";
+        case TentMetrics::StreamFailureReason::ConnectionRefused:
+            return "connection_refused";
+        case TentMetrics::StreamFailureReason::NetworkUnreachable:
+            return "network_unreachable";
+        case TentMetrics::StreamFailureReason::HostUnreachable:
+            return "host_unreachable";
+        case TentMetrics::StreamFailureReason::HostNotFound:
+            return "host_not_found";
+        case TentMetrics::StreamFailureReason::ConnectionReset:
+            return "connection_reset";
+        case TentMetrics::StreamFailureReason::Eof:
+            return "eof";
+        case TentMetrics::StreamFailureReason::BrokenPipe:
+            return "broken_pipe";
+        case TentMetrics::StreamFailureReason::OperationAborted:
+            return "operation_aborted";
+        case TentMetrics::StreamFailureReason::Unavailable:
+            return "unavailable";
+        case TentMetrics::StreamFailureReason::Other:
+            return "other";
+    }
+    return "other";
+}
+
 const char* streamConnectionRoleName(TentMetrics::StreamConnectionRole role) {
     switch (role) {
         case TentMetrics::StreamConnectionRole::Client:
@@ -1058,6 +1098,7 @@ void TentMetrics::registerMetrics() {
         &rdma_qp_transition_failures_total_,
         &rdma_notification_events_total_,
         &stream_events_total_,
+        &stream_failures_total_,
         &protocol_errors_total_,
         &tcp_retransmissions_total_,
         &shm_mapping_events_total_,
@@ -1519,6 +1560,17 @@ void TentMetrics::recordStreamQueueWait(TransportType transport,
                                               operationName(operation)};
         },
         static_cast<int64_t>(latency_us));
+}
+
+void TentMetrics::recordStreamFailure(TransportType transport,
+                                      Request::OpCode operation,
+                                      StreamFailurePhase phase,
+                                      StreamFailureReason reason) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    stream_failures_total_.inc(std::array<std::string, 4>{
+        transportTypeName(transport), operationName(operation),
+        streamFailurePhaseName(phase), streamFailureReasonName(reason)});
 }
 
 void TentMetrics::recordStreamQueueDepth(TransportType transport,
@@ -2370,6 +2422,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&rdma_notification_events_total_);
             root[stream_events_total_.str_name()] =
                 sumCounterValues(&stream_events_total_);
+            root[stream_failures_total_.str_name()] =
+                sumCounterValues(&stream_failures_total_);
             root[protocol_errors_total_.str_name()] =
                 sumCounterValues(&protocol_errors_total_);
             root[tcp_retransmissions_total_.str_name()] =
@@ -2628,6 +2682,9 @@ void TentMetrics::recordStreamAttempt(TransportType, Request::OpCode,
                                       StreamOutcome, double) {}
 void TentMetrics::recordStreamQueueWait(TransportType, Request::OpCode,
                                         double) {}
+void TentMetrics::recordStreamFailure(TransportType, Request::OpCode,
+                                      StreamFailurePhase, StreamFailureReason) {
+}
 void TentMetrics::recordStreamQueueDepth(TransportType, int64_t) {}
 void TentMetrics::recordStreamBusyWorkers(TransportType, int64_t) {}
 void TentMetrics::recordStreamAdmission(TransportType, int64_t, int64_t) {}

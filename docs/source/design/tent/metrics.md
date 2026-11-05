@@ -392,6 +392,7 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_rdma_qp_transition_failures_total` | Counter | `qp_type`, `transition` | Failed data or notification QP state transitions |
 | `tent_rdma_notification_events_total` | Counter | `event` | Notification receive posting/delivery, send posting/completion and channel failures |
 | `tent_stream_events_total` | Counter | `transport`, `operation`, `event` | TCP and HP-TCP queue, physical attempt, connection, retry and terminal events |
+| `tent_stream_failures_total` | Counter | `transport`, `operation`, `phase`, `reason` | TCP and HP-TCP socket/RPC failures classified by bounded connection phase and cause |
 | `tent_protocol_errors_total` | Counter | `transport`, `kind` | Malformed or inconsistent HP-TCP frames, including header fields, request IDs, and committed lengths |
 | `tent_tcp_retransmissions_total` | Counter | `transport`, `role` | Delta of Linux `TCP_INFO.tcpi_total_retrans` sampled from HP-TCP sockets |
 | `tent_shm_mapping_events_total` | Counter | `event` | SHM address relocation and backing-object mapping outcomes |
@@ -498,8 +499,8 @@ addresses, segment names, or other unbounded values are accepted.
 |-------|--------|-------------|
 | `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
 | `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
-| `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` | Stable phase where a terminal failure originated |
-| `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total` | Bounded failure classification |
+| `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` for terminal failures; `resolve`, `connect`, `io` for stream failures | Stable phase where a failure originated |
+| `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total`; `timeout`, `connection_refused`, `network_unreachable`, `host_unreachable`, `host_not_found`, `connection_reset`, `eof`, `broken_pipe`, `operation_aborted`, `unavailable`, `other` for `tent_stream_failures_total` | Bounded failure classification |
 | `outcome` | `success`, `failed`, `timeout`, `canceled` for logical/transport outcomes; `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions; `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` for stream attempts | Bounded operation outcome |
 | `worker` | `engine_progress`, `staging`, `rdma` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
@@ -567,8 +568,12 @@ physical slice operations, while `retry_issued` is counted once when a logical
 task retry is successfully admitted. Queue wait and attempt latency have at
 most 2x2 = 4 transport/operation series before their bounded outcome split;
 the event counter has at most 2x2x13 = 52 series and attempt latency has at
-most 2x2x7 = 28 series. Peer identity, socket address, lane and request ID are
-never metric labels.
+most 2x2x7 = 28 series. Stream failures have at most 2x2x3x11 = 132 series.
+HP-TCP maps the structured socket error to a bounded reason. The RPC-backed
+TCP path reports `unavailable` when YLT intentionally collapses the native
+errno; it does not infer a more specific cause from an error string. Peer
+identity, socket address, numeric errno, lane and request ID are never metric
+labels.
 
 `tent_worker_last_progress_timestamp_seconds` advances when the engine progress
 worker completes a wake cycle, when a staging worker changes a chunk state or
