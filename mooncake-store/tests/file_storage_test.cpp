@@ -138,6 +138,9 @@ class FileStorageTest : public ::testing::Test {
                 std::make_shared<BucketStorageBackend>(config, bucket_config);
         }
         ASSERT_TRUE(storage.storage_backend_->Init());
+        storage.cold_write_journal_ =
+            std::make_unique<ColdWriteJournal>(config.storage_filepath);
+        ASSERT_TRUE(storage.cold_write_journal_->Init());
         const auto baseline = StoredFileBytes(config.storage_filepath);
         ASSERT_TRUE(storage.OffloadObjects(tasks));
         const auto populated = StoredFileBytes(config.storage_filepath);
