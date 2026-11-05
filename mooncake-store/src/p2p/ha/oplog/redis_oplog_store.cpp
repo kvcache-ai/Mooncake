@@ -980,6 +980,31 @@ ErrorCode RedisOpLogStore::GetTrimmedSequenceId(uint64_t& sequence_id) {
 
 // Recovery/admin operation inherited from OpLogStore. It must not run
 // concurrently with normal writes.
+ErrorCode RedisOpLogStore::SetLocalCommittedSequenceId(uint64_t sequence_id) {
+    if (!enable_write_) {
+        LOG(ERROR) << "RedisOpLogStore::SetLocalCommittedSequenceId requires "
+                      "a writer store"
+                   << ", sequence_id=" << sequence_id;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    std::lock_guard<std::mutex> lock(async_mutex_);
+    if (sequence_id < committed_sequence_id_ || !pending_writes_.empty() ||
+        !inflight_writes_.empty()) {
+        LOG(ERROR) << "RedisOpLogStore::SetLocalCommittedSequenceId rejected"
+                   << ", sequence_id=" << sequence_id
+                   << ", committed_sequence_id=" << committed_sequence_id_
+                   << ", pending_size=" << pending_writes_.size()
+                   << ", inflight_size=" << inflight_writes_.size();
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    committed_sequence_id_ = sequence_id;
+    LOG(INFO) << "RedisOpLogStore local committed sequence initialized"
+              << ", sequence_id=" << sequence_id;
+    return ErrorCode::OK;
+}
+
 ErrorCode RedisOpLogStore::UpdateLatestSequenceId(uint64_t sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto err = EnsureConnectedUnlocked();

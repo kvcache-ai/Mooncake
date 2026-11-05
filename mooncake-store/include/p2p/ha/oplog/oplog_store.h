@@ -91,6 +91,14 @@ class OpLogStore {
     }
     virtual ErrorCode UpdateLatestSequenceId(uint64_t sequence_id) = 0;
 
+    // Advance a writer's local checkpoint after promotion. Backends with a
+    // persisted latest watermark may keep it unchanged and advance only their
+    // local state, then allow intentional holes up to this checkpoint.
+    virtual ErrorCode SetLocalCommittedSequenceId(uint64_t sequence_id) {
+        (void)sequence_id;
+        return ErrorCode::OK;
+    }
+
     // Snapshot
     virtual ErrorCode RecordSnapshotSequenceId(const std::string& snapshot_id,
                                                uint64_t sequence_id) = 0;

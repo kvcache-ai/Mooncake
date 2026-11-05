@@ -213,6 +213,15 @@ ErrorCode OpLogManager::SetInitialSequenceId(uint64_t sequence_id) {
                    << ", initial_sequence_id=" << initial_sequence_id;
         return ErrorCode::INVALID_PARAMS;
     }
+    if (store) {
+        auto err = store->SetLocalCommittedSequenceId(initial_sequence_id);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Cannot initialize OpLog local checkpoint"
+                       << ", sequence_id=" << initial_sequence_id
+                       << ", error=" << toString(err);
+            return err;
+        }
+    }
     last_seq_id_ = initial_sequence_id;
     first_seq_id_ = initial_sequence_id + 1;
     LOG(INFO) << "OpLogManager initial sequence_id set to "

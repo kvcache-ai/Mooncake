@@ -1010,6 +1010,42 @@ TEST_F(RedisOpLogStoreTest, RestorationPreservesUnappliedEntries) {
     EXPECT_EQ(new_entry.payload, "new-payload");
 }
 
+TEST_F(RedisOpLogStoreTest, PromotionWriterStartSkipsSnapshotCoveredGap) {
+    std::shared_ptr<RedisOpLogStore> writer(CreateWriter());
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(100));
+
+    OpLogManager manager;
+    manager.SetOpLogStore(writer);
+    ASSERT_EQ(manager.SetInitialSequenceId(101), ErrorCode::OK);
+    ASSERT_EQ(manager.GetLastSequenceId(), 101u);
+
+    {
+        auto reader = CreateReader();
+        uint64_t latest = 0;
+        ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+        EXPECT_EQ(latest, 100u);
+    }
+
+    const auto sequence = manager.AppendAndPersist(
+        OpType::PUT_END, "promoted-key", "promoted-payload", /*sync=*/true);
+    ASSERT_TRUE(sequence.has_value());
+    EXPECT_EQ(sequence.value(), 102u);
+
+    auto reader = CreateReader();
+    uint64_t latest = 0;
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 102u);
+
+    std::vector<OpLogEntry> entries;
+    ASSERT_EQ(reader->ReadOpLogSince(100, 10, entries), ErrorCode::OK);
+    ASSERT_EQ(entries.size(), 2u);
+    EXPECT_EQ(entries[0].sequence_id, 101u);
+    EXPECT_EQ(entries[0].op_type, OpType_NOOP);
+    EXPECT_EQ(entries[1].sequence_id, 102u);
+    EXPECT_EQ(entries[1].object_key, "promoted-key");
+    EXPECT_EQ(entries[1].payload, "promoted-payload");
+}
+
 TEST_F(RedisOpLogStoreTest, PromotionRejectsUnreadableOrChangedLatest) {
     {
         auto old_writer = CreateWriter();
