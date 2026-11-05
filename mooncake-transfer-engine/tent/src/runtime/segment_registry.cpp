@@ -15,6 +15,7 @@
 #include "tent/runtime/segment_registry.h"
 
 #include <cassert>
+#include <mutex>
 #include <set>
 
 #include "tent/common/status.h"
@@ -27,6 +28,15 @@ namespace tent {
 static inline std::string getFullMetadataKey(const std::string &segment_name) {
     const static std::string kCommonKeyPrefix = "mooncake/tent/";
     return kCommonKeyPrefix + segment_name;
+}
+
+// TENT publication and ownership-checked deletion are process-serialized so a
+// candidate handoff cannot interleave with the old instance's cleanup. The
+// remote backends do not provide a common compare-and-delete primitive, so
+// this is deliberately not presented as a distributed atomic operation.
+std::mutex &registryIoMutex() {
+    static std::mutex mutex;
+    return mutex;
 }
 
 CentralSegmentRegistry::CentralSegmentRegistry(const std::string &type,
@@ -54,6 +64,7 @@ Status CentralSegmentRegistry::putSegmentDesc(SegmentDescRef &desc) {
         return Status::MetadataError(
             "Central metadata store not started" LOC_MARK);
     json j = *desc;
+    std::lock_guard<std::mutex> lock(registryIoMutex());
     return plugin_->set(getFullMetadataKey(desc->name), j.dump());
 }
 
@@ -62,6 +73,37 @@ Status CentralSegmentRegistry::deleteSegmentDesc(
     if (!plugin_)
         return Status::MetadataError(
             "Central metadata store not started" LOC_MARK);
+    return plugin_->remove(getFullMetadataKey(segment_name));
+}
+
+Status CentralSegmentRegistry::deleteSegmentDescIfOwned(
+    const std::string &segment_name, const SegmentDescRef &expected) {
+    if (!plugin_)
+        return Status::MetadataError(
+            "Central metadata store not started" LOC_MARK);
+    if (!expected || expected->owner_id.empty())
+        return Status::InvalidArgument(
+            "Publication owner is required" LOC_MARK);
+
+    std::lock_guard<std::mutex> lock(registryIoMutex());
+    SegmentDescRef current;
+    auto status = getSegmentDesc(current, segment_name);
+    if (status.IsInvalidEntry()) return Status::OK();
+    if (!status.ok()) return status;
+    if (current->owner_id != expected->owner_id) {
+        if (current->owner_id.empty()) {
+            json current_legacy = *current;
+            json expected_legacy = *expected;
+            current_legacy.erase("owner_id");
+            expected_legacy.erase("owner_id");
+            if (current_legacy == expected_legacy) {
+                return plugin_->remove(getFullMetadataKey(segment_name));
+            }
+        }
+        LOG(INFO) << "Skipping deletion of segment " << segment_name
+                  << ": the registry belongs to a different publication";
+        return Status::OK();
+    }
     return plugin_->remove(getFullMetadataKey(segment_name));
 }
 

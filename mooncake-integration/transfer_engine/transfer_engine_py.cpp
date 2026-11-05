@@ -396,6 +396,24 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
     bool use_flagcx = (proto == "flagcx");
+    std::unique_ptr<TransferEngine> candidate;
+    auto failInitialization = [&]() {
+        // A failed candidate may already have published the same segment name.
+        // Keep the original wrapper alive and restore its metadata before the
+        // candidate's ownership-checked destructor runs.
+        if (engine_) {
+            auto tent = engine_->getTentEngine();
+            if (tent && tent->available()) {
+                auto status = tent->republishLocalSegment();
+                if (!status.ok()) {
+                    LOG(ERROR) << "Failed to restore local metadata after "
+                                  "Python reinitialization failure: "
+                               << status.ToString();
+                }
+            }
+        }
+        return -1;
+    };
 
 #ifdef USE_EFA
     // Only protocol=efa is set up by hand. Every other protocol goes through
@@ -403,38 +421,38 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     // the RDMA transport, so the EFA wheel behaves like the default wheel on
     // IB/RoCE hosts.
     bool use_efa = (proto == "efa");
-    engine_ = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
-                                               device_filter);
+    candidate = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
+                                                 device_filter);
     if (use_efa) {
-        engine_->getLocalTopology()->discover(device_filter);
+        candidate->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for EFA. Found "
-                  << engine_->getLocalTopology()->getHcaList().size()
+                  << candidate->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
 #elif defined(USE_CXI)
 
     bool use_cxi = (proto == "cxi");
-    engine_ = std::make_unique<TransferEngine>(false, device_filter);
+    candidate = std::make_unique<TransferEngine>(false, device_filter);
     if (use_cxi) {
-        engine_->getLocalTopology()->discover(device_filter);
+        candidate->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for CXI. Found "
-                  << engine_->getLocalTopology()->getHcaList().size()
+                  << candidate->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
+    candidate = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret = engine_->init(conn_string, local_hostname,
-                                hostname_port.first.c_str(),
-                                hostname_port.second, proto);
-        if (ret) return -1;
+        int ret = candidate->init(conn_string, local_hostname,
+                                  hostname_port.first.c_str(),
+                                  hostname_port.second, proto);
+        if (ret) return failInitialization();
     } else {
         // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
-        if (ret) return -1;
+        int ret = candidate->init(conn_string, local_hostname, "", 0, proto);
+        if (ret) return failInitialization();
     }
 
 #ifdef USE_EFA
@@ -442,19 +460,19 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("efa", nullptr);
+        auto transport = candidate->installTransport("efa", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install EFA transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "EFA transport installed successfully";
     } else if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "FlagCX transport installed successfully";
     }
@@ -462,19 +480,19 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_cxi) {
         LOG(INFO)
             << "Installing CXI transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("cxi", nullptr);
+        auto transport = candidate->installTransport("cxi", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install CXI transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "CXI transport installed successfully";
     } else if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "FlagCX transport installed successfully";
     } else {
@@ -483,10 +501,10 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         // (RDMA QP creation fails on EFA devices).
         LOG(INFO)
             << "Installing TCP transport (auto_discover disabled in CXI build)";
-        auto transport = engine_->installTransport("tcp", nullptr);
+        auto transport = candidate->installTransport("tcp", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install TCP transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "TCP transport installed successfully";
     }
@@ -494,16 +512,17 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
-            return -1;
+            return failInitialization();
         }
         LOG(INFO) << "FlagCX transport installed successfully";
     }
 #endif
 
     free_list_.resize(kSlabSizeKBTabLen);
+    engine_ = std::move(candidate);
     return 0;
 }
 

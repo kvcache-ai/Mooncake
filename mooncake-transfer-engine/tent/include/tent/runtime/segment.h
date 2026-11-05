@@ -171,6 +171,9 @@ struct SegmentDesc {
     std::string name;
     SegmentType type;
     std::string machine_id;
+    // Identifies the local manager instance that published this record. Older
+    // records omit it and can only be removed after an exact legacy match.
+    std::string owner_id;
     std::string rpc_server_addr;
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
 
@@ -199,6 +202,7 @@ inline void to_json(json& j, const SegmentDesc& s) {
     j = json{{"name", s.name},
              {"type", s.type},
              {"machine_id", s.machine_id},
+             {"owner_id", s.owner_id},
              {"rpc_server_addr", s.rpc_server_addr}};
     if (!s.rdma_server_name.empty()) {
         j["rdma_server_name"] = s.rdma_server_name;
@@ -214,6 +218,9 @@ inline void from_json(const json& j, SegmentDesc& s) {
     j.at("name").get_to(s.name);
     j.at("type").get_to(s.type);
     j.at("machine_id").get_to(s.machine_id);
+    if (j.contains("owner_id")) {
+        j.at("owner_id").get_to(s.owner_id);
+    }
     j.at("rpc_server_addr").get_to(s.rpc_server_addr);
     if (j.contains("rdma_server_name")) {
         j.at("rdma_server_name").get_to(s.rdma_server_name);

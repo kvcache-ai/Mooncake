@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include "transfer_engine.h"
+
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -27,6 +29,7 @@
 #include <unordered_map>
 
 #include "tent/common/config.h"
+#include "tent/runtime/segment_registry.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
 
@@ -170,6 +173,11 @@ class TestHttpMetadataServer {
         return it->second;
     }
 
+    size_t deleteRequests() const {
+        std::lock_guard<std::mutex> lock(store_mutex_);
+        return delete_requests_;
+    }
+
    private:
     void initServer() {
         using namespace coro_http;
@@ -228,6 +236,7 @@ class TestHttpMetadataServer {
                 }
 
                 std::lock_guard<std::mutex> lock(store_mutex_);
+                ++delete_requests_;
                 auto it = store_.find(key);
                 if (it == store_.end()) {
                     resp.set_status_and_content(status_type::not_found,
@@ -258,6 +267,7 @@ class TestHttpMetadataServer {
     std::unique_ptr<coro_http::coro_http_server> server_;
     mutable std::mutex store_mutex_;
     std::unordered_map<std::string, std::string> store_;
+    size_t delete_requests_ = 0;
 };
 #endif
 
@@ -712,6 +722,142 @@ TEST(TransferEngineConfigOverrideTest,
         EXPECT_EQ(config->get("rpc_server_port", ""), invalid_port);
         EXPECT_EQ(engine.getRpcServerPort(), 0);
     }
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     SameNameReinitializationKeepsReplacementMetadata) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    EnvVarGuard force_tcp("MC_FORCE_TCP", "1");
+    EnvVarGuard tent_guard("MC_USE_TENT", "1");
+    EnvVarGuard tev1_guard("MC_USE_TEV1", "0");
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"rpc_server_hostname":"127.0.0.1","rpc_server_port":0})");
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    const auto endpoint = buildHttpMetadataEndpoint(port);
+    const auto key = buildMetadataKey(kSegmentName);
+
+    mooncake::TransferEngine engine(false);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(endpoint, kSegmentName, "", 0, "tcp"), 0);
+    std::weak_ptr<mooncake::tent::TransferEngine> old_engine =
+        engine.getTentEngine();
+    ASSERT_TRUE(server.getStoredValue(key).has_value());
+
+    ASSERT_EQ(engine.init(endpoint, kSegmentName, "", 0, "tcp"), 0);
+    EXPECT_TRUE(old_engine.expired());
+    ASSERT_TRUE(engine.getTentEngine()->available());
+    EXPECT_TRUE(server.getStoredValue(key).has_value());
+    EXPECT_EQ(server.deleteRequests(), 0);
+
+    engine.freeEngine();
+    EXPECT_FALSE(server.getStoredValue(key).has_value());
+    EXPECT_EQ(server.deleteRequests(), 1);
+#endif
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     FailedSameNameReinitializationPreservesPreviousEngine) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    EnvVarGuard force_tcp("MC_FORCE_TCP", "1");
+    EnvVarGuard tent_guard("MC_USE_TENT", "1");
+    EnvVarGuard tev1_guard("MC_USE_TEV1", "0");
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"rpc_server_hostname":"127.0.0.1","rpc_server_port":0})");
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    const auto endpoint = buildHttpMetadataEndpoint(port);
+    const auto key = buildMetadataKey(kSegmentName);
+
+    mooncake::TransferEngine engine(false);
+    ASSERT_EQ(engine.init(endpoint, kSegmentName, "", 0, "tcp"), 0);
+    std::weak_ptr<mooncake::tent::TransferEngine> original =
+        engine.getTentEngine();
+    ASSERT_TRUE(server.getStoredValue(key).has_value());
+
+    EXPECT_NE(
+        engine.init("http://127.0.0.1:1/metadata", kSegmentName, "", 0, "tcp"),
+        0);
+    EXPECT_EQ(engine.getTentEngine(), original.lock());
+    EXPECT_TRUE(original.lock()->available());
+    EXPECT_TRUE(server.getStoredValue(key).has_value());
+    EXPECT_EQ(server.deleteRequests(), 0);
+
+    engine.freeEngine();
+    EXPECT_FALSE(server.getStoredValue(key).has_value());
+    EXPECT_EQ(server.deleteRequests(), 1);
+#endif
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     DifferentNameReinitializationDeletesOnlyRetiredMetadata) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    EnvVarGuard force_tcp("MC_FORCE_TCP", "1");
+    EnvVarGuard tent_guard("MC_USE_TENT", "1");
+    EnvVarGuard tev1_guard("MC_USE_TEV1", "0");
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"rpc_server_hostname":"127.0.0.1","rpc_server_port":0})");
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    const auto endpoint = buildHttpMetadataEndpoint(port);
+    const auto first_key = buildMetadataKey(kSegmentName);
+    const auto second_key = buildMetadataKey("store-segment-B");
+
+    mooncake::TransferEngine engine(false);
+    ASSERT_EQ(engine.init(endpoint, kSegmentName, "", 0, "tcp"), 0);
+    ASSERT_EQ(engine.init(endpoint, "store-segment-B", "", 0, "tcp"), 0);
+    EXPECT_FALSE(server.getStoredValue(first_key).has_value());
+    EXPECT_TRUE(server.getStoredValue(second_key).has_value());
+    EXPECT_EQ(server.deleteRequests(), 1);
+
+    engine.freeEngine();
+    EXPECT_FALSE(server.getStoredValue(second_key).has_value());
+    EXPECT_EQ(server.deleteRequests(), 2);
+#endif
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     OwnershipCheckedDeleteSupportsExactLegacyRecord) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    CentralSegmentRegistry registry("http", buildHttpMetadataEndpoint(port));
+    auto expected = std::make_shared<SegmentDesc>();
+    expected->name = kSegmentName;
+    expected->type = SegmentType::Memory;
+    expected->machine_id = "machine";
+    expected->rpc_server_addr = "127.0.0.1:12345";
+    expected->owner_id = "new-owner";
+    auto legacy = std::make_shared<SegmentDesc>(*expected);
+    legacy->owner_id.clear();
+
+    ASSERT_TRUE(registry.putSegmentDesc(legacy).ok());
+    EXPECT_TRUE(registry.deleteSegmentDescIfOwned(kSegmentName, expected).ok());
+    EXPECT_FALSE(
+        server.getStoredValue(buildMetadataKey(kSegmentName)).has_value());
+
+    auto replacement = std::make_shared<SegmentDesc>(*expected);
+    replacement->owner_id = "replacement-owner";
+    ASSERT_TRUE(registry.putSegmentDesc(replacement).ok());
+    EXPECT_TRUE(registry.deleteSegmentDescIfOwned(kSegmentName, expected).ok());
+    EXPECT_TRUE(
+        server.getStoredValue(buildMetadataKey(kSegmentName)).has_value());
+#endif
 }
 
 TEST(TransferEngineConfigOverrideTest,
