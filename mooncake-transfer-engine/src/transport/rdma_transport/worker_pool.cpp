@@ -346,13 +346,14 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
 
 void ClassicRdmaCongestionControl::observeUnavailable(
     Transport::Slice *slice, const std::string &peer_nic_path,
-    TaskCongestionFailureScope scope, std::optional<uint64_t> retry_after_ns) {
+    TaskCongestionFailureScope scope, std::optional<uint64_t> retry_after_ns,
+    TaskCongestionReason reason) {
     if (!enabled()) return;
     const auto slice_id = congestionSliceId(slice);
     if (!slice_id) return;
     slice->rdma_congestion_control_window_episode = 0;
     adaptive_congestion_control::TaskCongestionEvidence evidence;
-    evidence.reason = TaskCongestionReason::kPathQuarantined;
+    evidence.reason = reason;
     if (slice->interned_peer_nic_path &&
         *slice->interned_peer_nic_path == peer_nic_path)
         evidence.interned_path = slice->interned_peer_nic_path;
@@ -871,6 +872,11 @@ int WorkerPool::submitPostSend(
                 }
             }
             if (!found) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                adaptive_congestion_control_.observeUnavailable(
+                    slice, *peer_nic_path, TaskCongestionFailureScope::kRoute,
+                    std::nullopt, TaskCongestionReason::kNoUsablePath);
+#endif
                 slice->markFailed();  // All rails unavailable
                 continue;
             }
@@ -1651,6 +1657,12 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                         << slice->target_id
                         << ", selected peer=" << *peer_nic_path
                         << ", retry_cnt=" << slice->rdma.retry_cnt;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                    adaptive_congestion_control_.observeUnavailable(
+                        slice, *peer_nic_path,
+                        TaskCongestionFailureScope::kRoute, std::nullopt,
+                        TaskCongestionReason::kNoUsablePath);
+#endif
                     slice->markFailed();
                     processed_slice_count_++;
                     continue;

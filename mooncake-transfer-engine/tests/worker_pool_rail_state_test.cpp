@@ -36,6 +36,7 @@
 #include <glog/logging.h>
 
 #include "rdma_test_peers.h"
+#include "multi_transport.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -113,6 +114,11 @@ class WorkerPoolTestPeer {
                                 Transport::Slice *slice) {
         pool.collective_slice_queue_[0][path].push_back(slice);
         pool.performPostSend(0);
+    }
+
+    static void redispatch(WorkerPool &pool, Transport::Slice *slice) {
+        std::vector<Transport::Slice *> slices{slice};
+        pool.redispatch(slices, 0);
     }
 
     // Moves the recorded error timestamp back so the decay window can be
@@ -295,7 +301,92 @@ class WorkerPoolCongestionHealthTest : public WorkerPoolRailStateTest {
             unsetenv("MC_ADAPTIVE_CONGESTION_CONTROL_MODE");
     }
     virtual const char *mode() { return "enforce"; }
+
+    void checkAllRailsUnavailable(bool retry) {
+        constexpr uint64_t buffer_addr = 0x10000;
+        auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+        desc->name = "10.0.0.1";
+        desc->protocol = "rdma";
+        desc->devices.push_back({"mlx5_bond_0", 1, "", ""});
+        desc->devices.push_back({"mlx5_bond_1", 1, "", ""});
+        TransferMetadata::BufferDesc buffer;
+        buffer.name = "cpu:0";
+        buffer.addr = buffer_addr;
+        buffer.length = 4096;
+        buffer.rkey = {11, 22};
+        desc->buffers.push_back(buffer);
+        ASSERT_EQ(desc->topology.parse(
+                      R"({"cpu:0": [["mlx5_bond_0", "mlx5_bond_1"], []]})"),
+                  0);
+        metadata_->addLocalSegment(LOCAL_SEGMENT_ID, "10.0.0.1",
+                                   std::move(desc));
+        WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+        failRail(kPeerA, true);
+        failRail(kPeerB, true);
+
+        std::string local_name = "local";
+        MultiTransport transports(metadata_, local_name);
+        const auto batch_id = transports.allocateBatchID(1);
+        auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+        auto *slice = new Transport::Slice{};
+        task.slice_list.push_back(slice);
+        slice->task = &task;
+        slice->target_id = LOCAL_SEGMENT_ID;
+        slice->rdma.dest_addr = buffer_addr;
+        slice->rdma.max_retry_cnt = 2;
+        slice->rdma.retry_cnt = retry ? 1 : 0;
+        slice->length = 64;
+        if (retry)
+            WorkerPoolTestPeer::redispatch(*worker_pool_, slice);
+        else
+            ASSERT_EQ(worker_pool_->submitPostSend({slice}), 0);
+
+        EXPECT_EQ(slice->status, Transport::Slice::FAILED);
+        EXPECT_EQ(task.failed_slice_count, 1u);
+        EXPECT_TRUE(slice->rdma.dest_rkey == 11 || slice->rdma.dest_rkey == 22);
+        TaskCongestionState state;
+        TaskCongestionDetail detail;
+        ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
+        ASSERT_TRUE(
+            transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+        if (std::string(mode()) == "off") {
+            EXPECT_EQ(task.congestion_observation, nullptr);
+            EXPECT_EQ(state, TaskCongestionState::kUnknown);
+            EXPECT_EQ(detail.state, TaskCongestionState::kUnknown);
+        } else {
+            EXPECT_EQ(state, TaskCongestionState::kLongUnavailable);
+            EXPECT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
+            EXPECT_TRUE(detail.reason.observed);
+            EXPECT_EQ(detail.reason.value, TaskCongestionReason::kNoUsablePath);
+            EXPECT_TRUE(detail.failure_scope.observed);
+            EXPECT_EQ(detail.failure_scope.value,
+                      TaskCongestionFailureScope::kRoute);
+            EXPECT_TRUE(detail.affected_path.observed);
+            EXPECT_TRUE(detail.affected_path.value == kPeerA ||
+                        detail.affected_path.value == kPeerB);
+            EXPECT_FALSE(detail.retry_after_ns.observed);
+            EXPECT_FALSE(detail.resolved);
+            EXPECT_TRUE(detail.controller_mode.observed);
+            EXPECT_EQ(detail.controller_mode.value,
+                      std::string(mode()) == "observe"
+                          ? TaskCongestionControllerMode::kObserve
+                          : TaskCongestionControllerMode::kEnforce);
+        }
+        EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+        EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+        EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+    }
 };
+
+TEST_F(WorkerPoolCongestionHealthTest, AllRailsUnavailableAtSubmission) {
+    checkAllRailsUnavailable(false);
+}
+
+TEST_F(WorkerPoolCongestionHealthTest, AllRailsUnavailableAtRedispatch) {
+    checkAllRailsUnavailable(true);
+}
 
 TEST_F(WorkerPoolCongestionHealthTest, PostingPausedRailPublishesLegacyHealth) {
     WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
@@ -340,6 +431,28 @@ class WorkerPoolCongestionOffHealthTest
    protected:
     const char *mode() override { return "off"; }
 };
+
+TEST_F(WorkerPoolCongestionOffHealthTest, AllRailsUnavailableAtSubmission) {
+    checkAllRailsUnavailable(false);
+}
+
+TEST_F(WorkerPoolCongestionOffHealthTest, AllRailsUnavailableAtRedispatch) {
+    checkAllRailsUnavailable(true);
+}
+
+class WorkerPoolCongestionObserveHealthTest
+    : public WorkerPoolCongestionHealthTest {
+   protected:
+    const char *mode() override { return "observe"; }
+};
+
+TEST_F(WorkerPoolCongestionObserveHealthTest, AllRailsUnavailableAtSubmission) {
+    checkAllRailsUnavailable(false);
+}
+
+TEST_F(WorkerPoolCongestionObserveHealthTest, AllRailsUnavailableAtRedispatch) {
+    checkAllRailsUnavailable(true);
+}
 
 TEST_F(WorkerPoolCongestionOffHealthTest,
        PostingPausedRailAllocatesNoObservation) {

@@ -38,6 +38,11 @@ The queries reuse the existing admission controller and rail/context health;
 they do not add another recovery state machine or change window parameters.
 They do not change PUT APIs or caller retry policies.
 
+If all eligible peer rails are paused during initial submission or redispatch,
+the failed task retains `LONG_UNAVAILABLE` evidence with reason `kNoUsablePath`.
+The affected path identifies the selected paused rail; no aggregate retry
+deadline is inferred for the other rails.
+
 ## C++
 
 ```cpp

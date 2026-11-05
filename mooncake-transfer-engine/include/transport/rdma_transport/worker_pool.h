@@ -59,7 +59,8 @@ class ClassicRdmaCongestionControl {
     void observeUnavailable(
         Transport::Slice *slice, const std::string &peer_nic_path,
         TaskCongestionFailureScope scope,
-        std::optional<uint64_t> retry_after_ns = std::nullopt);
+        std::optional<uint64_t> retry_after_ns = std::nullopt,
+        TaskCongestionReason reason = TaskCongestionReason::kPathQuarantined);
     void complete(Transport::Slice *slice, ibv_wc_status status,
                   uint32_t vendor_error = 0);
     void releaseUnposted(Transport::Slice *slice);
