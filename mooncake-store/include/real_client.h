@@ -1368,11 +1368,11 @@ class RealClient : public PyClient {
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
+    void InitColdWrites();
     void StopColdWrites();
     struct ColdWriteSession;
-    std::mutex cold_write_mutex_;
-    std::unordered_map<ReplicaID, std::shared_ptr<ColdWriteSession>>
-        cold_write_sessions_;
+    struct ColdWriteRuntime;
+    std::shared_ptr<ColdWriteRuntime> cold_write_runtime_;
     std::unique_ptr<class EmbeddedMaster> embedded_master_;
 
     struct SessionRangeReadRequest {

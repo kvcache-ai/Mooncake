@@ -1572,6 +1572,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
     }
+    InitColdWrites();
     if (enable_ssd_offload && start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
         // Use port 0 to let the OS auto-allocate an available port.
@@ -9478,11 +9479,24 @@ struct RealClient::ColdWriteSession {
     }
 };
 
+struct RealClient::ColdWriteRuntime {
+    std::mutex mutex;
+    bool closing{false};
+    std::unordered_map<ReplicaID, std::shared_ptr<ColdWriteSession>> sessions;
+};
+
+void RealClient::InitColdWrites() {
+    cold_write_runtime_ = std::make_shared<ColdWriteRuntime>();
+}
+
 void RealClient::StopColdWrites() {
+    auto state = cold_write_runtime_;
+    if (!state) return;
     std::vector<std::shared_ptr<ColdWriteSession>> sessions;
     {
-        std::lock_guard lock(cold_write_mutex_);
-        for (const auto &entry : cold_write_sessions_)
+        std::lock_guard lock(state->mutex);
+        state->closing = true;
+        for (const auto &entry : state->sessions)
             sessions.push_back(entry.second);
     }
     for (const auto &session : sessions) {
@@ -9494,78 +9508,86 @@ void RealClient::StopColdWrites() {
     for (const auto &session : sessions) {
         if (session->worker.joinable()) session->worker.join();
     }
-    std::lock_guard lock(cold_write_mutex_);
-    cold_write_sessions_.clear();
+    std::lock_guard lock(state->mutex);
+    state->sessions.clear();
     if (client_) ReleaseIdleColdSlots(client_->getClientId());
 }
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
 RealClient::cold_write_begin(const ColdWriteRequest &request) {
-    auto job = [this, request]() -> tl::expected<void, ErrorCode> {
-        if (!file_storage_ || request.owner != client_->getClientId() ||
-            request.size == 0 || request.deadline_ms <= ColdWriteNowMs())
+    auto job = [state = cold_write_runtime_, storage = file_storage_,
+                client = client_, request]() -> tl::expected<void, ErrorCode> {
+        if (!state || !client || !storage ||
+            request.owner != client->getClientId() || request.size == 0 ||
+            request.deadline_ms <= ColdWriteNowMs())
             return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-        auto valid = client_->ValidateColdWrite(request);
+        auto valid = client->ValidateColdWrite(request);
         if (!valid) return valid;
-        auto journaled = file_storage_->PrepareColdWrite(request);
+        auto journaled = storage->PrepareColdWrite(request);
         if (!journaled) return journaled;
         auto session = std::make_shared<ColdWriteSession>();
         session->request = request;
         {
-            std::lock_guard lock(cold_write_mutex_);
-            if (closed_.load(std::memory_order_acquire))
+            std::unique_lock registry_lock(state->mutex);
+            if (state->closing)
                 return tl::make_unexpected(
                     ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-            std::erase_if(cold_write_sessions_, [](const auto &entry) {
+            std::erase_if(state->sessions, [](const auto &entry) {
                 std::lock_guard lock(entry.second->mutex);
                 return entry.second->completed && !entry.second->transfer_unknown;
             });
-            if (cold_write_sessions_.size() >= kColdWriteSlots ||
-                cold_write_sessions_.contains(request.reservation))
+            const bool active_stream =
+                std::any_of(state->sessions.begin(), state->sessions.end(),
+                            [](const auto &entry) {
+                                std::lock_guard lock(entry.second->mutex);
+                                return !entry.second->completed;
+                            });
+            if (active_stream || state->sessions.size() >= kColdWriteSlots ||
+                state->sessions.contains(request.reservation))
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-            cold_write_sessions_.emplace(request.reservation, session);
+            state->sessions.emplace(request.reservation, session);
+            session->worker = std::thread([session, storage, client, request] {
+                auto result = storage->OffloadStream(
+                    TenantId(request.tenant).MakeScopedKey(request.key),
+                    request.size,
+                    [session](int fd, uint64_t offset,
+                              uint64_t) -> tl::expected<void, ErrorCode> {
+                        std::unique_lock lock(session->mutex);
+                        session->fd = fd;
+                        session->file_offset = offset;
+                        session->ready = true;
+                        session->cv.notify_all();
+                        auto deadline = std::chrono::system_clock::time_point(
+                            std::chrono::milliseconds(
+                                session->request.deadline_ms));
+                        if (!session->cv.wait_until(lock, deadline, [&] {
+                                return session->finish;
+                            }))
+                            session->error = ErrorCode::INVALID_WRITE;
+                        session->fd = -1;
+                        if (session->error != ErrorCode::OK)
+                            return tl::make_unexpected(session->error);
+                        if (session->written != session->request.size)
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_WRITE);
+                        return {};
+                    },
+                    [client, request](const auto &, auto &) {
+                        auto result = client->FinishColdWrite(request);
+                        return result ? ErrorCode::OK : result.error();
+                    });
+                std::lock_guard lock(session->mutex);
+                if (!result) session->error = result.error();
+                session->completed = true;
+                if (session->staging_slot != kColdWriteSlots) {
+                    auto &pool = ColdPool(false);
+                    std::lock_guard pool_lock(pool.mutex);
+                    pool.slots[session->staging_slot].busy = false;
+                    session->staging.reset();
+                }
+                session->cv.notify_all();
+            });
         }
-        auto storage = file_storage_;
-        auto client = client_;
-        session->worker = std::thread([session, storage, client, request] {
-            auto result = storage->OffloadStream(
-                TenantId(request.tenant).MakeScopedKey(request.key),
-                request.size,
-                [session](int fd, uint64_t offset,
-                          uint64_t) -> tl::expected<void, ErrorCode> {
-                    std::unique_lock lock(session->mutex);
-                    session->fd = fd;
-                    session->file_offset = offset;
-                    session->ready = true;
-                    session->cv.notify_all();
-                    auto deadline = std::chrono::system_clock::time_point(
-                        std::chrono::milliseconds(
-                            session->request.deadline_ms));
-                    if (!session->cv.wait_until(
-                            lock, deadline, [&] { return session->finish; }))
-                        session->error = ErrorCode::INVALID_WRITE;
-                    session->fd = -1;
-                    if (session->error != ErrorCode::OK)
-                        return tl::make_unexpected(session->error);
-                    if (session->written != session->request.size)
-                        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-                    return {};
-                },
-                [client, request](const auto &, auto &) {
-                    auto result = client->FinishColdWrite(request);
-                    return result ? ErrorCode::OK : result.error();
-                });
-            std::lock_guard lock(session->mutex);
-            if (!result) session->error = result.error();
-            session->completed = true;
-            if (session->staging_slot != kColdWriteSlots) {
-                auto &pool = ColdPool(false);
-                std::lock_guard pool_lock(pool.mutex);
-                pool.slots[session->staging_slot].busy = false;
-                session->staging.reset();
-            }
-            session->cv.notify_all();
-        });
         std::unique_lock lock(session->mutex);
         auto deadline = std::chrono::system_clock::time_point(
             std::chrono::milliseconds(request.deadline_ms));
@@ -9584,12 +9606,17 @@ RealClient::cold_write_begin(const ColdWriteRequest &request) {
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
 RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
-    auto job = [this, chunk]() -> tl::expected<void, ErrorCode> {
+    auto job = [state = cold_write_runtime_, client = client_,
+                chunk]() -> tl::expected<void, ErrorCode> {
+        if (!state || !client)
+            return tl::make_unexpected(ErrorCode::INVALID_WRITE);
         std::shared_ptr<ColdWriteSession> session;
         {
-            std::lock_guard lock(cold_write_mutex_);
-            auto found = cold_write_sessions_.find(chunk.request.reservation);
-            if (found == cold_write_sessions_.end())
+            std::lock_guard lock(state->mutex);
+            if (state->closing)
+                return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+            auto found = state->sessions.find(chunk.request.reservation);
+            if (found == state->sessions.end())
                 return tl::make_unexpected(ErrorCode::INVALID_WRITE);
             session = found->second;
         }
@@ -9605,7 +9632,7 @@ RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
             chunk.size > session->request.size - session->written ||
             ColdWriteNowMs() >= session->request.deadline_ms)
             return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-        auto valid = client_->ValidateColdWrite(session->request);
+        auto valid = client->ValidateColdWrite(session->request);
         if (!valid) return valid;
         if (!session->staging) {
             auto &pool = ColdPool(false);
@@ -9613,7 +9640,7 @@ RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
             for (size_t i = 0; i < pool.slots.size(); ++i) {
                 auto &slot = pool.slots[i];
                 if (slot.busy || slot.quarantined) continue;
-                if (slot.client_id != client_->getClientId())
+                if (slot.client_id != client->getClientId())
                     slot.buffer.reset();
                 if (!slot.buffer) {
                     void *buffer = nullptr;
@@ -9621,18 +9648,18 @@ RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
                         0)
                         return tl::make_unexpected(
                             ErrorCode::NO_AVAILABLE_HANDLE);
-                    auto registered = client_->RegisterLocalMemory(
+                    auto registered = client->RegisterLocalMemory(
                         buffer, kColdWriteChunkBytes, "cpu:0");
                     if (!registered) {
                         free(buffer);
                         return registered;
                     }
-                    slot.buffer = std::shared_ptr<void>(
-                        buffer, [client = client_](void *ptr) {
+                    slot.buffer =
+                        std::shared_ptr<void>(buffer, [client](void *ptr) {
                             auto ignored = client->unregisterLocalMemory(ptr);
                             free(ptr);
                         });
-                    slot.client_id = client_->getClientId();
+                    slot.client_id = client->getClientId();
                 }
                 slot.busy = true;
                 session->staging_slot = i;
@@ -9642,7 +9669,7 @@ RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
             if (!session->staging)
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-        auto read = client_->ReadColdStagingChunk(
+        auto read = client->ReadColdStagingChunk(
             chunk.source_endpoint, chunk.source_address, session->staging.get(),
             chunk.size);
         if (read != ErrorCode::OK) {
@@ -9678,12 +9705,18 @@ RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
 RealClient::cold_write_cancel(const ColdWriteRequest &request) {
-    auto job = [this, request]() -> tl::expected<void, ErrorCode> {
+    auto job = [state = cold_write_runtime_, storage = file_storage_,
+                client = client_, request]() -> tl::expected<void, ErrorCode> {
+        if (!state || !client)
+            return tl::make_unexpected(ErrorCode::INVALID_WRITE);
         std::shared_ptr<ColdWriteSession> session;
         {
-            std::lock_guard lock(cold_write_mutex_);
-            auto found = cold_write_sessions_.find(request.reservation);
-            if (found == cold_write_sessions_.end()) return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+            std::lock_guard lock(state->mutex);
+            if (state->closing)
+                return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+            auto found = state->sessions.find(request.reservation);
+            if (found == state->sessions.end())
+                return tl::make_unexpected(ErrorCode::INVALID_WRITE);
             session = found->second;
         }
         // The TE read and pwrite hold this lock. Acquiring it fences every
@@ -9707,12 +9740,17 @@ RealClient::cold_write_cancel(const ColdWriteRequest &request) {
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
 RealClient::cold_write_finish(const ColdWriteRequest &request) {
-    auto job = [this, request]() -> tl::expected<void, ErrorCode> {
+    auto job = [state = cold_write_runtime_, storage = file_storage_,
+                client = client_, request]() -> tl::expected<void, ErrorCode> {
+        if (!state || !client)
+            return tl::make_unexpected(ErrorCode::INVALID_WRITE);
         std::shared_ptr<ColdWriteSession> session;
         {
-            std::lock_guard lock(cold_write_mutex_);
-            auto found = cold_write_sessions_.find(request.reservation);
-            if (found == cold_write_sessions_.end())
+            std::lock_guard lock(state->mutex);
+            if (state->closing)
+                return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+            auto found = state->sessions.find(request.reservation);
+            if (found == state->sessions.end())
                 return tl::make_unexpected(ErrorCode::INVALID_WRITE);
             session = found->second;
         }
