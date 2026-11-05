@@ -5589,6 +5589,8 @@ tl::expected<void, ErrorCode> MasterService::ValidateColdWrite(
             return replica.id() == request.reservation &&
                    (replica.is_completed() ||
                     (replica.is_processing() &&
+                     weight_manager_.AllowsGroupMemberMutation(
+                         metadata.group_id) &&
                      request.deadline_ms >
                          std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::system_clock::now()
@@ -5598,6 +5600,8 @@ tl::expected<void, ErrorCode> MasterService::ValidateColdWrite(
                    replica.get_local_disk_client_id() == request.owner;
         }))
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    weight_manager_.RecordImportWrite(TenantId(request.tenant),
+                                      metadata.group_id);
     return {};
 }
 
