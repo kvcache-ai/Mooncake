@@ -221,6 +221,14 @@ unfenced ordinary metadata scan. Automatic reassociation after a disk owner
 restarts with a different UUID is not implemented; the revision can remain
 DEGRADED until the required payload is recovered or replaced.
 
+The owner retains journal tokens as recovery control metadata after publication
+and payload reclamation. Backend payload usage and reclamation exclude the
+`cold_write_journal` directory; total filesystem usage still includes it.
+Automatic token garbage collection is not implemented. Reusing the same scoped
+key with a different reservation fails closed; a new generation should use new
+physical keys. Removing tokens requires a separate fenced release protocol,
+because a missing backend object can also be an active write awaiting persistence.
+
 Updating a policy to PINNED atomically records initial convergence when the
 new placement is not already satisfied. A MIXED update always confirms the
 affinity plan rather than comparing the observed ratio with the requested
