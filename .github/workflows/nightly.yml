@@ -536,10 +536,13 @@ jobs:
 
       - name: Build Store-RS and native shims
         run: |
+          cpu_count=$(nproc)
+          build_jobs=$(( (cpu_count + 1) / 2 ))
+          echo "Building Store-RS with ${build_jobs} parallel jobs (${cpu_count} CPUs available)"
           cmake --build "$MOONCAKE_BUILD_DIR" \
             --target _fast_copy engine store transfer_engine mooncake_store \
               mooncake_master mooncake_client build_store_rs \
-            --parallel "$(nproc)"
+            --parallel "$build_jobs"
         shell: bash
 
       - name: Install Store-RS Python component
