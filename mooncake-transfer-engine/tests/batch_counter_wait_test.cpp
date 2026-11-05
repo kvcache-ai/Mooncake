@@ -351,9 +351,10 @@ bool fdReadable(int fd) {
 }
 #endif
 
-// The wake is published from markSuccess after enableBatchCompletionNotification.
-// These tests do not call getBatchTransferStatus until after drain, except
-// where the assertion is that a drained id is still queryable.
+// The wake is published from markSuccess after
+// enableBatchCompletionNotification. These tests do not call
+// getBatchTransferStatus until after drain, except where the assertion is that
+// a drained id is still queryable.
 TEST_F(BatchCounterWait, CompletionFdWakesWithoutStatusPoll) {
 #ifndef __linux__
     EXPECT_EQ(multi.completionFd(), -1);
@@ -505,6 +506,43 @@ TEST_F(BatchCounterWait, SecondSubmitRejectedWhenEventEnabled) {
     ASSERT_TRUE(submit(legacy, {1}).ok());
     rdma->finish(1);
     ASSERT_TRUE(submit(legacy, {1}).ok());
+#endif
+}
+
+TEST_F(BatchCounterWait, FailedSubmitDoesNotPublishCompletion) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    rdma->empty_task = true;
+    rdma->reject_submit = true;
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    auto status = submit(b, {1});
+    EXPECT_FALSE(status.ok());
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    EXPECT_TRUE(done.empty());
+#endif
+}
+
+TEST_F(BatchCounterWait, SynchronousCompletionPublishesAfterSuccessfulSubmit) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    rdma->empty_task = true;
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    ASSERT_TRUE(submit(b, {1}).ok());
+    ASSERT_TRUE(fdReadable(multi.completionFd()));
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, b);
+    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
 #endif
 }
 

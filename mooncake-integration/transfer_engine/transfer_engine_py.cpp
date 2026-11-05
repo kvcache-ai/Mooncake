@@ -26,6 +26,13 @@
 
 #include <pybind11/stl.h>
 
+namespace {
+class CompletionNotificationFallback : public std::runtime_error {
+   public:
+    using std::runtime_error::runtime_error;
+};
+}  // namespace
+
 #include <algorithm>
 #include <cstring>
 #include "shared_segment_py.h"
@@ -1269,13 +1276,22 @@ batch_id_t TransferEnginePy::batchTransferAsync(
                 engine_->freeBatchID(batch_id);
                 LOG(ERROR) << "enableBatchCompletionNotification failed: "
                            << enable.ToString();
-                return 0;
+                if (enable.IsNotSupportedTransport()) {
+                    throw CompletionNotificationFallback(enable.ToString());
+                }
+                throw std::runtime_error(enable.ToString());
             }
         }
 
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
+            if (enable_completion_notification) {
+                if (s.IsNotSupportedTransport()) {
+                    throw CompletionNotificationFallback(s.ToString());
+                }
+                throw std::runtime_error(s.ToString());
+            }
             return 0;
         } else {
             break;
@@ -1766,6 +1782,8 @@ void bind_coro_rpc_interface(py::module_& m) {
 }
 
 PYBIND11_MODULE(engine, m) {
+    py::register_exception<CompletionNotificationFallback>(
+        m, "CompletionNotificationFallback");
 #ifdef USE_EFA
     m.attr("SUPPORT_EFA") = true;
 #else
@@ -1978,7 +1996,12 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("opcode"), py::arg("transport_hint") = "",
                  py::arg("nic_hint") = "",
-                 py::arg("enable_completion_notification") = false)
+                 py::arg("enable_completion_notification") = false,
+                 "With enable_completion_notification, a path that cannot "
+                 "complete without polling raises "
+                 "CompletionNotificationFallback so the caller can poll. "
+                 "Any other failure on that path raises RuntimeError. "
+                 "Without the flag, failure still returns 0.")
 #ifdef USE_CUDA
             .def("transfer_write_on_cuda",
                  &TransferEnginePy::transferWriteOnCuda,

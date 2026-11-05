@@ -20,6 +20,10 @@ SUPPORT_MNNVL: bool
 SUPPORT_MULTI_PROTOCOL: bool
 SUPPORT_MUSA: bool
 
+class CompletionNotificationFallback(Exception):
+    """Notification was requested, but this submit must fall back to polling."""
+
+
 class TransferOpcode:
     Read: ClassVar[TransferOpcode]
     Write: ClassVar[TransferOpcode]
@@ -291,7 +295,14 @@ class TransferEngine:
         transport_hint: str = "",
         nic_hint: str = "",
         enable_completion_notification: bool = False,
-    ) -> int: ...
+    ) -> int:
+        """Return a batch id.
+
+        With completion notification enabled, an unsupported transport raises
+        CompletionNotificationFallback. Any other failure on that path raises
+        RuntimeError.
+        """
+        ...
     # The *_on_cuda methods are only bound when SUPPORT_CUDA is true.
     def transfer_write_on_cuda(
         self,

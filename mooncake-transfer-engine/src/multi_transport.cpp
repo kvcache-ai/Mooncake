@@ -520,10 +520,9 @@ Status MultiTransport::submitTransfer(
             "event-enabled batch allows only one submitTransfer; "
             "freeBatchID and allocateBatchID again");
     }
-    const bool all_counter =
-        std::all_of(transports.begin(), transports.end(), [](Transport* t) {
-            return t->supportsBatchCompletionCounter();
-        });
+    const bool all_counter = std::all_of(
+        transports.begin(), transports.end(),
+        [](Transport* t) { return t->supportsBatchCompletionCounter(); });
     if (batch_desc.event_enabled && !all_counter) {
         return Status::NotSupportedTransport(
             "event-enabled batch requires a transport that publishes "
@@ -534,8 +533,14 @@ Status MultiTransport::submitTransfer(
     batch_desc.status_cached.store(false, std::memory_order_relaxed);
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
-    // Install before transport work so a seal-time publish (empty task) can
-    // wake. syncTerminalNotify at the end clears the hook if demoted.
+    // A seal inside submitTransferTask can finish a task before this call
+    // returns. Hold that record until the status is known: publish only after
+    // success, and drop it if submit fails. Publishing first and then erasing
+    // loses the race with a dispatcher already waiting on the fd.
+    if (batch_desc.event_enabled) {
+        std::lock_guard<std::mutex> lock(completion_mu_);
+        batch_desc.terminal_suppressed = true;
+    }
     syncTerminalNotify(batch_desc);
 
     task_list.reserve(task_list.size() + entries.size());
@@ -589,8 +594,32 @@ Status MultiTransport::submitTransfer(
         }
     }
     syncTerminalNotify(batch_desc);
-    if (!batch_desc.counter_eligible || !batch_desc.event_enabled) {
-        clearQueuedTerminal(batch_id);
+    const bool publish = overall_status.ok() && batch_desc.event_enabled &&
+                         batch_desc.counter_eligible && completion_fd_ >= 0;
+    {
+        std::lock_guard<std::mutex> lock(completion_mu_);
+        if (!publish) {
+            batch_desc.terminal_notify = nullptr;
+            batch_desc.terminal_notify_ctx = nullptr;
+            batch_desc.terminal_suppressed = true;
+            batch_desc.terminal_enqueued = false;
+            auto same_batch = [batch_id](const BatchCompletion& item) {
+                return item.batch_id == batch_id;
+            };
+            ready_.erase(
+                std::remove_if(ready_.begin(), ready_.end(), same_batch),
+                ready_.end());
+        } else {
+            batch_desc.terminal_suppressed = false;
+        }
+    }
+    if (publish) {
+        const uint64_t done =
+            batch_desc.finished_task_count.load(std::memory_order_acquire);
+        if (!batch_desc.task_list.empty() &&
+            done == batch_desc.task_list.size()) {
+            batch_desc.publishTerminalIfDone(done - 1);
+        }
     }
     return overall_status;
 }
