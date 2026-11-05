@@ -313,7 +313,19 @@ class StorageBackendInterface {
     using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
         const std::vector<std::string>& evicted_keys)>;
 
+    using StreamWriter = std::function<tl::expected<void, ErrorCode>(
+        int fd, uint64_t payload_offset, uint64_t size)>;
+    using CompleteHandler = std::function<ErrorCode(
+        const std::vector<std::string>&, std::vector<StorageObjectMetadata>&)>;
+
     virtual tl::expected<void, ErrorCode> Init() = 0;
+
+    // The caller serializes writes and writes exactly size bytes before
+    // success.
+    virtual tl::expected<int64_t, ErrorCode> OffloadStream(
+        const std::string& key, uint64_t size, const StreamWriter& writer,
+        CompleteHandler complete_handler,
+        EvictionHandler eviction_handler = nullptr);
 
     virtual tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -484,6 +496,12 @@ class StorageBackend {
      * @param slices Vector of data slices to store
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
+    tl::expected<std::vector<std::string>, ErrorCode> StoreObjectStream(
+        const std::string& path, const std::string& prefix, uint64_t size,
+        const std::string& key,
+        const StorageBackendInterface::StreamWriter& writer,
+        StorageBackendInterface::EvictionHandler eviction_handler);
+
     tl::expected<std::vector<std::string>, ErrorCode> StoreObject(
         const std::string& path, const std::vector<Slice>& slices,
         const std::string& key = "",
@@ -743,6 +761,11 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> Init() override;
 
+    tl::expected<int64_t, ErrorCode> OffloadStream(
+        const std::string& key, uint64_t size, const StreamWriter& writer,
+        CompleteHandler complete_handler,
+        EvictionHandler eviction_handler = nullptr) override;
+
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -777,6 +800,11 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         EvictionHandler eviction_handler = nullptr) override;
 
    private:
+    tl::expected<int64_t, ErrorCode> BatchOffloadImpl(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        CompleteHandler complete_handler, EvictionHandler eviction_handler,
+        const StreamWriter* writer);
+
     const FilePerKeyConfig file_per_key_config_;
 
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
@@ -849,6 +877,11 @@ class BucketStorageBackend : public StorageBackendInterface {
      * data is stored successfully.
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
+    tl::expected<int64_t, ErrorCode> OffloadStream(
+        const std::string& key, uint64_t size, const StreamWriter& writer,
+        CompleteHandler complete_handler,
+        EvictionHandler eviction_handler = nullptr) override;
+
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -1019,6 +1052,11 @@ class BucketStorageBackend : public StorageBackendInterface {
         EvictionHandler eviction_handler = nullptr) override;
 
    private:
+    tl::expected<int64_t, ErrorCode> BatchOffloadImpl(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        CompleteHandler complete_handler, EvictionHandler eviction_handler,
+        const StreamWriter* writer);
+
     tl::expected<void, ErrorCode> ReadBucketValues(
         std::unordered_map<std::string, StorageValueSpan>& spans,
         bool require_exact_size);
@@ -1031,7 +1069,8 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-        std::vector<iovec>& iovs, int disk_index);
+        std::vector<iovec>& iovs, int disk_index,
+        const StreamWriter* writer = nullptr);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
@@ -1363,6 +1402,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
      * @return tl::expected<int64_t, ErrorCode> indicating number of objects
      * offloaded or error
      */
+    tl::expected<int64_t, ErrorCode> OffloadStream(
+        const std::string& key, uint64_t size, const StreamWriter& writer,
+        CompleteHandler complete_handler,
+        EvictionHandler eviction_handler = nullptr) override;
+
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -1563,6 +1607,13 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     };
 
    private:
+    tl::expected<void, ErrorCode> RollbackStreamWrite(const std::string& key);
+
+    tl::expected<int64_t, ErrorCode> BatchOffloadImpl(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        CompleteHandler complete_handler, EvictionHandler eviction_handler,
+        const StreamWriter* writer);
+
     tl::expected<void, ErrorCode> ReadOffsetValues(
         std::unordered_map<std::string, StorageValueSpan>& spans,
         bool require_exact_size);

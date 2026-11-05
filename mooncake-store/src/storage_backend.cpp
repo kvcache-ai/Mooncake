@@ -82,6 +82,41 @@ bool PathContainsOrEquals(const std::string& base, const std::string& other) {
     return true;
 }
 
+bool StreamCompletionUnknown(ErrorCode code) {
+    return code == ErrorCode::RPC_FAIL || code == ErrorCode::RPC_TIMEOUT;
+}
+
+// Open a buffered descriptor for small format prefixes and bounded checksum
+// I/O. The streaming writer may reopen this same file with O_DIRECT for cuFile.
+tl::expected<size_t, ErrorCode> WriteStreamFile(
+    StorageFile& file, const std::vector<iovec>& iovs, uint64_t offset,
+    const StorageBackendInterface::StreamWriter& writer) {
+    FdGuard fd(open(file.filename().c_str(), O_RDWR));
+    if (fd.get() < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    uint64_t cursor = offset;
+    for (const auto& io : iovs) {
+        if (!io.iov_base) {
+            auto result = writer(fd.get(), cursor, io.iov_len);
+            if (!result) return tl::make_unexpected(result.error());
+        } else {
+            size_t done = 0;
+            while (done < io.iov_len) {
+                ssize_t n = pwrite(fd.get(),
+                                   static_cast<const char*>(io.iov_base) + done,
+                                   io.iov_len - done, cursor + done);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0)
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                done += n;
+            }
+        }
+        cursor += io.iov_len;
+    }
+    if (fdatasync(fd.get()) != 0) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return cursor - offset;
+}
 }  // namespace
 
 std::string StorageBackend::GetActualFsdir() const {
@@ -142,6 +177,9 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         LOG(ERROR) << "Init: Failed to get disk space info: " << ec.message();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
+    // Incomplete streams live outside the key fanout and are never recovered.
+    fs::remove_all(storage_root / ".streaming", ec);
+    if (ec) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     LOG(INFO) << "Reconstructing storage state from disk at: " << storage_root;
     std::vector<fs::directory_entry> existing_files;
     try {
@@ -373,6 +411,53 @@ tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
     }
 
     return evicted_keys;
+}
+
+tl::expected<int64_t, ErrorCode> StorageBackendInterface::OffloadStream(
+    const std::string&, uint64_t, const StreamWriter&, CompleteHandler,
+    EvictionHandler) {
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+StorageBackend::StoreObjectStream(
+    const std::string& path, const std::string& prefix, uint64_t size,
+    const std::string& key, const StorageBackendInterface::StreamWriter& writer,
+    StorageBackendInterface::EvictionHandler eviction_handler) {
+    const uint64_t total = prefix.size() + size;
+    std::vector<std::string> evicted;
+    uint64_t reserved = 0;
+    if (IsEvictionEnabled()) {
+        auto result = EnsureDiskSpace(total, eviction_handler);
+        if (!result) return tl::make_unexpected(result.error());
+        evicted = std::move(*result);
+        reserved = total;
+    }
+    MutexLocker lock(&GetFilePathMutex(path));
+    if (IsEvictionEnabled() && IsFilePendingEviction(path)) {
+        ReleaseSpace(reserved);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    // A failed/cancelled stream has no recoverable key file.
+    auto temporary =
+        (std::filesystem::path(root_dir_) / GetActualFsdir() / ".streaming" /
+         std::to_string(std::hash<std::string>{}(path)))
+            .string();
+    ResolvePath(path);
+    auto created = CreateFileForWriting(temporary, reserved);
+    if (!created) return tl::make_unexpected(created.error());
+    std::vector<iovec> iovs{{const_cast<char*>(prefix.data()), prefix.size()},
+                            {nullptr, static_cast<size_t>(size)}};
+    auto result = WriteStreamFile(**created, iovs, 0, writer);
+    if (!result || rename(temporary.c_str(), path.c_str()) != 0) {
+        created->reset();
+        unlink(temporary.c_str());
+        ReleaseSpace(reserved);
+        return tl::make_unexpected(result ? ErrorCode::FILE_WRITE_FAIL
+                                          : result.error());
+    }
+    if (IsEvictionEnabled()) AddFileToWriteQueue(path, total, key);
+    return evicted;
 }
 
 tl::expected<void, ErrorCode> StorageBackendInterface::BatchLoadSpans(
@@ -1335,6 +1420,29 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     EvictionHandler eviction_handler) {
+    return BatchOffloadImpl(batch_object, std::move(complete_handler),
+                            std::move(eviction_handler), nullptr);
+}
+
+tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::OffloadStream(
+    const std::string& key, uint64_t size, const StreamWriter& writer,
+    CompleteHandler complete_handler, EvictionHandler eviction_handler) {
+    if (!writer || size == 0 ||
+        size > static_cast<uint64_t>(INT64_MAX) - key.size() || key.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto exists = IsExist(key);
+    if (!exists) return tl::make_unexpected(exists.error());
+    if (*exists) return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    return BatchOffloadImpl({{key, {{nullptr, static_cast<size_t>(size)}}}},
+                            std::move(complete_handler),
+                            std::move(eviction_handler), &writer);
+}
+
+tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffloadImpl(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    CompleteHandler complete_handler, EvictionHandler eviction_handler,
+    const StreamWriter* writer) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1367,13 +1475,36 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         auto path = FileUtil::ResolvePathFromKey(
             kv.key, file_storage_config_.storage_filepath,
             file_per_key_config_.fsdir);
-        kv.value = ConcatSlicesToString(value);
-
         std::string kv_buf;
-        struct_pb::to_pb(kv, kv_buf);
-        auto store_result = storage_backend_->StoreObject(path, kv_buf, kv.key,
-                                                          eviction_handler);
+        uint64_t value_size = 0;
+        for (const auto& slice : value) value_size += slice.size;
+        if (writer) {
+            // Emit the existing protobuf wire format without materializing
+            // value.
+            auto varint = [&](uint64_t n) {
+                while (n >= 128) {
+                    kv_buf.push_back(static_cast<char>((n & 127) | 128));
+                    n >>= 7;
+                }
+                kv_buf.push_back(static_cast<char>(n));
+            };
+            kv_buf.push_back(10);
+            varint(kv.key.size());
+            kv_buf.append(kv.key);
+            kv_buf.push_back(18);
+            varint(value_size);
+        } else {
+            kv.value = ConcatSlicesToString(value);
+            struct_pb::to_pb(kv, kv_buf);
+        }
+        auto store_result = writer
+                                ? storage_backend_->StoreObjectStream(
+                                      path, kv_buf, value_size, kv.key, *writer,
+                                      eviction_handler)
+                                : storage_backend_->StoreObject(
+                                      path, kv_buf, kv.key, eviction_handler);
         if (!store_result) {
+            if (writer) return tl::make_unexpected(store_result.error());
             LOG(ERROR) << "Failed to store object for key: " << kv.key
                        << ", error: " << store_result.error()
                        << " - continuing with remaining keys";
@@ -1383,12 +1514,12 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         {
             MutexLocker lock(&mutex_);
             total_keys++;
-            total_size += kv_buf.size();
+            total_size += kv_buf.size() + (writer ? value_size : 0);
         }
 
         metadatas.emplace_back(
             StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
-                                  static_cast<int64_t>(kv.value.size()), ""});
+                                  static_cast<int64_t>(value_size), ""});
         keys.emplace_back(kv.key);
     }
 
@@ -1396,6 +1527,21 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
+            if (writer && !StreamCompletionUnknown(error_code)) {
+                for (const auto& key : keys) {
+                    auto path = FileUtil::ResolvePathFromKey(
+                        key, file_storage_config_.storage_filepath,
+                        file_per_key_config_.fsdir);
+                    std::error_code ec;
+                    auto bytes = std::filesystem::file_size(path, ec);
+                    storage_backend_->RemoveFile(path);
+                    MutexLocker lock(&mutex_);
+                    --total_keys;
+                    if (!ec) total_size -= bytes;
+                }
+                return tl::make_unexpected(error_code);
+            }
+
             LOG(ERROR)
                 << "Complete handler failed: " << error_code << " - "
                 << keys.size()
@@ -1687,6 +1833,29 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     EvictionHandler eviction_handler) {
+    return BatchOffloadImpl(batch_object, std::move(complete_handler),
+                            std::move(eviction_handler), nullptr);
+}
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::OffloadStream(
+    const std::string& key, uint64_t size, const StreamWriter& writer,
+    CompleteHandler complete_handler, EvictionHandler eviction_handler) {
+    if (!writer || size == 0 ||
+        size > static_cast<uint64_t>(INT64_MAX) - key.size() || key.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto exists = IsExist(key);
+    if (!exists) return tl::make_unexpected(exists.error());
+    if (*exists) return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    return BatchOffloadImpl({{key, {{nullptr, static_cast<size_t>(size)}}}},
+                            std::move(complete_handler),
+                            std::move(eviction_handler), &writer);
+}
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffloadImpl(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    CompleteHandler complete_handler, EvictionHandler eviction_handler,
+    const StreamWriter* writer) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -1698,6 +1867,18 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
 
     auto enable_offloading_res = IsEnableOffloading();
+    if (writer &&
+        bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+        auto metadata = GetStoreMetadata();
+        if (!metadata) return tl::make_unexpected(metadata.error());
+        const auto& object = *batch_object.begin();
+        enable_offloading_res =
+            metadata->total_keys + 1 <= file_storage_config_.total_keys_limit &&
+            metadata->total_size +
+                    static_cast<int64_t>(object.first.size() +
+                                         object.second.front().size) <=
+                file_storage_config_.total_size_limit;
+    }
     if (!enable_offloading_res) {
         return tl::make_unexpected(enable_offloading_res.error());
     }
@@ -1746,7 +1927,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             << finalize_result.error();
     }
 
-    auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs, disk_index);
+    auto write_bucket_result =
+        WriteBucket(bucket_id, bucket, iovs, disk_index, writer);
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
         ReleasePreparedWrite(pending);
@@ -1849,6 +2031,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             // doesn't know" ghost replica. Rollback the local commit
             // (removes index entries + waits for inflight reads + deletes
             // on-disk files).
+            if (writer && StreamCompletionUnknown(error_code)) {
+                return tl::make_unexpected(error_code);
+            }
             RollbackCommittedBucket(bucket_id, committed_keys, disk_index);
             return tl::make_unexpected(error_code);
         }
@@ -2839,7 +3024,7 @@ BucketStorageBackend::BuildBucket(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-    std::vector<iovec>& iovs, int disk_index) {
+    std::vector<iovec>& iovs, int disk_index, const StreamWriter* writer) {
     namespace fs = std::filesystem;
     auto bucket_data_path_res = GetBucketDataPath(bucket_id, disk_index);
     if (!bucket_data_path_res) {
@@ -2855,6 +3040,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     }
     auto file = std::move(open_file_result.value());
 
+    if (writer) {
+        auto result = WriteStreamFile(*file, iovs, 0, *writer);
+        if (!result) {
+            CleanupOrphanedBucket(bucket_id, disk_index);
+            return tl::make_unexpected(result.error());
+        }
+    } else
 #ifdef USE_URING
     // Try to use write_aligned for O_DIRECT I/O if file is UringFile
     UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
@@ -5374,6 +5566,78 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler,
     EvictionHandler eviction_handler) {
+    return BatchOffloadImpl(batch_object, std::move(complete_handler),
+                            std::move(eviction_handler), nullptr);
+}
+
+tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::OffloadStream(
+    const std::string& key, uint64_t size, const StreamWriter& writer,
+    CompleteHandler complete_handler, EvictionHandler eviction_handler) {
+    if (!writer || size == 0 || key.empty() || key.size() > kMaxKeyLen ||
+        size > UINT32_MAX - RecordHeader::ValueOffsetInRecord(key.size())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto exists = IsExist(key);
+    if (!exists) return tl::make_unexpected(exists.error());
+    if (*exists) return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    bool completion_unknown = false;
+    CompleteHandler guarded_complete;
+    if (complete_handler) {
+        guarded_complete = [&](const auto& keys, auto& metadatas) {
+            auto code = complete_handler(keys, metadatas);
+            completion_unknown = StreamCompletionUnknown(code);
+            return code;
+        };
+    }
+    auto result = BatchOffloadImpl(
+        {{key, {{nullptr, static_cast<size_t>(size)}}}},
+        std::move(guarded_complete), std::move(eviction_handler), &writer);
+    if (result && *result != 1)
+        result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!result && !completion_unknown) {
+        auto rollback = RollbackStreamWrite(key);
+        if (!rollback) return tl::make_unexpected(rollback.error());
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::RollbackStreamWrite(const std::string& key) {
+    {
+        MutexLocker ev_lock(&eviction_mutex_);
+        auto& shard = shards_[ShardForKey(key)];
+        SharedMutexLocker lock(&shard.mutex);
+        auto it = shard.map.find(key);
+        if (it == shard.map.end()) return {};
+        // Invalidate the durable record before releasing its extent.
+        // Even an older checkpoint then rejects this cancelled write.
+        FdGuard fd(open(data_file_path_.c_str(), O_RDWR));
+        const uint32_t invalid_key_len = UINT32_MAX;
+        if (pwrite(fd.get(), &invalid_key_len, sizeof(invalid_key_len),
+                   it->second.offset) != sizeof(invalid_key_len) ||
+            fdatasync(fd.get()) != 0) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        total_size_.fetch_sub(it->second.total_size, std::memory_order_relaxed);
+        total_keys_.fetch_sub(1, std::memory_order_relaxed);
+        fifo_index_.erase(it->second.fifo_seq);
+        shard.map.erase(it);
+        all_evicted_this_batch_.insert(key);
+        metadata_dirty_.store(true, std::memory_order_relaxed);
+    }
+    if (cfg_.persist_mode == OffsetPersistMode::kRelaxed ||
+        cfg_.persist_mode == OffsetPersistMode::kStrict) {
+        auto saved = SaveMetadata(all_evicted_this_batch_);
+        if (!saved) return tl::make_unexpected(saved.error());
+    }
+    return {};
+}
+
+tl::expected<int64_t, ErrorCode>
+OffsetAllocatorStorageBackend::BatchOffloadImpl(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    CompleteHandler complete_handler, EvictionHandler eviction_handler,
+    const StreamWriter* writer) {
     // ================================================================
     // SINGLE-WRITER PRECONDITION
     //
@@ -5497,7 +5761,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         // torn/stale records.
         char hdr_buf[RecordHeader::SIZE];
         header.WritePrefixTo(hdr_buf);
-        if (header.HasCrc()) {
+        if (header.HasCrc() && !writer) {
             Crc32c crc;
             crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
             crc.Extend(key.data(), key.size());
@@ -5619,8 +5883,47 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         }
 
         auto write_result =
-            data_file->vector_write(iovs.data(), iovs.size(), offset);
+            writer ? WriteStreamFile(*data_file, iovs, offset, *writer)
+                   : data_file->vector_write(iovs.data(), iovs.size(), offset);
+        if (write_result && writer && header.HasCrc()) {
+            FdGuard crc_fd(open(data_file_path_.c_str(), O_RDWR));
+            Crc32c crc;
+            crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
+            crc.Extend(key.data(), key.size());
+            std::array<char, 64 * 1024> buffer;
+            uint64_t read_offset =
+                offset + RecordHeader::ValueOffsetInRecord(header.key_len);
+            uint64_t remaining = value_size;
+            while (remaining) {
+                size_t n = std::min<uint64_t>(buffer.size(), remaining);
+                ssize_t read =
+                    pread(crc_fd.get(), buffer.data(), n, read_offset);
+                if (read != static_cast<ssize_t>(n)) {
+                    write_result =
+                        tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    break;
+                }
+                crc.Extend(buffer.data(), n);
+                remaining -= n;
+                read_offset += n;
+            }
+            if (write_result) {
+                header.crc32 = crc.Final();
+                header.WriteTo(hdr_buf);
+                auto written =
+                    pwrite(crc_fd.get(), hdr_buf, sizeof(hdr_buf), offset);
+                if (written != sizeof(hdr_buf)) {
+                    write_result =
+                        tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+            }
+        }
+        if (write_result && writer) {
+            auto sync = data_file->datasync();
+            if (!sync) write_result = tl::make_unexpected(sync.error());
+        }
         if (!write_result) {
+            if (writer) return tl::make_unexpected(write_result.error());
             LOG(ERROR) << "Failed to write record for key: " << key
                        << ", error: " << write_result.error();
             continue;
@@ -5777,6 +6080,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
+            if (writer) return tl::make_unexpected(error_code);
             LOG(ERROR) << "Complete handler failed: " << error_code << " - "
                        << keys.size()
                        << " keys were successfully written to disk but "

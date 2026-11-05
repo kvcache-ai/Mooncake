@@ -148,6 +148,8 @@ class StorageFile {
         return FileLockRAII(fd_, FileLockRAII::LockType::READ);
     }
 
+    const std::string &filename() const { return filename_; }
+
     /**
      * @brief Gets the current error code
      * @return Current error code
