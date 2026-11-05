@@ -27,7 +27,12 @@
 #include <thread>
 #include <unordered_map>
 
+#ifdef MOONCAKE_TEST_TENT_COMPAT
+#include "error.h"
+#include "transfer_engine.h"
+#endif
 #include "tent/common/config.h"
+#include "tent/rpc/rpc.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
 
@@ -797,6 +802,80 @@ TEST(TransferEngineConfigOverrideTest,
     engine.unregisterLocalMemory(buf.data(), kBufSize);
 #endif
 }
+
+#ifdef MOONCAKE_TEST_TENT_COMPAT
+TEST(TransferEngineConfigOverrideTest,
+     FailedCompatibilityReinitPreservesPublishedEngine) {
+#ifndef _WIN32
+    EnvVarGuard force_tcp("MC_FORCE_TCP", "1");
+    EnvVarGuard conf_guard("MC_TENT_CONF", R"({
+        "rpc_server_hostname": "127.0.0.1",
+        "rpc_server_port": 0
+    })");
+    for (const char* selector : {"MC_USE_TENT", "MC_USE_TEV1"}) {
+        SCOPED_TRACE(selector);
+        EnvVarGuard tent_guard(
+            "MC_USE_TENT", std::string(selector) == "MC_USE_TENT" ? "1" : "0");
+        EnvVarGuard tev1_guard(
+            "MC_USE_TEV1", std::string(selector) == "MC_USE_TEV1" ? "1" : "0");
+        const auto metadata_port = reserveUnusedTcpPort();
+        TestHttpMetadataServer server(metadata_port);
+        ASSERT_TRUE(server.start());
+        const auto endpoint = buildHttpMetadataEndpoint(metadata_port);
+        const auto key = buildMetadataKey(kSegmentName);
+        std::weak_ptr<TransferEngine> original;
+        uint16_t rpc_port = 0;
+        {
+            char buffer[16]{};
+            mooncake::TransferEngine engine(false);
+            ASSERT_TRUE(engine.isUsingTent());
+            ASSERT_EQ(engine.init(endpoint, kSegmentName, "", 0, "tcp"), 0);
+            ASSERT_TRUE(engine.getTentEngine()->available());
+            ASSERT_EQ(engine.registerLocalMemory(buffer, sizeof(buffer)), 0);
+            // Do not keep the old engine alive and hide premature destruction.
+            original = engine.getTentEngine();
+            const auto* identity = engine.getTentEngine().get();
+            rpc_port = engine.getRpcPort();
+            ASSERT_NE(rpc_port, 0);
+            const auto address =
+                std::string(kLoopbackHostname) + ":" + std::to_string(rpc_port);
+            const auto published = server.getStoredValue(key);
+            ASSERT_TRUE(published.has_value());
+            // An owned client cannot reuse stale connections from other tests.
+            CoroRpcAgent probe;
+            std::string response;
+            ASSERT_TRUE(probe.call(address, Probe, "", response).ok());
+
+            EXPECT_EQ(engine.init("unsupported://127.0.0.1:1", kSegmentName, "",
+                                  0, "tcp"),
+                      ERR_CONTEXT);
+            EXPECT_FALSE(original.expired());
+            const auto current = engine.getTentEngine();
+            EXPECT_EQ(current.get(), identity);
+            EXPECT_EQ(engine.getMetadataConnectionString(), endpoint);
+            EXPECT_EQ(engine.getRpcPort(), rpc_port);
+            EXPECT_EQ(server.getStoredValue(key), published);
+            EXPECT_EQ(server.deleteRequests(), 0);
+            EXPECT_FALSE(connectToLoopback(rpc_port));
+            EXPECT_TRUE(probe.call(address, Probe, "", response).ok());
+            EXPECT_TRUE(current && current->available());
+            if (current && current->available()) {
+                // Exercise the original memory registration after rejection.
+                EXPECT_EQ(engine.unregisterLocalMemory(buffer), 0);
+            }
+        }
+        EXPECT_TRUE(original.expired());
+        EXPECT_FALSE(server.getStoredValue(key).has_value());
+        EXPECT_EQ(server.deleteRequests(), 1);
+        EXPECT_EQ(
+            connectToLoopback(rpc_port),
+            asio::error::make_error_code(asio::error::connection_refused));
+    }
+#else
+    GTEST_SKIP() << "Requires the local HTTP metadata fixture";
+#endif
+}
+#endif
 
 TEST(TransferEngineConfigOverrideTest,
      FailedInitialPublicationStopsRpcAndPreservesMetadata) {
