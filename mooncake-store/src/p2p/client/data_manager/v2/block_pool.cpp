@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <glog/logging.h>
 #include <numa.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -768,6 +769,25 @@ class SSDBlockPoolState final : public BlockPoolState {
             LOG(ERROR) << "Failed to open " << config.file_path << ": "
                        << std::strerror(errno);
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        // Different names can still be hardlinks/symlinks to the same file.
+        // Check identity before resizing: two base-zero allocators must never
+        // manage overlapping extents, including for direct C++ pool callers.
+        struct stat identity;
+        if (::fstat(device->fd, &identity) != 0) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        for (const auto& existing : devices_) {
+            struct stat other;
+            if (::fstat(existing->fd, &other) != 0) {
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            if (identity.st_dev == other.st_dev &&
+                identity.st_ino == other.st_ino) {
+                LOG(ERROR) << "SSD devices must use independent files: "
+                           << config.file_path;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
         }
         // Size the file up front so an allocation never fails mid-write on a
         // full filesystem, and so the extent allocator's offsets are always

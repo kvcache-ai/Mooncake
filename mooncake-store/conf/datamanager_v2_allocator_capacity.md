@@ -34,9 +34,10 @@ without increasing the DRAM tier's metadata reservation:
 }
 ```
 
-Each JSON tier currently creates one allocator. C++ callers can independently
-set the same fields on each `DramArenaConfig` or `SSDDeviceConfig` when building
-a pool with multiple arenas/devices. Omitted fields keep the original defaults;
+Each flat JSON tier creates one allocator. With `arenas[]` / `devices[]`,
+each physical target has its own allocator and inherits these fields from
+the tier unless overridden. C++ callers can independently set the same fields
+on each `DramArenaConfig` or `SSDDeviceConfig`. Omitted fields keep the original defaults;
 V1 and the shared OffsetAllocator defaults are unchanged.
 
 Nodes describe both live extents and free regions. A million-node budget does
@@ -57,7 +58,9 @@ figures are estimates, not measured RSS values.
 Splitting one SSD into same-priority logical tiers is not a substitute for
 configuring its allocator: the tier placement policy does not balance those
 tiers or retry a different tier on metadata exhaustion. This configuration
-change keeps existing placement and eviction semantics. JSON multi-device
-configuration and allocator physical-usage accounting are separate concerns.
+change keeps existing placement and eviction semantics. Use `devices[]` inside
+one SSD tier to obtain the pool's round-robin allocation and target failover.
+Allocator physical-usage accounting is a separate concern.
 
-See [the full V2 example](datamanager_v2_full_example.json) for other settings.
+See [the V2 configuration reference](datamanager_v2_configuration.md) and
+[the full V2 example](datamanager_v2_full_example.json) for other settings.

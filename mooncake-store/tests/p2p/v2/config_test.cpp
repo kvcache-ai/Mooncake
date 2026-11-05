@@ -14,9 +14,12 @@
 #include <json/json.h>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -215,6 +218,290 @@ TEST_F(V2ConfigTest,
             EXPECT_TRUE(config.has_value()) << type << ": max=" << max;
         }
     }
+}
+
+TEST_F(V2ConfigTest,
+       RuntimeComponentSectionsConfigureAllPreviouslyHiddenFields) {
+    auto c = Parse(R"({
+      "tiers": [{"type": "DRAM", "capacity": "1MB", "alignment": 256}],
+      "v2": {
+        "events": {"lifecycle_reserve": 12},
+        "migration": {"max_batch_items": 7, "max_batch_bytes": "2MB",
+          "max_batch_delay_ms": 3, "max_inflight_per_route": 5,
+          "max_inflight_per_device": 9, "retry_limit": 4,
+          "retry_backoff_ms": 6, "max_queued_requests": 321},
+        "movement_tracker": {"shard_count": 3, "cooldown_ms": 11,
+          "minimum_residency_ms": 13, "max_tracked_keys": 127},
+        "frequency_tracker": {"shard_count": 5, "max_snapshot_keys": 101,
+          "default_hot_key_num": 17, "half_life_ms": 19,
+          "entry_ttl_ms": 23, "expiry_threshold": 0.125,
+          "max_tracked_keys": 257},
+        "movement": {"movement_deadline_ms": 29,
+          "offload_high_watermark": 0.75, "onboard_min_read_heat": 2.5},
+        "register_tiers_with_transfer_engine": false
+      }
+    })");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->events.lifecycle_reserve, 12u);
+    EXPECT_EQ(c->migration.max_batch_items, 7u);
+    EXPECT_EQ(c->migration.max_batch_bytes, 2u * 1024 * 1024);
+    EXPECT_EQ(c->migration.max_batch_delay.count(), 3);
+    EXPECT_EQ(c->migration.max_inflight_per_route, 5u);
+    EXPECT_EQ(c->migration.max_inflight_per_device, 9u);
+    EXPECT_EQ(c->migration.retry_limit, 4u);
+    EXPECT_EQ(c->migration.retry_backoff.count(), 6);
+    EXPECT_EQ(c->migration.max_queued_requests, 321u);
+    EXPECT_EQ(c->movement_tracker.shard_count, 3u);
+    EXPECT_EQ(c->movement_tracker.cooldown.count(), 11);
+    EXPECT_EQ(c->movement_tracker.minimum_residency.count(), 13);
+    EXPECT_EQ(c->movement_tracker.max_tracked_keys, 127u);
+    EXPECT_EQ(c->frequency_tracker.shard_count, 5u);
+    EXPECT_EQ(c->frequency_tracker.max_snapshot_keys, 101u);
+    EXPECT_EQ(c->frequency_tracker.default_hot_key_num, 17u);
+    EXPECT_EQ(c->frequency_tracker.half_life.count(), 19);
+    EXPECT_EQ(c->frequency_tracker.entry_ttl.count(), 23);
+    EXPECT_DOUBLE_EQ(c->frequency_tracker.expiry_threshold, 0.125);
+    EXPECT_EQ(c->frequency_tracker.max_tracked_keys, 257u);
+    EXPECT_EQ(c->movement.movement_deadline.count(), 29);
+    EXPECT_DOUBLE_EQ(c->movement.offload_high_watermark, 0.75);
+    EXPECT_DOUBLE_EQ(c->movement.onboard_min_read_heat, 2.5);
+    EXPECT_DOUBLE_EQ(*c->tilers[0].placement_policy.offload_high_watermark,
+                     0.75);
+    EXPECT_FALSE(c->register_tiers_with_transfer_engine);
+    EXPECT_EQ(
+        std::get<DramBlockPoolConfig>(c->tilers[0].pool).arenas[0].alignment,
+        256u);
+}
+
+TEST_F(V2ConfigTest, FactoryHonorsEitherRegistrationOptOut) {
+    for (bool file_register : {false, true}) {
+        DataManagerConfig config;
+        config.version = DataManagerVersion::kV2;
+        config.tier_config =
+            ParseJson(R"({"tiers": [{"type": "DRAM", "capacity": "1MB"}]})");
+        config.tier_config["v2"]["register_tiers_with_transfer_engine"] =
+            file_register;
+        config.register_tiers_with_transfer_engine = !file_register;
+        config.local_transfer.mode = LocalTransferMode::MEMCPY;
+        config.local_transfer.local_io_worker_num = 0;
+        config.local_transfer.te_async_poll_worker_num = 0;
+        config.local_transfer.business_coro_worker_num = 1;
+        // This engine has no transport: registration must be disabled by the
+        // file even when the outer config still has its default true.
+        auto manager =
+            CreateDataManager(config, std::make_shared<TransferEngine>(), {});
+        ASSERT_TRUE(manager.has_value());
+        (*manager)->Stop();
+    }
+}
+
+TEST_F(V2ConfigTest, ComponentSectionsOverrideLegacyAliasesFieldwise) {
+    auto c = Parse(R"({"tiers": [{"type": "DRAM", "capacity": "1MB"}],
+      "v2": {
+        "events": {"movement_queue_capacity": 10},
+        "hot_key_snapshot_limit": 11,
+        "placement_policy": {"offload_high_watermark": 0.7, "onboard_min_frequency": 12},
+        "migration": {"max_queued_requests": 20, "max_batch_size": 3},
+        "frequency_tracker": {"max_snapshot_keys": 21},
+        "movement": {"onboard_min_read_heat": 22}
+      }})");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->migration.max_queued_requests, 20u);
+    EXPECT_EQ(c->migration.max_batch_items, 3u);
+    EXPECT_EQ(c->frequency_tracker.max_snapshot_keys, 21u);
+    EXPECT_DOUBLE_EQ(c->movement.offload_high_watermark, 0.7);
+    EXPECT_DOUBLE_EQ(c->movement.onboard_min_read_heat, 22);
+    EXPECT_FALSE(Parse(R"({"tiers": [{"type": "DRAM", "capacity": "1MB"}],
+      "v2": {"migration": {"max_batch_size": 3, "max_batch_items": 4}}})"));
+}
+
+TEST_F(V2ConfigTest, InvalidRuntimeFieldsAndSectionsAreRejected) {
+    const auto base =
+        ParseJson(R"({"tiers": [{"type": "DRAM", "capacity": "1MB"}]})");
+    for (const char* section : {"migration", "movement_tracker",
+                                "frequency_tracker", "movement", "events"}) {
+        for (const char* bad : {"null", "false", "[]", "1", "\"bad\""}) {
+            auto node = base;
+            node["v2"][section] = ParseJson(bad);
+            EXPECT_FALSE(ParseDataManagerV2Config(node, {}, {}))
+                << section << ": " << bad;
+        }
+    }
+    struct InvalidField {
+        const char* section;
+        const char* field;
+        const char* value;
+    };
+    for (const auto& bad : std::vector<InvalidField>{
+             {"migration", "max_batch_items", "0"},
+             {"migration", "max_batch_items", "1.0"},
+             {"migration", "max_batch_bytes", "\"bad\""},
+             {"migration", "max_batch_bytes", "\"-1MB\""},
+             {"migration", "max_batch_bytes", "\"1e100TB\""},
+             {"migration", "max_batch_bytes", "\"nan\""},
+             {"migration", "max_batch_delay_ms", "0"},
+             {"migration", "max_batch_delay_ms", "18446744073709551615"},
+             {"migration", "max_inflight_per_route", "-1"},
+             {"migration", "max_inflight_per_device", "0"},
+             {"migration", "retry_limit", "4294967296"},
+             {"migration", "retry_backoff_ms", "-1"},
+             {"movement_tracker", "shard_count", "0"},
+             {"movement_tracker", "minimum_residency_ms", "\"10\""},
+             {"movement_tracker", "cooldown_ms", "-1"},
+             {"movement_tracker", "max_tracked_keys", "0"},
+             {"frequency_tracker", "shard_count", "0"},
+             {"frequency_tracker", "half_life_ms", "0"},
+             {"frequency_tracker", "entry_ttl_ms", "0"},
+             {"frequency_tracker", "expiry_threshold", "false"},
+             {"frequency_tracker", "max_tracked_keys", "0"},
+             {"movement", "movement_deadline_ms", "0"},
+             {"movement", "offload_high_watermark", "1.0"},
+             {"events", "lifecycle_reserve", "-1"}}) {
+        auto node = base;
+        node["v2"][bad.section][bad.field] = ParseJson(bad.value);
+        EXPECT_FALSE(ParseDataManagerV2Config(node, {}, {}))
+            << bad.section << "." << bad.field;
+    }
+    auto node = base;
+    node["v2"]["register_tiers_with_transfer_engine"] = 0;
+    EXPECT_FALSE(ParseDataManagerV2Config(node, {}, {}));
+    node["v2"] = Json::Value(Json::objectValue);
+    node["v2"]["eviction_policy"] = Json::Value(Json::objectValue);
+    EXPECT_FALSE(ParseDataManagerV2Config(node, {}, {}));
+}
+
+TEST_F(V2ConfigTest, ZeroDisablesOptionalGatesAndRetries) {
+    auto c = Parse(R"({"tiers": [{"type": "DRAM", "capacity": "1MB"}],
+      "v2": {"migration": {"retry_limit": 0, "retry_backoff_ms": 0, "max_queued_requests": 0},
+        "movement_tracker": {"cooldown_ms": 0, "minimum_residency_ms": 0},
+        "events": {"lifecycle_reserve": 0},
+        "movement": {"onboard_min_read_heat": 0}}})");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->migration.retry_limit, 0u);
+    EXPECT_EQ(c->migration.retry_backoff.count(), 0);
+    EXPECT_EQ(c->migration.max_queued_requests, 0u);
+    EXPECT_EQ(c->movement_tracker.minimum_residency.count(), 0);
+    EXPECT_EQ(c->events.lifecycle_reserve, 0u);
+}
+
+TEST_F(V2ConfigTest, PhysicalArraysInheritDefaultsAndRemainOneLogicalTier) {
+    auto c = Parse(R"({"tiers": [
+      {"type": "DRAM", "capacity": "3MB", "alignment": 128, "numa_node": 0,
+        "allocator_init_capacity": 1, "allocator_max_capacity": 8,
+        "arenas": [{"capacity": "1MB"}, {"capacity": "2MB", "alignment": 256, "numa_node": null}]},
+      {"type": "SSD", "alignment": 8192, "fsync_on_commit": true,
+        "allocator_init_capacity": 2, "allocator_max_capacity": 16,
+        "devices": [{"capacity": "1MB", "file_path": "/tmp/v2-device-0.data"},
+          {"capacity": "2MB", "file_path": "/tmp/v2-device-1.data", "allocator_max_capacity": 32}]}
+    ]})");
+    ASSERT_TRUE(c.has_value());
+    ASSERT_EQ(c->tilers.size(), 2u);
+    const auto& dram = std::get<DramBlockPoolConfig>(c->tilers[0].pool).arenas;
+    ASSERT_EQ(dram.size(), 2u);
+    EXPECT_EQ(dram[0].capacity_bytes, 1u << 20);
+    EXPECT_EQ(dram[1].capacity_bytes, 2u << 20);
+    EXPECT_EQ(dram[0].alignment, 128u);
+    EXPECT_EQ(dram[1].alignment, 256u);
+    EXPECT_EQ(dram[0].numa_node, 0);
+    EXPECT_FALSE(dram[1].numa_node);
+    EXPECT_EQ(dram[1].allocator_max_capacity, 8u);
+    const auto& ssd = std::get<SSDBlockPoolConfig>(c->tilers[1].pool).devices;
+    ASSERT_EQ(ssd.size(), 2u);
+    EXPECT_EQ(ssd[0].alignment, 8192u);
+    EXPECT_TRUE(ssd[1].fsync_on_commit);
+    EXPECT_EQ(ssd[0].allocator_max_capacity, 16u);
+    EXPECT_EQ(ssd[1].allocator_init_capacity, 2u);
+    EXPECT_EQ(ssd[1].allocator_max_capacity, 32u);
+}
+
+TEST_F(V2ConfigTest, JsonDevicesFailOverWhenOneAllocatorRunsOutOfNodes) {
+    struct TemporaryDirectory {
+        std::filesystem::path path;
+        ~TemporaryDirectory() { std::filesystem::remove_all(path); }
+    };
+    const auto id = generate_uuid();
+    TemporaryDirectory directory{std::filesystem::temp_directory_path() /
+                                 ("v2_json_devices_" +
+                                  std::to_string(id.first) + "_" +
+                                  std::to_string(id.second))};
+    auto json = ParseJson(R"({"tiers": [{"type": "SSD", "alignment": 1,
+      "allocator_init_capacity": 1, "allocator_max_capacity": 4,
+      "devices": [{"capacity": "1MB", "allocator_max_capacity": 2}, {"capacity": "1MB"}]}]})");
+    for (Json::ArrayIndex i = 0; i < 2; ++i) {
+        json["tiers"][0]["devices"][i]["file_path"] =
+            (directory.path / std::to_string(i)).string();
+    }
+    auto config = ParseDataManagerV2Config(json, {}, {});
+    ASSERT_TRUE(config.has_value());
+    auto pool = CreateBlockPool(config->tilers[0].pool, nullptr);
+    ASSERT_TRUE(pool.has_value());
+    std::vector<BlockAllocation> blocks;
+    for (uint32_t i = 0; i < 4; ++i) {
+        auto block = (*pool)->Allocate(64, 1);
+        ASSERT_TRUE(block.has_value());
+        EXPECT_EQ(block->Id().target_index, i == 0 ? 0u : 1u);
+        const std::vector<std::byte> payload(64, static_cast<std::byte>(i + 1));
+        ASSERT_TRUE(block->Data().Write(0, payload).has_value());
+        blocks.push_back(std::move(*block));
+    }
+    EXPECT_EQ((*pool)->Allocate(64, 1).error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_LT((*pool)->Usage(), (*pool)->Capacity() / 100);
+    for (uint32_t i = 0; i < blocks.size(); ++i) {
+        std::vector<std::byte> readback(64);
+        ASSERT_TRUE(blocks[i].Data().Read(0, readback).has_value());
+        EXPECT_EQ(readback,
+                  std::vector<std::byte>(64, static_cast<std::byte>(i + 1)));
+    }
+    blocks.clear();
+    EXPECT_EQ((*pool)->Usage(), 0u);
+    EXPECT_TRUE((*pool)->Allocate(64, 1).has_value());
+}
+
+TEST_F(V2ConfigTest, InvalidPhysicalArraysAndSharedFilesAreRejected) {
+    for (
+        const char* tier :
+        {R"({"type": "DRAM", "arenas": []})",
+         R"({"type": "DRAM", "arenas": {}})",
+         R"({"type": "DRAM", "arenas": [null]})",
+         R"({"type": "DRAM", "capacity": "1MB", "arenas": [{}]})",
+         R"({"type": "DRAM", "capacity": "2MB", "arenas": [{"capacity": "1MB"}]})",
+         R"({"type": "DRAM", "capacity": "1MB", "devices": []})",
+         R"({"type": "DRAM", "capacity": "1MB", "alignment": 3})",
+         R"({"type": "DRAM", "arenas": [{"capacity": 18446744073709551615}, {"capacity": 1}]})",
+         R"({"type": "SSD", "devices": [{"capacity": "1MB"}]})",
+         R"({"type": "SSD", "file_path": "/tmp/shared.data", "devices": [{"capacity": "1MB", "file_path": "/tmp/other.data"}]})",
+         R"({"type": "SSD", "devices": [{"capacity": "1MB", "file_path": "/tmp/shared.data"}, {"capacity": "1MB", "file_path": "/tmp/./shared.data"}]})"}) {
+        auto c = Parse(std::string("{\"tiers\": [") + tier + "]}");
+        EXPECT_FALSE(c.has_value()) << tier;
+    }
+    EXPECT_FALSE(Parse(R"({"tiers": [
+      {"type": "SSD", "capacity": "1MB", "file_path": "/tmp/shared.data"},
+      {"type": "SSD", "capacity": "1MB", "file_path": "/tmp/./shared.data"}
+    ]})"));
+}
+
+TEST_F(V2ConfigTest,
+       FullExampleParsesWithAllComponentSectionsAndPhysicalArrays) {
+    const auto path = std::filesystem::path(__FILE__)
+                          .parent_path()
+                          .parent_path()
+                          .parent_path()
+                          .parent_path() /
+                      "conf/datamanager_v2_full_example.json";
+    std::ifstream input(path);
+    ASSERT_TRUE(input.is_open()) << path;
+    std::ostringstream text;
+    text << input.rdbuf();
+    auto c = Parse(text.str());
+    ASSERT_TRUE(c.has_value());
+    ASSERT_EQ(c->tilers.size(), 2u);
+    EXPECT_EQ(std::get<DramBlockPoolConfig>(c->tilers[0].pool).arenas.size(),
+              2u);
+    EXPECT_EQ(std::get<SSDBlockPoolConfig>(c->tilers[1].pool).devices.size(),
+              2u);
+    EXPECT_EQ(c->migration.max_batch_items, 16u);
+    EXPECT_EQ(c->movement_tracker.minimum_residency.count(), 1000);
+    EXPECT_EQ(c->frequency_tracker.half_life.count(), 30000);
 }
 
 // Skipping the tier would be the dangerous outcome: the deployment would look

@@ -1247,5 +1247,24 @@ TEST_F(BlockPoolTest, SsdNodeBudgetCanExceedTheLegacyMillionNodeLimit) {
     EXPECT_TRUE(pool->Allocate(1, 1).has_value());
 }
 
+TEST_F(BlockPoolTest, DevicesSharingAnInodeAreRejectedBeforeTheSecondResize) {
+    auto first = SsdDevice("shared-file.data", kArenaCapacity);
+    {
+        auto pool = MakeSsdPool({first});
+        ASSERT_NE(pool, nullptr);
+    }
+    const auto alias = StoragePath("hardlink.data");
+    std::filesystem::create_hard_link(first.file_path, alias);
+    for (const auto& path : {first.file_path, alias}) {
+        auto second = SsdDevice("unused.data", 2 * kArenaCapacity);
+        second.file_path = path;
+        SSDBlockPool pool(SSDBlockPoolConfig{{first, second}});
+        auto initialized = pool.Init();
+        ASSERT_FALSE(initialized.has_value());
+        EXPECT_EQ(initialized.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(std::filesystem::file_size(first.file_path), kArenaCapacity);
+    }
+}
+
 }  // namespace
 }  // namespace mooncake::v2

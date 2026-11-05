@@ -1,8 +1,11 @@
 #include "p2p/client/data_manager/v2/data_manager_v2.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <span>
 #include <thread>
@@ -31,29 +34,211 @@ size_t ParseByteSize(const Json::Value& value) {
     return static_cast<size_t>(value.asUInt64());
 }
 
-/** Parse integer node counts without accepting byte strings or truncation. */
-tl::expected<void, ErrorCode> ApplyAllocatorCapacityConfig(
-    const Json::Value& entry, uint32_t& init_capacity, uint32_t& max_capacity) {
-    for (const char* field :
-         {"allocator_init_capacity", "allocator_max_capacity"}) {
-        if (!entry.isMember(field)) continue;
-        const auto& value = entry[field];
-        // JsonCpp's numeric predicates can accept integral-valued doubles;
-        // require an integer JSON representation before converting to uint32.
-        if ((value.type() != Json::intValue &&
-             value.type() != Json::uintValue) ||
-            !value.isUInt()) {
-            LOG(ERROR) << field << " must be a uint32 node count";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+// Strict conversions for new configuration fields. JsonCpp's asUInt64() can
+// accept booleans or integral-valued doubles; durations must also fit the
+// signed chrono representation instead of wrapping on conversion.
+class ConfigReader {
+   public:
+    ConfigReader(const Json::Value& node, std::string path)
+        : node_(node), path_(std::move(path)), valid_(node.isObject()) {
+        if (!valid_) Fail("", "must be an object");
+    }
+
+    template <typename T>
+    void Read(const char* field, T& out) {
+        static_assert(std::is_unsigned_v<T>);
+        if (!Has(field)) return;
+        const auto& value = node_[field];
+        if (!IsUnsigned(value) ||
+            value.asUInt64() > std::numeric_limits<T>::max()) {
+            Fail(field, "must be an unsigned integer in range");
+            return;
+        }
+        out = static_cast<T>(value.asUInt64());
+    }
+
+    void Read(const char* field, bool& out) {
+        if (!Has(field)) return;
+        if (!node_[field].isBool()) {
+            Fail(field, "must be a boolean");
+            return;
+        }
+        out = node_[field].asBool();
+    }
+
+    void Read(const char* field, double& out) {
+        if (!Has(field)) return;
+        if (!node_[field].isNumeric() ||
+            !std::isfinite(node_[field].asDouble())) {
+            Fail(field, "must be a finite number");
+            return;
+        }
+        out = node_[field].asDouble();
+    }
+
+    void Read(const char* field, std::chrono::milliseconds& out) {
+        if (!Has(field)) return;
+        const auto& value = node_[field];
+        if (!IsUnsigned(value) ||
+            value.asUInt64() > static_cast<uint64_t>(
+                                   std::chrono::milliseconds::max().count())) {
+            Fail(field,
+                 "must be a non-negative integer millisecond count in range");
+            return;
+        }
+        out = std::chrono::milliseconds(value.asUInt64());
+    }
+
+    void Read(const char* field, std::string& out) {
+        if (!Has(field)) return;
+        if (!node_[field].isString()) {
+            Fail(field, "must be a string");
+            return;
+        }
+        out = node_[field].asString();
+    }
+
+    void NumaNode(std::optional<int>& out) {
+        if (!Has("numa_node")) return;
+        const auto& value = node_["numa_node"];
+        if (value.isNull()) {
+            out.reset();
+        } else if ((value.type() == Json::intValue ||
+                    value.type() == Json::uintValue) &&
+                   value.isInt() && value.asInt() >= 0) {
+            out = value.asInt();
+        } else {
+            Fail("numa_node", "must be a non-negative integer or null");
         }
     }
-    if (entry.isMember("allocator_init_capacity")) {
-        init_capacity = entry["allocator_init_capacity"].asUInt();
+
+    void Bytes(const char* field, size_t& out) {
+        if (!Has(field)) return;
+        if (!node_[field].isString()) {
+            Read(field, out);
+            return;
+        }
+        const std::string text = node_[field].asString();
+        try {
+            size_t pos = 0;
+            long double bytes = std::stold(text, &pos);
+            std::string unit = text.substr(pos);
+            unit.erase(0, unit.find_first_not_of(" \t\r\n"));
+            unit.erase(unit.find_last_not_of(" \t\r\n") + 1);
+            std::transform(unit.begin(), unit.end(), unit.begin(),
+                           [](unsigned char c) { return std::toupper(c); });
+            if (unit == "KB" || unit == "K")
+                bytes *= 1024.L;
+            else if (unit == "MB" || unit == "M")
+                bytes *= 1024.L * 1024;
+            else if (unit == "GB" || unit == "G")
+                bytes *= 1024.L * 1024 * 1024;
+            else if (unit == "TB" || unit == "T")
+                bytes *= 1024.L * 1024 * 1024 * 1024;
+            else if (!unit.empty() && unit != "B") {
+                Fail(field, "has an unknown byte-size unit");
+                return;
+            }
+            if (!std::isfinite(bytes) || bytes < 0 ||
+                bytes >= std::ldexp(1.L, std::numeric_limits<size_t>::digits) ||
+                std::floor(bytes) != bytes) {
+                Fail(field, "must be a non-negative whole byte count in range");
+                return;
+            }
+            out = static_cast<size_t>(bytes);
+        } catch (const std::exception&) {
+            Fail(field, "must be a byte count or byte-size string");
+        }
     }
-    if (entry.isMember("allocator_max_capacity")) {
-        max_capacity = entry["allocator_max_capacity"].asUInt();
+
+    bool Good() const { return valid_; }
+
+   private:
+    static bool IsUnsigned(const Json::Value& value) {
+        return (value.type() == Json::intValue ||
+                value.type() == Json::uintValue) &&
+               value.isUInt64();
     }
-    return ValidateAllocatorCapacity(init_capacity, max_capacity);
+    bool Has(const char* field) const {
+        return valid_ && node_.isMember(field);
+    }
+    void Fail(const char* field, const char* message) {
+        LOG(ERROR) << path_ << (*field ? "." : "") << field << " " << message;
+        valid_ = false;
+    }
+    const Json::Value& node_;
+    std::string path_;
+    bool valid_;
+};
+
+tl::expected<void, ErrorCode> ApplyRuntimeConfig(const Json::Value& v2,
+                                                 DataManagerV2Config& config) {
+    ConfigReader root(v2, "v2");
+    root.Read("register_tiers_with_transfer_engine",
+              config.register_tiers_with_transfer_engine);
+    if (!root.Good()) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (v2.isMember("eviction_policy")) {
+        LOG(ERROR) << "v2.eviction_policy is not integrated into DataManagerV2";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (v2.isMember("migration")) {
+        const auto& node = v2["migration"];
+        ConfigReader reader(node, "v2.migration");
+        auto& c = config.migration;
+        // Keep the spelling used by some callers as an alias, but never
+        // silently choose between conflicting batch limits.
+        reader.Read("max_batch_size", c.max_batch_items);
+        const size_t alias = c.max_batch_items;
+        reader.Read("max_batch_items", c.max_batch_items);
+        if (node.isObject() && node.isMember("max_batch_size") &&
+            node.isMember("max_batch_items") && alias != c.max_batch_items) {
+            LOG(ERROR)
+                << "migration.max_batch_size conflicts with max_batch_items";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        reader.Bytes("max_batch_bytes", c.max_batch_bytes);
+        reader.Read("max_batch_delay_ms", c.max_batch_delay);
+        reader.Read("max_inflight_per_route", c.max_inflight_per_route);
+        reader.Read("max_inflight_per_device", c.max_inflight_per_device);
+        reader.Read("retry_limit", c.retry_limit);
+        reader.Read("retry_backoff_ms", c.retry_backoff);
+        reader.Read("max_queued_requests", c.max_queued_requests);
+        if (!reader.Good())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (v2.isMember("movement_tracker")) {
+        ConfigReader reader(v2["movement_tracker"], "v2.movement_tracker");
+        auto& c = config.movement_tracker;
+        reader.Read("shard_count", c.shard_count);
+        reader.Read("cooldown_ms", c.cooldown);
+        reader.Read("minimum_residency_ms", c.minimum_residency);
+        reader.Read("max_tracked_keys", c.max_tracked_keys);
+        if (!reader.Good())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (v2.isMember("frequency_tracker")) {
+        ConfigReader reader(v2["frequency_tracker"], "v2.frequency_tracker");
+        auto& c = config.frequency_tracker;
+        reader.Read("shard_count", c.shard_count);
+        reader.Read("max_snapshot_keys", c.max_snapshot_keys);
+        reader.Read("default_hot_key_num", c.default_hot_key_num);
+        reader.Read("half_life_ms", c.half_life);
+        reader.Read("entry_ttl_ms", c.entry_ttl);
+        reader.Read("expiry_threshold", c.expiry_threshold);
+        reader.Read("max_tracked_keys", c.max_tracked_keys);
+        if (!reader.Good())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (v2.isMember("movement")) {
+        ConfigReader reader(v2["movement"], "v2.movement");
+        auto& c = config.movement;
+        reader.Read("offload_high_watermark", c.offload_high_watermark);
+        reader.Read("onboard_min_read_heat", c.onboard_min_read_heat);
+        reader.Read("movement_deadline_ms", c.movement_deadline);
+        if (!reader.Good())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
 }
 
 /** Apply only fields present in one global or per-tier JSON object. */
@@ -148,6 +333,105 @@ tl::expected<std::string, ErrorCode> DeriveStorageFilePath(
            std::to_string(tiler_id.second) + ".data";
 }
 
+template <typename Target>
+bool ReadPhysicalConfig(const Json::Value& node, Target& target) {
+    ConfigReader reader(node, "tier physical target");
+    reader.Bytes("capacity", target.capacity_bytes);
+    reader.Read("alignment", target.alignment);
+    reader.Read("allocator_init_capacity", target.allocator_init_capacity);
+    reader.Read("allocator_max_capacity", target.allocator_max_capacity);
+    if constexpr (std::is_same_v<Target, DramArenaConfig>) {
+        reader.NumaNode(target.numa_node);
+    } else {
+        reader.Read("fsync_on_commit", target.fsync_on_commit);
+        reader.Read("file_path", target.file_path);
+    }
+    return reader.Good() && target.alignment != 0 &&
+           (target.alignment & (target.alignment - 1)) == 0 &&
+           ValidateAllocatorCapacity(target.allocator_init_capacity,
+                                     target.allocator_max_capacity)
+               .has_value();
+}
+
+// A tier owns one logical pool. Per-target capacity is explicit; other
+// physical settings inherit fieldwise from the tier when using an array.
+template <typename Pool, typename Target>
+tl::expected<BlockPoolConfig, ErrorCode> ParsePhysicalPool(
+    const Json::Value& entry, const char* array_name, const UUID& tiler_id) {
+    Target defaults;
+    if (!ReadPhysicalConfig(entry, defaults)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    Pool pool;
+    auto& targets = [&]() -> auto& {
+        if constexpr (std::is_same_v<Pool, DramBlockPoolConfig>) {
+            return pool.arenas;
+        } else {
+            return pool.devices;
+        }
+    }();
+    if (entry.isMember(array_name)) {
+        const auto& array = entry[array_name];
+        if (!array.isArray() || array.empty()) {
+            LOG(ERROR) << array_name << " must be a non-empty array";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if constexpr (std::is_same_v<Target, SSDDeviceConfig>) {
+            if (entry.isMember("file_path")) {
+                LOG(ERROR) << "Put file_path on each devices[] entry";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+        for (const auto& node : array) {
+            Target target = defaults;
+            target.capacity_bytes = 0;  // capacity is never inherited
+            if (!ReadPhysicalConfig(node, target) ||
+                target.capacity_bytes == 0) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            if constexpr (std::is_same_v<Target, SSDDeviceConfig>) {
+                if (target.file_path.empty()) {
+                    LOG(ERROR)
+                        << "Each devices[] entry needs its own file_path";
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+            }
+            targets.push_back(std::move(target));
+        }
+    } else {
+        if (defaults.capacity_bytes == 0) {
+            LOG(ERROR) << "A tier without physical targets needs capacity";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if constexpr (std::is_same_v<Target, SSDDeviceConfig>) {
+            if (!entry.isMember("file_path")) {
+                auto derived = DeriveStorageFilePath(tiler_id);
+                if (!derived) return tl::make_unexpected(derived.error());
+                defaults.file_path = *derived;
+            }
+            if (defaults.file_path.empty()) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+        targets.push_back(std::move(defaults));
+    }
+    size_t total = 0;
+    for (const auto& target : targets) {
+        if (target.capacity_bytes >
+            std::numeric_limits<size_t>::max() - total) {
+            LOG(ERROR) << "Tier capacity sum overflows";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total += target.capacity_bytes;
+    }
+    if (entry.isMember(array_name) && entry.isMember("capacity") &&
+        defaults.capacity_bytes != total) {
+        LOG(ERROR) << "Tier capacity must equal the sum of " << array_name;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return BlockPoolConfig(std::move(pool));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -160,13 +444,17 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
     DataManagerV2Config config;
     config.local_transfer = local_transfer;
     config.key_lease = key_lease;
-    if (!tier_config.isMember("tiers") || !tier_config["tiers"].isArray() ||
-        tier_config["tiers"].empty()) {
+    if (!tier_config.isObject() || !tier_config.isMember("tiers") ||
+        !tier_config["tiers"].isArray() || tier_config["tiers"].empty()) {
         LOG(ERROR) << "DataManagerV2 config has no 'tiers' array";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     for (const auto& entry : tier_config["tiers"]) {
+        if (!entry.isObject() || !entry.isMember("type") ||
+            !entry["type"].isString()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         const std::string type =
             entry.isMember("type") ? entry["type"].asString() : "";
         if (type == "ASCEND_NPU" || type == "ASCEND") {
@@ -191,13 +479,6 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
             }
         }
 
-        const size_t capacity =
-            entry.isMember("capacity") ? ParseByteSize(entry["capacity"]) : 0;
-        if (capacity == 0) {
-            LOG(ERROR) << "tier '" << type << "' has no capacity";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-
         if (entry.isMember("placement_policy") &&
             entry["placement_policy"].isMember("offload_high_watermark")) {
             tiler.placement_policy.offload_high_watermark =
@@ -205,48 +486,23 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         }
 
         if (type == "DRAM") {
+            if (entry.isMember("devices")) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
             tiler.logical.memory_type = MemoryType::DRAM;
-            DramArenaConfig arena;
-            arena.capacity_bytes = capacity;
-            auto allocator_valid = ApplyAllocatorCapacityConfig(
-                entry, arena.allocator_init_capacity,
-                arena.allocator_max_capacity);
-            if (!allocator_valid) {
-                return tl::make_unexpected(allocator_valid.error());
-            }
-            if (entry.isMember("numa_node") && !entry["numa_node"].isNull()) {
-                arena.numa_node = entry["numa_node"].asInt();
-            }
-            DramBlockPoolConfig pool;
-            pool.arenas.push_back(arena);
-            tiler.pool = pool;
+            auto pool = ParsePhysicalPool<DramBlockPoolConfig, DramArenaConfig>(
+                entry, "arenas", tiler.logical.tiler_id);
+            if (!pool) return tl::make_unexpected(pool.error());
+            tiler.pool = std::move(*pool);
         } else if (type == "STORAGE" || type == "NVME" || type == "SSD") {
+            if (entry.isMember("arenas")) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
             tiler.logical.memory_type = MemoryType::NVME;
-            SSDDeviceConfig device;
-            device.capacity_bytes = capacity;
-            auto allocator_valid = ApplyAllocatorCapacityConfig(
-                entry, device.allocator_init_capacity,
-                device.allocator_max_capacity);
-            if (!allocator_valid) {
-                return tl::make_unexpected(allocator_valid.error());
-            }
-            if (entry.isMember("alignment")) {
-                device.alignment =
-                    static_cast<size_t>(entry["alignment"].asUInt64());
-            }
-            if (entry.isMember("fsync_on_commit")) {
-                device.fsync_on_commit = entry["fsync_on_commit"].asBool();
-            }
-            if (entry.isMember("file_path")) {
-                device.file_path = entry["file_path"].asString();
-            } else {
-                auto derived = DeriveStorageFilePath(tiler.logical.tiler_id);
-                if (!derived) return tl::make_unexpected(derived.error());
-                device.file_path = *derived;
-            }
-            SSDBlockPoolConfig pool;
-            pool.devices.push_back(device);
-            tiler.pool = pool;
+            auto pool = ParsePhysicalPool<SSDBlockPoolConfig, SSDDeviceConfig>(
+                entry, "devices", tiler.logical.tiler_id);
+            if (!pool) return tl::make_unexpected(pool.error());
+            tiler.pool = std::move(*pool);
         } else {
             LOG(ERROR) << "Unknown tier type '" << type << "'";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -279,6 +535,8 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
 
     if (tier_config.isMember("v2")) {
         const auto& v2 = tier_config["v2"];
+        if (!v2.isObject())
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         if (v2.isMember("eviction_index")) {
             LOG(ERROR) << "v2.eviction_index moved to v2.block_index";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -295,25 +553,17 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
         }
         if (v2.isMember("events")) {
             const auto& node = v2["events"];
-            if (node.isMember("shard_count")) {
-                config.events.shard_count = node["shard_count"].asUInt64();
-            }
-            if (node.isMember("event_queue_capacity")) {
-                config.events.event_queue_capacity =
-                    node["event_queue_capacity"].asUInt64();
-            }
-            if (node.isMember("movement_queue_capacity")) {
-                // The command queue moved to the migration engine, where it
-                // became one queue per route. The old name still configures
-                // the total, so an existing tier file keeps meaning what it
-                // meant.
-                config.migration.max_queued_requests =
-                    node["movement_queue_capacity"].asUInt64();
-            }
-            if (node.isMember("movement_worker_count")) {
-                config.movement_worker_count =
-                    node["movement_worker_count"].asUInt64();
-            }
+            ConfigReader reader(node, "v2.events");
+            reader.Read("shard_count", config.events.shard_count);
+            reader.Read("event_queue_capacity",
+                        config.events.event_queue_capacity);
+            reader.Read("lifecycle_reserve", config.events.lifecycle_reserve);
+            // Legacy name: the command queue is now owned by migration.
+            reader.Read("movement_queue_capacity",
+                        config.migration.max_queued_requests);
+            reader.Read("movement_worker_count", config.movement_worker_count);
+            if (!reader.Good())
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (v2.isMember("placement_policy")) {
             // Keep the global offload threshold as the default for tiers with
@@ -402,6 +652,10 @@ tl::expected<DataManagerV2Config, ErrorCode> ParseDataManagerV2Config(
                     ParseByteSize(node["reclaim_margin_bytes"]);
             }
         }
+        // New component sections override legacy aliases parsed above. The
+        // resolution order does not depend on the order of JSON properties.
+        auto runtime_valid = ApplyRuntimeConfig(v2, config);
+        if (!runtime_valid) return tl::make_unexpected(runtime_valid.error());
     }
 
     // Resolve fieldwise JSON overrides only after the global defaults have
@@ -456,11 +710,13 @@ tl::expected<void, ErrorCode> ValidateDataManagerV2Config(
     auto frequency_valid =
         ValidateFrequencyTrackerConfig(config.frequency_tracker);
     if (!frequency_valid) return frequency_valid;
+    std::vector<std::filesystem::path> storage_files;
     for (const auto& tiler : config.tilers) {
         // C++ callers bypass the JSON parser. Validate before pool creation
         // can allocate memory or open/resize any backing files.
         auto allocator_valid = std::visit(
-            [](const auto& pool) -> tl::expected<void, ErrorCode> {
+            [&storage_files](
+                const auto& pool) -> tl::expected<void, ErrorCode> {
                 const auto& targets = [&]() -> const auto& {
                     if constexpr (std::is_same_v<std::decay_t<decltype(pool)>,
                                                  DramBlockPoolConfig>) {
@@ -469,11 +725,57 @@ tl::expected<void, ErrorCode> ValidateDataManagerV2Config(
                         return pool.devices;
                     }
                 }();
+                if (targets.empty()) {
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                size_t capacity = 0;
                 for (const auto& target : targets) {
                     auto valid = ValidateAllocatorCapacity(
                         target.allocator_init_capacity,
                         target.allocator_max_capacity);
                     if (!valid) return valid;
+                    if (target.capacity_bytes == 0 || target.alignment == 0 ||
+                        (target.alignment & (target.alignment - 1)) != 0 ||
+                        target.capacity_bytes >
+                            std::numeric_limits<size_t>::max() - capacity) {
+                        LOG(ERROR)
+                            << "Invalid physical target capacity or alignment";
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    capacity += target.capacity_bytes;
+                    if constexpr (std::is_same_v<std::decay_t<decltype(pool)>,
+                                                 SSDBlockPoolConfig>) {
+                        if (target.file_path.empty() ||
+                            target.capacity_bytes >
+                                static_cast<uint64_t>(
+                                    std::numeric_limits<int64_t>::max())) {
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                        std::error_code ec;
+                        auto absolute =
+                            std::filesystem::absolute(target.file_path, ec);
+                        if (ec)
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        auto path =
+                            std::filesystem::weakly_canonical(absolute, ec);
+                        if (ec)
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        for (const auto& existing : storage_files) {
+                            const bool same_file =
+                                std::filesystem::equivalent(path, existing, ec);
+                            if (path == existing || (!ec && same_file)) {
+                                LOG(ERROR)
+                                    << "SSD allocators must not share a file: "
+                                    << path;
+                                return tl::make_unexpected(
+                                    ErrorCode::INVALID_PARAMS);
+                            }
+                        }
+                        storage_files.push_back(std::move(path));
+                    }
                 }
                 return {};
             },
