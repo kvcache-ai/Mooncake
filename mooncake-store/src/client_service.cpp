@@ -2722,7 +2722,11 @@ void Client::healDanglingLocalDiskBatchStarts(
         }
         op.replicas = std::move(retry_responses[r].value());
         op.RecordAllocatedReplicas();
-        if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+        if (std::none_of(op.replicas.begin(), op.replicas.end(),
+                         [](const auto& replica) {
+                             return replica.is_local_disk_replica();
+                         }) &&
+            !HasExpectedReplicaAllocation(config, op.transfer_summary)) {
             op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
                                 PutOperationState::MASTER_FAILED,
                                 "Allocated replicas do not satisfy "
@@ -2815,7 +2819,11 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         } else {
             op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
-            if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+            if (std::none_of(op.replicas.begin(), op.replicas.end(),
+                             [](const auto& replica) {
+                                 return replica.is_local_disk_replica();
+                             }) &&
+                !HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
                                     PutOperationState::MASTER_FAILED,
                                     "Allocated replicas do not satisfy "
@@ -3724,6 +3732,28 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         }
     }
     StartBatchPut(ops, client_cfg);
+    for (auto& op : ops) {
+        if (op.IsResolved()) continue;
+        auto cold = std::find_if(op.replicas.begin(), op.replicas.end(),
+                                 [](const auto& replica) {
+                                     return replica.is_local_disk_replica();
+                                 });
+        if (cold == op.replicas.end()) continue;
+        auto result = cold_write_handler_
+                          ? cold_write_handler_(op.key, *cold, op.slices,
+                                                op.object_checksum)
+                          : tl::expected<void, ErrorCode>(
+                                tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD));
+        if (result)
+            op.SetSuccess();
+        else {
+            op.SetTerminalError(result.error(),
+                                PutOperationState::TRANSFER_FAILED,
+                                "Cold write did not confirm completion");
+            op.replicas.clear();
+        }
+    }
+
     StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -3823,6 +3853,15 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
     for (size_t i = 0; i < ops.size(); ++i) {
         if (ops[i].IsResolved()) {
             results[i] = tl::unexpected(ops[i].result.error());
+            continue;
+        }
+        if (std::any_of(ops[i].replicas.begin(), ops[i].replicas.end(),
+                        [](const auto& replica) {
+                            return replica.is_local_disk_replica();
+                        })) {
+            auto ignored =
+                master_client_.PutRevoke(ops[i].key, ReplicaType::LOCAL_DISK);
+            results[i] = tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
             continue;
         }
         results[i] = std::move(ops[i].replicas);

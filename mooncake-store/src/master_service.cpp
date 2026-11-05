@@ -5580,7 +5580,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateColdWrite(
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     auto& metadata = accessor.Get();
     if (metadata.client_id != request.writer ||
-        metadata.data_size != request.size ||
+        metadata.TotalLength() != request.size ||
         !metadata.HasReplica([&](const Replica& replica) {
             return replica.id() == request.reservation &&
                    (replica.is_completed() ||
@@ -6102,6 +6102,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (!plan) {
         return tl::make_unexpected(plan.error());
     }
+    if (weight_manager_.IsManagedGroup(plan->group_id))
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     std::optional<std::unique_lock<std::mutex>> weight_group_operation_lock;
     if (!plan->group_id.empty() &&
         weight_manager_.IsManagedGroup(plan->group_id)) {
@@ -6180,6 +6182,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // --- Step 1: safety checks and preemption (only if key exists) ---
             if (accessor.IsPublished()) {
                 auto& metadata = accessor.Get();
+                if (weight_manager_.IsManagedGroup(metadata.group_id))
+                    return tl::make_unexpected(ErrorCode::INVALID_WRITE);
                 auto& state = accessor.GetState();
 
                 // Reject if a Copy/Move task is actively reading this key's
