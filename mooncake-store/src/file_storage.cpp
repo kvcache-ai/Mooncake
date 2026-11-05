@@ -129,9 +129,12 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         }
     }
 
-    disk_dir_fd_ = ::open(config_.storage_filepath.c_str(),
-                          O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    PLOG_IF(WARNING, disk_dir_fd_ < 0) << "open " << config_.storage_filepath;
+    for (auto& path : ResolveOffloadDiskPaths(config_.storage_filepath)) {
+        if (path.empty()) continue;
+        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        PLOG_IF(WARNING, fd < 0) << "open " << path;
+        disk_roots_.push_back(DiskRoot{std::move(path), fd});
+    }
     storage_backend_->SetDiskErrorObserver(
         [this](int err, const char* op) { OnDiskError(err, op); });
     // Export 0 from the start: an unset gauge has no series at all.
@@ -181,7 +184,9 @@ FileStorage::~FileStorage() {
     // it.
     if (uring_buffer_registered_) UringFile::unregister_global_buffer();
 #endif
-    if (disk_dir_fd_ >= 0) ::close(disk_dir_fd_);
+    for (const auto& root : disk_roots_) {
+        if (root.fd >= 0) ::close(root.fd);
+    }
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -1148,12 +1153,19 @@ int FileStorage::CheckFilesystem(bool sync_first) const {
     // triggering call quickly but wedges writeback can park it here; that
     // thread is already stuck on that device, and hang detection is out of
     // scope.
-    if (sync_first && disk_dir_fd_ >= 0) (void)::syncfs(disk_dir_fd_);
-    struct stat st;
-    const int rc = disk_dir_fd_ >= 0
-                       ? ::fstat(disk_dir_fd_, &st)
-                       : ::stat(config_.storage_filepath.c_str(), &st);
-    return rc == 0 ? 0 : errno;
+    // The failure does not say which disk it came from, so every root is
+    // checked; the master has one LOCAL_DISK segment per client, so any dead
+    // root fences the whole disk tier. An errno that does not mean a dead
+    // filesystem (ENOENT on a missing root) does not hide one that does.
+    for (const auto& root : disk_roots_) {
+        if (sync_first && root.fd >= 0) (void)::syncfs(root.fd);
+        struct stat st;
+        const int rc = root.fd >= 0 ? ::fstat(root.fd, &st)
+                                    : ::stat(root.path.c_str(), &st);
+        const int err = rc == 0 ? 0 : errno;
+        if (ClassifyDiskErrno(err) != DiskErrorAction::kIgnore) return err;
+    }
+    return 0;
 }
 
 std::optional<FileStorage::DiskFailure> FileStorage::RunFilesystemChecks(

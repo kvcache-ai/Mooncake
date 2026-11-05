@@ -323,7 +323,8 @@ class FileStorage {
     // the filesystem down, with that check's errno in check_err.
     std::optional<DiskFailure> RunFilesystemChecks(DiskFailure failure,
                                                    int& check_err);
-    // errno, 0 if the filesystem is up; sync_first runs syncfs before fstat.
+    // errno of the first offload root whose filesystem is down, 0 if all are
+    // up; sync_first runs syncfs on each root before fstat.
     int CheckFilesystem(bool sync_first) const;
     // Heartbeat: latch the drain and hand pending offload work back.
     void ApplyDiskFence();
@@ -437,7 +438,13 @@ class FileStorage {
     // Set on the first disk failure retry cannot fix; cleared only by a
     // store restart. Reads and offload stop as soon as it is set.
     std::atomic<bool> disk_fenced_{false};
-    int disk_dir_fd_{-1};  // offload dir, held open for CheckFilesystem
+    // The offload roots (storage_filepath may list several disks), each held
+    // open for CheckFilesystem; fd is -1 where the open failed.
+    struct DiskRoot {
+        std::string path;
+        int fd;
+    };
+    std::vector<DiskRoot> disk_roots_;
     // One filesystem check runs at a time; a failure that arrives during it
     // is queued for the running thread to check next.
     Mutex filesystem_check_mutex_;

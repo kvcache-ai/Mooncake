@@ -448,9 +448,9 @@ Alternatively, reduce `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` to a value with
 A client fences its SSD tier when a disk call fails in a way that retrying cannot fix. It decides on the first failure, from the errno of the failed call:
 
 - `ENODEV`, `ENXIO`, `EROFS`, `ESHUTDOWN`: fence at once.
-- `EIO` and similar device errors: check the filesystem first (`syncfs` unless the failed call was a read, then `fstat` on the offload directory), and fence only if the check also fails. A single bad file on a healthy filesystem does not fence.
+- `EIO` and similar device errors: check the filesystem first (`syncfs` unless the failed call was a read, then `fstat` on each offload directory), and fence only if the check also fails. A single bad file on a healthy filesystem does not fence.
 - Anything else, including `ENOSPC`: no fence.
 
-After a fence, the client stops reading from and offloading to that disk, hands its queued offload tasks back to the master, and unmounts its `LOCAL_DISK` segment so the master stops handing out its disk replicas. The memory segment and other clients keep working. The fence lasts until the client restarts; the gauge `mooncake_ssd_disk_fenced` is `1` while it holds. Fix or replace the disk, then restart the client.
+After a fence, the client stops reading from and offloading to that disk, hands its queued offload tasks back to the master, and unmounts its `LOCAL_DISK` segment so the master stops handing out its disk replicas. The memory segment and other clients keep working. The fence lasts until the client restarts; the gauge `mooncake_ssd_disk_fenced` is `1` while it holds. Fix or replace the disk, then restart the client. With several disks in `storage_filepath`, the filesystem check covers every disk, and one dead disk fences the whole SSD tier of that client.
 
 Only `bucket_storage_backend` (the default) reports disk errors; with the other backends the fence never triggers.
