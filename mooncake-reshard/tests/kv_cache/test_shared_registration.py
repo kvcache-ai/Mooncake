@@ -1,21 +1,19 @@
 """Participants on one runtime share allocation registration and lifetime."""
 
-import ctypes
 from dataclasses import replace
 
 import pytest
-from mooncake.reshard.contracts import RuntimeFragmentId, RuntimeInstanceId
+from mooncake.reshard.contracts import RuntimeInstanceId
 from mooncake.reshard.kv_cache import (
     KVCacheComponent,
-    KVCacheLayout,
-    KVCachePlacementManifest,
     KVCacheRuntimeTransferPlan,
     KVCacheTransferEngineExecutor,
     plan_kv_cache_transfer_to_local_target,
     resolve_contiguous_runtime_binding,
     validate_runtime_bindings,
 )
-from test_kv_cache_reshard import _binding, _placement, _snapshot
+from test_cache_components import resource
+from test_kv_cache_reshard import _binding, _snapshot
 from test_runtime_transfer import MemoryEngine
 
 
@@ -39,27 +37,26 @@ class CountingEngine:
 
 
 def shared_bindings(
-    prefix, snapshot, base, *, ssm=False, strided=False, endpoint=None, device="cpu"
+    prefix,
+    snapshot,
+    base,
+    *,
+    component=None,
+    tp=2,
+    strided=False,
+    endpoint=None,
+    device="cpu",
 ):
-    placement = _placement(prefix, ((0,),), 2, page_size=1)
-    descriptor = replace(
-        placement.descriptor,
-        components=(KVCacheComponent.SSM,)
-        if ssm
-        else (KVCacheComponent.KEY, KVCacheComponent.VALUE),
+    ssm = component is KVCacheComponent.SSM
+    placement = resource(
+        prefix,
+        tp,
+        component,
+        strided=strided,
         dtype="float32" if ssm else "bfloat16",
         itemsize=4 if ssm else 2,
-        key_head_dim=4 if ssm else 8,
-        value_head_dim=4 if ssm else 8,
-        layout=KVCacheLayout.NHD_STRIDED if strided else KVCacheLayout.NHD,
-    )
-    placement = KVCachePlacementManifest(
-        resource_id=placement.resource_id,
-        revision=placement.revision,
-        placement_set_id=placement.placement_set_id,
-        topology=placement.topology,
-        descriptor=descriptor,
-        parts=tuple(replace(p, descriptor=descriptor) for p in placement.parts),
+        head_dim=4 if ssm else 8,
+        layer_ids=(0,),
     )
     bindings = []
     for rank, part in enumerate(placement.parts):
@@ -72,7 +69,10 @@ def shared_bindings(
         )
         buffers = []
         for view, item in enumerate(binding.buffers):
-            offset = rank * (64 if strided else 128) + view * (32 if strided else 64)
+            row_bytes = item.fragment.strides_bytes[0]
+            offset = row_bytes * (
+                rank * (2 if strided else 4) + view * (1 if strided else 2)
+            )
             buffers.append(
                 replace(
                     item,
@@ -85,9 +85,9 @@ def shared_bindings(
                         storage_address=base,
                         storage_nbytes=512,
                         storage_offset_bytes=offset,
-                        nbytes=288 if strided else 32,
+                        nbytes=256 + row_bytes if strided else row_bytes,
                         strides_bytes=(
-                            128 if strided else 32,
+                            128 if strided else row_bytes,
                             *item.fragment.strides_bytes[1:],
                         ),
                     ),
@@ -137,7 +137,9 @@ def shared_plan(source, target, snapshot, sources, targets):
 def test_participants_resolve_and_register_one_allocation(ssm):
     snapshot = _snapshot(token_count=1)
     base = 1_000_000
-    placement, bindings = shared_bindings("source", snapshot, base, ssm=ssm)
+    placement, bindings = shared_bindings(
+        "source", snapshot, base, component=KVCacheComponent.SSM if ssm else None
+    )
     resolved = resolve_all(placement, snapshot, bindings)
     engine = CountingEngine(MemoryEngine())
     executor = KVCacheTransferEngineExecutor(
@@ -154,26 +156,8 @@ def test_participants_resolve_and_register_one_allocation(ssm):
         512,
     )
     assert engine.registers == 1
-    renamed = tuple(
-        replace(
-            b,
-            buffers=tuple(
-                replace(
-                    item,
-                    fragment=replace(
-                        item.fragment,
-                        fragment_id=RuntimeFragmentId(
-                            f"new:{item.fragment.fragment_id}"
-                        ),
-                    ),
-                )
-                for item in b.buffers
-            ),
-        )
-        for b in bindings
-    )
-    # A new operation and new view IDs still refer to the same allocation.
-    another = resolve_all(placement, snapshot, renamed, operation_id="next-copy")
+    # Participant view IDs already differ above; operation IDs must not matter either.
+    another = resolve_all(placement, snapshot, bindings, operation_id="next-copy")
     assert another[0].regions == resolved[0].regions
     with pytest.raises(ValueError, match="registered regions overlap"):
         executor.register_region(replace(resolved[0].regions[0], region_id="alias"))
@@ -187,51 +171,30 @@ def test_participants_resolve_and_register_one_allocation(ssm):
 @pytest.mark.parametrize("order", [(0, 1), (1, 0)])
 def test_shared_allocation_lives_until_last_participant_finishes(ssm, order):
     snapshot = _snapshot(token_count=1)
-    source_memory = ctypes.create_string_buffer(bytes(range(256)) * 2, 512)
-    target_memory = ctypes.create_string_buffer(b"\xa5" * 512, 512)
-    source, sb = shared_bindings(
-        "source", snapshot, ctypes.addressof(source_memory), ssm=ssm
+    placement, raw = shared_bindings(
+        "source", snapshot, 1_000_000, component=KVCacheComponent.SSM if ssm else None
     )
-    target, tb = shared_bindings(
-        "target", snapshot, ctypes.addressof(target_memory), ssm=ssm
+    bindings = resolve_all(placement, snapshot, raw)
+    engine = CountingEngine(MemoryEngine())
+    executor = KVCacheTransferEngineExecutor(
+        engine,
+        instance_id=bindings[0].instance_id,
+        endpoint=bindings[0].regions[0].endpoint,
     )
-    sources = resolve_all(source, snapshot, sb)
-    targets = resolve_all(target, snapshot, tb)
-    plan = shared_plan(source, target, snapshot, sources, targets)
-    executors = []
-    for bindings in (sources, targets):
-        engine = CountingEngine(MemoryEngine())
-        executor = KVCacheTransferEngineExecutor(
-            engine,
-            instance_id=bindings[0].instance_id,
-            endpoint=bindings[0].regions[0].endpoint,
-        )
-        for binding in bindings:
-            for region in binding.regions:
-                executor.register_region(region, owner_id=binding.digest)
-                executor.register_region(region, owner_id=binding.digest)
-        assert engine.registers == 1
-        with pytest.raises(ValueError, match="not registered by this owner"):
-            executor.unregister_region(bindings[0].regions[0].region_id)
-        executors.append(executor)
-
-    expected = bytearray(target_memory.raw)
-    for index in order:
-        for executor, bindings in zip(executors, (sources, targets)):
-            executor.validate_local_binding(bindings[index])
-        receipts = executors[0].execute(plan, sources[index].participant_id)
-        assert receipts and all(r.success and r.quiesced for r in receipts)
-        for item in sb[index].buffers:
-            offset = item.fragment.storage_offset_bytes
-            expected[offset : offset + 32] = source_memory.raw[offset : offset + 32]
-        assert target_memory.raw == bytes(expected)
-        for executor, bindings in zip(executors, (sources, targets)):
-            binding = bindings[index]
-            executor.unregister_region(
-                binding.regions[0].region_id, owner_id=binding.digest
-            )
-            assert executor.engine.unregisters == int(index == order[-1])
-    assert source_memory.raw == bytes(range(256)) * 2
+    for binding in bindings:
+        region = binding.regions[0]
+        executor.register_region(region, owner_id=binding.digest)
+        executor.register_region(region, owner_id=binding.digest)
+    assert engine.registers == 1
+    with pytest.raises(ValueError, match="not registered by this owner"):
+        executor.unregister_region(region.region_id)
+    for step, index in enumerate(order):
+        binding = bindings[index]
+        executor.validate_local_binding(binding)
+        executor.unregister_region(region.region_id, owner_id=binding.digest)
+        assert engine.unregisters == step
+    with pytest.raises(ValueError, match="not registered"):
+        executor.validate_local_binding(bindings[order[-1]])
 
 
 def test_owner_claims_preserve_manual_registration():

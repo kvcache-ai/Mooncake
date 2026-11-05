@@ -5,7 +5,7 @@ import os
 import traceback
 
 import pytest
-from mooncake.reshard.kv_cache import KVCacheTransferEngineExecutor
+from mooncake.reshard.kv_cache import KVCacheComponent, KVCacheTransferEngineExecutor
 from test_kv_cache_reshard import _snapshot
 from test_runtime_transfer_native import _receive
 from test_shared_registration import (
@@ -54,7 +54,7 @@ def worker(connection, role, ssm, strided, order):
             role,
             snapshot,
             data.data_ptr(),
-            ssm=ssm,
+            component=KVCacheComponent.SSM if ssm else None,
             strided=strided,
             endpoint=endpoint,
             device=f"cuda:{gpu}",
