@@ -398,6 +398,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     bool use_flagcx = (proto == "flagcx");
     std::unique_ptr<TransferEngine> candidate;
     auto failInitialization = [&]() {
+#ifdef USE_TENT
         // A failed candidate may already have published the same segment name.
         // Keep the original wrapper alive and restore its metadata before the
         // candidate's ownership-checked destructor runs.
@@ -412,6 +413,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                 }
             }
         }
+#endif
         return -1;
     };
 
