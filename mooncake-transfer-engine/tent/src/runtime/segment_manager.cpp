@@ -87,7 +87,11 @@ Status SegmentManager::updateLocal(
     // No concurrent writer exists (serialized by local_update_mu_), so
     // reading local_desc_ without local_desc_lock_ is safe here.
     auto next = std::make_shared<SegmentDesc>(*local_desc_);
-    CHECK_STATUS(mutator(*next));
+    auto mutation_status = mutator(*next);
+    if (!mutation_status.ok()) {
+        TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::MutationError);
+        return mutation_status;
+    }
     {
         std::unique_lock<std::shared_mutex> guard(local_desc_lock_);
         local_desc_ = std::move(next);
@@ -103,6 +107,7 @@ Status SegmentManager::updateLocal(
         std::lock_guard<std::mutex> jg(local_json_cache_mu_);
         local_json_cache_.reset();
     }
+    TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::SnapshotPublished);
     return Status::OK();
 }
 
@@ -276,7 +281,12 @@ Status SegmentManager::synchronizeLocal() {
         // from peers until the next synchronizeLocal call.
         std::lock_guard<std::mutex> g(local_sync_mu_);
         auto snapshot = getLocal();
-        CHECK_STATUS(registry_->putSegmentDesc(snapshot));
+        auto publish_status = registry_->putSegmentDesc(snapshot);
+        TENT_RECORD_SEGMENT_EVENT(
+            publish_status.ok()
+                ? TentMetrics::SegmentEvent::RegistryPublishSuccess
+                : TentMetrics::SegmentEvent::RegistryPublishError);
+        if (!publish_status.ok()) return publish_status;
     }
 
     std::vector<std::string> subscribers_snapshot;
@@ -307,8 +317,14 @@ Status SegmentManager::synchronizeLocal() {
 }
 
 Status SegmentManager::deleteLocal() {
-    return registry_->deleteSegmentDesc(getLocal()->name);
+    auto status = registry_->deleteSegmentDesc(getLocal()->name);
+    TENT_RECORD_SEGMENT_EVENT(
+        status.ok() ? TentMetrics::SegmentEvent::RegistryDeleteSuccess
+                    : TentMetrics::SegmentEvent::RegistryDeleteError);
+    return status;
 }
 
 }  // namespace tent
 }  // namespace mooncake
+
+#undef TENT_RECORD_SEGMENT_EVENT
