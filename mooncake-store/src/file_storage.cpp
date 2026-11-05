@@ -116,9 +116,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 #endif
 }
 
-FileStorage::~FileStorage() {
-    Shutdown();
-}
+FileStorage::~FileStorage() { Shutdown(); }
 
 void FileStorage::Shutdown() {
     std::lock_guard shutdown_lock(shutdown_mutex_);
@@ -241,7 +239,8 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             Heartbeat();
             std::unique_lock wait_lock(worker_wait_mutex_);
             worker_wait_cv_.wait_for(
-                wait_lock, std::chrono::seconds(config_.heartbeat_interval_seconds),
+                wait_lock,
+                std::chrono::seconds(config_.heartbeat_interval_seconds),
                 [this] { return !heartbeat_running_.load(); });
         }
     });

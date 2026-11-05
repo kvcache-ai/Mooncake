@@ -9689,7 +9689,8 @@ RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
                     }
                     slot.buffer = std::shared_ptr<void>(
                         buffer, [](void *ptr) { free(ptr); });
-                    slot.release_registration = client->WeightMemoryRelease(buffer);
+                    slot.release_registration =
+                        client->WeightMemoryRelease(buffer);
                     slot.client_id = client->getClientId();
                 }
                 slot.busy = true;

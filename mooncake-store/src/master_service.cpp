@@ -6134,8 +6134,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     const ResolvedSoftPinRequest& soft_pin_request = plan->soft_pin_request;
 
     auto member_tier = weight_manager_.ResolveImportMemberTier(
-        object_id.tenant_id, group_id, key, slice_length,
-        residency_affinity_id, config.data_type);
+        object_id.tenant_id, group_id, key, slice_length, residency_affinity_id,
+        config.data_type);
     if (!member_tier) return tl::make_unexpected(member_tier.error());
     if (*member_tier == WeightResidencyState::COLD)
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);

@@ -4286,7 +4286,8 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
 std::function<tl::expected<void, ErrorCode>()> Client::WeightMemoryRelease(
     void* address) const {
     // Quarantine retains transport registration, not Client worker threads.
-    return [engine = transfer_engine_, address]() -> tl::expected<void, ErrorCode> {
+    return [engine = transfer_engine_,
+            address]() -> tl::expected<void, ErrorCode> {
         const int result = engine->unregisterLocalMemory(address, true);
         if (result != 0 && result != ERR_ADDRESS_NOT_REGISTERED) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);

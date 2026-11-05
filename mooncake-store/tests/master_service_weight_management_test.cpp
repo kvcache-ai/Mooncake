@@ -259,7 +259,8 @@ TEST_F(MasterServiceWeightManagementTest,
             .has_value());
 }
 
-TEST_F(MasterServiceWeightManagementTest, RejectsWrongManifestTypeBeforeAllocation) {
+TEST_F(MasterServiceWeightManagementTest,
+       RejectsWrongManifestTypeBeforeAllocation) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
