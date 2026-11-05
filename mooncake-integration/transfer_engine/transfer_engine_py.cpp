@@ -1227,8 +1227,14 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         } else {
             handle = engine_->openSegment(target_hostname);
             // batch_id_t is unsigned; 0 is the documented failure sentinel
-            // (-1 would surface as 2^64 - 1 in Python).
-            if (handle == (Transport::SegmentHandle)-1) return 0;
+            // (-1 would surface as 2^64 - 1 in Python). Event mode must not
+            // reuse that sentinel: a caller cannot tell it from success.
+            if (handle == (Transport::SegmentHandle)-1) {
+                if (enable_completion_notification) {
+                    throw std::runtime_error("openSegment failed");
+                }
+                return 0;
+            }
             handle_map_[target_hostname] = handle;
         }
     }
@@ -1237,6 +1243,11 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         buffers.size() != lengths.size()) {
         LOG(ERROR)
             << "buffers, peer_buffer_addresses and lengths have different size";
+        if (enable_completion_notification) {
+            throw std::runtime_error(
+                "buffers, peer_buffer_addresses and lengths have different "
+                "size");
+        }
         return 0;
     }
 
@@ -1285,12 +1296,23 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
-            engine_->freeBatchID(batch_id);
+            // freeBatchID may return BatchCleanupDeferred while transport
+            // work still owns the buffers. Wait that out before throwing, so
+            // the exception means those buffers may be reused. A hard free
+            // error does not establish that.
+            Status freed = engine_->freeBatchID(batch_id);
+            std::string release;
+            if (freed.IsBatchCleanupDeferred()) {
+                engine_->waitUntilDeferredCleanupDone(batch_id);
+            } else if (!freed.ok()) {
+                release = "; buffers may still be in use: " + freed.ToString();
+            }
             if (enable_completion_notification) {
+                const std::string msg = s.ToString() + release;
                 if (s.IsNotSupportedTransport()) {
-                    throw CompletionNotificationFallback(s.ToString());
+                    throw CompletionNotificationFallback(msg);
                 }
-                throw std::runtime_error(s.ToString());
+                throw std::runtime_error(msg);
             }
             return 0;
         } else {

@@ -2,6 +2,9 @@
 // Licensed under the Apache License, Version 2.0.
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <vector>
 #ifdef __linux__
 #include <poll.h>
@@ -590,6 +593,12 @@ TEST_F(BatchCounterWait, PartialSliceFailureDoesNotWakeUntilTaskDone) {
     ASSERT_TRUE(multi.drainCompletions(done).ok());
     ASSERT_EQ(done.size(), 1u);
     EXPECT_EQ(done[0].status.s, Transport::FAILED);
+    // The successful 17-byte slice must not be counted. The status query
+    // also ignores a FAILED task's bytes.
+    EXPECT_EQ(done[0].status.transferred_bytes, 0u);
+    auto queried = query(b);
+    EXPECT_EQ(queried.s, Transport::FAILED);
+    EXPECT_EQ(queried.transferred_bytes, 0u);
 #endif
 }
 
@@ -656,8 +665,128 @@ TEST(CompletionEventFd, DestroyClosesOriginalFd) {
     pollfd held{};
     held.fd = duped;
     held.events = POLLIN;
-    EXPECT_EQ(::poll(&held, 1, 0), 0);
+    // Destruction writes the counter before close, so a dup wakes.
+    ASSERT_EQ(::poll(&held, 1, 0), 1);
+    EXPECT_NE(held.revents & POLLIN, 0);
     ::close(duped);
+#endif
+}
+
+TEST(CompletionEventFd, DestroyWakesBlockedWaiter) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto md = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    std::string local = "eventfd-wake:1";
+    int duped = -1;
+    std::atomic<int> entered{0};
+    std::atomic<int> woke{-1};
+    std::thread waiter;
+    {
+        MultiTransport multi(md, local);
+        duped = ::dup(multi.completionFd());
+        ASSERT_GE(duped, 0);
+        waiter = std::thread([&] {
+            pollfd held{};
+            held.fd = duped;
+            held.events = POLLIN;
+            entered.store(1);
+            woke.store(::poll(&held, 1, 5000));
+        });
+        while (entered.load() == 0) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    waiter.join();
+    EXPECT_EQ(woke.load(), 1);
+    uint64_t value = 0;
+    ASSERT_EQ(::read(duped, &value, sizeof(value)),
+              static_cast<ssize_t>(sizeof(value)));
+    EXPECT_GE(value, 1u);
+    pollfd again{};
+    again.fd = duped;
+    again.events = POLLIN;
+    EXPECT_EQ(::poll(&again, 1, 0), 0);
+    ::close(duped);
+#endif
+}
+
+TEST_F(BatchCounterWait, EmptyEventSubmitRejected) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    std::vector<Transport::TransferRequest> empty;
+    auto rejected = multi.submitTransfer(b, empty);
+    EXPECT_TRUE(rejected.IsInvalidArgument());
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    // The rejected empty submit did not consume the one submission.
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(0);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, b);
+#endif
+}
+
+TEST_F(BatchCounterWait, NonOptInRdmaDoesNotPublish) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(submit(b, {1}).ok());
+    rdma->finish(0);
+    EXPECT_EQ(query(b).s, Transport::COMPLETED);
+    EXPECT_EQ(query(b).transferred_bytes, 17u);
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    EXPECT_TRUE(done.empty());
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
+#endif
+}
+
+TEST_F(BatchCounterWait, ConcurrentFinishDrainAndFree) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    ASSERT_TRUE(submit(b, {1}).ok());
+    std::atomic<bool> go{false};
+    std::vector<BatchCompletion> drained;
+    std::thread finisher([&] {
+        while (!go.load()) std::this_thread::yield();
+        rdma->finish(0);
+    });
+    std::thread drainer([&] {
+        while (!go.load()) std::this_thread::yield();
+        for (int i = 0; i < 1000 && drained.empty(); ++i) {
+            std::vector<BatchCompletion> got;
+            if (!multi.drainCompletions(got).ok()) continue;
+            drained.insert(drained.end(), got.begin(), got.end());
+        }
+    });
+    go.store(true);
+    finisher.join();
+    drainer.join();
+    if (drained.empty()) {
+        ASSERT_TRUE(multi.drainCompletions(drained).ok());
+    }
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_EQ(drained[0].batch_id, b);
+    EXPECT_EQ(drained[0].status.s, Transport::COMPLETED);
+    EXPECT_EQ(drained[0].status.transferred_bytes, 17u);
+    ASSERT_TRUE(multi.freeBatchID(b).ok());
+    forget(batches, b);
 #endif
 }
 }  // namespace
