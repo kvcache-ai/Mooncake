@@ -112,13 +112,7 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     // Share one export across NICs. In particular, repeated CNDrv exports
     // must not create a separate dma-buf mapping for each context.
     DmabufExport handle;
-    struct ExportGuard {
-        DmabufExport& handle;
-        ~ExportGuard() {
-            if (handle.close_fd && handle.fd >= 0 && close(handle.fd) != 0)
-                PLOG(WARNING) << "Failed to close dma-buf fd";
-        }
-    } export_guard{handle};
+    DmabufExportGuard export_guard{handle};
     for (auto* context : context_list_) {
         if (!context || !context->supportsDmabuf()) continue;
         auto status =

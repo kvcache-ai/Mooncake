@@ -622,13 +622,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(
         } else {
             s = exportDmabuf(addr, length, handle);
         }
-        struct ExportGuard {
-            DmabufExport& handle;
-            ~ExportGuard() {
-                if (handle.close_fd && handle.fd >= 0 && close(handle.fd) != 0)
-                    PLOG(WARNING) << "Failed to close dma-buf fd";
-            }
-        } export_guard{handle};
+        DmabufExportGuard export_guard{handle};
         if (s.ok()) {
             ibv_mr* entry = verbs_.ibv_reg_dmabuf_mr(
                 native_pd_, handle.offset, length,

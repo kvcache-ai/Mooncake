@@ -240,11 +240,8 @@ Status MluPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
     // to be aligned to the host page size. Derive export_base and export_size
     // from the allocation and requested range, rejecting ranges that cannot
     // be aligned without extending beyond the allocation.
-    CNaddr export_base = base;
     if (allocation_size > std::numeric_limits<size_t>::max())
         return Status::InvalidArgument("MLU allocation is too large" LOC_MARK);
-    size_t export_size = static_cast<size_t>(allocation_size);
-    uint64_t offset = address - base;
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0)
         return Status::InternalError("Unable to query page size" LOC_MARK);
@@ -253,14 +250,11 @@ Status MluPlatform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
     if (aligned < base)
         return Status::NotImplemented(
             "MLU DMA-BUF export base is not host-page aligned" LOC_MARK);
-    if (offset || length != allocation_size) {
-        export_base = static_cast<CNaddr>(aligned);
-        offset = address - aligned;
-        if (offset > std::numeric_limits<size_t>::max() - length)
-            return Status::InvalidArgument(
-                "MLU DMA-BUF size overflow" LOC_MARK);
-        export_size = offset + length;
-    }
+    const CNaddr export_base = static_cast<CNaddr>(aligned);
+    const uint64_t offset = address - aligned;
+    if (offset > std::numeric_limits<size_t>::max() - length)
+        return Status::InvalidArgument("MLU DMA-BUF size overflow" LOC_MARK);
+    size_t export_size = offset + length;
     if (export_size > std::numeric_limits<size_t>::max() - (page - 1))
         return Status::InvalidArgument("MLU DMA-BUF size overflow" LOC_MARK);
     export_size = ((export_size + page - 1) / page) * page;

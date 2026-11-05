@@ -52,6 +52,14 @@ struct DmabufExport {
     int fd = -1;
     uint64_t offset = 0;
     bool close_fd = false;
+
+    // Close only caller-owned descriptors; safe to call more than once.
+    void close();
+};
+
+struct DmabufExportGuard {
+    DmabufExport &handle;
+    ~DmabufExportGuard() { handle.close(); }
 };
 
 class Platform {
