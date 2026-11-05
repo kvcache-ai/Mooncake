@@ -42,6 +42,7 @@ ErrorCode OpLogBatchStandbyReader::SetBaselineCursor(
     require_complete_history_ = cursor.batch_id == 0;
     last_observed_prefix_ = cursor;
     last_applied_durable_prefix_ = cursor;
+    last_complete_batch_prefix_ = cursor;
     last_applied_batch_id_ = cursor.batch_id;
     last_scanned_batch_last_seq_ =
         cursor.batch_id == 0 ? std::nullopt
@@ -126,6 +127,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
         } else if (applier_.GetExpectedSequenceId() == 1) {
             last_applied_durable_prefix_ = prefix;
+            last_complete_batch_prefix_ = prefix;
         }
         return result;
     }
@@ -215,6 +217,13 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
         ++result.applied_batches;
         last_applied_batch_id_ = batch.batch_id;
         last_scanned_batch_last_seq_ = batch.last_seq;
+        const uint64_t expected = applier_.GetExpectedSequenceId();
+        if (batch.batch_id <= prefix.batch_id &&
+            batch.last_seq <= prefix.last_seq && expected > 0 &&
+            expected - 1 == batch.last_seq) {
+            last_complete_batch_prefix_ = DurablePrefix{
+                .batch_id = batch.batch_id, .last_seq = batch.last_seq};
+        }
         if (last_applied_batch_id_ >= prefix.batch_id) {
             break;
         }
