@@ -54,7 +54,7 @@ class WeightColdImportE2ETest : public ::testing::Test {
     }
 
     void Import(WeightResidencyState target, bool batch, bool local,
-                const std::vector<size_t>& sizes) {
+                const std::vector<size_t>& sizes, size_t replicas = 1) {
         ASSERT_TRUE(owner_);
         const std::string hot_control(64 * 1024, 'h');
         ASSERT_EQ(0, source_->put("hot-control", hot_control));
@@ -101,7 +101,7 @@ class WeightColdImportE2ETest : public ::testing::Test {
         ASSERT_TRUE(begin && begin->has_value());
         const auto group = (*begin)->manifest.payload_group_id;
         ReplicateConfig config;
-        config.replica_num = 1;
+        config.replica_num = replicas;
         config.data_type = ObjectDataType::WEIGHT;
         auto* writer = local ? owner_.get() : source_.get();
         if (batch) {
@@ -110,6 +110,12 @@ class WeightColdImportE2ETest : public ::testing::Test {
             auto result =
                 writer->batch_put_from(keys, addresses, sizes, config);
             ASSERT_EQ(result.size(), keys.size());
+            if (replicas != 1) {
+                for (const auto status : result)
+                    EXPECT_EQ(status,
+                              static_cast<int>(ErrorCode::NOT_SUPPORTED));
+                return;
+            }
             for (const auto status : result) ASSERT_EQ(status, 0);
         } else {
             for (size_t index = 0; index < keys.size(); ++index) {
@@ -158,12 +164,19 @@ class WeightColdImportE2ETest : public ::testing::Test {
             const bool hot =
                 std::find(hot_affinities.begin(), hot_affinities.end(),
                           affinity_ids[index]) != hot_affinities.end();
-            ASSERT_EQ(placements[index]->replicas.size(), 1u);
-            EXPECT_TRUE(
-                hot ? placements[index]->replicas.front().is_memory_replica()
-                    : placements[index]
-                          ->replicas.front()
-                          .is_local_disk_replica());
+            EXPECT_TRUE(std::any_of(
+                placements[index]->replicas.begin(),
+                placements[index]->replicas.end(), [hot](const auto& replica) {
+                    return hot ? replica.is_memory_replica()
+                               : replica.is_local_disk_replica();
+                }));
+            if (!hot) {
+                EXPECT_TRUE(std::none_of(placements[index]->replicas.begin(),
+                                         placements[index]->replicas.end(),
+                                         [](const auto& replica) {
+                                             return replica.is_memory_replica();
+                                         }));
+            }
             std::string actual(sizes[index], '\0');
             ASSERT_EQ(0,
                       source_->register_buffer(actual.data(), actual.size()));
@@ -214,6 +227,12 @@ TEST_F(WeightColdImportE2ETest, RemoteBatchBypassesHotSegmentCapacity) {
 TEST_F(WeightColdImportE2ETest, MixedBatchOnlyKeepsPlannedAffinitiesHot) {
     Start(16 * kMiB);
     Import(WeightResidencyState::MIXED, true, false, {8 * kMiB, 24 * kMiB});
+}
+
+TEST_F(WeightColdImportE2ETest,
+       ColdImportDoesNotSilentlyDropReplicaRequirements) {
+    Start(16 * kMiB);
+    Import(WeightResidencyState::COLD, true, false, {32 * kMiB}, 2);
 }
 
 }  // namespace

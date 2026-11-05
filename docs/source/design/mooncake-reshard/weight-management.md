@@ -203,6 +203,10 @@ Each disk owner must enable local SSD offload. Its write dispatcher uses:
 | Locally addressable GPU memory without that capability | pinned-host staging, then file write |
 | Another client endpoint | Transfer Engine into the disk owner's staging, then file write |
 
+Direct cold imports currently support one local-SSD replica. Requests for
+additional replicas or a simultaneous NoF/DFS replica return NOT_SUPPORTED
+instead of silently reducing replication.
+
 Both source and destination staging pools have eight 4 MiB slots per process,
 independent of ordinary Store segments. The native storage format is written
 incrementally. Backend serialization admits one active stream per owner; lack

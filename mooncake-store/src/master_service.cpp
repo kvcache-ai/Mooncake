@@ -5476,6 +5476,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         object_id.tenant_id, plan->group_id, key, slice_length,
         plan->residency_affinity_id, config.data_type);
     if (!member_tier) return tl::make_unexpected(member_tier.error());
+    if (*member_tier == WeightResidencyState::COLD &&
+        (config.replica_num != 1 || config.nof_replica_num != 0 ||
+         config.dfs_replica_num != 0)) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     auto admit = [&](bool* dfs_allocation_failed)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -5760,13 +5765,17 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         // collected before the marker is recorded.
         std::optional<ReplicaID> source_id;
         std::vector<UUID> mirror_clients;
+        const bool managed_weight =
+            metadata.data_type == ObjectDataType::WEIGHT &&
+            weight_manager_.IsManagedGroup(metadata.group_id);
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
-                auto result =
-                    PushOffloadingQueue(object_id, replica, &mirror_clients);
+            [this, &object_id, &source_id, &mirror_clients,
+             managed_weight](Replica& replica) {
+                auto result = PushOffloadingQueue(
+                    object_id, replica, &mirror_clients, managed_weight);
                 if (result && !source_id.has_value()) {
                     replica.inc_refcnt();
                     source_id = replica.id();
