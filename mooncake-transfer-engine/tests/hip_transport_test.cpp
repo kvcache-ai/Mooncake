@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -31,7 +32,17 @@
 #include "cuda_alike.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"  // P2PHANDSHAKE
+#include "transport/hip_transport/hip_transport.h"
 #include "transport/transport.h"
+
+namespace mooncake {
+class HipTransportTestPeer {
+   public:
+    static hipStream_t nextStream(HipTransport* transport, int device) {
+        return transport->stream_pool_.getNextStream(device);
+    }
+};
+}  // namespace mooncake
 
 using namespace mooncake;
 
@@ -205,25 +216,79 @@ class HipTransportAsyncTest : public ::testing::Test {
 };
 
 #ifndef USE_EVENT_DRIVEN_COMPLETION
-// submitTransfer only enqueues the copy: a 1 GiB copy is still in flight at
-// the first poll, so freeBatchID defers cleanup, and the copy still lands.
-TEST_F(HipTransportAsyncTest, SubmitDoesNotWaitForCopy) {
-    constexpr size_t kBigLen = 1ull << 30;
-    void* src = allocRegistered(kBigLen, 0, 0x5A);
-    void* dst = allocRegistered(kBigLen, 0, 0);
+// Holds every copy stream of a device behind a GPU-side wait on a host flag
+// until release() or destruction, so a submitted copy cannot finish early.
+class StreamGate {
+   public:
+    StreamGate(Transport* transport, int device) {
+        int supported = 0;
+        if (hipDeviceGetAttribute(&supported,
+                                  hipDeviceAttributeCanUseStreamWaitValue,
+                                  device) != hipSuccess ||
+            !supported) {
+            return;
+        }
+        if (hipExtMallocWithFlags(reinterpret_cast<void**>(&flag_),
+                                  sizeof(*flag_),
+                                  hipMallocSignalMemory) != hipSuccess) {
+            flag_ = nullptr;
+            return;
+        }
+        *flag_ = 0;
+        // The pool hands out its streams round robin: gate each one until it
+        // comes around again.
+        auto* hip = static_cast<HipTransport*>(transport);
+        hipStream_t first = HipTransportTestPeer::nextStream(hip, device);
+        hipStream_t stream = first;
+        do {
+            if (stream == nullptr ||
+                hipStreamWaitValue64(stream, flag_, 1, hipStreamWaitValueEq) !=
+                    hipSuccess) {
+                release();
+                return;
+            }
+            stream = HipTransportTestPeer::nextStream(hip, device);
+        } while (stream != first);
+        armed_ = true;
+    }
+    ~StreamGate() { release(); }
 
+    bool armed() const { return armed_; }
+
+    void release() {
+        if (flag_ == nullptr) return;
+        __atomic_store_n(flag_, uint64_t{1}, __ATOMIC_RELEASE);
+        (void)hipDeviceSynchronize();
+        (void)hipFree(flag_);
+        flag_ = nullptr;
+    }
+
+   private:
+    uint64_t* flag_ = nullptr;
+    bool armed_ = false;
+};
+
+// submitTransfer only enqueues the copy: while the copy streams are held,
+// the task stays WAITING and freeBatchID defers cleanup; once they are let
+// go, the copy lands.
+TEST_F(HipTransportAsyncTest, SubmitDoesNotWaitForCopy) {
+    void* src = allocRegistered(kLen, 0, 0x5A);
+    void* dst = allocRegistered(kLen, 0, 0);
+
+    StreamGate gate(engine_->getTransport("hip"), 0);
+    if (!gate.armed()) GTEST_SKIP() << "hipStreamWaitValue64 unsupported.";
     auto batch_id = engine_->allocateBatchID(1);
     ASSERT_TRUE(engine_
                     ->submitTransfer(batch_id, {request(TransferRequest::WRITE,
-                                                        src, dst, kBigLen)})
+                                                        src, dst, kLen)})
                     .ok());
     TransferStatus status;
     ASSERT_TRUE(engine_->getTransferStatus(batch_id, 0, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::WAITING);
     EXPECT_TRUE(engine_->freeBatchID(batch_id).IsBatchCleanupDeferred());
 
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    EXPECT_TRUE(allEqual((char*)dst + kBigLen - kLen, kLen, 0x5A));
+    gate.release();
+    EXPECT_TRUE(allEqual(dst, kLen, 0x5A));
 }
 #else
 // Event-driven waiters (Mooncake Store) block on the batch's condition
@@ -365,9 +430,14 @@ TEST(HipIpcTest, TwoProcessCopies) {
     posix_spawn_file_actions_addclose(&actions, to_child[1]);
     posix_spawn_file_actions_addclose(&actions, from_child[0]);
     // Ours come first, so they win over the same names in the environment.
+    // Inherited GoogleTest settings are dropped: under sharding the child's
+    // only test may belong to another shard, and it must not write the
+    // parent's report.
     std::vector<std::string> env = {"MC_HIP_TEST_IPC_TARGET=17820",
                                     "GTEST_FILTER=HipIpcTest.Target"};
-    for (char** e = environ; *e; ++e) env.emplace_back(*e);
+    for (char** e = environ; *e; ++e) {
+        if (strncmp(*e, "GTEST_", 6) != 0) env.emplace_back(*e);
+    }
     std::vector<char*> envp;
     for (auto& e : env) envp.push_back(e.data());
     envp.push_back(nullptr);
@@ -445,7 +515,11 @@ TEST(HipIpcTest, TwoProcessCopies) {
         engine.unregisterLocalMemory(ptr);
         (void)cudaFree(ptr);
     }
+    // Read the child's output to EOF: it still prints GoogleTest results
+    // after its stdin closes, and closing the pipe first could SIGPIPE it.
     close(to_child[1]);
+    while (fgets(line, sizeof(line), out)) {
+    }
     fclose(out);
     int wstatus = 0;
     ASSERT_EQ(waitpid(pid, &wstatus, 0), pid);

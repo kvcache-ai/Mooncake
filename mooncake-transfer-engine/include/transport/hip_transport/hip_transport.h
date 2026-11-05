@@ -67,6 +67,8 @@ class HipTransport : public Transport {
     const char* getName() const override { return "hip"; }
 
    private:
+    friend class HipTransportTestPeer;
+
     struct OpenedShmEntry {
         void* shm_addr;
         uint64_t length;
@@ -79,7 +81,9 @@ class HipTransport : public Transport {
             tasks);
 
     // Enqueue one device's copies on one stream, followed by one event.
-    void submitDeviceCopies(int device_id, const std::vector<Slice*>& slices);
+    // Slices that could not be enqueued are failed and reported in the
+    // returned status; the others stay tracked by the event.
+    Status submitDeviceCopies(int device_id, const std::vector<Slice*>& slices);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;

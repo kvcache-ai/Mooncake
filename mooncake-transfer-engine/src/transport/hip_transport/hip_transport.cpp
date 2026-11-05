@@ -509,17 +509,18 @@ void releaseSliceEvent(Transport::Slice* slice) {
 
 }  // namespace
 
-void HipTransport::submitDeviceCopies(int device_id,
-                                      const std::vector<Slice*>& slices) {
+Status HipTransport::submitDeviceCopies(int device_id,
+                                        const std::vector<Slice*>& slices) {
     hipStream_t stream = stream_pool_.getNextStream(device_id);
     hipEvent_t event = stream ? event_pool_.getEvent(device_id) : nullptr;
     if (event == nullptr) {
         LOG(ERROR) << "HipTransport: failed to get a stream or event on device "
                    << device_id;
         for (Slice* slice : slices) slice->markFailed();
-        return;
+        return Status::Memory("HipTransport: failed to get a stream or event");
     }
 
+    Status status = Status::OK();
     std::vector<Slice*> posted;
     for (Slice* slice : slices) {
         hipError_t err;
@@ -534,11 +535,15 @@ void HipTransport::submitDeviceCopies(int device_id,
             posted.push_back(slice);
         } else {
             slice->markFailed();
+            if (status.ok()) {
+                status =
+                    Status::Memory("HipTransport: async memory copy failed");
+            }
         }
     }
     if (posted.empty()) {
         event_pool_.putEvent(event, device_id);
-        return;
+        return status;
     }
 
     if (!checkHip(hipEventRecord(event, stream),
@@ -547,7 +552,7 @@ void HipTransport::submitDeviceCopies(int device_id,
         event_pool_.putEvent(event, device_id);
         (void)hipStreamSynchronize(stream);
         for (Slice* slice : posted) slice->markFailed();
-        return;
+        return Status::Memory("HipTransport: failed to record event");
     }
 
     auto* completion =
@@ -556,6 +561,7 @@ void HipTransport::submitDeviceCopies(int device_id,
         slice->status = Slice::POSTED;
         __atomic_store_n(&slice->local.hip_event, completion, __ATOMIC_RELEASE);
     }
+    return status;
 }
 
 Status HipTransport::submitTasks(
@@ -610,13 +616,20 @@ Status HipTransport::submitTasks(
         device_slices[device_ids[i]].push_back(slice);
     }
 
+    // A failure on one device fails only its slices: copies already enqueued
+    // on other devices stay tracked by their events, and the first error is
+    // returned.
     for (auto& [device_id, slices] : device_slices) {
+        Status device_status = Status::OK();
         if (!checkHip(hipSetDevice(device_id),
                       "HipTransport: failed to set device context")) {
             for (Slice* slice : slices) slice->markFailed();
-            continue;
+            device_status =
+                Status::InvalidArgument("failed to set device context");
+        } else {
+            device_status = submitDeviceCopies(device_id, slices);
         }
-        submitDeviceCopies(device_id, slices);
+        if (status.ok()) status = device_status;
     }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
