@@ -33,7 +33,8 @@ bool SameImport(const WeightRevisionMetadata& metadata,
            metadata.manifest.logical_bytes == request.expected_logical_bytes &&
            metadata.policy == request.policy.value_or(WeightStoragePolicy{}) &&
            metadata.affinity_count == request.affinity_summary.affinity_count &&
-           metadata.affinity_digest == request.affinity_summary.affinity_digest &&
+           metadata.affinity_digest ==
+               request.affinity_summary.affinity_digest &&
            (metadata.availability != WeightAvailabilityState::IMPORTING ||
             metadata.import_layout == request.payload_layout);
 }
@@ -117,10 +118,10 @@ std::string ComputeWeightPayloadKeysSha256(
 std::string ComputeWeightAffinityMappingSha256(
     const std::vector<WeightAffinityMappingEntry>& entries) {
     auto sorted = entries;
-    std::sort(sorted.begin(), sorted.end(), [](const auto& left,
-                                             const auto& right) {
-        return left.key < right.key;
-    });
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& left, const auto& right) {
+                  return left.key < right.key;
+              });
     std::vector<std::string> storage;
     storage.reserve(sorted.size() * 4);
     std::vector<std::string_view> chunks{"weight-affinity-mapping-v1\n"};

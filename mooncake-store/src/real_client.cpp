@@ -2748,10 +2748,12 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.data_type == ObjectDataType::WEIGHT) {
-        auto slices = split_into_slices(const_cast<char*>(value.data()), value.size_bytes());
+        auto slices = split_into_slices(const_cast<char *>(value.data()),
+                                        value.size_bytes());
         std::vector<BufferHandle> staging_handles;
-        return client_->Put(key, slices, config, [&](const auto& raw_slices) {
-            return StageWriteSlices(client_buffer_allocator, raw_slices, staging_handles);
+        return client_->Put(key, slices, config, [&](const auto &raw_slices) {
+            return StageWriteSlices(client_buffer_allocator, raw_slices,
+                                    staging_handles);
         });
     }
     auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
@@ -2836,13 +2838,17 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     }
     if (config.data_type == ObjectDataType::WEIGHT) {
         std::vector<std::vector<Slice>> raw_slices;
-        for (const auto& value : values)
-            raw_slices.push_back(split_into_slices(const_cast<char*>(value.data()), value.size_bytes()));
+        for (const auto &value : values)
+            raw_slices.push_back(split_into_slices(
+                const_cast<char *>(value.data()), value.size_bytes()));
         std::vector<BufferHandle> staging_handles;
-        auto results = client_->BatchPut(keys, raw_slices, config, [&](const auto& slices) {
-            return StageWriteSlices(client_buffer_allocator, slices, staging_handles);
-        });
-        for (const auto& result : results) if (!result) return tl::make_unexpected(result.error());
+        auto results = client_->BatchPut(
+            keys, raw_slices, config, [&](const auto &slices) {
+                return StageWriteSlices(client_buffer_allocator, slices,
+                                        staging_handles);
+            });
+        for (const auto &result : results)
+            if (!result) return tl::make_unexpected(result.error());
         return {};
     }
     std::vector<BufferHandle> buffer_handles;

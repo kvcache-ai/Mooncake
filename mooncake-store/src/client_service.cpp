@@ -2080,10 +2080,9 @@ ErrorCode Client::ReadColdStagingChunk(const std::string& endpoint,
     return TransferRead(source, slices);
 }
 
-tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
-                                          std::vector<Slice>& slices,
-                                          const ReplicateConfig& config,
-                                          const WriteBufferStager& prepare_memory) {
+tl::expected<void, ErrorCode> Client::Put(
+    const ObjectKey& key, std::vector<Slice>& slices,
+    const ReplicateConfig& config, const WriteBufferStager& prepare_memory) {
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(

@@ -24,7 +24,8 @@ class FileStorage {
     tl::expected<void, ErrorCode> Init();
 
     void RemoveAll();
-    tl::expected<void, ErrorCode> PrepareColdWrite(const ColdWriteRequest& request);
+    tl::expected<void, ErrorCode> PrepareColdWrite(
+        const ColdWriteRequest& request);
     tl::expected<void, ErrorCode> RecoverOffloadedObjects(
         const std::vector<std::string>& keys,
         std::vector<StorageObjectMetadata>& metadatas);

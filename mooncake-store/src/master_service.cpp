@@ -5510,7 +5510,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     metadata.GrantReadLease(
                         std::chrono::milliseconds(default_kv_lease_ttl_));
                 }
-                if (*member_tier == WeightResidencyState::COLD && !HasReadableReplica(metadata))
+                if (*member_tier == WeightResidencyState::COLD &&
+                    !HasReadableReplica(metadata))
                     return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }

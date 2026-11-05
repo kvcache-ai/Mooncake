@@ -193,7 +193,8 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
-    cold_write_journal_ = std::make_unique<ColdWriteJournal>(config_.storage_filepath);
+    cold_write_journal_ =
+        std::make_unique<ColdWriteJournal>(config_.storage_filepath);
     auto journal_initialized = cold_write_journal_->Init();
     if (!journal_initialized) return journal_initialized;
 
@@ -474,8 +475,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         bool success = false;
         auto found = sources.find(task.key);
         if (queried && found != sources.end()) {
-            ColdWriteRequest recovery_fence{client_->getClientId(), client_->getClientId(), 0,
-                task.tenant_id, task.key, static_cast<uint64_t>(task.size), 0, std::nullopt};
+            ColdWriteRequest recovery_fence{client_->getClientId(),
+                                            client_->getClientId(),
+                                            0,
+                                            task.tenant_id,
+                                            task.key,
+                                            static_cast<uint64_t>(task.size),
+                                            0,
+                                            std::nullopt};
             auto journaled = PrepareColdWrite(recovery_fence);
             if (!journaled) return journaled;
             auto result = OffloadStream(
@@ -1057,13 +1064,17 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     return {};
 }
 
-tl::expected<void, ErrorCode> FileStorage::PrepareColdWrite(const ColdWriteRequest& request) {
-    if (!cold_write_journal_) return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
-    return cold_write_journal_->Put(TenantId(request.tenant).MakeScopedKey(request.key), request);
+tl::expected<void, ErrorCode> FileStorage::PrepareColdWrite(
+    const ColdWriteRequest& request) {
+    if (!cold_write_journal_)
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
+    return cold_write_journal_->Put(
+        TenantId(request.tenant).MakeScopedKey(request.key), request);
 }
 
 tl::expected<void, ErrorCode> FileStorage::RecoverOffloadedObjects(
-    const std::vector<std::string>& keys, std::vector<StorageObjectMetadata>& metadatas) {
+    const std::vector<std::string>& keys,
+    std::vector<StorageObjectMetadata>& metadatas) {
     auto entries = cold_write_journal_->List();
     if (!entries) return tl::make_unexpected(entries.error());
     std::vector<std::string> ordinary_keys;
@@ -1072,11 +1083,13 @@ tl::expected<void, ErrorCode> FileStorage::RecoverOffloadedObjects(
         auto found = entries->find(keys[i]);
         if (found != entries->end()) {
             // A cold record never falls through to generic AddReplica recovery.
-            // A changed owner incarnation requires an explicit reattach protocol.
+            // A changed owner incarnation requires an explicit reattach
+            // protocol.
             if (found->second.owner == client_->getClientId()) {
                 auto recovered = client_->FinishColdWrite(found->second);
-                if (!recovered) LOG(WARNING) << "Cold recovery deferred for key=" << keys[i]
-                                             << ", error=" << recovered.error();
+                if (!recovered)
+                    LOG(WARNING) << "Cold recovery deferred for key=" << keys[i]
+                                 << ", error=" << recovered.error();
             }
             continue;
         }
@@ -1084,7 +1097,8 @@ tl::expected<void, ErrorCode> FileStorage::RecoverOffloadedObjects(
         ordinary_metadata.push_back(metadatas[i]);
     }
     if (ordinary_keys.empty()) return {};
-    auto tasks = BuildOffloadTasksFromStorageKeys(ordinary_keys, ordinary_metadata);
+    auto tasks =
+        BuildOffloadTasksFromStorageKeys(ordinary_keys, ordinary_metadata);
     return client_->NotifyOffloadSuccess(tasks, ordinary_metadata);
 }
 
@@ -1675,7 +1689,8 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = local_rpc_addr_;
                 }
-                auto add_object_result = RecoverOffloadedObjects(keys, metadatas);
+                auto add_object_result =
+                    RecoverOffloadedObjects(keys, metadatas);
                 if (!add_object_result) {
                     total_failures++;
                     LOG(ERROR)
