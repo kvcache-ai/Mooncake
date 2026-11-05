@@ -299,18 +299,27 @@ bool LocalSsdManager::CancelOffloadsIfAllPending(
         mailbox_locks.emplace_back(client.record->mailbox.mutex_);
     }
 
+    // Collect iterators while holding every mailbox lock; they stay valid
+    // until return because no other code path can touch the maps. Erasing
+    // through them avoids re-finding entries whose presence was already
+    // verified in the same critical section.
     const std::string index = tenant_id.MakeScopedKey(key);
+    using PendingOffloads = std::unordered_map<std::string, OffloadTaskItem>;
+    std::vector<std::pair<LocalSsdTaskMailbox*, PendingOffloads::iterator>>
+        found;
+    found.reserve(clients.size());
     for (const auto& client : clients) {
-        if (!client.record->mailbox.pending_offloads_.contains(index)) {
-            return false;
-        }
-    }
-    for (auto& client : clients) {
         auto& mailbox = client.record->mailbox;
         auto it = mailbox.pending_offloads_.find(index);
-        mailbox.pending_offload_bytes_ -=
+        if (it == mailbox.pending_offloads_.end()) {
+            return false;
+        }
+        found.emplace_back(&mailbox, it);
+    }
+    for (auto& [mailbox, it] : found) {
+        mailbox->pending_offload_bytes_ -=
             static_cast<uint64_t>(it->second.size);
-        mailbox.pending_offloads_.erase(it);
+        mailbox->pending_offloads_.erase(it);
     }
     return true;
 }
