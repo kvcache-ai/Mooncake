@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import asyncio
+import gc
 import json
 import logging
 import signal
+import socket
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -32,6 +35,7 @@ except ModuleNotFoundError:
     aiohttp_module.web = web_module
     sys.modules["aiohttp"] = aiohttp_module
     sys.modules["aiohttp.web"] = web_module
+    _unused_web = web_module
 
 try:
     from mooncake.store import MooncakeDistributedStore as _unused_store  # noqa: F401
@@ -131,6 +135,9 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.service.mounted_segment_ids = []
         self.service.last_mount_info = {}
         self.service._state_lock = asyncio.Lock()
+        self.service._http_runner = None
+        self.service._http_lock = asyncio.Lock()
+        self.service._store_tasks = set()
 
     async def test_start_store_service_passes_tenant_id_to_setup(self):
         fake_store = FakeStore()
@@ -319,7 +326,9 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         # subsequent same-path detection keeps working.
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/old")
 
-    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(self):
+    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(
+        self,
+    ):
         # A remount to the SAME path that fails to mount must not destroy the
         # still-healthy previous segments: the node keeps serving from them and
         # stays in decode mode (make-before-break). Same-path MBB is safe here
@@ -397,7 +406,9 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.current_mode, "decode")
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/new")
 
-    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(self):
+    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(
+        self,
+    ):
         # New mount succeeds, but retiring the previous segments only PARTIALLY
         # fails. unmount_segment reports the first error for a batch, so the old
         # ids must be unmounted individually; mounted_segment_ids must then hold
@@ -596,7 +607,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_handle_put_missing_value(self):
         self.fake_store.put = lambda key, value: 0
         resp = await self.service.handle_put(FakeRequest({"key": "k"}))
-        self.assertEqual(resp.status, 500)
+        self.assertEqual(resp.status, 400)
 
     async def test_handle_put_store_failure(self):
         self.fake_store.put = lambda key, value: -1
@@ -847,7 +858,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.service.mounted_segment_ids = [sid]
         resp = await self.service.handle_reconfigure(FakeRequest({"mode": "prefill"}))
         self.assertEqual(resp.status, 200)
-        self.assertEqual(self.fake_store.unmount_calls, [[sid]])
+        self.assertEqual(self.fake_store.unmount_calls, [([sid], 0)])
         self.assertEqual(self.service.mounted_segment_ids, [])
         self.assertEqual(self.service.current_mode, "prefill")
 
@@ -888,7 +899,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(resp.status, 200)
-        self.assertEqual(self.fake_store.unmount_calls, [[old_id]])
+        self.assertEqual(self.fake_store.unmount_calls, [([old_id], 0)])
         self.assertEqual(self.service.current_mode, "decode")
 
     # ==================== /api/mount edge cases ====================
@@ -985,7 +996,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         self.assertEqual(
             self.fake_store.unmount_calls,
-            [["00000000-0000-0000-0000-000000000001"]],
+            [(["00000000-0000-0000-0000-000000000001"], 0)],
         )
 
     async def test_unmount_shm_empty_list(self):
@@ -997,6 +1008,9 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.service = MooncakeStoreService.__new__(MooncakeStoreService)
         self.service.store = None
+        self.service._http_runner = None
+        self.service._http_lock = asyncio.Lock()
+        self.service._store_tasks = set()
         self.service.config = SimpleNamespace(
             local_hostname="localhost",
             metadata_server="P2PHANDSHAKE",
@@ -1008,6 +1022,8 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             enable_ssd_offload=False,
             ssd_offload_path="",
             tenant_id="",
+            enable_client_http_server=False,
+            client_http_port=9300,
         )
 
     async def test_shutdown_event_stops_startup_retry_sleep(self):
@@ -1077,9 +1093,7 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             await self.service.stop()
 
         self.assertIsNone(self.service.store)
-        self.assertTrue(
-            any("close returned 7" in message for message in logs.output)
-        )
+        self.assertTrue(any("close returned 7" in message for message in logs.output))
         await self.service.stop()
         store.close.assert_called_once_with()
 
@@ -1142,6 +1156,197 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
         service.start_http_service.assert_not_awaited()
         service.stop.assert_awaited_once()
         self.assertEqual(startup_calls, ["install", "unblock"])
+
+
+@unittest.skipUnless(hasattr(_unused_web, "AppRunner"), "requires aiohttp")
+class StoreServiceHttpLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.service = MooncakeStoreService.__new__(MooncakeStoreService)
+        self.store = mock.Mock()
+        self.store.close.return_value = 0
+        self.service.store = self.store
+        self.service._http_runner = None
+        self.service._http_lock = asyncio.Lock()
+        self.service._store_tasks = set()
+        self.runners = []
+        self.shutdown_started = asyncio.Event()
+        self.cleanup_finished = asyncio.Event()
+        self.shutdown_timeout = 60
+        runner_class = _unused_web.AppRunner
+
+        async def on_shutdown(_app):
+            self.shutdown_started.set()
+
+        async def on_cleanup(_app):
+            self.cleanup_finished.set()
+
+        def make_runner(app):
+            app.on_shutdown.append(on_shutdown)
+            app.on_cleanup.append(on_cleanup)
+            runner = runner_class(app, shutdown_timeout=self.shutdown_timeout)
+            self.runners.append(runner)
+            # Also releases listeners when a regression fails against old code.
+            self.addAsyncCleanup(runner.cleanup)
+            return runner
+
+        patcher = patch(
+            "mooncake.mooncake_store_service.web.AppRunner", side_effect=make_runner
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_stop_releases_listener_and_is_idempotent(self):
+        await self.service.start_http_service(0)
+        port = self.runners[0].addresses[0][1]
+        await self.service.stop()
+        await self.service.stop()
+
+        server = await asyncio.get_running_loop().create_server(
+            asyncio.Protocol, "0.0.0.0", port
+        )
+        server.close()
+        await server.wait_closed()
+        self.store.close.assert_called_once_with()
+
+    async def test_stop_drains_requests_before_closing_store(self):
+        from aiohttp import ClientSession
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def handle_get(_request):
+            entered.set()
+            await release.wait()
+            return _unused_web.Response(
+                text="open" if self.service.store is self.store else "closed"
+            )
+
+        self.service.handle_get = handle_get
+        await self.service.start_http_service(0)
+        port = self.runners[0].addresses[0][1]
+        async with ClientSession() as session:
+            request = asyncio.ensure_future(
+                session.get(f"http://127.0.0.1:{port}/api/get/key")
+            )
+            await asyncio.wait_for(entered.wait(), 2)
+            stops = asyncio.gather(self.service.stop(), self.service.stop())
+            try:
+                await asyncio.wait_for(self.shutdown_started.wait(), 2)
+                self.store.close.assert_not_called()
+                self.assertFalse(stops.done())
+            finally:
+                release.set()
+                response = await asyncio.wait_for(request, 2)
+                await asyncio.wait_for(stops, 2)
+            async with response:
+                self.assertEqual(await response.text(), "open")
+        self.store.close.assert_called_once_with()
+
+    async def test_stop_waits_for_unmount_thread_after_http_shutdown_timeout(self):
+        from aiohttp import ClientSession
+
+        self.shutdown_timeout = 0.01
+        entered = asyncio.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def unmount(_grace_period_seconds):
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(5)
+            finished.set()
+            return 0
+
+        self.store.unmount_local_disk_segment.side_effect = unmount
+        await self.service.start_http_service(0)
+        port = self.runners[0].addresses[0][1]
+        async with ClientSession() as session:
+            request = asyncio.ensure_future(
+                session.post(
+                    f"http://127.0.0.1:{port}/api/unmount_local_disk",
+                    json={"grace_period_seconds": 120},
+                )
+            )
+            stop = None
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                stop = asyncio.create_task(self.service.stop())
+                await asyncio.wait_for(self.cleanup_finished.wait(), 2)
+                self.assertFalse(finished.is_set())
+                self.store.close.assert_not_called()
+                self.assertFalse(stop.done())
+            finally:
+                release.set()
+                await asyncio.wait_for(
+                    asyncio.gather(request, return_exceptions=True), 2
+                )
+                if stop is not None:
+                    await asyncio.wait_for(stop, 2)
+        self.assertTrue(finished.is_set())
+        self.store.close.assert_called_once_with()
+
+    async def test_cancelled_unmount_reports_background_failure_before_stop(self):
+        entered = asyncio.Event()
+        completed = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        loop_errors = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+
+        def unmount(_grace_period_seconds):
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(5)
+            raise RuntimeError("backend unmount failed")
+
+        self.store.unmount_local_disk_segment.side_effect = unmount
+        request = asyncio.create_task(
+            self.service.handle_unmount_local_disk(FakeRequest({}))
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            # Observe completion without awaiting/retrieving the worker result:
+            # doing so here would hide an unhandled background exception.
+            worker = next(iter(self.service._store_tasks))
+            worker.add_done_callback(lambda _task: completed.set())
+            request.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+            with mock.patch("mooncake.mooncake_store_service.logging.error") as log:
+                release.set()
+                await asyncio.wait_for(completed.wait(), 2)
+                del worker
+                gc.collect()
+                self.assertEqual(loop_errors, [])
+                self.assertTrue(
+                    any(
+                        "backend unmount failed" in str(call)
+                        for call in log.call_args_list
+                    )
+                )
+            await self.service.stop()
+            self.store.close.assert_called_once_with()
+        finally:
+            release.set()
+            loop.set_exception_handler(previous_handler)
+
+    async def test_failed_bind_cleans_runner_and_allows_retry(self):
+        with socket.socket() as occupied:
+            occupied.bind(("0.0.0.0", 0))
+            occupied.listen()
+            with self.assertRaises(OSError):
+                await self.service.start_http_service(occupied.getsockname()[1])
+        self.assertIsNone(self.runners[0].server)
+        self.assertTrue(await self.service.start_http_service(0))
+        await self.service.stop()
+
+    async def test_repeated_start_does_not_lose_original_runner(self):
+        await self.service.start_http_service(0)
+        with self.assertRaisesRegex(RuntimeError, "already started"):
+            await self.service.start_http_service(0)
+        self.assertEqual(len(self.runners), 1)
+        await self.service.stop()
+        self.assertEqual(self.runners[0].addresses, [])
 
 
 class ShmNameToPathTest(unittest.TestCase):

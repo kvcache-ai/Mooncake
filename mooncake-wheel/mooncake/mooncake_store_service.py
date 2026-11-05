@@ -41,9 +41,7 @@ def _shm_name_to_path(name):
 
 def _unblock_shutdown_signals():
     try:
-        signal.pthread_sigmask(
-            signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM}
-        )
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGTERM})
     except AttributeError:
         pass
 
@@ -92,6 +90,9 @@ class MooncakeStoreService:
 
     def __init__(self, config_path: str = None, cli_config: dict = None):
         self.store = None
+        self._http_runner = None
+        self._http_lock = asyncio.Lock()
+        self._store_tasks = set()
         self.config = None
         self._setup_logging()
 
@@ -126,9 +127,7 @@ class MooncakeStoreService:
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
-    async def start_store_service(
-        self, max_wait_time: float = 60, shutdown_event=None
-    ):
+    async def start_store_service(self, max_wait_time: float = 60, shutdown_event=None):
         """
         Start the store service with retry mechanism.
 
@@ -191,9 +190,7 @@ class MooncakeStoreService:
                     # chance to publish a shutdown requested while it ran.
                     await asyncio.sleep(0)
                     if shutdown_event.is_set():
-                        logging.info(
-                            "Store startup cancelled by shutdown request"
-                        )
+                        logging.info("Store startup cancelled by shutdown request")
                         await self.stop()
                         return False
 
@@ -228,9 +225,7 @@ class MooncakeStoreService:
                                 shutdown_event.wait(),
                                 timeout=actual_sleep_time,
                             )
-                            logging.info(
-                                "Store startup cancelled by shutdown request"
-                            )
+                            logging.info("Store startup cancelled by shutdown request")
                             return False
                         except asyncio.TimeoutError:
                             pass
@@ -274,10 +269,18 @@ class MooncakeStoreService:
                 ),
             ]
         )
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
+        async with self._http_lock:
+            if self._http_runner is not None:
+                raise RuntimeError("HTTP service already started")
+            runner = web.AppRunner(app)
+            try:
+                await runner.setup()
+                site = web.TCPSite(runner, "0.0.0.0", port)
+                await site.start()
+            except BaseException:
+                await runner.cleanup()
+                raise
+            self._http_runner = runner
         logging.info(f"REST API started on port {port}")
         return True
 
@@ -670,9 +673,16 @@ class MooncakeStoreService:
             )
 
         try:
-            ret = await asyncio.to_thread(
-                self.store.unmount_local_disk_segment, grace_period_seconds
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.store.unmount_local_disk_segment, grace_period_seconds
+                )
             )
+            self._store_tasks.add(task)
+            task.add_done_callback(self._finish_store_task)
+            # Cancelling an HTTP handler cannot stop its worker thread. Keep
+            # the operation alive and visible to stop() until it has finished.
+            ret = await asyncio.shield(task)
             if ret != 0:
                 return web.Response(
                     status=500,
@@ -853,14 +863,35 @@ class MooncakeStoreService:
                 content_type="application/json",
             )
 
+    def _finish_store_task(self, task):
+        self._store_tasks.discard(task)
+        if not task.cancelled():
+            # The HTTP handler may already be gone, leaving nobody to await
+            # this result. Retrieve failures before releasing the task.
+            error = task.exception()
+            if error is not None:
+                logging.error("Background Store operation failed: %s", error)
+
     async def stop(self):
-        if self.store:
-            ret = self.store.close()
-            self.store = None
-            if ret != 0:
-                logging.warning("Mooncake service close returned %s", ret)
-            else:
-                logging.info("Mooncake service stopped")
+        async with self._http_lock:
+            if self._http_runner is not None:
+                # Stop accepting requests and drain handlers while their Store
+                # is still available. Serialize concurrent stop calls as well.
+                await self._http_runner.cleanup()
+                self._http_runner = None
+            if self._store_tasks:
+                # HTTP shutdown may cancel a handler after its drain timeout,
+                # while an unmount is still using the Store in a worker thread.
+                await asyncio.shield(
+                    asyncio.gather(*self._store_tasks, return_exceptions=True)
+                )
+            if self.store:
+                ret = self.store.close()
+                self.store = None
+                if ret != 0:
+                    logging.warning("Mooncake service close returned %s", ret)
+                else:
+                    logging.info("Mooncake service stopped")
 
 
 def parse_arguments():
