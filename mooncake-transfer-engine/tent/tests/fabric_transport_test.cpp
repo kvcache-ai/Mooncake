@@ -45,6 +45,15 @@ namespace {
 
 constexpr size_t kBufferLength = 64 * 1024 * 1024;
 
+// The server is a fork()ed child of a process that has already initialized
+// CUDA. With FI_HMEM, the EFA provider's shm path cudaHostRegister()s its
+// regions, which fails in such a child, so same-host ops on hosts without
+// device RDMA write never progress. Keep them on the EFA device instead.
+const bool kEfaShmOff = [] {
+    setenv("FI_EFA_ENABLE_SHM_TRANSFER", "0", 0);
+    return true;
+}();
+
 // Transport provider name and the libfabric provider string behind it.
 std::string testProvider() {
     const char* env = std::getenv("MC_FABRIC_TEST_PROVIDER");
