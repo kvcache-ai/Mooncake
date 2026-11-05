@@ -1,12 +1,16 @@
 """Shared-allocation strided views must be checked by their live payload."""
 
+import ctypes
 from dataclasses import replace
+from unittest.mock import Mock
 
 import pytest
 from mooncake.reshard.kv_cache import (
     KVCacheComponent,
     KVCacheLayout,
     KVCachePlacementManifest,
+    KVCacheRuntimeTransferPlan,
+    KVCacheTransferEngineExecutor,
     plan_kv_cache_transfer_to_local_target,
     prepare_kv_cache_transfer,
     resolve_contiguous_runtime_binding,
@@ -14,6 +18,7 @@ from mooncake.reshard.kv_cache import (
     validate_runtime_bindings,
 )
 from test_kv_cache_reshard import _binding, _placement, _snapshot
+from test_runtime_transfer import MemoryEngine
 
 
 def interleaved_binding(prefix, base, snapshot, kind, second_offset=48):
@@ -135,3 +140,98 @@ def test_interleaved_views_require_consistent_backing_allocations(kind):
     )
     with pytest.raises(ValueError, match="backing allocations overlap"):
         validate_runtime_binding(placement, binding)
+
+
+@pytest.mark.parametrize("kind", ["ssm", "kv"])
+@pytest.mark.parametrize("source_row,target_row", [(0, 0), (0, 1), (1, 0)])
+def test_interleaved_views_register_and_copy_selected_rows(
+    kind, source_row, target_row, monkeypatch
+):
+    snapshot = _snapshot(token_start=13, token_count=2)
+    source_memory = ctypes.create_string_buffer(
+        bytes(range(256)) + bytes(range(64)), 320
+    )
+    target_memory = ctypes.create_string_buffer(b"\xa5" * 320, 320)
+    source_before = source_memory.raw
+    expected = bytearray(target_memory.raw)
+    for view_offset in (0, 48):
+        for row in range(snapshot.token_count):
+            source_offset = 16 + view_offset + (source_row + row) * 96
+            target_offset = 16 + view_offset + (target_row + row) * 96
+            expected[target_offset : target_offset + 48] = source_before[
+                source_offset : source_offset + 48
+            ]
+
+    placements, bindings, executors = [], [], []
+    for prefix, allocation, first_row in (
+        ("source", source_memory, source_row),
+        ("target", target_memory, target_row),
+    ):
+        base = ctypes.addressof(allocation)
+        placement, binding = interleaved_binding(prefix, base + 16, snapshot, kind)
+        binding = replace(
+            binding,
+            buffers=tuple(
+                replace(
+                    item,
+                    fragment=replace(
+                        item.fragment,
+                        storage_address=base,
+                        storage_nbytes=len(allocation),
+                        storage_offset_bytes=item.fragment.storage_offset_bytes + 16,
+                    ),
+                )
+                for item in binding.buffers
+            ),
+        )
+        resolved = resolve_contiguous_runtime_binding(
+            placement,
+            snapshot,
+            binding,
+            operation_id="interleaved-copy",
+            first_token_offset=first_row,
+        )
+        engine = MemoryEngine()
+        register = Mock(return_value=0)
+        monkeypatch.setattr(engine, "register_memory", register)
+        executor = KVCacheTransferEngineExecutor(
+            engine,
+            instance_id=resolved.instance_id,
+            endpoint=resolved.regions[0].endpoint,
+        )
+        for region in resolved.regions:
+            executor.register_region(region)
+        executor.validate_local_binding(resolved)
+        register.assert_called_once_with(base, len(allocation))
+        assert len(resolved.regions) == 1
+        assert {r.region_id for r in resolved.ranges} == {resolved.regions[0].region_id}
+        assert {r.offset_bytes for r in resolved.ranges} == {
+            16 + first_row * 96,
+            64 + first_row * 96,
+        }
+        # A caller cannot bypass overlap protection by using another region ID.
+        with pytest.raises(ValueError, match="registered regions overlap"):
+            executor.register_region(replace(resolved.regions[0], region_id="overlap"))
+        register.assert_called_once_with(base, len(allocation))
+        placements.append(placement)
+        bindings.append(resolved)
+        executors.append(executor)
+
+    source, target = placements
+    source_binding, target_binding = bindings
+    plan = KVCacheRuntimeTransferPlan(
+        "interleaved-copy",
+        (
+            plan_kv_cache_transfer_to_local_target(
+                source, target, target_binding.participant_id, snapshot=snapshot
+            ),
+        ),
+        (source_binding,),
+        (target_binding,),
+    )
+    receipts = executors[0].execute(plan, source_binding.participant_id)
+    assert receipts and all(r.success and r.quiesced for r in receipts)
+    assert source_memory.raw == source_before
+    assert target_memory.raw == bytes(expected)
+    for executor, binding in zip(executors, bindings):
+        executor.unregister_region(binding.regions[0].region_id)
