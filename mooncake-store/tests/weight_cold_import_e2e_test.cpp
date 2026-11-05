@@ -31,11 +31,11 @@ class WeightColdImportE2ETest : public ::testing::Test {
         auto ports = getFreeTcpPorts(2);
         ASSERT_EQ(ports.size(), 2u);
         owner_ = std::make_unique<RealClient>();
-        ASSERT_EQ(
-            0, owner_->setup_real("127.0.0.1:" + std::to_string(ports[0]),
-                                  server_.metadata_url(), segment_bytes, 16 * kMiB,
-                                  "tcp", "", server_.master_address(), nullptr,
-                                  "", true, directory_.string()));
+        ASSERT_EQ(0, owner_->setup_real("127.0.0.1:" + std::to_string(ports[0]),
+                                        server_.metadata_url(), segment_bytes,
+                                        16 * kMiB, "tcp", "",
+                                        server_.master_address(), nullptr, "",
+                                        true, directory_.string()));
         source_ = std::make_unique<RealClient>();
         ASSERT_EQ(
             0, source_->setup_real("127.0.0.1:" + std::to_string(ports[1]),
@@ -159,8 +159,8 @@ class WeightColdImportE2ETest : public ::testing::Test {
                 std::find(hot_affinities.begin(), hot_affinities.end(),
                           affinity_ids[index]) != hot_affinities.end();
             ASSERT_EQ(placements[index]->replicas.size(), 1u);
-            EXPECT_EQ(placements[index]->replicas.front().type(),
-                      hot ? ReplicaType::MEMORY : ReplicaType::LOCAL_DISK);
+            EXPECT_TRUE(hot ? placements[index]->replicas.front().is_memory_replica()
+                            : placements[index]->replicas.front().is_local_disk_replica());
             std::string actual(sizes[index], '\0');
             ASSERT_EQ(0,
                       source_->register_buffer(actual.data(), actual.size()));
@@ -174,8 +174,7 @@ class WeightColdImportE2ETest : public ::testing::Test {
         ASSERT_EQ(manifest.size(), 1u);
         ASSERT_TRUE(manifest.front());
         ASSERT_EQ(manifest.front()->replicas.size(), 1u);
-        EXPECT_EQ(manifest.front()->replicas.front().type(),
-                  ReplicaType::MEMORY);
+        EXPECT_TRUE(manifest.front()->replicas.front().is_memory_replica());
         std::string control_readback(hot_control.size(), '\0');
         ASSERT_EQ(0, source_->register_buffer(control_readback.data(),
                                               control_readback.size()));
@@ -186,7 +185,7 @@ class WeightColdImportE2ETest : public ::testing::Test {
         EXPECT_EQ(0, source_->unregister_buffer(control_readback.data()));
     }
 
-    InProcMasterServer server_;
+    InProcMaster server_;
     std::unique_ptr<RealClient> owner_;
     std::unique_ptr<RealClient> source_;
     std::filesystem::path directory_;
