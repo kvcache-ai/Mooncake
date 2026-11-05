@@ -33,7 +33,9 @@ bool SameImport(const WeightRevisionMetadata& metadata,
            metadata.manifest.logical_bytes == request.expected_logical_bytes &&
            metadata.policy == request.policy.value_or(WeightStoragePolicy{}) &&
            metadata.affinity_count == request.affinity_summary.affinity_count &&
-           metadata.affinity_digest == request.affinity_summary.affinity_digest;
+           metadata.affinity_digest == request.affinity_summary.affinity_digest &&
+           (metadata.availability != WeightAvailabilityState::IMPORTING ||
+            metadata.import_layout == request.payload_layout);
 }
 
 bool SameManifest(const WeightRevisionMetadata& metadata,
@@ -173,6 +175,25 @@ WeightMetadataStore::PrepareBeginImport(const BeginWeightImportRequest& request,
         request.affinity_summary.affinity_count < 2) {
         return tl::make_unexpected(WeightManagementError::POLICY_UNSATISFIABLE);
     }
+    if (!request.payload_layout.empty()) {
+        uint64_t bytes = 0;
+        std::unordered_set<std::string> affinities;
+        for (const auto& entry : request.payload_layout) {
+            if (entry.size > std::numeric_limits<uint64_t>::max() - bytes) {
+                return tl::make_unexpected(
+                    WeightManagementError::INVALID_ARGUMENT);
+            }
+            bytes += entry.size;
+            affinities.insert(entry.affinity_id);
+        }
+        if (request.payload_layout.size() != request.expected_payload_count ||
+            bytes != request.expected_logical_bytes ||
+            affinities.size() != request.affinity_summary.affinity_count ||
+            ComputeWeightAffinityMappingSha256(request.payload_layout) !=
+                request.affinity_summary.affinity_digest) {
+            return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+        }
+    }
 
     std::lock_guard lock(mutex_);
     const auto group = group_index_.find(request.payload_group_id);
@@ -217,6 +238,7 @@ WeightMetadataStore::PrepareBeginImport(const BeginWeightImportRequest& request,
         .metadata_generation = 1,
         .created_at_ms = now_ms,
         .updated_at_ms = now_ms,
+        .import_layout = request.payload_layout,
     };
     return WeightMetadataMutation{
         .kind = WeightMetadataMutationKind::UPSERT,
@@ -284,6 +306,7 @@ WeightMetadataStore::PrepareCommitImport(
     auto next = current->second;
     next.manifest = request.manifest;
     next.availability = WeightAvailabilityState::READY;
+    next.import_layout.clear();
     next.residency = WeightResidencyState::HOT;
     next.observed_hot_ratio = 1.0;
     ++next.metadata_generation;

@@ -13,7 +13,7 @@
 
 namespace mooncake {
 
-inline constexpr uint32_t kWeightMetadataSchemaVersion = 2;
+inline constexpr uint32_t kWeightMetadataSchemaVersion = 3;
 
 enum class WeightMetadataMutationKind : uint8_t {
     UPSERT = 0,

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -153,12 +154,16 @@ struct WeightRevisionMetadata {
     uint64_t created_at_ms{0};
     uint64_t updated_at_ms{0};
 
+    // The declared physical layout is retained only until import commits.
+    std::vector<WeightAffinityMappingEntry> import_layout;
+
     friend bool operator==(const WeightRevisionMetadata&,
                            const WeightRevisionMetadata&) = default;
 };
 YLT_REFL(WeightRevisionMetadata, identity, manifest, policy, availability,
          residency, operation_id, affinity_count, affinity_digest,
-         observed_hot_ratio, metadata_generation, created_at_ms, updated_at_ms);
+         observed_hot_ratio, metadata_generation, created_at_ms, updated_at_ms,
+         import_layout);
 
 struct WeightRevisionLease {
     uint64_t lease_id{0};
@@ -222,10 +227,11 @@ struct BeginWeightImportRequest {
     uint64_t expected_logical_bytes{0};
     std::optional<WeightStoragePolicy> policy;
     WeightAffinitySummary affinity_summary;
+    std::vector<WeightAffinityMappingEntry> payload_layout;
 };
 YLT_REFL(BeginWeightImportRequest, identity, payload_group_id,
          expected_payload_count, expected_logical_bytes, policy,
-         affinity_summary);
+         affinity_summary, payload_layout);
 
 struct CommitWeightImportRequest {
     WeightRevisionIdentity identity;
@@ -544,6 +550,24 @@ inline WeightValidationResult ValidateWeightRevisionMetadata(
     });
     if (!affinity_result.ok()) {
         return affinity_result;
+    }
+    if (!metadata.import_layout.empty()) {
+        uint64_t bytes = 0;
+        std::set<std::string> affinities;
+        for (const auto& entry : metadata.import_layout) {
+            if (entry.size > std::numeric_limits<uint64_t>::max() - bytes) {
+                return WeightValidationResult::Failure("invalid import layout");
+            }
+            bytes += entry.size;
+            affinities.insert(entry.affinity_id);
+        }
+        if (metadata.import_layout.size() != metadata.manifest.payload_count ||
+            bytes != metadata.manifest.logical_bytes ||
+            affinities.size() != metadata.affinity_count ||
+            ComputeWeightAffinityMappingSha256(metadata.import_layout) !=
+                metadata.affinity_digest) {
+            return WeightValidationResult::Failure("invalid import layout");
+        }
     }
     if (!std::isfinite(metadata.observed_hot_ratio) ||
         metadata.observed_hot_ratio < 0.0 ||
