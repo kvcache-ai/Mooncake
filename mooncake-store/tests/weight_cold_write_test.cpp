@@ -32,9 +32,9 @@ class WeightColdWriteTest : public ::testing::Test {
         owner_ = std::make_unique<RealClient>();
         ASSERT_EQ(
             owner_->setup_real("127.0.0.1:" + std::to_string(ports.front()),
-                               server_.metadata_url(), 64 * 1024, 1024 * 1024,
-                               "tcp", "", server_.master_address(), nullptr, "",
-                               true, directory_.string()),
+                               server_.metadata_url(), 0, 1024 * 1024, "tcp",
+                               "", server_.master_address(), nullptr, "", true,
+                               directory_.string()),
             0);
         writer_id_ = generate_uuid();
         writer_ = std::make_unique<MasterClient>(writer_id_);

@@ -217,7 +217,7 @@ TEST(LocalSsdManagerTest, CancelsOffloadMirrorsOnlyWhenAllArePending) {
 TEST(LocalSsdManagerTest, ColdReservationsCannotOversubscribeCapacity) {
     LocalSsdManager manager;
     const UUID owner{987, 654};
-    ASSERT_EQ(manager.RegisterClient(owner, true), ErrorCode::OK);
+    ASSERT_TRUE(manager.RegisterClient(owner, true) == ErrorCode::OK);
     ASSERT_TRUE(manager.ReportCapacity(owner, 17));
     std::atomic<int> admitted{0};
     std::vector<std::thread> threads;

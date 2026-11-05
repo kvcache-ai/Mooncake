@@ -33,7 +33,7 @@ class WeightColdImportE2ETest : public ::testing::Test {
         owner_ = std::make_unique<RealClient>();
         ASSERT_EQ(0, owner_->setup_real("127.0.0.1:" + std::to_string(ports[0]),
                                         server_.metadata_url(), segment_bytes,
-                                        16 * kMiB, "tcp", "",
+                                        64 * kMiB, "tcp", "",
                                         server_.master_address(), nullptr, "",
                                         true, directory_.string()));
         source_ = std::make_unique<RealClient>();
@@ -159,8 +159,11 @@ class WeightColdImportE2ETest : public ::testing::Test {
                 std::find(hot_affinities.begin(), hot_affinities.end(),
                           affinity_ids[index]) != hot_affinities.end();
             ASSERT_EQ(placements[index]->replicas.size(), 1u);
-            EXPECT_TRUE(hot ? placements[index]->replicas.front().is_memory_replica()
-                            : placements[index]->replicas.front().is_local_disk_replica());
+            EXPECT_TRUE(
+                hot ? placements[index]->replicas.front().is_memory_replica()
+                    : placements[index]
+                          ->replicas.front()
+                          .is_local_disk_replica());
             std::string actual(sizes[index], '\0');
             ASSERT_EQ(0,
                       source_->register_buffer(actual.data(), actual.size()));
@@ -194,23 +197,23 @@ class WeightColdImportE2ETest : public ::testing::Test {
 };
 
 TEST_F(WeightColdImportE2ETest, RemoteScalarBypassesHotSegmentCapacity) {
-    Start(512 * 1024);
-    Import(WeightResidencyState::COLD, false, false, {8 * kMiB});
+    Start(16 * kMiB);
+    Import(WeightResidencyState::COLD, false, false, {32 * kMiB});
 }
 
 TEST_F(WeightColdImportE2ETest, LocalScalarBypassesHotSegmentCapacity) {
-    Start(512 * 1024);
-    Import(WeightResidencyState::COLD, false, true, {8 * kMiB});
+    Start(16 * kMiB);
+    Import(WeightResidencyState::COLD, false, true, {32 * kMiB});
 }
 
 TEST_F(WeightColdImportE2ETest, RemoteBatchBypassesHotSegmentCapacity) {
-    Start(512 * 1024);
-    Import(WeightResidencyState::COLD, true, false, {8 * kMiB, 8 * kMiB});
+    Start(16 * kMiB);
+    Import(WeightResidencyState::COLD, true, false, {32 * kMiB, 32 * kMiB});
 }
 
 TEST_F(WeightColdImportE2ETest, MixedBatchOnlyKeepsPlannedAffinitiesHot) {
-    Start(3 * kMiB);
-    Import(WeightResidencyState::MIXED, true, false, {2 * kMiB, 6 * kMiB});
+    Start(16 * kMiB);
+    Import(WeightResidencyState::MIXED, true, false, {8 * kMiB, 24 * kMiB});
 }
 
 }  // namespace
