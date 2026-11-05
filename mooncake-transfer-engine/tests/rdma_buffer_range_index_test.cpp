@@ -526,3 +526,35 @@ TEST(BufferRangeIndex, SelectDeviceMatchesLinearFirstMatch) {
     }
     EXPECT_GE(compared, 100000);
 }
+
+// hasValidLkey() and hasValidRkey() check one key array each; hasValidKeys()
+// needs a valid key in every array the buffer publishes.
+TEST(RdmaKeyCheck, OneSidedKeys) {
+    SegmentDesc desc;
+    BufferDesc buffer;
+    buffer.lkey = {0};
+    buffer.rkey = {7};
+    EXPECT_FALSE(RdmaTransport::hasValidLkey(&desc, buffer, 0));
+    EXPECT_TRUE(RdmaTransport::hasValidRkey(&desc, buffer, 0));
+    EXPECT_FALSE(RdmaTransport::hasValidKeys(&desc, buffer, 0));
+
+    buffer.lkey = {7};
+    buffer.rkey.clear();  // local-only MR
+    EXPECT_TRUE(RdmaTransport::hasValidLkey(&desc, buffer, 0));
+    EXPECT_FALSE(RdmaTransport::hasValidRkey(&desc, buffer, 0));
+    EXPECT_TRUE(RdmaTransport::hasValidKeys(&desc, buffer, 0));
+}
+
+// Keys past the end of a non-empty devices list do not make a device valid.
+TEST(RdmaKeyCheck, DeviceOutsideSegmentIsRejected) {
+    SegmentDesc desc;
+    desc.devices.push_back({"mlx5_unit_test", 1, "", ""});
+    BufferDesc buffer;
+    buffer.lkey = {7, 8};
+    buffer.rkey = {7, 8};
+    EXPECT_TRUE(RdmaTransport::hasValidKeys(&desc, buffer, 0));
+    EXPECT_FALSE(RdmaTransport::hasValidLkey(&desc, buffer, 1));
+    EXPECT_FALSE(RdmaTransport::hasValidRkey(&desc, buffer, 1));
+    EXPECT_FALSE(RdmaTransport::hasValidKeys(&desc, buffer, 1));
+    EXPECT_FALSE(RdmaTransport::hasValidKeys(&desc, buffer, -1));
+}

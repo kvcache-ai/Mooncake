@@ -168,6 +168,20 @@ class RdmaTransport : public Transport {
                                       int hint_buffer_id = -1,
                                       int hint_device_id = -1);
 
+    // A buffer may have no MR on some HCAs (e.g. Data Direct pairing leaves
+    // zero keys on non-paired NICs). hasValidLkey() / hasValidRkey(): the
+    // device is within the segment and the buffer holds a nonzero lkey / rkey
+    // for it; false when the buffer publishes no such key array.
+    static bool hasValidLkey(const SegmentDesc *desc, const BufferDesc &buffer,
+                             int device_id);
+    static bool hasValidRkey(const SegmentDesc *desc, const BufferDesc &buffer,
+                             int device_id);
+    // hasValidKeys(): every key array the buffer publishes holds a valid key
+    // for the device. A local-only MR has no rkey array, so only its lkey
+    // counts.
+    static bool hasValidKeys(const SegmentDesc *desc, const BufferDesc &buffer,
+                             int device_id);
+
     const std::vector<std::shared_ptr<RdmaContext>> &getContextList() const {
         return context_list_;
     }
