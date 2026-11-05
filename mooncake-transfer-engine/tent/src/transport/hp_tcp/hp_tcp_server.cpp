@@ -10,6 +10,7 @@
 
 #include <glog/logging.h>
 
+#include "tent/metrics/tent_metrics.h"
 #include "tent/transport/hp_tcp/hp_tcp_protocol.h"
 
 namespace mooncake::tent {
@@ -359,10 +360,36 @@ bool HighPerformanceTcpServer::reserveConnection() {
         if (active_sessions_.compare_exchange_weak(current, current + 1,
                                                    std::memory_order_acq_rel,
                                                    std::memory_order_acquire)) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordStreamConnection(
+                TransportType::HP_TCP,
+                TentMetrics::StreamConnectionRole::Server, 1);
+#endif
             return true;
         }
     }
     return false;
+}
+
+void HighPerformanceTcpServer::releaseConnection() {
+    size_t previous = active_sessions_.load(std::memory_order_acquire);
+    while (previous != 0 &&
+           !active_sessions_.compare_exchange_weak(previous, previous - 1,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+    }
+    if (previous == 0) {
+        LOG(ERROR) << "HP TCP active-session accounting underflow";
+        return;
+    }
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordStreamConnection(
+        TransportType::HP_TCP, TentMetrics::StreamConnectionRole::Server, -1);
+#endif
+    if (previous == 1) {
+        std::lock_guard<std::mutex> lock(sessions_wait_mutex_);
+        sessions_wait_cv_.notify_all();
+    }
 }
 
 Status HighPerformanceTcpServer::start(uint16_t* bound_port) {
@@ -450,18 +477,12 @@ Status HighPerformanceTcpServer::startAccept() {
                     } catch (const std::exception& post_error) {
                         LOG(ERROR) << "HP TCP accepted-socket dispatch failed: "
                                    << post_error.what();
-                        if (active_sessions_.fetch_sub(
-                                1, std::memory_order_acq_rel) == 1) {
-                            sessions_wait_cv_.notify_all();
-                        }
+                        releaseConnection();
                         std::error_code ignored;
                         socket->close(ignored);
                     } catch (...) {
                         LOG(ERROR) << "HP TCP accepted-socket dispatch failed";
-                        if (active_sessions_.fetch_sub(
-                                1, std::memory_order_acq_rel) == 1) {
-                            sessions_wait_cv_.notify_all();
-                        }
+                        releaseConnection();
                         std::error_code ignored;
                         socket->close(ignored);
                     }
@@ -498,9 +519,7 @@ void HighPerformanceTcpServer::installAcceptedSocket(
     if (stopping_.load(std::memory_order_acquire)) {
         std::error_code ignored;
         socket->close(ignored);
-        if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            sessions_wait_cv_.notify_all();
-        }
+        releaseConnection();
         return;
     }
     std::shared_ptr<Session> session;
@@ -519,28 +538,21 @@ void HighPerformanceTcpServer::installAcceptedSocket(
         std::error_code ignored;
         socket->cancel(ignored);
         socket->close(ignored);
-        if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            sessions_wait_cv_.notify_all();
-        }
+        releaseConnection();
     } catch (...) {
         LOG(ERROR) << "HP TCP server session start failed";
         if (session) sessions_[worker_id].erase(session);
         std::error_code ignored;
         socket->cancel(ignored);
         socket->close(ignored);
-        if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            sessions_wait_cv_.notify_all();
-        }
+        releaseConnection();
     }
 }
 
 void HighPerformanceTcpServer::onSessionClosed(
     size_t worker_id, const std::shared_ptr<Session>& session) {
     if (worker_id < sessions_.size()) sessions_[worker_id].erase(session);
-    if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        std::lock_guard<std::mutex> lock(sessions_wait_mutex_);
-        sessions_wait_cv_.notify_all();
-    }
+    releaseConnection();
 }
 
 Status HighPerformanceTcpServer::stopAccepting() {
