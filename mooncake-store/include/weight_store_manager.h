@@ -5,6 +5,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "weight_store_backend.h"
 
@@ -21,6 +22,10 @@ class WeightStoreManager {
         uint64_t last_write_ms{0};
         size_t in_flight{0};
         bool closing{false};
+        std::string manifest_key;
+        WeightResidencyState preferred_residency{WeightResidencyState::HOT};
+        std::unordered_map<std::string, WeightAffinityMappingEntry> layout;
+        std::unordered_set<std::string> hot_affinities;
     };
 
    public:
@@ -59,6 +64,10 @@ class WeightStoreManager {
     tl::expected<ImportWriteGuard, ErrorCode> TrackImportWrite(
         const TenantId& tenant, const std::string& group);
     void RecordImportWrite(const TenantId& tenant, const std::string& group);
+    tl::expected<WeightResidencyState, ErrorCode> ResolveImportMemberTier(
+        const TenantId& tenant, const std::string& group,
+        const std::string& key, uint64_t size, const std::string& affinity_id,
+        ObjectDataType data_type);
     bool RecordOffloadFailures(std::vector<uint64_t> operation_ids);
     bool HasActiveLease(const WeightRevisionIdentity& identity,
                         uint64_t generation, uint64_t now_ms) const {
@@ -124,15 +133,15 @@ class WeightStoreManager {
     PersistAndPublishWeightMutation(const WeightMetadataMutation& mutation);
     std::unique_lock<std::mutex> LockGroup(
         const WeightRevisionIdentity& identity);
-    WeightMetadataStore::Result<void> ValidateWeightGroupForCommit(
-        const CommitWeightImportRequest& request,
-        uint64_t expected_affinity_count,
-        const std::string& expected_affinity_digest) const;
+    WeightMetadataStore::Result<WeightResidencyObservation>
+    ValidateWeightGroupForCommit(const CommitWeightImportRequest& request,
+                                 const WeightRevisionMetadata& importing) const;
 
     WeightStoreBackend& backend_;
     std::shared_ptr<ImportActivity> FindImportActivity(
         const TenantId& tenant, const std::string& group);
-    void RegisterImportActivity(const WeightRevisionMetadata& metadata);
+    WeightMetadataStore::Result<std::shared_ptr<ImportActivity>>
+    PrepareImportActivity(const WeightRevisionMetadata& metadata) const;
     uint64_t import_idle_timeout_ms_{5 * 60 * 1000};
     std::mutex import_activity_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ImportActivity>>

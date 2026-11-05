@@ -114,36 +114,107 @@ void WeightStoreManager::RecordImportWrite(const TenantId& tenant,
     }
 }
 
-void WeightStoreManager::RegisterImportActivity(
-    const WeightRevisionMetadata& metadata) {
+WeightMetadataStore::Result<std::shared_ptr<WeightStoreManager::ImportActivity>>
+WeightStoreManager::PrepareImportActivity(
+    const WeightRevisionMetadata& metadata) const {
+    if (!ValidateWeightRevisionMetadata(metadata).ok()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+    if (metadata.availability == WeightAvailabilityState::IMPORTING &&
+        metadata.policy.preferred_residency != WeightResidencyState::HOT &&
+        metadata.import_layout.empty()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
     auto activity = std::make_shared<ImportActivity>();
     activity->last_write_ms = WeightNowMs();
     activity->closing =
         metadata.availability == WeightAvailabilityState::DELETING;
-    std::lock_guard lock(import_activity_mutex_);
-    import_activity_[TenantId(metadata.identity.tenant_id)
-                         .MakeScopedKey(metadata.manifest.payload_group_id)] =
-        std::move(activity);
+    activity->manifest_key = MakeWeightManifestKey(metadata.identity);
+    activity->preferred_residency = metadata.policy.preferred_residency;
+    std::map<std::string, uint64_t> affinity_bytes;
+    for (const auto& entry : metadata.import_layout) {
+        activity->layout.emplace(entry.key, entry);
+        affinity_bytes[entry.affinity_id] += entry.size;
+    }
+    if (!activity->closing &&
+        metadata.policy.preferred_residency == WeightResidencyState::MIXED &&
+        !metadata.import_layout.empty()) {
+        std::vector<WeightAffinityUnit> units;
+        for (const auto& [affinity_id, bytes] : affinity_bytes) {
+            units.push_back({affinity_id, bytes});
+        }
+        auto plan =
+            PlanMixedWeightResidency(units, metadata.policy.mixed_hot_ratio);
+        if (!plan) return tl::make_unexpected(plan.error());
+        activity->hot_affinities.insert(plan->hot_affinity_ids.begin(),
+                                        plan->hot_affinity_ids.end());
+    } else if (metadata.policy.preferred_residency ==
+               WeightResidencyState::HOT) {
+        for (const auto& [affinity_id, bytes] : affinity_bytes) {
+            activity->hot_affinities.insert(affinity_id);
+        }
+    }
+    return activity;
+}
+
+tl::expected<WeightResidencyState, ErrorCode>
+WeightStoreManager::ResolveImportMemberTier(
+    const TenantId& tenant, const std::string& group, const std::string& key,
+    uint64_t size, const std::string& affinity_id, ObjectDataType data_type) {
+    if (!weight_metadata_.IsManagedGroup(group))
+        return WeightResidencyState::HOT;
+    auto activity = FindImportActivity(tenant, group);
+    if (!activity) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    std::lock_guard lock(activity->mutex);
+    if (activity->closing) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (key == activity->manifest_key) {
+        if (data_type == ObjectDataType::METADATA && affinity_id.empty()) {
+            return WeightResidencyState::HOT;
+        }
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (data_type != ObjectDataType::WEIGHT) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (activity->layout.empty()) {
+        if (activity->preferred_residency == WeightResidencyState::HOT) {
+            return WeightResidencyState::HOT;
+        }
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto entry = activity->layout.find(key);
+    if (entry == activity->layout.end() || entry->second.size != size ||
+        entry->second.affinity_id != affinity_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return activity->hot_affinities.contains(affinity_id)
+               ? WeightResidencyState::HOT
+               : WeightResidencyState::COLD;
 }
 
 WeightMetadataStore::Result<void> WeightStoreManager::RestoreSnapshot(
     const WeightMetadataSnapshot& snapshot) {
-    auto restored = weight_metadata_.RestoreSnapshot(snapshot);
-    if (!restored) {
-        return restored;
-    }
-    {
-        std::lock_guard lock(import_activity_mutex_);
-        import_activity_.clear();
-    }
-    // Restore runs behind the master-state barrier. Give the new leader a full
-    // observation window; local write activity is intentionally not durable.
+    decltype(import_activity_) activities;
+    // Build the same immutable plan before publishing the restored registry.
     for (const auto& metadata : snapshot.metadata) {
         if (metadata.availability == WeightAvailabilityState::IMPORTING ||
             metadata.availability == WeightAvailabilityState::DELETING) {
-            RegisterImportActivity(metadata);
+            auto activity = PrepareImportActivity(metadata);
+            if (!activity) return tl::make_unexpected(activity.error());
+            activities[TenantId(metadata.identity.tenant_id)
+                           .MakeScopedKey(metadata.manifest.payload_group_id)] =
+                std::move(*activity);
         }
     }
+    auto restored = weight_metadata_.RestoreSnapshot(snapshot);
+    if (!restored) return restored;
+    // Local write activity starts a fresh observation window after failover.
+    std::lock_guard lock(import_activity_mutex_);
+    import_activity_.swap(activities);
     return {};
 }
 
@@ -181,9 +252,15 @@ WeightStoreManager::BeginWeightImport(const BeginWeightImportRequest& request) {
     if (!mutation) {
         return tl::make_unexpected(mutation.error());
     }
+    auto activity = PrepareImportActivity(*mutation->next);
+    if (!activity) return tl::make_unexpected(activity.error());
     auto importing = PersistAndPublishWeightMutation(*mutation);
     if (importing && !mutation->no_op) {
-        RegisterImportActivity(*importing);
+        std::lock_guard lock(import_activity_mutex_);
+        import_activity_[TenantId(importing->identity.tenant_id)
+                             .MakeScopedKey(
+                                 importing->manifest.payload_group_id)] =
+            std::move(*activity);
     }
     return importing;
 }
@@ -192,7 +269,8 @@ WeightMetadataStore::Result<WeightRevisionMetadata>
 WeightStoreManager::CommitWeightImport(
     const CommitWeightImportRequest& request) {
     const auto canonical_group = MakeWeightPayloadGroupId(request.identity);
-    if (canonical_group.empty() ||
+    if (canonical_group.empty() || request.expected_metadata_generation == 0 ||
+        !ValidateWeightManifestReference(request.manifest).ok() ||
         request.manifest.payload_group_id != canonical_group) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
     }
@@ -202,20 +280,22 @@ WeightStoreManager::CommitWeightImport(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
 
-    auto mutation = weight_metadata_.PrepareCommitImport(request, now_ms);
-    if (!mutation) {
-        return tl::make_unexpected(mutation.error());
-    }
-    if (mutation->no_op) {
+    auto current = weight_metadata_.Get(request.identity, now_ms);
+    if (!current) return tl::make_unexpected(current.error());
+    if (current->metadata.availability != WeightAvailabilityState::IMPORTING) {
+        auto mutation = weight_metadata_.PrepareCommitImport(request, now_ms);
+        if (!mutation) return tl::make_unexpected(mutation.error());
         return PersistAndPublishWeightMutation(*mutation);
     }
-    auto validation =
-        ValidateWeightGroupForCommit(request, mutation->next->affinity_count,
-                                     mutation->next->affinity_digest);
-    if (!validation) {
-        return tl::make_unexpected(validation.error());
+    if (current->metadata.metadata_generation !=
+        request.expected_metadata_generation) {
+        return tl::make_unexpected(WeightManagementError::STALE_GENERATION);
     }
-
+    auto validation = ValidateWeightGroupForCommit(request, current->metadata);
+    if (!validation) return tl::make_unexpected(validation.error());
+    auto mutation =
+        weight_metadata_.PrepareCommitImport(request, now_ms, *validation);
+    if (!mutation) return tl::make_unexpected(mutation.error());
     auto committed = PersistAndPublishWeightMutation(*mutation);
     if (committed) {
         std::lock_guard lock(import_activity_mutex_);
@@ -269,10 +349,10 @@ WeightStoreManager::ListWeightRevisions(
     return weight_metadata_.List(request, now_ms);
 }
 
-WeightMetadataStore::Result<void>
+WeightMetadataStore::Result<WeightResidencyObservation>
 WeightStoreManager::ValidateWeightGroupForCommit(
-    const CommitWeightImportRequest& request, uint64_t expected_affinity_count,
-    const std::string& expected_affinity_digest) const {
+    const CommitWeightImportRequest& request,
+    const WeightRevisionMetadata& importing) const {
     const auto expected_manifest_key = MakeWeightManifestKey(request.identity);
     if (request.manifest.manifest_key != expected_manifest_key) {
         return tl::make_unexpected(WeightManagementError::CONFLICT);
@@ -287,6 +367,10 @@ WeightStoreManager::ValidateWeightGroupForCommit(
         return tl::make_unexpected(WeightManagementError::CONFLICT);
     }
 
+    auto activity = PrepareImportActivity(importing);
+    if (!activity) return tl::make_unexpected(activity.error());
+    bool preferred_placement_satisfied = true;
+    uint64_t hot_bytes = 0;
     bool found_manifest = false;
     uint64_t logical_bytes = 0;
     std::unordered_set<std::string> affinity_ids;
@@ -302,6 +386,9 @@ WeightStoreManager::ValidateWeightGroupForCommit(
                 member.data_type != ObjectDataType::METADATA) {
                 return tl::make_unexpected(WeightManagementError::CONFLICT);
             }
+            if (!member.has_memory) {
+                return tl::make_unexpected(WeightManagementError::NOT_READY);
+            }
             found_manifest = true;
             continue;
         }
@@ -312,6 +399,14 @@ WeightStoreManager::ValidateWeightGroupForCommit(
             return tl::make_unexpected(WeightManagementError::CONFLICT);
         }
         logical_bytes += member.size;
+        if (member.has_memory) hot_bytes += member.size;
+        const bool should_be_hot =
+            (*activity)->layout.empty() ||
+            (*activity)->hot_affinities.contains(member.residency_affinity_id);
+        preferred_placement_satisfied =
+            preferred_placement_satisfied &&
+            (should_be_hot ? member.has_memory
+                           : (member.has_cold && !member.has_memory));
         affinity_ids.insert(member.residency_affinity_id);
         payload_keys.push_back(member.key);
         affinity_mapping.push_back(
@@ -321,15 +416,23 @@ WeightStoreManager::ValidateWeightGroupForCommit(
         return tl::make_unexpected(WeightManagementError::NOT_FOUND);
     }
     if (logical_bytes != request.manifest.logical_bytes ||
-        affinity_ids.size() != expected_affinity_count ||
+        affinity_ids.size() != importing.affinity_count ||
         ComputeWeightAffinityMappingSha256(affinity_mapping) !=
-            expected_affinity_digest ||
+            importing.affinity_digest ||
         payload_keys.size() != request.manifest.payload_count ||
         ComputeWeightPayloadKeysSha256(payload_keys) !=
             request.manifest.payload_keys_sha256) {
         return tl::make_unexpected(WeightManagementError::CONFLICT);
     }
-    return {};
+    const double ratio =
+        static_cast<double>(hot_bytes) / static_cast<double>(logical_bytes);
+    return WeightResidencyObservation{
+        .residency = ratio == 1.0   ? WeightResidencyState::HOT
+                     : ratio == 0.0 ? WeightResidencyState::COLD
+                                    : WeightResidencyState::MIXED,
+        .hot_ratio = ratio,
+        .preferred_placement_satisfied = preferred_placement_satisfied,
+    };
 }
 
 WeightMetadataStore::Result<WeightRevisionMetadata>
@@ -683,8 +786,6 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
         bool all_memory{true};
         bool all_cold{true};
         bool all_have_cold{true};
-        std::vector<std::string> keys;
-        std::vector<std::string> keys_without_cold;
     };
     auto aggregate_affinities = [](const auto& member_snapshots) {
         std::map<std::string, AffinityObservation> affinities;
@@ -697,10 +798,7 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
             affinity.all_memory = affinity.all_memory && member.has_memory;
             affinity.all_cold =
                 affinity.all_cold && member.has_cold && !member.has_memory;
-            affinity.keys.push_back(member.key);
             affinity.all_have_cold = affinity.all_have_cold && member.has_cold;
-            if (!member.has_cold)
-                affinity.keys_without_cold.push_back(member.key);
         }
         return affinities;
     };

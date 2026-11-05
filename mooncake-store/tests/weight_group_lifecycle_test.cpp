@@ -129,6 +129,107 @@ class WeightGroupLifecycleTest : public MasterServiceTest {
     }
 };
 
+TEST_F(WeightGroupLifecycleTest,
+       DeclaredImportPlanSurvivesRestoreAndValidatesMembers) {
+    for (const auto residency :
+         {WeightResidencyState::HOT, WeightResidencyState::COLD,
+          WeightResidencyState::MIXED}) {
+        SCOPED_TRACE(static_cast<int>(residency));
+        MasterService service;
+        const std::vector<WeightAffinityMappingEntry> layout{
+            {"payload-a", 1024, "affinity-a"},
+            {"payload-b", 1024, "affinity-b"}};
+        auto policy = WeightStoragePolicy{
+            .preferred_residency = residency,
+            .migration_mode = WeightMigrationMode::MANUAL,
+        };
+        if (residency == WeightResidencyState::MIXED)
+            policy.mixed_hot_ratio = 0.5;
+        const auto importing = service.BeginWeightImport({
+            .identity = Identity(),
+            .expected_payload_count = 2,
+            .expected_logical_bytes = 2048,
+            .policy = policy,
+            .affinity_summary = {2, ComputeWeightAffinityMappingSha256(layout)},
+            .payload_layout = layout,
+        });
+        ASSERT_TRUE(importing);
+        auto& manager = MasterServiceTestPeer::WeightManager(service);
+        auto resolve = [&](const WeightAffinityMappingEntry& entry) {
+            return manager.ResolveImportMemberTier(
+                TenantId::Default(), importing->manifest.payload_group_id,
+                entry.key, entry.size, entry.affinity_id,
+                ObjectDataType::WEIGHT);
+        };
+        const auto first = resolve(layout[0]);
+        const auto second = resolve(layout[1]);
+        ASSERT_TRUE(first);
+        ASSERT_TRUE(second);
+        if (residency == WeightResidencyState::MIXED) {
+            EXPECT_NE(*first, *second);
+        } else {
+            EXPECT_EQ(residency, *first);
+            EXPECT_EQ(residency, *second);
+        }
+        const auto manifest = manager.ResolveImportMemberTier(
+            TenantId::Default(), importing->manifest.payload_group_id,
+            ManifestKey(), 128, "", ObjectDataType::METADATA);
+        ASSERT_TRUE(manifest);
+        EXPECT_EQ(WeightResidencyState::HOT, *manifest);
+        for (const auto& invalid : std::vector<WeightAffinityMappingEntry>{
+                 {"payload-a", 2048, "affinity-a"},
+                 {"payload-a", 1024, "affinity-b"},
+                 {"undeclared", 1024, "affinity-a"}}) {
+            const auto result = resolve(invalid);
+            ASSERT_FALSE(result);
+            EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+        }
+        EXPECT_FALSE(manager.ResolveImportMemberTier(
+            TenantId::Default(), importing->manifest.payload_group_id,
+            "payload-a", 1024, "affinity-a", ObjectDataType::METADATA));
+        EXPECT_FALSE(manager.ResolveImportMemberTier(
+            TenantId::Default(), importing->manifest.payload_group_id,
+            ManifestKey(), 128, "", ObjectDataType::WEIGHT));
+        EXPECT_FALSE(manager.ResolveImportMemberTier(
+            TenantId("another-tenant"), importing->manifest.payload_group_id,
+            "payload-a", 1024, "affinity-a", ObjectDataType::WEIGHT));
+        const auto snapshot = manager.ExportSnapshot();
+        ASSERT_TRUE(manager.RestoreSnapshot(snapshot));
+        EXPECT_EQ(first, resolve(layout[0]));
+        EXPECT_EQ(second, resolve(layout[1]));
+        EXPECT_EQ(WeightResidencyState::HOT,
+                  manager
+                      .ResolveImportMemberTier(TenantId::Default(),
+                                               "ordinary-group", "ordinary-key",
+                                               1, "", ObjectDataType::KVCACHE)
+                      .value());
+    }
+}
+
+TEST_F(WeightGroupLifecycleTest,
+       NonHotImportRequiresDeclaredLayoutBeforePublication) {
+    for (const auto residency :
+         {WeightResidencyState::COLD, WeightResidencyState::MIXED}) {
+        MasterService service;
+        auto policy = WeightStoragePolicy{
+            .preferred_residency = residency,
+            .migration_mode = WeightMigrationMode::MANUAL,
+        };
+        if (residency == WeightResidencyState::MIXED)
+            policy.mixed_hot_ratio = 0.5;
+        const auto importing = service.BeginWeightImport({
+            .identity = Identity(),
+            .expected_payload_count = 2,
+            .expected_logical_bytes = 2048,
+            .policy = policy,
+            .affinity_summary = {2, std::string(64, 'c')},
+        });
+        ASSERT_FALSE(importing);
+        EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, importing.error());
+        EXPECT_FALSE(service.GetWeightRevision({.identity = Identity()}));
+    }
+}
+
 TEST_F(WeightGroupLifecycleTest, CommitRejectsSwappedAffinityMapping) {
     MasterService service;
     const auto context = PrepareSimpleSegment(service);
