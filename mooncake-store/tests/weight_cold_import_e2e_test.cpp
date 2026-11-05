@@ -33,7 +33,7 @@ class WeightColdImportE2ETest : public ::testing::Test {
         owner_ = std::make_unique<RealClient>();
         ASSERT_EQ(
             0, owner_->setup_real("127.0.0.1:" + std::to_string(ports[0]),
-                                  server_.metadata_url(), segment_bytes, kMiB,
+                                  server_.metadata_url(), segment_bytes, 16 * kMiB,
                                   "tcp", "", server_.master_address(), nullptr,
                                   "", true, directory_.string()));
         source_ = std::make_unique<RealClient>();
