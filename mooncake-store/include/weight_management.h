@@ -117,6 +117,19 @@ struct WeightStoragePolicy {
 YLT_REFL(WeightStoragePolicy, preferred_residency, mixed_hot_ratio,
          migration_mode);
 
+struct WeightAffinityMappingEntry {
+    std::string key;
+    uint64_t size{0};
+    std::string affinity_id;
+
+    friend bool operator==(const WeightAffinityMappingEntry&,
+                           const WeightAffinityMappingEntry&) = default;
+};
+YLT_REFL(WeightAffinityMappingEntry, key, size, affinity_id);
+
+std::string ComputeWeightAffinityMappingSha256(
+    const std::vector<WeightAffinityMappingEntry>& entries);
+
 struct WeightAffinitySummary {
     uint64_t affinity_count{0};
     std::string affinity_digest;

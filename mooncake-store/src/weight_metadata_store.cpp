@@ -112,6 +112,32 @@ std::string ComputeWeightPayloadKeysSha256(
     return Sha256Hex(chunks);
 }
 
+std::string ComputeWeightAffinityMappingSha256(
+    const std::vector<WeightAffinityMappingEntry>& entries) {
+    auto sorted = entries;
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left,
+                                             const auto& right) {
+        return left.key < right.key;
+    });
+    std::vector<std::string> storage;
+    storage.reserve(sorted.size() * 4);
+    std::vector<std::string_view> chunks{"weight-affinity-mapping-v1\n"};
+    chunks.reserve(1 + sorted.size() * 12);
+    for (size_t index = 0; index < sorted.size(); ++index) {
+        const auto& entry = sorted[index];
+        if (entry.key.empty() || entry.affinity_id.empty() || entry.size == 0 ||
+            (index > 0 && sorted[index - 1].key == entry.key)) {
+            return {};
+        }
+        AppendLengthPrefixed(&storage, &chunks, entry.key);
+        storage.push_back(std::to_string(entry.size));
+        const std::string_view size = storage.back();
+        AppendLengthPrefixed(&storage, &chunks, size);
+        AppendLengthPrefixed(&storage, &chunks, entry.affinity_id);
+    }
+    return Sha256Hex(chunks);
+}
+
 std::string MakeWeightPayloadGroupId(const WeightRevisionIdentity& identity) {
     const auto digest = ComputeWeightIdentitySha256(identity);
     return digest.empty() ? std::string() : "weight:" + digest;
