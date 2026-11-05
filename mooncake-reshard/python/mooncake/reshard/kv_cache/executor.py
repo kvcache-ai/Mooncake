@@ -49,6 +49,7 @@ class KVCacheTransferEngineExecutor:
         self.instance_id = instance_id
         self.endpoint = endpoint
         self._regions: dict[str, KVCacheRegisteredRegion] = {}
+        self._region_owners: dict[str, set[str | None]] = {}
         self._results: dict[
             tuple[str, str], tuple[str, tuple[KVCacheWriterReceipt, ...]]
         ] = {}
@@ -62,15 +63,26 @@ class KVCacheTransferEngineExecutor:
                 "in flight or registration state is uncertain"
             )
 
-    def register_region(self, region: KVCacheRegisteredRegion) -> None:
+    def register_region(
+        self, region: KVCacheRegisteredRegion, *, owner_id: str | None = None
+    ) -> None:
+        """Acquire one idempotent claim per owner on a runtime-owned region.
+
+        Independent binding lifetimes can use binding.digest as owner_id.
+        Omitting it retains the legacy single runtime claim, released once after
+        all users finish. All owners must use the same runtime/endpoint executor.
+        """
         if not isinstance(region, KVCacheRegisteredRegion):
             raise TypeError("region must be a KVCacheRegisteredRegion")
         if region.endpoint != self.endpoint:
             raise ValueError("region endpoint differs from local executor")
+        if owner_id is not None:
+            require_nonempty_string(owner_id, "owner_id")
         with self._lock:
             self._require_ready()
             if region.region_id in self._regions:
                 if self._regions[region.region_id] == region:
+                    self._region_owners[region.region_id].add(owner_id)
                     return
                 raise ValueError("registered region_id is already bound")
             if any(
@@ -86,17 +98,28 @@ class KVCacheTransferEngineExecutor:
             if type(code) is not int or code != 0:
                 raise RuntimeError(f"TE register_memory failed: {code}")
             self._regions[region.region_id] = region
+            self._region_owners[region.region_id] = {owner_id}
             self._uncertain = False
 
-    def unregister_region(self, region_id: str) -> None:
+    def unregister_region(self, region_id: str, *, owner_id: str | None = None) -> None:
+        """Release a quiescent owner's claim; only the last release unpins it."""
+        if owner_id is not None:
+            require_nonempty_string(owner_id, "owner_id")
         with self._lock:
             self._require_ready()
             region = self._regions[region_id]
+            owners = self._region_owners[region_id]
+            if owner_id not in owners:
+                raise ValueError("region is not registered by this owner")
+            if len(owners) > 1:
+                owners.remove(owner_id)
+                return
             self._uncertain = True
             code = self.engine.unregister_memory(region.address)
             if type(code) is not int or code != 0:
                 raise RuntimeError(f"TE unregister_memory failed: {code}")
             del self._regions[region_id]
+            del self._region_owners[region_id]
             self._uncertain = False
 
     def validate_local_binding(self, binding: KVCacheResolvedRuntimeBinding) -> None:

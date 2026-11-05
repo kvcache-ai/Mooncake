@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from ..contracts import ParticipantId
 from .binding import validate_runtime_binding
 from .placement import KVCachePlacementManifest
-from .runtime import KVCacheBufferBinding, KVCacheRuntimeBindingManifest
+from .runtime import KVCacheRuntimeBindingManifest
 from .snapshot import KVCacheSnapshotDescriptor, _canonical_digest
 from .types import (
     KVCacheComponent,
@@ -372,57 +372,53 @@ def resolve_contiguous_runtime_binding(
 ) -> KVCacheResolvedRuntimeBinding:
     """Adapt legacy contiguous buffers; offsets are supplied by the runtime.
 
-    Views sharing an allocation use one region spanning that allocation. The
-    runtime must keep the complete registered allocation pinned until quiescence.
+    Every view names its complete allocation with a runtime-scoped region ID,
+    independent of participant, fragment and operation. One executor per
+    runtime/endpoint deduplicates registration across bindings. The runtime must
+    keep that allocation pinned until all users are quiescent; callers releasing
+    bindings independently can use binding.digest as the executor's owner_id.
     Paged/noncontiguous allocations must export resolved ranges themselves.
     No framework page IDs or allocation metadata enter Mooncake.
     """
     validate_runtime_binding(placement, binding, snapshot=snapshot)
     require_integer(first_token_offset, "first_token_offset")
     part = placement.part(ParticipantId(binding.participant_id))
-    regions: list[KVCacheRegisteredRegion] = []
+    regions: dict[str, KVCacheRegisteredRegion] = {}
     ranges: list[KVCacheResolvedRange] = []
-    allocations: dict[tuple[str, str, str, int, int], list[KVCacheBufferBinding]] = {}
     for item in binding.buffers:
         f = item.fragment
         if first_token_offset + snapshot.token_count > f.local_shape[0]:
             raise ValueError("snapshot exceeds legacy runtime buffer token capacity")
-        key = (
-            f.worker_id,
-            f.device,
+        region_id = "kv-allocation:" + _canonical_digest(
+            {
+                "instance_id": binding.instance_id,
+                "worker_id": f.worker_id,
+                "device": f.device,
+                "endpoint": f.endpoint,
+                "address": f.storage_address,
+                "nbytes": f.storage_nbytes,
+            }
+        )
+        regions[region_id] = KVCacheRegisteredRegion(
+            region_id,
             f.endpoint,
             f.storage_address,
             f.storage_nbytes,
         )
-        allocations.setdefault(key, []).append(item)
-    for items in allocations.values():
-        f = items[0].fragment
-        shared = len(items) > 1
-        region = KVCacheRegisteredRegion(
-            f.fragment_id,
-            f.endpoint,
-            f.storage_address if shared else f.address,
-            f.storage_nbytes if shared else f.nbytes,
-        )
-        regions.append(region)
-        for item in items:
-            f = item.fragment
-            ranges.append(
-                KVCacheResolvedRange(
-                    item.global_layer_id,
-                    item.component,
-                    snapshot.token_start,
-                    snapshot.token_count,
-                    part.head_start,
-                    part.head_count,
-                    region.region_id,
-                    f.address
-                    - region.address
-                    + first_token_offset * f.strides_bytes[0],
-                    f.strides_bytes[0],
-                    f.strides_bytes[1],
-                )
+        ranges.append(
+            KVCacheResolvedRange(
+                item.global_layer_id,
+                item.component,
+                snapshot.token_start,
+                snapshot.token_count,
+                part.head_start,
+                part.head_count,
+                region_id,
+                f.storage_offset_bytes + first_token_offset * f.strides_bytes[0],
+                f.strides_bytes[0],
+                f.strides_bytes[1],
             )
+        )
     result = KVCacheResolvedRuntimeBinding(
         operation_id,
         binding.resource_id,
@@ -433,7 +429,7 @@ def resolve_contiguous_runtime_binding(
         binding.participant_id,
         snapshot.snapshot_id,
         snapshot.digest,
-        tuple(regions),
+        tuple(regions.values()),
         tuple(ranges),
     )
     validate_resolved_runtime_binding(
