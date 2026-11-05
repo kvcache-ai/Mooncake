@@ -1577,10 +1577,7 @@ void Workers::workerThread(int thread_id) {
                     });
             } else {
                 worker.cv.wait(lock, [&]() -> bool {
-                    return !running_ ||
-                           !accepting_submits_.load(
-                               std::memory_order_acquire) ||
-                           worker.inflight_slices.load(
+                    return !running_ || worker.inflight_slices.load(
                                std::memory_order_acquire) > 0;
                 });
             }

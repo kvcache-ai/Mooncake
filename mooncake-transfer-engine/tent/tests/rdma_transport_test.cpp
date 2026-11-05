@@ -253,6 +253,11 @@ class RdmaTransportTestPeer {
     static void addInflight(Workers& workers, size_t worker_id, int64_t delta) {
         workers.worker_context_[worker_id].inflight_slices.fetch_add(delta);
     }
+    static bool workerInSuspend(Workers& workers, size_t worker_id) {
+        auto& worker = workers.worker_context_[worker_id];
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        return worker.in_suspend;
+    }
 
     using NotifyAction = RdmaTransport::NotifyCompletionAction;
 
@@ -5970,7 +5975,7 @@ TEST(RdmaQuiesceTest, WorkersQuiesceWithoutStartRejectsSubmit) {
     EXPECT_TRUE(workers->submit(slice_list).IsInternalError());
 }
 
-TEST(RdmaQuiesceTest, IdleWorkersDrainAndRejectSubmit) {
+TEST(RdmaQuiesceTest, IdleWorkersDrainStaySuspendedAndRejectSubmit) {
     auto topology = std::make_shared<Topology>();
     RdmaTransport transport;
     RdmaTransportTestPeer::bindTopology(transport, topology);
@@ -5979,6 +5984,20 @@ TEST(RdmaQuiesceTest, IdleWorkersDrainAndRejectSubmit) {
     ASSERT_TRUE(workers->start().ok());
 
     EXPECT_TRUE(workers->quiesce().ok());
+    const auto suspend_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    bool worker_suspended = false;
+    while (!worker_suspended &&
+           std::chrono::steady_clock::now() < suspend_deadline) {
+        worker_suspended =
+            RdmaTransportTestPeer::workerInSuspend(*workers, 0);
+        if (!worker_suspended) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    EXPECT_TRUE(worker_suspended);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_TRUE(RdmaTransportTestPeer::workerInSuspend(*workers, 0));
     RdmaSliceList slice_list;
     EXPECT_TRUE(workers->submit(slice_list).IsInternalError());
     EXPECT_TRUE(workers->quiesce().ok());
