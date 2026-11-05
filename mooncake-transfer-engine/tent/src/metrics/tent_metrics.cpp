@@ -180,6 +180,16 @@ TentMetrics::StreamEvent streamOutcomeEvent(
     }
     return TentMetrics::StreamEvent::IoError;
 }
+
+const char* streamConnectionRoleName(TentMetrics::StreamConnectionRole role) {
+    switch (role) {
+        case TentMetrics::StreamConnectionRole::Client:
+            return "client";
+        case TentMetrics::StreamConnectionRole::Server:
+            return "server";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -397,6 +407,10 @@ void TentMetrics::registerMetrics() {
     gauges_ = {
         &inflight_attempts_,
         &logical_requests_inflight_,
+        &stream_queue_depth_,
+        &stream_busy_workers_,
+        &stream_admitted_tasks_,
+        &stream_admitted_bytes_,
         &registered_buffer_bytes_,
     };
 
@@ -618,6 +632,55 @@ void TentMetrics::recordStreamQueueWait(TransportType transport,
         static_cast<int64_t>(latency_us));
 }
 
+void TentMetrics::recordStreamQueueDepth(TransportType transport,
+                                         int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    stream_queue_depth_.incCached(
+        transportSlot(transport),
+        [transport] {
+            return std::array<std::string, 1>{transportTypeName(transport)};
+        },
+        delta);
+}
+
+void TentMetrics::recordStreamBusyWorkers(TransportType transport,
+                                          int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    stream_busy_workers_.incCached(
+        transportSlot(transport),
+        [transport] {
+            return std::array<std::string, 1>{transportTypeName(transport)};
+        },
+        delta);
+}
+
+void TentMetrics::recordStreamAdmission(TransportType transport,
+                                        int64_t task_delta,
+                                        int64_t byte_delta) {
+    if (!initialized_) return;
+    auto labels = [transport] {
+        return std::array<std::string, 1>{transportTypeName(transport)};
+    };
+    const size_t slot = transportSlot(transport);
+    if (task_delta != 0)
+        stream_admitted_tasks_.incCached(slot, labels, task_delta);
+    if (byte_delta != 0)
+        stream_admitted_bytes_.incCached(slot, labels, byte_delta);
+}
+
+void TentMetrics::recordStreamConnection(TransportType transport,
+                                         StreamConnectionRole role,
+                                         int64_t delta) {
+    if (!initialized_ || delta == 0) return;
+    stream_connections_.incCached(
+        streamConnectionSlot(transport, role),
+        [transport, role] {
+            return std::array<std::string, 2>{transportTypeName(transport),
+                                              streamConnectionRoleName(role)};
+        },
+        delta);
+}
+
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
 // engine state through paired add/sub operations (attempt start/finish,
 // register/unregister), and skipping one half of a pair across a
@@ -798,6 +861,7 @@ bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
             for (auto* gauge : gauges_) {
                 serializeGaugePrometheus(*gauge, output);
             }
+            serializeGaugePrometheus(stream_connections_, output);
 
             appendSelfMetricsPrometheus(output, success_timestamp);
         });
@@ -970,8 +1034,9 @@ void TentMetrics::serializeHistogramPrometheus(
     }
 }
 
+template <uint8_t N>
 void TentMetrics::serializeGaugePrometheus(
-    metrics::CachedDynamicCounter<1>& gauge, std::string& out) const {
+    metrics::CachedDynamicCounter<N>& gauge, std::string& out) const {
     auto cells = gauge.copy();
     if (cells.empty()) return;
     const std::string& name = gauge.str_name();
@@ -982,12 +1047,15 @@ void TentMetrics::serializeGaugePrometheus(
         .append("\n");
     out.append("# TYPE ").append(name).append(" gauge\n");
     for (auto& e : cells) {
-        out.append(name)
-            .append("{")
-            .append(gauge.labels_name()[0])
-            .append("=\"")
-            .append(e->label[0])
-            .append("\"} ")
+        out.append(name).append("{");
+        for (uint8_t i = 0; i < N; ++i) {
+            if (i != 0) out.append(",");
+            out.append(gauge.labels_name()[i])
+                .append("=\"")
+                .append(escapePrometheusLabelValue(e->label[i]))
+                .append("\"");
+        }
+        out.append("} ")
             .append(std::to_string(e->value.load(std::memory_order_relaxed)))
             .append("\n");
     }
@@ -1131,6 +1199,16 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&logical_requests_inflight_);
             root[registered_buffer_bytes_.str_name()] =
                 sumCounterValues(&registered_buffer_bytes_);
+            root[stream_queue_depth_.str_name()] =
+                sumCounterValues(&stream_queue_depth_);
+            root[stream_busy_workers_.str_name()] =
+                sumCounterValues(&stream_busy_workers_);
+            root[stream_admitted_tasks_.str_name()] =
+                sumCounterValues(&stream_admitted_tasks_);
+            root[stream_admitted_bytes_.str_name()] =
+                sumCounterValues(&stream_admitted_bytes_);
+            root[stream_connections_.str_name()] =
+                sumCounterValues(&stream_connections_);
 
             // Histograms: sum bucket counts across all transport labels. The
             // templated helper also reads back the histogram's sum counter so
@@ -1286,6 +1364,11 @@ void TentMetrics::recordStreamAttempt(TransportType, Request::OpCode,
                                       StreamOutcome, double) {}
 void TentMetrics::recordStreamQueueWait(TransportType, Request::OpCode,
                                         double) {}
+void TentMetrics::recordStreamQueueDepth(TransportType, int64_t) {}
+void TentMetrics::recordStreamBusyWorkers(TransportType, int64_t) {}
+void TentMetrics::recordStreamAdmission(TransportType, int64_t, int64_t) {}
+void TentMetrics::recordStreamConnection(TransportType, StreamConnectionRole,
+                                         int64_t) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

@@ -271,6 +271,11 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_logical_requests_inflight` | Gauge | `operation` | Counted logical requests without a terminal outcome |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
+| `tent_stream_queue_depth` | Gauge | `transport` | TCP tasks or HP-TCP operations waiting to start |
+| `tent_stream_busy_workers` | Gauge | `transport` | TCP workers or HP-TCP lanes currently executing an operation |
+| `tent_stream_admitted_tasks` | Gauge | `transport` | HP-TCP tasks currently reserved by admission control |
+| `tent_stream_admitted_bytes` | Gauge | `transport` | HP-TCP bytes currently reserved by admission control |
+| `tent_stream_connections` | Gauge | `transport`, `role` | Open stream connections split by client and server role |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -321,6 +326,9 @@ visible when runtime transfer recording is disabled.
   closed exactly once even if recording is disabled before completion. A
   request that starts while disabled emits neither side of the pair.
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
+- State gauges ignore the runtime sampling switch. Every queue, worker,
+  admission, and connection increment is paired with a decrement on success,
+  cancellation, timeout, dispatch failure, and shutdown paths.
 - `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
@@ -351,6 +359,7 @@ or other unbounded values are accepted.
 | `outcome` | accounting: `success`, `failed`, `timeout`, `canceled`; stream attempts: `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` | Family-specific bounded terminal outcome |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
 | `event` | `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted` | Bounded stream lifecycle event |
+| `role` | `client`, `server` | Stream connection endpoint role |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |

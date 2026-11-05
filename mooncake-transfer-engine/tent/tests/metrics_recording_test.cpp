@@ -446,6 +446,16 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStreamAttempt(HP_TCP, Request::WRITE,
                                 TentMetrics::StreamOutcome::Success, 45.0);
     metrics.recordStreamQueueWait(TCP, Request::READ, 12.0);
+    metrics.recordStreamQueueDepth(TCP, 1);
+    metrics.recordStreamBusyWorkers(TCP, 1);
+    metrics.recordStreamAdmission(HP_TCP, 2, 4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 1);
+    metrics.recordStreamQueueDepth(TCP, -1);
+    metrics.recordStreamBusyWorkers(TCP, -1);
+    metrics.recordStreamAdmission(HP_TCP, -2, -4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -455,7 +465,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 37>
+    const std::array<std::pair<std::string_view, std::string_view>, 42>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -475,6 +485,11 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stream_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_logical_requests_inflight", "gauge"},
+            {"tent_stream_queue_depth", "gauge"},
+            {"tent_stream_busy_workers", "gauge"},
+            {"tent_stream_admitted_tasks", "gauge"},
+            {"tent_stream_admitted_bytes", "gauge"},
+            {"tent_stream_connections", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_read_latency_us", "histogram"},
             {"tent_write_latency_us", "histogram"},
@@ -568,6 +583,33 @@ TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {
               0);
 
     TentMetrics::setEnabled(true);
+}
+
+TEST_F(MetricsRecordingTest, StreamStateGaugesSurviveEnableToggle) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    TentMetrics::setEnabled(true);
+    metrics.recordStreamQueueDepth(HP_TCP, 1);
+    metrics.recordStreamBusyWorkers(HP_TCP, 1);
+    metrics.recordStreamAdmission(HP_TCP, 2, 4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 1);
+    TentMetrics::setEnabled(false);
+    metrics.recordStreamQueueDepth(HP_TCP, -1);
+    metrics.recordStreamBusyWorkers(HP_TCP, -1);
+    metrics.recordStreamAdmission(HP_TCP, -2, -4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
+    TentMetrics::setEnabled(true);
+
+    const auto after = MetricsSnapshot(metrics);
+    for (const char* family :
+         {"tent_stream_queue_depth", "tent_stream_busy_workers",
+          "tent_stream_admitted_tasks", "tent_stream_admitted_bytes",
+          "tent_stream_connections"}) {
+        EXPECT_EQ(after.counter(family) - before.counter(family), 0) << family;
+    }
 }
 
 TEST_F(MetricsRecordingTest,
@@ -1926,6 +1968,11 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_stream_events_total"));
     EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));
     EXPECT_TRUE(json.contains("tent_stream_queue_wait_us"));
+    EXPECT_TRUE(json.contains("tent_stream_queue_depth"));
+    EXPECT_TRUE(json.contains("tent_stream_busy_workers"));
+    EXPECT_TRUE(json.contains("tent_stream_admitted_tasks"));
+    EXPECT_TRUE(json.contains("tent_stream_admitted_bytes"));
+    EXPECT_TRUE(json.contains("tent_stream_connections"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_FALSE(
         json["tent_metrics_build_info"].contains("compile_time_enabled"));

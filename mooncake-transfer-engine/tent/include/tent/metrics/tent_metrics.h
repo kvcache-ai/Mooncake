@@ -188,6 +188,15 @@ class TentMetrics {
                              StreamOutcome outcome, double latency_us);
     void recordStreamQueueWait(TransportType transport,
                                Request::OpCode operation, double latency_us);
+    enum class StreamConnectionRole { Client, Server };
+    // Paired stream state gauges. These updates remain active when runtime
+    // sampling is disabled so current state cannot drift.
+    void recordStreamQueueDepth(TransportType transport, int64_t delta);
+    void recordStreamBusyWorkers(TransportType transport, int64_t delta);
+    void recordStreamAdmission(TransportType transport, int64_t task_delta,
+                               int64_t byte_delta);
+    void recordStreamConnection(TransportType transport,
+                                StreamConnectionRole role, int64_t delta);
 
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
@@ -326,6 +335,8 @@ class TentMetrics {
         "transport", "operation", "event"};
     static inline const std::array<std::string, 3> kStreamAttemptLabels{
         "transport", "operation", "outcome"};
+    static inline const std::array<std::string, 2> kStreamConnectionLabels{
+        "transport", "role"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -348,6 +359,7 @@ class TentMetrics {
         kStreamOperationDomain * kStreamEventValueDomain;
     static constexpr size_t kStreamAttemptDomain =
         kStreamOperationDomain * kStreamOutcomeDomain;
+    static constexpr size_t kStreamConnectionDomain = kTransportDomain * 2;
 
     // Stable slot indices into the cached-cell label domain.
     static size_t transportSlot(TransportType tp) {
@@ -391,6 +403,10 @@ class TentMetrics {
         return streamOperationSlot(transport, operation) *
                    kStreamOutcomeDomain +
                static_cast<size_t>(outcome);
+    }
+    static size_t streamConnectionSlot(TransportType transport,
+                                       StreamConnectionRole role) {
+        return transportSlot(transport) * 2 + static_cast<size_t>(role);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -470,6 +486,23 @@ class TentMetrics {
         "tent_logical_requests_inflight",
         "Accepted logical requests without a terminal outcome", kOperationLabel,
         kOperationDomain};
+    metrics::CachedDynamicCounter<1> stream_queue_depth_{
+        "tent_stream_queue_depth", "Queued stream transport operations",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_busy_workers_{
+        "tent_stream_busy_workers", "Stream workers executing operations",
+        kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_admitted_tasks_{
+        "tent_stream_admitted_tasks",
+        "HP-TCP tasks holding bounded admission capacity", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_admitted_bytes_{
+        "tent_stream_admitted_bytes",
+        "HP-TCP bytes holding bounded admission capacity", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<2> stream_connections_{
+        "tent_stream_connections", "Open stream connections by endpoint role",
+        kStreamConnectionLabels, kStreamConnectionDomain};
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
@@ -547,7 +580,8 @@ class TentMetrics {
 
     // Serialize a gauge backed by a cached-cell counter: emits the current
     // value per label with # TYPE ... gauge.
-    void serializeGaugePrometheus(metrics::CachedDynamicCounter<1>& gauge,
+    template <uint8_t N>
+    void serializeGaugePrometheus(metrics::CachedDynamicCounter<N>& gauge,
                                   std::string& out) const;
 
     // Append the fixed single-series metrics-pipeline state plus the
