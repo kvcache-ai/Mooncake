@@ -10,20 +10,24 @@
 namespace mooncake {
 namespace {
 
-enum class ImprovementKind {
-    NONE,
-    ADD,
-    REMOVE,
-    SWAP,
+struct Subset {
+    uint64_t bytes;
+    uint32_t mask;
 };
 
-struct Improvement {
-    ImprovementKind kind{ImprovementKind::NONE};
-    std::string removed_id;
-    std::string added_id;
-    uint64_t logical_bytes{0};
-    long double distance{std::numeric_limits<long double>::infinity()};
-};
+std::vector<Subset> Enumerate(const std::vector<WeightAffinityUnit>& units,
+                              size_t begin, size_t count) {
+    std::vector<Subset> sums{{0, 0}};
+    sums.reserve(size_t{1} << count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto size = sums.size();
+        for (size_t j = 0; j < size; ++j) {
+            sums.push_back({sums[j].bytes + units[begin + i].logical_bytes,
+                            sums[j].mask | (uint32_t{1} << i)});
+        }
+    }
+    return sums;
+}
 
 }  // namespace
 
@@ -51,142 +55,104 @@ PlanMixedWeightResidency(const std::vector<WeightAffinityUnit>& units,
     auto ordered = units;
     std::sort(ordered.begin(), ordered.end(),
               [](const auto& lhs, const auto& rhs) {
-                  if (lhs.logical_bytes != rhs.logical_bytes) {
-                      return lhs.logical_bytes > rhs.logical_bytes;
-                  }
                   return lhs.affinity_id < rhs.affinity_id;
               });
     const long double target =
         static_cast<long double>(total_bytes) * target_hot_ratio;
-
-    std::set<std::string> selected{ordered.front().affinity_id};
-    uint64_t hot_bytes = ordered.front().logical_bytes;
-    for (const auto& unit : ordered) {
-        if (selected.contains(unit.affinity_id) ||
-            selected.size() + 1 == units.size()) {
-            continue;
+    std::vector<std::string> selected;
+    uint64_t hot_bytes = 0;
+    long double best_distance = std::numeric_limits<long double>::infinity();
+    constexpr size_t kExactAffinityLimit = 32;
+    auto consider = [&](uint64_t bytes, auto make_ids) {
+        if (bytes == 0 || bytes == total_bytes) {
+            return;
         }
-        const auto before =
-            std::fabs(static_cast<long double>(hot_bytes) - target);
-        const auto after = std::fabs(static_cast<long double>(hot_bytes) +
-                                     unit.logical_bytes - target);
-        if (after < before) {
-            selected.insert(unit.affinity_id);
-            hot_bytes += unit.logical_bytes;
-        }
-    }
-
-    auto consider = [](Improvement candidate, Improvement* best) {
-        if (candidate.distance < best->distance ||
-            (candidate.distance == best->distance &&
-             std::tie(candidate.kind, candidate.removed_id,
-                      candidate.added_id) <
-                 std::tie(best->kind, best->removed_id, best->added_id))) {
-            *best = std::move(candidate);
+        const auto distance =
+            std::fabs(static_cast<long double>(bytes) - target);
+        if (distance < best_distance) {
+            best_distance = distance;
+            hot_bytes = bytes;
+            selected = make_ids();
+        } else if (ordered.size() <= kExactAffinityLimit &&
+                   distance == best_distance) {
+            auto ids = make_ids();
+            if (ids < selected) {
+                hot_bytes = bytes;
+                selected = std::move(ids);
+            }
         }
     };
-    constexpr size_t kMaxLocalImprovementPasses = 8;
-    for (size_t pass = 0; pass < kMaxLocalImprovementPasses; ++pass) {
-        const auto current_distance =
-            std::fabs(static_cast<long double>(hot_bytes) - target);
-        Improvement best;
-        if (selected.size() + 1 < units.size()) {
-            for (const auto& unit : ordered) {
-                if (selected.contains(unit.affinity_id)) {
-                    continue;
-                }
-                const uint64_t bytes = hot_bytes + unit.logical_bytes;
-                consider(
-                    Improvement{
-                        .kind = ImprovementKind::ADD,
-                        .removed_id = {},
-                        .added_id = unit.affinity_id,
-                        .logical_bytes = bytes,
-                        .distance =
-                            std::fabs(static_cast<long double>(bytes) - target),
-                    },
-                    &best);
-            }
-        }
-        if (selected.size() > 1) {
-            for (const auto& unit : ordered) {
-                if (!selected.contains(unit.affinity_id)) {
-                    continue;
-                }
-                const uint64_t bytes = hot_bytes - unit.logical_bytes;
-                consider(
-                    Improvement{
-                        .kind = ImprovementKind::REMOVE,
-                        .removed_id = unit.affinity_id,
-                        .added_id = {},
-                        .logical_bytes = bytes,
-                        .distance =
-                            std::fabs(static_cast<long double>(bytes) - target),
-                    },
-                    &best);
-            }
-        }
-
-        std::vector<WeightAffinityUnit> unselected;
-        for (const auto& unit : ordered) {
-            if (!selected.contains(unit.affinity_id)) {
-                unselected.push_back(unit);
-            }
-        }
-        std::sort(unselected.begin(), unselected.end(),
+    if (ordered.size() <= kExactAffinityLimit) {
+        // Each half has at most 65536 states, independent of byte magnitudes.
+        const size_t middle = ordered.size() / 2;
+        const auto left = Enumerate(ordered, 0, middle);
+        auto right = Enumerate(ordered, middle, ordered.size() - middle);
+        std::sort(right.begin(), right.end(),
                   [](const auto& lhs, const auto& rhs) {
-                      if (lhs.logical_bytes != rhs.logical_bytes) {
-                          return lhs.logical_bytes < rhs.logical_bytes;
-                      }
-                      return lhs.affinity_id < rhs.affinity_id;
+                      return std::tie(lhs.bytes, lhs.mask) <
+                             std::tie(rhs.bytes, rhs.mask);
                   });
-        for (const auto& removed : ordered) {
-            if (!selected.contains(removed.affinity_id)) {
-                continue;
-            }
-            const long double desired =
-                target -
-                static_cast<long double>(hot_bytes - removed.logical_bytes);
+        for (const auto& lhs : left) {
             const auto lower = std::lower_bound(
-                unselected.begin(), unselected.end(), desired,
-                [](const auto& unit, long double bytes) {
-                    return static_cast<long double>(unit.logical_bytes) < bytes;
+                right.begin(), right.end(), target - lhs.bytes,
+                [](const auto& rhs, long double desired) {
+                    return static_cast<long double>(rhs.bytes) < desired;
                 });
-            for (const auto replacement :
-                 {lower == unselected.end() ? std::prev(unselected.end())
-                                            : lower,
-                  lower == unselected.begin() ? lower : std::prev(lower)}) {
-                const uint64_t bytes = hot_bytes - removed.logical_bytes +
-                                       replacement->logical_bytes;
-                consider(
-                    Improvement{
-                        .kind = ImprovementKind::SWAP,
-                        .removed_id = removed.affinity_id,
-                        .added_id = replacement->affinity_id,
-                        .logical_bytes = bytes,
-                        .distance =
-                            std::fabs(static_cast<long double>(bytes) - target),
-                    },
-                    &best);
+            const auto index = static_cast<ptrdiff_t>(lower - right.begin());
+            // Empty/full are the only invalid sums; inspect their next
+            // neighbor.
+            for (ptrdiff_t offset = -2; offset <= 1; ++offset) {
+                const auto candidate = index + offset;
+                if (candidate < 0 ||
+                    candidate >= static_cast<ptrdiff_t>(right.size())) {
+                    continue;
+                }
+                const auto& rhs = right[candidate];
+                consider(lhs.bytes + rhs.bytes, [&] {
+                    std::vector<std::string> ids;
+                    for (size_t i = 0; i < ordered.size(); ++i) {
+                        const bool included =
+                            i < middle ? (lhs.mask & (uint32_t{1} << i)) != 0
+                                       : (rhs.mask &
+                                          (uint32_t{1} << (i - middle))) != 0;
+                        if (included) ids.push_back(ordered[i].affinity_id);
+                    }
+                    return ids;
+                });
             }
         }
-        if (best.kind == ImprovementKind::NONE ||
-            best.distance >= current_distance) {
-            break;
+    } else {
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      return std::tie(lhs.logical_bytes, lhs.affinity_id) <
+                             std::tie(rhs.logical_bytes, rhs.affinity_id);
+                  });
+        // Proper prefixes plus complement(min) span [min, total-min], with
+        // gaps <= max. Nearest distance is <= max/2 inside that interval;
+        // outside it, the closest feasible endpoint is selected exactly.
+        uint64_t prefix = 0;
+        size_t best_prefix = 0;
+        for (size_t i = 0; i + 1 < ordered.size(); ++i) {
+            prefix += ordered[i].logical_bytes;
+            consider(prefix, [&] {
+                best_prefix = i + 1;
+                return std::vector<std::string>{};
+            });
         }
-        if (best.kind == ImprovementKind::REMOVE ||
-            best.kind == ImprovementKind::SWAP) {
-            selected.erase(best.removed_id);
-        }
-        if (best.kind == ImprovementKind::ADD ||
-            best.kind == ImprovementKind::SWAP) {
-            selected.insert(best.added_id);
-        }
-        hot_bytes = best.logical_bytes;
+        const auto before = best_distance;
+        consider(total_bytes - ordered.front().logical_bytes, [&] {
+            best_prefix = 0;
+            return std::vector<std::string>{};
+        });
+        const size_t begin = best_distance < before ? 1 : 0;
+        const size_t end = begin == 1 ? ordered.size() : best_prefix;
+        for (size_t i = begin; i < end; ++i)
+            selected.push_back(ordered[i].affinity_id);
+        std::sort(selected.begin(), selected.end());
     }
 
     return WeightMixedResidencyPlan{
-        .hot_affinity_ids = {selected.begin(), selected.end()},
+        .hot_affinity_ids = std::move(selected),
         .hot_logical_bytes = hot_bytes,
         .total_logical_bytes = total_bytes,
     };
