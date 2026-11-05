@@ -586,7 +586,7 @@ P2PMasterService::ExportLocalCommittedMetadataForStandby(
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
             rollback_store.UnmountSegment(
-                {payload.segment.id, payload.client_id});
+                {payload.client_id, payload.segment.id});
             ++rolled_back_entries;
         } else {
             // Delete-like P2P OpLog entries do not carry pre-image metadata,
