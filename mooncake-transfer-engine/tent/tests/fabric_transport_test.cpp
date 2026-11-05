@@ -98,11 +98,7 @@ std::shared_ptr<Config> makeFabricConfig(uint64_t max_mr_size,
     auto config = std::make_shared<Config>();
     config->set("metadata_type", "p2p");
     config->set("metadata_servers", "P2PHANDSHAKE");
-    config->set("transports/tcp/enable", false);
-    config->set("transports/rdma/enable", false);
-    config->set("transports/shm/enable", false);
-    config->set("transports/fabric/enable", true);
-    config->set("transports/fabric/provider", testProvider());
+    ConfigHelper::forceFabric(*config, testProvider());
     config->set("transports/fabric/slice_size", 256 * 1024);
     config->set("transports/fabric/max_mr_size", max_mr_size);
     config->set("transports/fabric/post_timeout_ms", 5000);

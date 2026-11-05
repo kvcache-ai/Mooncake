@@ -686,6 +686,18 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                              "use TCP";
             }
         }
+        if (protocol == "efa") {
+#ifdef USE_FABRIC
+            mooncake::tent::ConfigHelper::forceFabric(*config, "efa");
+            if (!tent_device_filter_.empty()) {
+                config->set("transports/fabric/devices", tent_device_filter_);
+            }
+            LOG(INFO) << "protocol=efa, requiring TENT Fabric EFA";
+#else
+            LOG(ERROR) << "protocol=efa requires a TENT build with Fabric";
+            return ERR_NOT_IMPLEMENTED;
+#endif
+        }
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
         // Store still constructs TENT through this classic init() shim, not
         // tent::TransferEngine(Config) directly. Copy Dummy-real flags until

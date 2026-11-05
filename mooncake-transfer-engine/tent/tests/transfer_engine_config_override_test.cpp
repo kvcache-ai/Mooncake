@@ -384,6 +384,57 @@ TEST(TransferEngineConfigOverrideTest,
     }
 }
 
+TEST(TransferEngineConfigOverrideTest, ForceFabricDisablesHostTransports) {
+    Config config;
+    ConfigHelper::forceTcp(config);
+    ConfigHelper::forceFabric(config, "efa");
+
+    EXPECT_FALSE(config.get("transports/force_tcp", true));
+    EXPECT_TRUE(config.get("transports/force_fabric", false));
+    EXPECT_FALSE(config.get("transports/tcp/enable", true));
+    EXPECT_FALSE(config.get("transports/rdma/enable", true));
+    EXPECT_FALSE(config.get("transports/hp_tcp/enable", true));
+    EXPECT_FALSE(config.get("transports/shm/enable", true));
+    EXPECT_TRUE(config.get("transports/fabric/enable", false));
+    EXPECT_EQ(config.get("transports/fabric/provider", ""), "efa");
+
+    ConfigHelper::forceTcp(config);
+    EXPECT_FALSE(config.get("transports/force_fabric", true));
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitForceFabricSurvivesEnvAndRequiresInstall) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":true},"rdma":{"enable":true},"hp_tcp":{"enable":true},"shm":{"enable":true},"fabric":{"enable":false,"provider":"tcp","devices":["tcp0"]}},"metrics":{"enabled":false}})");
+    EnvVarGuard force_tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("local_segment_name", "force-fabric-explicit");
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", 0);
+    ConfigHelper::forceFabric(*config, "invalid-test-provider");
+    const std::vector<std::string> devices{"efa0", "efa1"};
+    config->set("transports/fabric/devices", devices);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_FALSE(config->get("transports/force_tcp", true));
+    EXPECT_TRUE(config->get("transports/force_fabric", false));
+    EXPECT_FALSE(config->get("transports/tcp/enable", true));
+    EXPECT_FALSE(config->get("transports/rdma/enable", true));
+    EXPECT_FALSE(config->get("transports/hp_tcp/enable", true));
+    EXPECT_FALSE(config->get("transports/shm/enable", true));
+    EXPECT_TRUE(config->get("transports/fabric/enable", false));
+    EXPECT_EQ(config->get("transports/fabric/provider", ""),
+              "invalid-test-provider");
+    EXPECT_EQ(config->getArray<std::string>("transports/fabric/devices"),
+              devices);
+}
+
 // MOONCAKE_LOCAL_HOSTNAME is the classic Transfer Engine + store env var that
 // names the local host for RPC binding and segment identity. TENT must honor
 // the same env so a single MOONCAKE_LOCAL_HOSTNAME works across both engines;
