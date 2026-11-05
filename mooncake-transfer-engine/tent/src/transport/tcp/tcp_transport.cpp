@@ -216,20 +216,14 @@ Status TcpTransport::uninstallImpl(bool force) {
     Status result = Status::OK();
     if (installed_) {
         if (metadata_) {
-            metadata_->setUnsafeLegacyTcpDataRpcEnabled(false);
-            metadata_->tcpBufferRegistry().close(force);
-            if (!force && !metadata_->tcpBufferRegistry().empty()) {
-                // Buffer descriptors still carry registration IDs and must be
-                // removed through this transport. Reopen the registry and
-                // leave the transport installed so callers can unregister the
-                // buffers and retry uninstall without stranding metadata.
-                CHECK_STATUS(metadata_->tcpBufferRegistry().reopen());
-                metadata_->setUnsafeLegacyTcpDataRpcEnabled(
-                    params_.allow_unsafe_legacy_data_rpc);
+            auto& registry = metadata_->tcpBufferRegistry();
+            if (!force && !registry.empty()) {
                 return Status::InvalidArgument(
                     "Cannot uninstall TCP transport with registered "
                     "buffers" LOC_MARK);
             }
+            metadata_->setUnsafeLegacyTcpDataRpcEnabled(false);
+            registry.close(force);
             metadata_->setNotifyCallback(nullptr);
         }
         quiesce();
@@ -438,6 +432,13 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,
                           task->request.target_id, rpc_server_addr, identity);
+    if (status.IsAddressNotRegistered()) {
+        CHECK_STATUS(metadata_->segmentManager().invalidateRemote(
+            task->request.target_id));
+        status = findRemoteSegment(
+            task->request.target_offset, task->request.length,
+            task->request.target_id, rpc_server_addr, identity);
+    }
     if (!status.ok()) return status;
 
     Status last_error;
@@ -557,12 +558,12 @@ Status TcpTransport::findRemoteSegment(
                 process != segment->getMemory().transport_attrs.end();
             const bool has_registration =
                 registration != buffer->transport_attrs.end();
-            // A missing buffer attribute is a legacy registration, even when
-            // a rolling upgrade already published the segment-wide v2
-            // capability. Once a buffer advertises v2, its process identity
-            // is mandatory and partial metadata fails closed.
             if (!has_registration) {
                 identity.reset();
+                if (has_process) {
+                    return Status::AddressNotRegistered(
+                        "TCP target buffer is not registered for TCP" LOC_MARK);
+                }
                 return Status::OK();
             }
             if (!has_process) {

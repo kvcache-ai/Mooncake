@@ -295,7 +295,9 @@ TEST_F(TcpRegression, PayloadCapsRejectBeforeAllocationOrDataRpc) {
     calls = 0;
     injected_failures = 0;
     for (auto opcode : {Request::READ, Request::WRITE}) {
-        for (size_t length : {tcpMaxTransferBytes(opcode) + 1,
+        const size_t v1_cap = opcode == Request::READ ? kTcpMaxReadBytes
+                                                      : kTcpMaxWriteBytes;
+        for (size_t length : {v1_cap + 1,
                               std::numeric_limits<size_t>::max()}) {
             auto call = opcode == Request::READ ? ControlClient::recvData
                                                 : ControlClient::sendData;
@@ -307,10 +309,29 @@ TEST_F(TcpRegression, PayloadCapsRejectBeforeAllocationOrDataRpc) {
             });
         }
     }
+    const TcpDataPlaneIdentity identity{{1, 1}, 1};
+    for (size_t length : {kTcpMaxWriteV2Bytes + 1,
+                          std::numeric_limits<size_t>::max()}) {
+        EXPECT_TRUE(ControlClient::sendDataV2(
+                        address, reinterpret_cast<uint64_t>(data.data()),
+                        data.data(), length, identity)
+                        .IsInvalidArgument());
+    }
+    for (size_t length : {kTcpMaxReadBytes + 1,
+                          std::numeric_limits<size_t>::max()}) {
+        EXPECT_TRUE(ControlClient::recvDataV2(
+                        address, reinterpret_cast<uint64_t>(data.data()),
+                        data.data(), length, identity)
+                        .IsInvalidArgument());
+    }
     EXPECT_EQ(injected_failures.load(), 0);
     EXPECT_EQ(calls.load(), 0);
     EXPECT_EQ(kTcpMaxWriteBytes + sizeof(XferDataDesc),
               std::numeric_limits<uint32_t>::max());
+    EXPECT_EQ(kTcpMaxWriteV2Bytes + kTcpDataV2HeaderBytes,
+              std::numeric_limits<uint32_t>::max());
+    EXPECT_EQ(tcpMaxTransferBytes(Request::WRITE), kTcpMaxWriteV2Bytes);
+    EXPECT_EQ(tcpMaxTransferBytes(Request::READ), kTcpMaxReadBytes);
     EXPECT_TRUE(receiver.stop().ok());
 }
 

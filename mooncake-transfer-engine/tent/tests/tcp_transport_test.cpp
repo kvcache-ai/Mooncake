@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -454,6 +455,19 @@ TEST(TcpTransportIdentityTest, PublishesAndResolvesRegistrationMetadata) {
                         return Status::OK();
                     })
                     .ok());
+    auto missing_registration = TcpTransportTestPeer::resolve(
+        transport, buffer.addr, buffer.length, LOCAL_SEGMENT_ID, identity);
+    EXPECT_TRUE(missing_registration.IsAddressNotRegistered())
+        << missing_registration.ToString();
+
+    ASSERT_TRUE(metadata->segmentManager()
+                    .updateLocal([](SegmentDesc& segment) {
+                        std::get<MemorySegmentDesc>(segment.detail)
+                            .transport_attrs.erase(
+                                static_cast<int>(TransportType::TCP));
+                        return Status::OK();
+                    })
+                    .ok());
     ASSERT_TRUE(TcpTransportTestPeer::resolve(transport, buffer.addr,
                                               buffer.length, LOCAL_SEGMENT_ID,
                                               identity)
@@ -466,9 +480,6 @@ TEST(TcpTransportIdentityTest, PublishesAndResolvesRegistrationMetadata) {
                             .buffers.back()
                             .transport_attrs[TransportType::TCP] =
                             buffer.transport_attrs.at(TransportType::TCP);
-                        std::get<MemorySegmentDesc>(segment.detail)
-                            .transport_attrs.erase(
-                                static_cast<int>(TransportType::TCP));
                         return Status::OK();
                     })
                     .ok());
@@ -562,9 +573,9 @@ TEST(TcpTransportIdentityTest, RefreshesStaleRegistrationBeforeWriteReplay) {
     EXPECT_EQ(target, second_source);
 
     // Simulate a client snapshot captured before the server published the
-    // per-buffer registration. The default-safe server rejects v1 before any
-    // copy; the client recognizes that as refreshable, refetches v2 metadata,
-    // and safely replays the WRITE.
+    // per-buffer registration. The client must not fall back to v1 when the
+    // process advertises v2 support; it refreshes the incomplete snapshot
+    // locally and issues only the identified WRITE.
     ASSERT_TRUE(server_metadata->segmentManager()
                     .updateLocal([](SegmentDesc& segment) {
                         std::get<MemorySegmentDesc>(segment.detail)
@@ -735,12 +746,15 @@ TEST(TcpTransportIdentityTest, RealRpcLeasesDrainRemoveAndUninstall) {
                     })
                     .ok());
     std::array<char, 8> received{};
+    std::atomic<bool> block_first_read{true};
     std::promise<void> read_entered;
     std::promise<void> read_resume;
     auto read_resumed = read_resume.get_future().share();
     TcpBufferRegistryTestPeer::setAcquireHook(metadata->tcpBufferRegistry(),
                                               [&](uint64_t acquired) {
-                                                  if (acquired != registration)
+                                                  if (acquired != registration ||
+                                                      !block_first_read.exchange(
+                                                          false))
                                                       return;
                                                   read_entered.set_value();
                                                   read_resumed.wait();
@@ -761,39 +775,27 @@ TEST(TcpTransportIdentityTest, RealRpcLeasesDrainRemoveAndUninstall) {
 
     auto uninstalling =
         std::async(std::launch::async, [&] { return transport.uninstall(); });
-    const auto close_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (!TcpBufferRegistryTestPeer::closing(metadata->tcpBufferRegistry()) &&
-           std::chrono::steady_clock::now() < close_deadline) {
-        std::this_thread::yield();
-    }
-    if (!TcpBufferRegistryTestPeer::closing(metadata->tcpBufferRegistry())) {
-        TcpBufferRegistryTestPeer::setAcquireHook(metadata->tcpBufferRegistry(),
-                                                  nullptr);
-        read_resume.set_value();
-        (void)read.get();
-        (void)uninstalling.get();
-        FAIL() << "uninstall did not close the registration registry";
-        return;
-    }
-    std::array<char, 8> rejected_read{};
-    auto rejected = ControlClient::recvData(
-        name, buffer.addr, rejected_read.data(), rejected_read.size());
-    EXPECT_TRUE(rejected.IsNeedsRefreshCache()) << rejected.ToString();
-    auto rejected_v2 =
-        ControlClient::recvDataV2(name, buffer.addr, rejected_read.data(),
-                                  rejected_read.size(), identity);
-    EXPECT_TRUE(rejected_v2.IsNeedsRefreshCache()) << rejected_v2.ToString();
-    EXPECT_EQ(uninstalling.wait_for(std::chrono::seconds(0)),
-              std::future_status::timeout);
+    EXPECT_EQ(uninstalling.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::ready);
+    EXPECT_FALSE(
+        TcpBufferRegistryTestPeer::closing(metadata->tcpBufferRegistry()));
+
+    std::array<char, 8> concurrent_v1{};
+    auto v1 = ControlClient::recvData(name, buffer.addr, concurrent_v1.data(),
+                                      concurrent_v1.size());
+    EXPECT_TRUE(v1.ok()) << v1.ToString();
+    EXPECT_EQ(concurrent_v1, source);
+    std::array<char, 8> concurrent_v2{};
+    auto v2 = ControlClient::recvDataV2(name, buffer.addr, concurrent_v2.data(),
+                                        concurrent_v2.size(), identity);
+    EXPECT_TRUE(v2.ok()) << v2.ToString();
+    EXPECT_EQ(concurrent_v2, source);
 
     read_resume.set_value();
     ASSERT_EQ(read.wait_for(std::chrono::seconds(5)),
               std::future_status::ready);
     EXPECT_TRUE(read.get().ok());
     EXPECT_EQ(received, source);
-    ASSERT_EQ(uninstalling.wait_for(std::chrono::seconds(5)),
-              std::future_status::ready);
     auto still_registered = uninstalling.get();
     EXPECT_TRUE(still_registered.IsInvalidArgument())
         << still_registered.ToString();

@@ -125,7 +125,7 @@ struct XferDataDesc {
 };
 
 // Standard TCP RPC payload boundaries. READ retains the server's 1 GiB cap;
-// WRITE uses a 32-bit RPC attachment that includes XferDataDesc.
+// each WRITE protocol uses a 32-bit attachment that includes its own header.
 inline constexpr size_t kTcpMaxReadBytes = size_t{1} << 30;
 inline constexpr size_t kTcpMaxWriteBytes =
     std::numeric_limits<uint32_t>::max() - sizeof(XferDataDesc);
@@ -134,7 +134,8 @@ inline constexpr size_t kTcpMaxWriteV2Bytes =
     std::numeric_limits<uint32_t>::max() - kTcpDataV2HeaderBytes;
 
 inline constexpr size_t tcpMaxTransferBytes(Request::OpCode opcode) {
-    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteBytes;
+    // The submit planner must use the limit supported by both v1 and v2.
+    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteV2Bytes;
 }
 
 using OnReceiveBootstrap =
