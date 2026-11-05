@@ -12,6 +12,7 @@
 #include <glog/logging.h>
 
 #include "tent/common/config.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/slab.h"
 
@@ -839,6 +840,13 @@ Status HighPerformanceTcpTransport::retryTransferTask(SubBatchRef batch,
             hp_batch->tasks[static_cast<size_t>(task_id)] =
                 std::move(planned_task);
         });
+#if TENT_METRICS_ENABLED
+    if (committed.ok()) {
+        TentMetrics::instance().recordStreamEvent(
+            TransportType::HP_TCP, request.opcode,
+            TentMetrics::StreamEvent::RetryIssued);
+    }
+#endif
     return committed;
 }
 
