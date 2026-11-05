@@ -1,0 +1,7 @@
+# Build artifacts and generated/temp files produced by check_wire_contract.sh.
+# The golden (wire_contract_golden.txt) is the only generated file that is
+# committed; everything below is transient and must never be checked in.
+wire_contract_gen
+.wire_contract_live.txt
+.wire_contract.diff
+.build.log
