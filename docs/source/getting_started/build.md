@@ -329,7 +329,7 @@ The following options can be passed to `cmake ..`.
 | `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` | `-DUSE_MACA=ON` | Override MACA runtime libraries linked by `transfer_engine`. |
 | `-DDTK_ROOT=/path/to/dtk` | `-DUSE_HYGON=ON` | Override the DTK SDK root. `DTK_HOME` is also honored; default is `/opt/dtk`. |
 | `-DDTK_CUDA_ROOT=/path/to/cuda-12` | `-DUSE_HYGON=ON` | Override DTK's CUDA-compatible toolkit. The default is `${DTK_ROOT}/cuda/cuda`, falling back to the newest `${DTK_ROOT}/cuda/cuda-*`. |
-| `-DDTK_NVCC_EXECUTABLE=/path/to/nvcc` | `-DUSE_HYGON=ON` | Override DTK's CUDA-compatible compiler used for Mooncake EP/PG device sources. |
+| `-DDTK_NVCC_EXECUTABLE=/path/to/nvcc` | `-DUSE_HYGON=ON` | Override DTK's CUDA-compatible compiler used for Mooncake EP device sources. |
 | `-DDTK_INCLUDE_DIR=/path/to/include` | `-DUSE_HYGON=ON` | Override the DTK include directory. |
 | `-DDTK_LIB_DIR=/path/to/lib64` | `-DUSE_HYGON=ON` | Override the DTK library directory. |
 | `-DCOREX_ROOT=/path/to/corex` | `-DUSE_COREX=ON` | Override the CoreX SDK root. `COREX_HOME` is also honored; default is `/usr/local/corex`. |

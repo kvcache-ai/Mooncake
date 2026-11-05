@@ -175,8 +175,10 @@ endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
 if(WITH_EP)
-  add_subdirectory(mooncake-pg)
-  include_directories(mooncake-pg/include)
+  if(NOT USE_HYGON)
+    add_subdirectory(mooncake-pg)
+    include_directories(mooncake-pg/include)
+  endif()
 
   if(EP_USE_IDE)
     message(WARNING "EP_USE_IDE enabled. DO NOT USE IN PRODUCTION!")
@@ -255,14 +257,16 @@ if(WITH_EP)
         VERBATIM)
     endif()
 
-    add_custom_target(
-      mooncake_pg_device_stage ALL
+    if(NOT USE_HYGON)
+      add_custom_target(
+        mooncake_pg_device_stage ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               "$<TARGET_FILE:mooncake_pg_device>" "${EP_PG_STAGING_DIR}/"
       COMMENT "Staging Mooncake PG device library"
       DEPENDS mooncake_pg_device
-      VERBATIM)
+        VERBATIM)
+    endif()
   endif()
 endif()
 
