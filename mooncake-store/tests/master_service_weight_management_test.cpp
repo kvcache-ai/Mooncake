@@ -259,7 +259,7 @@ TEST_F(MasterServiceWeightManagementTest,
             .has_value());
 }
 
-TEST_F(MasterServiceWeightManagementTest, RejectsWrongManifestType) {
+TEST_F(MasterServiceWeightManagementTest, RejectsWrongManifestTypeBeforeAllocation) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
     const UUID client_id = generate_uuid();
@@ -267,8 +267,14 @@ TEST_F(MasterServiceWeightManagementTest, RejectsWrongManifestType) {
     PutObject(service, client_id, "payload-a",
               importing.manifest.payload_group_id, ObjectDataType::WEIGHT,
               1024);
-    PutObject(service, client_id, ManifestKey(),
-              importing.manifest.payload_group_id, ObjectDataType::WEIGHT, 128);
+    ReplicateConfig invalid_manifest;
+    invalid_manifest.group_ids =
+        std::vector<std::string>{importing.manifest.payload_group_id};
+    invalid_manifest.data_type = ObjectDataType::WEIGHT;
+    auto invalid = service.PutStart(client_id, ManifestKey(),
+                                    TenantId::Default(), 128, invalid_manifest);
+    ASSERT_FALSE(invalid);
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
 
     auto result = service.CommitWeightImport(
         CommitRequest(importing, {"payload-a"}, 1024));
