@@ -77,10 +77,15 @@ class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
 
-    static uintmax_t StoredFileBytes(const std::string& path) {
+    static uintmax_t StoredFileBytes(const std::string& path,
+                                     bool exclude_cold_journal = false) {
         uintmax_t bytes = 0;
         for (const auto& entry : fs::recursive_directory_iterator(path)) {
             if (!entry.is_regular_file()) continue;
+            if (exclude_cold_journal &&
+                entry.path().parent_path() ==
+                    fs::path(path) / "cold_write_journal")
+                continue;
             struct stat info{};
             EXPECT_EQ(0, ::stat(entry.path().c_str(), &info));
             bytes += static_cast<uintmax_t>(info.st_blocks) * 512;
@@ -250,7 +255,7 @@ class FileStorageTest : public ::testing::Test {
         storage.cold_write_journal_ =
             std::make_unique<ColdWriteJournal>(config.storage_filepath);
         ASSERT_TRUE(storage.cold_write_journal_->Init());
-        const auto baseline = StoredFileBytes(config.storage_filepath);
+        const auto baseline = StoredFileBytes(config.storage_filepath, true);
         if (protected_prefix) {
             for (const auto index : {1, 2, 0}) {
                 for (const auto& task : tasks) {
@@ -262,7 +267,7 @@ class FileStorageTest : public ::testing::Test {
         } else {
             ASSERT_TRUE(storage.OffloadObjects(tasks));
         }
-        const auto populated = StoredFileBytes(config.storage_filepath);
+        const auto populated = StoredFileBytes(config.storage_filepath, true);
         ASSERT_GT(populated, baseline);
         auto ready = client->CommitWeightImport(
             {.identity = identity,
@@ -299,7 +304,11 @@ class FileStorageTest : public ::testing::Test {
             uintmax_t logical_bytes = 0;
             for (const auto& entry :
                  fs::recursive_directory_iterator(config.storage_filepath)) {
-                if (entry.is_regular_file()) logical_bytes += entry.file_size();
+                if (entry.is_regular_file() &&
+                    entry.path().parent_path() !=
+                        fs::path(config.storage_filepath) /
+                            "cold_write_journal")
+                    logical_bytes += entry.file_size();
             }
             const auto capacity = static_cast<uint64_t>(
                 fs::space(config.storage_filepath).capacity * 0.9);
@@ -314,13 +323,15 @@ class FileStorageTest : public ::testing::Test {
             ASSERT_TRUE(storage.Heartbeat());
         }
         if (file_per_key) {
-            EXPECT_LT(StoredFileBytes(config.storage_filepath), populated);
+            EXPECT_LT(StoredFileBytes(config.storage_filepath, true),
+                      populated);
             auto ordinary_exists = storage.storage_backend_->IsExist(
                 TenantId::Default().MakeScopedKey(keys[0]));
             ASSERT_TRUE(ordinary_exists);
             EXPECT_FALSE(*ordinary_exists);
         } else {
-            EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+            EXPECT_EQ(populated,
+                      StoredFileBytes(config.storage_filepath, true));
         }
         ASSERT_NO_FATAL_FAILURE(check_payload());
 
@@ -335,7 +346,11 @@ class FileStorageTest : public ::testing::Test {
         storage.config_.disk_eviction_high_watermark_ratio = 1e-12;
         storage.config_.disk_eviction_low_watermark_ratio = 0.5e-12;
         ASSERT_TRUE(storage.Heartbeat());
-        EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+        EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath, true));
+        auto journal_entries = storage.cold_write_journal_->List();
+        ASSERT_TRUE(journal_entries);
+        ASSERT_EQ(1, journal_entries->size());
+        EXPECT_EQ(keys[1], journal_entries->begin()->second.key);
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
