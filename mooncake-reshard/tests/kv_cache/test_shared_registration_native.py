@@ -101,6 +101,12 @@ def worker(connection, role, ssm, strided, order):
                 binding.regions[0].region_id, owner_id=binding.digest
             )
             assert engine.unregisters == int(step == 1)
+            if step == 0:
+                with pytest.raises(ValueError, match="owner claim"):
+                    executor.validate_local_binding(binding)
+                if role == "source":
+                    with pytest.raises(ValueError, match="owner claim"):
+                        executor.execute(plan, binding.participant_id)
             connection.send(("released", None))
         region = bindings[0].regions[0]
         executor.register_region(region, owner_id="reuse")
