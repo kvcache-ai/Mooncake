@@ -202,8 +202,10 @@ inline void to_json(json& j, const SegmentDesc& s) {
     j = json{{"name", s.name},
              {"type", s.type},
              {"machine_id", s.machine_id},
-             {"owner_id", s.owner_id},
              {"rpc_server_addr", s.rpc_server_addr}};
+    if (!s.owner_id.empty()) {
+        j["owner_id"] = s.owner_id;
+    }
     if (!s.rdma_server_name.empty()) {
         j["rdma_server_name"] = s.rdma_server_name;
     }

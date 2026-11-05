@@ -845,6 +845,10 @@ TEST(TransferEngineConfigOverrideTest,
     expected->owner_id = "new-owner";
     auto legacy = std::make_shared<SegmentDesc>(*expected);
     legacy->owner_id.clear();
+    json legacy_json = *legacy;
+    json expected_json = *expected;
+    EXPECT_FALSE(legacy_json.contains("owner_id"));
+    EXPECT_EQ(expected_json.at("owner_id"), "new-owner");
 
     ASSERT_TRUE(registry.putSegmentDesc(legacy).ok());
     EXPECT_TRUE(registry.deleteSegmentDescIfOwned(kSegmentName, expected).ok());
