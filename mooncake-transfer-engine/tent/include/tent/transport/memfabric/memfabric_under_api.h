@@ -39,6 +39,7 @@ class MemFabricUnderApi {
    public:
     static bool LoadLibrary();
     static void CleanupLibrary();
+    static std::shared_ptr<const void> RetainLibrary();
     static bool IsLoaded() { return gLoaded; }
     static int32_t SmemMemAlloc(uint16_t deviceId, uint64_t size,
                                 uint32_t flags, void** address);

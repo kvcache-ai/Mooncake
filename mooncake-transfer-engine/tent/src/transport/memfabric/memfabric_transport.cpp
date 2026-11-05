@@ -66,6 +66,9 @@ TransferStatusEnum mapBatchStatus(int32_t query_ret, int32_t batch_result) {
 
 std::atomic<int> MemFabricTransport::g_init_ref_{0};
 std::mutex MemFabricTransport::g_init_mutex_;
+std::mutex* MemFabricTransport::g_quarantine_mutex_ = new std::mutex();
+std::vector<MemFabricTransport::Quarantine>* MemFabricTransport::g_quarantine_ =
+    new std::vector<MemFabricTransport::Quarantine>();
 
 MemFabricSubBatch::~MemFabricSubBatch() {
     if (pending_batch_count > 0)
@@ -116,6 +119,10 @@ Status MemFabricTransport::install(std::string& local_segment_name,
                                    std::shared_ptr<Topology> local_topology,
                                    std::shared_ptr<Config> conf) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
+    if (quarantined_)
+        return Status::InternalError(
+            "MemFabric transport was quarantined after a teardown "
+            "timeout" LOC_MARK);
     if (installed_)
         return Status::InvalidArgument("MemFabric already installed" LOC_MARK);
     LOG(INFO) << "install: segment_name=" << local_segment_name;
@@ -352,8 +359,9 @@ Status MemFabricTransport::allocateSubBatch(SubBatchRef& batch,
             "MemFabric transport is stopping" LOC_MARK);
     auto mf_batch = std::make_unique<MemFabricSubBatch>();
     mf_batch->task_list.reserve(max_size);
-    batches_.insert(mf_batch.get());
-    batch = mf_batch.release();
+    auto* raw_batch = mf_batch.get();
+    batches_.emplace(raw_batch, std::move(mf_batch));
+    batch = raw_batch;
     return Status::OK();
 }
 
@@ -366,6 +374,9 @@ Status MemFabricTransport::freeSubBatch(SubBatchRef& batch) {
         LOG(ERROR) << "Invalid sub-batch type in freeSubBatch";
         return Status::InvalidArgument("invalid sub-batch" LOC_MARK);
     }
+    if (batches_.find(mf_batch) == batches_.end())
+        return Status::InvalidArgument(
+            "MemFabric sub-batch is not owned by this transport" LOC_MARK);
     while (mf_batch->pending_batch_count > 0) {
         if (std::chrono::steady_clock::now() >= deadline) {
             LOG(WARNING) << "MemFabricTransport freeSubBatch timed out with "
@@ -388,8 +399,11 @@ Status MemFabricTransport::freeSubBatch(SubBatchRef& batch) {
             lock, std::min(deadline, std::chrono::steady_clock::now() +
                                          std::chrono::milliseconds(1)));
     }
-    batches_.erase(mf_batch);
-    delete mf_batch;
+    auto it = batches_.find(mf_batch);
+    if (it == batches_.end())
+        return Status::InternalError(
+            "MemFabric sub-batch owner was quarantined" LOC_MARK);
+    batches_.erase(it);
     batch = nullptr;
     return Status::OK();
 }
@@ -698,10 +712,14 @@ Status MemFabricTransport::addMemoryBuffer(std::vector<BufferDesc>& desc_list,
 
 Status MemFabricTransport::removeMemoryBuffer(BufferDesc& desc) {
     std::lock_guard<std::mutex> lock(inflight_mu_);
-    if (!handle_) return Status::OK();
     if (config_.data_op_type == SMEMB_DATA_OP_SDMA &&
         desc.permission == kLocalReadWrite)
         return Status::OK();
+    if (inflight_.load(std::memory_order_acquire) > 0)
+        return Status::InternalError(
+            "Cannot deregister MemFabric memory with in-flight "
+            "transfers" LOC_MARK);
+    if (!handle_) return Status::OK();
     CHECK_STATUS(bindDevice());
 
     // SMEM's deregistration currently retains the native MR until destruction;
@@ -729,7 +747,8 @@ Status MemFabricTransport::quiesce() {
             return Status::InternalError(
                 "MemFabric quiesce timed out" LOC_MARK);
         }
-        for (auto* batch : batches_) {
+        for (const auto& entry : batches_) {
+            auto* batch = entry.first;
             if (std::chrono::steady_clock::now() >= deadline) break;
             if (batch->pending_batch_count == 0) continue;
             for (size_t i = 0; i < batch->task_list.size(); ++i) {
@@ -755,9 +774,36 @@ Status MemFabricTransport::quiesce() {
 }
 
 Status MemFabricTransport::uninstall() {
-    (void)quiesce();
+    {
+        std::lock_guard<std::mutex> lock(inflight_mu_);
+        if (!installed_) return Status::OK();
+    }
+    auto quiesce_status = quiesce();
     std::lock_guard<std::mutex> lock(inflight_mu_);
     if (!installed_) return Status::OK();
+    const int inflight = inflight_.load(std::memory_order_acquire);
+    if (!quiesce_status.ok() && inflight > 0) {
+        Quarantine quarantine;
+        quarantine.handle = handle_;
+        quarantine.library = MemFabricUnderApi::RetainLibrary();
+        quarantine.registered_ranges = std::move(registered_ranges_);
+        quarantine.batches = std::move(batches_);
+        quarantine.inflight = inflight;
+        LOG(WARNING) << "Quarantining MemFabric handle " << handle_ << " with "
+                     << inflight << " in-flight batches and "
+                     << quarantine.batches.size()
+                     << " sub-batches until process exit";
+        {
+            std::lock_guard<std::mutex> quarantine_lock(*g_quarantine_mutex_);
+            g_quarantine_->push_back(std::move(quarantine));
+        }
+        handle_ = nullptr;
+        installed_ = false;
+        quarantined_ = true;
+        config_.device_id = -1;
+        metadata_.reset();
+        return quiesce_status;
+    }
     LOG(INFO) << "uninstall: handle=" << handle_;
     if (handle_) {
         CHECK_STATUS(bindDevice());
