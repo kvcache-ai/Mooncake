@@ -68,6 +68,11 @@ class MultiTransport {
     // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
+    // Block until batch_id has left the deferred-cleanup set. The handle is
+    // already invalid. Returns when that batch no longer owns its buffers,
+    // or when shutdown stops the cleaner.
+    void waitUntilDeferredCleanupDone(BatchID batch_id);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
 
@@ -183,9 +188,8 @@ class MultiTransport {
     // batches reject a second submit instead.
     void clearQueuedTerminal(BatchID batch_id);
 
-    // Install or clear terminal_notify from event_enabled, counter_eligible,
-    // and completion_fd_. Called around submit so non-opted-in and
-    // non-counter batches never hook the wake.
+    // Install terminal_notify once, before dispatch. The function pointer
+    // stays immutable afterwards; terminal_suppressed hides publication.
     void syncTerminalNotify(BatchDesc &batch_desc);
 
     void enqueueTerminal(BatchID batch_id, TransferStatus status);

@@ -272,6 +272,10 @@ Status TransferEngine::freeBatchID(BatchID batch_id) {
     return impl_->freeBatchID(batch_id);
 }
 
+void TransferEngine::waitUntilDeferredCleanupDone(BatchID batch_id) {
+    impl_->waitUntilDeferredCleanupDone(batch_id);
+}
+
 int TransferEngine::getNotifies(
     std::vector<TransferMetadata::NotifyDesc>& notifies) {
     return impl_->getNotifies(notifies);
@@ -926,6 +930,10 @@ Status TransferEngine::freeBatchID(BatchID batch_id) {
     } else {
         return impl_->freeBatchID(batch_id);
     }
+}
+
+void TransferEngine::waitUntilDeferredCleanupDone(BatchID batch_id) {
+    if (!use_tent_) impl_->waitUntilDeferredCleanupDone(batch_id);
 }
 
 Status TransferEngine::submitTransfer(

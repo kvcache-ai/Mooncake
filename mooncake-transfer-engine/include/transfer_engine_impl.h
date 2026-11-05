@@ -228,6 +228,10 @@ class TransferEngineImpl {
         });
     }
 
+    void waitUntilDeferredCleanupDone(BatchID batch_id) {
+        multi_transports_->waitUntilDeferredCleanupDone(batch_id);
+    }
+
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
     int sendNotifyByID(SegmentID target_id,

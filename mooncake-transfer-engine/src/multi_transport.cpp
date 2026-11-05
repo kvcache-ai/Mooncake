@@ -115,12 +115,21 @@ MultiTransport::~MultiTransport() {
         std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
         stop_deferred_cleanup_ = true;
     }
-    deferred_cleanup_cv_.notify_one();
+    deferred_cleanup_cv_.notify_all();
     if (deferred_cleanup_thread_.joinable()) {
         deferred_cleanup_thread_.join();
     }
+    // transport_map_ is declared before the completion queue. Destroying it
+    // here joins RDMA workers while completion_mu_, ready_, and the fd are
+    // still alive, so a last callback cannot touch a destroyed queue.
+    transport_map_.clear();
 #ifdef __linux__
     if (completion_fd_ >= 0) {
+        const uint64_t one = 1;
+        // close() alone does not reliably wake a poll/epoll already blocked
+        // on this fd or on a dup. The counter write is the shutdown wake.
+        const ssize_t n = ::write(completion_fd_, &one, sizeof(one));
+        (void)n;
         ::close(completion_fd_);
         completion_fd_ = -1;
     }
@@ -244,6 +253,8 @@ Status MultiTransport::tryFreeBatchID(
 }
 
 void MultiTransport::discardQueuedCompletion(BatchID batch_id) {
+    // Legacy free must not take the completion lock or scan ready_.
+    if (!Transport::toBatchDesc(batch_id).event_enabled) return;
     std::lock_guard<std::mutex> lock(completion_mu_);
     Transport::toBatchDesc(batch_id).terminal_suppressed = true;
     ready_.erase(std::remove_if(ready_.begin(), ready_.end(),
@@ -254,8 +265,9 @@ void MultiTransport::discardQueuedCompletion(BatchID batch_id) {
 }
 
 void MultiTransport::clearQueuedTerminal(BatchID batch_id) {
-    std::lock_guard<std::mutex> lock(completion_mu_);
     auto& batch = Transport::toBatchDesc(batch_id);
+    if (!batch.event_enabled) return;
+    std::lock_guard<std::mutex> lock(completion_mu_);
     if (batch.terminal_suppressed) return;
     batch.terminal_enqueued = false;
     ready_.erase(std::remove_if(ready_.begin(), ready_.end(),
@@ -286,16 +298,23 @@ Status MultiTransport::enableBatchCompletionNotification(BatchID batch_id) {
 }
 
 void MultiTransport::syncTerminalNotify(BatchDesc& batch_desc) {
-    // Opt-in plus a counter-capable submit path. Non-opted-in batches keep
-    // the legacy fast path and never write the eventfd.
-    if (batch_desc.event_enabled && batch_desc.counter_eligible &&
-        completion_fd_ >= 0) {
-        batch_desc.terminal_notify = &MultiTransport::onTerminal;
-        batch_desc.terminal_notify_ctx = this;
-    } else {
-        batch_desc.terminal_notify = nullptr;
-        batch_desc.terminal_notify_ctx = nullptr;
+    // Install once, before dispatch. CQ threads read the function pointer
+    // without completion_mu_, so it must not be rewritten or cleared later.
+    // terminal_suppressed, under that lock, drops publication instead.
+    if (!batch_desc.event_enabled || !batch_desc.counter_eligible ||
+        completion_fd_ < 0 || batch_desc.terminal_notify != nullptr) {
+        return;
     }
+    batch_desc.terminal_notify = &MultiTransport::onTerminal;
+    batch_desc.terminal_notify_ctx = this;
+}
+
+void MultiTransport::waitUntilDeferredCleanupDone(BatchID batch_id) {
+    std::unique_lock<std::mutex> lock(deferred_cleanup_mutex_);
+    deferred_cleanup_cv_.wait(lock, [&] {
+        return deferred_cleanup_batches_.count(batch_id) == 0 ||
+               stop_deferred_cleanup_;
+    });
 }
 
 void MultiTransport::onTerminal(void* ctx, BatchID batch_id,
@@ -362,21 +381,25 @@ void MultiTransport::deferredCleanupLoop() {
             continue;
         }
 
+        bool dropped = false;
         for (auto it = deferred_cleanup_batches_.begin();
              it != deferred_cleanup_batches_.end();) {
             Status status = tryFreeBatchID(it->first, it->second);
             if (status.ok()) {
                 it = deferred_cleanup_batches_.erase(it);
+                dropped = true;
             } else if (!status.IsBatchBusy()) {
                 // A permanent error (e.g. a stale task reference) will never
                 // resolve on retry; drop the entry instead of polling forever.
                 LOG(ERROR) << "Dropping deferred cleanup for batch "
                            << it->first << ": " << status.ToString();
                 it = deferred_cleanup_batches_.erase(it);
+                dropped = true;
             } else {
                 ++it;
             }
         }
+        if (dropped) deferred_cleanup_cv_.notify_all();
 
         if (stop_deferred_cleanup_) {
             if (!deferred_cleanup_batches_.empty()) {
@@ -506,20 +529,25 @@ Status MultiTransport::submitTransfer(
             "Exceed the limitation of batch capacity");
     }
 
+    // RFC #5164: an event-enabled batch is one submit and at most one
+    // completion record. An empty submit is not that submission, so a later
+    // real submit is still allowed. Legacy empty submit stays OK.
+    if (batch_desc.event_enabled && !batch_desc.task_list.empty()) {
+        return Status::InvalidArgument(
+            "event-enabled batch allows only one submitTransfer; "
+            "freeBatchID and allocateBatchID again");
+    }
+    if (batch_desc.event_enabled && entries.empty()) {
+        return Status::InvalidArgument(
+            "event-enabled batch rejects an empty submit");
+    }
+
     std::vector<Transport*> transports;
     auto select_status = selectTransports(entries, transports);
     if (!select_status.ok()) return select_status;
 
     if (entries.empty()) return Status::OK();
     auto& task_list = batch_desc.task_list;
-    const bool append = !task_list.empty();
-    // RFC #5164: an event-enabled batch is one submit and at most one
-    // completion record. Legacy (non-opted-in) append stays unchanged.
-    if (batch_desc.event_enabled && append) {
-        return Status::InvalidArgument(
-            "event-enabled batch allows only one submitTransfer; "
-            "freeBatchID and allocateBatchID again");
-    }
     const bool all_counter = std::all_of(
         transports.begin(), transports.end(),
         [](Transport* t) { return t->supportsBatchCompletionCounter(); });
@@ -593,14 +621,17 @@ Status MultiTransport::submitTransfer(
             overall_status = status;
         }
     }
-    syncTerminalNotify(batch_desc);
-    const bool publish = overall_status.ok() && batch_desc.event_enabled &&
-                         batch_desc.counter_eligible && completion_fd_ >= 0;
+    // Non-event batches stop here. They must not take completion_mu_ or
+    // scan ready_, and the callback pointer is left untouched.
+    if (!batch_desc.event_enabled) return overall_status;
+    const bool publish =
+        overall_status.ok() && batch_desc.counter_eligible &&
+        completion_fd_ >= 0;
     {
         std::lock_guard<std::mutex> lock(completion_mu_);
         if (!publish) {
-            batch_desc.terminal_notify = nullptr;
-            batch_desc.terminal_notify_ctx = nullptr;
+            // Keep terminal_notify installed. A CQ thread may already have
+            // loaded it; clearing the pointer races that load.
             batch_desc.terminal_suppressed = true;
             batch_desc.terminal_enqueued = false;
             auto same_batch = [batch_id](const BatchCompletion& item) {
@@ -610,6 +641,11 @@ Status MultiTransport::submitTransfer(
                 std::remove_if(ready_.begin(), ready_.end(), same_batch),
                 ready_.end());
         } else {
+            // Pin before reopening publication. A dispatcher can drain and
+            // free as soon as the record is queued, while this tail still
+            // reads the batch.
+            batch_desc.active_completion_callbacks.fetch_add(
+                1, std::memory_order_acq_rel);
             batch_desc.terminal_suppressed = false;
         }
     }
@@ -620,6 +656,8 @@ Status MultiTransport::submitTransfer(
             done == batch_desc.task_list.size()) {
             batch_desc.publishTerminalIfDone(done - 1);
         }
+        batch_desc.active_completion_callbacks.fetch_sub(
+            1, std::memory_order_acq_rel);
     }
     return overall_status;
 }

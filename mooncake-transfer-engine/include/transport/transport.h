@@ -311,6 +311,13 @@ class Transport {
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+            // Store the failure before the completion count becomes visible.
+            // A sibling slice can otherwise observe the count, publish
+            // COMPLETED, and leave getBatchTransferStatus returning FAILED.
+            if (t->batch_id) {
+                toBatchDesc(t->batch_id)
+                    .has_failure.store(true, std::memory_order_release);
+            }
             const uint64_t state =
                 __atomic_add_fetch(&t->completion_state, 1, __ATOMIC_ACQ_REL);
             finishIfComplete(t, state, true);
@@ -611,7 +618,13 @@ class Transport {
                            ? TransferStatusEnum::FAILED
                            : TransferStatusEnum::COMPLETED;
             status.transferred_bytes = 0;
+            // Same rule as getBatchTransferStatus: a FAILED task contributes
+            // no bytes. A successful slice beside a failed slice must not
+            // show up on the fd and disappear from the status query.
             for (auto &task : task_list) {
+                if (__atomic_load_n(&task.failed_slice_count,
+                                    __ATOMIC_ACQUIRE) != 0)
+                    continue;
                 status.transferred_bytes +=
                     __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
             }

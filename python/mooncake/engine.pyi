@@ -299,8 +299,11 @@ class TransferEngine:
         """Return a batch id.
 
         With completion notification enabled, an unsupported transport raises
-        CompletionNotificationFallback. Any other failure on that path raises
-        RuntimeError.
+        CompletionNotificationFallback. openSegment failure, mismatched list
+        lengths, and any other failure on that path raise RuntimeError.
+        The exception is raised only after the batch has been released. When
+        the message does not say buffers may still be in use, the caller may
+        reuse them. Without the flag, those failures still return 0.
         """
         ...
     # The *_on_cuda methods are only bound when SUPPORT_CUDA is true.

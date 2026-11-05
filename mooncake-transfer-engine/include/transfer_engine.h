@@ -272,6 +272,11 @@ class TransferEngine {
     // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
+    // Block until a deferred free of batch_id has finished. The handle is
+    // already invalid. After this returns, that batch no longer owns its
+    // buffers, unless shutdown stopped the cleaner first.
+    void waitUntilDeferredCleanupDone(BatchID batch_id);
+
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
     // RDMA success means queued on the notification QP, not remote delivery.
