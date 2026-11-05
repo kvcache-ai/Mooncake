@@ -88,36 +88,30 @@ class TestSuiteLayout(unittest.TestCase):
     def test_store_rs_case_is_appended_to_the_existing_tone_lane(self):
         runner = SCRIPTS / "tone_tests" / "scripts" / "run_test.sh"
         regular = self.shell(f'"{runner}" list-tests')
-        store_rs = self.shell(f'"{runner}" list-tests STORE_RS')
         store_rs_job = self.shell(
             f'RUN_STORE_RS_TESTS=true "{runner}" list-tests SGLANG'
         )
 
-        self.assertEqual(
-            store_rs.splitlines(),
-            ["test_hicache_storage_mooncake_store_rs.sh"],
-        )
+        regular_cases = regular.splitlines()
         self.assertEqual(
             store_rs_job.splitlines(),
-            regular.splitlines() + store_rs.splitlines(),
+            regular_cases[:5]
+            + ["test_hicache_storage_mooncake_store_rs.sh"]
+            + regular_cases[5:],
         )
         self.assertNotIn("mooncake_store_rs", regular)
 
     def test_store_rs_controller_uses_the_matching_framework(self):
         controller = SCRIPTS / "e2e" / "scripts" / "controller.sh"
         output = self.shell(
-            f"""All_TEST_SCRIPTS_SGLANG=(regular-sglang.sh)
-            All_TEST_SCRIPTS_VLLM=(regular-vllm.sh)
-            All_TEST_SCRIPTS_STORE_RS_SGLANG=(store-rs-sglang.sh)
+            f"""All_TEST_SCRIPTS_VLLM=(regular-vllm.sh)
             source "{controller}"
-            [ "$(get_framework_from_test_name store-rs-sglang.sh)" = SGLANG ]
-            run_single_test() {{ printf '%s\n' "$1"; }}
-            run_store_rs_tests
+            get_framework_from_test_name test_hicache_storage_mooncake_store_rs.sh
             """
         )
-        self.assertEqual(output.splitlines(), ["store-rs-sglang.sh"])
+        self.assertEqual(output.strip(), "SGLANG")
 
-    def test_store_rs_tone_job_runs_six_existing_cases_then_store_rs(self):
+    def test_store_rs_tone_job_reuses_the_sglang_run_all_lifecycle(self):
         runner = SCRIPTS / "tone_tests" / "scripts" / "run_test.sh"
         output = self.shell(
             f'''RUN_STORE_RS_TESTS=true LOCAL_IP=192.0.2.1 REMOTE_IP=192.0.2.2
@@ -125,7 +119,7 @@ class TestSuiteLayout(unittest.TestCase):
             main() {{ printf '%s\\n' "$@"; }}
             run_requested_suite run-all SGLANG'''
         )
-        self.assertEqual(output.splitlines(), ["run-all", "run-store-rs"])
+        self.assertEqual(output.splitlines(), ["run-all"])
 
     def test_store_rs_e2e_job_selects_the_exact_combined_wheel(self):
         repository_root = SCRIPTS.parent

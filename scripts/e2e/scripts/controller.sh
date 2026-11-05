@@ -326,16 +326,6 @@ run_all_tests(){
     $all_passed && return 0 || return 1
 }
 
-run_store_rs_tests() {
-    local all_passed=true
-    local test_name
-    for test_name in "${All_TEST_SCRIPTS_STORE_RS_SGLANG[@]}"; do
-        run_single_test "$test_name" || all_passed=false
-    done
-
-    $all_passed
-}
-
 show_help(){
     echo "Mooncake CI Controller"
     echo "Usage: $0 <command> [args]"
@@ -346,7 +336,6 @@ show_help(){
     echo "  run-all                            - Run all tests for both SGLANG and VLLM frameworks"
     echo "  run-all SGLANG                     - Run all SGLANG tests (using SGLANG image)"
     echo "  run-all VLLM                       - Run all VLLM tests (using VLLM image)"
-    echo "  run-store-rs                       - Run the Store-RS SGLang integration test"
 }
 
 main() {
@@ -382,9 +371,6 @@ main() {
                     return 1
                 fi
             fi
-            ;;
-        "run-store-rs")
-            run_store_rs_tests
             ;;
         *)
             show_help
