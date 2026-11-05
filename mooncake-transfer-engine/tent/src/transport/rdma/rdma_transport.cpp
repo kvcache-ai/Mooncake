@@ -545,7 +545,7 @@ Status RdmaTransport::submitTransferTasks(
     // Distribute starting worker across threads to avoid contention
     static std::atomic<int> g_caller_threads(0);
     thread_local int tl_caller_id = g_caller_threads.fetch_add(1);
-    int next_worker_idx = tl_caller_id;
+    RdmaLaneCursor lanes(num_workers, tl_caller_id);
     for (auto& request : request_list) {
         auto opcode = request.opcode;
         auto type = Platform::getLoader().getMemoryType(request.source);
@@ -584,6 +584,7 @@ Status RdmaTransport::submitTransferTasks(
         }
 
         uint64_t offset = 0;
+        lanes.beginRequest();
         for (uint64_t slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
             // The last slice takes what is left, which is a block plus a
             // folded-in tail when the plan folded one; every other slice is
@@ -608,16 +609,17 @@ Status RdmaTransport::submitTransferTasks(
             slice->priority = request.priority;  // Copy priority from request
             task->num_slices++;
             task->ref();  // Each slice holds a reference to the task
+            int lane_dev = -1;
             if (slice_idx < slice_dev_ids.size()) {
                 slice->source_dev_id = slice_dev_ids[slice_idx];
                 slice->charged_dev = slice->source_dev_id;
+                lane_dev = slice->source_dev_id;
             }
             offset += length;
-            int part_id = next_worker_idx % num_workers;
+            int part_id = lanes.next(lane_dev);
             auto& list = slice_lists[part_id];
             auto& tail = slice_tails[part_id];
             list.num_slices++;
-            next_worker_idx++;
             if (list.first) {
                 tail->next = slice;
                 tail = slice;

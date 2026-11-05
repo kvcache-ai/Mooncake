@@ -1610,6 +1610,94 @@ TEST(RdmaSlicePlanTest, DegenerateInputsStayInRange) {
     EXPECT_EQ(walkPlan(no_block, 4096).size(), no_block.count);
 }
 
+// ---- which lane a slice is posted on --------------------------------------
+
+// Hand out lanes the way submitTransferTasks() does for one request whose
+// slices sit on `devices`, in order, and count the slices each NIC puts on
+// each of its lanes.
+std::vector<std::vector<int>> laneCounts(RdmaLaneCursor& lanes,
+                                         const std::vector<int>& devices,
+                                         int num_lanes, int num_devices) {
+    std::vector<std::vector<int>> count(num_devices,
+                                        std::vector<int>(num_lanes, 0));
+    lanes.beginRequest();
+    for (int dev : devices) count[dev][lanes.next(dev)]++;
+    return count;
+}
+
+// Two NICs alternating slice by slice -- round-robin mode, or a probe call
+// of the smart selector -- with the default six lanes. Taking the lane from
+// the slice's position put each NIC on three of its six queue pairs.
+TEST(RdmaLaneCursorTest, TwoAlternatingNicsEachUseAllSixLanes) {
+    std::vector<int> devices;
+    for (int i = 0; i < 32; ++i) devices.push_back(i % 2);
+    RdmaLaneCursor lanes(6, 0);
+    const auto count = laneCounts(lanes, devices, 6, 2);
+    for (int dev = 0; dev < 2; ++dev)
+        for (int lane = 0; lane < 6; ++lane)
+            EXPECT_GT(count[dev][lane], 0) << "nic " << dev << " lane " << lane;
+}
+
+// The same for any lane and NIC count, at the slice counts that get NICs
+// chosen up front: every NIC spreads its slices over its lanes evenly, no
+// lane carrying more than one slice above another.
+TEST(RdmaLaneCursorTest, AlternatingNicsSpreadEvenlyOverTheirLanes) {
+    for (int num_lanes = 1; num_lanes <= 8; ++num_lanes) {
+        for (int num_devices = 1; num_devices <= 4; ++num_devices) {
+            for (int num_slices : {16, 32, 64}) {
+                SCOPED_TRACE("lanes=" + std::to_string(num_lanes) +
+                             " nics=" + std::to_string(num_devices) +
+                             " slices=" + std::to_string(num_slices));
+                std::vector<int> devices;
+                for (int i = 0; i < num_slices; ++i)
+                    devices.push_back(i % num_devices);
+                RdmaLaneCursor lanes(num_lanes, num_lanes - 1);
+                const auto count =
+                    laneCounts(lanes, devices, num_lanes, num_devices);
+                for (int dev = 0; dev < num_devices; ++dev) {
+                    const auto [lo, hi] = std::minmax_element(
+                        count[dev].begin(), count[dev].end());
+                    EXPECT_LE(*hi - *lo, 1) << "nic " << dev;
+                }
+            }
+        }
+    }
+}
+
+// A NIC whose slices form one run keeps the lane the slice's position gives
+// it, so an allocation made of such runs posts exactly as before, including
+// across the requests of one submission.
+TEST(RdmaLaneCursorTest, ContiguousRunsKeepTheirPositionalLanes) {
+    constexpr int kLanes = 6;
+    constexpr int kStart = 4;
+    auto runs = [](std::initializer_list<std::pair<int, int>> spec) {
+        std::vector<int> devices;
+        for (const auto& [dev, n] : spec) devices.insert(devices.end(), n, dev);
+        return devices;
+    };
+    const std::vector<std::vector<int>> requests = {
+        runs({{0, 32}}), runs({{0, 10}, {1, 16}}),
+        runs({{1, 9}, {0, 9}, {2, 6}})};
+
+    RdmaLaneCursor lanes(kLanes, kStart);
+    int position = kStart;
+    for (const auto& devices : requests) {
+        lanes.beginRequest();
+        for (int dev : devices) EXPECT_EQ(lanes.next(dev), position++ % kLanes);
+    }
+}
+
+// Slices left for the worker to place, and an id no device mask can name,
+// keep the positional lane too.
+TEST(RdmaLaneCursorTest, SlicesWithoutANicKeepTheirPositionalLanes) {
+    constexpr int kLanes = 6;
+    RdmaLaneCursor lanes(kLanes, 2);
+    lanes.beginRequest();
+    int position = 2;
+    for (int i = 0; i < 20; ++i) EXPECT_EQ(lanes.next(-1), position++ % kLanes);
+    EXPECT_EQ(lanes.next(RdmaLaneCursor::kMaxDevices), position++ % kLanes);
+}
+
 // ibv_query_port_speed() exists only in rdma-core >= 62. It must be resolved
 // as an optional symbol: present -> non-null, absent -> null, and either way
 // the mandatory verbs are still there (an older libibverbs must not lose
