@@ -82,7 +82,7 @@ class WeightMetadataStore {
     Result<WeightRevisionMetadata> Publish(
         const WeightMetadataMutation& mutation);
     Result<WeightMetadataMutation> PrepareUpdatePolicy(
-        const UpdateWeightPolicyRequest& request, uint64_t now_ms) const;
+        const UpdateWeightPolicyRequest& request, uint64_t now_ms);
 
     Result<WeightRevisionView> Get(const WeightRevisionIdentity& identity,
                                    uint64_t now_ms) const;

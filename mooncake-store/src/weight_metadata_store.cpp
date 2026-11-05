@@ -482,7 +482,7 @@ WeightMetadataStore::Publish(const WeightMetadataMutation& mutation) {
 
 WeightMetadataStore::Result<WeightMetadataMutation>
 WeightMetadataStore::PrepareUpdatePolicy(
-    const UpdateWeightPolicyRequest& request, uint64_t now_ms) const {
+    const UpdateWeightPolicyRequest& request, uint64_t now_ms) {
     if (!ValidateWeightRevisionIdentity(request.identity).ok() ||
         request.expected_metadata_generation == 0 ||
         !ValidateWeightStoragePolicy(request.policy).ok()) {
@@ -517,13 +517,8 @@ WeightMetadataStore::PrepareUpdatePolicy(
         revision->second.availability != WeightAvailabilityState::DEGRADED) {
         return tl::make_unexpected(WeightManagementError::NOT_READY);
     }
-    if ((request.policy.preferred_residency == WeightResidencyState::MIXED &&
-         revision->second.affinity_count < 2) ||
-        (request.policy.migration_mode == WeightMigrationMode::PINNED &&
-         (revision->second.residency != request.policy.preferred_residency ||
-          (request.policy.preferred_residency == WeightResidencyState::MIXED &&
-           revision->second.observed_hot_ratio !=
-               request.policy.mixed_hot_ratio)))) {
+    if (request.policy.preferred_residency == WeightResidencyState::MIXED &&
+        revision->second.affinity_count < 2) {
         return tl::make_unexpected(WeightManagementError::POLICY_UNSATISFIABLE);
     }
     if (!CanAdvanceWeightMetadataGeneration(
@@ -534,10 +529,41 @@ WeightMetadataStore::PrepareUpdatePolicy(
     next.policy = request.policy;
     ++next.metadata_generation;
     next.updated_at_ms = now_ms;
+    std::optional<WeightResidencyOperation> operation;
+    if (next.policy.migration_mode == WeightMigrationMode::PINNED &&
+        (next.availability != WeightAvailabilityState::READY ||
+         next.residency != next.policy.preferred_residency ||
+         next.policy.preferred_residency == WeightResidencyState::MIXED)) {
+        if (next_operation_id_ == 0 ||
+            next_operation_id_ == std::numeric_limits<uint64_t>::max()) {
+            return tl::make_unexpected(
+                WeightManagementError::GENERATION_EXHAUSTED);
+        }
+        const uint64_t operation_id = next_operation_id_++;
+        next.operation_id = operation_id;
+        operation = WeightResidencyOperation{
+            .operation_id = operation_id,
+            .identity = next.identity,
+            .kind = WeightOperationKind::MIGRATING,
+            .target_residency = next.policy.preferred_residency,
+            .target_hot_ratio =
+                next.policy.preferred_residency == WeightResidencyState::MIXED
+                    ? std::optional<double>(next.policy.mixed_hot_ratio)
+                    : std::nullopt,
+            .fenced_metadata_generation = next.metadata_generation,
+            .started_at_ms = now_ms,
+            .updated_at_ms = now_ms,
+            .processed_units = 0,
+            .total_units = next.affinity_count,
+            .processed_bytes = 0,
+            .total_bytes = next.manifest.logical_bytes,
+        };
+    }
     return WeightMetadataMutation{
         .identity = request.identity,
         .previous = revision->second,
         .next = std::move(next),
+        .operation = std::move(operation),
     };
 }
 
