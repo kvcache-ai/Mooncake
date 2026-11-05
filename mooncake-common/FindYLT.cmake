@@ -26,8 +26,12 @@ else()
 endif()
 
 set(YLT_COMMIT 45c6463c0afbcc46262e373effa30635be3846a0)
+if(YLT_DOWNLOAD_DIR)
+  set(_ylt_download_dir DOWNLOAD_DIR "${YLT_DOWNLOAD_DIR}")
+endif()
 FetchContent_Declare(
   yalantinglibs
+  ${_ylt_download_dir}
   URL ${GH_MIRROR}https://github.com/alibaba/yalantinglibs/archive/${YLT_COMMIT}.tar.gz
   URL_HASH
     SHA256=baa6b5c9ffcc0af8252742bba8f0fb9c6d37387c13b2ff5b26d29c6aaff6ee37)

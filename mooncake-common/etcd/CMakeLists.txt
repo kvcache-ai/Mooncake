@@ -1,7 +1,27 @@
+file(GLOB_RECURSE _go_sources CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/*.go")
+set_property(
+  DIRECTORY
+  APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS ${_go_sources}
+           "${CMAKE_CURRENT_SOURCE_DIR}/go.mod")
+execute_process(
+  COMMAND go mod tidy
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  RESULT_VARIABLE _go_tidy_result)
+if(NOT _go_tidy_result STREQUAL "0")
+  message(
+    FATAL_ERROR "Failed to prepare etcd Go dependencies: ${_go_tidy_result}")
+endif()
+set_property(
+  DIRECTORY
+  APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/go.sum")
+
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.so
   COMMAND
-    bash -c "go mod tidy" && bash -c
+    bash -c
     "go build -buildmode=c-shared -o ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.so etcd_wrapper.go"
     && cp ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.h
     ${CMAKE_CURRENT_SOURCE_DIR}
