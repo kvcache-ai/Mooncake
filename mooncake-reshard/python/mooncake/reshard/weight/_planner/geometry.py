@@ -8,6 +8,7 @@ from ..._typing import TypeAlias
 
 from ..._compat import _strict_zip
 from ...contracts import TensorId
+from ...geometry import box_intersection
 from ..types import TensorDescriptor
 from ..storage_manifest import StoredFragmentSnapshot
 from .fragments import (
@@ -226,29 +227,18 @@ def _overlap_box(
     source: GeometryFragment,
     target: GeometryFragment,
 ) -> Optional[tuple[tuple[int, ...], tuple[int, ...]]]:
-    overlap_offset = tuple(
-        max(source_begin, target_begin)
-        for source_begin, target_begin in _strict_zip(
-            source.global_offset, target.global_offset
-        )
+    overlap = box_intersection(
+        source.global_offset,
+        source.local_shape,
+        target.global_offset,
+        target.local_shape,
     )
-    overlap_end = tuple(
-        min(
-            source_begin + source_extent,
-            target_begin + target_extent,
-        )
-        for source_begin, source_extent, target_begin, target_extent in _strict_zip(
-            source.global_offset,
-            source.local_shape,
-            target.global_offset,
-            target.local_shape,
-        )
-    )
+    if overlap is None:
+        return None
+    overlap_offset, overlap_end = overlap
     overlap_shape = tuple(
         end - begin for begin, end in _strict_zip(overlap_offset, overlap_end)
     )
-    if any(extent <= 0 for extent in overlap_shape):
-        return None
     return overlap_offset, overlap_shape
 
 

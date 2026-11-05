@@ -223,6 +223,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/endpoint/qp_mul_factor");
     setConfig(config, "MC_MAX_SGE", "transports/rdma/endpoint/max_sge");
     setConfig(config, "MC_MAX_WR", "transports/rdma/endpoint/max_qp_wr");
+    setConfig(config, "MC_TENT_RDMA_SIGNAL_INTERVAL",
+              "transports/rdma/endpoint/signal_interval");
     setConfig(config, "MC_MAX_INLINE",
               "transports/rdma/endpoint/max_inline_bytes");
     setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
@@ -236,10 +238,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_SLICE_SIZE", "transports/rdma/workers/block_size");
     setConfig(config, "MC_RETRY_CNT",
               "transports/rdma/workers/max_retry_count");
-    setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
-              "transports/rdma/disable_gpu_direct_rdma");
-    setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
-              "transports/rdma/log_slice_affinity");
+    setBoolConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
+                  "transports/rdma/disable_gpu_direct_rdma");
+    setBoolConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
+                  "transports/rdma/log_slice_affinity");
     setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
                   "transports/rdma/strict_local_numa");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
@@ -260,6 +262,15 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // defaults to several threads so concurrent bulk transfers are not
     // serialized on one io_context.
     setConfig(config, "MC_TENT_RPC_THREADS", "rpc_server_threads");
+    // io_uring staging pool: pinned host slots allocated once at install()
+    // for requests that need a bounce buffer (device memory or unaligned
+    // host memory). The size keys only apply when pinned_staging is on.
+    setBoolConfig(config, "MC_IOURING_PINNED_STAGING",
+                  "transports/io_uring/pinned_staging");
+    setConfig(config, "MC_IOURING_STAGING_SLOT_KB",
+              "transports/io_uring/staging_slot_kb");
+    setConfig(config, "MC_IOURING_STAGING_SLOTS",
+              "transports/io_uring/staging_slots");
     return status;
 }
 

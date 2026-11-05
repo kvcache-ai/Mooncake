@@ -10,6 +10,7 @@
 #include "conductor/common/utils.h"
 #include "conductor/kvevent/config.h"
 #include "conductor/kvevent/event_manager.h"
+#include "conductor/prefixindex/prefix_indexer.h"
 
 namespace {
 
@@ -44,11 +45,19 @@ int main(int argc, char** argv) {
     // rpcServerPort defaults to 13334 (RPC channel on); the config file may
     // override it, and an explicit 0 disables the channel.
     int rpc_server_port = 13334;
-    auto services = mooncake::conductor::kvevent::ParseConfig(&http_server_port,
-                                                              &rpc_server_port);
+    // The prefix index keeps at most kDefaultMaxBlocks entries per context;
+    // the config file may override it, and 0 disables capacity eviction.
+    size_t max_blocks_per_context =
+        mooncake::conductor::prefixindex::kDefaultMaxBlocks;
+    auto services = mooncake::conductor::kvevent::ParseConfig(
+        &http_server_port, &rpc_server_port, &max_blocks_per_context);
+    LOG(INFO) << "Prefix index capacity max_blocks_per_context="
+              << max_blocks_per_context
+              << (max_blocks_per_context == 0 ? " (unlimited)" : "");
 
     mooncake::conductor::kvevent::EventManager manager(
-        std::move(services), http_server_port, rpc_server_port);
+        std::move(services), http_server_port, rpc_server_port,
+        max_blocks_per_context);
 
     if (!manager.StartHTTPServer()) {
         LOG(ERROR) << "Failed to start HTTP server";

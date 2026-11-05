@@ -37,7 +37,11 @@ Every event map contains these fields:
 
 `stored` and `removed` add `group_id`, `object_key` (unless
 `kv_events_emit_object_key=false`), `seq_hashes`, and `base_block_idx`. `stored`
-additionally carries `parent_hash` and `token_ids`.
+additionally carries `parent_hash`, `token_ids`, and `session_id`.
+
+`session_id` is the write attribution committed with the object, or nil when
+the object is untagged. It names a single session and does not enumerate every
+session that reused the object. `removed` and `cleared` carry no `session_id`.
 
 ## Keys are not interpreted
 

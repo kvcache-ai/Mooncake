@@ -245,6 +245,62 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
 }
 
 #ifdef USE_TENT
+TEST_F(TransferTaskTest, NativeScatterPreservesSharedRemoteSegment) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar ipv6("MC_USE_IPV6", nullptr);
+    ScopedEnvVar tcp_bind("MC_TCP_BIND_ADDRESS", "127.0.0.1");
+    TransferEngine client(false), server(false);
+    ASSERT_EQ(client.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+    ASSERT_EQ(server.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+    ASSERT_TRUE(client.isUsingTent());
+    constexpr size_t kSize = 128;
+    std::vector<char> source(kSize, 'T'), destination(kSize, 0);
+    ASSERT_EQ(server.registerLocalMemory(source.data(), kSize, "cpu:0"), 0);
+    ASSERT_EQ(client.registerLocalMemory(destination.data(), kSize, "cpu:0"),
+              0);
+
+    const auto peer = server.getLocalIpAndPort();
+    const auto shared_handle = client.openSegment(peer);
+    ASSERT_NE(shared_handle, static_cast<uint64_t>(ERR_INVALID_ARGUMENT));
+    std::vector<SegmentBufferInfo> buffers;
+    ASSERT_EQ(client.getSegmentBuffers(shared_handle, buffers), 0);
+    std::vector<size_t> offsets{0};
+    std::vector<size_t> lengths{kSize};
+    std::shared_ptr<StorageBackend> backend;
+    {
+        TransferSubmitter submitter(client, backend,
+                                    client.getLocalIpAndPort());
+        for (bool invalid_range : {false, true}) {
+            lengths[0] = invalid_range ? kSize + 1 : kSize;
+            {
+                auto operation = submitter.submitNativeScatter(
+                    {{.opcode = TransferRequest::READ,
+                      .remote_segment = peer,
+                      .remote_base_offset =
+                          reinterpret_cast<uintptr_t>(source.data()),
+                      .remote_size = kSize,
+                      .local_buffer = destination.data(),
+                      .local_capacity = kSize,
+                      .local_offsets = offsets,
+                      .remote_offsets = offsets,
+                      .lengths = lengths}},
+                    TransferIntent::kForegroundGet);
+                EXPECT_EQ(operation.wait().ok(), !invalid_range);
+                // Another caller may still use the same idempotently opened
+                // handle after this operation finishes or is destroyed.
+                EXPECT_EQ(client.getSegmentBuffers(shared_handle, buffers), 0);
+            }
+            EXPECT_EQ(client.getSegmentBuffers(shared_handle, buffers), 0);
+            EXPECT_EQ(client.openSegment(peer), shared_handle);
+        }
+    }
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(client.closeSegment(shared_handle), 0);
+    EXPECT_EQ(client.unregisterLocalMemory(destination.data()), 0);
+    EXPECT_EQ(server.unregisterLocalMemory(source.data()), 0);
+}
+
 TEST_F(TransferTaskTest, TransferSubmitterScatterUsesTentDataPath) {
     TransferEngine engine(false);
     ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17934"), 0);

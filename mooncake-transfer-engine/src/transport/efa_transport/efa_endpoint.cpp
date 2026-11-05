@@ -36,45 +36,66 @@ void EfaEndPoint::setPeerNicPath(const std::string& peer_nic_path) {
                   << peer_nic_path_ << " -> " << peer_nic_path;
         disconnectUnlocked();
     }
+    ++generation_;
     peer_nic_path_ = peer_nic_path;
 }
 
 int EfaEndPoint::setupConnectionsByActive() {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
+    std::lock_guard<std::mutex> setup_guard(active_setup_mutex_);
+    TransferMetadata::HandShakeDesc local_desc, peer_desc;
+    uint64_t generation;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
 
-    // Loopback: handshake against ourselves.  Use the binary overload
-    // so we avoid hex-encoding the local address just to have
-    // insertPeerAddr decode it right back.
-    if (context_.nicPath() == peer_nic_path_) {
-        const auto& bytes = context_.localEpAddrBytes();
-        int ret = context_.insertPeerAddrBytes(bytes.data(), bytes.size(),
-                                               peer_fi_addr_);
-        if (ret != 0) return ret;
-        status_.store(CONNECTED, std::memory_order_release);
-        LOG(INFO) << "EFA loopback connection established: " << toString();
-        return 0;
+        if (context_.nicPath() == peer_nic_path_) {
+            // Loopback: handshake against ourselves.  Use the binary overload
+            // so we avoid hex-encoding the local address just to have
+            // insertPeerAddr decode it right back.
+            const auto& bytes = context_.localEpAddrBytes();
+            int ret = context_.insertPeerAddrBytes(bytes.data(), bytes.size(),
+                                                   peer_fi_addr_);
+            if (ret != 0) return ret;
+            status_.store(CONNECTED, std::memory_order_release);
+            LOG(INFO) << "EFA loopback connection established: " << toString();
+            return 0;
+        }
+        generation = generation_;
+        // Exchange addresses via the transfer-metadata handshake RPC.
+        local_desc.local_nic_path = context_.nicPath();
+        local_desc.peer_nic_path = peer_nic_path_;
+        local_desc.efa_addr = context_.localEpAddr();
     }
 
-    // Exchange addresses via the transfer-metadata handshake RPC.
-    TransferMetadata::HandShakeDesc local_desc, peer_desc;
-    local_desc.local_nic_path = context_.nicPath();
-    local_desc.peer_nic_path = peer_nic_path_;
-    local_desc.efa_addr = context_.localEpAddr();
-
-    auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
-    auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
+    auto peer_server_name = getServerNameFromNicPath(local_desc.peer_nic_path);
+    auto peer_nic_name = getNicNameFromNicPath(local_desc.peer_nic_path);
     if (peer_server_name.empty() || peer_nic_name.empty()) {
-        LOG(ERROR) << "Parse peer EFA nic path failed: " << peer_nic_path_;
+        LOG(ERROR) << "Parse peer EFA nic path failed: "
+                   << local_desc.peer_nic_path;
         return ERR_INVALID_ARGUMENT;
     }
 
+    // A reciprocal RPC needs our passive handler, which takes lock_.
     int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                              peer_desc);
+
+    RWSpinlock::WriteGuard guard(lock_);
+    // A passive handshake may have connected the endpoint while the RPC was
+    // in flight; reuse that connection and discard this reply.
+    if (status_.load(std::memory_order_relaxed) == CONNECTED) return 0;
+    if (generation != generation_) {
+        LOG(WARNING) << "Discarding stale EFA handshake reply: " << toString();
+        return ERR_ENDPOINT;
+    }
     if (rc) return rc;
 
     if (peer_desc.efa_addr.empty()) {
-        LOG(ERROR) << "Peer did not provide EFA address in handshake";
+        LOG(ERROR) << "Peer did not provide EFA address in handshake: "
+                   << "local=" << context_.nicPath()
+                   << ", peer_nic_path=" << peer_nic_path_ << ", reply_msg=\""
+                   << peer_desc.reply_msg << "\""
+                   << " (peer may be in the middle of restart / not yet "
+                      "fully initialized; consider retry with backoff)";
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -105,7 +126,11 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
 
     if (peer_desc.efa_addr.empty()) {
         local_desc.reply_msg = "No EFA address provided";
-        LOG(ERROR) << "Peer did not provide EFA address";
+        LOG(ERROR) << "Peer did not provide EFA address (passive path): "
+                   << "local=" << context_.nicPath()
+                   << ", peer_nic_path=" << peer_nic_path_
+                   << " (peer's shared endpoint may not be fully "
+                      "initialized yet)";
         return ERR_REJECT_HANDSHAKE;
     }
 
@@ -119,7 +144,7 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
     //
     // Log semantics:
     //   * Same cached peer address → benign symmetric handshake under
-    //     bilateral traffic.  Demote to INFO to keep decode logs readable
+    //     bilateral traffic.  Demote to VLOG(1) to keep decode logs readable
     //     without hiding real reconnects.
     //   * Different cached peer address → genuine reconnect (peer
     //     restart, port reshuffle that reached disconnect first, etc.).
@@ -156,7 +181,37 @@ void EfaEndPoint::disconnect() {
     disconnectUnlocked();
 }
 
+bool EfaEndPoint::hasOutstandingSlice() const {
+    RWSpinlock::ReadGuard guard(lock_);
+    return context_.slotHasInflight(peer_fi_addr_);
+}
+
+bool EfaEndPoint::disconnectIfIdle() {
+    // tryLock, never a blocking WriteGuard: this runs on the CQ-polling
+    // thread, and submitPostSend() holds the read lock while it spins waiting
+    // for CQ credit that only this poller can release.  Blocking for the
+    // write lock here deadlocks that pair outright (observed: submitter
+    // spinning in submitSlicesOnPeer under the read lock, poller queued for
+    // the write lock, neither able to advance).  Failing to acquire is
+    // reported as "still busy" so the caller retries on a later drain.
+    if (!lock_.tryLock()) return false;
+    // Idle means BOTH: the write lock was free (no submitter inside
+    // submitPostSend for this handle) and the shared AV slot has no inflight
+    // operations, possibly a sibling endpoint's (see EfaContext::av_slots_).
+    // Tearing down a busy peer here stays memory-safe, but it drops the handle
+    // to UNCONNECTED and forces the next batch through a fresh handshake --
+    // both callers only want to touch a peer that is quiet.
+    if (context_.slotHasInflight(peer_fi_addr_)) {
+        lock_.unlock();
+        return false;
+    }
+    disconnectUnlocked();
+    lock_.unlock();
+    return true;
+}
+
 void EfaEndPoint::disconnectUnlocked() {
+    ++generation_;
     if (peer_fi_addr_ != FI_ADDR_UNSPEC) {
         context_.removePeerAddr(peer_fi_addr_);
         peer_fi_addr_ = FI_ADDR_UNSPEC;
@@ -167,6 +222,7 @@ void EfaEndPoint::disconnectUnlocked() {
 
 void EfaEndPoint::markDetachedForTeardown() {
     RWSpinlock::WriteGuard guard(lock_);
+    ++generation_;
     peer_fi_addr_ = FI_ADDR_UNSPEC;
     cached_peer_addr_.clear();
     status_.store(UNCONNECTED, std::memory_order_release);

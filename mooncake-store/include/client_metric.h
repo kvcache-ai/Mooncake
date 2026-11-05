@@ -545,6 +545,12 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_total_latency_summary;
     std::chrono::steady_clock::time_point start_time_;
 
+    // SSD prefetch (SSD->DRAM promotion on exist) observation. Counted on the
+    // holder that executes the promotion; PROMOTION_ALREADY_EXISTS skips are
+    // not failures and are not counted here.
+    std::atomic<uint64_t> prefetch_complete_total{0};
+    std::atomic<uint64_t> prefetch_fail_total{0};
+
     void serialize(std::string& str) {
         ssd_read_bytes.serialize(str);
         ssd_write_bytes.serialize(str);
@@ -610,6 +616,11 @@ struct SsdMetric {
                << (total_ops / elapsed_s);
         }
         ss << "\n";
+
+        ss << "SSD Prefetch: complete="
+           << prefetch_complete_total.load(std::memory_order_relaxed)
+           << ", failed=" << prefetch_fail_total.load(std::memory_order_relaxed)
+           << "\n";
 
         ss << "\n" << "=== SSD Latency Summary (microseconds) ===" << "\n";
         ss << "Read: " << format_summary_percentiles(ssd_read_latency_summary)

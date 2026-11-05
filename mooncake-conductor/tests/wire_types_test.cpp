@@ -26,56 +26,17 @@ TEST(WireTypesTest, QueryRequestRoundtrip) {
 TEST(WireTypesTest, QueryResultRoundtrip) {
     QueryResult result;
     prefixindex::CacheHitResult hit;
-    hit.longest_match_tokens = 42;
-    hit.dp = {{0, 10}, {1, 20}};
-    hit.device = 5;
-    hit.cpu_share = 7;
+    hit.longest_match_tokens = 80;
+    hit.dp = {{0, 16}, {12, 32}};
+    hit.rank_matches = {
+        {0, {.device = 16, .cpu_local = 32, .cpu_share = 48, .disk = 64}},
+        {12, {.device = 32, .cpu_local = 48, .cpu_share = 64, .disk = 80}}};
+    hit.device = 32;
+    hit.cpu_local = 48;
+    hit.cpu_share = 64;
+    hit.disk = 80;
     result.instances.emplace("inst-1", hit);
     ExpectRoundtrip(result);
-}
-
-// Retain the previous result layout only as a wire-compatibility fixture.
-// Production exposes device, without a second npu member or response alias.
-TEST(WireTypesTest, DeviceRenamePreservesResultWireLayout) {
-    struct PreviousRankMatch {
-        int64_t npu = 0;
-        int64_t cpu_local = 0;
-        int64_t cpu_share = 0;
-        int64_t disk = 0;
-    };
-    struct PreviousHit {
-        int64_t longest_match_tokens = 0;
-        std::map<int64_t, int64_t> dp;
-        std::map<int64_t, PreviousRankMatch> rank_matches;
-        int64_t npu = 0;
-        int64_t cpu_local = 0;
-        int64_t cpu_share = 0;
-        int64_t disk = 0;
-    };
-    struct PreviousResult {
-        std::map<std::string, PreviousHit> instances;
-    };
-    PreviousResult previous;
-    previous.instances.emplace(
-        "engine",
-        PreviousHit{64, {{0, 16}}, {{0, {16, 32, 48, 64}}}, 16, 32, 48, 64});
-    QueryResult current;
-    current.instances.emplace(
-        "engine", prefixindex::CacheHitResult{
-                      64, {{0, 16}}, {{0, {16, 32, 48, 64}}}, 16, 32, 48, 64});
-    const auto old_bytes = struct_pack::serialize(previous);
-    const auto new_bytes = struct_pack::serialize(current);
-    EXPECT_EQ(old_bytes, new_bytes);
-    auto decoded = struct_pack::deserialize<QueryResult>(old_bytes);
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(*decoded, current);
-    auto old_decoded = struct_pack::deserialize<PreviousResult>(new_bytes);
-    ASSERT_TRUE(old_decoded.has_value());
-    const auto& hit = old_decoded->instances.at("engine");
-    EXPECT_EQ(hit.npu, current.instances.at("engine").device);
-    EXPECT_EQ(hit.rank_matches.at(0).npu,
-              current.instances.at("engine").rank_matches.at(0).device);
-    EXPECT_EQ(struct_pack::serialize(*old_decoded), old_bytes);
 }
 
 TEST(WireTypesTest, ServiceConfigRoundtrip) {

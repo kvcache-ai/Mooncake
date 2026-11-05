@@ -14,8 +14,10 @@
 
 #include "tent/runtime/platform.h"
 
+#include <cstdlib>
 #include <mutex>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #ifdef USE_CUDA
@@ -41,35 +43,64 @@ namespace mooncake {
 namespace tent {
 
 std::unique_ptr<Platform> Platform::create(std::shared_ptr<Config> conf) {
+    const auto init_conf = conf ? conf : std::make_shared<Config>();
 #ifdef USE_CUDA
-    return std::make_unique<CudaPlatform>(conf);
+    return std::make_unique<CudaPlatform>(init_conf);
 #elif defined(USE_HIP)
-    return std::make_unique<RocmPlatform>(conf);
+    return std::make_unique<RocmPlatform>(init_conf);
 #elif defined(USE_SUNRISE)
-    return std::make_unique<SunrisePlatform>(conf);
+    return std::make_unique<SunrisePlatform>(init_conf);
 #elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
     defined(USE_MEMFABRIC)
-    return std::make_unique<AscendPlatform>(conf);
+    return std::make_unique<AscendPlatform>(init_conf);
 #elif defined(USE_TPU)
-    return std::make_unique<TpuPlatform>(conf);
+    return std::make_unique<TpuPlatform>(init_conf);
 #elif defined(USE_MLU)
-    return std::make_unique<MluPlatform>(conf);
+    return std::make_unique<MluPlatform>(init_conf);
 #elif defined(USE_XPU)
-    return std::make_unique<XpuPlatform>(conf);
+    return std::make_unique<XpuPlatform>(init_conf);
 #else
-    return std::make_unique<CpuPlatform>(conf);
+    return std::make_unique<CpuPlatform>(init_conf);
 #endif
 }
 
 Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
-    static std::unique_ptr<Platform> g_instance;
+    static std::shared_ptr<Platform> g_instance;
     static std::once_flag flag;
-    std::call_once(flag, [&]() { g_instance = create(conf); });
+    std::call_once(flag,
+                   [conf = std::move(conf)]() { g_instance = create(conf); });
     return *g_instance;
 }
 
 Status Platform::synchronizeDevices(const Topology* topology) {
     (void)topology;
+    return Status::OK();
+}
+
+Status Platform::exportDmabuf(void* addr, size_t length, DmabufExport& out) {
+    (void)addr;
+    (void)length;
+    out = DmabufExport{};
+    return Status::NotImplemented(
+        "dma-buf export is not supported by this platform" LOC_MARK);
+}
+
+// Fallback for platforms without a pinned-host API: ordinary pageable
+// memory (see platform.h). Page alignment is required for O_DIRECT staging.
+Status Platform::allocatePinnedHost(void** pptr, size_t size) {
+    if (!pptr || size == 0)
+        return Status::InvalidArgument(
+            "Invalid pinned host allocation" LOC_MARK);
+    if (posix_memalign(pptr, 4096, size) != 0) {
+        *pptr = nullptr;
+        return Status::InternalError("posix_memalign failed" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+Status Platform::freePinnedHost(void* ptr, size_t size) {
+    (void)size;
+    std::free(ptr);
     return Status::OK();
 }
 
