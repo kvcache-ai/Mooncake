@@ -32,9 +32,11 @@ namespace xpu_ep {
 // number into the peer's ready flag, on one RC queue pair so the responder
 // executes them in order.
 
-// The RDMA device under the same PCIe switch as `device`: the one whose
-// sysfs path shares the longest prefix with the GPU's. MC_EP_XPU_NIC
-// overrides the choice. Throws if no RDMA device is present.
+// The RDMA device under the same PCIe switch as `device`: one whose sysfs
+// path shares the longest prefix with the GPU's. When several do (the ports
+// of one card), the GPUs nearest that same set take them in turn, in PCI
+// order. MC_EP_XPU_NIC overrides the choice. Throws if no RDMA device is
+// present.
 std::string nearestRdmaDevice(const sycl::device& device);
 
 // The dma-buf fd of the Level Zero device allocation containing `addr`, and

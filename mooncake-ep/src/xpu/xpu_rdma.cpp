@@ -24,7 +24,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <random>
+#include <utility>
+#include <vector>
 
 #include "xpu_ep_common.h"
 
@@ -85,6 +88,52 @@ int commonDepth(const std::string& a, const std::string& b) {
     return depth;
 }
 
+using NicPaths = std::vector<std::pair<std::string, std::string>>;
+
+// The names of the NICs nearest the device at `pci_path`, in `nics` order.
+std::vector<std::string> nearestNics(const std::string& pci_path,
+                                     const NicPaths& nics) {
+    std::vector<std::string> best;
+    int best_depth = -1;
+    for (const auto& [name, path] : nics) {
+        const int depth = commonDepth(pci_path, path);
+        if (depth > best_depth) {
+            best_depth = depth;
+            best.clear();
+        }
+        if (depth == best_depth) best.push_back(name);
+    }
+    return best;
+}
+
+std::string readSysfs(const std::string& path) {
+    std::ifstream in(path);
+    std::string s;
+    in >> s;
+    return s;
+}
+
+// The sysfs paths of all Intel display controllers, in PCI order, whether or
+// not this process can see them.
+std::vector<std::string> intelGpuPaths() {
+    std::vector<std::string> out;
+    if (DIR* dir = opendir("/sys/bus/pci/devices")) {
+        while (dirent* e = readdir(dir)) {
+            if (e->d_name[0] == '.') continue;
+            const std::string dev =
+                std::string("/sys/bus/pci/devices/") + e->d_name;
+            if (readSysfs(dev + "/vendor") != "0x8086" ||
+                readSysfs(dev + "/class").compare(0, 4, "0x03") != 0)
+                continue;
+            const std::string path = realPath(dev);
+            if (!path.empty()) out.push_back(path);
+        }
+        closedir(dir);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 bool isIpv4Mapped(const ibv_gid& gid) {
     static const uint8_t kPrefix[12] = {0, 0, 0, 0, 0,    0,
                                         0, 0, 0, 0, 0xff, 0xff};
@@ -117,20 +166,23 @@ std::string nearestRdmaDevice(const sycl::device& device) {
         closedir(dir);
     }
     std::sort(names.begin(), names.end());
-    std::string best;
-    int best_depth = -1;
+    NicPaths nics;
     for (const auto& name : names) {
-        const std::string nic_path =
+        std::string nic_path =
             realPath("/sys/class/infiniband/" + name + "/device");
-        if (nic_path.empty()) continue;
-        const int depth = commonDepth(gpu_path, nic_path);
-        if (depth > best_depth) {
-            best_depth = depth;
-            best = name;
-        }
+        if (!nic_path.empty()) nics.emplace_back(name, std::move(nic_path));
     }
+    const std::vector<std::string> best = nearestNics(gpu_path, nics);
     XPU_EP_CHECK(!best.empty(), "no RDMA device found");
-    return best;
+
+    // GPUs equally near the same NICs take them in turn, in PCI order, so
+    // two GPUs beside a dual-port card get a port each instead of sharing one.
+    size_t index = 0;
+    for (const auto& other : intelGpuPaths()) {
+        if (other == gpu_path) break;
+        if (nearestNics(other, nics) == best) ++index;
+    }
+    return best[index % best.size()];
 }
 
 void exportDmabuf(ze_context_handle_t ctx, const void* addr, int* fd,
