@@ -47,7 +47,6 @@ from mooncake.reshard.kv_cache import (
     validate_runtime_bindings,
 )
 
-
 _MAX_U64 = (1 << 64) - 1
 
 
@@ -292,18 +291,18 @@ def test_placement_part_and_binding_round_trip_are_canonical() -> None:
     ],
 )
 def test_transfer_edge_byte_size_boundary(heads, dim, itemsize, accepted):
-    args = dict(
-        source_participant_id="s",
-        target_participant_id="t",
-        global_layer_id=0,
-        component=KVCacheComponent.KEY,
-        global_head_start=0,
-        head_count=heads,
-        source_head_offset=0,
-        target_head_offset=0,
-        head_dim=dim,
-        itemsize=itemsize,
-    )
+    args = {
+        "source_participant_id": "s",
+        "target_participant_id": "t",
+        "global_layer_id": 0,
+        "component": KVCacheComponent.KEY,
+        "global_head_start": 0,
+        "head_count": heads,
+        "source_head_offset": 0,
+        "target_head_offset": 0,
+        "head_dim": dim,
+        "itemsize": itemsize,
+    }
     if accepted:
         assert KVCacheTransferEdge(**args).inner_bytes == heads * dim * itemsize
     else:
