@@ -9295,6 +9295,7 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
 namespace {
 struct ColdArenaSlot {
     std::shared_ptr<void> buffer;
+    std::shared_ptr<Client> registration_owner;
     UUID client_id{};
     bool busy{false};
     bool quarantined{false};
@@ -9309,13 +9310,28 @@ ColdArenaPool &ColdPool(bool source) {
     static auto *destination_pool = new ColdArenaPool;
     return source ? *source_pool : *destination_pool;
 }
+bool ReleaseColdSlotBuffer(ColdArenaSlot &slot) {
+    if (!slot.buffer) return true;
+    auto result =
+        slot.registration_owner->unregisterLocalMemory(slot.buffer.get());
+    if (!result) {
+        // Cleanup failure does not authorize freeing a registered allocation.
+        slot.quarantined = true;
+        LOG(ERROR) << "Cold staging unregister failed; retaining bounded slot: "
+                   << result.error();
+        return false;
+    }
+    slot.buffer.reset();
+    slot.registration_owner.reset();
+    return true;
+}
 void ReleaseIdleColdSlots(const UUID &client_id) {
     for (bool source : {false, true}) {
         auto &pool = ColdPool(source);
         std::lock_guard lock(pool.mutex);
         for (auto &slot : pool.slots) {
             if (!slot.busy && !slot.quarantined && slot.client_id == client_id)
-                slot.buffer.reset();
+                (void)ReleaseColdSlotBuffer(slot);
         }
     }
 }
@@ -9381,7 +9397,9 @@ tl::expected<void, ErrorCode> WriteColdLocalSlices(
         for (size_t i = 0; i < pool.slots.size(); ++i) {
             auto &slot = pool.slots[i];
             if (slot.busy || slot.quarantined) continue;
-            if (slot.client_id != client->getClientId()) slot.buffer.reset();
+            if (slot.client_id != client->getClientId() &&
+                !ReleaseColdSlotBuffer(slot))
+                continue;
             if (!slot.buffer) {
                 void *buffer = nullptr;
                 if (posix_memalign(&buffer, 4096, kColdWriteChunkBytes) != 0)
@@ -9393,10 +9411,8 @@ tl::expected<void, ErrorCode> WriteColdLocalSlices(
                     return registered;
                 }
                 slot.buffer =
-                    std::shared_ptr<void>(buffer, [client](void *ptr) {
-                        auto ignored = client->unregisterLocalMemory(ptr);
-                        free(ptr);
-                    });
+                    std::shared_ptr<void>(buffer, [](void *ptr) { free(ptr); });
+                slot.registration_owner = client;
                 slot.client_id = client->getClientId();
             }
             slot.busy = true;
@@ -9640,8 +9656,9 @@ RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
             for (size_t i = 0; i < pool.slots.size(); ++i) {
                 auto &slot = pool.slots[i];
                 if (slot.busy || slot.quarantined) continue;
-                if (slot.client_id != client->getClientId())
-                    slot.buffer.reset();
+                if (slot.client_id != client->getClientId() &&
+                    !ReleaseColdSlotBuffer(slot))
+                    continue;
                 if (!slot.buffer) {
                     void *buffer = nullptr;
                     if (posix_memalign(&buffer, 4096, kColdWriteChunkBytes) !=
@@ -9654,11 +9671,9 @@ RealClient::cold_write_chunk(const ColdWriteChunk &chunk) {
                         free(buffer);
                         return registered;
                     }
-                    slot.buffer =
-                        std::shared_ptr<void>(buffer, [client](void *ptr) {
-                            auto ignored = client->unregisterLocalMemory(ptr);
-                            free(ptr);
-                        });
+                    slot.buffer = std::shared_ptr<void>(
+                        buffer, [](void *ptr) { free(ptr); });
+                    slot.registration_owner = client;
                     slot.client_id = client->getClientId();
                 }
                 slot.busy = true;
@@ -9808,7 +9823,12 @@ tl::expected<void, ErrorCode> RealClient::WriteColdObject(
     if (slot_index == kColdWriteSlots)
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     auto &slot = cold_source_slots_[slot_index];
-    if (slot.client_id != client_->getClientId()) slot.buffer.reset();
+    if (slot.client_id != client_->getClientId() &&
+        !ReleaseColdSlotBuffer(slot)) {
+        std::lock_guard lock(cold_source_mutex_);
+        slot.busy = false;
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
     if (!slot.buffer) {
         void *buffer = nullptr;
         if (posix_memalign(&buffer, 4096, kColdWriteChunkBytes) != 0) {
@@ -9825,10 +9845,8 @@ tl::expected<void, ErrorCode> RealClient::WriteColdObject(
             return registered;
         }
         slot.buffer =
-            std::shared_ptr<void>(buffer, [client = client_](void *ptr) {
-                auto ignored = client->unregisterLocalMemory(ptr);
-                free(ptr);
-            });
+            std::shared_ptr<void>(buffer, [](void *ptr) { free(ptr); });
+        slot.registration_owner = client_;
         slot.client_id = client_->getClientId();
     }
     if (disk.client_id == client_->getClientId() && file_storage_) {
@@ -9875,7 +9893,7 @@ tl::expected<void, ErrorCode> RealClient::WriteColdObject(
                 dev->SetContext(info.device_id);
                 if (!dev->Copy(slot.buffer.get(), source, size,
                                device::CopyDirection::kDeviceToHost)) {
-                    auto ignored = client_requester_->cold_write_cancel(
+                    (void)client_requester_->cold_write_cancel(
                         disk.transport_endpoint, request);
                     std::lock_guard lock(cold_source_mutex_);
                     slot.busy = false;
