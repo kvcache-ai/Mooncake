@@ -139,6 +139,38 @@ const char* shmCopyOutcomeName(TentMetrics::ShmCopyOutcome outcome) {
     }
     return "unknown";
 }
+
+const char* segmentEventName(TentMetrics::SegmentEvent event) {
+    switch (event) {
+        case TentMetrics::SegmentEvent::SnapshotPublished:
+            return "snapshot_published";
+        case TentMetrics::SegmentEvent::MutationError:
+            return "mutation_error";
+        case TentMetrics::SegmentEvent::RegistryPublishSuccess:
+            return "registry_publish_success";
+        case TentMetrics::SegmentEvent::RegistryPublishError:
+            return "registry_publish_error";
+        case TentMetrics::SegmentEvent::RegistryDeleteSuccess:
+            return "registry_delete_success";
+        case TentMetrics::SegmentEvent::RegistryDeleteError:
+            return "registry_delete_error";
+        case TentMetrics::SegmentEvent::CacheHit:
+            return "cache_hit";
+        case TentMetrics::SegmentEvent::CacheMiss:
+            return "cache_miss";
+        case TentMetrics::SegmentEvent::CacheReset:
+            return "cache_reset";
+        case TentMetrics::SegmentEvent::FetchSuccess:
+            return "fetch_success";
+        case TentMetrics::SegmentEvent::FetchError:
+            return "fetch_error";
+        case TentMetrics::SegmentEvent::EntryInvalidated:
+            return "entry_invalidated";
+        case TentMetrics::SegmentEvent::GenerationAdvanced:
+            return "generation_advanced";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -352,6 +384,7 @@ void TentMetrics::registerMetrics() {
         &quarantined_batches_total_,
         &shm_mapping_events_total_,
         &shm_copy_events_total_,
+        &segment_events_total_,
     };
 
     gauges_ = {
@@ -551,6 +584,14 @@ void TentMetrics::recordShmCopy(Request::OpCode operation,
         shm_copy_latency_.observeCached(slot, labels,
                                         static_cast<int64_t>(latency_us));
     }
+}
+
+void TentMetrics::recordSegmentEvent(SegmentEvent event) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    segment_events_total_.incCached(static_cast<size_t>(event), [event] {
+        return std::array<std::string, 1>{segmentEventName(event)};
+    });
 }
 
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
@@ -1057,6 +1098,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&shm_mapping_events_total_);
             root[shm_copy_events_total_.str_name()] =
                 sumCounterValues(&shm_copy_events_total_);
+            root[segment_events_total_.str_name()] =
+                sumCounterValues(&segment_events_total_);
 
             // Gauges: aggregate across transport labels (total in-flight
             // attempts / total registered bytes). Per-transport breakdown is
@@ -1217,6 +1260,7 @@ void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
 void TentMetrics::recordShmMappingEvent(ShmMappingEvent) {}
 void TentMetrics::recordShmCopy(Request::OpCode, ShmCopyOutcome, double) {}
+void TentMetrics::recordSegmentEvent(SegmentEvent) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}
