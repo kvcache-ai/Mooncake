@@ -196,8 +196,10 @@ class FileStorageTest : public ::testing::Test {
                 WeightStoragePolicy{
                     .preferred_residency = WeightResidencyState::HOT,
                     .migration_mode = WeightMigrationMode::MANUAL},
-            .affinity_summary = {.affinity_count = 1,
-                                 .affinity_digest = std::string(64, 'c')},
+            .affinity_summary =
+                {.affinity_count = 1,
+                 .affinity_digest = ComputeWeightAffinityMappingSha256(
+                     {{"managed-payload", 128, "payload"}})},
         });
         ASSERT_TRUE(begin && *begin);
         const auto manifest_key = MakeWeightManifestKey(identity);

@@ -314,7 +314,8 @@ TEST_F(WeightManagementTcpTest, LeaseProtectsPublishedBytesUntilManagedDelete) {
         .affinity_summary =
             WeightAffinitySummary{
                 .affinity_count = 1,
-                .affinity_digest = std::string(64, 'c'),
+                .affinity_digest = ComputeWeightAffinityMappingSha256(
+                    {{payload_key, kPayloadSize, "payload"}}),
             },
     });
     ASSERT_TRUE(begin.has_value());

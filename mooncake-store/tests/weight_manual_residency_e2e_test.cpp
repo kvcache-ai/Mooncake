@@ -66,6 +66,11 @@ class WeightManualResidencyE2ETest : public ::testing::Test {
     }
 
     void Import() {
+        std::vector<WeightAffinityMappingEntry> mapping;
+        for (size_t i = 0; i < 4; ++i) {
+            mapping.push_back({"manual-payload-" + std::to_string(i), kBytes,
+                               i < 2 ? "tensor-a" : "tensor-b"});
+        }
         auto begin = reader_->begin_weight_import({
             .identity = Identity(),
             .payload_group_id = {},
@@ -74,7 +79,9 @@ class WeightManualResidencyE2ETest : public ::testing::Test {
             .policy = WeightStoragePolicy{.preferred_residency =
                                               WeightResidencyState::HOT},
             .affinity_summary = {.affinity_count = 2,
-                                 .affinity_digest = std::string(64, 'c')},
+                                 .affinity_digest =
+                                     ComputeWeightAffinityMappingSha256(
+                                         mapping)},
         });
         ASSERT_TRUE(begin.has_value());
         ASSERT_TRUE(begin->has_value());

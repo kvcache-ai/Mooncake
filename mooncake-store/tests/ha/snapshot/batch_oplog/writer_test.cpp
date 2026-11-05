@@ -1055,7 +1055,10 @@ TEST_F(BatchOpLogSnapshotWriterTest,
                 .preferred_residency = WeightResidencyState::HOT,
                 .migration_mode = WeightMigrationMode::MANUAL},
         .affinity_summary = {.affinity_count = 1,
-                             .affinity_digest = std::string(64, 'c')},
+                             .affinity_digest =
+                                 ComputeWeightAffinityMappingSha256(
+                                     {{"snapshot-weight-payload", 1024,
+                                       "snapshot-weight-affinity"}})},
     });
     ASSERT_TRUE(importing);
     const std::string payload_key = "snapshot-weight-payload";

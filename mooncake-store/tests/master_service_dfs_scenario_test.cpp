@@ -214,7 +214,9 @@ TEST_F(ManagedWeightDfsEvictionTest,
         .affinity_summary =
             WeightAffinitySummary{
                 .affinity_count = 1,
-                .affinity_digest = std::string(64, 'c'),
+                .affinity_digest = ComputeWeightAffinityMappingSha256(
+                    {{"managed-weight-dfs-payload", 4096,
+                      "managed-weight-dfs-payload"}}),
             },
     });
     ASSERT_TRUE(importing.has_value());

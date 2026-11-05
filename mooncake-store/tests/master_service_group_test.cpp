@@ -185,7 +185,9 @@ TEST_F(MasterServiceTest, RemoveAllPreservesManagedGroupImportedDuringScan) {
                     .preferred_residency = WeightResidencyState::HOT,
                     .migration_mode = WeightMigrationMode::MANUAL},
             .affinity_summary = {.affinity_count = 1,
-                                 .affinity_digest = std::string(64, 'a')},
+                                 .affinity_digest =
+                                     ComputeWeightAffinityMappingSha256(
+                                         {{payload_key, 1024, "payload"}})},
         });
         if (importing) {
             ReplicateConfig config;
@@ -344,7 +346,9 @@ TEST_F(MasterServiceTest,
         .affinity_summary =
             WeightAffinitySummary{
                 .affinity_count = 1,
-                .affinity_digest = std::string(64, 'c'),
+                .affinity_digest = ComputeWeightAffinityMappingSha256(
+                    {{"managed-weight-payload", kObjectSize,
+                      "managed-weight-payload"}}),
             },
     });
     ASSERT_TRUE(importing.has_value());
