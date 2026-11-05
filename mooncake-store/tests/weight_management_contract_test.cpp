@@ -315,6 +315,67 @@ TEST(WeightManagementContractTest, ManifestKeyUsesCanonicalUrlEncoding) {
               MakeWeightManifestKey(identity));
 }
 
+TEST(WeightManagementContractTest, AffinityMappingDigestMatchesGoldenRecords) {
+    // Golden digests are independently computed with Python hashlib.sha256.
+    EXPECT_EQ(
+        "119669c48231711543bf39ce55b577d0c5ca5453d5a273f053aef06d63d1c153",
+        ComputeWeightAffinityMappingSha256({
+            {"payload-a", 4096, "layer-0"},
+            {"payload-b", 17, "layer-1"},
+        }));
+    EXPECT_EQ(
+        "bdf091c5aaf9f34b78a5703ff24f1e3f8037045c5a19283181538b61bb0d611a",
+        ComputeWeightAffinityMappingSha256({
+            {"模型/权重", 123, "层/零"},
+            {"é", 2, "分组"},
+        }));
+    EXPECT_EQ(
+        "a784027328ec26959f1c23093d80a9b7ee4a4d5da3c37185ae9d978dda55a0f6",
+        ComputeWeightAffinityMappingSha256({
+            {"a:1\nb", 1, "x:\ny"},
+            {std::string("a\0z", 3), std::numeric_limits<uint64_t>::max(),
+             std::string("g\0:\n", 4)},
+        }));
+}
+
+TEST(WeightManagementContractTest, AffinityMappingDigestBindsEveryField) {
+    const std::vector<WeightAffinityMappingEntry> entries{
+        {"payload-a", 4096, "layer-0"},
+        {"payload-b", 17, "layer-1"},
+    };
+    const auto digest = ComputeWeightAffinityMappingSha256(entries);
+    ASSERT_EQ(64, digest.size());
+    EXPECT_EQ(digest,
+              ComputeWeightAffinityMappingSha256({entries[1], entries[0]}));
+    auto changed = entries;
+    changed[0].key += ":\n";
+    EXPECT_NE(digest, ComputeWeightAffinityMappingSha256(changed));
+    changed = entries;
+    ++changed[0].size;
+    EXPECT_NE(digest, ComputeWeightAffinityMappingSha256(changed));
+    changed = entries;
+    changed[0].affinity_id = entries[1].affinity_id;
+    EXPECT_NE(digest, ComputeWeightAffinityMappingSha256(changed));
+}
+
+TEST(WeightManagementContractTest, AffinityMappingDigestRejectsInvalidEntries) {
+    const WeightAffinityMappingEntry valid{"payload", 1, "layer"};
+    EXPECT_TRUE(ComputeWeightAffinityMappingSha256({valid, valid}).empty());
+    auto changed = valid;
+    changed.size = 2;
+    changed.affinity_id = "other-layer";
+    EXPECT_TRUE(ComputeWeightAffinityMappingSha256({valid, changed}).empty());
+    changed = valid;
+    changed.key.clear();
+    EXPECT_TRUE(ComputeWeightAffinityMappingSha256({changed}).empty());
+    changed = valid;
+    changed.size = 0;
+    EXPECT_TRUE(ComputeWeightAffinityMappingSha256({changed}).empty());
+    changed = valid;
+    changed.affinity_id.clear();
+    EXPECT_TRUE(ComputeWeightAffinityMappingSha256({changed}).empty());
+}
+
 TEST(WeightManagementContractTest, MetadataDoesNotDuplicateManifestChildren) {
     static_assert(!HasTensorsField<WeightRevisionMetadata>);
     static_assert(!HasRuntimeEndpointField<WeightRevisionMetadata>);
