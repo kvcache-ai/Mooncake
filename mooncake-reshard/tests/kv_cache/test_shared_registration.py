@@ -193,6 +193,9 @@ def test_shared_allocation_lives_until_last_participant_finishes(ssm, order):
         executor.validate_local_binding(binding)
         executor.unregister_region(region.region_id, owner_id=binding.digest)
         assert engine.unregisters == step
+        if step == 0:
+            with pytest.raises(ValueError, match="owner claim"):
+                executor.validate_local_binding(binding)
     with pytest.raises(ValueError, match="not registered"):
         executor.validate_local_binding(bindings[order[-1]])
 
@@ -200,14 +203,17 @@ def test_shared_allocation_lives_until_last_participant_finishes(ssm, order):
 def test_owner_claims_preserve_manual_registration():
     snapshot = _snapshot(token_count=1)
     placement, bindings = shared_bindings("source", snapshot, 1_000_000)
-    region = resolve_all(placement, snapshot, bindings)[0].regions[0]
+    binding = resolve_all(placement, snapshot, bindings)[0]
+    region = binding.regions[0]
     engine = CountingEngine(MemoryEngine())
     executor = KVCacheTransferEngineExecutor(
         engine, instance_id="source-runtime", endpoint=region.endpoint
     )
     executor.register_region(region)
     executor.register_region(region, owner_id="participant")
+    executor.validate_local_binding(binding)
     executor.unregister_region(region.region_id, owner_id="participant")
+    executor.validate_local_binding(binding)
     assert engine.unregisters == 0
     with pytest.raises(ValueError, match="not registered by this owner"):
         executor.unregister_region(region.region_id, owner_id="participant")

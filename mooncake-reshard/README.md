@@ -340,6 +340,16 @@ can select a group within a fused allocation. The ordinary `NHD` contract
 continues to require dense rows. These are byte-copy layouts, not dtype
 conversion, quantization, or arbitrary tensor transposition.
 
+Overlap checks for equal row strides are independent of row capacity. Validation
+is capped at 1,000,000 candidate-pair/expanded-interval work units per call;
+mixed-stride layouts exceeding that budget fail before their rows are expanded.
+
+Bindings with independent lifetimes must register regions with
+`owner_id=binding.digest`. Validation and execution, including cached results,
+require that claim to remain active on every region. Omitting `owner_id` retains
+the legacy runtime-wide claim, which authorizes all matching local bindings until
+released. Other owner IDs can pin memory but do not authorize binding execution.
+
 The framework retains responsibility for token-page and state-slot mappings,
 cache lifetime, coordinating all resources, and withholding request completion
 until every required resource writer succeeds. Mooncake does not infer model

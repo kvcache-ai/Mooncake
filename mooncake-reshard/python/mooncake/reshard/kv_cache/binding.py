@@ -18,6 +18,9 @@ from .types import (
     require_manifest_items,
 )
 
+# Charge candidate pairs and mixed-stride payload intervals before expansion.
+_MAX_OVERLAP_VALIDATION_WORK = 1_000_000
+
 
 def validate_runtime_binding(
     placement: KVCachePlacementManifest,
@@ -147,6 +150,23 @@ def _payload_ranges(fragment: KVCacheRuntimeBuffer) -> Iterator[tuple[int, int]]
         yield start, start + row_bytes
 
 
+def _view_payloads_overlap(
+    left: KVCacheRuntimeBuffer, right: KVCacheRuntimeBuffer
+) -> bool:
+    # The caller orders views by address and checks their bounding spans first.
+    if left.strides_bytes[0] == right.strides_bytes[0]:
+        stride = left.strides_bytes[0]
+        row, offset = divmod(right.address - left.address, stride)
+        left_width = left.local_shape[1] * left.local_shape[2] * left.itemsize
+        right_width = right.local_shape[1] * right.local_shape[2] * right.itemsize
+        # Later right-hand rows have the same phase, moving only past the left view.
+        return (row < left.local_shape[0] and offset < left_width) or (
+            row + 1 < left.local_shape[0] and offset + right_width > stride
+        )
+    payloads = merge(_payload_ranges(left), _payload_ranges(right))
+    return any(current[0] < previous[1] for previous, current in pairwise(payloads))
+
+
 def _validate_shared_instance_ranges(
     bindings: tuple[KVCacheRuntimeBindingManifest, ...],
 ) -> None:
@@ -157,17 +177,26 @@ def _validate_shared_instance_ranges(
             fragment = item.fragment
             key = (binding.instance_id, fragment.worker_id, fragment.device)
             by_space.setdefault(key, []).append(fragment)
+    work = 0
     for fragments in by_space.values():
-        views = sorted(
-            (fragment.address, fragment.address + fragment.nbytes)
-            for fragment in fragments
-        )
-        # Disjoint bounding spans need no row expansion. When spans overlap,
-        # merge each view's sorted payload rows lazily; padding is not data.
-        if any(current[0] < previous[1] for previous, current in pairwise(views)):
-            payloads = merge(*(_payload_ranges(f) for f in fragments))
-            for previous, current in pairwise(payloads):
-                if current[0] < previous[1]:
+        fragments.sort(key=lambda f: f.address)
+        for index, left in enumerate(fragments):
+            for other in range(index + 1, len(fragments)):
+                right = fragments[other]
+                if right.address >= left.address + left.nbytes:
+                    break
+                work += 1
+                if left.strides_bytes[0] != right.strides_bytes[0]:
+                    work += sum(
+                        1
+                        if f.strides_bytes[0]
+                        == f.local_shape[1] * f.local_shape[2] * f.itemsize
+                        else f.local_shape[0]
+                        for f in (left, right)
+                    )
+                if work > _MAX_OVERLAP_VALIDATION_WORK:
+                    raise ValueError("runtime overlap validation work limit exceeded")
+                if _view_payloads_overlap(left, right):
                     raise ValueError("runtime KV buffers overlap in one address space")
         # Several disjoint views may share the same complete allocation. Distinct
         # allocation claims may not overlap, including unequal nested claims.

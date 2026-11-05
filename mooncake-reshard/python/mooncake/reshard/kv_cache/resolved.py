@@ -376,7 +376,7 @@ def resolve_contiguous_runtime_binding(
     independent of participant, fragment and operation. One executor per
     runtime/endpoint deduplicates registration across bindings. The runtime must
     keep that allocation pinned until all users are quiescent; callers releasing
-    bindings independently can use binding.digest as the executor's owner_id.
+    bindings independently must use binding.digest as the executor's owner_id.
     Paged/noncontiguous allocations must export resolved ranges themselves.
     No framework page IDs or allocation metadata enter Mooncake.
     """

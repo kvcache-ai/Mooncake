@@ -1,7 +1,9 @@
 """Shared-allocation strided views must be checked by their live payload."""
 
 from dataclasses import replace
+from itertools import product
 
+import mooncake.reshard.kv_cache.binding as binding_checks
 import pytest
 from mooncake.reshard.kv_cache import (
     KVCacheComponent,
@@ -148,3 +150,103 @@ def test_invalid_strided_geometry_is_rejected(change, match):
     )
     with pytest.raises(ValueError, match=match):
         validate_runtime_binding(placement, broken)
+
+
+@pytest.mark.parametrize("second_offset,overlap", [(48, False), (46, True), (50, True)])
+def test_large_interleaved_capacity_never_expands_rows(
+    monkeypatch, second_offset, overlap
+):
+    placement, binding = interleaved_binding(
+        "source", 1_000_000, _snapshot(token_count=1), "ssm", second_offset
+    )
+    rows = 10**12
+    binding = replace(
+        binding,
+        buffers=tuple(
+            replace(
+                item,
+                fragment=replace(
+                    item.fragment,
+                    local_shape=(rows, 4, 6),
+                    nbytes=(rows - 1) * 96 + 48,
+                    storage_nbytes=(rows + 1) * 96,
+                ),
+            )
+            for item in binding.buffers
+        ),
+    )
+
+    def no_expansion(_fragment):
+        raise AssertionError("capacity-sized row expansion")
+
+    monkeypatch.setattr(binding_checks, "_payload_ranges", no_expansion)
+    if overlap:
+        with pytest.raises(ValueError, match="buffers overlap"):
+            validate_runtime_binding(placement, binding)
+    else:
+        validate_runtime_binding(placement, binding)
+
+
+@pytest.mark.parametrize("rows", [3, 10**12])
+def test_mixed_stride_overlap_work_is_bounded(monkeypatch, rows):
+    placement, binding = interleaved_binding(
+        "source", 1_000_000, _snapshot(token_count=1), "ssm"
+    )
+    binding = replace(
+        binding,
+        buffers=tuple(
+            replace(
+                item,
+                fragment=replace(
+                    item.fragment,
+                    local_shape=(rows, 4, 6),
+                    strides_bytes=(stride, 12, 2),
+                    nbytes=(rows - 1) * stride + 48,
+                    storage_nbytes=(rows + 1) * 192,
+                ),
+            )
+            for item, stride in zip(binding.buffers, (96, 192))
+        ),
+    )
+    if rows == 3:
+        validate_runtime_binding(placement, binding)
+    else:
+
+        def no_expansion(_fragment):
+            raise AssertionError("expanded before checking the work budget")
+
+        monkeypatch.setattr(binding_checks, "_payload_ranges", no_expansion)
+        with pytest.raises(ValueError, match="validation work limit"):
+            validate_runtime_binding(placement, binding)
+
+
+def test_equal_stride_arithmetic_matches_small_byte_oracle():
+    _, binding = interleaved_binding(
+        "source", 1_000_000, _snapshot(token_count=1), "ssm"
+    )
+    template = binding.buffers[0].fragment
+    for left_rows, right_rows, left_width, right_width, offset in product(
+        (2, 4), (2, 3), (2, 8, 16), (2, 8, 16), range(0, 80, 2)
+    ):
+        left, right = (
+            replace(
+                template,
+                address=template.address + start,
+                storage_offset_bytes=start,
+                storage_nbytes=256,
+                local_shape=(rows, 1, width // 2),
+                strides_bytes=(16, width, 2),
+                nbytes=(rows - 1) * 16 + width,
+            )
+            for rows, width, start in (
+                (left_rows, left_width, 0),
+                (right_rows, right_width, offset),
+            )
+        )
+        expected = any(
+            max(i * 16, offset + j * 16)
+            < min(i * 16 + left_width, offset + j * 16 + right_width)
+            for i in range(left_rows)
+            for j in range(right_rows)
+        )
+        assert binding_checks._view_payloads_overlap(left, right) == expected

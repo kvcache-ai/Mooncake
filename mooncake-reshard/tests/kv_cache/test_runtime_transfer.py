@@ -512,6 +512,45 @@ def test_local_registration_and_operation_reuse(small_operation):
         executor.execute(changed, b.participant_id)
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_released_owner_cannot_validate_or_execute(small_operation, cached):
+    plan, _keepalive = small_operation
+    binding = plan.source_bindings[0]
+    peer_plan = replace(
+        plan,
+        operation_id="peer-operation",
+        source_bindings=tuple(
+            replace(b, operation_id="peer-operation") for b in plan.source_bindings
+        ),
+        target_bindings=tuple(
+            replace(b, operation_id="peer-operation") for b in plan.target_bindings
+        ),
+    )
+    peer = peer_plan.source_bindings[0]
+    engine = MemoryEngine()
+    executor = KVCacheTransferEngineExecutor(
+        engine, instance_id=binding.instance_id, endpoint=binding.regions[0].endpoint
+    )
+    for region in binding.regions:
+        executor.register_region(region, owner_id=binding.digest)
+        executor.register_region(region, owner_id=peer.digest)
+    if cached:
+        assert all(r.success for r in executor.execute(plan, binding.participant_id))
+    for region in binding.regions:
+        executor.unregister_region(region.region_id, owner_id=binding.digest)
+    calls = len(engine.calls)
+    with pytest.raises(ValueError, match="owner claim"):
+        executor.validate_local_binding(binding)
+    with pytest.raises(ValueError, match="owner claim"):
+        executor.execute(plan, binding.participant_id)
+    assert len(engine.calls) == calls
+    executor.validate_local_binding(peer)
+    assert all(r.success for r in executor.execute(peer_plan, peer.participant_id))
+    assert len(engine.calls) > calls
+    for region in peer.regions:
+        executor.unregister_region(region.region_id, owner_id=peer.digest)
+
+
 @pytest.mark.parametrize("operation", ["register", "unregister"])
 @pytest.mark.parametrize("failure", [-7, False, RuntimeError, KeyboardInterrupt])
 def test_registration_failure_blocks_further_operations(
