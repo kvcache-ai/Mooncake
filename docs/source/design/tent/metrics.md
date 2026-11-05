@@ -383,6 +383,9 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_staging_cleanup_timeouts_total` | Counter | - | Staging shutdown drains that reached their configured deadline |
 | `tent_rpc_attempts_total` | Counter | `method`, `outcome` | Physical TENT client RPC attempts, including attempts that fail to connect |
 | `tent_rpc_retries_total` | Counter | `method` | Retry attempts actually issued by an idempotent RPC call |
+| `tent_rpc_server_requests_total` | Counter | `method` | Requests accepted by the TENT RPC server |
+| `tent_rpc_server_bytes_total` | Counter | `method`, `direction` | Application attachment bytes received in requests or successfully written in responses |
+| `tent_rpc_server_responses_total` | Counter | `method`, `outcome` | Server handler and response-write outcomes |
 | `tent_rdma_slice_events_total` | Counter | `operation`, `event` | RDMA slice lifecycle events from initial worker enqueue through post, completion, timeout, or pre-post failure |
 | `tent_rdma_retries_total` | Counter | `operation`, `cause` | RDMA slice retries actually re-enqueued after endpoint, post, or completion failure |
 | `tent_rdma_retry_exhausted_total` | Counter | `operation`, `cause` | RDMA slices terminated after reaching the configured retry limit |
@@ -430,6 +433,7 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_logical_request_outcome_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end logical request latency, including unsuccessful outcomes |
 | `tent_transport_attempt_outcome_latency_us` | Histogram | `transport`, `operation`, `outcome` | Physical attempt latency split by terminal outcome |
 | `tent_rpc_attempt_latency_us` | Histogram | `method`, `outcome` | End-to-end latency of each physical client RPC attempt, including connection setup when needed |
+| `tent_rpc_server_latency_us` | Histogram | `method`, `outcome` | Server latency from handler dispatch through response socket-write completion |
 | `tent_rdma_completion_latency_us` | Histogram | `operation`, `outcome` | Post-to-CQ latency of physical RDMA slice completions |
 | `tent_stream_attempt_latency_us` | Histogram | `transport`, `operation`, `outcome` | End-to-end latency of physical TCP or HP-TCP network attempts |
 | `tent_stream_queue_wait_us` | Histogram | `transport`, `operation` | TCP logical-task and HP-TCP physical-slice queue wait before an attempt starts |
@@ -501,11 +505,12 @@ addresses, segment names, or other unbounded values are accepted.
 | `operation` | `read`, `write`; `register`, `unregister` | Attempt or memory lifecycle operation, depending on the metric family |
 | `phase` | `metadata`, `admission`, `selection`, `connect`, `register`, `submit`, `queue`, `post`, `poll`, `completion`, `retry`, `failover`, `notify`, `cleanup`, `shutdown` for terminal failures; `resolve`, `connect`, `io` for stream failures | Stable phase where a failure originated |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` for `tent_task_failures_total`; `timeout`, `unavailable`, `queue_full`, `resource_exhausted`, `protocol`, `stale_generation`, `wc_error`, `cq_error`, `mr_error`, `peer_closed`, `canceled`, `internal` for `tent_terminal_failures_total`; `timeout`, `connection_refused`, `network_unreachable`, `host_unreachable`, `host_not_found`, `connection_reset`, `eof`, `broken_pipe`, `operation_aborted`, `unavailable`, `other` for `tent_stream_failures_total` | Bounded failure classification |
-| `outcome` | `success`, `failed`, `timeout`, `canceled` for logical/transport outcomes; `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions; `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` for stream attempts | Bounded operation outcome |
+| `outcome` | `success`, `failed`, `timeout`, `canceled` for logical/transport outcomes; `success`, `failure` for memory lifecycle metrics; `success`, `connection_error`, `rpc_error` for client RPC metrics; `success`, `handler_error`, `write_error` for server RPC metrics; `success`, `wc_error`, `flush`, `late` for RDMA completions; `success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error` for stream attempts | Bounded operation outcome |
 | `worker` | `engine_progress`, `staging`, `rdma` | Worker subsystem reporting forward progress |
 | `kind` | `group`, `batch`, `remote_operation` | Deferred staging cleanup resource kind |
 | `owner_kind` | `user`, `staging`, `all` | Runtime admission owner class; `all` is the aggregate capacity domain |
 | `method` | `get_segment_desc`, `bootstrap_rdma`, `bootstrap_ub`, `send_data`, `recv_data`, `notify`, `probe`, `delegate`, `pin`, `unpin`, `subscribe_segment_update`, `notify_segment_updated`, `unknown` | TENT RPC method; `unknown` safely bounds extension methods |
+| `direction` | `request`, `response` | RPC application attachment direction |
 | `event` | RDMA slice: `enqueued`, `post_attempt`, `path_error`, `post_error`, `completion_success`, `completion_error`, `completion_flush`, `late_completion`, `software_timeout`; endpoint: `constructed`, `construct_failure`, `ready_active`, `ready_passive`, `retiring`, `destroyed`, `destroy_error`; notification: `recv_posted`, `recv_post_error`, `recv_delivered`, `recv_invalid`, `recv_dropped`, `send_posted`, `send_completed`, `send_unavailable`, `send_encode_error`, `send_post_error`, `completion_error`, `cq_poll_error`, `unknown_qp`, `channel_disabled`; stream: `queued`, `attempt_started`, `attempt_success`, `connect_started`, `connect_success`, `connection_error`, `io_error`, `timeout`, `peer_closed`, `canceled`, `remote_error`, `retry_issued`, `retry_exhausted`; selection and admission use the closed decision names documented by their counters | Family-specific bounded lifecycle event or decision |
 | `cause` | `endpoint`, `post`, `completion` | RDMA retry or retry-exhaustion source |
 | `qp_type` | `data`, `notification` | RDMA queue-pair role; QP numbers are never labels |
@@ -532,12 +537,18 @@ constant for the life of the process; a served `tent_metrics_build_info` series
 itself confirms that metrics were compiled in. Total series across all metrics
 is bounded by these closed sets.
 
-Each RPC family is bounded to 13 methods. Attempts and attempt latency have at
-most 13x3 = 39 method/outcome series; retries have at most 13. These are
-client-side physical-attempt metrics: an idempotent logical call retried once
-records two attempts and one retry. A peer response that carries an
-application-level error is still a successful RPC transport attempt; the
-caller-facing failure is classified by the owning subsystem metric or log.
+Each RPC family is bounded to 13 methods. Client attempts and attempt latency
+have at most 13x3 = 39 method/outcome series; retries and server requests each
+have at most 13. Server bytes have at most 13x2 = 26 method/direction series,
+and server response outcomes and latency each have at most 13x3 = 39 series.
+Client metrics describe physical attempts: an idempotent logical call retried
+once records two attempts and one retry. Server request bytes count an accepted
+application attachment. Response bytes advance only after YLT reports a
+successful socket write; `write_error` identifies generated responses that
+could not be fully written. Server latency includes handler execution and the
+response write. A peer response that carries an application-level error is
+still a successful client RPC transport attempt; the caller-facing failure is
+classified by the owning subsystem metric or log.
 
 RDMA metrics count physical slices, not logical requests. Slice events have at
 most 2x9 = 18 operation/event series. Retry and retry-exhausted counters each

@@ -273,6 +273,7 @@ class TentMetrics {
         Unknown,
     };
     enum class RpcOutcome { Success, ConnectionError, RpcError };
+    enum class RpcServerOutcome { Success, HandlerError, WriteError };
 
     // Record physical client RPC attempts at the CoroRpcAgent attempt loop.
     // One logical call may produce two attempts when its idempotent retry is
@@ -280,6 +281,12 @@ class TentMetrics {
     void recordRpcAttempt(RpcMethod method, RpcOutcome outcome,
                           double latency_us);
     void recordRpcRetry(RpcMethod method);
+    // Server latency spans handler execution through response socket write.
+    // Byte counters cover application attachments, not protocol framing;
+    // response bytes advance only after a successful write completion.
+    void recordRpcServerRequest(RpcMethod method, size_t request_bytes);
+    void recordRpcServerResponse(RpcMethod method, RpcServerOutcome outcome,
+                                 size_t response_bytes, double latency_us);
 
     enum class RdmaSliceEvent {
         Enqueued,
@@ -689,6 +696,10 @@ class TentMetrics {
     static inline const std::array<std::string, 2> kRpcAttemptLabels{"method",
                                                                      "outcome"};
     static inline const std::array<std::string, 1> kRpcMethodLabel{"method"};
+    static inline const std::array<std::string, 2> kRpcServerByteLabels{
+        "method", "direction"};
+    static inline const std::array<std::string, 2> kRpcServerOutcomeLabels{
+        "method", "outcome"};
     static inline const std::array<std::string, 2> kRdmaEventLabels{"operation",
                                                                     "event"};
     static inline const std::array<std::string, 2> kRdmaRetryLabels{"operation",
@@ -747,6 +758,12 @@ class TentMetrics {
     static constexpr size_t kRpcOutcomeDomain = 3;
     static constexpr size_t kRpcAttemptDomain =
         kRpcMethodDomain * kRpcOutcomeDomain;
+    static constexpr size_t kRpcServerDirectionDomain = 2;
+    static constexpr size_t kRpcServerOutcomeDomain = 3;
+    static constexpr size_t kRpcServerByteDomain =
+        kRpcMethodDomain * kRpcServerDirectionDomain;
+    static constexpr size_t kRpcServerResponseDomain =
+        kRpcMethodDomain * kRpcServerOutcomeDomain;
     static constexpr size_t kRdmaSliceEventDomain = 9;
     static constexpr size_t kRdmaRetryCauseDomain = 3;
     static constexpr size_t kRdmaWcErrorCategoryDomain = 8;
@@ -813,6 +830,15 @@ class TentMetrics {
     }
     static size_t rpcAttemptSlot(RpcMethod method, RpcOutcome outcome) {
         return static_cast<size_t>(method) * kRpcOutcomeDomain +
+               static_cast<size_t>(outcome);
+    }
+    static size_t rpcServerByteSlot(RpcMethod method, bool response) {
+        return static_cast<size_t>(method) * kRpcServerDirectionDomain +
+               (response ? 1u : 0u);
+    }
+    static size_t rpcServerResponseSlot(RpcMethod method,
+                                        RpcServerOutcome outcome) {
+        return static_cast<size_t>(method) * kRpcServerOutcomeDomain +
                static_cast<size_t>(outcome);
     }
     static size_t rdmaEventSlot(Request::OpCode operation,
@@ -969,6 +995,18 @@ class TentMetrics {
         "tent_rpc_retries_total",
         "Physical TENT client RPC retry attempts actually issued",
         kRpcMethodLabel, kRpcMethodDomain};
+    metrics::CachedDynamicCounter<1> rpc_server_requests_total_{
+        "tent_rpc_server_requests_total",
+        "TENT RPC requests accepted by the server", kRpcMethodLabel,
+        kRpcMethodDomain};
+    metrics::CachedDynamicCounter<2> rpc_server_bytes_total_{
+        "tent_rpc_server_bytes_total",
+        "TENT RPC application attachment bytes received or written",
+        kRpcServerByteLabels, kRpcServerByteDomain};
+    metrics::CachedDynamicCounter<2> rpc_server_responses_total_{
+        "tent_rpc_server_responses_total",
+        "TENT RPC server responses by handler or socket-write outcome",
+        kRpcServerOutcomeLabels, kRpcServerResponseDomain};
     metrics::CachedDynamicCounter<2> rdma_slice_events_total_{
         "tent_rdma_slice_events_total",
         "RDMA slice lifecycle events by operation and event", kRdmaEventLabels,
@@ -1173,6 +1211,10 @@ class TentMetrics {
         "tent_rpc_attempt_latency_us",
         "Physical TENT client RPC attempt latency in microseconds",
         kLatencyBuckets, kRpcAttemptLabels, kRpcAttemptDomain};
+    metrics::CachedDynamicHistogram<2> rpc_server_latency_{
+        "tent_rpc_server_latency_us",
+        "TENT RPC server latency through response write completion",
+        kLatencyBuckets, kRpcServerOutcomeLabels, kRpcServerResponseDomain};
     metrics::CachedDynamicHistogram<2> rdma_completion_latency_{
         "tent_rdma_completion_latency_us",
         "RDMA posted-slice completion latency in microseconds", kLatencyBuckets,

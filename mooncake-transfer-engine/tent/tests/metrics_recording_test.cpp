@@ -492,6 +492,10 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordRpcAttempt(TentMetrics::RpcMethod::Probe,
                              TentMetrics::RpcOutcome::Success, 25.0);
     metrics.recordRpcRetry(TentMetrics::RpcMethod::GetSegmentDesc);
+    metrics.recordRpcServerRequest(TentMetrics::RpcMethod::Probe, 128);
+    metrics.recordRpcServerResponse(TentMetrics::RpcMethod::Probe,
+                                    TentMetrics::RpcServerOutcome::WriteError,
+                                    256, 35.0);
     metrics.recordRdmaSliceEvent(Request::READ,
                                  TentMetrics::RdmaSliceEvent::Enqueued);
     metrics.recordRdmaRetry(Request::READ,
@@ -557,7 +561,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 83>
+    const std::array<std::pair<std::string_view, std::string_view>, 87>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -581,6 +585,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_staging_cleanup_timeouts_total", "counter"},
             {"tent_rpc_attempts_total", "counter"},
             {"tent_rpc_retries_total", "counter"},
+            {"tent_rpc_server_requests_total", "counter"},
+            {"tent_rpc_server_bytes_total", "counter"},
+            {"tent_rpc_server_responses_total", "counter"},
             {"tent_rdma_slice_events_total", "counter"},
             {"tent_rdma_retries_total", "counter"},
             {"tent_rdma_retry_exhausted_total", "counter"},
@@ -628,6 +635,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_logical_request_outcome_latency_us", "histogram"},
             {"tent_transport_attempt_outcome_latency_us", "histogram"},
             {"tent_rpc_attempt_latency_us", "histogram"},
+            {"tent_rpc_server_latency_us", "histogram"},
             {"tent_rdma_completion_latency_us", "histogram"},
             {"tent_stream_attempt_latency_us", "histogram"},
             {"tent_stream_queue_wait_us", "histogram"},
@@ -706,10 +714,12 @@ TEST_F(MetricsRecordingTest,
 
 TEST_F(MetricsRecordingTest, RpcAgentRecordsSuccessfulPhysicalAttempt) {
     CoroRpcAgent server;
-    ASSERT_TRUE(server
-                    .registerFunction(
-                        Probe, [](const std::string_view&, std::string&) {})
-                    .ok());
+    ASSERT_TRUE(
+        server
+            .registerFunction(Probe,
+                              [](const std::string_view& request,
+                                 std::string& response) { response = request; })
+            .ok());
     uint16_t port = 0;
     ASSERT_TRUE(server.start(port).ok());
 
@@ -717,8 +727,10 @@ TEST_F(MetricsRecordingTest, RpcAgentRecordsSuccessfulPhysicalAttempt) {
     CoroRpcAgent client;
     std::string response;
     ASSERT_TRUE(
-        client.call("127.0.0.1:" + std::to_string(port), Probe, "", response)
+        client
+            .call("127.0.0.1:" + std::to_string(port), Probe, "ping", response)
             .ok());
+    EXPECT_EQ(response, "ping");
     auto after = MetricsSnapshot(TentMetrics::instance());
 
     const std::string series =
@@ -726,6 +738,61 @@ TEST_F(MetricsRecordingTest, RpcAgentRecordsSuccessfulPhysicalAttempt) {
     EXPECT_EQ(after.series(series) - before.series(series), 1);
     EXPECT_EQ(after.histogramCount("tent_rpc_attempt_latency_us") -
                   before.histogramCount("tent_rpc_attempt_latency_us"),
+              1);
+    EXPECT_EQ(
+        after.series("tent_rpc_server_requests_total{method=\"probe\"}") -
+            before.series("tent_rpc_server_requests_total{method=\"probe\"}"),
+        1);
+    EXPECT_EQ(after.series("tent_rpc_server_bytes_total{method=\"probe\","
+                           "direction=\"request\"}") -
+                  before.series("tent_rpc_server_bytes_total{method=\"probe\","
+                                "direction=\"request\"}"),
+              4);
+    EXPECT_EQ(after.series("tent_rpc_server_bytes_total{method=\"probe\","
+                           "direction=\"response\"}") -
+                  before.series("tent_rpc_server_bytes_total{method=\"probe\","
+                                "direction=\"response\"}"),
+              4);
+    EXPECT_EQ(
+        after.series("tent_rpc_server_responses_total{method=\"probe\","
+                     "outcome=\"success\"}") -
+            before.series("tent_rpc_server_responses_total{method=\"probe\","
+                          "outcome=\"success\"}"),
+        1);
+    EXPECT_EQ(after.histogramCount("tent_rpc_server_latency_us") -
+                  before.histogramCount("tent_rpc_server_latency_us"),
+              1);
+    EXPECT_TRUE(server.stop().ok());
+}
+
+TEST_F(MetricsRecordingTest, RpcAgentRecordsHandlerFailure) {
+    CoroRpcAgent server;
+    ASSERT_TRUE(server
+                    .registerFunction(
+                        Probe,
+                        [](const std::string_view&, std::string&) {
+                            throw std::runtime_error("injected handler error");
+                        })
+                    .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+
+    const auto before = MetricsSnapshot(TentMetrics::instance());
+    CoroRpcAgent client;
+    std::string response;
+    EXPECT_FALSE(
+        client.call("127.0.0.1:" + std::to_string(port), Probe, "bad", response)
+            .ok());
+    const auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(
+        after.series("tent_rpc_server_responses_total{method=\"probe\","
+                     "outcome=\"handler_error\"}") -
+            before.series("tent_rpc_server_responses_total{method=\"probe\","
+                          "outcome=\"handler_error\"}"),
+        1);
+    EXPECT_EQ(after.histogramCount("tent_rpc_server_latency_us") -
+                  before.histogramCount("tent_rpc_server_latency_us"),
               1);
     EXPECT_TRUE(server.stop().ok());
 }
@@ -2662,6 +2729,10 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_staging_cleanup_pending"));
     EXPECT_TRUE(json.contains("tent_rpc_attempts_total"));
     EXPECT_TRUE(json.contains("tent_rpc_retries_total"));
+    EXPECT_TRUE(json.contains("tent_rpc_server_requests_total"));
+    EXPECT_TRUE(json.contains("tent_rpc_server_bytes_total"));
+    EXPECT_TRUE(json.contains("tent_rpc_server_responses_total"));
+    EXPECT_TRUE(json.contains("tent_rpc_server_latency_us"));
     EXPECT_TRUE(json.contains("tent_rpc_attempt_latency_us"));
     EXPECT_TRUE(json.contains("tent_rdma_slice_events_total"));
     EXPECT_TRUE(json.contains("tent_rdma_retries_total"));

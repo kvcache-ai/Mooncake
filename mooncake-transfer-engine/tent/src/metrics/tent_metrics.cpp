@@ -383,6 +383,18 @@ const char* rpcOutcomeName(TentMetrics::RpcOutcome outcome) {
     return "unknown";
 }
 
+const char* rpcServerOutcomeName(TentMetrics::RpcServerOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::RpcServerOutcome::Success:
+            return "success";
+        case TentMetrics::RpcServerOutcome::HandlerError:
+            return "handler_error";
+        case TentMetrics::RpcServerOutcome::WriteError:
+            return "write_error";
+    }
+    return "unknown";
+}
+
 const char* rdmaSliceEventName(TentMetrics::RdmaSliceEvent event) {
     switch (event) {
         case TentMetrics::RdmaSliceEvent::Enqueued:
@@ -1089,6 +1101,9 @@ void TentMetrics::registerMetrics() {
         &staging_cleanup_timeouts_total_,
         &rpc_attempts_total_,
         &rpc_retries_total_,
+        &rpc_server_requests_total_,
+        &rpc_server_bytes_total_,
+        &rpc_server_responses_total_,
         &rdma_slice_events_total_,
         &rdma_retries_total_,
         &rdma_retry_exhausted_total_,
@@ -1371,6 +1386,48 @@ void TentMetrics::recordRpcRetry(RpcMethod method) {
     rpc_retries_total_.incCached(static_cast<size_t>(method), [method] {
         return std::array<std::string, 1>{rpcMethodName(method)};
     });
+}
+
+void TentMetrics::recordRpcServerRequest(RpcMethod method,
+                                         size_t request_bytes) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    rpc_server_requests_total_.incCached(static_cast<size_t>(method), [method] {
+        return std::array<std::string, 1>{rpcMethodName(method)};
+    });
+    rpc_server_bytes_total_.incCached(
+        rpcServerByteSlot(method, false),
+        [method] {
+            return std::array<std::string, 2>{rpcMethodName(method), "request"};
+        },
+        static_cast<int64_t>(request_bytes));
+}
+
+void TentMetrics::recordRpcServerResponse(RpcMethod method,
+                                          RpcServerOutcome outcome,
+                                          size_t response_bytes,
+                                          double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const size_t slot = rpcServerResponseSlot(method, outcome);
+    auto outcome_labels = [method, outcome] {
+        return std::array<std::string, 2>{rpcMethodName(method),
+                                          rpcServerOutcomeName(outcome)};
+    };
+    rpc_server_responses_total_.incCached(slot, outcome_labels);
+    if (outcome == RpcServerOutcome::Success) {
+        rpc_server_bytes_total_.incCached(
+            rpcServerByteSlot(method, true),
+            [method] {
+                return std::array<std::string, 2>{rpcMethodName(method),
+                                                  "response"};
+            },
+            static_cast<int64_t>(response_bytes));
+    }
+    if (latency_us >= 0.0) {
+        rpc_server_latency_.observeCached(slot, outcome_labels,
+                                          static_cast<int64_t>(latency_us));
+    }
 }
 
 void TentMetrics::recordRdmaSliceEvent(Request::OpCode operation,
@@ -1971,6 +2028,7 @@ bool TentMetrics::tryGetPrometheusMetrics(bool open_metrics,
             serializeHistogramPrometheus(transport_attempt_outcome_latency_,
                                          output);
             serializeHistogramPrometheus(rpc_attempt_latency_, output);
+            serializeHistogramPrometheus(rpc_server_latency_, output);
             serializeHistogramPrometheus(rdma_completion_latency_, output);
             serializeHistogramPrometheus(stream_attempt_latency_, output);
             serializeHistogramPrometheus(stream_queue_wait_, output);
@@ -2404,6 +2462,12 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&rpc_attempts_total_);
             root[rpc_retries_total_.str_name()] =
                 sumCounterValues(&rpc_retries_total_);
+            root[rpc_server_requests_total_.str_name()] =
+                sumCounterValues(&rpc_server_requests_total_);
+            root[rpc_server_bytes_total_.str_name()] =
+                sumCounterValues(&rpc_server_bytes_total_);
+            root[rpc_server_responses_total_.str_name()] =
+                sumCounterValues(&rpc_server_responses_total_);
             root[rdma_slice_events_total_.str_name()] =
                 sumCounterValues(&rdma_slice_events_total_);
             root[rdma_retries_total_.str_name()] =
@@ -2513,6 +2577,7 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             serializeHistogramToJson(root, logical_request_outcome_latency_);
             serializeHistogramToJson(root, transport_attempt_outcome_latency_);
             serializeHistogramToJson(root, rpc_attempt_latency_);
+            serializeHistogramToJson(root, rpc_server_latency_);
             serializeHistogramToJson(root, rdma_completion_latency_);
             serializeHistogramToJson(root, stream_attempt_latency_);
             serializeHistogramToJson(root, stream_queue_wait_);
@@ -2663,6 +2728,9 @@ void TentMetrics::recordStagingCleanupPending(StagingCleanupKind, int64_t) {}
 void TentMetrics::recordStagingCleanupTimeout() {}
 void TentMetrics::recordRpcAttempt(RpcMethod, RpcOutcome, double) {}
 void TentMetrics::recordRpcRetry(RpcMethod) {}
+void TentMetrics::recordRpcServerRequest(RpcMethod, size_t) {}
+void TentMetrics::recordRpcServerResponse(RpcMethod, RpcServerOutcome, size_t,
+                                          double) {}
 void TentMetrics::recordRdmaSliceEvent(Request::OpCode, RdmaSliceEvent,
                                        int64_t) {}
 void TentMetrics::recordRdmaRetry(Request::OpCode, RdmaRetryCause) {}

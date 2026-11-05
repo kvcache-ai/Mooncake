@@ -116,6 +116,13 @@ void recordRpcAttempt(TentMetrics::RpcMethod method,
             .count();
     TentMetrics::instance().recordRpcAttempt(method, outcome, latency_us);
 }
+
+double rpcServerLatencyUs(
+    std::chrono::steady_clock::time_point request_started) {
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - request_started)
+        .count();
+}
 #endif
 }  // namespace
 
@@ -265,25 +272,51 @@ Lazy<void> CoroRpcAgent::process(int func_id) {
     }
 
     auto request = ctx->get_request_attachment();
+#if TENT_METRICS_ENABLED
+    const auto metric_method = rpcMethodForFuncId(func_id);
+    const auto request_started = std::chrono::steady_clock::now();
+    TentMetrics::instance().recordRpcServerRequest(metric_method,
+                                                   request.size());
+#endif
     std::string response;
-    if (handler.offload) {
-        // Suspends this coroutine, freeing the io_context thread. The request
-        // buffer belongs to the context_info this coroutine keeps alive, so
-        // the view survives the hop. tl_inside_rpc_handler is deliberately
-        // not set: it guards against deadlocking the RPC thread, which an
-        // offloaded handler no longer occupies.
-        //
-        // post() reports a throwing handler through the Try instead of
-        // unwinding, so rethrow here: the router turns that into the same
-        // rpc_throw_exception an inline handler would produce. Dropping it
-        // would answer a malformed request with an empty success.
-        auto result =
-            co_await coro_io::post([&] { handler.func(request, response); });
-        result.value();
-    } else {
-        RpcHandlerScope handler_scope(tl_inside_rpc_handler);
-        handler.func(request, response);
+    try {
+        if (handler.offload) {
+            // Suspends this coroutine, freeing the io_context thread. The
+            // request buffer belongs to the context_info this coroutine keeps
+            // alive, so the view survives the hop. tl_inside_rpc_handler is
+            // deliberately not set: it guards against deadlocking the RPC
+            // thread, which an offloaded handler no longer occupies.
+            //
+            // post() reports a throwing handler through the Try instead of
+            // unwinding, so rethrow here: the router turns that into the same
+            // rpc_throw_exception an inline handler would produce. Dropping
+            // it would answer a malformed request with an empty success.
+            auto result = co_await coro_io::post(
+                [&] { handler.func(request, response); });
+            result.value();
+        } else {
+            RpcHandlerScope handler_scope(tl_inside_rpc_handler);
+            handler.func(request, response);
+        }
+    } catch (...) {
+#if TENT_METRICS_ENABLED
+        TentMetrics::instance().recordRpcServerResponse(
+            metric_method, TentMetrics::RpcServerOutcome::HandlerError, 0,
+            rpcServerLatencyUs(request_started));
+#endif
+        throw;
     }
+#if TENT_METRICS_ENABLED
+    const size_t response_bytes = response.size();
+    ctx->set_complete_handler([metric_method, response_bytes, request_started](
+                                  const std::error_code& error, size_t) {
+        TentMetrics::instance().recordRpcServerResponse(
+            metric_method,
+            error ? TentMetrics::RpcServerOutcome::WriteError
+                  : TentMetrics::RpcServerOutcome::Success,
+            response_bytes, rpcServerLatencyUs(request_started));
+    });
+#endif
     ctx->set_response_attachment(std::move(response));
 }
 
