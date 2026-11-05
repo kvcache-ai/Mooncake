@@ -244,7 +244,8 @@ class FileStorageTest : public ::testing::Test {
         fs::create_directories(config.storage_filepath);
         FileStorage storage(config, client, endpoint);
         BucketBackendConfig bucket_config;
-        bucket_config.bucket_keys_limit = keys.size();
+        // The managed payload streams separately from the generic bucket.
+        bucket_config.bucket_keys_limit = keys.size() - 1;
         bucket_config.max_total_size = 1024 * 1024;
         bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
         if (!file_per_key) {
