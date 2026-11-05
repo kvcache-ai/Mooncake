@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <glog/logging.h>
 #include <numa.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -23,6 +24,21 @@
 #include "utils.h"
 
 namespace mooncake::v2 {
+
+tl::expected<void, ErrorCode> ValidateAllocatorCapacity(uint32_t init_capacity,
+                                                        uint32_t max_capacity) {
+    if (init_capacity == 0 || max_capacity < 2 ||
+        init_capacity > max_capacity ||
+        max_capacity == std::numeric_limits<uint32_t>::max()) {
+        LOG(ERROR)
+            << "Allocator node capacities must satisfy 1 <= init <= max, "
+               "2 <= max < UINT32_MAX; got init="
+            << init_capacity << ", max=" << max_capacity;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
+}
+
 namespace {
 
 constexpr const char* kWildcardLocation = "*";
@@ -322,6 +338,9 @@ class DramBlockPoolState final : public BlockPoolState {
 
     tl::expected<std::unique_ptr<DramArena>, ErrorCode> CreateArena(
         const DramArenaConfig& config) {
+        auto valid = ValidateAllocatorCapacity(config.allocator_init_capacity,
+                                               config.allocator_max_capacity);
+        if (!valid) return tl::make_unexpected(valid.error());
         if (config.capacity_bytes == 0) {
             LOG(ERROR) << "DRAM arena capacity must be greater than zero";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -372,9 +391,17 @@ class DramBlockPoolState final : public BlockPoolState {
                 memory, [](char* p) { delete[] p; });
         }
 
-        arena->allocator = offset_allocator::OffsetAllocator::create(
-            reinterpret_cast<uint64_t>(arena->memory.get()),
-            config.capacity_bytes);
+        try {
+            arena->allocator = offset_allocator::OffsetAllocator::create(
+                reinterpret_cast<uint64_t>(arena->memory.get()),
+                config.capacity_bytes, config.allocator_init_capacity,
+                config.allocator_max_capacity);
+        } catch (const std::bad_alloc&) {
+            LOG(ERROR)
+                << "Failed to reserve DRAM allocator metadata, max_nodes="
+                << config.allocator_max_capacity;
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
         if (!arena->allocator) {
             LOG(ERROR) << "Failed to create the offset allocator for a DRAM "
                           "arena";
@@ -703,6 +730,9 @@ class SSDBlockPoolState final : public BlockPoolState {
 
     tl::expected<std::unique_ptr<SSDDevice>, ErrorCode> CreateDevice(
         const SSDDeviceConfig& config) {
+        auto valid = ValidateAllocatorCapacity(config.allocator_init_capacity,
+                                               config.allocator_max_capacity);
+        if (!valid) return tl::make_unexpected(valid.error());
         if (config.capacity_bytes == 0) {
             LOG(ERROR) << "SSD device capacity must be greater than zero";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -740,6 +770,25 @@ class SSDBlockPoolState final : public BlockPoolState {
                        << std::strerror(errno);
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
+        // Different names can still be hardlinks/symlinks to the same file.
+        // Check identity before resizing: two base-zero allocators must never
+        // manage overlapping extents, including for direct C++ pool callers.
+        struct stat identity;
+        if (::fstat(device->fd, &identity) != 0) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        for (const auto& existing : devices_) {
+            struct stat other;
+            if (::fstat(existing->fd, &other) != 0) {
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            if (identity.st_dev == other.st_dev &&
+                identity.st_ino == other.st_ino) {
+                LOG(ERROR) << "SSD devices must use independent files: "
+                           << config.file_path;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
         // Size the file up front so an allocation never fails mid-write on a
         // full filesystem, and so the extent allocator's offsets are always
         // inside the file. Stale bytes from a previous run are harmless: the
@@ -752,8 +801,16 @@ class SSDBlockPoolState final : public BlockPoolState {
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
 
-        device->allocator = offset_allocator::OffsetAllocator::create(
-            /*base=*/0, config.capacity_bytes);
+        try {
+            device->allocator = offset_allocator::OffsetAllocator::create(
+                /*base=*/0, config.capacity_bytes,
+                config.allocator_init_capacity, config.allocator_max_capacity);
+        } catch (const std::bad_alloc&) {
+            LOG(ERROR) << "Failed to reserve SSD allocator metadata for "
+                       << config.file_path
+                       << ", max_nodes=" << config.allocator_max_capacity;
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
         if (!device->allocator) {
             LOG(ERROR) << "Failed to create the extent allocator for "
                        << config.file_path;
@@ -762,7 +819,11 @@ class SSDBlockPoolState final : public BlockPoolState {
         LOG(INFO) << "SSD device ready: " << config.file_path
                   << ", capacity=" << config.capacity_bytes
                   << ", alignment=" << config.alignment
-                  << ", fsync_on_commit=" << config.fsync_on_commit;
+                  << ", fsync_on_commit=" << config.fsync_on_commit
+                  << ", allocator_init_capacity="
+                  << config.allocator_init_capacity
+                  << ", allocator_max_capacity="
+                  << config.allocator_max_capacity;
         return device;
     }
 

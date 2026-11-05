@@ -1165,6 +1165,117 @@ TEST_F(MigrationSchedulerTest, EachItemInABatchGetsItsOwnOutcome) {
     EXPECT_TRUE(slow_->Match(*registration).has_value());
 }
 
+TEST_F(MigrationSchedulerTest,
+       RetriesOnlyFailedItemsWithoutReplayingSuccesses) {
+    MigrationSchedulerConfig scheduler;
+    scheduler.retry_limit = 1;
+    scheduler.retry_backoff = std::chrono::milliseconds(0);
+    Rebuild(scheduler);
+    std::vector<MovementRequest> batch;
+    for (const std::string key : {"retry/ok", "retry/transient"}) {
+        auto block = Commit(*fast_, key, Pattern(kBlockSize, 0x51));
+        auto registration = registry_.Match(key);
+        ASSERT_TRUE(registration.has_value());
+        batch.push_back(MakeRequest(MovementKind::kReplicate, key,
+                                    *registration, block.Id(), fast_, slow_));
+    }
+    on_allocate_ = [&] {
+        if (allocations_.size() == 2) {
+            allocate_failure_ = ErrorCode::NO_AVAILABLE_HANDLE;
+        } else {
+            allocate_failure_.reset();
+        }
+    };
+    const auto results = engine_->ExecuteBatch(batch);
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_TRUE(results[0].has_value());
+    EXPECT_TRUE(results[1].has_value());
+    EXPECT_EQ(allocations_.size(), 3u);
+    EXPECT_EQ(added_.size(), 2u);
+    EXPECT_EQ(engine_->Stats().retries, 1u);
+    EXPECT_EQ(engine_->Stats().succeeded, 2u);
+}
+
+TEST_F(MigrationSchedulerTest, RetryLimitAppliesOnlyToTransientErrors) {
+    auto block = Commit(*fast_, "retry/limit", Pattern(kBlockSize, 0x51));
+    auto registration = registry_.Match("retry/limit");
+    ASSERT_TRUE(registration.has_value());
+    auto request = MakeRequest(MovementKind::kReplicate, "retry/limit",
+                               *registration, block.Id(), fast_, slow_);
+    for (uint32_t limit : {0u, 2u}) {
+        for (ErrorCode error :
+             {ErrorCode::NO_AVAILABLE_HANDLE, ErrorCode::TRANSFER_FAIL,
+              ErrorCode::RPC_FAIL, ErrorCode::INVALID_PARAMS,
+              ErrorCode::FILE_READ_FAIL}) {
+            MigrationSchedulerConfig scheduler;
+            scheduler.retry_limit = limit;
+            scheduler.retry_backoff = std::chrono::milliseconds(0);
+            Rebuild(scheduler);
+            allocations_.clear();
+            allocate_failure_ = error;
+            const auto results = engine_->ExecuteBatch({request});
+            ASSERT_EQ(results.size(), 1u);
+            ASSERT_FALSE(results[0].has_value());
+            EXPECT_EQ(results[0].error(), error);
+            const bool transient = error == ErrorCode::NO_AVAILABLE_HANDLE ||
+                                   error == ErrorCode::TRANSFER_FAIL ||
+                                   error == ErrorCode::RPC_FAIL;
+            EXPECT_EQ(allocations_.size(), transient ? 1u + limit : 1u);
+            EXPECT_EQ(engine_->Stats().retries, transient ? limit : 0u);
+        }
+    }
+    EXPECT_FALSE(slow_->Match(*registration).has_value());
+    EXPECT_TRUE(fast_->Match(*registration).has_value());
+}
+
+TEST_F(MigrationSchedulerTest, ExpiredCommandsAreNotRetried) {
+    MigrationSchedulerConfig scheduler;
+    scheduler.retry_backoff = std::chrono::milliseconds(0);
+    Rebuild(scheduler);
+    auto block = Commit(*fast_, "retry/expired", Pattern(kBlockSize, 0x51));
+    auto registration = registry_.Match("retry/expired");
+    ASSERT_TRUE(registration.has_value());
+    auto request = MakeRequest(MovementKind::kReplicate, "retry/expired",
+                               *registration, block.Id(), fast_, slow_);
+    request.deadline = clock_->Now() + std::chrono::milliseconds(10);
+    allocate_failure_ = ErrorCode::NO_AVAILABLE_HANDLE;
+    on_allocate_ = [&] { clock_->Advance(std::chrono::milliseconds(20)); };
+    auto results = engine_->ExecuteBatch({request});
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(allocations_.size(), 1u);
+    EXPECT_EQ(engine_->Stats().retries, 0u);
+}
+
+TEST_F(MigrationSchedulerTest, StopInterruptsRetryBackoffAndSettlesLease) {
+    MigrationSchedulerConfig scheduler;
+    scheduler.max_batch_items = 1;
+    scheduler.retry_backoff = std::chrono::hours(1);
+    Rebuild(scheduler);
+    auto block = Commit(*fast_, "retry/stop", Pattern(kBlockSize, 0x51));
+    auto registration = registry_.Match("retry/stop");
+    ASSERT_TRUE(registration.has_value());
+    auto request = MakeRequest(MovementKind::kReplicate, "retry/stop",
+                               *registration, block.Id(), fast_, slow_);
+    request.route.kind = request.kind;
+    request.route.source_tiler = fast_->Id();
+    request.route.destination_tiler = slow_->Id();
+    allocate_failure_ = ErrorCode::NO_AVAILABLE_HANDLE;
+    std::promise<void> entered;
+    auto allocated = entered.get_future();
+    on_allocate_ = [&] { entered.set_value(); };
+    ASSERT_TRUE(Submit(std::move(request)));
+    auto worker =
+        std::async(std::launch::async, [&] { return engine_->RunOnce(); });
+    const auto state = allocated.wait_for(std::chrono::seconds(2));
+    engine_->Stop();
+    EXPECT_EQ(state, std::future_status::ready);
+    ASSERT_EQ(worker.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(worker.get(), 1u);
+    EXPECT_EQ(engine_->Stats().retries, 0u);
+    EXPECT_EQ(tracker_->Stats().inflight, 0u);
+}
+
 // Route labels are a metric dimension, so their cardinality has to be bounded
 // by the topology rather than by the workload.
 TEST_F(MigrationSchedulerTest, RouteStatsAreLabelledByRouteNotByKey) {

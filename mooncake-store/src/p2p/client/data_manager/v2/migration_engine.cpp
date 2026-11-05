@@ -238,6 +238,49 @@ std::vector<tl::expected<void, ErrorCode>> MigrationEngine::ExecuteBatch(
         // because another failed would undo work that is already correct.
         results.push_back(Execute(request));
     }
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        for (uint32_t retry = 0; !results[i] && retry < scheduler_.retry_limit;
+             ++retry) {
+            const ErrorCode error = results[i].error();
+            // No retry for stale identities, invalid configuration or file
+            // errors. The source and registration are revalidated by Execute
+            // on every retry, and previously successful batch items stay put.
+            if (error != ErrorCode::NO_AVAILABLE_HANDLE &&
+                error != ErrorCode::TRANSFER_FAIL &&
+                error != ErrorCode::RPC_FAIL) {
+                break;
+            }
+            auto backoff = scheduler_.retry_backoff;
+            if (request.deadline.has_value()) {
+                const auto now = clock_->Now();
+                if (now >= *request.deadline) break;
+                backoff = std::min(
+                    backoff,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        *request.deadline - now));
+            }
+            {
+                std::unique_lock<std::mutex> lock(queue_mu_);
+                if (stopped_) break;
+                // Stop wakes the backoff immediately instead of waiting for
+                // an operator-configured interval to elapse during shutdown.
+                if (queue_cv_.wait_for(lock, backoff,
+                                       [this] { return stopped_; })) {
+                    break;
+                }
+            }
+            if (request.deadline.has_value() &&
+                clock_->Now() >= *request.deadline) {
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lock(stats_mu_);
+                ++stats_.retries;
+            }
+            results[i] = Execute(request);
+        }
+    }
     return results;
 }
 
@@ -476,6 +519,10 @@ tl::expected<void, ErrorCode> ValidateMigrationSchedulerConfig(
     if (config.max_inflight_per_route == 0 ||
         config.max_inflight_per_device == 0) {
         LOG(ERROR) << "migration inflight quotas must be greater than zero";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.retry_backoff < std::chrono::milliseconds::zero()) {
+        LOG(ERROR) << "migration.retry_backoff_ms must not be negative";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
