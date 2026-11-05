@@ -344,8 +344,9 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
     storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
     if (!storage_plugin_) {
         throw std::invalid_argument(
-            "Unable to create metadata storage plugin: unsupported or disabled "
-            "backend");
+            "Unable to create metadata storage plugin for backend '" +
+            protocol + "' with conn string '" + conn_string +
+            "': unsupported or disabled backend");
     }
     startMetadataRefreshPollingIfNeeded();
 }

@@ -563,11 +563,15 @@ class TestTransferEngineInitialization(unittest.TestCase):
         # Fatal native regressions must not kill the test runner.
         code = textwrap.dedent("""
             import json
-            import resource
             import sys
             from mooncake.engine import TransferEngine
 
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            try:
+                import resource
+            except ImportError:
+                pass  # Core dump limits are optional on non-POSIX platforms.
+            else:
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             engine = TransferEngine()
             results = [engine.initialize("127.0.0.1", connection, "tcp", "")
                        for connection in sys.argv[1:]]

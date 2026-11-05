@@ -1429,7 +1429,17 @@ int rejectUnavailablePlugin(const std::string &connection) {
     try {
         TransferMetadata metadata(connection);
         return 2;
-    } catch (const std::invalid_argument &) {
+    } catch (const std::invalid_argument &e) {
+        const std::string error = e.what();
+        if (error.find("with conn string '" + connection + "'") ==
+            std::string::npos)
+            return 6;
+        if (connection == "127.0.0.1:1" &&
+            error.find("backend 'etcd'") == std::string::npos)
+            return 7;
+        if (connection == "unsupported://127.0.0.1:1" &&
+            error.find("backend 'unsupported'") == std::string::npos)
+            return 8;
     }
 
     TransferEngine engine(false);
