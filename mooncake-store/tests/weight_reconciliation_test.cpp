@@ -64,7 +64,9 @@ class WeightReconciliationTest : public MasterServiceTest {
             .affinity_summary =
                 WeightAffinitySummary{
                     .affinity_count = 1,
-                    .affinity_digest = std::string(64, 'c'),
+                    .affinity_digest = ComputeWeightAffinityMappingSha256(
+                        {{identity.revision + "-payload", 1024,
+                          "affinity-" + identity.revision}}),
                 },
         });
         EXPECT_TRUE(importing.has_value());
@@ -191,7 +193,9 @@ class WeightReconciliationTest : public MasterServiceTest {
                 .affinity_summary =
                     WeightAffinitySummary{
                         .affinity_count = 2,
-                        .affinity_digest = std::string(64, 'c'),
+                        .affinity_digest = ComputeWeightAffinityMappingSha256(
+                            {{"payload-a", 1024, "affinity-payload-a"},
+                             {"payload-b", 1024, "affinity-payload-b"}}),
                     },
             });
         ASSERT_TRUE(importing.has_value());
@@ -813,10 +817,10 @@ TEST_F(WeightReconciliationTest,
 
 TEST_F(WeightReconciliationTest,
        PublicCompletedMigrationMemberLossStillUpdatesAvailability) {
-    CheckPublicPayloadLoss(1, true, WeightResidencyState::HOT, 1.0, true);
+    CheckPublicPayloadLoss(1, true, WeightResidencyState::MIXED, 0.5, true);
 }
 TEST_F(WeightReconciliationTest, PublicPayloadLossRetainsPartialHotCoverage) {
-    CheckPublicPayloadLoss(1, false, WeightResidencyState::HOT, 1.0);
+    CheckPublicPayloadLoss(1, false, WeightResidencyState::MIXED, 0.5);
 }
 
 TEST_F(WeightReconciliationTest, PublicPayloadLossRetainsColdResidency) {

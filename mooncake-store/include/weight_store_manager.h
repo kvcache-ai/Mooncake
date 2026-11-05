@@ -126,7 +126,8 @@ class WeightStoreManager {
         const WeightRevisionIdentity& identity);
     WeightMetadataStore::Result<void> ValidateWeightGroupForCommit(
         const CommitWeightImportRequest& request,
-        uint64_t expected_affinity_count) const;
+        uint64_t expected_affinity_count,
+        const std::string& expected_affinity_digest) const;
 
     WeightStoreBackend& backend_;
     std::shared_ptr<ImportActivity> FindImportActivity(
