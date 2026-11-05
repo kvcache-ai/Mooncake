@@ -3457,8 +3457,8 @@ PYBIND11_MODULE(_store, m) {
             py::arg("key"))
         .def(
             "batch_get_replica_desc",
-            [](MooncakeStorePyWrapper& self,
-               const std::vector<std::string>& keys) {
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
                 std::map<std::string, std::vector<Replica::Descriptor>>
                     replica_map;
                 {
@@ -3466,7 +3466,7 @@ PYBIND11_MODULE(_store, m) {
                     replica_map = self.store_->batch_get_replica_desc(keys);
                 }
                 py::dict decoded;
-                for (const auto& entry : replica_map) {
+                for (const auto &entry : replica_map) {
                     decoded[StoreKeyToPy(entry.first)] = entry.second;
                 }
                 return decoded;
