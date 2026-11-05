@@ -330,6 +330,9 @@ class FileStorage {
     // transfer engine; nullptr keeps BatchGet on the copy path.
     std::atomic<void*> zero_copy_base_{nullptr};
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
+    // which the destructor must unregister before the buffer is freed.
+    bool uring_buffer_registered_ = false;
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;

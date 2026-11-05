@@ -105,6 +105,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
             void* base_ptr = aligned_allocator->get_base_pointer();
             size_t size = aligned_allocator->get_total_size();
             if (UringFile::register_global_buffer(base_ptr, size)) {
+                uring_buffer_registered_ = true;
                 LOG(INFO) << "Successfully registered buffer with UringFile: "
                           << "base=" << base_ptr << ", size=" << size;
             } else {
@@ -125,6 +126,8 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    // A metadata rescan can still be reading through the storage backend.
+    if (rescan_future_.valid()) rescan_future_.wait();
     // Deregister before storage_backend_ unmaps the region.
     void* base = zero_copy_base_.exchange(nullptr);
     if (base && client_) {
@@ -134,6 +137,14 @@ FileStorage::~FileStorage() {
                          << res.error();
         }
     }
+#ifdef USE_URING
+    // client_buffer_allocator_ frees the staging buffer after this body, so
+    // unpin it here: the source registration and every I/O thread's clone of
+    // it would otherwise keep the freed pages pinned for the process lifetime.
+    // The owner stops issuing I/O through this FileStorage before destroying
+    // it.
+    if (uring_buffer_registered_) UringFile::unregister_global_buffer();
+#endif
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {

@@ -2670,6 +2670,7 @@ void Client::healDanglingLocalDiskBatchStarts(
     }
     const auto retry_config =
         config.group_ids || config.session_ids ||
+                config.residency_affinity_ids ||
                 config.per_key_preferred_hca_names
             ? std::make_optional(config.ForKeySubset(retry_config_indices))
             : std::nullopt;
@@ -2745,6 +2746,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             AttachBatchHcaAffinity(base_config, ops, active_indices);
     } else if (active_indices.size() != ops.size() &&
                (base_config.group_ids || base_config.session_ids ||
+                base_config.residency_affinity_ids ||
                 base_config.per_key_preferred_hca_names)) {
         active_config = base_config.ForKeySubset(active_indices);
     }
@@ -2854,6 +2856,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
             AttachBatchHcaAffinity(base_config, ops, active_indices);
     } else if (active_indices.size() != ops.size() &&
                (base_config.group_ids || base_config.session_ids ||
+                base_config.residency_affinity_ids ||
                 base_config.per_key_preferred_hca_names)) {
         active_config = base_config.ForKeySubset(active_indices);
     }

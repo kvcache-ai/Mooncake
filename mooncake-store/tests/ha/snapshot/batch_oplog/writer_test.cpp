@@ -703,6 +703,104 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
     std::unique_ptr<HotStandbyService> standby_;
 };
 
+TEST_F(BatchOpLogSnapshotWriterTest,
+       PublicWriteAffinitySurvivesCompactedSnapshotPromotion) {
+    backend_ = std::make_shared<FakeHaKvBackend>();
+    MasterService primary(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(kClusterId)
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK,
+              MasterServiceTestPeer(primary).SetBatchOpLogBackendForTesting(
+                  backend_));
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "snapshot-affinity-segment";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x100000000ULL;
+    segment.size = 16 * 1024 * 1024;
+    const UUID client_id = generate_uuid();
+    const auto tenant = TenantId::Default();
+    const std::string key = "snapshot-affinity-key";
+    ASSERT_TRUE(primary.MountSegment(segment, client_id));
+    ReplicateConfig replicate;
+    replicate.residency_affinity_ids = std::vector<std::string>{"opaque-unit"};
+    replicate.session_ids = std::vector<std::string>{"write-session"};
+    ASSERT_TRUE(primary.PutStart(client_id, key, tenant, 1024, replicate));
+    ASSERT_TRUE(primary.PutEnd(client_id, ObjectMeta{key, 0x1234}, tenant,
+                               ReplicaType::MEMORY));
+    auto promise = std::make_shared<std::promise<ErrorCode>>();
+    auto future = promise->get_future();
+    MasterServiceTestPeer::OrderedOplogWriter(primary)
+        ->AwaitDurable(2)
+        .thenValue([promise](ErrorCode error) { promise->set_value(error); });
+    ASSERT_EQ(std::future_status::ready,
+              future.wait_for(std::chrono::seconds(5)));
+    ASSERT_EQ(ErrorCode::OK, future.get());
+    OpLogBatchStorage storage(kClusterId, *backend_);
+    DurablePrefix cursor;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(cursor));
+    ASSERT_EQ(2u, cursor.last_seq);
+
+    HotStandbyConfig config;
+    config.enable_oplog_following = true;
+    config.enable_verification = false;
+    config.oplog_poll_interval_ms = 1;
+    standby_ = std::make_unique<HotStandbyService>(config);
+    standby_->SetCatchUpBatchKvBackendForTesting(backend_);
+    ASSERT_EQ(ErrorCode::OK, standby_->Start("", "", kClusterId));
+    auto capture = standby_->BeginBatchOpLogSnapshotCapture();
+    ASSERT_TRUE(capture);
+    ASSERT_EQ(cursor.last_seq, capture->last_included_seq);
+    FakeObjectStore object_store;
+    BatchOpLogSnapshotWriter writer(object_store);
+    auto descriptor = writer.Write(
+        *standby_, *capture, "snapshots",
+        std::to_string(capture->last_included_batch_id) + "-43", 2, 1234);
+    ASSERT_TRUE(descriptor) << descriptor.error();
+    standby_->Stop();
+
+    auto compacted = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              compacted->Put(ha::BuildBatchOpLogSnapshotLatestKey(kClusterId),
+                             *descriptor));
+    ASSERT_EQ(ErrorCode::OK,
+              compacted->Put(
+                  ha::BuildBatchOpLogSnapshotCompactionFloorKey(kClusterId),
+                  std::to_string(cursor.batch_id)));
+    ASSERT_EQ(ErrorCode::OK, compacted->Put(BuildDurablePrefixKey(kClusterId),
+                                            EncodeDurablePrefix(cursor)));
+    std::string missing;
+    ASSERT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              compacted->Get(BuildBatchRecordKey(kClusterId, cursor.batch_id),
+                             missing));
+    const auto downloads_before = object_store.download_attempts;
+    auto recovered = Bootstrap(compacted, object_store);
+    EXPECT_GT(object_store.download_attempts, downloads_before);
+    auto handoff = recovered->PromoteAndDetachBatchOpLogStore();
+    ASSERT_TRUE(handoff) << toString(handoff.error());
+    EXPECT_EQ(cursor, handoff->applied_cursor);
+    MasterService restored;
+    ASSERT_TRUE(restored.RestoreFromBatchOpLogPromotion(std::move(*handoff)));
+    auto before_remount = restored.GetReplicaList(key, tenant);
+    ASSERT_FALSE(before_remount);
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, before_remount.error());
+    ASSERT_TRUE(restored.ReMountSegment({segment}, client_id));
+    auto query = restored.GetReplicaList(key, tenant);
+    ASSERT_TRUE(query) << toString(query.error());
+    ASSERT_EQ(1u, query->replicas.size());
+    EXPECT_EQ(std::optional<uint64_t>(0x1234), query->object_checksum);
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &restored, MasterServiceTestPeer::ObjectIdentity{tenant, key});
+    ASSERT_TRUE(accessor.Exists());
+    EXPECT_EQ("opaque-unit", accessor.Get().residency_affinity_id);
+    EXPECT_EQ("write-session", accessor.Get().session_id);
+    EXPECT_EQ(tenant, accessor.Get().tenant_id);
+    EXPECT_EQ(key, accessor.Get().user_key);
+}
+
 TEST_F(BatchOpLogSnapshotWriterTest, WritesAndVerifiesMultipleChunks) {
     auto capture = StartCapture(3);
     ASSERT_TRUE(capture);
