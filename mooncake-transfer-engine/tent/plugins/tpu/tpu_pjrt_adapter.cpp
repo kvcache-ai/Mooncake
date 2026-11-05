@@ -48,10 +48,12 @@ const mc_tpu_buffer_provider_t *getBoundProvider() {
     return g_provider;
 }
 
-// Checks that every required function pointer in the table is set.
+// Checks that every required function pointer in the table is set, and that
+// the optional DMA mapping pair is either both set or both null.
 bool tableIsComplete(const mc_tpu_buffer_provider_t &t) {
     return t.size && t.device_index && t.numa_node && t.copy_to_host &&
-           t.copy_from_host && t.release;
+           t.copy_from_host && t.release &&
+           (static_cast<bool>(t.dma_map) == static_cast<bool>(t.dma_unmap));
 }
 
 // A registry region backed by one provider handle. Owns the handle.
@@ -141,6 +143,12 @@ int mc_tpu_adapter_load_provider(const char *path) {
         return 1;
     }
     if (!table.name) table.name = "unnamed provider";
+    if (!table.dma_map) {
+        tpuAdapterLog(std::string(table.name) +
+                      " does not provide dma_map/dma_unmap, so TENT's host "
+                      "staging buffers are not DMA-mapped and TPU copies are "
+                      "slower");
+    }
     g_provider_table = table;
     g_provider = &g_provider_table;
     g_provider_path = path;
@@ -223,6 +231,26 @@ int mc_tpu_pjrt_device_count(void) {
 
 int mc_tpu_pjrt_device_numa(int index) {
     return TpuSyntheticAddrRegistry::instance().deviceNuma(index);
+}
+
+int mc_tpu_pjrt_dma_map(void *host, size_t len) {
+    const mc_tpu_buffer_provider_t *provider =
+        mooncake::tent::getBoundProvider();
+    if (!provider || !provider->dma_map) return 1;
+    if (provider->dma_map(host, len) == 0) return 0;
+    tpuAdapterLog(std::string(provider->name) + ": DMA-mapping " +
+                  std::to_string(len) + " bytes of host memory failed");
+    return 1;
+}
+
+int mc_tpu_pjrt_dma_unmap(void *host) {
+    const mc_tpu_buffer_provider_t *provider =
+        mooncake::tent::getBoundProvider();
+    if (!provider || !provider->dma_unmap) return 1;
+    if (provider->dma_unmap(host) == 0) return 0;
+    tpuAdapterLog(std::string(provider->name) +
+                  ": DMA-unmapping host memory failed");
+    return 1;
 }
 
 }  // extern "C"

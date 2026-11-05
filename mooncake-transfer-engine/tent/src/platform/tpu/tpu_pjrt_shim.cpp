@@ -89,6 +89,21 @@ void TpuPjrtShim::load() {
         return;
     }
 
+    // Optional pair: custom adapters built against the base ABI still load,
+    // using unmapped host staging pools.
+    fn_dma_map_ = reinterpret_cast<int (*)(void *, size_t)>(
+        dlsym(handle_, "mc_tpu_pjrt_dma_map"));
+    fn_dma_unmap_ = reinterpret_cast<int (*)(void *)>(
+        dlsym(handle_, "mc_tpu_pjrt_dma_unmap"));
+    if (!fn_dma_map_ || !fn_dma_unmap_) {
+        LOG(WARNING) << "TpuPjrtShim: adapter '" << lib
+                     << "' does not export both mc_tpu_pjrt_dma_map and "
+                        "mc_tpu_pjrt_dma_unmap; host staging pools will not "
+                        "be DMA-mapped.";
+        fn_dma_map_ = nullptr;
+        fn_dma_unmap_ = nullptr;
+    }
+
     if (fn_init_() != 0) {
         LOG(ERROR) << "TpuPjrtShim: mc_tpu_pjrt_init() failed; disabling TPU.";
         dlclose(handle_);
@@ -138,6 +153,28 @@ int TpuPjrtShim::deviceCount() const {
 int TpuPjrtShim::deviceNumaNode(int index) const {
     if (!available_) return -1;
     return fn_device_numa_(index);
+}
+
+Status TpuPjrtShim::dmaMap(void *host, size_t length) const {
+    if (!available_)
+        return Status::NotImplemented("TPU PJRT adapter unavailable" LOC_MARK);
+    if (!fn_dma_map_)
+        return Status::NotImplemented(
+            "TPU PJRT adapter does not support DMA mapping" LOC_MARK);
+    if (fn_dma_map_(host, length) != 0)
+        return Status::InternalError("TPU DMA mapping failed" LOC_MARK);
+    return Status::OK();
+}
+
+Status TpuPjrtShim::dmaUnmap(void *host) const {
+    if (!available_)
+        return Status::NotImplemented("TPU PJRT adapter unavailable" LOC_MARK);
+    if (!fn_dma_unmap_)
+        return Status::NotImplemented(
+            "TPU PJRT adapter does not support DMA unmapping" LOC_MARK);
+    if (fn_dma_unmap_(host) != 0)
+        return Status::InternalError("TPU DMA unmapping failed" LOC_MARK);
+    return Status::OK();
 }
 
 }  // namespace tent

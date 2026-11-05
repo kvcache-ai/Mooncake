@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "tent/common/concurrent/thread_pool.h"
@@ -71,6 +72,8 @@ struct TpuSubBatch : public Transport::SubBatch {
 // device<->host capabilities (gpu_to_dram / dram_to_gpu) and leaves gpu_to_gpu
 // false so the engine always stages cross-node traffic through host DRAM. It is
 // therefore only ever selected for LOCAL_SEGMENT_ID copies.
+//
+// It also DMA-maps TENT's host staging pools while they are registered.
 class TpuTransport : public Transport {
    public:
     TpuTransport();
@@ -118,6 +121,10 @@ class TpuTransport : public Transport {
     std::mutex lifecycle_mutex_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::atomic<bool> shutting_down_{false};
+    std::mutex dma_mutex_;
+    // Base address -> length of host staging pools DMA-mapped by this
+    // transport.
+    std::unordered_map<uint64_t, size_t> dma_mapped_;
 };
 
 }  // namespace tent

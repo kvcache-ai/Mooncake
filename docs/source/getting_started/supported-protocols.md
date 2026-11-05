@@ -561,15 +561,19 @@ planned as a follow-up.
   (see `tpu_pjrt_abi.h`). The adapter is resolved at runtime via `dlopen`; its
   path defaults to `libmooncake_tpu_pjrt.so` and can be overridden with the
   `MC_TPU_PJRT_LIB` environment variable. No PJRT/TPU SDK is required at build
-  time.
+  time. When the adapter and buffer provider (`tpu_buffer_provider.h`) expose
+  the optional `dma_map`/`dma_unmap` callbacks, TENT also DMA-maps its own host
+  staging pools (never user host memory); adapters or providers without them
+  still work, with slower HBM ↔ host copies.
 - An RDMA (or TCP) transport enabled for the host ↔ host hop.
 
 **Design notes:**
 - TPU memory is reported as a distinct memory type (`tpu:N` locations); the
   staging policy routes the local HBM ↔ host copy to the TPU device-copy
   transport and the cross-node hop to RDMA/TCP.
-- DMA-mapped (pinned) staging buffers for true async device DMA are a planned
-  performance follow-up.
+- TENT DMA-maps its own host staging pools while they are registered and unmaps
+  them on unregister or `TransferEngine` teardown; destroy the `TransferEngine`
+  before explicitly shutting down the TPU/PJRT runtime.
 
 (intel-xpu-transport)=
 ### Intel XPU Transport (xpu)

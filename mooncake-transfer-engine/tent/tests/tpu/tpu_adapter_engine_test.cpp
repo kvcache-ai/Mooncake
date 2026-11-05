@@ -151,6 +151,7 @@ class TpuAdapterEngineTest : public ::testing::TestWithParam<Params> {
     void TearDown() override {
         env().setFailCopies(false);
         env().setDeviceAlignment(0);
+        env().setFailDmaMap(false);
         // Stop staging while transports and registrations are still alive.
         for (auto* engine : {a_.get(), b_.get()}) {
             if (!engine) continue;
@@ -532,6 +533,69 @@ TEST_P(TpuAdapterEngineTest, UnregisterReleasesProviderHandles) {
     EXPECT_FALSE(env().unregister(buffer));
 
     roundTrip(tpu(*a_, kLength), peer, kLength);
+}
+
+TEST_P(TpuAdapterEngineTest, StagingPoolsAreDmaMappedWhileStaging) {
+    const int mappings = env().dmaMappingCount();
+    const int unmapped_copies = env().unmappedCopyCount();
+    // User host memory (even when page aligned) must never be DMA-mapped.
+    Side user_host = host(*a_, 4 * kChunk);
+    ASSERT_NE(user_host.addr, nullptr);
+    EXPECT_EQ(env().dmaMappingCount(), mappings);
+
+    roundTrip(tpu(*a_, kLength), tpu(*b_, kLength), kLength);
+    EXPECT_GT(env().dmaMappingCount(), mappings);
+    EXPECT_EQ(env().unmappedCopyCount(), unmapped_copies);
+
+    for (auto* engine : {a_.get(), b_.get()})
+        ASSERT_TRUE(TransferEngineImplTestPeer::stopStaging(*engine).ok());
+    EXPECT_EQ(env().dmaMappingCount(), mappings);
+}
+
+TEST_P(TpuAdapterEngineTest, StagesWhenDmaMappingFails) {
+    env().setFailDmaMap(true);
+    const int mappings = env().dmaMappingCount();
+    const int unmapped_copies = env().unmappedCopyCount();
+    roundTrip(tpu(*a_, kLength), tpu(*b_, kLength), kLength);
+    EXPECT_EQ(env().dmaMappingCount(), mappings);
+    EXPECT_GT(env().unmappedCopyCount(), unmapped_copies);
+}
+
+TEST_P(TpuAdapterEngineTest, DmaUnmapMatchesInternalBufferRange) {
+    void* addr = nullptr;
+    MemoryOptions alloc_opts;
+    alloc_opts.location = "cpu:0";
+    ASSERT_TRUE(a_->allocateLocalMemory(&addr, 2 * kChunk, alloc_opts).ok());
+    allocations_.push_back({a_.get(), addr});
+
+    const int before = env().dmaMappingCount();
+
+    // Unaligned internal registration is skipped rather than failing.
+    // allocateLocalMemory() fills alloc_opts.type with the allocator transport,
+    // so build fresh options with UNSPEC to register across all transports.
+    MemoryOptions internal_opts;
+    internal_opts.location = "cpu:0";
+    internal_opts.internal = true;
+    ASSERT_TRUE(
+        a_->registerLocalMemory({addr}, {kChunk + 3}, internal_opts).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before);
+    ASSERT_TRUE(a_->unregisterLocalMemory(addr, kChunk + 3).ok());
+
+    // Register a mapped internal range and a non-internal range at the same
+    // base address; removing the latter must not unmap the live internal range.
+    MemoryOptions user_opts;
+    user_opts.location = "cpu:0";
+    ASSERT_TRUE(
+        a_->registerLocalMemory({addr}, {2 * kChunk}, internal_opts).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before + 1);
+    ASSERT_TRUE(a_->registerLocalMemory({addr}, {kChunk}, user_opts).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before + 1);
+
+    ASSERT_TRUE(a_->unregisterLocalMemory(addr, kChunk).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before + 1);
+
+    ASSERT_TRUE(a_->unregisterLocalMemory(addr, 2 * kChunk).ok());
+    EXPECT_EQ(env().dmaMappingCount(), before);
 }
 
 INSTANTIATE_TEST_SUITE_P(

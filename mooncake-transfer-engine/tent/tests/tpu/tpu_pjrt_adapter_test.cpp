@@ -18,6 +18,7 @@
 
 #include <dlfcn.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -45,10 +46,13 @@ using UnregisterFn = int (*)(uint64_t);
 using ReleaseFn = int (*)(uint64_t);
 using InitFn = int (*)();
 using CopyD2HFn = int (*)(void *, const void *, size_t);
+using DmaMapFn = int (*)(void *, size_t);
+using DmaUnmapFn = int (*)(void *);
 
 using CreateFn = uint64_t (*)(size_t, int, int);
 using DataFn = uint8_t *(*)(uint64_t);
 using CountFn = int (*)();
+using SetFlagFn = void (*)(int);
 
 template <typename Fn>
 Fn sym(void *lib, const char *name) {
@@ -73,16 +77,30 @@ class TpuPjrtAdapterTest : public ::testing::Test {
         release_ = sym<ReleaseFn>(adapter_, "mc_tpu_adapter_release_buffer");
         init_ = sym<InitFn>(adapter_, "mc_tpu_pjrt_init");
         d2h_ = sym<CopyD2HFn>(adapter_, "mc_tpu_pjrt_copy_d2h");
+        dma_map_ = sym<DmaMapFn>(adapter_, "mc_tpu_pjrt_dma_map");
+        dma_unmap_ = sym<DmaUnmapFn>(adapter_, "mc_tpu_pjrt_dma_unmap");
         create_ = sym<CreateFn>(provider_, "mock_provider_create_buffer");
         data_ = sym<DataFn>(provider_, "mock_provider_buffer_data");
         live_ = sym<CountFn>(provider_, "mock_provider_live_count");
         released_ = sym<CountFn>(provider_, "mock_provider_released_count");
+        set_enable_dma_map_ =
+            sym<SetFlagFn>(provider_, "mock_provider_set_enable_dma_map");
+        set_fail_dma_map_ =
+            sym<SetFlagFn>(provider_, "mock_provider_set_fail_dma_map");
+        mappings_ = sym<CountFn>(provider_, "mock_provider_dma_mapping_count");
         for (void *fn :
              {(void *)load_, (void *)register_, (void *)unregister_,
-              (void *)release_, (void *)init_, (void *)d2h_, (void *)create_,
-              (void *)data_, (void *)live_, (void *)released_}) {
+              (void *)release_, (void *)init_, (void *)d2h_, (void *)dma_map_,
+              (void *)dma_unmap_, (void *)create_, (void *)data_, (void *)live_,
+              (void *)released_, (void *)set_enable_dma_map_,
+              (void *)set_fail_dma_map_, (void *)mappings_}) {
             ASSERT_NE(fn, nullptr);
         }
+    }
+
+    void TearDown() override {
+        if (set_enable_dma_map_) set_enable_dma_map_(1);
+        if (set_fail_dma_map_) set_fail_dma_map_(0);
     }
 
     struct Registered {
@@ -107,14 +125,49 @@ class TpuPjrtAdapterTest : public ::testing::Test {
     ReleaseFn release_ = nullptr;
     InitFn init_ = nullptr;
     CopyD2HFn d2h_ = nullptr;
+    DmaMapFn dma_map_ = nullptr;
+    DmaUnmapFn dma_unmap_ = nullptr;
     CreateFn create_ = nullptr;
     DataFn data_ = nullptr;
     CountFn live_ = nullptr;
     CountFn released_ = nullptr;
+    SetFlagFn set_enable_dma_map_ = nullptr;
+    SetFlagFn set_fail_dma_map_ = nullptr;
+    CountFn mappings_ = nullptr;
 };
 
 void *TpuPjrtAdapterTest::adapter_ = nullptr;
 void *TpuPjrtAdapterTest::provider_ = nullptr;
+
+// Page-aligned host memory, as TENT's staging pools are.
+struct PageBuffer {
+    const size_t size = 4 * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void *data = std::aligned_alloc(size / 4, size);
+    ~PageBuffer() { std::free(data); }
+};
+
+// A provider with null dma_map/dma_unmap still binds and copies. Binding is
+// permanent, so this runs in a child process before the parent binds the mock
+// with DMA mapping enabled.
+TEST_F(TpuPjrtAdapterTest, BindsProviderWithoutDmaMapping) {
+    auto bind_and_copy = [this] {
+        set_enable_dma_map_(0);
+        uint64_t fake_addr = 0, size = 0;
+        int device = -1;
+        std::vector<uint8_t> out(kChunk);
+        PageBuffer host;
+        return load_(MOCK_TPU_BUFFER_PROVIDER_LIB) == 0 &&
+               register_(create_(kChunk, 0, 0), &fake_addr, &size, &device) ==
+                   0 &&
+               d2h_(out.data(), reinterpret_cast<void *>(fake_addr), kChunk) ==
+                   0 &&
+               dma_map_(host.data, host.size) != 0 &&
+               dma_unmap_(host.data) != 0;
+    };
+    EXPECT_EXIT(std::_Exit(bind_and_copy() ? 0 : 1),
+                ::testing::ExitedWithCode(0),
+                "does not provide dma_map/dma_unmap");
+}
 
 TEST_F(TpuPjrtAdapterTest, RejectsIncompatibleProvidersThenBindsOnce) {
     uint64_t fake_addr = 0, size = 0;
@@ -177,6 +230,21 @@ TEST_F(TpuPjrtAdapterTest, ReleaseBufferDropsAnUnadoptedHandle) {
     EXPECT_EQ(release_(handle), 0);
     EXPECT_EQ(data_(handle), nullptr);
     EXPECT_NE(release_(0), 0);
+}
+
+TEST_F(TpuPjrtAdapterTest, DmaMappingReachesTheProvider) {
+    PageBuffer host;
+    ASSERT_NE(host.data, nullptr);
+    const int before = mappings_();
+    ASSERT_EQ(dma_map_(host.data, host.size), 0);
+    EXPECT_EQ(mappings_(), before + 1);
+    EXPECT_EQ(dma_unmap_(host.data), 0);
+    EXPECT_EQ(mappings_(), before);
+
+    EXPECT_NE(dma_unmap_(host.data), 0);  // No longer mapped.
+    set_fail_dma_map_(1);
+    EXPECT_NE(dma_map_(host.data, host.size), 0);
+    EXPECT_EQ(mappings_(), before);
 }
 
 // Registers buffers before first touching the shim, as mooncake.tpu requires.
