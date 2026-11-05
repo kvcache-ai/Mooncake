@@ -15,19 +15,42 @@
 #ifndef TENT_TPU_TRANSPORT_H_
 #define TENT_TPU_TRANSPORT_H_
 
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
+#include "tent/common/concurrent/thread_pool.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 
 namespace mooncake {
 namespace tent {
 
+struct TpuParams {
+    // HBM<->host copy threads: other chunks move while one copy runs.
+    size_t max_concurrent_tasks = 4;
+};
+
 struct TpuTask {
     Request request;
-    volatile TransferStatusEnum status_word;
-    volatile size_t transferred_bytes;
+    BatchID progress_batch_id{0};
+    std::function<void(BatchID)> notify_progress;
+    std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
+    std::atomic<size_t> transferred_bytes{0};
+
+    TpuTask() = default;
+    TpuTask(TpuTask &&other) noexcept
+        : request(std::move(other.request)),
+          progress_batch_id(other.progress_batch_id),
+          notify_progress(std::move(other.notify_progress)),
+          status_word(other.status_word.load(std::memory_order_relaxed)),
+          transferred_bytes(
+              other.transferred_bytes.load(std::memory_order_relaxed)) {}
+    TpuTask(const TpuTask &) = delete;
+    TpuTask &operator=(const TpuTask &) = delete;
 };
 
 struct TpuSubBatch : public Transport::SubBatch {
@@ -40,7 +63,9 @@ struct TpuSubBatch : public Transport::SubBatch {
 // HBM<->host-DRAM hop of a staged transfer by delegating to
 // Platform::copy() (which routes to the PJRT adapter for TPU memory). It never
 // touches the network — the host<->host hop is carried by RDMA/TCP, and
-// ProxyManager chains the two stages (see findStagingPolicy).
+// ProxyManager chains the two stages (see findStagingPolicy). The copies run
+// on a thread pool (transports/tpu/max_concurrent_tasks), so a submit can
+// return before its copy completes.
 //
 // Because TPU HBM is not NIC-addressable, this transport advertises only the
 // device<->host capabilities (gpu_to_dram / dram_to_gpu) and leaves gpu_to_gpu
@@ -58,6 +83,8 @@ class TpuTransport : public Transport {
                            std::shared_ptr<Config> conf = nullptr);
 
     virtual Status uninstall();
+
+    virtual Status quiesce() override;
 
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
@@ -77,7 +104,9 @@ class TpuTransport : public Transport {
     virtual const char *getName() const { return "tpu"; }
 
    private:
-    void startTransfer(TpuTask *task, TpuSubBatch *batch);
+    void startTransfer(TpuTask *task);
+
+    Status copy(const Request &request);
 
    private:
     bool installed_;
@@ -85,6 +114,10 @@ class TpuTransport : public Transport {
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Config> conf_;
+    TpuParams params_;
+    std::mutex lifecycle_mutex_;
+    std::unique_ptr<ThreadPool> thread_pool_;
+    std::atomic<bool> shutting_down_{false};
 };
 
 }  // namespace tent

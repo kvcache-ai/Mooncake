@@ -580,7 +580,15 @@ Status TransferEngineImpl::construct() {
         }
     }
 
-    staging_proxy_ = std::make_unique<ProxyManager>(this);
+    // A staging worker overlaps the chunks of one request only, and a TPU
+    // KV-cache batch holds a small request per layer and shard. TPU engines
+    // get more workers, and stage buffers for them; others keep the defaults.
+    if (transport_list_[TPU])
+        staging_proxy_ = std::make_unique<ProxyManager>(this, 4 * 1024 * 1024,
+                                                        /*chunk_count=*/256,
+                                                        /*worker_count=*/32);
+    else
+        staging_proxy_ = std::make_unique<ProxyManager>(this);
 
     if (runtime_queue_config_.limits.deadline_aware &&
         runtime_queue_config_.limits.mlu_local_threshold > 0.0) {
@@ -4411,7 +4419,9 @@ Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
     uint64_t addr = 0;
     auto status = staging_proxy_->pinStageBuffer(location, addr);
-    if (!status.ok()) LOG(ERROR) << status.ToString();
+    // A full pool is transient: a peer pinning remotely backs off and retries.
+    if (!status.ok() && !status.IsTooManyRequests())
+        LOG(ERROR) << status.ToString();
     return addr;
 }
 

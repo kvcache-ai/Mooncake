@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "mock_tpu_env.h"
@@ -52,6 +53,11 @@ class TransferEngineImplTestPeer {
     }
     static tent::Status stopStaging(tent::TransferEngineImpl& engine) {
         return engine.staging_proxy_->deconstruct();
+    }
+    static std::pair<size_t, size_t> stagingWorkersAndChunks(
+        tent::TransferEngineImpl& engine) {
+        return {engine.staging_proxy_->worker_count_,
+                engine.staging_proxy_->chunk_count_};
     }
     static tent::Status sweep(tent::TransferEngineImpl& engine) {
         return engine.lazyFreeBatch();
@@ -447,6 +453,49 @@ TEST_P(TpuAdapterEngineTest, BatchOfRequestsAcrossManyBuffers) {
             }
         }
     }
+}
+
+// Each request needs every pool slot; concurrent ones wait instead of failing.
+TEST_P(TpuAdapterEngineTest, BatchLargerThanTheStagePoolWaitsForBuffers) {
+    constexpr int kRequests = 3;
+    std::vector<Side> local, peer;
+    for (int i = 0; i < kRequests; ++i) {
+        local.push_back(tpu(*a_, kLength));
+        peer.push_back(tpu(*b_, kLength));
+    }
+    for (auto op : {Request::WRITE, Request::READ}) {
+        SCOPED_TRACE(op == Request::WRITE ? "WRITE" : "READ");
+        auto& src = op == Request::WRITE ? local : peer;
+        auto& dst = op == Request::WRITE ? peer : local;
+        std::vector<Request> requests;
+        std::vector<std::vector<uint8_t>> expected;
+        for (int i = 0; i < kRequests; ++i) {
+            expected.push_back(pattern(kLength, ++seed_));
+            std::memcpy(src[i].bytes, expected.back().data(), kLength);
+            std::memset(dst[i].bytes, kGuard, kLength);
+            requests.push_back(request(op, local[i], 0, peer[i], 0, kLength));
+        }
+        auto status = run(requests);
+        ASSERT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(status.transferred_bytes, kRequests * kLength);
+        for (int i = 0; i < kRequests; ++i) {
+            EXPECT_EQ(0, std::memcmp(dst[i].bytes, expected[i].data(), kLength))
+                << "request " << i;
+        }
+    }
+    expectIdle();
+}
+
+TEST_P(TpuAdapterEngineTest, OnlyEnginesWithTpuTransportGetMoreStaging) {
+    auto host_config = config();
+    host_config->set("transports/tpu/enable", false);
+    TransferEngineImpl tpu_engine(config()), host_engine(host_config);
+    ASSERT_TRUE(tpu_engine.available());
+    ASSERT_TRUE(host_engine.available());
+    EXPECT_EQ(TransferEngineImplTestPeer::stagingWorkersAndChunks(tpu_engine),
+              std::make_pair(size_t{32}, size_t{256}));
+    EXPECT_EQ(TransferEngineImplTestPeer::stagingWorkersAndChunks(host_engine),
+              std::make_pair(size_t{8}, size_t{64}));
 }
 
 TEST_P(TpuAdapterEngineTest, ProviderCopyFailureFailsThenRecovers) {

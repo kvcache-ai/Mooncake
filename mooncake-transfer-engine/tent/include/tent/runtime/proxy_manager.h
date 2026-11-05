@@ -27,6 +27,7 @@
 // Beta version -- use with own risk
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
 namespace tent {
 class TransferEngineImpl;
 class TaskInfo;
@@ -55,7 +56,7 @@ class ProxyManager {
    public:
     explicit ProxyManager(TransferEngineImpl* impl,
                           size_t chunk_size = 4 * 1024 * 1024,
-                          size_t chunk_count = 64);
+                          size_t chunk_count = 64, size_t worker_count = 8);
 
     ~ProxyManager();
 
@@ -73,6 +74,11 @@ class ProxyManager {
 
    private:
     void runner(size_t id);
+
+    // Pins `count` buffers per staged side, all or none. A full pool makes it
+    // wait while holding none: the other workers share the pool.
+    Status reserveStageBuffers(const StagingTask& task, StageBufferCache* cache,
+                               size_t count, uint64_t* local, uint64_t* remote);
 
     Status transferEventLoop(
         StagingTask& task, StageBufferCache* cache,
@@ -133,7 +139,7 @@ class ProxyManager {
     const std::chrono::milliseconds shutdown_drain_timeout_;
     // Guards the map, not the chunk bitmaps in it: those are atomic_flags and
     // stay lock-free under a shared lock. Exclusive only to insert or erase an
-    // entry, at most once per location. Reached by the kShards staging workers
+    // entry, at most once per location. Reached by the staging workers
     // via StageBufferCache and by the RPC thread via Pin/Unpin.
     mutable std::shared_mutex stage_buffers_mutex_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
@@ -147,9 +153,13 @@ class ProxyManager {
         std::mutex mu;
         std::condition_variable cv;
         std::queue<StagingTask> queue;
+        // Tasks queued on or running in this worker.
+        std::atomic<size_t> pending{0};
     };
-    const static size_t kShards = 8;
-    WorkerShard shards_[kShards];
+    const size_t worker_count_;
+    std::unique_ptr<WorkerShard[]> shards_;
+
+    friend class ::mooncake::TransferEngineImplTestPeer;
 };
 }  // namespace tent
 }  // namespace mooncake

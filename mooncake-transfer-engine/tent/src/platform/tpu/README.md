@@ -29,7 +29,7 @@ double-buffering, staging-buffer lifecycle, and async status tracking.
 |------|------|
 | `tpu_platform.cpp` (`TpuPlatform`) | Derives `CpuPlatform`. Host DRAM + NIC topology are inherited (RDMA NICs if present, otherwise just host NUMA nodes for TCP); only the TPU-device-aware paths are overridden (`copy`, `getMemoryType`, `getLocation`, and one `MemEntry` per device in `probe`). |
 | `tpu_pjrt_shim.cpp` (`TpuPjrtShim`) | Isolates all PJRT dependency. Resolves the device-copy adapter at runtime via `dlopen`. |
-| `../../transport/tpu/tpu_transport.cpp` (`TpuTransport`) | The local HBM↔host staging executor. Advertises only `gpu_to_dram` / `dram_to_gpu`; runs the copy via `Platform::copy` for `LOCAL_SEGMENT_ID` requests. |
+| `../../transport/tpu/tpu_transport.cpp` (`TpuTransport`) | The local HBM↔host staging executor. Advertises only `gpu_to_dram` / `dram_to_gpu`; runs the copy via `Platform::copy` for `LOCAL_SEGMENT_ID` requests, on a pool of `transports/tpu/max_concurrent_tasks` threads (default 4). |
 
 The staging policy that ties these together is planned in
 `TransferEngineImpl::getTransportType` (before transport selection) using the
