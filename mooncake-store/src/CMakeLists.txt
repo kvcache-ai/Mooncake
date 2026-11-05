@@ -140,6 +140,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     shm_helper.cpp
     config/shm_spdk_registration_config.cpp
     file_storage.cpp
+    cold_write_journal.cpp
     config/client_host_identity_config.cpp
     ssd_prefetcher.cpp
     config/client_metric_config.cpp

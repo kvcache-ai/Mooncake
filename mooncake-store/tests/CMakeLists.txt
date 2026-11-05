@@ -596,3 +596,6 @@ add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
 add_store_test(weight_manual_residency_e2e_test
                weight_manual_residency_e2e_test.cpp)
 set_tests_properties(weight_manual_residency_e2e_test PROPERTIES TIMEOUT 420)
+add_store_test(weight_cold_import_e2e_test weight_cold_import_e2e_test.cpp)
+set_tests_properties(weight_cold_import_e2e_test PROPERTIES TIMEOUT 420)
+add_store_test(cold_write_journal_test cold_write_journal_test.cpp)
