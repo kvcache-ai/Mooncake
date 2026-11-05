@@ -301,6 +301,10 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
       ipv6_(false),
       merge_requests_(true) {
     if (!config_loaded) return;
+    if (!conf_) {
+        LOG(ERROR) << "Cannot construct Transfer Engine with a null config";
+        return;
+    }
     auto preserved = captureExplicitTransferEngineConfig(*conf_);
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
