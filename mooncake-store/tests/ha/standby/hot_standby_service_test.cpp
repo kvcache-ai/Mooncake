@@ -569,6 +569,59 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_ResumesBatchCursor) {
     EXPECT_EQ(resume_key, range_begin_keys.front());
 }
 
+// A Start that fails before bootstrap must keep the saved batch cursor for
+// the next Start.
+TEST_F(HotStandbyServiceTest, TestWarmStart_KeepsBatchCursorAfterFailedStart) {
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 2);
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id_, 2),
+                           EncodeOpLogBatchRecord(MakeBatch(2, 3, 4))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 2, .last_seq = 4})));
+    config_.enable_oplog_following = true;
+    config_.enable_snapshot_bootstrap = false;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 4));
+    service_->Stop();
+
+    // Fail the next Start when it opens the OpLog backend.
+    service_->SetCatchUpBatchKvBackendForTesting(nullptr);
+    service_->SetOpLogBackendType(ha::HABackendType::UNKNOWN);
+    EXPECT_NE(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    service_->Stop();
+    service_->SetOpLogBackendType(ha::HABackendType::ETCD);
+    service_->SetCatchUpBatchKvBackendForTesting(backend);
+    backend->TakeRangeBeginKeys();
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id_, 3),
+                           EncodeOpLogBatchRecord(MakeBatch(3, 5, 5))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 3, .last_seq = 5})));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 5));
+
+    const auto range_begin_keys = backend->TakeRangeBeginKeys();
+    ASSERT_FALSE(range_begin_keys.empty());
+    const std::string first_batch_key =
+        BuildBatchRecordRange(cluster_id_, 0).begin_key;
+    for (const auto& key : range_begin_keys) {
+        EXPECT_NE(first_batch_key, key);
+    }
+    EXPECT_EQ(BuildBatchRecordRange(cluster_id_, 2).begin_key,
+              range_begin_keys.front());
+}
+
 TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
     auto backend = std::make_shared<FakeHaKvBackend>();
     ASSERT_EQ(

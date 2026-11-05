@@ -87,9 +87,10 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         metadata_store_ = std::make_unique<StandbyMetadataStore>();
     }
     const bool preserve_baseline = preserve_promotion_baseline_;
-    warm_start_cursor_ = batch_standby_reader_
-                             ? batch_standby_reader_->GetResumeCursor()
-                             : std::nullopt;
+    // Without a reader, keep the cursor that a failed Start saved.
+    if (batch_standby_reader_) {
+        warm_start_cursor_ = batch_standby_reader_->GetResumeCursor();
+    }
     batch_standby_reader_.reset();
     if (!preserve_baseline) {
         batch_standby_kv_backend_.reset();
