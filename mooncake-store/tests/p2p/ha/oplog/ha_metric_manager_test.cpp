@@ -49,6 +49,13 @@ TEST_F(HAMetricManagerTest, TestSetOpLogAsyncQueueSize) {
     EXPECT_EQ(5, M().get_oplog_async_queue_size());
 }
 
+TEST_F(HAMetricManagerTest, TestSetOpLogTrimProgress) {
+    M().set_oplog_trimmed_sequence_id(123);
+    M().set_oplog_gc_cursor_sequence_id(100);
+    EXPECT_EQ(123, M().get_oplog_trimmed_sequence_id());
+    EXPECT_EQ(100, M().get_oplog_gc_cursor_sequence_id());
+}
+
 TEST_F(HAMetricManagerTest, TestSetElectionAndOpLogHealthMetrics) {
     M().set_election_last_successful_renew_timestamp_ms(12345);
     M().set_oplog_last_successful_write_timestamp_ms(23456);
@@ -140,7 +147,13 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
     M().set_oplog_last_successful_write_timestamp_ms(23456);
     M().set_oplog_consecutive_write_failures(3);
     M().set_oplog_snapshot_ready_standby_count(2);
+    M().set_oplog_trimmed_sequence_id(80);
+    M().set_oplog_gc_cursor_sequence_id(70);
+    M().set_election_last_successful_renew_timestamp_ms(12345);
     M().inc_election_renew_failures();
+    M().inc_oplog_trim_advance_success();
+    M().inc_oplog_gc_deleted_entries();
+    M().inc_oplog_trim_failures();
 
     std::string text = M().serialize_metrics();
     EXPECT_FALSE(text.empty());
@@ -171,6 +184,13 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
     EXPECT_NE(std::string::npos,
               text.find("ha_oplog_snapshot_ready_standby_count"));
     EXPECT_NE(std::string::npos, text.find("ha_election_renew_failures_total"));
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_trimmed_sequence_id"));
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_gc_cursor_sequence_id"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_trim_advance_success_total"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_gc_deleted_entries_total"));
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_trim_failures_total"));
     EXPECT_EQ(std::string::npos, text.find("ha_oplog_etcd_write"));
 }
 
@@ -180,6 +200,8 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
     M().set_standby_degraded(true);
     M().set_primary_degraded(true);
     M().set_oplog_last_successful_poll_timestamp_ms(12345);
+    M().set_oplog_trimmed_sequence_id(90);
+    M().set_oplog_gc_cursor_sequence_id(80);
     M().set_election_last_successful_renew_timestamp_ms(23456);
     M().set_oplog_last_successful_write_timestamp_ms(34567);
     M().set_oplog_consecutive_write_failures(3);
@@ -223,6 +245,8 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
              "ha_standby_degraded",
              "ha_primary_degraded",
              "ha_oplog_last_successful_poll_timestamp_ms",
+             "ha_oplog_trimmed_sequence_id",
+             "ha_oplog_gc_cursor_sequence_id",
              "ha_election_last_successful_renew_timestamp_ms",
              "ha_oplog_last_successful_write_timestamp_ms",
              "ha_oplog_consecutive_write_failures",
@@ -268,6 +292,8 @@ TEST_F(HAMetricManagerTest, TestGetSummaryString) {
     M().set_oplog_standby_lag(5);
     M().set_oplog_consecutive_write_failures(3);
     M().set_oplog_snapshot_ready_standby_count(2);
+    M().set_oplog_trimmed_sequence_id(90);
+    M().set_oplog_gc_cursor_sequence_id(80);
 
     std::string summary = M().get_summary_string();
     EXPECT_FALSE(summary.empty());
@@ -276,6 +302,8 @@ TEST_F(HAMetricManagerTest, TestGetSummaryString) {
     EXPECT_NE(std::string::npos, summary.find("applied_seq"));
     EXPECT_NE(std::string::npos, summary.find("consecutive_write_fail=3"));
     EXPECT_NE(std::string::npos, summary.find("snapshot_ready_standby=2"));
+    EXPECT_NE(std::string::npos, summary.find("trimmed_seq"));
+    EXPECT_NE(std::string::npos, summary.find("gc_cursor"));
     EXPECT_NE(std::string::npos, summary.find("renew_fail"));
 }
 

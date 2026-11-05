@@ -76,6 +76,11 @@ HAMetricManager::HAMetricManager()
       p2p_bootstrap_catchup_target_sequence_id_(
           "ha_p2p_bootstrap_catchup_target_sequence_id",
           "Latest OpLog target sequence ID used after P2P snapshot bootstrap"),
+      oplog_trimmed_sequence_id_("ha_oplog_trimmed_sequence_id",
+                                 "Current OpLog logical trim horizon"),
+      oplog_gc_cursor_sequence_id_(
+          "ha_oplog_gc_cursor_sequence_id",
+          "Current OpLog physical garbage collection cursor"),
       master_role_("ha_master_role",
                    "Current HA master role (0=unknown, 1=disabled, 2=starting, "
                    "3=standby, 4=promoting, 5=primary, 6=failed)"),
@@ -194,6 +199,15 @@ HAMetricManager::HAMetricManager()
       p2p_snapshot_resync_failures_total_(
           "ha_p2p_snapshot_resync_failures_total",
           "Total failed P2P snapshot resync attempts"),
+      oplog_trim_advance_success_total_(
+          "ha_oplog_trim_advance_success_total",
+          "Total successful OpLog logical trim advances"),
+      oplog_gc_deleted_entries_total_(
+          "ha_oplog_gc_deleted_entries_total",
+          "Total OpLog entries deleted by physical garbage collection"),
+      oplog_trim_failures_total_(
+          "ha_oplog_trim_failures_total",
+          "Total failed OpLog auto trim worker iterations"),
       oplog_watch_disconnections_total_(
           "ha_oplog_watch_disconnections_total",
           "Total number of OpLog watch disconnections"),
@@ -259,6 +273,8 @@ HAMetricManager::HAMetricManager()
     oplog_last_successful_write_timestamp_ms_.update(0);
     p2p_snapshot_bootstrap_baseline_sequence_id_.update(0);
     p2p_bootstrap_catchup_target_sequence_id_.update(0);
+    oplog_trimmed_sequence_id_.update(0);
+    oplog_gc_cursor_sequence_id_.update(0);
     master_role_.update(0);
     snapshot_ready_.update(0);
     registry_heartbeat_ok_.update(0);
@@ -359,6 +375,22 @@ void HAMetricManager::set_p2p_snapshot_bootstrap_baseline_sequence_id(
 void HAMetricManager::set_p2p_bootstrap_catchup_target_sequence_id(
     int64_t seq_id) {
     p2p_bootstrap_catchup_target_sequence_id_.update(seq_id);
+}
+
+void HAMetricManager::set_oplog_trimmed_sequence_id(int64_t seq_id) {
+    oplog_trimmed_sequence_id_.update(seq_id);
+}
+
+int64_t HAMetricManager::get_oplog_trimmed_sequence_id() {
+    return static_cast<int64_t>(oplog_trimmed_sequence_id_.value());
+}
+
+void HAMetricManager::set_oplog_gc_cursor_sequence_id(int64_t seq_id) {
+    oplog_gc_cursor_sequence_id_.update(seq_id);
+}
+
+int64_t HAMetricManager::get_oplog_gc_cursor_sequence_id() {
+    return static_cast<int64_t>(oplog_gc_cursor_sequence_id_.value());
 }
 
 void HAMetricManager::set_master_role(int64_t role) {
@@ -566,6 +598,30 @@ void HAMetricManager::inc_p2p_snapshot_resync_failures(int64_t val) {
     p2p_snapshot_resync_failures_total_.inc(val);
 }
 
+void HAMetricManager::inc_oplog_trim_advance_success(int64_t val) {
+    oplog_trim_advance_success_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_trim_advance_success_total() {
+    return static_cast<int64_t>(oplog_trim_advance_success_total_.value());
+}
+
+void HAMetricManager::inc_oplog_gc_deleted_entries(int64_t val) {
+    oplog_gc_deleted_entries_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_gc_deleted_entries_total() {
+    return static_cast<int64_t>(oplog_gc_deleted_entries_total_.value());
+}
+
+void HAMetricManager::inc_oplog_trim_failures(int64_t val) {
+    oplog_trim_failures_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_trim_failures_total() {
+    return static_cast<int64_t>(oplog_trim_failures_total_.value());
+}
+
 void HAMetricManager::inc_oplog_watch_disconnections(int64_t val) {
     oplog_watch_disconnections_total_.inc(val);
 }
@@ -678,6 +734,8 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_last_successful_write_timestamp_ms_);
     serialize_metric(p2p_snapshot_bootstrap_baseline_sequence_id_);
     serialize_metric(p2p_bootstrap_catchup_target_sequence_id_);
+    serialize_metric(oplog_trimmed_sequence_id_);
+    serialize_metric(oplog_gc_cursor_sequence_id_);
     serialize_metric(master_role_);
     serialize_metric(snapshot_ready_);
     serialize_metric(registry_heartbeat_ok_);
@@ -722,6 +780,9 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(p2p_snapshot_bootstrap_failures_total_);
     serialize_metric(p2p_snapshot_resync_success_total_);
     serialize_metric(p2p_snapshot_resync_failures_total_);
+    serialize_metric(oplog_trim_advance_success_total_);
+    serialize_metric(oplog_gc_deleted_entries_total_);
+    serialize_metric(oplog_trim_failures_total_);
     serialize_metric(oplog_watch_disconnections_total_);
     serialize_metric(oplog_applied_entries_total_);
     serialize_metric(oplog_applied_noop_entries_total_);
@@ -768,11 +829,16 @@ std::string HAMetricManager::get_summary_string() {
     ss << ", lag=" << get_oplog_standby_lag();
     ss << ", pending=" << get_oplog_pending_entries();
     ss << ", async_queue=" << get_oplog_async_queue_size();
+    ss << ", trimmed_seq=" << get_oplog_trimmed_sequence_id();
+    ss << ", gc_cursor=" << get_oplog_gc_cursor_sequence_id();
     ss << ", consecutive_write_fail=" << get_oplog_consecutive_write_failures();
     ss << ", snapshot_ready_standby="
        << get_oplog_snapshot_ready_standby_count();
     ss << ", batch_commits=" << get_oplog_batch_commits_total();
     ss << ", sync_commits=" << get_oplog_sync_batch_commits_total();
+    ss << ", trim_advance_success=" << get_oplog_trim_advance_success_total();
+    ss << ", gc_deleted_entries=" << get_oplog_gc_deleted_entries_total();
+    ss << ", trim_fail=" << get_oplog_trim_failures_total();
     ss << ", skipped=" << get_oplog_skipped_entries_total();
     ss << ", checksum_fail=" << get_oplog_checksum_failures_total();
     ss << ", write_fail=" << get_oplog_write_failures_total();

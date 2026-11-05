@@ -74,6 +74,10 @@ class HAMetricManager {
     int64_t get_oplog_last_successful_write_timestamp_ms();
     void set_p2p_snapshot_bootstrap_baseline_sequence_id(int64_t seq_id);
     void set_p2p_bootstrap_catchup_target_sequence_id(int64_t seq_id);
+    void set_oplog_trimmed_sequence_id(int64_t seq_id);
+    int64_t get_oplog_trimmed_sequence_id();
+    void set_oplog_gc_cursor_sequence_id(int64_t seq_id);
+    int64_t get_oplog_gc_cursor_sequence_id();
     void set_master_role(int64_t role);
     int64_t get_master_role();
     void set_snapshot_ready(bool value);
@@ -195,6 +199,12 @@ class HAMetricManager {
      */
     void inc_oplog_sync_batch_commits(int64_t count = 1);
     int64_t get_oplog_sync_batch_commits_total();
+    void inc_oplog_trim_advance_success(int64_t val = 1);
+    int64_t get_oplog_trim_advance_success_total();
+    void inc_oplog_gc_deleted_entries(int64_t val = 1);
+    int64_t get_oplog_gc_deleted_entries_total();
+    void inc_oplog_trim_failures(int64_t val = 1);
+    int64_t get_oplog_trim_failures_total();
 
     // ========== Latency Histograms ==========
 
@@ -261,6 +271,8 @@ class HAMetricManager {
     ylt::metric::gauge_t oplog_last_successful_write_timestamp_ms_;
     ylt::metric::gauge_t p2p_snapshot_bootstrap_baseline_sequence_id_;
     ylt::metric::gauge_t p2p_bootstrap_catchup_target_sequence_id_;
+    ylt::metric::gauge_t oplog_trimmed_sequence_id_;
+    ylt::metric::gauge_t oplog_gc_cursor_sequence_id_;
     ylt::metric::gauge_t master_role_;
     ylt::metric::gauge_t snapshot_ready_;
     ylt::metric::gauge_t registry_heartbeat_ok_;
@@ -304,6 +316,9 @@ class HAMetricManager {
     ylt::metric::counter_t p2p_snapshot_bootstrap_failures_total_;
     ylt::metric::counter_t p2p_snapshot_resync_success_total_;
     ylt::metric::counter_t p2p_snapshot_resync_failures_total_;
+    ylt::metric::counter_t oplog_trim_advance_success_total_;
+    ylt::metric::counter_t oplog_gc_deleted_entries_total_;
+    ylt::metric::counter_t oplog_trim_failures_total_;
     ylt::metric::counter_t oplog_watch_disconnections_total_;
     ylt::metric::counter_t oplog_applied_entries_total_;
     ylt::metric::counter_t oplog_applied_noop_entries_total_;
