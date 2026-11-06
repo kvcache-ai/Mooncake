@@ -1705,7 +1705,7 @@ mod owner_page_tests {
         let mut low = 0usize;
         let mut high = MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES / DEFAULT_ROUTE_OWNER_PAGE_SIZE;
         while low < high {
-            let middle = low.saturating_add((high - low + 1) / 2);
+            let middle = low.saturating_add((high - low).div_ceil(2));
             if route_fields_len(&page_with_padding(middle).routes)
                 <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
             {
@@ -1741,7 +1741,7 @@ mod owner_page_tests {
         let mut low = 0usize;
         let mut high = MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES / DEFAULT_ROUTE_OWNER_PAGE_SIZE;
         while low < high {
-            let middle = low.saturating_add((high - low + 1) / 2);
+            let middle = low.saturating_add((high - low).div_ceil(2));
             if route_fields_len(&page_with_padding(middle).routes)
                 .saturating_add(optional_u64_field_len(Some(u64::MAX)))
                 <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
