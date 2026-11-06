@@ -277,7 +277,6 @@ class MooncakeDistributedStore:
         self._worker = None
         self._lock = threading.RLock()
         self._registered_buffers: dict[int, int] = {}
-        self._tracked_keys: set[tuple[str | None, str | None, str | None, str]] = set()
         self._default_domain: str | None = None
         self._default_object_set: str | None = None
 
@@ -437,7 +436,6 @@ class MooncakeDistributedStore:
     def close(self) -> None:
         with self._lock:
             self._registered_buffers.clear()
-            self._tracked_keys.clear()
         try:
             self._invoke("close")
         finally:
@@ -469,8 +467,6 @@ class MooncakeDistributedStore:
             tenant=tenant,
             **_replication_kwargs(config),
         )
-        if result == 0:
-            self._track_keys([key], tenant=tenant)
         return result
 
     def put_from(
@@ -490,8 +486,6 @@ class MooncakeDistributedStore:
             tenant=tenant,
             **_replication_kwargs(config),
         )
-        if result == 0:
-            self._track_keys([key], tenant=tenant)
         return result
 
     def batch_put(
@@ -510,8 +504,6 @@ class MooncakeDistributedStore:
             tenant=tenant,
             **_replication_kwargs(config),
         )
-        if result == 0:
-            self._track_keys([key for key, _ in normalized], tenant=tenant)
         return result
 
     def put_batch(
@@ -535,9 +527,6 @@ class MooncakeDistributedStore:
                 **_replication_kwargs(config),
             )
             statuses = _coerce_batch_status_result(result, len(items))
-            self._track_successful_keys(
-                [key for key, _, _ in items], statuses, tenant=tenant
-            )
             return statuses
         if len(args) == 3:
             keys, buffer_ptrs, sizes = _normalize_raw_batch_args(*args)
@@ -551,7 +540,6 @@ class MooncakeDistributedStore:
                 **_replication_kwargs(config),
             )
             statuses = _coerce_batch_status_result(result, len(keys))
-            self._track_successful_keys(keys, statuses, tenant=tenant)
             return statuses
         raise TypeError(
             "batch_put_from expects either items or (keys, buffer_ptrs, sizes)"
@@ -1070,8 +1058,6 @@ class MooncakeDistributedStore:
 
     def remove(self, key: str, *, force: bool = False, tenant: str | None = None):
         result = self._invoke_cache("remove", key, force=force, tenant=tenant)
-        if result == 0:
-            self._forget_keys([key], tenant=tenant)
         return result
 
     def batch_remove(
@@ -1089,9 +1075,6 @@ class MooncakeDistributedStore:
             force=force,
             tenant=tenant,
         )
-        for key, status in zip(key_list, result):
-            if int(status) == 0:
-                self._forget_keys([key], tenant=tenant)
         return result
 
     def remove_all(self, force: bool = False):
@@ -1121,41 +1104,6 @@ class MooncakeDistributedStore:
                     "buffer size is required for unknown pointers; call register_buffer first or pass size explicitly"
                 )
             return self._registered_buffers[int(buffer_ptr)]
-
-    def _track_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
-        with self._lock:
-            for key in keys:
-                self._tracked_keys.add(
-                    (tenant, self._default_domain, self._default_object_set, str(key))
-                )
-
-    def _forget_keys(self, keys: Iterable[str], *, tenant: str | None = None) -> None:
-        with self._lock:
-            for key in keys:
-                self._tracked_keys.discard(
-                    (tenant, self._default_domain, self._default_object_set, str(key))
-                )
-
-    def _track_successful_keys(
-        self,
-        keys: Iterable[str],
-        statuses: Iterable[int],
-        *,
-        tenant: str | None = None,
-    ) -> None:
-        self._track_keys(
-            (key for key, status in zip(keys, statuses) if int(status) == 0),
-            tenant=tenant,
-        )
-
-    def _group_tracked_keys(
-        self,
-    ) -> dict[tuple[str | None, str | None, str | None], list[str]]:
-        grouped: dict[tuple[str | None, str | None, str | None], list[str]] = {}
-        with self._lock:
-            for tenant, domain, object_set, key in self._tracked_keys:
-                grouped.setdefault((tenant, domain, object_set), []).append(key)
-        return grouped
 
     def _setup_from_config_dict(self, config: Mapping[str, object]):
         config = _apply_setup_env_defaults(dict(config))
