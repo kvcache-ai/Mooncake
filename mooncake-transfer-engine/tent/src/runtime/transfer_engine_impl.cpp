@@ -57,7 +57,8 @@ constexpr uint8_t kRedisDefaultDbIndex = 0;
 // After this many consecutive failed reclaim attempts, lazyFreeBatch stops
 // retrying a batch (see Batch::reclaim_abandoned). Transient errors heal in a
 // pass or two and a healthy-but-inflight batch reports PENDING (which resets
-// the counter), so only a permanently failing poll or queue retire gets here.
+// the counter), so only a permanently failing poll, queue retire, or sub-batch
+// release gets here.
 constexpr size_t kMaxReclaimAttempts = 4096;
 constexpr int kMaxHpTcpMetadataRefreshRetries = 1;
 }  // namespace
@@ -74,10 +75,10 @@ struct Batch {
     bool free_requested{false};
     uint64_t queue_token{0};
     // Consecutive lazyFreeBatch passes that failed to reclaim this batch
-    // (poll error or queue retire error). Reset when a pass observes the
-    // batch healthy (PENDING). At kMaxReclaimAttempts the batch is marked
-    // reclaim_abandoned: the sweep stops retrying (and warning) and leaves
-    // it for deconstruct(), which reclaims the freelist unconditionally.
+    // (poll, queue retire, or sub-batch release error). Reset when a pass
+    // observes the batch healthy (PENDING). At kMaxReclaimAttempts the batch is
+    // marked reclaim_abandoned: the sweep stops retrying (and warning) and
+    // leaves it for deconstruct(), which reclaims the freelist unconditionally.
     size_t reclaim_failures{0};
     bool reclaim_abandoned{false};
 
@@ -1190,6 +1191,18 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     return batch_id;
 }
 
+Status TransferEngineImpl::freeSubBatches(Batch* batch) {
+    Status first_error;
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto& transport = transport_list_[type];
+        auto& sub_batch = batch->sub_batch[type];
+        if (!transport || !sub_batch) continue;
+        auto status = transport->freeSubBatch(sub_batch);
+        if (!status.ok() && first_error.ok()) first_error = status;
+    }
+    return first_error;
+}
+
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
@@ -1206,27 +1219,25 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
         if (!runtime_queue_config_.enabled && batch->runtime_refs == 0 &&
             !batch->free_requested) {
             // Only free inline when the final poll succeeds and reports a
-            // terminal state. A poll error defers the batch instead of
-            // failing freeBatch(): the lazy sweep retries, rate-limits and
-            // eventually quarantines a permanently stuck batch.
+            // terminal state. A poll or sub-batch release error defers the
+            // batch instead of failing freeBatch(): the lazy sweep retries,
+            // rate-limits and eventually quarantines a permanently stuck
+            // batch.
             TransferStatus overall_status;
             auto status = getTransferStatus(batch_id, overall_status);
             if (status.ok() && overall_status.s != PENDING) {
-                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                    auto& transport = transport_list_[type];
-                    auto& sub_batch = batch->sub_batch[type];
-                    if (transport && sub_batch)
-                        transport->freeSubBatch(sub_batch);
+                status = freeSubBatches(batch);
+                if (status.ok()) {
+                    {
+                        BatchShard& shard = batchShard(batch_id);
+                        std::lock_guard<std::recursive_mutex> shard_reg_lk(
+                            shard.mtx);
+                        shard.active_batches.erase(batch);
+                        shard.alive_batches.erase(batch_id);
+                    }
+                    Slab<Batch>::Get().deallocate(batch);
+                    return Status::OK();
                 }
-                {
-                    BatchShard& shard = batchShard(batch_id);
-                    std::lock_guard<std::recursive_mutex> shard_reg_lk(
-                        shard.mtx);
-                    shard.active_batches.erase(batch);
-                    shard.alive_batches.erase(batch_id);
-                }
-                Slab<Batch>::Get().deallocate(batch);
-                return Status::OK();
             }
         }
         already_requested = batch->free_requested;
@@ -1279,13 +1290,13 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
 Status TransferEngineImpl::lazyFreeBatch() {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     // freelist is insertion-ordered. A batch that cannot be reclaimed on this
-    // pass (poll error, queue owners not yet terminal) must not stop the sweep:
-    // returning early would strand every batch queued behind it, and a
-    // permanent error would strand them for good. Skip it, keep going, and
-    // report the first error once the pass is complete. Most callers drop the
-    // returned status (the ProgressWorker sweeps on every step), so the skip is
-    // also logged here, rate-limited, or a permanently stuck batch would be
-    // re-polled forever without a trace.
+    // pass (poll or sub-batch release error, queue owners not yet terminal)
+    // must not stop the sweep: returning early would strand every batch queued
+    // behind it, and a permanent error would strand them for good. Skip it,
+    // keep going, and report the first error once the pass is complete. Most
+    // callers drop the returned status (the ProgressWorker sweeps on every
+    // step), so the skip is also logged here, rate-limited, or a permanently
+    // stuck batch would be re-polled forever without a trace.
     Status first_error = Status::OK();
     for (auto it = batch_freelist_.begin(); it != batch_freelist_.end();) {
         auto& batch = *it;
@@ -1320,6 +1331,7 @@ Status TransferEngineImpl::lazyFreeBatch() {
                 batch->queue_token != 0) {
                 status = retireQueueForBatch(batch);
             }
+            if (status.ok()) status = freeSubBatches(batch);
             if (!status.ok()) {
                 if (++batch->reclaim_failures >= kMaxReclaimAttempts) {
                     batch->reclaim_abandoned = true;
@@ -1361,11 +1373,6 @@ Status TransferEngineImpl::lazyFreeBatch() {
                 if (first_error.ok()) first_error = status;
                 it++;
                 continue;
-            }
-            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                auto& transport = transport_list_[type];
-                auto& sub_batch = batch->sub_batch[type];
-                if (transport && sub_batch) transport->freeSubBatch(sub_batch);
             }
             {
                 BatchShard& shard = batchShard(batch_id);
