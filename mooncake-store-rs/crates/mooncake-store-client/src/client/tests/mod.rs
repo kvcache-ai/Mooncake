@@ -15427,34 +15427,6 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
         client.state.lock().pending_reclaims.is_empty(),
         "flush_all_reclaims should drain the entire queue"
     );
-
-    let primary = client.segment_name().expect("primary segment should exist");
-    let (_target, reservation) = client
-        .reserve_specific_segment(client.runtime_id(), &primary, 8, true)
-        .expect("reserve_specific_segment should succeed");
-    client
-        .release_reserved_allocations(
-            &[ReplicaWriteTarget {
-                storage_runtime: client.runtime_id().clone(),
-                segment_name: primary.clone(),
-                transport_endpoint: None,
-                target_chunks: Vec::new(),
-            }],
-            std::slice::from_ref(&reservation),
-        )
-        .expect("release_reserved_allocations should succeed");
-    assert!(matches!(
-        client.release_reserved_allocations(
-            &[ReplicaWriteTarget {
-                storage_runtime: client.runtime_id().clone(),
-                segment_name: primary,
-                transport_endpoint: None,
-                target_chunks: Vec::new(),
-            }],
-            &[],
-        ),
-        Err(StoreError::InvalidState(_))
-    ));
 }
 
 #[test]
@@ -15783,6 +15755,109 @@ fn partial_replica_reservation_is_released_when_required_segment_lookup_fails() 
         0,
         "a later required-segment lookup failure must roll back earlier reservations"
     );
+}
+
+#[test]
+fn unresolved_reservation_reclaim_drops_after_owner_is_confirmed_unavailable() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let metadata = Arc::new(RecoverableMetadataBackend::new(inner));
+    let transport = Arc::new(TestTransport::new("unavailable-owner-writer-segment"));
+    let writer = StoreClientBuilder::new(metadata, "unavailable-owner-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+
+    let owner = ClientRuntimeId::new("unavailable-owner", ClientEpoch(1));
+    let mut unreachable_owner = writer.lease.clone();
+    unreachable_owner.runtime = owner.clone();
+    unreachable_owner.endpoints.labels.insert(
+        control_address_label().to_string(),
+        "127.0.0.1:1".to_string(),
+    );
+    writer
+        .live_client_cache
+        .lock()
+        .store(vec![unreachable_owner]);
+    let reservation = SegmentReservation {
+        owner: owner.clone(),
+        segment_name: SegmentName::new("unavailable-owner-segment"),
+        offset_bytes: 0,
+        length_bytes: 16,
+    };
+
+    writer.release_unresolved_reservation(&reservation);
+    assert_eq!(
+        writer.state.lock().pending_reclaims.len(),
+        1,
+        "an unreachable owner must retain the unresolved reservation cleanup"
+    );
+
+    writer.live_client_cache.lock().store(Vec::new());
+    writer
+        .flush_due_reclaims()
+        .expect("a confirmed-unavailable owner should drain its reclaim entry");
+    assert!(
+        writer.state.lock().pending_reclaims.is_empty(),
+        "the reclaim queue should stop retrying after the owner lease disappears"
+    );
+}
+
+#[test]
+fn failed_best_effort_reservation_release_is_queued_for_retry() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("best-effort-release-segment"));
+    let client = StoreClientBuilder::new(metadata, "best-effort-release-client")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    let reservation = client
+        .reserve_segment_allocation(client.runtime_id(), None, 16, true)
+        .expect("local reservation should succeed");
+    let target = client
+        .replica_write_target(client.runtime_id(), &reservation.segment_name)
+        .expect("local target should resolve");
+    let detached_segment = client
+        .allocator
+        .lock()
+        .segments
+        .remove(&reservation.segment_name)
+        .expect("reserved segment should be removable for fault injection");
+
+    client.best_effort_release_reserved_allocations(
+        std::slice::from_ref(&target),
+        std::slice::from_ref(&reservation),
+        "test_best_effort_release_failure",
+    );
+    assert_eq!(
+        client.state.lock().pending_reclaims.len(),
+        1,
+        "a failed best-effort release must retain the reservation for retry"
+    );
+
+    client
+        .allocator
+        .lock()
+        .segments
+        .insert(reservation.segment_name.clone(), detached_segment);
+    client
+        .flush_due_reclaims()
+        .expect("queued reservation cleanup should retry successfully");
+    assert_eq!(client.allocator.lock().usage_bytes().0, 0);
 }
 
 #[test]

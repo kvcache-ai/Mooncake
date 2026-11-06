@@ -997,12 +997,11 @@ impl StoreClient {
         let mut targets = Vec::with_capacity(policy.replica_count);
         let mut reservations = Vec::with_capacity(policy.replica_count);
         let mut excluded = BTreeSet::new();
-        let rollback =
-            |this: &Self,
-             targets: &[ReplicaWriteTarget],
-             reservations: &[mooncake_store_core::SegmentReservation]| {
-                let _ = this.release_reserved_allocations(targets, reservations);
-            };
+        let rollback = |this: &Self,
+                        reservations: &[mooncake_store_core::SegmentReservation],
+                        reason: &str| {
+            this.release_reservations_or_enqueue(reservations, reason);
+        };
 
         {
             let mut preferred = PreferredSegmentReservationContext {
@@ -1021,7 +1020,11 @@ impl StoreClient {
                 PreferredSegmentSource::Request,
                 false,
             ) {
-                rollback(self, preferred.targets, preferred.reservations);
+                rollback(
+                    self,
+                    preferred.reservations,
+                    "reserve_required_segments_failed",
+                );
                 return Err(error);
             }
             if preferred.targets.len() != policy.replica_count {
@@ -1031,7 +1034,11 @@ impl StoreClient {
                     PreferredSegmentSource::TenantPolicy,
                     true,
                 ) {
-                    rollback(self, preferred.targets, preferred.reservations);
+                    rollback(
+                        self,
+                        preferred.reservations,
+                        "reserve_hint_segments_failed",
+                    );
                     return Err(error);
                 }
             }
@@ -1076,7 +1083,7 @@ impl StoreClient {
                     );
                 }
                 Err(error) => {
-                    rollback(self, &targets, &reservations);
+                    rollback(self, &reservations, "reserve_preferred_owner_failed");
                     return Err(error);
                 }
             }
@@ -1109,7 +1116,7 @@ impl StoreClient {
                     );
                 }
                 Err(error) => {
-                    rollback(self, &targets, &reservations);
+                    rollback(self, &reservations, "reserve_local_owner_failed");
                     return Err(error);
                 }
             }
@@ -1121,7 +1128,7 @@ impl StoreClient {
         {
             Ok(ranked) => ranked,
             Err(error) => {
-                rollback(self, &targets, &reservations);
+                rollback(self, &reservations, "rank_placement_candidates_failed");
                 return Err(error);
             }
         };
@@ -1153,13 +1160,13 @@ impl StoreClient {
                     );
                 }
                 Err(error) => {
-                    rollback(self, &targets, &reservations);
+                    rollback(self, &reservations, "reserve_fallback_owner_failed");
                     return Err(error);
                 }
             }
         }
 
-        rollback(self, &targets, &reservations);
+        rollback(self, &reservations, "reserve_replica_targets_incomplete");
         Err(StoreError::InvalidState(format!(
             "not enough writable placement targets: reserved={} need={}",
             targets.len(),

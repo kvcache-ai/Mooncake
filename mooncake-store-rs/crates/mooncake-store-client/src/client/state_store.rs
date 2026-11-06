@@ -293,6 +293,15 @@ impl StoreState {
         Ok(())
     }
 
+    fn enqueue_pending_reclaim(&mut self, reclaim: PendingReclaim) {
+        let insertion_index = self
+            .pending_reclaims
+            .iter()
+            .position(|pending| pending.due_at_ms > reclaim.due_at_ms)
+            .unwrap_or(self.pending_reclaims.len());
+        self.pending_reclaims.insert(insertion_index, reclaim);
+    }
+
     fn take_due_reclaims(&mut self, now_ms: u64) -> Vec<PendingReclaim> {
         let mut ready = Vec::new();
         while self
