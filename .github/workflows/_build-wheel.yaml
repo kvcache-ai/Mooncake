@@ -95,13 +95,13 @@ jobs:
               variant_flag=''
               arch_list='9.0'
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             cuda13:arm64)
               variant_flag=CU13_BUILD
               arch_list='9.0;10.3'
               build_nvlink=false
-              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF'
               ;;
             non-cuda:arm64)
               variant_flag=NON_CUDA_BUILD
