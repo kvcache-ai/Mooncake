@@ -807,6 +807,38 @@ impl BlockingCasMetadataBackend {
 }
 
 impl MetadataBackend for RecoverableMetadataBackend {
+    fn put_cold_tier_device_if_absent(
+        &self,
+        device: &mooncake_store_core::ColdTierDeviceRecord,
+    ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierPutDeviceResult> {
+        self.inner.put_cold_tier_device_if_absent(device)
+    }
+
+    fn get_cold_tier_device(
+        &self,
+        device_id: &str,
+    ) -> mooncake_store_core::Result<Option<mooncake_store_core::ColdTierDeviceRecord>> {
+        self.inner.get_cold_tier_device(device_id)
+    }
+
+    fn update_cold_tier_device(
+        &self,
+        device_id: &str,
+        update: mooncake_store_core::ColdTierDeviceUpdate,
+    ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierDeviceRecord> {
+        self.inner.update_cold_tier_device(device_id, update)
+    }
+
+    fn apply_cold_tier_usage_delta(
+        &self,
+        device_id: &str,
+        delta: mooncake_store_core::ColdTierUsageDelta,
+        updated_at_ms: u64,
+    ) -> mooncake_store_core::Result<mooncake_store_core::ColdTierDeviceRecord> {
+        self.inner
+            .apply_cold_tier_usage_delta(device_id, delta, updated_at_ms)
+    }
+
     fn route_namespace(&self) -> String {
         self.inner.route_namespace()
     }
@@ -22278,3 +22310,7 @@ fn migration_applied_reply_loss_keeps_publicly_readable_generation() {
     b.put("migration-reuse-probe", &vec![0x5a; payload.len()]).unwrap();
     assert_eq!(reader.get(key).unwrap(), payload, "an applied route must keep its generation after the CAS reply is lost");
 }
+
+mod background_eviction_alignment_tests;
+mod clock_hit_alignment_tests;
+mod offload_waves_alignment_tests;
