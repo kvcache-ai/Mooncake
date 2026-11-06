@@ -45,6 +45,10 @@ struct FilePerKeyEnvironmentVariables {
 };
 
 struct BucketBackendEnvironmentVariables {
+    // 0/false: buffered; packed/true/1: packed direct writes.
+    // aligned is reserved for the separate aligned-layout implementation.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES);
