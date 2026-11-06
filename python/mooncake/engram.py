@@ -257,14 +257,22 @@ class EngramStore:
         if key not in self._cuda_lookups:
             _engram_cuda.require_warmup(stream)
             tables = []
-            for name in names:
-                if name not in self._cuda_tables:
-                    self._cuda_tables[name] = _engram_cuda.LocalTable(self._open(name))
-                tables.append(self._cuda_tables[name])
-            lookup = _engram_cuda.Lookup(tables, offsets)
-            # A failed first run must not cache a lookup on the wrong device.
-            lookup.run(ids, out, stream)
-            self._cuda_lookups[key] = lookup
+            lookup = None
+            try:
+                for name in names:
+                    if name not in self._cuda_tables:
+                        self._cuda_tables[name] = _engram_cuda.LocalTable(
+                            self._open(name)
+                        )
+                    tables.append(self._cuda_tables[name])
+                lookup = _engram_cuda.Lookup(tables, offsets)
+                # A failed first run must not cache a lookup on the wrong device.
+                lookup.run(ids, out, stream)
+                self._cuda_lookups[key] = lookup
+            finally:
+                # Retained tracebacks must not keep native table owners alive.
+                tables.clear()
+                lookup = None
             return
         self._cuda_lookups[key].run(ids, out, stream)
 

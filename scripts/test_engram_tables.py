@@ -225,6 +225,52 @@ def test_cuda_lookup_can_retry_after_current_device_mismatch(tmp_path):
         store.close()
 
 
+@pytest.mark.parametrize("failure", ["ids_dtype", "missing_table"])
+@pytest.mark.parametrize("persistent", [True, False])
+def test_cuda_close_releases_tables_with_retained_traceback(
+    tmp_path, failure, persistent
+):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("mooncake._engram_cuda")
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    store, rows, specs = make_store(tmp_path, persistent=persistent)
+    store.close()
+    names = ["a"] if failure == "ids_dtype" else ["a", "b"]
+    ids = torch.full((1, len(names)), 3, dtype=torch.int64, device="cuda")
+    output = torch.full(
+        (1, len(names), rows.shape[1]), 201, dtype=torch.uint8, device="cuda"
+    )
+    stream = torch.cuda.current_stream().cuda_stream
+    failure_info = None
+    try:
+        with EngramStore(
+            tables=specs, namespace="test/v1", local_dir=tmp_path, persistent=persistent
+        ) as failed:
+            if not persistent:
+                failed.populate("a", rows)
+            elif failure == "missing_table":
+                failed.remove("b")
+            invalid_ids = ids.float() if failure == "ids_dtype" else ids
+            error = ValueError if failure == "ids_dtype" else FileNotFoundError
+            with pytest.raises(error) as failure_info:
+                failed.lookup(names, invalid_ids, output, stream=stream)
+            assert torch.all(output == 201).item()
+
+        # Logging and callers may retain the exception after closing the Store.
+        assert failure_info.value.__traceback__ is not None
+        with EngramStore(
+            tables=specs, namespace="test/v1", local_dir=tmp_path, persistent=persistent
+        ) as reopened:
+            if not persistent:
+                reopened.populate("a", rows)
+            reopened.lookup(["a"], ids[:, :1], output[:, :1], stream=stream)
+            np.testing.assert_array_equal(output.cpu().numpy()[0, 0], rows[3])
+        assert failure_info.value.__traceback__ is not None
+    finally:
+        failure_info = None
+
+
 @pytest.mark.parametrize("head_major", [False, True])
 @pytest.mark.parametrize("dtype_name", ["int32", "int64"])
 @pytest.mark.parametrize("persistent", [True, False])
