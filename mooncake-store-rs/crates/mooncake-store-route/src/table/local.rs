@@ -73,6 +73,10 @@ impl LocalRouteTable {
         self.routes.get(&key.0).cloned()
     }
 
+    pub(crate) fn get_many(&self, keys: &[ObjectKey]) -> Vec<Option<ObjectRoute>> {
+        keys.iter().map(|key| self.get(key)).collect()
+    }
+
     pub(crate) fn get_record(&self, key: &ObjectKey) -> RouteAuthorityRecord {
         RouteAuthorityRecord {
             route: self.get(key),

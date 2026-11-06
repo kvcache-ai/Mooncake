@@ -38,6 +38,10 @@ impl LocalRouteAuthority {
         authority_get(&self.namespace, &self.authority, key)
     }
 
+    pub fn get_routes(&self, keys: &[ObjectKey]) -> Result<Vec<Option<ObjectRoute>>> {
+        authority_get_many(&self.namespace, &self.authority, keys)
+    }
+
     pub fn get_route_record(&self, key: &ObjectKey) -> Result<RouteAuthorityRecord> {
         authority_get_record(&self.namespace, &self.authority, key)
     }
