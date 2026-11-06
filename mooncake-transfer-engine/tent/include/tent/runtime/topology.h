@@ -167,6 +167,12 @@ class LocationParser {
     int index_;
 };
 
+// Only CUDA and MLU locations are keys for RDMA GPUDirect reachability.
+inline int gdrOrdinal(const LocationParser& location) {
+    const auto type = location.type();
+    return (type == "cuda" || type == "mlu") ? location.index() : -1;
+}
+
 // Canonical AMD GPU location prefix and alias handling live in
 // amd_location.h, shared with the rocm device plugin.
 

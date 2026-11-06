@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <unordered_set>
@@ -1123,6 +1124,39 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     ASSERT_TRUE(enable_offloading_result3 &&
                 !enable_offloading_result3.value());
 }
+
+#ifdef USE_URING
+// Pages this process has pinned, in KiB (VmPin).
+static long PinnedKib() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmPin:", 0) == 0) return std::stol(line.substr(6));
+    }
+    return -1;
+}
+
+// With io_uring, FileStorage pins its staging buffer as the fixed buffer. The
+// destructor must unpin it before the buffer is freed.
+TEST_F(FileStorageTest, UringStagingBufferUnpinnedOnDestruction) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.use_uring = true;
+    const long pinned_before = PinnedKib();
+    long pinned_alive = -1;
+    {
+        FileStorage file_storage(file_storage_config, nullptr,
+                                 "localhost:9003");
+        pinned_alive = PinnedKib();
+    }
+    if (pinned_alive <= pinned_before) {
+        GTEST_SKIP() << "io_uring did not pin the staging buffer here "
+                        "(no buffer clone support or RLIMIT_MEMLOCK too small)";
+    }
+    EXPECT_LE(PinnedKib(), pinned_before);
+}
+#endif
 
 TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
