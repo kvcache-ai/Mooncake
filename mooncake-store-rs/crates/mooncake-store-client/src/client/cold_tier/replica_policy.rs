@@ -1,7 +1,9 @@
 //! Provider-neutral replica placement and read load-balancing policy.
 
-// Ignore sub-object capacity noise without using a non-transitive epsilon comparator.
-const WRITE_SCORE_BUCKET_WIDTH: f64 = 1e-5;
+// Capacity snapshots are updated asynchronously. Treat sub-per-mille score drift as the same
+// tier so the process-local write counter, rather than a stale capacity sample, keeps equal-class
+// devices balanced. Material score and restore-load differences still win before this tie-breaker.
+const WRITE_SCORE_BUCKET_WIDTH: f64 = 1e-3;
 
 fn write_score_bucket(score: f64) -> i64 {
     if score.is_finite() {
@@ -152,6 +154,27 @@ mod tests {
                 target_id: "target-b",
                 score: 0.8,
                 accumulated_writes: 1,
+            },
+        ];
+
+        assert_eq!(
+            DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, 1),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn write_selection_ignores_stale_sub_per_mille_capacity_drift() {
+        let candidates = [
+            ReplicaWriteCandidate {
+                target_id: "target-a",
+                score: 0.800_3,
+                accumulated_writes: 54,
+            },
+            ReplicaWriteCandidate {
+                target_id: "target-b",
+                score: 0.8,
+                accumulated_writes: 0,
             },
         ];
 

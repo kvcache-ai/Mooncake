@@ -1740,9 +1740,10 @@ impl StorageOwnerState {
     }
 
     fn evict_background_batch(&self, bytes_to_reclaim: u64, batch_size: usize) -> Result<usize> {
-        if batch_size <= 1 || self.has_usable_cold_tier_device()? {
+        if batch_size <= 1 {
             return Ok(usize::from(self.evict_one_blocking(None)?));
         }
+        let has_usable_cold_tier_device = self.has_usable_cold_tier_device()?;
 
         let budget = self.hot_replicas.clock.lock().eviction_budget();
         let mut victims = Vec::with_capacity(batch_size.min(budget));
@@ -1771,13 +1772,32 @@ impl StorageOwnerState {
             .iter()
             .map(|victim| victim.route_key.clone())
             .collect::<Vec<_>>();
-        let routes = self.route_ops.load_routes_bounded(&keys)?;
+        let mut routes = self.route_ops.load_routes_bounded(&keys)?;
         if routes.len() != victims.len() {
             return Err(StoreError::InvalidState(format!(
                 "background eviction route lookup returned {} results for {} candidates",
                 routes.len(),
                 victims.len()
             )));
+        }
+        if has_usable_cold_tier_device {
+            let pending_routes = routes
+                .iter()
+                .filter_map(Option::as_ref)
+                .filter(|route| cold_tier::pending_persistent_backing(route).is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            if !pending_routes.is_empty() {
+                cold_tier::materialize_pending_offload_routes_bounded(self, &pending_routes)?;
+                routes = self.route_ops.load_routes_bounded(&keys)?;
+                if routes.len() != victims.len() {
+                    return Err(StoreError::InvalidState(format!(
+                        "background eviction route reload returned {} results for {} candidates",
+                        routes.len(),
+                        victims.len()
+                    )));
+                }
+            }
         }
 
         let mut reclaimed = 0usize;
@@ -1806,14 +1826,31 @@ impl StorageOwnerState {
                 || route.cold_backing.as_ref().is_some_and(|backing| {
                     backing.state == mooncake_store_core::ColdBackingState::PendingOffload
                 });
-            if route.state != RouteState::Active || !cold_backing_not_on_disk {
+            if route.state != RouteState::Active {
+                if self.evict_candidate(&victim)? {
+                    reclaimed = reclaimed.saturating_add(1);
+                }
+                continue;
+            }
+            if cold_backing_not_on_disk && has_usable_cold_tier_device {
+                if cold_tier::pending_persistent_backing(&route).is_some() {
+                    self.hot_replicas
+                        .clock
+                        .lock()
+                        .mark_hot_keys(std::slice::from_ref(&route.key));
+                    continue;
+                }
                 if self.evict_candidate(&victim)? {
                     reclaimed = reclaimed.saturating_add(1);
                 }
                 continue;
             }
 
-            let next = cold_tier::route_after_replica_eviction(&route, replica_index, true);
+            let next = cold_tier::route_after_replica_eviction(
+                &route,
+                replica_index,
+                cold_backing_not_on_disk,
+            );
             let Some(token) = self.begin_eviction(&victim, &route, replica_index, next.clone())?
             else {
                 continue;
@@ -2035,6 +2072,12 @@ impl StorageOwnerState {
             return Ok(true);
         }
         if self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)? > 0 {
+            return Ok(true);
+        }
+        if preferred_segment.is_none()
+            && self.has_usable_cold_tier_device()?
+            && self.evict_background_batch(u64::MAX, DEFAULT_OFFLOAD_MATERIALIZE_BATCH)? > 0
+        {
             return Ok(true);
         }
         if self.evict_one_blocking(preferred_segment)? {
