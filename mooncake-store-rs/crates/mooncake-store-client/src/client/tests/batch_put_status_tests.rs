@@ -186,14 +186,19 @@ impl RouteDirectory for BatchReplyFaultRouteDirectory {
 }
 
 fn assert_pending_publication_retains_allocation(storage: &StoreClient, route: &ObjectRoute) {
-    let replica = route.replicas.first().expect("published route should keep its replica");
+    let replica = route
+        .replicas
+        .first()
+        .expect("published route should keep its replica");
     assert_eq!(replica.owner, *storage.runtime_id());
     let pending = PendingPublication {
         identity: AllocationIdentity {
             segment_name: replica.segment_name.clone(),
             offset_bytes: replica.segment_offset,
             length_bytes: replica.length,
-            allocation_id: replica.allocation_id.expect("lifecycle route needs allocation id"),
+            allocation_id: replica
+                .allocation_id
+                .expect("lifecycle route needs allocation id"),
         },
     };
     let allocation = AllocationSpan {
@@ -202,12 +207,18 @@ fn assert_pending_publication_retains_allocation(storage: &StoreClient, route: &
         length_bytes: pending.identity.length_bytes,
     };
     let allocator = storage.allocator.lock();
-    assert_eq!(allocator.allocation_identity(&allocation), Some(pending.identity.clone()));
-    assert!(matches!(
-        allocator.pending_allocations.get(&allocation),
-        Some(PendingAllocation::Publication { allocation_id, .. })
-            if *allocation_id == pending.identity.allocation_id
-    ), "unknown publication must retain its exact pending allocation");
+    assert_eq!(
+        allocator.allocation_identity(&allocation),
+        Some(pending.identity.clone())
+    );
+    assert!(
+        matches!(
+            allocator.pending_allocations.get(&allocation),
+            Some(PendingAllocation::Publication { allocation_id, .. })
+                if *allocation_id == pending.identity.allocation_id
+        ),
+        "unknown publication must retain its exact pending allocation"
+    );
 }
 
 #[test]
@@ -304,7 +315,7 @@ fn routed_batch_statuses_retain_unknown_batch_outcomes_without_replay() {
 }
 
 #[test]
-fn routed_batch_statuses_abort_only_failed_quota_finalization() {
+fn routed_batch_statuses_preserve_pending_quota_after_finalize_failure() {
     let inner = Arc::new(InMemoryMetadataBackend::new());
     let scope = TenantPolicyScope::new("default", None::<String>, None::<String>);
     inner
@@ -349,8 +360,12 @@ fn routed_batch_statuses_abort_only_failed_quota_finalization() {
         .expect("quota should exist");
     assert_eq!(quota.used_bytes, 4);
     assert_eq!(quota.used_objects, 1);
-    assert_eq!(quota.pending_reserved_bytes, 0);
-    assert_eq!(quota.pending_reserved_objects, 0);
+    assert_eq!(quota.pending_reserved_bytes, 4);
+    assert_eq!(quota.pending_reserved_objects, 1);
+    assert!(writer
+        .query_route("a-failed")
+        .expect("published route lookup should succeed")
+        .is_some());
     assert_eq!(
         writer
             .get("b-success")

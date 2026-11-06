@@ -1675,10 +1675,6 @@ impl StoreClient {
                         Ok(Some(updated)) => updated,
                         Ok(None) => pending.route,
                         Err(error) => {
-                            let _ = self.abort_tenant_quota_reservation(
-                                pending.quota_reservation.as_ref(),
-                                "batch_put_finalize_failed",
-                            );
                             statuses.push(Err(error));
                             continue;
                         }
