@@ -892,27 +892,8 @@ struct PendingEviction {
     deferred: bool,
 }
 
-#[derive(Clone, Debug)]
-struct PendingDelete {
-    route_key: ObjectKey,
-    identity: AllocationIdentity,
-    confirmation_attempts: u32,
-    next_attempt_at_ms: u64,
-    confirmation_in_progress: bool,
-    deferred: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct PendingDeleteReady {
-    next_attempt_at_ms: u64,
-    identity: AllocationIdentity,
-}
-
-#[derive(Default)]
-struct PendingDeleteQueue {
-    entries: BTreeMap<AllocationIdentity, PendingDelete>,
-    ready: BTreeSet<PendingDeleteReady>,
-}
+type PendingDelete = ReclaimToken<AllocationIdentity>;
+type PendingDeleteQueue = ReclaimQueue<AllocationIdentity>;
 
 #[derive(Default)]
 struct RouteWriteGate {

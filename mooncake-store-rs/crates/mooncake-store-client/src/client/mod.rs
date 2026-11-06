@@ -117,6 +117,8 @@ include!("membership_sync.rs");
 include!("state_adapters.rs");
 include!("state_store.rs");
 include!("helpers.rs");
+mod reclaim;
+use reclaim::{ReclaimQueue, ReclaimToken};
 
 /// Cold tier persistent storage backend abstraction.
 /// Contains PersistentStorageBackend trait, LocalDir backend, and ColdTierBackendResolver.

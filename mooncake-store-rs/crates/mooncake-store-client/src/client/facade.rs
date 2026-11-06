@@ -368,6 +368,77 @@ impl StoreClient {
         }
     }
 
+
+
+    /// Prepare every lifecycle-capable allocation owner before deleting the route.
+    /// The same owner-local queue used by post-delete notifications is used as the
+    /// durable token store; `prepare_only` keeps a token alive while the old route
+    /// is still referenced and makes retries idempotent.
+    fn prepare_route_storage_reclaim(&self, route: &ObjectRoute) -> Result<()> {
+        let mut local = Vec::new();
+        let mut remote = BTreeMap::<ClientRuntimeId, Vec<DeletePendingEntry>>::new();
+        for replica in &route.replicas {
+            let Some(allocation_id) = replica.allocation_id.filter(|id| *id != 0) else {
+                continue;
+            };
+            let entry = DeletePendingEntry {
+                route_key: route.key.clone(),
+                identity: mooncake_store_core::AllocationRouteIdentity {
+                    owner: replica.owner.clone(),
+                    segment_name: replica.segment_name.clone(),
+                    offset_bytes: replica.segment_offset,
+                    length_bytes: replica.length,
+                    allocation_id,
+                },
+                reclaim_grace_ms: self.local_memory.reclaim_grace_ms,
+                prepare_only: true,
+                expected_route_version: Some(route.version),
+            };
+            match self.allocation_lifecycle_owner_mode(&replica.owner) {
+                AllocationLifecycleOwnerMode::Lifecycle if replica.owner == self.lease.runtime => {
+                    local.push(entry);
+                }
+                AllocationLifecycleOwnerMode::Lifecycle => {
+                    remote.entry(replica.owner.clone()).or_default().push(entry);
+                }
+                AllocationLifecycleOwnerMode::Legacy => {}
+                AllocationLifecycleOwnerMode::Unknown => {
+                    // Preserve the main-branch compatibility path while membership
+                    // refresh resolves the owner capability. The post-delete
+                    // notification path will hand off to a lifecycle owner when it
+                    // becomes known; no destructive release is performed here.
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        storage_owner = %replica.owner,
+                        key = %route.key.0,
+                        allocation_id,
+                        "deferring delete prepare until allocation-owner capability is known"
+                    );
+                }
+            }
+        }
+        if !local.is_empty() {
+            self.storage_owner.enqueue_delete_pending(&local)?;
+        }
+        for (owner, entries) in remote {
+            let lease = self.lookup_runtime_lease(&owner)?;
+            if !lease.compatibility.supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY) {
+                return Err(StoreError::Unsupported(format!(
+                    "allocation owner {} does not support owner-local delete reclaim",
+                    owner
+                )));
+            }
+            self.control_client.batch_notify_delete_pending(&lease, &entries)?;
+        }
+        Ok(())
+    }
+
+
+
+
+
+
+
     pub(super) fn remove_object_route_with_retry(
         &self,
         object_id: &LogicalObjectId,
@@ -388,8 +459,10 @@ impl StoreClient {
                 };
             };
             let has_nof = !self.storage_owner.cold_tier_devices.nof_targets.is_empty();
+            let has_cold_backing = route.cold_backing.is_some();
             if route.state != RouteState::Active
                 && !(has_nof && route.state == RouteState::Deleting)
+                && !(has_cold_backing && route.state == RouteState::Deleting)
             {
                 return if force {
                     Ok(())
@@ -399,6 +472,45 @@ impl StoreClient {
             }
 
             attempt = attempt.saturating_add(1);
+            if route.state == RouteState::Active {
+                self.prepare_route_storage_reclaim(&route)?;
+            }
+            if !has_nof && has_cold_backing {
+                if route.state == RouteState::Deleting {
+                    return Ok(());
+                }
+                let mut deleting = route.clone();
+                deleting.version = route.version.next();
+                deleting.state = RouteState::Deleting;
+                if let Some(backing) = deleting.cold_backing.as_mut() {
+                    backing.state = mooncake_store_core::ColdBackingState::PendingDelete;
+                }
+                let quota_reservation =
+                    self.reserve_tenant_quota_for_delete(object_id, object_key, &route)?;
+                let cas = self.route_ops().compare_and_swap_route(
+                    object_key,
+                    Some(route.version),
+                    Some(&deleting),
+                )?;
+                if cas.applied {
+                    self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
+                    self.storage_owner.sync_route(&deleting);
+                    return Ok(());
+                }
+                let _ = self.abort_tenant_quota_reservation(
+                    quota_reservation.as_ref(),
+                    "cold_route_delete_compare_and_swap_conflict",
+                );
+                current = self.retry_route_delete_conflict(
+                    &route,
+                    cas.current,
+                    force,
+                    attempt,
+                    tenant,
+                    key,
+                )?;
+                continue;
+            }
             if has_nof && route.state == RouteState::Active {
                 let mut deleting = route.clone();
                 deleting.version = route.version.next();
@@ -842,6 +954,8 @@ impl StoreClient {
                     allocation_id,
                 },
                 reclaim_grace_ms,
+                prepare_only: false,
+                expected_route_version: Some(route.version),
             };
             match self.allocation_lifecycle_owner_mode(&replica.owner) {
                 AllocationLifecycleOwnerMode::Lifecycle => {

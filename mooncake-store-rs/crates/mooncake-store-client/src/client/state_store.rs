@@ -11,6 +11,7 @@ const PENDING_DELETE_MAX_ENTRIES: usize = 4096;
 const PENDING_DELETE_RETRY_BASE_MS: u64 = 100;
 const PENDING_DELETE_RETRY_MAX_MS: u64 = 60_000;
 const PENDING_DELETE_WARN_AFTER_ATTEMPTS: u32 = 10;
+const PENDING_DELETE_RECLAIM_PREPARE_TTL_MS: u64 = 60_000;
 const STALE_CANDIDATE_RECONCILE_MIN_INTERVAL_MS: u64 = 100;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1322,30 +1323,9 @@ impl StorageOwnerState {
 
             let accepted_delete_pending = {
                 let mut pending = self.pending_deletes.lock();
-                let next_attempt_at_ms = now_ms.saturating_add(entry.reclaim_grace_ms);
-                if let Some(existing_next_attempt_at_ms) = pending
-                    .entries
-                    .get(&identity)
-                    .map(|existing| existing.next_attempt_at_ms)
+                if !pending.entries.contains_key(&identity)
+                    && pending.entries.len() >= PENDING_DELETE_MAX_ENTRIES
                 {
-                    if next_attempt_at_ms < existing_next_attempt_at_ms {
-                        pending.ready.remove(&PendingDeleteReady {
-                            next_attempt_at_ms: existing_next_attempt_at_ms,
-                            identity: identity.clone(),
-                        });
-                        pending
-                            .entries
-                            .get_mut(&identity)
-                            .expect("pending delete entry must remain present while locked")
-                            .next_attempt_at_ms = next_attempt_at_ms;
-                        pending.ready.insert(PendingDeleteReady {
-                            next_attempt_at_ms,
-                            identity: identity.clone(),
-                        });
-                        self.refresh_pending_delete_next_due_at_ms(&pending);
-                    }
-                    true
-                } else if pending.entries.len() >= PENDING_DELETE_MAX_ENTRIES {
                     debug!(
                         runtime = %self.runtime,
                         limit = PENDING_DELETE_MAX_ENTRIES,
@@ -1353,21 +1333,19 @@ impl StorageOwnerState {
                     );
                     false
                 } else {
-                    pending.ready.insert(PendingDeleteReady {
-                        next_attempt_at_ms,
+                    pending.insert(PendingDelete {
+                        route_key: entry.route_key.clone(),
                         identity: identity.clone(),
+                        grace_ms: entry.reclaim_grace_ms,
+                        expected_route_version: entry.expected_route_version,
+                        prepare_only: entry.prepare_only,
+                        prepared_at_ms: now_ms,
+                        confirmed_absent_at_ms: None,
+                        confirmation_attempts: 0,
+                        next_attempt_at_ms: now_ms.saturating_add(entry.reclaim_grace_ms),
+                        confirmation_in_progress: false,
+                        deferred: false,
                     });
-                    pending.entries.insert(
-                        identity.clone(),
-                        PendingDelete {
-                            route_key: entry.route_key.clone(),
-                            identity: identity.clone(),
-                            confirmation_attempts: 0,
-                            next_attempt_at_ms,
-                            confirmation_in_progress: false,
-                            deferred: false,
-                        },
-                    );
                     self.refresh_pending_delete_next_due_at_ms(&pending);
                     true
                 }
@@ -1411,84 +1389,32 @@ impl StorageOwnerState {
 
     fn claim_due_pending_deletes(&self, now_ms: u64, limit: usize) -> Vec<PendingDelete> {
         let mut pending = self.pending_deletes.lock();
-        let mut claimed = Vec::with_capacity(limit);
-        while claimed.len() < limit.max(1) {
-            let Some(ready) = pending.ready.first().cloned() else {
-                break;
-            };
-            if ready.next_attempt_at_ms > now_ms {
-                break;
-            }
-            pending.ready.pop_first();
-            if let Some(entry) = pending.entries.get_mut(&ready.identity) {
-                if entry.next_attempt_at_ms == ready.next_attempt_at_ms
-                    && !entry.confirmation_in_progress
-                {
-                    entry.confirmation_in_progress = true;
-                    claimed.push(entry.clone());
-                }
-            }
-        }
+        let claimed = pending.claim_due(now_ms, limit);
         self.refresh_pending_delete_next_due_at_ms(&pending);
         claimed
     }
 
     fn complete_pending_delete(&self, identity: &AllocationIdentity) {
         let mut pending = self.pending_deletes.lock();
-        if let Some(entry) = pending.entries.remove(identity) {
-            pending.ready.remove(&PendingDeleteReady {
-                next_attempt_at_ms: entry.next_attempt_at_ms,
-                identity: identity.clone(),
-            });
-        }
+        pending.complete(identity);
         self.refresh_pending_delete_next_due_at_ms(&pending);
     }
 
     fn defer_pending_delete(&self, identity: &AllocationIdentity, reason: &str) {
         let now_ms = now_ms();
-        let (_next_attempt_at_ms, attempts, became_deferred) = {
+        let (attempts, became_deferred) = {
             let mut pending = self.pending_deletes.lock();
-            let Some(previous_next_attempt_at_ms) = pending
-                .entries
-                .get(identity)
-                .map(|entry| entry.next_attempt_at_ms)
-            else {
+            let Some((_, attempts, became_deferred)) = pending.defer(
+                identity,
+                now_ms,
+                PENDING_DELETE_RETRY_BASE_MS,
+                PENDING_DELETE_RETRY_MAX_MS,
+                PENDING_DELETE_WARN_AFTER_ATTEMPTS,
+            ) else {
                 return;
             };
-            pending.ready.remove(&PendingDeleteReady {
-                next_attempt_at_ms: previous_next_attempt_at_ms,
-                identity: identity.clone(),
-            });
-            let (next_attempt_at_ms, attempts, became_deferred) = {
-                let entry = pending
-                    .entries
-                    .get_mut(identity)
-                    .expect("pending delete entry must remain present while locked");
-                entry.confirmation_in_progress = false;
-                entry.confirmation_attempts = entry.confirmation_attempts.saturating_add(1);
-                let exponent = entry.confirmation_attempts.saturating_sub(1).min(9);
-                let delay_ms = PENDING_DELETE_RETRY_BASE_MS
-                    .saturating_mul(1u64 << exponent)
-                    .min(PENDING_DELETE_RETRY_MAX_MS);
-                entry.next_attempt_at_ms = now_ms.saturating_add(delay_ms);
-                let became_deferred = entry.confirmation_attempts
-                    >= PENDING_DELETE_WARN_AFTER_ATTEMPTS
-                    && !entry.deferred;
-                if became_deferred {
-                    entry.deferred = true;
-                }
-                (
-                    entry.next_attempt_at_ms,
-                    entry.confirmation_attempts,
-                    became_deferred,
-                )
-            };
-            pending.ready.insert(PendingDeleteReady {
-                next_attempt_at_ms,
-                identity: identity.clone(),
-            });
             self.refresh_pending_delete_next_due_at_ms(&pending);
-            (next_attempt_at_ms, attempts, became_deferred)
+            (attempts, became_deferred)
         };
         if became_deferred {
             warn!(
@@ -1567,6 +1493,18 @@ impl StorageOwnerState {
         for (entry, reference) in pending.iter().zip(references) {
             match reference.state {
                 mooncake_store_core::AllocationRouteReferenceState::Absent => {
+                    let now = now_ms();
+                    let grace_until = self
+                        .pending_deletes
+                        .lock()
+                        .mark_absent(&entry.identity, now, 0)
+                        .unwrap_or(now);
+                    if now < grace_until {
+                        let mut pending = self.pending_deletes.lock();
+                        pending.reschedule(&entry.identity, grace_until);
+                        self.refresh_pending_delete_next_due_at_ms(&pending);
+                        continue;
+                    }
                     if self
                         .read_pin_registry
                         .is_pinned(&entry.identity.segment_name, entry.identity.offset_bytes)
@@ -1622,6 +1560,9 @@ impl StorageOwnerState {
                     }
                 }
                 mooncake_store_core::AllocationRouteReferenceState::Exact => {
+                    self.pending_deletes
+                        .lock()
+                        .clear_absent(&entry.identity);
                     let Some(route_key) = reference.route_key else {
                         self.defer_pending_delete(
                             &entry.identity,
@@ -1646,7 +1587,17 @@ impl StorageOwnerState {
                     {
                         Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
                             self.track_route(&route);
-                            self.complete_pending_delete(&entry.identity);
+                            let prepared_expired = entry.prepare_only
+                                && now_ms().saturating_sub(entry.prepared_at_ms)
+                                    >= PENDING_DELETE_RECLAIM_PREPARE_TTL_MS;
+                            if entry.prepare_only && !prepared_expired {
+                                self.defer_pending_delete(
+                                    &entry.identity,
+                                    "prepared delete still references old route",
+                                );
+                            } else {
+                                self.complete_pending_delete(&entry.identity);
+                            }
                             registry::record_eviction_guard_event("delete_pending", "retained");
                         }
                         Ok(mooncake_store_core::RouteReplicaReference::Absent) => {
@@ -1670,6 +1621,9 @@ impl StorageOwnerState {
                     }
                 }
                 mooncake_store_core::AllocationRouteReferenceState::Conflict => {
+                    self.pending_deletes
+                        .lock()
+                        .clear_absent(&entry.identity);
                     self.defer_pending_delete(
                         &entry.identity,
                         "delete reference authorities disagree",

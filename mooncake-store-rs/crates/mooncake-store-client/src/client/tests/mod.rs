@@ -20507,6 +20507,8 @@ fn delete_pending_releases_absent_exact_identity() {
             allocation_id: reservation.allocation_id,
         },
         reclaim_grace_ms: 0,
+        prepare_only: false,
+        expected_route_version: None,
     };
 
     assert_eq!(
@@ -20577,6 +20579,8 @@ fn delete_pending_queue_backpressure_preserves_pending_publication_recovery() {
             allocation_id: identity.allocation_id,
         },
         reclaim_grace_ms: 0,
+        prepare_only: false,
+        expected_route_version: None,
     };
 
     {
@@ -20593,10 +20597,15 @@ fn delete_pending_queue_backpressure_preserves_pending_publication_recovery() {
                 PendingDelete {
                     route_key: ObjectKey::new(format!("default::queue-fill-{index}")),
                     identity: queued_identity,
+                    grace_ms: 0,
+                    expected_route_version: None,
+                    prepared_at_ms: 0,
+                    confirmed_absent_at_ms: None,
                     confirmation_attempts: 0,
                     next_attempt_at_ms: u64::MAX,
                     confirmation_in_progress: false,
                     deferred: false,
+                    prepare_only: false,
                 },
             );
         }
@@ -20663,6 +20672,8 @@ fn delete_pending_force_notification_overrides_grace_without_blind_release() {
             allocation_id: reservation.allocation_id,
         },
         reclaim_grace_ms: 60_000,
+        prepare_only: false,
+        expected_route_version: None,
     };
 
     client
@@ -20763,6 +20774,8 @@ fn delete_pending_retains_republished_exact_identity() {
             allocation_id: reservation.allocation_id,
         },
         reclaim_grace_ms: 0,
+        prepare_only: false,
+        expected_route_version: None,
     };
 
     client

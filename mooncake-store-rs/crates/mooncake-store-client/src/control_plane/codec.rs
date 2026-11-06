@@ -136,6 +136,8 @@ pub(super) fn pb_delete_pending_entry(entry: &DeletePendingEntry) -> pb::DeleteP
         route_key: entry.route_key.0.clone(),
         identity: Some(pb_allocation_route_identity(&entry.identity)),
         reclaim_grace_ms: entry.reclaim_grace_ms,
+        prepare_only: entry.prepare_only,
+        expected_route_version: entry.expected_route_version.map(|version| version.0),
     }
 }
 
@@ -158,6 +160,10 @@ pub(super) fn try_delete_pending_entry(
         route_key: ObjectKey::new(entry.route_key),
         identity,
         reclaim_grace_ms: entry.reclaim_grace_ms,
+        prepare_only: entry.prepare_only,
+        expected_route_version: entry
+            .expected_route_version
+            .map(mooncake_store_core::RouteVersion),
     })
 }
 
