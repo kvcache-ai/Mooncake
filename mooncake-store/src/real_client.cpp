@@ -4070,7 +4070,7 @@ RealClient::get_buffer_internal(
     auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        return tl::make_unexpected(ErrorCode::CLIENT_BUFFER_EXHAUSTED);
     }
 
     auto buffer_handle =

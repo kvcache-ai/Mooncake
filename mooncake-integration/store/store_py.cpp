@@ -680,7 +680,7 @@ class MooncakeStorePyWrapper {
             if (real_client_) {
                 auto result = real_client_->get_buffer_with_error(key);
                 if (!result &&
-                    result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+                    result.error() == ErrorCode::CLIENT_BUFFER_EXHAUSTED) {
                     throw std::bad_alloc();
                 }
                 if (result) {
