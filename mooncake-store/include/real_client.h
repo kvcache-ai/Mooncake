@@ -351,6 +351,14 @@ class RealClient : public PyClient {
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     /**
+     * @brief Get a buffer while preserving the failure reason for API adapters
+     * @param key Key to get data for
+     * @return Buffer on success, or the corresponding error code
+     */
+    tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>
+    get_buffer_with_error(const std::string &key);
+
+    /**
      * @brief Get buffers containing the data for multiple keys (batch version)
      * @param keys Vector of keys to get data for
      * @return Vector of std::shared_ptr<BufferHandle> buffers containing the
@@ -896,7 +904,7 @@ class RealClient : public PyClient {
         const std::string &key, const Replica::Descriptor &local_disk_replica,
         const std::optional<std::string> &resolved_tenant_id = std::nullopt);
 
-    std::shared_ptr<BufferHandle> get_buffer_internal(
+    tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> get_buffer_internal(
         const std::string &key,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr,

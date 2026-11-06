@@ -1312,6 +1312,7 @@ def get(self, key: str) -> bytes
 
 **Raises:**
 - Returns empty bytes if key doesn't exist
+- `MemoryError`: The object exists, but the client buffer pool cannot allocate space for another `get()` buffer. Use `get_into()` with caller-owned storage, or release retained `get_buffer()` handles before retrying.
 
 **Example:**
 
