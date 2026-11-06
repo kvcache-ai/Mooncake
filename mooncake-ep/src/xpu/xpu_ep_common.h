@@ -105,6 +105,8 @@ inline size_t dispatch_msg_bytes(int hidden, bool use_fp8);
 //   outbox[R][T]            this rank's messages for each remote rank, in
 //                           that rank's token-list order
 // Offsets follow the BF16 message size, so FP8 and BF16 calls share a layout.
+// Within local_stage and outbox, messages are packed at the call's own size,
+// so an FP8 dispatch writes half the bytes over RDMA.
 struct DispatchLanding {
     size_t counts, lists, rank_list, picks, bytes;
     DispatchLanding(int T, int num_local) {

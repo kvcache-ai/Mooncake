@@ -232,7 +232,6 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
     const size_t msg_bytes = dispatch_msg_bytes(a.hidden, kUseFP8);
     const DispatchStaging st(a.hidden, a.num_max_dispatch_tokens_per_rank,
                              a.num_experts, a.num_ranks);
-    const size_t stage_bytes = dispatch_msg_bytes(a.hidden, false);
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int, 1> s_last(1, h);
         // Hybrid: the remote ranks the current token goes to, as
@@ -333,7 +332,7 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                             const size_t dst = s_out[i] & 0xffff;
                             const size_t pos = s_out[i] >> 16;
                             coop_copy(a.staging + st.outbox +
-                                          (dst * T + pos) * stage_bytes,
+                                          (dst * T + pos) * msg_bytes,
                                       msg, msg_bytes, tid, kWGSize);
                         }
                         sycl::group_barrier(it.get_group());
@@ -384,7 +383,6 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
     // it pulls, and the source's flag carries the token count.
     const int num_local = a.num_experts / a.num_ranks;
     const size_t msg_bytes = dispatch_msg_bytes(a.hidden, kUseFP8);
-    const size_t stage_bytes = dispatch_msg_bytes(a.hidden, false);
     const size_t hidden_bytes =
         kUseFP8 ? a.hidden : static_cast<size_t>(a.hidden) * kBf16Size;
     const DispatchStaging st(a.hidden, a.num_max_dispatch_tokens_per_rank,
@@ -466,9 +464,8 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                     sg, list0 && lane == 0 ? counts[le0] : 0, 0);
                 const int list0_lane = lane < cnt0 ? list0[lane] : 0;
 
-                uint8_t* stage =
-                    a.staging + st.local_stage +
-                    static_cast<size_t>(src_rank) * T * stage_bytes;
+                uint8_t* stage = a.staging + st.local_stage +
+                                 static_cast<size_t>(src_rank) * T * msg_bytes;
                 const int pick_ints = 2 * a.num_topk;
                 for (int i = 0, p = warp; p < n; ++i, p += kNumWarps) {
                     const int tok =
@@ -487,7 +484,7 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                             pick_b = picks[lane + kWarpSize];
                     }
                     if (!pushed)
-                        coop_pull(stage + p * stage_bytes,
+                        coop_pull(stage + p * msg_bytes,
                                   src + (tok & 0xffff) * msg_bytes, msg_bytes,
                                   lane, kWarpSize);
                     if (a.recv.count) {
@@ -529,7 +526,7 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                             lane_e = j + lane < cnt ? list[j + lane] : 0;
                         const int e =
                             sycl::select_from_group(sg, lane_e, j % kWarpSize);
-                        const uint8_t* msg = stage + (e >> 16) * stage_bytes;
+                        const uint8_t* msg = stage + (e >> 16) * msg_bytes;
                         const size_t row =
                             static_cast<size_t>(le) * slots + begin + j;
                         if (lane == 0) a.packed_recv_src_info[row] = e & 0xffff;
@@ -854,7 +851,7 @@ std::vector<ProxyPut> dispatch_puts(const DispatchArgs& a, const void* base,
     // list and picks dispatch_recv would have read from this staging.
     const DispatchStaging st(a.hidden, a.num_max_dispatch_tokens_per_rank,
                              a.num_experts, a.num_ranks);
-    const uint64_t stage_bytes = dispatch_msg_bytes(a.hidden, false);
+    const uint64_t msg_bytes = dispatch_msg_bytes(a.hidden, a.use_fp8);
     const uint64_t t = a.num_max_dispatch_tokens_per_rank;
     const uint64_t local = a.num_experts / a.num_ranks;
     const uint64_t pick_bytes = kTopkShadowMaxTopk * 2 * sizeof(int32_t);
@@ -870,9 +867,8 @@ std::vector<ProxyPut> dispatch_puts(const DispatchArgs& a, const void* base,
             if (bytes)
                 puts.push_back({b, from, to, static_cast<uint32_t>(bytes), 0});
         };
-        put(staging + st.outbox + b * t * stage_bytes,
-            staging + st.local_stage + a.rank * t * stage_bytes,
-            n * stage_bytes);
+        put(staging + st.outbox + b * t * msg_bytes,
+            staging + st.local_stage + a.rank * t * msg_bytes, n * msg_bytes);
         put(staging + st.counts + b * local * sizeof(int),
             land + st.land.counts, local * sizeof(int));
         put(staging + st.lists + b * local * t * sizeof(int),
