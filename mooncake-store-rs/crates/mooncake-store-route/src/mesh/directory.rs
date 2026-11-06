@@ -2024,11 +2024,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             .iter()
             .take(self.route_topk)
             .filter_map(|authority| {
-                authority_get_delete_marker(
-                    &self.namespace,
-                    &authority.runtime.stable_id,
-                    key,
-                )
+                authority_get_delete_marker(&self.namespace, &authority.runtime.stable_id, key)
             })
             .max()
     }

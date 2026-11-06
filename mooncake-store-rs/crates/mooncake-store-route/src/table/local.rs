@@ -417,11 +417,7 @@ impl LocalRouteTable {
         }
     }
 
-    fn delete_marker_blocks_insert(
-        &self,
-        key: &ObjectKey,
-        next: Option<&ObjectRoute>,
-    ) -> bool {
+    fn delete_marker_blocks_insert(&self, key: &ObjectKey, next: Option<&ObjectRoute>) -> bool {
         let Some(route) = next else {
             return false;
         };
