@@ -321,7 +321,7 @@ impl LocalRouteTable {
         let current = self.get(key);
         let marker = self.delete_marker(key);
         let matches = match (expected, current.as_ref(), marker) {
-            (None, None, None) => true,
+            (None, None, _) => true,
             (Some(version), Some(route), _) => route.version == version,
             (Some(version), None, Some(marker)) => marker == version,
             _ => false,
@@ -752,6 +752,28 @@ mod tests {
 
         assert_eq!(table.get(&key), None);
         assert_eq!(table.delete_marker(&key), Some(RouteVersion(4)));
+    }
+
+    #[test]
+    fn unconditional_insert_above_delete_marker_is_allowed() {
+        let key = ObjectKey::new("marker-initial-insert".to_string());
+        let mut table = LocalRouteTable::default();
+        table.replace_many(&[RouteCasRequest {
+            key: key.clone(),
+            expected: Some(RouteVersion(4)),
+            next: None,
+        }]);
+
+        let stale = test_route(&key, 4);
+        let stale_result = table.compare_and_swap(&key, None, Some(&stale));
+        assert!(!stale_result.applied);
+        assert_eq!(stale_result.delete_version, Some(RouteVersion(4)));
+
+        let newer = test_route(&key, 5);
+        let newer_result = table.compare_and_swap(&key, None, Some(&newer));
+        assert!(newer_result.applied);
+        assert_eq!(table.get(&key), Some(newer));
+        assert_eq!(table.delete_marker(&key), None);
     }
 
     #[test]
