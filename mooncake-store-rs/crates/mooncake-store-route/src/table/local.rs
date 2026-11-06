@@ -327,6 +327,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg".to_string()),
+                allocation_id: None,
                 segment_offset: 0,
                 length: 100,
                 checksum: Some(42),

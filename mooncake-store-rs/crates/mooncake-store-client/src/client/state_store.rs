@@ -609,6 +609,7 @@ mod state_store_tests {
             replicas: vec![ReplicaRoute {
                 owner: runtime.clone(),
                 segment_name: SegmentName("seg-0".to_string()),
+                allocation_id: None,
                 offset: Some(0),
                 segment_offset: 0,
                 length: 1024,
@@ -1360,6 +1361,7 @@ impl StorageOwnerState {
                 &evicted_replica.segment_name,
                 evicted_replica.segment_offset + length_bytes,
                 excess,
+                0,
             )?;
         }
         if let Some(next) = &next {
@@ -1379,6 +1381,7 @@ impl StorageOwnerState {
             segment_name: evicted_replica.segment_name,
             offset_bytes: evicted_replica.segment_offset,
             length_bytes,
+            allocation_id: evicted_replica.allocation_id.unwrap_or(0),
         }))
     }
 
@@ -1507,6 +1510,7 @@ impl StorageOwnerState {
                     &allocation.segment_name,
                     allocation.offset_bytes,
                     allocation.length_bytes,
+                    0,
                 )?;
             }
             releasable
@@ -1658,6 +1662,7 @@ impl StorageOwnerState {
             &evicted_replica.segment_name,
             evicted_replica.segment_offset,
             evicted_replica.length,
+            evicted_replica.allocation_id.unwrap_or(0),
         ) {
             if is_missing_live_allocation_error(&error) {
                 warn!(
@@ -1754,6 +1759,7 @@ fn is_missing_live_allocation_error(error: &StoreError) -> bool {
         error,
         StoreError::Allocator(message)
             if message.contains("segment release missing live allocation")
+                || message.contains("segment release stale allocation generation")
     )
 }
 
@@ -1880,6 +1886,7 @@ impl StorageClockState {
             self.upsert_replica(
                 route,
                 &ReplicaRoute {
+            allocation_id: None,
                     owner: owner.clone(),
                     segment_name: nof_backing_clock_segment(target_id),
                     offset: None,

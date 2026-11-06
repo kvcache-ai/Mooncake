@@ -161,6 +161,7 @@ pub(super) fn pb_replica_route(replica: &ReplicaRoute) -> pb::ReplicaRoute {
     pb::ReplicaRoute {
         owner: Some(pb_runtime_id(&replica.owner)),
         segment_name: replica.segment_name.0.clone(),
+        allocation_id: replica.allocation_id,
         offset: replica.offset,
         segment_offset: replica.segment_offset,
         length: replica.length,
@@ -188,6 +189,7 @@ pub(super) fn try_replica_route(replica: pb::ReplicaRoute) -> Result<ReplicaRout
     Ok(ReplicaRoute {
         owner,
         segment_name: SegmentName::new(replica.segment_name),
+        allocation_id: replica.allocation_id,
         offset: replica.offset,
         segment_offset: replica.segment_offset,
         length: replica.length,
@@ -297,6 +299,7 @@ pub(super) fn pb_segment_reservation(reservation: &SegmentReservation) -> pb::Se
         segment_name: reservation.segment_name.0.clone(),
         offset_bytes: reservation.offset_bytes,
         length_bytes: reservation.length_bytes,
+        allocation_id: reservation.allocation_id,
     }
 }
 
@@ -316,5 +319,6 @@ pub(super) fn try_segment_reservation(
         segment_name: SegmentName::new(reservation.segment_name),
         offset_bytes: reservation.offset_bytes,
         length_bytes: reservation.length_bytes,
+        allocation_id: reservation.allocation_id,
     })
 }

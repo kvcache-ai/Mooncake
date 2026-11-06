@@ -108,6 +108,8 @@ pub struct ReplicaRoute {
     pub owner: ClientRuntimeId,
     pub segment_name: SegmentName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
     #[serde(default)]
     pub segment_offset: u64,
@@ -185,6 +187,8 @@ pub struct SegmentReservation {
     pub segment_name: SegmentName,
     pub offset_bytes: u64,
     pub length_bytes: u64,
+    #[serde(default)]
+    pub allocation_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -763,8 +767,9 @@ mod tests {
     use super::{
         default_segment_alignment_bytes, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
         RoutePolicy, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-        SegmentName, SegmentTargetChunk, TenantObjectAccountingState, TenantPolicyScope,
-        TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantRoutePolicy,
+        SegmentName, SegmentReservation, SegmentTargetChunk, TenantObjectAccountingState,
+        TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
+        TenantRoutePolicy,
     };
     use crate::NamespaceScope;
     use crate::{
@@ -1214,6 +1219,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("node", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg"),
+                allocation_id: Some(42),
                 offset: Some(0),
                 segment_offset: 0,
                 length: 1024,
@@ -1255,7 +1261,21 @@ mod tests {
 
         let decoded: ObjectRoute = serde_json::from_str(encoded).unwrap();
         assert_eq!(decoded.replicas[0].offset, None);
+        assert_eq!(decoded.replicas[0].allocation_id, None);
         assert_eq!(decoded.replicas[0].segment_offset, 64);
+    }
+
+    #[test]
+    fn segment_reservation_serde_accepts_legacy_payload_without_allocation_id() {
+        let encoded = r#"{
+            "owner":{"stable_id":"node","epoch":1},
+            "segment_name":"seg",
+            "offset_bytes":64,
+            "length_bytes":16
+        }"#;
+
+        let decoded: SegmentReservation = serde_json::from_str(encoded).unwrap();
+        assert_eq!(decoded.allocation_id, 0);
     }
 
     #[test]

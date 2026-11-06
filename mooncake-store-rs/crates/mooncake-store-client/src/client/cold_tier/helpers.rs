@@ -278,6 +278,7 @@ pub(in super::super) fn cold_backing_placeholder(
     ReplicaRoute {
         owner: cold_backing.owner.clone(),
         segment_name: SegmentName::new("__cold_backing__"),
+        allocation_id: None,
         offset: None,
         segment_offset: 0,
         length: cold_backing.length,

@@ -444,7 +444,7 @@ impl StoreClient {
             )?;
         }
         self.ensure_local_memory()?;
-        self.flush_due_reclaims()?;
+        self.flush_due_reclaims_best_effort();
         self.validate_unique_requests(requests)?;
         let transport = self.transport()?;
         let planner = self.request_placement_planner();
@@ -490,7 +490,7 @@ impl StoreClient {
         };
         let (routes, prepared) = loop {
             write_attempt = write_attempt.saturating_add(1);
-            self.flush_due_reclaims()?;
+            self.flush_due_reclaims_best_effort();
 
             let rank_tracker = OperationTracker::new("batch_put_stage_rank");
             let rank_result = planner.rank_many(self, &object_refs);
@@ -1124,6 +1124,7 @@ impl StoreClient {
                             replicas.push(ReplicaRoute {
                                 owner: target.storage_runtime.clone(),
                                 segment_name: target.segment_name.clone(),
+                                allocation_id: Some(reservation.allocation_id),
                                 offset: Some(offset),
                                 segment_offset: reservation.offset_bytes,
                                 length: entry.value_len as u64,

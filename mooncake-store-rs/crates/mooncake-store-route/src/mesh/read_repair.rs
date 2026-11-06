@@ -201,6 +201,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg".to_string()),
+                allocation_id: None,
                 segment_offset: 0,
                 length: 100,
                 checksum: Some(42),
@@ -227,6 +228,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("other-owner", ClientEpoch(1)),
                 segment_name: SegmentName::new("other-seg".to_string()),
+                allocation_id: None,
                 segment_offset: 0,
                 length: 200,
                 checksum: Some(99),
@@ -330,6 +332,25 @@ mod tests {
             "",
         );
         assert_eq!(current.unwrap().version, RouteVersion(1));
+    }
+
+    #[test]
+    fn merge_fresher_route_preserves_allocation_generation_over_legacy_copy() {
+        let mut legacy = test_route("key", 1);
+        legacy.replicas[0].allocation_id = None;
+        let mut generated = legacy.clone();
+        generated.replicas[0].allocation_id = Some(7);
+
+        let mut current = Some(legacy);
+        merge_fresher_route(
+            &mut current,
+            generated,
+            "auth-a",
+            &ObjectKey::new("key".to_string()),
+            "",
+        );
+
+        assert_eq!(current.unwrap().replicas[0].allocation_id, Some(7));
     }
 
     #[test]

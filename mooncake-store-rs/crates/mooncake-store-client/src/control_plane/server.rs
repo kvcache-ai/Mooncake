@@ -1055,6 +1055,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     &SegmentName::new(request.segment_name),
                     request.offset_bytes,
                     request.length_bytes,
+                    request.allocation_id,
                 )
             }) {
             Ok(()) => pb::ReleaseReply { error: None },
@@ -1086,6 +1087,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 segment_name: SegmentName::new(entry.segment_name),
                 offset_bytes: entry.offset_bytes,
                 length_bytes: entry.length_bytes,
+                allocation_id: entry.allocation_id,
             })
             .collect::<Vec<_>>();
         let replies = self

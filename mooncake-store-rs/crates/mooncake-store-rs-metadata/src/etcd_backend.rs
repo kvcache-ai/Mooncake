@@ -2785,6 +2785,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: sample_runtime(),
                 segment_name: SegmentName::new("segment-a"),
+                allocation_id: None,
                 offset: Some(32),
                 segment_offset: 32,
                 length: 12,

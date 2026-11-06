@@ -290,6 +290,7 @@ impl AllocatorService for LocalAllocatorAdapter {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> Result<()> {
         if *owner != self.runtime {
             return Err(StoreError::InvalidState(format!(
@@ -299,7 +300,13 @@ impl AllocatorService for LocalAllocatorAdapter {
         }
         self.allocator
             .lock()
-            .release(owner, segment_name, offset_bytes, length_bytes)
+            .release(
+                owner,
+                segment_name,
+                offset_bytes,
+                length_bytes,
+                allocation_id,
+            )
     }
 
     fn batch_reserve_any(
@@ -375,6 +382,7 @@ impl AllocatorService for LocalAllocatorAdapter {
                     &request.segment_name,
                     request.offset_bytes,
                     request.length_bytes,
+                    request.allocation_id,
                 )
             })
             .collect()

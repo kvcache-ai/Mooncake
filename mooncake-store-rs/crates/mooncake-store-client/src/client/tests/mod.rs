@@ -187,6 +187,7 @@ impl AllocatorService for StaticAllocatorAdapter {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> mooncake_store_core::Result<()> {
         if *owner != self.runtime {
             return Err(StoreError::InvalidState(format!(
@@ -194,9 +195,13 @@ impl AllocatorService for StaticAllocatorAdapter {
                 owner, self.runtime
             )));
         }
-        self.allocator
-            .lock()
-            .release(owner, segment_name, offset_bytes, length_bytes)
+        self.allocator.lock().release(
+            owner,
+            segment_name,
+            offset_bytes,
+            length_bytes,
+            allocation_id,
+        )
     }
 }
 
@@ -3899,6 +3904,7 @@ fn remove_retries_after_route_delete_conflict_with_partial_multi_replica_handoff
             ReplicaRoute {
                 owner: owner_a_v1.clone(),
                 segment_name: SegmentName::new("multi-replica-store-a-segment-v1"),
+                allocation_id: None,
                 offset: Some(1024),
                 segment_offset: 0,
                 length: 7,
@@ -3909,6 +3915,7 @@ fn remove_retries_after_route_delete_conflict_with_partial_multi_replica_handoff
             ReplicaRoute {
                 owner: owner_b_v1.clone(),
                 segment_name: SegmentName::new("multi-replica-store-b-segment-v1"),
+                allocation_id: None,
                 offset: Some(2048),
                 segment_offset: 0,
                 length: 7,
@@ -6545,6 +6552,7 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
     let replica = ReplicaRoute {
         owner: store.runtime_id().clone(),
         segment_name: SegmentName::new("deadline-store-segment"),
+        allocation_id: None,
         offset: Some(0),
         segment_offset: 0,
         length: 4,
@@ -8704,6 +8712,7 @@ fn routed_batch_put_from_uses_bounded_recheck_for_empty_conflict() {
         replicas: vec![ReplicaRoute {
             owner: storage.runtime_id().clone(),
             segment_name: segment,
+            allocation_id: None,
             offset: Some(0),
             segment_offset: 0,
             length: 32,
@@ -11462,6 +11471,7 @@ fn eviction_stale_prepass_respects_pending_window_before_reclaiming_orphans() {
             segment_name: stale_route.replicas[0].segment_name.clone(),
             offset_bytes: stale_route.replicas[0].segment_offset,
             length_bytes: stale_route.replicas[0].length,
+            allocation_id: 0,
         },
         now_ms().saturating_add(60_000),
     );
@@ -11543,6 +11553,7 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
         replicas: vec![ReplicaRoute {
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
+            allocation_id: None,
             offset: Some(reservation.offset_bytes),
             segment_offset: reservation.offset_bytes,
             length: reservation.length_bytes,
@@ -11575,6 +11586,7 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
         replicas: vec![ReplicaRoute {
             owner: ClientRuntimeId::new("mixed-pending-successor", ClientEpoch(1)),
             segment_name: SegmentName::new("mixed-pending-successor-segment"),
+            allocation_id: None,
             offset: Some(0),
             segment_offset: 0,
             length: 16,
@@ -15075,6 +15087,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
             &primary,
             single_reservation.offset_bytes,
             single_reservation.length_bytes,
+            single_reservation.allocation_id,
         )
         .expect("single allocator release should succeed");
     let wrong_owner = ClientRuntimeId::new("wrong-owner", ClientEpoch(9));
@@ -15087,7 +15100,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         Err(StoreError::InvalidState(_))
     ));
     assert!(matches!(
-        local_allocator.release(&wrong_owner, &primary, 0, 8),
+        local_allocator.release(&wrong_owner, &primary, 0, 8, 0),
         Err(StoreError::InvalidState(_))
     ));
 
@@ -15220,16 +15233,19 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
                     segment_name: rpc_reservations[0].segment_name.clone(),
                     offset_bytes: rpc_reservations[0].offset_bytes,
                     length_bytes: rpc_reservations[0].length_bytes,
+                    allocation_id: rpc_reservations[0].allocation_id,
                 },
                 ReleaseOp {
                     segment_name: rpc_reservations[1].segment_name.clone(),
                     offset_bytes: rpc_reservations[1].offset_bytes,
                     length_bytes: rpc_reservations[1].length_bytes,
+                    allocation_id: rpc_reservations[1].allocation_id,
                 },
                 ReleaseOp {
                     segment_name: rpc_specific.segment_name.clone(),
                     offset_bytes: rpc_specific.offset_bytes,
                     length_bytes: rpc_specific.length_bytes,
+                    allocation_id: rpc_specific.allocation_id,
                 },
             ],
         )
@@ -15248,6 +15264,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
                 segment_name: primary.clone(),
                 offset_bytes: 0,
                 length_bytes: 8,
+                allocation_id: 0,
             }],
         )
         .expect("wrong-owner release should still reply");
@@ -15371,6 +15388,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             segment_name: SegmentName::new("stale-segment"),
             offset_bytes: 0,
             length_bytes: 16,
+            allocation_id: 0,
             route_key: ObjectKey(String::new()),
             cold_backing: None,
         });
@@ -15383,6 +15401,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             segment_name: reclaim_reservation.segment_name.clone(),
             offset_bytes: reclaim_reservation.offset_bytes,
             length_bytes: reclaim_reservation.length_bytes,
+            allocation_id: 0,
             route_key: ObjectKey(String::new()),
             cold_backing: None,
         });
@@ -15395,6 +15414,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             segment_name: reclaim_reservation.segment_name.clone(),
             offset_bytes: reclaim_reservation.offset_bytes,
             length_bytes: reclaim_reservation.length_bytes,
+            allocation_id: 0,
             route_key: ObjectKey(String::new()),
             cold_backing: None,
         });
@@ -15428,6 +15448,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
                 segment_name: reclaim_all_reservation.segment_name.clone(),
                 offset_bytes: reclaim_all_reservation.offset_bytes,
                 length_bytes: reclaim_all_reservation.length_bytes,
+                allocation_id: 0,
                 route_key: ObjectKey(String::new()),
                 cold_backing: None,
             });
@@ -15474,6 +15495,7 @@ fn pending_reclaims_split_cold_backing_from_hot_replica_releases() {
         replicas: vec![ReplicaRoute {
             owner: hot_owner.clone(),
             segment_name: SegmentName::new("split-reclaim-hot-segment"),
+            allocation_id: None,
             offset: Some(8),
             segment_offset: 8,
             length: 16,
@@ -15582,6 +15604,7 @@ fn flush_due_reclaims_skips_duplicate_remote_release() {
                 segment_name: reservation.segment_name.clone(),
                 offset_bytes: reservation.offset_bytes,
                 length_bytes: reservation.length_bytes,
+                allocation_id: 0,
                 route_key: ObjectKey(String::new()),
                 cold_backing: None,
             });
@@ -15777,6 +15800,366 @@ fn partial_replica_reservation_is_released_when_required_segment_lookup_fails() 
 }
 
 #[test]
+fn failed_unresolved_reservation_reclaim_is_retried_until_release_succeeds() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("retry-pending-reclaim-segment"));
+    let client = StoreClientBuilder::new(metadata, "retry-pending-reclaim-client")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    let reservation = client
+        .reserve_segment_allocation(client.runtime_id(), None, 16, true)
+        .expect("local reservation should succeed");
+    let detached_segment = client
+        .allocator
+        .lock()
+        .segments
+        .remove(&reservation.segment_name)
+        .expect("reserved segment should be removable for fault injection");
+    client.release_unresolved_reservation(&reservation);
+    assert_eq!(
+        client.state.lock().pending_reclaims.len(),
+        1,
+        "a failed immediate cleanup must enter the retryable reclaim queue"
+    );
+    assert!(client.flush_due_reclaims().is_err());
+    assert_eq!(
+        client.state.lock().pending_reclaims.len(),
+        1,
+        "a retry failure must keep the unresolved reservation queued"
+    );
+    client
+        .allocator
+        .lock()
+        .segments
+        .insert(reservation.segment_name.clone(), detached_segment);
+
+    client
+        .flush_due_reclaims()
+        .expect("reclaim should retry after the owner is reachable again");
+    assert_eq!(client.allocator.lock().usage_bytes().0, 0);
+    assert!(
+        client.state.lock().pending_reclaims.is_empty(),
+        "successful retry should drain the queued reservation cleanup"
+    );
+}
+
+#[test]
+fn failed_reclaim_retry_does_not_release_reused_allocation() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("partial-reclaim-retry-segment"));
+    let client = StoreClientBuilder::new(metadata, "partial-reclaim-retry-client")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    let released = client
+        .reserve_segment_allocation(client.runtime_id(), None, 16, true)
+        .expect("initial reservation should succeed");
+    {
+        let mut state = client.state.lock();
+        state.enqueue_pending_reclaim(PendingReclaim {
+            due_at_ms: 0,
+            policy_rank: 1,
+            tenant: client.default_tenant().to_string(),
+            qos_tier: mooncake_store_core::DEFAULT_QOS_TIER.to_string(),
+            storage_runtime: client.runtime_id().clone(),
+            segment_name: released.segment_name.clone(),
+            offset_bytes: released.offset_bytes,
+            length_bytes: released.length_bytes,
+            allocation_id: released.allocation_id,
+            route_key: ObjectKey(String::new()),
+            cold_backing: None,
+        });
+        state.enqueue_pending_reclaim(PendingReclaim {
+            due_at_ms: 0,
+            policy_rank: 1,
+            tenant: client.default_tenant().to_string(),
+            qos_tier: mooncake_store_core::DEFAULT_QOS_TIER.to_string(),
+            storage_runtime: client.runtime_id().clone(),
+            segment_name: SegmentName::new("missing-partial-reclaim-segment"),
+            offset_bytes: 0,
+            length_bytes: 16,
+            allocation_id: 0,
+            route_key: ObjectKey(String::new()),
+            cold_backing: None,
+        });
+    }
+
+    assert!(client.flush_due_reclaims().is_err());
+    assert_eq!(client.allocator.lock().usage_bytes().0, 0);
+    {
+        let pending = client.state.lock();
+        assert_eq!(
+            pending.pending_reclaims.len(),
+            1,
+            "only the failed reclaim should remain queued"
+        );
+        assert_eq!(
+            pending.pending_reclaims[0].segment_name,
+            SegmentName::new("missing-partial-reclaim-segment")
+        );
+    }
+
+    let replacement = client
+        .reserve_segment_allocation(client.runtime_id(), None, 16, true)
+        .expect("released span should be reusable");
+    assert_eq!(replacement.offset_bytes, released.offset_bytes);
+    assert!(client.flush_due_reclaims().is_err());
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "retrying a failed reclaim must not release a newer allocation that reused the offset"
+    );
+}
+
+#[test]
+fn ambiguous_reclaim_retry_does_not_release_reused_allocation() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("ambiguous-reclaim-retry-segment"));
+    let client = StoreClientBuilder::new(metadata, "ambiguous-reclaim-retry-client")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    let released = client
+        .reserve_segment_allocation(client.runtime_id(), None, 16, true)
+        .expect("initial reservation should succeed");
+    let stale_release = AllocationReleaseRequest {
+        storage_runtime: client.runtime_id().clone(),
+        segment_name: released.segment_name.clone(),
+        offset_bytes: released.offset_bytes,
+        length_bytes: released.length_bytes,
+        allocation_id: released.allocation_id,
+    };
+    client
+        .release_segment_allocations_batch(std::slice::from_ref(&stale_release))
+        .expect("simulate a release that completed before its reply was lost");
+
+    let replacement = client
+        .reserve_segment_allocation(client.runtime_id(), None, 16, true)
+        .expect("released span should be reusable");
+    assert_eq!(replacement.offset_bytes, released.offset_bytes);
+    client.enqueue_unresolved_reservation_reclaim(stale_release);
+
+    client
+        .flush_due_reclaims()
+        .expect("a stale retry should be treated as already resolved");
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "an ambiguous retry must not release a newer allocation that reused the offset"
+    );
+}
+
+#[test]
+fn partial_reservation_rollback_queues_only_failed_releases() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("partial-rollback-segment"));
+    let client = StoreClientBuilder::new(metadata, "partial-rollback-client")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    let released = client
+        .reserve_segment_allocation(client.runtime_id(), None, 16, true)
+        .expect("initial reservation should succeed");
+    client.release_allocation_requests_or_enqueue(
+        &[
+            AllocationReleaseRequest {
+                storage_runtime: client.runtime_id().clone(),
+                segment_name: released.segment_name.clone(),
+                offset_bytes: released.offset_bytes,
+                length_bytes: released.length_bytes,
+                allocation_id: released.allocation_id,
+            },
+            AllocationReleaseRequest {
+                storage_runtime: client.runtime_id().clone(),
+                segment_name: SegmentName::new("missing-partial-rollback-segment"),
+                offset_bytes: 0,
+                length_bytes: 16,
+                allocation_id: 0,
+            },
+        ],
+        "test_partial_reservation_rollback",
+    );
+
+    assert_eq!(client.allocator.lock().usage_bytes().0, 0);
+    let pending = client.state.lock();
+    assert_eq!(
+        pending.pending_reclaims.len(),
+        1,
+        "a successful rollback must not be queued again"
+    );
+    assert_eq!(
+        pending.pending_reclaims[0].segment_name,
+        SegmentName::new("missing-partial-rollback-segment")
+    );
+}
+
+#[test]
+fn queued_reclaim_failure_does_not_fail_unrelated_put() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("reclaim-availability-segment"));
+    let client = StoreClientBuilder::new(metadata, "reclaim-availability-client")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    client.enqueue_unresolved_reservation_reclaim(AllocationReleaseRequest {
+        storage_runtime: client.runtime_id().clone(),
+        segment_name: SegmentName::new("missing-reclaim-segment"),
+        offset_bytes: 0,
+        length_bytes: 16,
+        allocation_id: 0,
+    });
+
+    client
+        .put("unrelated-key", b"value")
+        .expect("background reclaim failure must not fail an unrelated put");
+    assert_eq!(
+        client.state.lock().pending_reclaims.len(),
+        1,
+        "the failed cleanup must remain queued without blocking foreground I/O"
+    );
+}
+
+#[test]
+fn failed_cold_reclaim_is_requeued_for_retry() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("cold-reclaim-retry-segment"));
+    let client = StoreClientBuilder::new(metadata, "cold-reclaim-retry-client")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    let cold_backing = mooncake_store_core::ColdBackingRoute {
+        owner: client.runtime_id().clone(),
+        cold_tier_id: "missing-cold-tier-device".to_string(),
+        object_locator: "missing-cold-payload".to_string(),
+        length: 16,
+        checksum: None,
+        state: mooncake_store_core::ColdBackingState::Materialized,
+        replicas: Vec::new(),
+    };
+    client.state.lock().enqueue_pending_reclaim(PendingReclaim {
+        due_at_ms: 0,
+        policy_rank: 1,
+        tenant: client.default_tenant().to_string(),
+        qos_tier: mooncake_store_core::DEFAULT_QOS_TIER.to_string(),
+        storage_runtime: client.runtime_id().clone(),
+        segment_name: SegmentName::new("__cold_backing_cleanup__"),
+        offset_bytes: 0,
+        length_bytes: cold_backing.length,
+        allocation_id: 0,
+        route_key: ObjectKey::new("cold-reclaim-retry-key"),
+        cold_backing: Some(cold_backing),
+    });
+
+    assert!(client.flush_due_reclaims().is_err());
+    let pending = client.state.lock();
+    assert_eq!(pending.pending_reclaims.len(), 1);
+    assert!(
+        pending.pending_reclaims[0].cold_backing.is_some(),
+        "a transient cold-tier cleanup failure must remain queued for retry"
+    );
+}
+
+#[test]
+fn unresolved_reservation_reclaim_does_not_treat_suspect_owner_as_unavailable() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("suspect-reclaim-storage-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("suspect-reclaim-writer-segment"));
+    let storage = StoreClientBuilder::new(metadata.clone(), "suspect-reclaim-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(storage_transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let writer = StoreClientBuilder::new(metadata, "suspect-reclaim-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&storage, &writer]);
+
+    let reservation = writer
+        .reserve_segment_allocation(storage.runtime_id(), None, 16, false)
+        .expect("remote reservation should succeed");
+    assert_eq!(storage.allocator.lock().usage_bytes().0, 16);
+
+    writer.mark_runtime_suspect(storage.runtime_id(), "test_release_transport_failure");
+    writer.enqueue_unresolved_reservation_reclaim(AllocationReleaseRequest {
+        storage_runtime: reservation.owner,
+        segment_name: reservation.segment_name,
+        offset_bytes: reservation.offset_bytes,
+        length_bytes: reservation.length_bytes,
+        allocation_id: reservation.allocation_id,
+    });
+    writer
+        .flush_due_reclaims()
+        .expect("reclaim should still contact a live owner while placement quarantines it");
+
+    assert_eq!(
+        storage.allocator.lock().usage_bytes().0,
+        0,
+        "placement quarantine must not masquerade as authoritative owner removal"
+    );
+    assert!(writer.state.lock().pending_reclaims.is_empty());
+}
+
+#[test]
 fn unresolved_reservation_reclaim_drops_after_owner_is_confirmed_unavailable() {
     let inner = Arc::new(InMemoryMetadataBackend::new());
     let metadata = Arc::new(RecoverableMetadataBackend::new(inner));
@@ -15809,6 +16192,7 @@ fn unresolved_reservation_reclaim_drops_after_owner_is_confirmed_unavailable() {
         segment_name: SegmentName::new("unavailable-owner-segment"),
         offset_bytes: 0,
         length_bytes: 16,
+        allocation_id: 0,
     };
 
     writer.release_unresolved_reservation(&reservation);
@@ -16532,6 +16916,7 @@ fn local_read_prefers_replica_target_offset_over_segment_offset() {
         replicas: vec![ReplicaRoute {
             owner: store.runtime_id().clone(),
             segment_name: segment,
+            allocation_id: None,
             offset: Some(base as u64 + target_offset as u64),
             segment_offset: 0,
             length: payload.len() as u64,
@@ -17036,6 +17421,7 @@ fn readable_replica_selection_prefers_local_survivor() {
             ReplicaRoute {
                 owner: remote.runtime_id().clone(),
                 segment_name: remote_segment,
+                allocation_id: None,
                 offset: Some(0),
                 segment_offset: 0,
                 length: 8,
@@ -17046,6 +17432,7 @@ fn readable_replica_selection_prefers_local_survivor() {
             ReplicaRoute {
                 owner: local.runtime_id().clone(),
                 segment_name: local_segment.clone(),
+                allocation_id: None,
                 offset: Some(0),
                 segment_offset: 0,
                 length: 8,
@@ -17933,6 +18320,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
             &first.segment_name,
             first.offset_bytes,
             first.length_bytes,
+            first.allocation_id,
         )
         .expect("release should succeed");
     let reused = allocator
@@ -17947,13 +18335,19 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         .reserve(&owner, &primary.segment_name, 15)
         .expect("reservation should succeed");
     assert!(matches!(
-        mismatch.release(&owner, &primary.segment_name, reserved.offset_bytes, 14),
+        mismatch.release(
+            &owner,
+            &primary.segment_name,
+            reserved.offset_bytes,
+            14,
+            reserved.allocation_id,
+        ),
         Err(StoreError::Allocator(_))
     ));
 
     let mut missing = SegmentAllocator::new(primary.clone());
     assert!(matches!(
-        missing.release(&owner, &primary.segment_name, 0, 1),
+        missing.release(&owner, &primary.segment_name, 0, 1, 0),
         Err(StoreError::Allocator(_))
     ));
 
@@ -17967,6 +18361,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
             &primary.segment_name,
             recycled.offset_bytes,
             recycled.length_bytes,
+            recycled.allocation_id,
         )
         .expect("release should succeed");
     let next_announcement = SegmentAnnouncement {
@@ -18014,6 +18409,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: primary.segment_name.clone(),
+            allocation_id: None,
             offset: Some(0),
             segment_offset: reused.offset_bytes,
             length: reused.length_bytes,
@@ -18119,6 +18515,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         segment_name: SegmentName::new("seg-a"),
         offset_bytes: 0,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });
@@ -18131,6 +18528,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         segment_name: SegmentName::new("seg-b"),
         offset_bytes: 16,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });
@@ -18228,6 +18626,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: published.segment_name.clone(),
+            allocation_id: None,
             offset: Some(0),
             segment_offset: published.offset_bytes,
             length: published.length_bytes,
@@ -18281,6 +18680,7 @@ fn qos_tier_reclaims_low_priority_before_high_priority() {
         segment_name: SegmentName::new("seg-critical"),
         offset_bytes: 0,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });
@@ -18293,6 +18693,7 @@ fn qos_tier_reclaims_low_priority_before_high_priority() {
         segment_name: SegmentName::new("seg-gold"),
         offset_bytes: 8,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });
@@ -18305,6 +18706,7 @@ fn qos_tier_reclaims_low_priority_before_high_priority() {
         segment_name: SegmentName::new("seg-bronze"),
         offset_bytes: 16,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });
@@ -18317,6 +18719,7 @@ fn qos_tier_reclaims_low_priority_before_high_priority() {
         segment_name: SegmentName::new("seg-default"),
         offset_bytes: 24,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });
@@ -18342,6 +18745,7 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
         segment_name: SegmentName::new("seg-a"),
         offset_bytes: 0,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });
@@ -18354,6 +18758,7 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
         segment_name: SegmentName::new("seg-b"),
         offset_bytes: 8,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });
@@ -18366,6 +18771,7 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
         segment_name: SegmentName::new("seg-c"),
         offset_bytes: 16,
         length_bytes: 8,
+        allocation_id: 0,
         route_key: ObjectKey(String::new()),
         cold_backing: None,
     });

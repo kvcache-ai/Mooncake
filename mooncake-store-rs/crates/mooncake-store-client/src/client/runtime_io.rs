@@ -420,7 +420,7 @@ impl StoreClient {
         options: PutObjectCurrentOptions<'_>,
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
-        self.flush_due_reclaims()?;
+        self.flush_due_reclaims_best_effort();
         let tenant = object_id.scope.tenant.as_str();
         let key = object_id.logical_key.as_str();
         let scoped_key = mooncake_store_core::ObjectKey::from_logical_id(object_id);
@@ -458,7 +458,7 @@ impl StoreClient {
         let mut attempt = 0usize;
         loop {
             attempt = attempt.saturating_add(1);
-            self.flush_due_reclaims()?;
+            self.flush_due_reclaims_best_effort();
             let quota_reservation = self.reserve_tenant_quota_for_put(
                 object_id,
                 &scoped_key,
@@ -554,6 +554,7 @@ impl StoreClient {
                     .map(|(priority, (target, offset))| ReplicaRoute {
                         owner: target.storage_runtime.clone(),
                         segment_name: target.segment_name.clone(),
+                        allocation_id: Some(reservations[priority].allocation_id),
                         offset: Some(*offset),
                         segment_offset: reservations[priority].offset_bytes,
                         length: value.len() as u64,
@@ -1087,7 +1088,7 @@ impl StoreClient {
         plan: &ExplicitMigrationPlan,
     ) -> Result<ObjectRoute> {
         self.ensure_local_memory()?;
-        self.flush_due_reclaims()?;
+        self.flush_due_reclaims_best_effort();
 
         let current = self
             .route_ops()
@@ -1137,6 +1138,7 @@ impl StoreClient {
             .map(|(priority, (target, offset))| ReplicaRoute {
                 owner: target.storage_runtime.clone(),
                 segment_name: target.segment_name.clone(),
+                allocation_id: Some(reservations[priority].allocation_id),
                 offset: Some(*offset),
                 segment_offset: reservations[priority].offset_bytes,
                 length: payload.len() as u64,
@@ -1797,6 +1799,7 @@ impl StoreClient {
                 segment_name: allocation.segment_name.clone(),
                 offset_bytes: allocation.offset_bytes,
                 length_bytes: allocation.length_bytes,
+                allocation_id: 0,
             })
             .collect::<Vec<_>>();
         self.release_segment_allocations_batch(&releases)?;
@@ -3647,6 +3650,7 @@ impl StoreClient {
                     resolved[index].replica = ReplicaRoute {
                         owner: batch.owner_lease.runtime.clone(),
                         segment_name: segment_name.clone(),
+                        allocation_id: None,
                         offset: absolute_offset,
                         segment_offset: reply.segment_offset,
                         length: reply.length,
@@ -3934,6 +3938,7 @@ impl StoreClient {
                         resolved[index].replica = ReplicaRoute {
                             owner: batch.owner_lease.runtime.clone(),
                             segment_name: segment_name.clone(),
+                            allocation_id: None,
                             offset: absolute_offset,
                             segment_offset: reply.segment_offset,
                             length: reply.length,
@@ -6342,6 +6347,7 @@ mod runtime_io_tests {
         ReplicaRoute {
             owner: ClientRuntimeId::new("test-runtime", ClientEpoch(0)),
             segment_name: SegmentName::new(segment_name),
+            allocation_id: None,
             offset: Some(offset),
             segment_offset,
             length,

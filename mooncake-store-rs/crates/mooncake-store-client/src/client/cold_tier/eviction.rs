@@ -286,6 +286,7 @@ impl StorageOwnerState {
             &evicted_replica.segment_name,
             evicted_replica.segment_offset,
             evicted_replica.length,
+            evicted_replica.allocation_id.unwrap_or(0),
         ) {
             if is_missing_live_allocation_error(&error) {
                 warn!(

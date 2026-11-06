@@ -110,6 +110,7 @@ fn legacy_backend_object_route_is_not_restored_on_read_miss() {
         replicas: vec![ReplicaRoute {
             owner: cold_backing.owner.clone(),
             segment_name: SegmentName::new("__legacy_backend_object__"),
+            allocation_id: None,
             offset: None,
             segment_offset: 0,
             length: cold_backing.length,
