@@ -100,15 +100,32 @@ impl LiveClientCache {
 }
 
 fn membership_equivalent(left: &[ClientLease], right: &[ClientLease]) -> bool {
-    left.len() == right.len()
-        && left.iter().all(|expected| {
-            right.iter().any(|candidate| {
+    fn index_by_runtime(
+        leases: &[ClientLease],
+    ) -> Option<BTreeMap<&ClientRuntimeId, &ClientLease>> {
+        let mut indexed = BTreeMap::new();
+        for lease in leases {
+            if indexed.insert(&lease.runtime, lease).is_some() {
+                return None;
+            }
+        }
+        Some(indexed)
+    }
+
+    if left.len() != right.len() {
+        return false;
+    }
+    let (Some(left), Some(right)) = (index_by_runtime(left), index_by_runtime(right)) else {
+        return false;
+    };
+    left.iter().all(|(runtime, expected)| {
+        right.get(runtime).is_some_and(|candidate| {
                 candidate.runtime == expected.runtime
                     && candidate.state == expected.state
                     && candidate.compatibility == expected.compatibility
                     && candidate.endpoints == expected.endpoints
-            })
         })
+    })
 }
 
 #[derive(Default)]
