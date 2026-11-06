@@ -40,6 +40,7 @@ use tonic::{Request, Response, Status};
 #[derive(Default)]
 struct TestAuthority {
     routes: Mutex<BTreeMap<String, ObjectRoute>>,
+    delete_versions: Mutex<BTreeMap<String, RouteVersion>>,
     route_epoch: AtomicU64,
 }
 
@@ -58,6 +59,29 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
         Ok(self.routes.lock().get(&key.0).cloned())
+    }
+
+    fn get_route_record(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<mooncake_store_route::RouteAuthorityRecord> {
+        Ok(mooncake_store_route::RouteAuthorityRecord {
+            route: self.get_route(namespace, authority, key)?,
+            delete_version: self.delete_versions.lock().get(&key.0).copied(),
+        })
+    }
+
+    fn batch_get_route_records(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<mooncake_store_core::Result<mooncake_store_route::RouteAuthorityRecord>> {
+        keys.iter()
+            .map(|key| self.get_route_record(namespace, authority, key))
+            .collect()
     }
 
     fn list_routes_by_replica_owner(
@@ -2343,6 +2367,48 @@ fn control_plane_client_short_circuits_empty_batches_and_rejects_bad_uris() {
         .batch_get_routes(&lease, "ns", &authority, &[ObjectKey::new("bad-key")])
         .expect_err("invalid control uri should fail");
     assert!(matches!(error, StoreError::Transport(_)));
+}
+
+#[test]
+fn route_get_preserves_delete_marker_over_control_plane_transport() {
+    let authority = Arc::new(TestAuthority::default());
+    authority
+        .delete_versions
+        .lock()
+        .insert("deleted".to_string(), RouteVersion(43));
+    authority.insert(sample_route("live", 44, &sample_owner()));
+    let mut handle = ControlPlaneHandle::spawn(
+        "127.0.0.1",
+        authority,
+        Arc::new(TestAllocator::default()),
+        Arc::new(TestEviction::default()),
+    )
+    .expect("control plane server should start");
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+    let response = mooncake_store_route::RouteControlTransport::send_route_control(
+        &client,
+        &sample_lease(handle.address()),
+        mooncake_store_route::RouteControlRequest::BatchGet {
+            namespace: "ns-a".to_string(),
+            authority: ClientStableId::new("authority"),
+            keys: vec![ObjectKey::new("deleted"), ObjectKey::new("live")],
+        },
+    )
+    .expect("route records should cross the control plane");
+    let mooncake_store_route::RouteControlResponse::BatchGet(records) = response else {
+        panic!("expected route records");
+    };
+    assert_eq!(records.len(), 2);
+    let deleted = records[0].as_ref().expect("deleted record should decode");
+    assert!(deleted.route.is_none());
+    assert_eq!(deleted.delete_version, Some(RouteVersion(43)));
+    let live = records[1].as_ref().expect("live record should decode");
+    assert_eq!(
+        live.route.as_ref().map(|route| route.version),
+        Some(RouteVersion(44))
+    );
+    assert_eq!(live.delete_version, None);
+    handle.shutdown();
 }
 
 #[test]

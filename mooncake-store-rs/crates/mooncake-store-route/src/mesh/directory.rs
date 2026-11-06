@@ -2856,6 +2856,147 @@ mod owner_page_contract_tests {
         assert!(actual.len() <= 4);
     }
 
+    fn mirror_regression_directory(
+        observer: &ClientLease,
+        peers: Vec<ClientLease>,
+    ) -> EmbeddedWrhRouteDirectory {
+        EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership { leases: peers }),
+        )
+    }
+
+    #[test]
+    fn authority_mirror_ignores_delayed_older_live_route() {
+        let observer = test_lease("observer-delayed-live-mirror");
+        let directory = mirror_regression_directory(&observer, vec![observer.clone()]);
+        let authority = crate::mesh::local_authority::LocalRouteAuthority::new(
+            &directory.namespace,
+            observer.runtime.stable_id.clone(),
+        );
+        let mut old = test_route("delayed-live-mirror", &observer.runtime);
+        old.version = RouteVersion(3);
+        let mut new = old.clone();
+        new.version = RouteVersion(4);
+        authority.replace_route(&old.key, Some(&old)).unwrap();
+        authority.replace_route(&new.key, Some(&new)).unwrap();
+        authority.replace_route(&old.key, Some(&old)).unwrap();
+        assert_eq!(
+            authority.get_route(&old.key).unwrap().unwrap().version,
+            new.version
+        );
+    }
+
+    #[test]
+    fn authority_mirror_ignores_delayed_delete_of_older_live_route() {
+        let observer = test_lease("observer-delayed-delete-mirror");
+        let directory = mirror_regression_directory(&observer, vec![observer.clone()]);
+        let authority = crate::mesh::local_authority::LocalRouteAuthority::new(
+            &directory.namespace,
+            observer.runtime.stable_id.clone(),
+        );
+        let mut route = test_route("delayed-delete-mirror", &observer.runtime);
+        route.version = RouteVersion(4);
+        authority.replace_route(&route.key, Some(&route)).unwrap();
+        authority
+            .replace_routes(&[RouteCasRequest {
+                key: route.key.clone(),
+                expected: Some(RouteVersion(3)),
+                next: None,
+            }])
+            .unwrap();
+        assert_eq!(authority.get_route(&route.key).unwrap(), Some(route));
+    }
+
+    #[test]
+    fn public_route_cas_respects_configured_delete_marker_budget() {
+        let observer = test_lease("budget-authority");
+        let directory = EmbeddedWrhRouteDirectory::new_with_delete_marker_budget(
+            1,
+            256,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![observer.clone()],
+            }),
+        );
+        let keys = (0..32)
+            .map(|index| ObjectKey::new(format!("budget-key-{index}")))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            let route = test_route(&key.0, &observer.runtime);
+            assert!(
+                directory
+                    .compare_and_swap_object_route(&observer, key, None, Some(&route))
+                    .unwrap()
+                    .applied
+            );
+            assert!(
+                directory
+                    .compare_and_swap_object_route(&observer, key, Some(route.version), None)
+                    .unwrap()
+                    .applied
+            );
+        }
+        let markers = directory.get_delete_markers(&observer, &keys);
+        assert_eq!(markers.iter().filter(|marker| marker.is_some()).count(), 1);
+        assert_eq!(markers.last(), Some(&Some(RouteVersion(1))));
+        let last = keys.last().unwrap();
+        let stale = test_route(&last.0, &observer.runtime);
+        let result = directory
+            .compare_and_swap_object_route(&observer, last, None, Some(&stale))
+            .unwrap();
+        assert!(!result.applied);
+        assert_eq!(result.delete_version, Some(RouteVersion(1)));
+    }
+
+    #[test]
+    fn version_floor_queries_merge_highest_authority_version() {
+        let observer = test_lease("observer-version-floor-merge");
+        let peer = test_lease("peer-version-floor-merge");
+        let candidates = vec![observer.clone(), peer.clone()];
+        let directory = mirror_regression_directory(&observer, candidates.clone());
+        register_local_authority(
+            &directory.namespace,
+            &peer.runtime.stable_id,
+            DEFAULT_DELETE_MARKER_BUDGET_BYTES,
+        );
+        let key = ObjectKey::new("version-floor-merge");
+        let ranked = ranked_top_authorities(&directory.namespace, &candidates, &key, 2);
+        for (lease, version) in ranked.iter().zip([RouteVersion(4), RouteVersion(9)]) {
+            let authority = crate::mesh::local_authority::LocalRouteAuthority::new(
+                &directory.namespace,
+                lease.runtime.stable_id.clone(),
+            );
+            let mut route = test_route(&key.0, &observer.runtime);
+            route.version = version;
+            authority.replace_route(&key, Some(&route)).unwrap();
+            assert!(
+                authority
+                    .compare_and_swap_route(&key, Some(version), None)
+                    .unwrap()
+                    .applied
+            );
+        }
+        let single = directory.get_version_floor(&observer, &key);
+        let batch = directory.get_version_floors(&observer, std::slice::from_ref(&key));
+        unregister_local_authority(&directory.namespace, &peer.runtime.stable_id);
+        assert_eq!(
+            (single, batch),
+            (Some(RouteVersion(9)), vec![Some(RouteVersion(9))]),
+        );
+    }
+
     #[test]
     fn delete_marker_queries_merge_highest_authority_version() {
         let observer = test_lease("observer-delete-marker-merge");
