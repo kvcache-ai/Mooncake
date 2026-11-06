@@ -10,7 +10,9 @@ use mooncake_store_core::{
 };
 
 use crate::metrics::record_cas_outcome;
-use crate::metrics::{record_authoritative_route_update, record_delete_marker_event, record_delete_marker_state};
+use crate::metrics::{
+    record_authoritative_route_update, record_delete_marker_event, record_delete_marker_state,
+};
 use crate::table::{DeleteMarkerSnapshot, DeleteMarkerStore};
 use crate::RouteAuthorityRecord;
 use crate::{RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
@@ -391,8 +393,7 @@ impl LocalRouteTable {
         }
     }
 
-    // Secondary mirrors are asynchronous, so an older publish or delete can arrive
-    // after a newer route is already visible on the authority.
+    // Asynchronous mirrors can arrive after a newer publish or delete.
     fn replace_is_stale(
         &self,
         key: &ObjectKey,
@@ -602,8 +603,8 @@ mod tests {
     use mooncake_store_core::{
         ClientEpoch, CompatibilityDescriptor, ReplicaRoute, ReplicaTier, RouteState, SegmentName,
     };
-
     use std::sync::{Arc, Mutex};
+
     use crate::metrics::record_cas_outcome;
 
     use crate::{set_route_metrics_sink, RouteMetricsSink};
@@ -637,7 +638,10 @@ mod tests {
         fn record_delete_marker_state(&self, _entries: u64, _bytes: u64, _budget_bytes: u64) {}
 
         fn record_delete_marker_event(&self, event: &'static str, count: u64) {
-            self.delete_marker_events.lock().unwrap().push((event, count));
+            self.delete_marker_events
+                .lock()
+                .unwrap()
+                .push((event, count));
         }
     }
 

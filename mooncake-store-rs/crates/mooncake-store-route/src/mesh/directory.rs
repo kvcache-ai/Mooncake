@@ -25,10 +25,10 @@ use crate::mesh::read_repair::{
 use crate::mesh::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
     authority_get_allocation_route_reference_keys, authority_get_allocation_route_references,
-    authority_list_routes_by_replica_owner_page, authority_get_delete_marker, authority_get_delete_markers, authority_get_records,
+    authority_get_delete_marker, authority_get_delete_markers, authority_get_records,
     authority_is_local, authority_list_reuse_candidates, authority_list_routes,
-    authority_list_routes_in_scope, local_authority_service, register_local_authority,
-    unregister_local_authority,
+    authority_list_routes_by_replica_owner_page, authority_list_routes_in_scope,
+    local_authority_service, register_local_authority, unregister_local_authority,
 };
 use crate::mesh::selection::{
     authority_candidates, merge_authority_candidates, ranked_authorities,
