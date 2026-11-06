@@ -572,6 +572,10 @@ int DeviceTransferService::deviceIndex() const noexcept {
     return device_->device_index;
 }
 
+const P2pRoute* DeviceTransferService::p2pRoute() const noexcept {
+    return device_->p2p_route.get();
+}
+
 PGResult<RegionSlice> DeviceTransferService::allocatePeerAccessible(
     size_t size, size_t alignment) {
     std::lock_guard<std::mutex> lock(mutex_);

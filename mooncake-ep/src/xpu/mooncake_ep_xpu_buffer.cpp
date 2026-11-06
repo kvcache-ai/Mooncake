@@ -16,6 +16,7 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
 #include <string>
 
 #include "xpu_ep_common.h"
@@ -39,6 +40,9 @@ constexpr size_t kSlotShadowOffset =
     kShadowOffset + kTopkShadowSlots * kTopkShadowBytes;
 constexpr size_t kWorkspaceBytes =
     kSlotShadowOffset + kTopkShadowSlots * kSlotShadowBytes;
+// A half of the hybrid path's host counts (see kHostCellsOffset).
+static_assert(kMaxRanks <= static_cast<int>(kHostCellsOffset));
+constexpr size_t kHostCountInts = kHostCellsOffset + kMaxExperts;
 
 sycl::queue* asQueue(uint64_t stream_ptr) {
     XPU_EP_CHECK(stream_ptr != 0,
@@ -89,10 +93,16 @@ MooncakeEpXpuBuffer::~MooncakeEpXpuBuffer() {
     try {
         last_event_.wait();
         queue_.wait();
+        drainProxy();
     } catch (...) {
     }
+#if MOONCAKE_EP_XPU_RDMA
+    proxy_.reset();  // deregisters the buffer before it is freed
+#endif
     if (workspace_) sycl::free(workspace_, queue_);
     if (recv_tables_) sycl::free(recv_tables_, queue_);
+    if (d_remote_) sycl::free(d_remote_, queue_);
+    if (host_counts_) sycl::free(host_counts_, queue_);
     ipc_.reset();
 }
 
@@ -103,7 +113,75 @@ bool MooncakeEpXpuBuffer::use_fast_path() const {
                         "IPC; using the fallback path (degraded performance)";
         return false;
     }
+    if (std::any_of(remote_.begin(), remote_.end(),
+                    [](int r) { return r != 0; }) &&
+        !rdma_ok_) {
+        LOG(WARNING) << "[EP XPU] ranks on other nodes are not connected over "
+                        "RDMA; using the fallback path (degraded performance)";
+        return false;
+    }
     return true;
+}
+
+bool MooncakeEpXpuBuffer::rdma_available() { return MOONCAKE_EP_XPU_RDMA != 0; }
+
+std::vector<int32_t> MooncakeEpXpuBuffer::init_rdma(
+    const std::vector<int>& remote) {
+    XPU_EP_CHECK(static_cast<int>(remote.size()) == num_ranks_,
+                 "remote must have one entry per rank");
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        last_event_.wait();
+    }
+    queue_.wait();
+    drainProxy();
+    remote_ = remote;
+    rdma_ok_ = false;
+    hybrid_ = false;
+    rdma_ranks_.clear();
+#if MOONCAKE_EP_XPU_RDMA
+    proxy_.reset();
+    proxy_ = std::make_unique<XpuEpProxy>(
+        queue_.get_device(), ipc_->zeContext(), ipc_->base(),
+        static_cast<size_t>(num_ep_buffer_bytes_), rank_, remote);
+    return proxy_->localInfo();
+#else
+    XPU_EP_CHECK(false,
+                 "built without the verbs path (no rdma-core with "
+                 "ibv_reg_dmabuf_mr)");
+    return {};
+#endif
+}
+
+void MooncakeEpXpuBuffer::connect_rdma(
+    const std::vector<std::vector<int32_t>>& infos,
+    const std::vector<int>& active_ranks_mask) {
+#if MOONCAKE_EP_XPU_RDMA
+    XPU_EP_CHECK(proxy_ != nullptr, "connect_rdma needs init_rdma first");
+    rdma_ranks_.clear();
+    proxy_->connect(infos, active_ranks_mask);
+    std::vector<int> connected(num_ranks_, 0);
+    for (int r = 0; r < num_ranks_; ++r) {
+        if (!proxy_->connected(r)) continue;
+        connected[r] = 1;
+        rdma_ranks_.push_back(r);
+    }
+    if (!d_remote_) {
+        d_remote_ = sycl::malloc_device<int>(num_ranks_, queue_);
+        host_counts_ = sycl::malloc_host<int>(2 * kHostCountInts, queue_);
+        XPU_EP_CHECK(d_remote_ && host_counts_,
+                     "hybrid path allocation failed");
+    }
+    queue_.memcpy(d_remote_, connected.data(), num_ranks_ * sizeof(int)).wait();
+    hybrid_ = !rdma_ranks_.empty();
+    rdma_ok_ = true;
+#else
+    (void)infos;
+    (void)active_ranks_mask;
+    XPU_EP_CHECK(false,
+                 "built without the verbs path (no rdma-core with "
+                 "ibv_reg_dmabuf_mr)");
+#endif
 }
 
 std::vector<int32_t> MooncakeEpXpuBuffer::get_ipc_handle() {
@@ -120,7 +198,23 @@ void MooncakeEpXpuBuffer::sync_nvlink_ipc_handles(
         last_event_.wait();
     }
     queue_.wait();
-    ipc_->importPeers(remote_handles, active_ranks_mask);
+    drainProxy();
+    // Ranks on other nodes are reached over RDMA, if at all.
+    std::vector<int> active = active_ranks_mask;
+    for (size_t r = 0; r < remote_.size() && r < active.size(); ++r)
+        if (remote_[r]) active[r] = 0;
+    ipc_->importPeers(remote_handles, active);
+}
+
+void MooncakeEpXpuBuffer::drainProxy() {
+#if MOONCAKE_EP_XPU_RDMA
+    if (proxy_) proxy_->drain();
+#endif
+}
+
+PeerView MooncakeEpXpuBuffer::peerView() const {
+    return PeerView{ipc_->base(), ipc_->peerBases(),
+                    hybrid_ ? d_remote_ : nullptr};
 }
 
 sycl::queue& MooncakeEpXpuBuffer::queueFor(uint64_t stream_ptr) {
@@ -182,8 +276,9 @@ void MooncakeEpXpuBuffer::checkShape(int hidden, int num_topk,
     XPU_EP_CHECK(num_experts > 0 && num_experts % num_ranks_ == 0 &&
                      num_experts <= kMaxExperts,
                  "num_experts must be a positive multiple of the EP size");
-    const size_t need = get_ep_buffer_size_hint(
-        num_max_dispatch_tokens_per_rank, hidden, num_ranks_, num_experts);
+    const size_t need = BufferPair(nullptr, num_max_dispatch_tokens_per_rank,
+                                   hidden, num_ranks_, num_experts, hybrid_)
+                            .total_bytes;
     XPU_EP_CHECK(need <= static_cast<size_t>(num_ep_buffer_bytes_),
                  "EP buffer too small for this shape; size it with "
                  "Buffer.get_ep_buffer_size_hint()");
@@ -214,7 +309,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     sycl::queue& q = queueFor(compute_stream_ptr);
 
     BufferPair layout(ipc_->base(), num_max_dispatch_tokens_per_rank, hidden,
-                      num_ranks_, num_experts);
+                      num_ranks_, num_experts, hybrid_);
     std::lock_guard<std::mutex> lock(mu_);
     const int cur = buffer_idx_;
     buffer_idx_ ^= 1;
@@ -244,8 +339,9 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     a.counter_per_rank =
         reinterpret_cast<int*>(workspace_ + kRankCounterOffset);
     a.done_counter = reinterpret_cast<int*>(workspace_ + kDoneOffset);
+    if (hybrid_) a.host_counts = host_counts_ + cur * kHostCountInts;
     if (with_topk_weights) a.recv = recvTable(shadow_slot);
-    a.peers = PeerView{ipc_->base(), ipc_->peerBases()};
+    a.peers = peerView();
     a.num_tokens = num_tokens;
     a.hidden = hidden;
     a.num_topk = num_topk;
@@ -258,6 +354,14 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::dispatch(
     a.max_wgs = max_wgs_;
 
     last_event_ = dispatch_send(q, a);
+#if MOONCAKE_EP_XPU_RDMA
+    if (hybrid_) {
+        proxy_->submit(last_event_,
+                       [a, base = ipc_->base(), ranks = rdma_ranks_] {
+                           return dispatch_puts(a, base, ranks);
+                       });
+    }
+#endif
     Hook hook;
     if (return_recv_hook) {
         sycl::queue hook_queue = q;
@@ -298,7 +402,7 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::combine(
     sycl::queue& q = queueFor(compute_stream_ptr);
 
     BufferPair layout(ipc_->base(), num_max_dispatch_tokens_per_rank, hidden,
-                      num_ranks_, num_experts);
+                      num_ranks_, num_experts, hybrid_);
     std::lock_guard<std::mutex> lock(mu_);
     const int shadow_slot = dispatch_slots_.find(src_info_ptr);
     XPU_EP_CHECK(shadow_slot >= 0,
@@ -322,8 +426,12 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::combine(
     a.next_ready = layout.halves[cur ^ 1].ready;
     a.staging = layout.halves[cur].staging;
     a.done_counter = reinterpret_cast<int*>(workspace_ + kDoneOffset) + 1;
+    if (hybrid_) {
+        a.inbox = a.staging + layout.combine_bytes;
+        a.host_counts = host_counts_ + cur * kHostCountInts;
+    }
     if (slot_reduced_[shadow_slot]) a.recv = recvTable(shadow_slot);
-    a.peers = PeerView{ipc_->base(), ipc_->peerBases()};
+    a.peers = peerView();
     a.num_combined_tokens = num_combined_tokens;
     a.hidden = hidden;
     a.num_topk = num_topk;
@@ -335,6 +443,14 @@ MooncakeEpXpuBuffer::Result MooncakeEpXpuBuffer::combine(
     a.max_wgs = max_wgs_;
 
     last_event_ = combine_send(q, a);
+#if MOONCAKE_EP_XPU_RDMA
+    if (hybrid_) {
+        proxy_->submit(last_event_,
+                       [a, base = ipc_->base(), ranks = rdma_ranks_] {
+                           return combine_puts(a, base, ranks);
+                       });
+    }
+#endif
     Hook hook;
     if (return_recv_hook) {
         sycl::queue hook_queue = q;
