@@ -105,8 +105,14 @@ completed KVCS DFS replica, which matches the HiCache configuration validated
 for this change. DFS-only KVCS objects are not selected by automatic watermark
 eviction yet.
 
-Automatic KVCS watermark eviction is disabled when OpLog durability is enabled
-because provider deletion is not yet tied to the durable metadata finalizer.
+With OpLog enabled, watermark eviction uses the same metadata reclaimer as
+memory eviction. Under the per-key write lock, Mooncake first deletes the KVCS
+value and then submits the DFS-replica removal to OpLog. The replica is excluded
+from selection after submission, while final removal and its event/accounting
+side effects run after the record is durable. A provider-delete failure leaves
+metadata unchanged for a later refresh. A crash after provider delete but
+before the OpLog record becomes durable can temporarily leave a stale DFS
+replica, which is reconciled by the existing explicit-Get miss path.
 
 Deployments should configure the KVCS GC watermark to 100%. Current KVCS
 cannot fully disable automatic GC, so this only makes provider-side deletion
