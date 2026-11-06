@@ -31,7 +31,7 @@ impl LiveClientCache {
         } else {
             &self.retained_leases
         };
-        Some(filter_live_client_leases(leases))
+        Some(leases.clone())
     }
 
     pub(crate) fn tenant_quota_policy(

@@ -61,6 +61,41 @@ pub(crate) fn authority_candidates(
     Ok(candidates.into_values().collect())
 }
 
+pub(crate) fn retained_authority_candidates(
+    membership: &dyn RouteMembershipProvider,
+    observer: &ClientLease,
+) -> Result<Vec<ClientLease>> {
+    use std::collections::BTreeMap;
+
+    let route_scope = observer.endpoints.labels.get(ROUTE_SCOPE_LABEL).cloned();
+    let mut candidates = BTreeMap::<String, ClientLease>::new();
+    for lease in membership.retained_live_clients("retained_live_client_snapshot")? {
+        if lease.state != ClientLifecycleState::Active
+            || !route_capable(&lease)
+            || !compatibility_matches(observer, &lease)
+        {
+            continue;
+        }
+        if route_scope.as_ref().is_some_and(|scope| {
+            lease
+                .endpoints
+                .labels
+                .get(ROUTE_SCOPE_LABEL)
+                .is_none_or(|candidate| candidate != scope)
+        }) {
+            continue;
+        }
+        let stable_id = lease.runtime.stable_id.0.clone();
+        match candidates.get(&stable_id) {
+            Some(current) if current.runtime.epoch >= lease.runtime.epoch => {}
+            _ => {
+                candidates.insert(stable_id, lease);
+            }
+        }
+    }
+    Ok(candidates.into_values().collect())
+}
+
 pub(crate) fn ranked_authorities(
     namespace: &str,
     candidates: &[ClientLease],

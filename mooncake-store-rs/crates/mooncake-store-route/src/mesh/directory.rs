@@ -30,7 +30,7 @@ use crate::mesh::registry::{
 };
 use crate::mesh::selection::{
     authority_candidates, ranked_authorities, ranked_top_authorities,
-    select_authorities_for_requests, RouteAuthoritySelection,
+    retained_authority_candidates, select_authorities_for_requests, RouteAuthoritySelection,
 };
 use crate::metrics::record_cas_outcome;
 use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
@@ -187,6 +187,39 @@ impl EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
     ) -> Result<Vec<ClientLease>> {
         authority_candidates(self.membership.as_ref(), observer, true)
+    }
+
+    fn eviction_confirmation_authorities(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        current_candidates: &[ClientLease],
+    ) -> Result<Vec<ClientLease>> {
+        let retained_candidates =
+            retained_authority_candidates(self.membership.as_ref(), observer)?;
+        let mut authorities = BTreeMap::<String, ClientLease>::new();
+        for authority in ranked_top_authorities(
+            &self.namespace,
+            current_candidates,
+            key,
+            self.route_topk,
+        )
+        .into_iter()
+        .chain(ranked_top_authorities(
+            &self.namespace,
+            &retained_candidates,
+            key,
+            self.route_topk,
+        )) {
+            let stable_id = authority.runtime.stable_id.0.clone();
+            match authorities.get(&stable_id) {
+                Some(current) if current.runtime.epoch >= authority.runtime.epoch => {}
+                _ => {
+                    authorities.insert(stable_id, authority);
+                }
+            }
+        }
+        Ok(authorities.into_values().collect())
     }
 
     fn local_authority_service(
@@ -1149,20 +1182,21 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         key: &ObjectKey,
         replica: &ReplicaRoute,
     ) -> Result<RouteReplicaReference> {
-        let candidates = self.authority_candidates_force_refresh(observer)?;
-        if candidates.is_empty() {
+        let current_candidates = self.authority_candidates(observer)?;
+        let expected_members = current_candidates
+            .iter()
+            .map(|authority| authority.runtime.clone())
+            .collect::<BTreeSet<_>>();
+        let authorities =
+            self.eviction_confirmation_authorities(observer, key, &current_candidates)?;
+        if authorities.is_empty() {
             return Err(StoreError::Transport(
                 "exact replica confirmation has no live route authorities".to_string(),
             ));
         }
-        let expected_members = candidates
-            .iter()
-            .map(|authority| authority.runtime.clone())
-            .collect::<BTreeSet<_>>();
 
-        let mut observed: Option<Option<ObjectRoute>> = None;
         let mut referenced: Option<ObjectRoute> = None;
-        for authority in candidates {
+        for authority in authorities {
             let mut responses = self.read_authority_batch(&authority, std::slice::from_ref(key))?;
             let response = responses.pop().ok_or_else(|| {
                 StoreError::InvalidState(
@@ -1180,22 +1214,17 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                             .is_some_and(|allocation_id| allocation_id != 0)
                 })
             });
-            if let Some(previous) = observed.as_ref() {
-                if previous != &response {
-                    return Err(StoreError::Transport(format!(
-                        "route authorities diverged while confirming exact replica for {}",
-                        key.0
-                    )));
-                }
-            } else {
-                observed = Some(response.clone());
-            }
             if references_replica {
-                referenced = response;
+                if let Some(route) = response {
+                    match referenced.as_ref() {
+                        Some(current) if current.version >= route.version => {}
+                        _ => referenced = Some(route),
+                    }
+                }
             }
         }
         let refreshed_members = self
-            .authority_candidates_force_refresh(observer)?
+            .authority_candidates(observer)?
             .into_iter()
             .map(|authority| authority.runtime)
             .collect::<BTreeSet<_>>();
