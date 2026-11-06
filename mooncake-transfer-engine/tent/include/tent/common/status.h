@@ -102,6 +102,7 @@ class Status final {
         kInvalidEntry = 5,
         kInvalidMetadataType = 6,
         kNeedsRefreshCache = 7,
+        kStaleLease = 8,
 
         kRdmaError = 100,
         kCudaError = 101,
@@ -158,6 +159,7 @@ class Status final {
     TYPE_CHECK(InvalidEntry);
     TYPE_CHECK(InvalidMetadataType);
     TYPE_CHECK(NeedsRefreshCache);
+    TYPE_CHECK(StaleLease);
 
     TYPE_CHECK(RdmaError);
     TYPE_CHECK(CudaError);
