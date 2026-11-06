@@ -11,7 +11,7 @@ use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
     MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest,
-    RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
+    RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteReplicaReference, RouteVersion, SegmentAnnouncement,
     SegmentLifecycleState, SegmentName, SegmentReservation, SegmentTargetChunk, StoreError,
     TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantObjectAccounting,
     TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
@@ -33,9 +33,9 @@ use super::{
     ColdObjectRead, ColdObjectWrite, ColdTierBackendResolver, ColdTierKind, ColdTierOffloadMode,
     ColdTierOffloadPriorityConfig, ColdTierRateLimitConfig, ColdTierTargetConfig,
     ColdTierWatermarkConfig, LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState,
-    LocalAuthorityAdapter, LocalDirPersistentStorageBackend, PendingReclaim,
+    LocalAuthorityAdapter, LocalDirPersistentStorageBackend, PendingEvictionPhase, PendingReclaim,
     PersistentStorageBackend, ReplicaWriteTarget, ResolvedObject, RouteWriteGate, SegmentAllocator,
-    StorageOwnerColdTierConfig, StorageOwnerState, StoreState, SuspectRuntimeCache,
+    StorageOwnerColdTierConfig, StorageOwnerState, StoreState, SuspectRuntimeCache, PENDING_EVICTION_RETRY_MAX_MS,
 };
 use crate::{
     control_plane::{
@@ -133,6 +133,7 @@ struct CountingRouteDirectory {
     single_cas_calls: AtomicUsize,
     batch_cas_calls: AtomicUsize,
     max_cas_batch_size: AtomicUsize,
+    owner_list_scans: AtomicUsize,
 }
 
 struct EmptyConflictRouteDirectory {
@@ -423,6 +424,7 @@ impl CountingRouteDirectory {
             single_cas_calls: AtomicUsize::new(0),
             batch_cas_calls: AtomicUsize::new(0),
             max_cas_batch_size: AtomicUsize::new(0),
+            owner_list_scans: AtomicUsize::new(0),
         }
     }
 
@@ -448,6 +450,9 @@ impl CountingRouteDirectory {
 
     fn max_cas_batch_size(&self) -> usize {
         self.max_cas_batch_size.load(Ordering::Relaxed)
+    }
+    fn owner_list_scans(&self) -> usize {
+        self.owner_list_scans.load(Ordering::Relaxed)
     }
 }
 
@@ -1822,6 +1827,15 @@ impl RouteDirectory for CountingRouteDirectory {
         self.inner.get_object_route(observer, key)
     }
 
+    fn confirm_replica_reference(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+    ) -> mooncake_store_core::Result<RouteReplicaReference> {
+        self.inner.confirm_replica_reference(observer, key, replica)
+    }
+
     fn get_object_routes(
         &self,
         observer: &ClientLease,
@@ -1887,7 +1901,19 @@ impl RouteDirectory for CountingRouteDirectory {
         observer: &ClientLease,
         owner: &ClientRuntimeId,
     ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+        self.owner_list_scans.fetch_add(1, Ordering::Relaxed);
         self.inner.list_routes_by_replica_owner(observer, owner)
+    }
+
+    fn visit_routes_by_replica_owner_consistent(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> mooncake_store_core::Result<()>,
+    ) -> mooncake_store_core::Result<()> {
+        self.owner_list_scans.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .visit_routes_by_replica_owner_consistent(observer, owner, visitor)
     }
 
     fn list_routes_in_scope(
@@ -11680,7 +11706,7 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
         replicas: vec![ReplicaRoute {
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
-            allocation_id: None,
+            allocation_id: Some(reservation.allocation_id),
             offset: Some(reservation.offset_bytes),
             segment_offset: reservation.offset_bytes,
             length: reservation.length_bytes,
@@ -11732,11 +11758,11 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
 
     client
         .storage_owner
-        .stale_reclaim_scan_completed_at_ms
+        .stale_candidate_reconcile_completed_at_ms
         .store(0, Ordering::Relaxed);
     let reclaimed = client
         .storage_owner
-        .reclaim_stale_local_allocations_before_clock_eviction(None)
+        .reconcile_stale_clock_candidates(None, false)
         .expect("mixed stale pre-pass should succeed");
     assert_eq!(
         reclaimed, 1,
@@ -11766,11 +11792,11 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
         .mark_pending_reservation(&pending_reservation, 0);
     client
         .storage_owner
-        .stale_reclaim_scan_completed_at_ms
+        .stale_candidate_reconcile_completed_at_ms
         .store(0, Ordering::Relaxed);
     let reclaimed_after_deadline = client
         .storage_owner
-        .reclaim_stale_local_allocations_before_clock_eviction(None)
+        .reconcile_stale_clock_candidates(None, false)
         .expect("expired pending stale pre-pass should succeed");
     assert_eq!(
         reclaimed_after_deadline, 1,
@@ -11879,13 +11905,13 @@ fn eviction_reclaims_stale_local_allocation_even_with_tiny_scan_limit() {
     let mut total_reclaimed = 0usize;
     for attempt in 0..8 {
         counting_owner
-            .stale_reclaim_scan_completed_at_ms
+            .stale_candidate_reconcile_completed_at_ms
             .store(0, Ordering::Relaxed);
         let route_reads_before = metadata.get_object_route_calls();
         let bounded_reads_before = counting_directory.bounded_reads();
         let full_reads_before = counting_directory.full_reads();
         let reclaimed = counting_owner
-            .reclaim_stale_local_allocations_before_clock_eviction(None)
+            .reconcile_stale_clock_candidates(None, false)
             .expect("bounded stale pre-pass should succeed");
         let route_reads = metadata
             .get_object_route_calls()
@@ -11897,8 +11923,8 @@ fn eviction_reclaims_stale_local_allocation_even_with_tiny_scan_limit() {
             .full_reads()
             .saturating_sub(full_reads_before);
         assert!(
-            route_reads <= 1,
-            "eviction_scan_limit=1 must cap attempt {attempt} to at most one authoritative route read; saw {route_reads}"
+            route_reads <= 2,
+            "eviction_scan_limit=1 permits one bounded victim lookup plus one exact candidate confirmation; saw {route_reads} reads on attempt {attempt}"
         );
         assert_eq!(
             bounded_reads, 1,
@@ -11996,7 +12022,7 @@ fn eviction_reclaims_route_deleted_orphan_when_prepass_is_rate_limited() {
 
     client
         .storage_owner
-        .stale_reclaim_scan_completed_at_ms
+        .stale_candidate_reconcile_completed_at_ms
         .store(now_ms(), Ordering::Relaxed);
     client
         .put("deleted-orphan-fresh", b"fedcba9876543210")
@@ -12064,6 +12090,7 @@ fn eviction_victim_lookup_uses_bounded_route_read() {
         route_key: route.key.clone(),
         segment_name: route.replicas[0].segment_name.clone(),
         segment_offset: route.replicas[0].segment_offset,
+        allocation_id: route.replicas[0].allocation_id,
     };
 
     assert!(
@@ -12135,7 +12162,7 @@ fn clean_eviction_victim_lookup_uses_bounded_route_read() {
     );
     counting_owner.track_route(&materialized_route);
     counting_owner
-        .stale_reclaim_scan_completed_at_ms
+        .stale_candidate_reconcile_completed_at_ms
         .store(now_ms(), Ordering::Relaxed);
 
     let reservation = counting_owner
@@ -12470,6 +12497,7 @@ fn eviction_keeps_non_active_routes_tracked_until_delete_cleanup() {
         route_key: deleting_route.key.clone(),
         segment_name: deleting_route.replicas[0].segment_name.clone(),
         segment_offset: deleting_route.replicas[0].segment_offset,
+        allocation_id: deleting_route.replicas[0].allocation_id,
     };
     assert!(
         !client
@@ -19567,3 +19595,1218 @@ mod routing_tests;
 mod store_client_tests;
 mod transport_prop;
 mod unit_tests;
+
+
+struct ApplyThenFailRouteDirectory {
+    inner: Arc<dyn RouteDirectory>,
+    fail_once: AtomicBool,
+    confirmation_fails: AtomicBool,
+}
+
+struct ApplyBatchThenFailRouteDirectory {
+    inner: Arc<dyn RouteDirectory>,
+    fail_once: AtomicBool,
+}
+
+struct FailBeforeApplyRouteDirectory {
+    inner: Arc<dyn RouteDirectory>,
+    fail_once: AtomicBool,
+}
+
+impl RouteDirectory for ApplyThenFailRouteDirectory {
+    fn get_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        self.inner.get_object_route(observer, key)
+    }
+
+    fn confirm_replica_reference(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+    ) -> mooncake_store_core::Result<RouteReplicaReference> {
+        if self.confirmation_fails.load(Ordering::SeqCst) {
+            return Err(StoreError::Transport(
+                "injected exact confirmation transport failure".to_string(),
+            ));
+        }
+        self.inner.confirm_replica_reference(observer, key, replica)
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        let result = self
+            .inner
+            .compare_and_swap_object_route(observer, key, expected, next)?;
+        if result.applied && self.fail_once.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::Transport(
+                "injected route CAS reply loss after apply".to_string(),
+            ));
+        }
+        Ok(result)
+    }
+
+    fn metadata(&self) -> &dyn MetadataBackend {
+        self.inner.metadata()
+    }
+}
+
+impl RouteDirectory for ApplyBatchThenFailRouteDirectory {
+    fn get_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        self.inner.get_object_route(observer, key)
+    }
+
+    fn confirm_replica_reference(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+    ) -> mooncake_store_core::Result<RouteReplicaReference> {
+        self.inner.confirm_replica_reference(observer, key, replica)
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        self.inner
+            .compare_and_swap_object_route(observer, key, expected, next)
+    }
+
+    fn compare_and_swap_object_routes(
+        &self,
+        observer: &ClientLease,
+        requests: &[RouteCasRequest],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::Result<mooncake_store_core::CasResult>>>
+    {
+        let results = self
+            .inner
+            .compare_and_swap_object_routes(observer, requests)?;
+        if self.fail_once.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::Transport(
+                "injected batched route CAS reply loss after apply".to_string(),
+            ));
+        }
+        Ok(results)
+    }
+
+    fn metadata(&self) -> &dyn MetadataBackend {
+        self.inner.metadata()
+    }
+}
+
+impl RouteDirectory for FailBeforeApplyRouteDirectory {
+    fn get_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        self.inner.get_object_route(observer, key)
+    }
+
+    fn confirm_replica_reference(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+    ) -> mooncake_store_core::Result<RouteReplicaReference> {
+        self.inner.confirm_replica_reference(observer, key, replica)
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        if self.fail_once.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::Transport(
+                "injected route CAS failure before apply".to_string(),
+            ));
+        }
+        self.inner
+            .compare_and_swap_object_route(observer, key, expected, next)
+    }
+
+    fn metadata(&self) -> &dyn MetadataBackend {
+        self.inner.metadata()
+    }
+}
+
+#[test]
+fn batch_buffer_delete_reclaims_untracked_remote_allocations() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("batch-delete-reuse-storage-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("batch-delete-reuse-writer-segment"));
+    let next_writer_transport =
+        Arc::new(storage_transport.peer("batch-delete-reuse-next-writer-segment"));
+    let storage = StoreClientBuilder::new(metadata.clone(), "batch-delete-reuse-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config_with_bytes(16))
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let routes = {
+        let writer = StoreClientBuilder::new(metadata.clone(), "batch-delete-reuse-writer")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .route_control(RouteControlMode::EmbeddedWrh)
+            .live_client_sync_interval(fast_live_client_sync_interval())
+            .transport(writer_transport)
+            .local_memory(rw_only_config())
+            .routed_writes(
+                PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+                1,
+            )
+            .build(test_future_expiry_ms())
+            .expect("writer build should succeed");
+        writer
+            .register_local_memory()
+            .expect("writer memory should register");
+        wait_for_membership_convergence(&[&storage, &writer]);
+
+        let mut source = *b"abcdefghijklmnop";
+        writer
+            .register_buffer(source.as_mut_ptr().cast(), source.len())
+            .expect("source buffer should register");
+        let policy = ReplicationPolicy::new()
+            .replica_count(1)
+            .prefer_local(false)
+            .preferred_storage_owner(storage.runtime_id().storage_key());
+        let routes = writer
+            .batch_put_from(&[
+                PutFromRequest::new("batch-deleted-a", source.as_ptr().cast(), 8)
+                    .replication(policy.clone()),
+                PutFromRequest::new(
+                    "batch-deleted-b",
+                    unsafe { source.as_ptr().add(8).cast() },
+                    8,
+                )
+                .replication(policy),
+            ])
+            .expect("batch_put_from should fill remote storage");
+
+        let mut target = [0u8; 16];
+        writer
+            .register_buffer(target.as_mut_ptr().cast(), target.len())
+            .expect("target buffer should register");
+        let (target_a, target_b) = target.split_at_mut(8);
+        let sizes = writer
+            .batch_get_into(&mut [
+                GetRequest::new("batch-deleted-a", target_a),
+                GetRequest::new("batch-deleted-b", target_b),
+            ])
+            .expect("batch_get_into should read the remote payloads");
+        assert_eq!(sizes, vec![8, 8]);
+        assert_eq!(&target, b"abcdefghijklmnop");
+        routes
+    };
+
+    // This test exercises recovery after local CLOCK tracking is lost. Route
+    // hit report delivery is covered separately, so establish the local entry
+    // directly instead of making the reclaim invariant depend on its timing.
+    for route in &routes {
+        storage.storage_owner.track_route(route);
+    }
+    let mark_expired_pending = |route: &ObjectRoute| {
+        let replica = route
+            .replicas
+            .iter()
+            .find(|replica| replica.owner == *storage.runtime_id())
+            .expect("route should contain the storage replica");
+        storage.allocator.lock().mark_pending_allocation(
+            &replica.segment_name,
+            replica.segment_offset,
+            replica.length,
+            0,
+        );
+    };
+    for route in &routes {
+        wait_for_storage_clock_route(&storage, route, false);
+        storage.storage_owner.hot_replicas.remove_key(&route.key);
+        mark_expired_pending(route);
+    }
+    storage
+        .storage_owner
+        .stale_candidate_reconcile_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    assert_eq!(
+        storage
+            .storage_owner
+            .reconcile_stale_clock_candidates(None, false)
+            .expect("live route reconciliation should succeed"),
+        0,
+        "authoritative live routes must protect untracked allocations"
+    );
+    assert_eq!(storage.allocator.lock().usage_bytes().0, 16);
+
+    for route in &routes {
+        let cas = storage
+            .route_directory
+            .compare_and_swap_object_route(&storage.lease, &route.key, Some(route.version), None)
+            .expect("route delete CAS should succeed");
+        assert!(cas.applied, "route delete CAS should apply");
+        mark_expired_pending(route);
+    }
+    storage
+        .storage_owner
+        .stale_candidate_reconcile_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    assert!(
+        storage
+            .storage_owner
+            .hot_replicas
+            .clock
+            .lock()
+            .tracked_allocation_spans()
+            .is_empty(),
+        "test setup must model route tracking lost before delete cleanup"
+    );
+
+    let next_writer = StoreClientBuilder::new(metadata.clone(), "batch-delete-reuse-next-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(next_writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("next writer build should succeed");
+    next_writer
+        .register_local_memory()
+        .expect("next writer memory should register");
+    wait_for_membership_convergence(&[&storage, &next_writer]);
+
+    let mut fresh = *b"ABCDEFGHIJKLMNOP";
+    next_writer
+        .register_buffer(fresh.as_mut_ptr().cast(), fresh.len())
+        .expect("fresh source buffer should register");
+    let policy = ReplicationPolicy::new()
+        .replica_count(1)
+        .prefer_local(false)
+        .preferred_storage_owner(storage.runtime_id().storage_key());
+    let fresh_routes = next_writer
+        .batch_put_from(&[
+            PutFromRequest::new("batch-fresh-a", fresh.as_ptr().cast(), 8)
+                .replication(policy.clone()),
+            PutFromRequest::new("batch-fresh-b", unsafe { fresh.as_ptr().add(8).cast() }, 8)
+                .replication(policy),
+        ])
+        .expect("batch_put_from should reuse deleted remote allocations");
+
+    assert_eq!(fresh_routes.len(), 2);
+    assert_eq!(storage.allocator.lock().usage_bytes().0, 16);
+    for route in fresh_routes {
+        assert_eq!(route.replicas[0].owner, *storage.runtime_id());
+    }
+}
+
+#[test]
+fn orphaned_pending_allocation_reclaims_after_publication_deadline() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("orphan-pending-owner-segment"));
+    let client = StoreClientBuilder::new(metadata, "orphan-pending-owner")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .reclaim_grace_ms(60_000)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let reservation = {
+        let mut allocator = client.allocator.lock();
+        let reservation = allocator
+            .reserve_any(client.runtime_id(), 16)
+            .expect("local reservation should succeed");
+        allocator.mark_pending_reservation(&reservation, now_ms().saturating_add(40));
+        reservation
+    };
+    assert_eq!(client.allocator.lock().usage_bytes().0, 16);
+    client
+        .storage_owner
+        .stale_candidate_reconcile_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    assert_eq!(
+        client
+            .storage_owner
+            .reconcile_stale_clock_candidates(None, false)
+            .expect("fresh pending orphan reconciliation should succeed"),
+        0,
+        "fresh pending allocation should keep its publication fence"
+    );
+
+    sleep(Duration::from_millis(60));
+    client
+        .storage_owner
+        .stale_candidate_reconcile_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    assert_eq!(
+        client
+            .storage_owner
+            .reconcile_stale_clock_candidates(None, false)
+            .expect("expired pending orphan reconciliation should succeed"),
+        1,
+        "orphaned pending allocation should be reclaimable after publication deadline"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        0,
+        "orphaned allocation should release physical bytes"
+    );
+    assert!(
+        client
+            .allocator
+            .lock()
+            .pending_allocations(now_ms())
+            .is_empty(),
+        "released orphan should leave no pending allocation"
+    );
+    assert_eq!(reservation.length_bytes, 16);
+}
+
+#[test]
+fn deleted_untracked_route_reclaims_non_pending_owner_allocation() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("delete-non-pending-owner-segment"));
+    let client = StoreClientBuilder::new(metadata, "delete-non-pending-owner")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .reclaim_grace_ms(60_000)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("delete-non-pending-stale", b"0123456789abcdef")
+        .expect("put should succeed");
+    client.storage_owner.track_route(&route);
+    wait_for_storage_clock_route(&client, &route, false);
+    client.storage_owner.hot_replicas.remove_key(&route.key);
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(&client.lease, &route.key, Some(route.version), None)
+        .expect("delete CAS should succeed");
+    assert!(cas.applied, "delete CAS should apply");
+
+    client
+        .storage_owner
+        .stale_candidate_reconcile_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    assert_eq!(
+        client
+            .storage_owner
+            .reconcile_stale_clock_candidates(None, false)
+            .expect("non-pending stale allocation reclaim should succeed"),
+        1,
+        "deleted untracked routes should reclaim non-pending owner bytes"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        0,
+        "deleted non-pending allocation should be reusable"
+    );
+}
+
+#[test]
+fn capacity_pressure_forces_bounded_reclaim_of_untracked_allocation() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("capacity-force-untracked-segment"));
+    let client = StoreClientBuilder::new(metadata, "capacity-force-untracked")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(16)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .reclaim_grace_ms(60_000)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let stale = client
+        .put("capacity-force-stale", b"0123456789abcdef")
+        .expect("initial put should consume local capacity");
+    client.storage_owner.track_route(&stale);
+    wait_for_storage_clock_route(&client, &stale, false);
+    client.storage_owner.hot_replicas.remove_key(&stale.key);
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(&client.lease, &stale.key, Some(stale.version), None)
+        .expect("route delete CAS should succeed");
+    assert!(cas.applied, "test setup must remove the stale route");
+
+    // Startup seeds the successful-pass timestamp. After the 100ms minimum
+    // cadence, a reserve miss is allowed to force a bounded candidate pass.
+    sleep(Duration::from_millis(120));
+    let fresh = client
+        .put("capacity-force-fresh", b"fedcba9876543210")
+        .expect("capacity pressure should reclaim only the proven-unreferenced allocation");
+    assert_eq!(fresh.replicas[0].owner, *client.runtime_id());
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "the new write should reuse the reclaimed local capacity"
+    );
+    assert!(
+        client
+            .query_route("capacity-force-stale")
+            .expect("stale route lookup should succeed")
+            .is_none(),
+        "forced candidate reclaim must not republish the deleted route"
+    );
+}
+
+#[test]
+fn deleted_tracked_route_waits_for_publication_fence_before_reclaim() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("delete-pending-owner-segment"));
+    let client = StoreClientBuilder::new(metadata, "delete-pending-owner")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .reclaim_grace_ms(60_000)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("delete-pending-stale", b"0123456789abcdef")
+        .expect("stale put should succeed");
+    client.storage_owner.track_route(&route);
+    wait_for_storage_clock_route(&client, &route, false);
+    let replica = route
+        .replicas
+        .iter()
+        .find(|replica| replica.owner == *client.runtime_id())
+        .expect("route should contain local replica")
+        .clone();
+    client.allocator.lock().mark_pending_allocation(
+        &replica.segment_name,
+        replica.segment_offset,
+        replica.length,
+        now_ms().saturating_add(40),
+    );
+    let cas = client
+        .route_directory
+        .compare_and_swap_object_route(&client.lease, &route.key, Some(route.version), None)
+        .expect("delete CAS should succeed");
+    assert!(cas.applied, "delete CAS should apply");
+
+    client
+        .storage_owner
+        .stale_candidate_reconcile_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    let reclaimed = client
+        .storage_owner
+        .reconcile_stale_clock_candidates(None, false)
+        .expect("deleted route stale reclaim should succeed");
+    assert_eq!(
+        reclaimed, 0,
+        "a pending publication fence must keep the allocation until its deadline"
+    );
+    sleep(Duration::from_millis(60));
+    client
+        .storage_owner
+        .stale_candidate_reconcile_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    let reclaimed = client
+        .storage_owner
+        .reconcile_stale_clock_candidates(None, false)
+        .expect("expired publication fence should allow stale reclaim");
+    assert_eq!(
+        reclaimed, 1,
+        "a deleted route should release its allocation after the publication fence expires"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        0,
+        "expired deleted-route allocation should be reusable"
+    );
+}
+
+#[test]
+fn forced_stale_candidate_reclaim_bypasses_interval_after_publication_fence() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("force-stale-reclaim-segment"));
+    let client = StoreClientBuilder::new(metadata, "force-stale-reclaim")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .cold_tier_offload_priority(ColdTierOffloadPriorityConfig::default().eviction_scan_limit(1))
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .reclaim_grace_ms(60_000)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let routes = [
+        client
+            .put("force-stale-a", b"abcdefgh")
+            .expect("first put should succeed"),
+        client
+            .put("force-stale-b", b"ABCDEFGH")
+            .expect("second put should succeed"),
+    ];
+    for route in &routes {
+        wait_for_storage_clock_route(&client, route, false);
+        let replica = &route.replicas[0];
+        client.allocator.lock().mark_pending_allocation(
+            &replica.segment_name,
+            replica.segment_offset,
+            replica.length,
+            0,
+        );
+        let cas = client
+            .route_directory
+            .compare_and_swap_object_route(&client.lease, &route.key, Some(route.version), None)
+            .expect("route delete CAS should succeed");
+        assert!(cas.applied, "route delete CAS should apply");
+    }
+
+    client
+        .storage_owner
+        .stale_candidate_reconcile_completed_at_ms
+        .store(0, Ordering::Relaxed);
+    assert_eq!(
+        client
+            .storage_owner
+            .reconcile_stale_clock_candidates(None, false)
+            .expect("first stale reclaim should succeed"),
+        1
+    );
+    assert_eq!(
+        client
+            .storage_owner
+            .reconcile_stale_clock_candidates(None, false)
+            .expect("second non-forced stale reclaim should be throttled"),
+        0
+    );
+    assert_eq!(
+        client
+            .storage_owner
+            .reconcile_stale_clock_candidates(None, true)
+            .expect("an immediate forced reclaim should respect minimum cadence"),
+        0,
+        "force_scan bypasses the successful-pass interval, not the 100ms guard"
+    );
+    sleep(Duration::from_millis(120));
+    assert_eq!(
+        client
+            .storage_owner
+            .reconcile_stale_clock_candidates(None, true)
+            .expect("forced stale reclaim should run after the minimum cadence"),
+        1
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        0,
+        "allocation pressure reclaim should release all deleted-route bytes"
+    );
+}
+
+#[test]
+fn forced_stale_candidate_reclaim_never_starts_owner_route_scan() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new(
+        "forced-stale-reclaim-singleflight-segment",
+    ));
+    let client = StoreClientBuilder::new(metadata, "forced-stale-reclaim-singleflight")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .reclaim_grace_ms(60_000)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("forced-stale-reclaim-singleflight", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+    client.storage_owner.hot_replicas.remove_key(&route.key);
+
+    let counting_directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        counting_directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner
+        .reconcile_stale_clock_candidates(None, true)
+        .expect("forced bounded candidate reclaim should succeed");
+    assert_eq!(
+        counting_directory.owner_list_scans(),
+        0,
+        "candidate reclaim must not start an owner-wide route scan"
+    );
+}
+
+#[test]
+fn normal_eviction_does_not_list_all_owner_routes() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("eviction-no-owner-list-segment"));
+    let client = StoreClientBuilder::new(metadata, "eviction-no-owner-list")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("eviction-no-owner-list", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_route(&route);
+
+    assert!(
+        owner
+            .evict_one_blocking(None)
+            .expect("normal eviction should succeed"),
+        "the cold local replica should be evicted"
+    );
+    assert_eq!(
+        directory.owner_list_scans(),
+        0,
+        "normal eviction must use its bounded victim route lookup, not an owner-wide route scan"
+    );
+}
+
+#[test]
+fn eviction_rejects_stale_route_metadata_before_route_cas() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("eviction-release-reject-segment"));
+    let client = StoreClientBuilder::new(metadata, "eviction-release-reject")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("eviction-release-reject", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        client.route_directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_route(&route);
+
+    let replica = route
+        .replicas
+        .iter()
+        .find(|replica| replica.owner == *client.runtime_id())
+        .expect("route should contain the local replica");
+    let victim = ClockEntryId {
+        route_key: route.key.clone(),
+        segment_name: replica.segment_name.clone(),
+        segment_offset: replica.segment_offset,
+        allocation_id: replica.allocation_id,
+    };
+    let mut stale_route = route.clone();
+    stale_route.replicas[0].length = stale_route.replicas[0].length.saturating_add(1);
+
+    assert!(
+        !owner
+            .evict_route_replica(&victim, &stale_route, 0, true)
+            .expect("stale route metadata should be rejected before eviction CAS"),
+        "an eviction must not delete a route when its replica no longer matches the allocator"
+    );
+    assert!(
+        !owner
+            .hot_replicas
+            .clock
+            .lock()
+            .allocation_spans_for_key(&route.key)
+            .is_empty(),
+        "a rejected eviction must retain an exact local tracking record"
+    );
+    assert!(
+        client
+            .query_route("eviction-release-reject")
+            .expect("route lookup should succeed")
+            .is_some(),
+        "the stale caller must not delete the still-published route"
+    );
+    assert_eq!(
+        owner.allocator.lock().usage_bytes().0,
+        replica.length,
+        "the rejected release must not mutate allocator ownership"
+    );
+}
+
+#[test]
+fn eviction_retains_token_when_applied_cas_reply_is_lost() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("eviction-applied-reply-loss-segment"));
+    let client = StoreClientBuilder::new(metadata, "eviction-applied-reply-loss")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("eviction-applied-reply-loss", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        Arc::new(ApplyThenFailRouteDirectory {
+            inner: client.route_directory.clone(),
+            fail_once: AtomicBool::new(true),
+            confirmation_fails: AtomicBool::new(false),
+        }),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_route(&route);
+
+    assert!(
+        !owner
+            .evict_one_blocking(None)
+            .expect("unknown CAS outcome must retain a pending eviction instead of failing"),
+        "the foreground attempt must not claim space before the outcome is confirmed"
+    );
+    assert_eq!(
+        owner.pending_evictions.lock().len(),
+        1,
+        "an applied CAS with a lost reply must remain owner-tracked"
+    );
+    assert_eq!(
+        owner.allocator.lock().usage_bytes().0,
+        16,
+        "the allocator allocation must remain non-reusable until confirmation"
+    );
+
+    sleep(Duration::from_millis(120));
+    assert_eq!(
+        owner
+            .process_pending_evictions(1)
+            .expect("the exact confirmation should succeed"),
+        1,
+        "one confirmed absent token should commit exactly once"
+    );
+    assert!(owner.pending_evictions.lock().is_empty());
+    assert_eq!(
+        owner.allocator.lock().usage_bytes().0,
+        0,
+        "the confirmed absent allocation should become reusable"
+    );
+}
+
+#[test]
+fn eviction_aborts_pending_token_when_unknown_cas_remains_referenced() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new(
+        "eviction-referenced-confirmation-segment",
+    ));
+    let client = StoreClientBuilder::new(metadata, "eviction-referenced-confirmation")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("eviction-referenced-confirmation", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        Arc::new(FailBeforeApplyRouteDirectory {
+            inner: client.route_directory.clone(),
+            fail_once: AtomicBool::new(true),
+        }),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_route(&route);
+
+    assert!(!owner
+        .evict_one_blocking(None)
+        .expect("unknown CAS outcome should retain pending state"));
+    sleep(Duration::from_millis(120));
+    assert_eq!(
+        owner
+            .process_pending_evictions(1)
+            .expect("referenced confirmation should succeed"),
+        0,
+        "a still-referenced route must abort instead of releasing"
+    );
+    assert!(owner.pending_evictions.lock().is_empty());
+    assert_eq!(owner.allocator.lock().usage_bytes().0, 16);
+    assert!(
+        !owner
+            .hot_replicas
+            .clock
+            .lock()
+            .allocation_spans_for_key(&route.key)
+            .is_empty(),
+        "abort must keep or restore CLOCK tracking for the live allocation"
+    );
+}
+
+#[test]
+fn eviction_keeps_pending_token_when_exact_confirmation_is_indeterminate() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new(
+        "eviction-indeterminate-confirmation-segment",
+    ));
+    let client = StoreClientBuilder::new(metadata, "eviction-indeterminate-confirmation")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("eviction-indeterminate-confirmation", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        Arc::new(ApplyThenFailRouteDirectory {
+            inner: client.route_directory.clone(),
+            fail_once: AtomicBool::new(true),
+            confirmation_fails: AtomicBool::new(true),
+        }),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_route(&route);
+
+    assert!(!owner
+        .evict_one_blocking(None)
+        .expect("unknown CAS outcome should retain pending state"));
+    sleep(Duration::from_millis(120));
+    assert_eq!(
+        owner
+            .process_pending_evictions(1)
+            .expect("indeterminate confirmation must not fail eviction worker"),
+        0
+    );
+    assert_eq!(owner.pending_evictions.lock().len(), 1);
+    assert_eq!(owner.allocator.lock().usage_bytes().0, 16);
+}
+
+#[test]
+fn pending_eviction_retries_settle_to_low_frequency_after_default_limit() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("eviction-pending-retry-backoff-segment"));
+    let client = StoreClientBuilder::new(metadata, "eviction-pending-retry-backoff")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("eviction-pending-retry-backoff", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        Arc::new(ApplyThenFailRouteDirectory {
+            inner: client.route_directory.clone(),
+            fail_once: AtomicBool::new(true),
+            confirmation_fails: AtomicBool::new(true),
+        }),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_route(&route);
+
+    assert!(!owner
+        .evict_one_blocking(None)
+        .expect("unknown CAS outcome should retain pending state"));
+    let identity = owner
+        .pending_evictions
+        .lock()
+        .keys()
+        .next()
+        .cloned()
+        .expect("failed CAS must create one pending token");
+
+    // CAS reply loss already scheduled the first 100ms retry. The second
+    // retry remains quick, while the third retains the token but switches to
+    // the low-frequency interval instead of busy-looping RPCs.
+    let before = now_ms();
+    owner.defer_pending_eviction(&identity, PendingEvictionPhase::PendingConfirmation);
+    let scheduled = owner
+        .pending_evictions
+        .lock()
+        .get(&identity)
+        .expect("token should remain pending")
+        .next_attempt_at_ms;
+    assert!(
+        scheduled >= before.saturating_add(200),
+        "the second retry should observe its configured exponential delay"
+    );
+    let before = now_ms();
+    owner.defer_pending_eviction(&identity, PendingEvictionPhase::PendingConfirmation);
+    let scheduled = owner
+        .pending_evictions
+        .lock()
+        .get(&identity)
+        .expect("token should remain pending after retry budget")
+        .next_attempt_at_ms;
+    assert!(
+        scheduled >= before.saturating_add(PENDING_EVICTION_RETRY_MAX_MS),
+        "the retained token must stop issuing confirmation RPCs at a hot cadence"
+    );
+}
+
+#[test]
+fn background_watermark_batch_retains_token_when_applied_cas_reply_is_lost() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new(
+        "background-batch-applied-reply-loss-segment",
+    ));
+    let client = StoreClientBuilder::new(metadata, "background-batch-applied-reply-loss")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(60))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let routes = (0..3)
+        .map(|index| {
+            client
+                .put(
+                    &format!("background-batch-applied-reply-loss-{index}"),
+                    &[index as u8; 20],
+                )
+                .expect("put should succeed")
+        })
+        .collect::<Vec<_>>();
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        Arc::new(ApplyThenFailRouteDirectory {
+            inner: client.route_directory.clone(),
+            fail_once: AtomicBool::new(true),
+            confirmation_fails: AtomicBool::new(false),
+        }),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_routes(&routes);
+
+    assert_eq!(
+        owner
+            .evict_until_low_watermark(60, 0)
+            .expect("batch eviction should retain unknown CAS outcomes"),
+        2,
+        "only CAS replies that were received may release their allocator allocations"
+    );
+    assert_eq!(owner.pending_evictions.lock().len(), 1);
+    assert_eq!(
+        owner.allocator.lock().usage_bytes().0,
+        20,
+        "the allocation with an applied but unacknowledged CAS must remain non-reusable"
+    );
+    let metrics = render_prometheus_metrics();
+    assert_eviction_guard_event_at_least(&metrics, "route_cas", "outcome_unknown", 1);
+
+    sleep(Duration::from_millis(120));
+    assert_eq!(
+        owner
+            .process_pending_evictions(1)
+            .expect("the exact confirmation should succeed"),
+        1,
+        "the pending token should release exactly once after confirmation"
+    );
+    assert!(owner.pending_evictions.lock().is_empty());
+    assert_eq!(owner.allocator.lock().usage_bytes().0, 0);
+}
+
+#[test]
+fn background_watermark_batch_retains_all_tokens_when_complete_reply_is_lost() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new(
+        "background-batch-complete-reply-loss-segment",
+    ));
+    let client = StoreClientBuilder::new(metadata, "background-batch-complete-reply-loss")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(60))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let routes = (0..3)
+        .map(|index| {
+            client
+                .put(
+                    &format!("background-batch-complete-reply-loss-{index}"),
+                    &[index as u8; 20],
+                )
+                .expect("put should succeed")
+        })
+        .collect::<Vec<_>>();
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        Arc::new(ApplyBatchThenFailRouteDirectory {
+            inner: client.route_directory.clone(),
+            fail_once: AtomicBool::new(true),
+        }),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_routes(&routes);
+
+    assert_eq!(
+        owner
+            .evict_until_low_watermark(60, 0)
+            .expect("batch reply loss must retain every token for confirmation"),
+        0,
+        "no allocation may be released when the complete batch outcome is unknown"
+    );
+    assert_eq!(owner.pending_evictions.lock().len(), 3);
+    assert_eq!(owner.allocator.lock().usage_bytes().0, 60);
+    let metrics = render_prometheus_metrics();
+    assert_eviction_guard_event_at_least(&metrics, "route_cas", "outcome_unknown", 3);
+
+    sleep(Duration::from_millis(120));
+    assert_eq!(
+        owner
+            .process_pending_evictions(3)
+            .expect("each exact confirmation should succeed"),
+        3,
+        "all pending allocations should release exactly once after confirmation"
+    );
+    assert!(owner.pending_evictions.lock().is_empty());
+    assert_eq!(owner.allocator.lock().usage_bytes().0, 0);
+}
