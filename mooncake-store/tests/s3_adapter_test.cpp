@@ -18,6 +18,8 @@
 #include <vector>
 
 #include "storage/distributed/s3_adapter.h"
+#include "storage/distributed/object_storage_backend.h"
+#include "oss_fault_test_helpers.h"
 
 namespace mooncake {
 namespace {
@@ -436,6 +438,81 @@ TEST(S3ObjectStorageAdapterTest, BatchGetRetriesTransientFailure) {
     EXPECT_TRUE(results[0].has_value());
     EXPECT_EQ(buffer, "abc");
     EXPECT_EQ(server.requests().size(), 2u);
+}
+
+TEST(S3ObjectStorageAdapterTest, GenericAndBatchReadsValidateContentRange) {
+    const auto wrong = RawResponse("206 Partial Content",
+                                   "Content-Range: bytes 2-4/5\r\n", "abc");
+    const auto missing = RawResponse("206 Partial Content", "", "abc");
+    OneShotHttpServer server(
+        {wrong, wrong, missing, missing,
+         RawResponse("206 Partial Content", "Content-Range: bytes 1-3/5\r\n",
+                     "abc"),
+         RawResponse("206 Partial Content", "Content-Range: bytes 0-2/3\r\n",
+                     "abc")});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
+    S3ObjectStorageAdapter adapter("p");
+    ASSERT_TRUE(adapter.Init());
+    ObjectStorageAdapter& generic = adapter;
+    std::array<char, 5> output;
+    for (int i = 0; i < 2; ++i) {
+        output.fill('!');
+        const auto single = generic.GetRange("k", output.data() + 1, 3, 1);
+        EXPECT_FALSE(single);
+        if (!single) {
+            EXPECT_EQ(single.error(), ErrorCode::FILE_READ_FAIL);
+        }
+        const auto batch = adapter.GetBatch({{"k", output.data() + 1, 3}});
+        ASSERT_EQ(batch.size(), 1U);
+        EXPECT_FALSE(batch[0]);
+        if (!batch[0]) {
+            EXPECT_EQ(batch[0].error(), ErrorCode::FILE_READ_FAIL);
+        }
+        EXPECT_EQ(output.front(), '!');
+        EXPECT_EQ(output.back(), '!');
+    }
+    EXPECT_TRUE(generic.GetRange("k", output.data() + 1, 3, 1));
+    EXPECT_EQ(std::string(output.data(), output.size()), "!abc!");
+    const auto batch = adapter.GetBatch({{"k", output.data() + 1, 3}});
+    ASSERT_EQ(batch.size(), 1U);
+    EXPECT_TRUE(batch[0]);
+    EXPECT_EQ(server.requests().size(), 6U);
+}
+
+TEST(S3ObjectStorageAdapterTest, ImmutableBackendUsesSingleAttemptUploads) {
+    using Server = test::OssFaultHttpServer;
+    Server server(
+        {{"uncertain", Server::Reset()}, {"fresh", Server::Reply(200, "")}});
+    ScopedEnvironment env;
+    ConfigureLocalEndpoint(env, server.port());
+    auto adapter = std::make_shared<S3ObjectStorageAdapter>("p");
+    ASSERT_TRUE(adapter->Init());
+    EXPECT_TRUE(adapter->SupportsSinglePutAttempt());
+    EXPECT_TRUE(adapter->SupportsSinglePutVAttempt());
+    ObjectStorageBackend backend({}, adapter);
+    char value = 'x';
+    bool started = false;
+    const auto copy = [](void* dst, const void* src, size_t bytes) {
+        std::memcpy(dst, src, bytes);
+        return true;
+    };
+    EXPECT_EQ(backend.Write("uncertain", 1, {{&value, 1}}, copy, &started),
+              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(started);
+    EXPECT_EQ(backend.WriteV(
+                  "fresh", 1, {{&value, 1}}, [](const Slice&) { return true; },
+                  {}, &started),
+              ErrorCode::OK);
+    EXPECT_TRUE(started);
+    server.Stop();
+    EXPECT_TRUE(server.error().empty()) << server.error();
+    ASSERT_EQ(server.requests().size(), 2U);
+    EXPECT_NE(server.requests()[0].find("/uncertain HTTP/"), std::string::npos);
+    EXPECT_NE(server.requests()[1].find("/fresh HTTP/"), std::string::npos);
+    for (const auto& request : server.requests()) {
+        EXPECT_TRUE(request.ends_with("\r\n\r\nx"));
+    }
 }
 
 // A connection dropped before any response (for example a reset after a
