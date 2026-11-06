@@ -843,6 +843,15 @@ mod state_store_tests {
         clock.remove_key(&first.key);
 
         assert_eq!(clock.free_slots, vec![0]);
+
+        let third = test_route("third", &runtime);
+        clock.track_route(&third, &runtime);
+
+        assert!(clock.free_slots.is_empty());
+        assert_eq!(clock.entries.len(), 2, "the vacant slot should be reused");
+        let mut occupied_slots = clock.by_id.values().copied().collect::<Vec<_>>();
+        occupied_slots.sort_unstable();
+        assert_eq!(occupied_slots, vec![0, 1]);
     }
 
     #[test]
@@ -857,7 +866,7 @@ mod state_store_tests {
             routes.push(route);
         }
         for index in 0..8 {
-            clock.mark_hot_keys(&[ObjectKey(format!("k-{index}"))]);
+            clock.pending_hot_keys.insert(ObjectKey(format!("k-{index}")));
         }
         assert_eq!(clock.pending_hot_keys.len(), 8);
 
@@ -2100,12 +2109,17 @@ impl StorageClockState {
         runtime: &ClientRuntimeId,
         fresh_write: bool,
     ) {
+        let has_local_replica = route
+            .replicas
+            .iter()
+            .any(|replica| replica.owner == *runtime);
+        let pending_hot = has_local_replica && self.pending_hot_keys.remove(&route.key);
         for replica in route
             .replicas
             .iter()
             .filter(|replica| replica.owner == *runtime)
         {
-            self.upsert_replica(route, replica, fresh_write);
+            self.upsert_replica(route, replica, fresh_write, pending_hot);
         }
     }
 
@@ -2153,6 +2167,7 @@ impl StorageClockState {
         if local_targets.is_empty() {
             return;
         }
+        let pending_hot = self.pending_hot_keys.remove(&route.key);
         for (owner, target_id, _) in local_targets {
             self.upsert_replica(
                 route,
@@ -2168,6 +2183,7 @@ impl StorageClockState {
                     priority: 0,
                 },
                 fresh_write,
+                pending_hot,
             );
         }
         self.pending_hot_keys.remove(&route.key);
@@ -2177,14 +2193,20 @@ impl StorageClockState {
         let mut slots = Vec::new();
         let mut bytes = 0u64;
         for key in keys {
-            self.pending_hot_keys.insert(key.clone());
+            let mut tracked = false;
             if let Some(indices) = self.by_key.get(key) {
                 for index in indices {
                     if let Some(entry) = self.entries.get(*index).and_then(Option::as_ref) {
+                        tracked = true;
                         bytes = bytes.saturating_add(entry.length_bytes);
                         slots.push(*index);
                     }
                 }
+            }
+            if tracked {
+                self.pending_hot_keys.remove(key);
+            } else {
+                self.pending_hot_keys.insert(key.clone());
             }
         }
         for index in slots {
@@ -2244,6 +2266,7 @@ impl StorageClockState {
         route: &ObjectRoute,
         replica: &ReplicaRoute,
         fresh_write: bool,
+        pending_hot: bool,
     ) {
         let id = ClockEntryId {
             route_key: route.key.clone(),
@@ -2253,13 +2276,17 @@ impl StorageClockState {
         if let Some(index) = self.by_id.get(&id).copied() {
             if let Some(entry) = self.entries.get_mut(index).and_then(Option::as_mut) {
                 entry.length_bytes = replica.length;
-                if fresh_write && entry.hot_credit == 0 {
+                if pending_hot {
+                    entry.hot = true;
+                    entry.hot_credit = Self::READ_HOT_CLOCK_CREDIT;
+                    entry.fresh_write = false;
+                } else if fresh_write && entry.hot_credit == 0 {
                     entry.fresh_write = true;
                 }
             }
             return;
         }
-        let hot_credit = if self.pending_hot_keys.contains(&route.key) {
+        let hot_credit = if pending_hot {
             Self::READ_HOT_CLOCK_CREDIT
         } else {
             0
