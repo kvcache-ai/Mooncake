@@ -16,6 +16,26 @@ pub(crate) fn route_capable(lease: &ClientLease) -> bool {
         .is_some_and(|value| value == "true")
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum RouteAuthorityLifetime {
+    Durable,
+    Legacy,
+    Ephemeral,
+}
+
+pub(crate) fn route_authority_lifetime(lease: &ClientLease) -> RouteAuthorityLifetime {
+    match lease
+        .endpoints
+        .labels
+        .get("route_ephemeral")
+        .map(String::as_str)
+    {
+        Some("false") => RouteAuthorityLifetime::Durable,
+        Some("true") => RouteAuthorityLifetime::Ephemeral,
+        _ => RouteAuthorityLifetime::Legacy,
+    }
+}
+
 pub(crate) fn route_weight(lease: &ClientLease) -> f64 {
     lease
         .endpoints
