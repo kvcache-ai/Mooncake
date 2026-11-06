@@ -1165,6 +1165,26 @@ mod state_store_tests {
             .filter_map(Option::as_ref)
             .any(|entry| entry.id.route_key == route.key && entry.hot));
 
+        let mut pending_delete = route.clone();
+        pending_delete.nof_backing.as_mut().unwrap().state =
+            mooncake_store_core::ColdBackingState::PendingDelete;
+        clock.sync_nof_route(&pending_delete, &runtime, false);
+        assert!(
+            !clock.by_key.contains_key(&route.key),
+            "a non-materialized update must remove the old NoF clock entry"
+        );
+
+        clock.sync_nof_route(&route, &runtime, false);
+        let mut without_nof = route.clone();
+        without_nof.nof_backing = None;
+        clock.sync_nof_route(&without_nof, &runtime, false);
+        assert!(
+            !clock.by_key.contains_key(&route.key),
+            "removing NoF backing must remove the old NoF clock entry"
+        );
+
+        clock.sync_nof_route(&route, &runtime, false);
+
         let victim = clock
             .pick_victim(
                 Some(&nof_backing_clock_segment("nof-local")),
@@ -1272,9 +1292,7 @@ impl StorageOwnerState {
             allocator.clear_pending_route(route, &self.runtime);
             clock.sync_fresh_route(route, &self.runtime);
         }
-        if self.nof_backing_tracking_enabled
-            && routes.iter().any(route_has_materialized_nof_backing)
-        {
+        if self.nof_backing_tracking_enabled {
             let mut nof_clock = self.nof_backings.clock.lock();
             for route in routes {
                 nof_clock.sync_nof_route(route, &self.runtime, true);
@@ -1288,7 +1306,7 @@ impl StorageOwnerState {
         let mut clock = self.hot_replicas.clock.lock();
         allocator.clear_pending_route(route, &self.runtime);
         clock.track_fresh_route(route, &self.runtime);
-        if self.nof_backing_tracking_enabled && route_has_materialized_nof_backing(route) {
+        if self.nof_backing_tracking_enabled {
             self.nof_backings
                 .clock
                 .lock()
@@ -1301,7 +1319,7 @@ impl StorageOwnerState {
             .clock
             .lock()
             .untrack_route(route, &self.runtime);
-        if self.nof_backing_tracking_enabled && route.nof_backing.is_some() {
+        if self.nof_backing_tracking_enabled {
             self.nof_backings.clock.lock().remove_key(&route.key);
         }
     }
@@ -1311,7 +1329,7 @@ impl StorageOwnerState {
         let mut clock = self.hot_replicas.clock.lock();
         allocator.clear_pending_route(route, &self.runtime);
         clock.sync_route(route, &self.runtime);
-        if self.nof_backing_tracking_enabled && route_has_materialized_nof_backing(route) {
+        if self.nof_backing_tracking_enabled {
             self.nof_backings
                 .clock
                 .lock()
@@ -3307,13 +3325,6 @@ pub(in crate::client) fn nof_backing_clock_segment(target_id: &str) -> SegmentNa
     SegmentName::new(format!("__nof_backing__/{target_id}"))
 }
 
-fn route_has_materialized_nof_backing(route: &ObjectRoute) -> bool {
-    route
-        .nof_backing
-        .as_ref()
-        .is_some_and(|backing| backing.state == mooncake_store_core::ColdBackingState::Materialized)
-}
-
 impl StorageClockState {
     const READ_HOT_CLOCK_CREDIT: u8 = 2;
 
@@ -3499,6 +3510,8 @@ impl StorageClockState {
         self.mark_hot_keys_inner(keys, true)
     }
 
+    /// Marks existing entries without retaining misses for a later route synchronization.
+    /// NoF traffic uses this to keep unrelated hot keys out of the NoF clock.
     fn mark_tracked_hot_keys(&mut self, keys: &[ObjectKey]) -> RouteTrafficReport {
         if self.by_key.is_empty() {
             return RouteTrafficReport::new(keys.len(), 0);
