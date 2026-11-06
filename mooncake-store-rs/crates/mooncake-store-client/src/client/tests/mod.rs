@@ -153,6 +153,7 @@ struct CountingMetadataBackend {
 
 struct CountingRouteDirectory {
     inner: Arc<dyn RouteDirectory>,
+    injected_routes: Mutex<BTreeMap<String, ObjectRoute>>,
     get_object_routes_calls: AtomicUsize,
     bounded_reads: Arc<AtomicUsize>,
     full_reads: Arc<AtomicUsize>,
@@ -453,6 +454,7 @@ impl CountingRouteDirectory {
     fn new(inner: Arc<dyn RouteDirectory>) -> Self {
         Self {
             inner,
+            injected_routes: Mutex::new(BTreeMap::new()),
             get_object_routes_calls: AtomicUsize::new(0),
             bounded_reads: Arc::new(AtomicUsize::new(0)),
             full_reads: Arc::new(AtomicUsize::new(0)),
@@ -463,6 +465,27 @@ impl CountingRouteDirectory {
             allocation_reference_key_queries: AtomicUsize::new(0),
             fail_allocation_reference_key_queries: AtomicBool::new(false),
         }
+    }
+
+    fn with_injected_route(inner: Arc<dyn RouteDirectory>, route: ObjectRoute) -> Self {
+        let directory = Self::new(inner);
+        directory
+            .injected_routes
+            .lock()
+            .insert(route.key.0.clone(), route);
+        directory
+    }
+
+    fn injected_route(&self, key: &ObjectKey) -> Option<ObjectRoute> {
+        self.injected_routes.lock().get(&key.0).cloned()
+    }
+
+    fn injected_route_for_owner(&self, owner: &ClientRuntimeId) -> Option<ObjectRoute> {
+        self.injected_routes
+            .lock()
+            .values()
+            .find(|route| route.replicas.iter().any(|replica| replica.owner == *owner))
+            .cloned()
     }
 
     fn get_object_routes_calls(&self) -> usize {
@@ -1866,6 +1889,9 @@ impl RouteDirectory for CountingRouteDirectory {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
         self.full_reads.fetch_add(1, Ordering::Relaxed);
+        if let Some(route) = self.injected_route(key) {
+            return Ok(Some(route));
+        }
         self.inner.get_object_route(observer, key)
     }
 
@@ -1885,7 +1911,13 @@ impl RouteDirectory for CountingRouteDirectory {
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.get_object_routes_calls.fetch_add(1, Ordering::Relaxed);
         self.full_reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_object_routes(observer, keys)
+        let mut routes = self.inner.get_object_routes(observer, keys)?;
+        for (key, route) in keys.iter().zip(routes.iter_mut()) {
+            if let Some(injected) = self.injected_route(key) {
+                *route = Some(injected);
+            }
+        }
+        Ok(routes)
     }
 
     fn get_object_routes_bounded(
@@ -1894,7 +1926,13 @@ impl RouteDirectory for CountingRouteDirectory {
         keys: &[ObjectKey],
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.bounded_reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_object_routes_bounded(observer, keys)
+        let mut routes = self.inner.get_object_routes_bounded(observer, keys)?;
+        for (key, route) in keys.iter().zip(routes.iter_mut()) {
+            if let Some(injected) = self.injected_route(key) {
+                *route = Some(injected);
+            }
+        }
+        Ok(routes)
     }
 
     fn contains_object_route(
@@ -1902,6 +1940,9 @@ impl RouteDirectory for CountingRouteDirectory {
         observer: &ClientLease,
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<bool> {
+        if self.injected_route(key).is_some() {
+            return Ok(true);
+        }
         self.inner.contains_object_route(observer, key)
     }
 
@@ -1910,7 +1951,13 @@ impl RouteDirectory for CountingRouteDirectory {
         observer: &ClientLease,
         keys: &[ObjectKey],
     ) -> mooncake_store_core::Result<Vec<bool>> {
-        self.inner.contains_object_routes_bounded(observer, keys)
+        let mut contains = self.inner.contains_object_routes_bounded(observer, keys)?;
+        for (key, present) in keys.iter().zip(contains.iter_mut()) {
+            if self.injected_route(key).is_some() {
+                *present = true;
+            }
+        }
+        Ok(contains)
     }
 
     fn compare_and_swap_object_route(
@@ -1944,7 +1991,12 @@ impl RouteDirectory for CountingRouteDirectory {
         owner: &ClientRuntimeId,
     ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
         self.owner_list_scans.fetch_add(1, Ordering::Relaxed);
-        self.inner.list_routes_by_replica_owner(observer, owner)
+        let mut routes = self.inner.list_routes_by_replica_owner(observer, owner)?;
+        if let Some(injected) = self.injected_route_for_owner(owner) {
+            routes.retain(|route| route.key != injected.key);
+            routes.push(injected);
+        }
+        Ok(routes)
     }
 
     fn visit_routes_by_replica_owner_consistent(
@@ -1955,7 +2007,11 @@ impl RouteDirectory for CountingRouteDirectory {
     ) -> mooncake_store_core::Result<()> {
         self.owner_list_scans.fetch_add(1, Ordering::Relaxed);
         self.inner
-            .visit_routes_by_replica_owner_consistent(observer, owner, visitor)
+            .visit_routes_by_replica_owner_consistent(observer, owner, visitor)?;
+        if let Some(injected) = self.injected_route_for_owner(owner) {
+            visitor(injected)?;
+        }
+        Ok(())
     }
 
     fn list_routes_in_scope(
@@ -12285,6 +12341,119 @@ fn eviction_materializes_missing_replica_checksum_from_owner_hot_payload() {
         Some(payload_checksum(payload)),
         "owner should compute the cold backing checksum from its local hot payload"
     );
+}
+
+#[test]
+fn debug_evict_all_does_not_list_all_owner_routes() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("debug-evict-all-no-owner-list-segment"));
+    let client = StoreClientBuilder::new(metadata, "debug-evict-all-no-owner-list")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("debug-evict-all-no-owner-list", b"0123456789abcdef")
+        .expect("initial put should succeed");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    owner.track_route(&route);
+
+    let result = owner
+        .evict_all(&client.restore_promotions)
+        .expect("debug evict-all should succeed");
+    assert!(
+        result.completed,
+        "debug evict-all should complete: {result:?}"
+    );
+    assert_eq!(result.evicted, 1);
+    assert_eq!(
+        directory.owner_list_scans(),
+        0,
+        "debug evict-all must use bounded normal eviction, not an owner-wide route scan"
+    );
+}
+
+#[test]
+fn debug_evict_all_ignores_deleted_allocation_still_advertised_by_authority() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("debug-evict-all-ghost-route-segment"));
+    let client = StoreClientBuilder::new(metadata, "debug-evict-all-ghost-route")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let deleted = client
+        .put("ghost-route", b"0123456789abcdef")
+        .expect("put should succeed");
+    client
+        .remove("ghost-route", true)
+        .expect("logical delete should succeed");
+    let deleted_replica = deleted
+        .replicas
+        .iter()
+        .find(|replica| replica.owner == *client.runtime_id())
+        .expect("route should contain the local replica");
+    let deleted_allocation = AllocationSpan {
+        segment_name: deleted_replica.segment_name.clone(),
+        offset_bytes: deleted_replica.segment_offset,
+        length_bytes: deleted_replica.length,
+    };
+    assert!(
+        client
+            .allocator
+            .lock()
+            .allocation_identity(&deleted_allocation)
+            .is_none(),
+        "logical delete must have already released the local allocation"
+    );
+    assert!(
+        client
+            .query_route("ghost-route")
+            .expect("route query should succeed")
+            .is_none(),
+        "the primary route view must observe the completed logical delete"
+    );
+
+    // Model a ranked authority whose asynchronous delete marker mirror is stale.
+    // Debug eviction must not rebuild CLOCK from that stale view.
+    let directory = Arc::new(CountingRouteDirectory::with_injected_route(
+        client.route_directory.clone(),
+        deleted,
+    ));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+
+    let result = owner
+        .evict_all(&client.restore_promotions)
+        .expect("stale authority route must not fail debug evict-all");
+    assert!(
+        result.completed,
+        "debug evict-all should complete: {result:?}"
+    );
+    assert_eq!(result.remaining_hot_replicas, 0);
+    assert_eq!(directory.owner_list_scans(), 0);
 }
 
 #[test]
