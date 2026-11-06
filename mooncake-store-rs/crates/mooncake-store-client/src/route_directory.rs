@@ -18,10 +18,14 @@ use crate::client::{
 use crate::control_plane::ControlPlaneClient;
 use crate::observability::{registry, OperationTracker};
 
+pub(crate) struct RouteDirectoryBuildConfig {
+    pub(crate) mode: RouteControlMode,
+    pub(crate) route_topk: usize,
+    pub(crate) delete_marker_budget_bytes: usize,
+}
+
 pub(crate) fn build_route_directory(
-    mode: RouteControlMode,
-    route_topk: usize,
-    delete_marker_budget_bytes: usize,
+    config: RouteDirectoryBuildConfig,
     metadata: Arc<dyn MetadataBackend>,
     lease: &ClientLease,
     control_plane: Arc<ControlPlaneClient>,
@@ -35,9 +39,9 @@ pub(crate) fn build_route_directory(
         suspect_runtime_cache,
     });
     mooncake_store_route::build_route_directory(
-        mode,
-        route_topk,
-        delete_marker_budget_bytes,
+        config.mode,
+        config.route_topk,
+        config.delete_marker_budget_bytes,
         metadata,
         lease,
         control_plane,

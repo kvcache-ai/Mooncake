@@ -547,9 +547,13 @@ impl StoreClientBuilder {
             Vec::new()
         };
         let route_directory = build_route_directory(
-            effective_route_control,
-            effective_route_topk,
-            delete_marker_budget_bytes(self.local_memory.storage_bytes),
+            crate::route_directory::RouteDirectoryBuildConfig {
+                mode: effective_route_control,
+                route_topk: effective_route_topk,
+                delete_marker_budget_bytes: delete_marker_budget_bytes(
+                    self.local_memory.storage_bytes,
+                ),
+            },
             runtime_metadata.clone(),
             &provisional_lease,
             control_client.clone(),
