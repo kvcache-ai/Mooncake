@@ -752,6 +752,132 @@ TEST(ObjectRouteTest, CursorLeavesNoEmptySlotItSetAside) {
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 1u);
 }
 
+// --- Batch reads -------------------------------------------------------------
+
+// Waits until `count` reaches `target`; false if it does not within 10 s.
+bool WaitForCount(const std::atomic<size_t>& count, size_t target) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (count.load() < target) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+TEST(ObjectRouteTest, ReadBatchVisitsEachKeyThatHoldsAnObjectInOrder) {
+    ObjectRoute route;
+    std::vector<std::string> keys;
+    for (int i = 0; i < 200; ++i) {
+        keys.push_back("k" + std::to_string(i));
+        ASSERT_NE(PublishObject(route, keys.back()), 0u);
+    }
+    // A slot that holds no object and a key with no slot are skipped; a key
+    // asked for twice is visited at both indexes.
+    auto kept = ObjectRouteTestPeer::SlotRef(route, "k0");
+    ASSERT_TRUE(TearDownKey(route, "k0"));
+    keys.push_back("missing");
+    keys.push_back("k7");
+
+    std::vector<size_t> visited;
+    route.ReadBatch(keys, [&](size_t i, const ObjectMetadata& metadata) {
+        EXPECT_EQ(metadata.user_key, keys[i]);
+        visited.push_back(i);
+    });
+    std::vector<size_t> expected;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i] != "k0" && keys[i] != "missing") {
+            expected.push_back(i);
+        }
+    }
+    EXPECT_EQ(visited, expected);
+}
+
+TEST(ObjectRouteTest, ReadBatchWaitsForABusyKeyWithNoStripeLocked) {
+    ObjectRoute route;
+    const std::vector<std::string> keys = {"busy", "other"};
+    for (const auto& key : keys) {
+        ASSERT_NE(PublishObject(route, key), 0u);
+    }
+    // Creating a key locks its stripe exclusively, so this one can be created
+    // only while nothing holds the stripe of "busy".
+    std::string neighbour;
+    for (int i = 0; neighbour.empty(); ++i) {
+        const std::string candidate = "neighbour" + std::to_string(i);
+        if (ObjectRouteTestPeer::StripeIndex(candidate) ==
+            ObjectRouteTestPeer::StripeIndex("busy")) {
+            neighbour = candidate;
+        }
+    }
+
+    std::promise<void> held;
+    std::promise<void> release;
+    std::thread holder([&] {
+        auto guard = route.Write("busy");
+        ASSERT_TRUE(guard.has_value());
+        held.set_value();
+        release.get_future().wait();
+        guard->metadata().MutablePart(0).SetChecksum(42);
+    });
+    held.get_future().wait();
+
+    std::atomic<size_t> visited{0};
+    std::optional<uint64_t> busy_checksum;
+    auto batch = std::async(std::launch::async, [&] {
+        route.ReadBatch(keys, [&](size_t i, const ObjectMetadata& metadata) {
+            if (i == 0) {
+                busy_checksum = metadata.GetPart(0).checksum();
+            }
+            ++visited;
+        });
+    });
+    EXPECT_EQ(batch.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    EXPECT_NE(PublishObject(route, neighbour), 0u);
+    EXPECT_EQ(visited.load(), 0u);
+    release.set_value();
+    holder.join();
+    batch.get();
+    EXPECT_EQ(visited.load(), keys.size());
+    EXPECT_EQ(busy_checksum, std::optional<uint64_t>(42));
+}
+
+TEST(ObjectRouteTest, ReadBatchSkipsABusyKeyTornDownMeanwhile) {
+    ObjectRoute route;
+    const std::vector<std::string> keys = {"other", "busy"};
+    for (const auto& key : keys) {
+        ASSERT_NE(PublishObject(route, key), 0u);
+    }
+
+    std::promise<void> held;
+    std::promise<void> tear_down;
+    std::thread holder([&] {
+        auto guard = route.Write("busy");
+        ASSERT_TRUE(guard.has_value());
+        held.set_value();
+        tear_down.get_future().wait();
+        guard->TearDown();
+    });
+    held.get_future().wait();
+
+    std::atomic<size_t> visited{0};
+    std::vector<size_t> indexes;
+    auto batch = std::async(std::launch::async, [&] {
+        route.ReadBatch(keys, [&](size_t i, const ObjectMetadata&) {
+            indexes.push_back(i);
+            ++visited;
+        });
+    });
+    ASSERT_TRUE(WaitForCount(visited, 1));
+    tear_down.set_value();
+    holder.join();
+    batch.get();
+    EXPECT_EQ(indexes, (std::vector<size_t>{0}));
+    EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 1u);
+}
+
 // Misuse that would corrupt the route aborts in release builds too.
 TEST(ObjectRouteDeathTest, PublishOverAnObjectAborts) {
     ObjectRoute route;
@@ -923,6 +1049,26 @@ TEST(ObjectRouteTest, ObserverIsNotCalledForReadsOrCursors) {
         object.metadata().MutablePart(0).SetChecksum(7);
     }
     EXPECT_TRUE(observer.releases.empty());
+}
+
+TEST(ObjectRouteTest, ReadBatchReportsEachReadToAReadObserver) {
+    class ReadCounter final : public route::RouteObserver {
+       public:
+        void OnWriteRelease(const route::WriteGuard&) override {}
+        void OnReadRelease(const route::ReadGuard& guard) override {
+            keys.push_back(guard.key());
+        }
+        std::vector<std::string> keys;
+    } observer;
+    ObjectRoute route(&observer, /*report_reads=*/true);
+    ASSERT_NE(PublishObject(route, "k1"), 0u);
+    ASSERT_NE(PublishObject(route, "k2"), 0u);
+
+    const std::vector<std::string> keys = {"k1", "missing", "k2"};
+    size_t visits = 0;
+    route.ReadBatch(keys, [&](size_t, const ObjectMetadata&) { ++visits; });
+    EXPECT_EQ(visits, 2u);
+    EXPECT_EQ(observer.keys, (std::vector<std::string>{"k1", "k2"}));
 }
 
 // --- Concurrency -------------------------------------------------------------
