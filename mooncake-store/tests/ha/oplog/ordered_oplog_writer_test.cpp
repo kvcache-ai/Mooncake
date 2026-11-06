@@ -1942,4 +1942,111 @@ TEST_F(OrderedOpLogWriterAwaitTest, TimedContinuationCanStopWriter) {
     writer_->Stop();
 }
 
+TEST_F(OrderedOpLogWriterAwaitTest,
+       BlockedTimeoutContinuationDoesNotDelayAnotherWait) {
+    storage_.BlockWrites();
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    writer_->Start();
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+
+    auto first =
+        writer_
+            ->AwaitDurable(pending->sequence_id(), std::chrono::milliseconds(1))
+            .thenValue([this](ErrorCode error) {
+                BlockCallback();
+                return error;
+            });
+    ASSERT_TRUE(WaitForCallback());
+    auto second = writer_->AwaitDurable(pending->sequence_id(),
+                                        std::chrono::milliseconds(1));
+    ExpectResult(second, ErrorCode::PERSISTENT_FAIL);
+    ReleaseCallback();
+    ExpectResult(first, ErrorCode::PERSISTENT_FAIL);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       TimeoutContinuationCanSynchronouslyWaitForAnotherTimeout) {
+    CreateWriter();
+    auto first =
+        writer_->AwaitDurable(1, std::chrono::milliseconds(1))
+            .thenValue([this](ErrorCode error) {
+                EXPECT_EQ(error, ErrorCode::PERSISTENT_FAIL);
+                return writer_->AwaitDurable(1, std::chrono::milliseconds(1))
+                    .get();
+            });
+    ExpectResult(first, ErrorCode::PERSISTENT_FAIL);
+    // On failure, Stop releases the nested wait before joining the timer.
+    writer_->Stop();
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       StopDoesNotWaitForBlockedTimeoutContinuation) {
+    CreateWriter();
+    writer_->Start();
+    auto first = writer_->AwaitDurable(1, std::chrono::milliseconds(1))
+                     .thenValue([this](ErrorCode error) {
+                         BlockCallback();
+                         return error;
+                     });
+    ASSERT_TRUE(WaitForCallback());
+    std::promise<void> stopped;
+    auto completion = stopped.get_future();
+    std::thread stopping([&] {
+        writer_->Stop();
+        stopped.set_value();
+    });
+    const auto status = completion.wait_for(std::chrono::seconds(5));
+    ReleaseCallback();
+    stopping.join();
+    EXPECT_EQ(status, std::future_status::ready);
+    ExpectResult(first, ErrorCode::PERSISTENT_FAIL);
+}
+
+TEST(OrderedOpLogWriterTimeoutTest, ContinuationCanReleaseLastWriterOwner) {
+    for (bool start : {false, true}) {
+        SCOPED_TRACE(start ? "started writer" : "writer before Start");
+        auto destroyed = std::make_shared<std::promise<void>>();
+        auto destruction = destroyed->get_future();
+        auto writer = std::shared_ptr<OrderedOpLogWriter>(
+            new OrderedOpLogWriter({},
+                                   [](const auto&, const auto&) {
+                                       return ErrorCode::PERSISTENT_FAIL;
+                                   }),
+            [destroyed](OrderedOpLogWriter* ptr) {
+                delete ptr;
+                destroyed->set_value();
+            });
+        if (start) {
+            auto reservation = writer->Reserve();
+            ASSERT_TRUE(reservation);
+            auto pending =
+                writer->Commit(std::move(*reservation), MakeEntry(), {});
+            ASSERT_TRUE(pending);
+            writer->Start();
+        }
+        std::promise<void> release;
+        auto gate = release.get_future().share();
+        auto completed =
+            writer->AwaitDurable(1, std::chrono::milliseconds(1))
+                .thenValue([owner = writer, gate](ErrorCode error) {
+                    gate.wait();
+                    owner->LastError();
+                    return error;
+                });
+        std::weak_ptr<OrderedOpLogWriter> owner = writer;
+        writer.reset();
+        release.set_value();
+        // Returning from the continuation releases its last shared_ptr. Wait
+        // for deletion to finish, not just for the downstream result to wake.
+        ASSERT_EQ(destruction.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_TRUE(owner.expired());
+        EXPECT_EQ(std::move(completed).get(), ErrorCode::PERSISTENT_FAIL);
+    }
+}
+
 }  // namespace mooncake::test

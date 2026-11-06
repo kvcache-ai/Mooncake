@@ -48,7 +48,7 @@ struct OrderedOpLogWriter::Impl {
           write_batch(std::move(write_batch)),
           terminal_callback(std::move(terminal_callback)),
           waiter_deadlines([this](const WaitDeadline& expired) {
-              DurableWaiters timed_out;
+              std::shared_ptr<async_simple::Promise<ErrorCode>> timed_out;
               ErrorCode error;
               {
                   std::lock_guard<std::mutex> lock(mutex);
@@ -58,7 +58,8 @@ struct OrderedOpLogWriter::Impl {
                       durable_waiters.equal_range(expired.first);
                   for (auto it = begin; it != end; ++it) {
                       if (it->second == promise) {
-                          timed_out.insert(durable_waiters.extract(it));
+                          timed_out = std::move(it->second);
+                          durable_waiters.erase(it);
                           break;
                       }
                   }
@@ -66,7 +67,15 @@ struct OrderedOpLogWriter::Impl {
                               ? ErrorCode::PERSISTENT_FAIL
                               : last_error;
               }
-              CompleteWaiters(std::move(timed_out), error);
+              if (timed_out) {
+                  // setValue may run user code inline, including blocking or
+                  // releasing the last writer owner. Each expired wait gets
+                  // an independent notification that owns only its promise;
+                  // neither the timer nor Stop waits for the continuation.
+                  std::thread([promise = std::move(timed_out), error] {
+                      promise->setValue(ErrorCode{error});
+                  }).detach();
+              }
           }) {
         if (this->config.max_entries_per_batch == 0) {
             this->config.max_entries_per_batch = 1;
