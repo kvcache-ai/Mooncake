@@ -26,6 +26,44 @@
 namespace mooncake {
 namespace {
 
+class IbTimeoutEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_IB_TIMEOUT"); }
+};
+
+TEST_F(IbTimeoutEnvTest, PreservesDefault) {
+    ::unsetenv("MC_IB_TIMEOUT");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.ib_timeout, 14);
+}
+
+TEST_F(IbTimeoutEnvTest, AcceptsFiniteExponents) {
+    for (int exponent = 1; exponent <= 31; ++exponent) {
+        ASSERT_EQ(
+            ::setenv("MC_IB_TIMEOUT", std::to_string(exponent).c_str(), 1), 0);
+        GlobalConfig config;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.ib_timeout, exponent);
+    }
+    ::setenv("MC_IB_TIMEOUT", " +18 ", 1);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.ib_timeout, 18);
+}
+
+TEST_F(IbTimeoutEnvTest, RejectsInvalidValuesWithoutChangingConfig) {
+    for (const char* value : {"", "0", "32", "-1", "18ms", "18.5", "+-18",
+                              "18 19", "999999999999999999999999"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(::setenv("MC_IB_TIMEOUT", value, 1), 0);
+        GlobalConfig config;
+        config.ib_timeout = 20;
+        loadGlobalConfig(config);
+        EXPECT_EQ(config.ib_timeout, 20);
+    }
+}
+
 // --- MC_PKEY_INDEX (stoi with try-catch, range 0-65535) ---
 
 class PkeyIndexEnvTest : public ::testing::Test {
