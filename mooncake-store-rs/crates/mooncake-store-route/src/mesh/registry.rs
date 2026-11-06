@@ -42,6 +42,22 @@ pub(crate) fn authority_get(
     Ok(slot.table.get(key))
 }
 
+pub(crate) fn authority_get_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<Option<ObjectRoute>>> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    Ok(slot.table.get_many(keys))
+}
+
 pub(crate) fn authority_get_record(
     namespace: &str,
     authority: &ClientStableId,
