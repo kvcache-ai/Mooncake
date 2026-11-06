@@ -26,7 +26,7 @@ use super::{
     align_up_u64, backend_store_cold_payload_batch, bootstrap_route_policy,
     cached_live_client_snapshot, compatibility_matches, control_bind_host, copy_into_region,
     decode_backend_payload, effective_route_policy, encode_backend_component,
-    encode_backend_payload, encode_lifecycle_state, flatten_slices, now_ms, payload_checksum,
+    encode_backend_payload, encode_lifecycle_state, flatten_slices, now_ms, parallel_map_ordered, payload_checksum,
     record_success_metric, restore_payload_from_cold_backing, route_topk_from_tenant_spec,
     run_bounded_parallel_jobs, scatter_into_buffers, shared_cold_tier_device_cache,
     shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
@@ -305,6 +305,96 @@ struct CountingStorageBackend {
     reads: AtomicUsize,
     batch_reads: AtomicUsize,
     delay: Duration,
+}
+
+#[derive(Default)]
+struct ConcurrentColdWriteProbe {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+}
+
+impl ConcurrentColdWriteProbe {
+    fn begin(&self) {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+    }
+
+    fn end(&self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
+    }
+}
+
+struct ProbedStorageBackend {
+    probe: Arc<ConcurrentColdWriteProbe>,
+    delay: Duration,
+}
+
+impl ProbedStorageBackend {
+    fn new(probe: Arc<ConcurrentColdWriteProbe>) -> Self {
+        Self {
+            probe,
+            delay: Duration::from_millis(75),
+        }
+    }
+}
+
+impl PersistentStorageBackend for ProbedStorageBackend {
+    fn put_object(
+        &self,
+        cold_backing: &mooncake_store_core::ColdBackingRoute,
+        _payload: &[u8],
+    ) -> mooncake_store_core::Result<mooncake_store_core::ColdBackingRoute> {
+        self.probe.begin();
+        sleep(self.delay);
+        self.probe.end();
+        let mut materialized = cold_backing.clone();
+        materialized.state = mooncake_store_core::ColdBackingState::Materialized;
+        Ok(materialized)
+    }
+
+    fn get_object(
+        &self,
+        _cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> mooncake_store_core::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn delete_object(
+        &self,
+        _cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> mooncake_store_core::Result<bool> {
+        Ok(true)
+    }
+
+    fn put_pending_source(
+        &self,
+        _cold_backing: &mooncake_store_core::ColdBackingRoute,
+        _payload: &[u8],
+    ) -> mooncake_store_core::Result<()> {
+        Ok(())
+    }
+
+    fn get_pending_source(
+        &self,
+        _cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> mooncake_store_core::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn delete_pending_source(
+        &self,
+        _cold_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> mooncake_store_core::Result<bool> {
+        Ok(true)
+    }
+
+    fn disable_pending_source(&self) -> bool {
+        true
+    }
 }
 
 impl CountingStorageBackend {
@@ -21991,3 +22081,36 @@ fn background_watermark_batch_retains_all_tokens_when_complete_reply_is_lost() {
 }
 
 mod batch_put_status_tests;
+
+#[test]
+fn parallel_map_parallelizes_and_preserves_order() {
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let max_inflight = Arc::new(AtomicUsize::new(0));
+    let jobs = vec![0usize, 1, 2, 3];
+    let results = parallel_map_ordered(jobs, 2, {
+        let inflight = inflight.clone();
+        let max_inflight = max_inflight.clone();
+        move |job| {
+            let current = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            max_inflight.fetch_max(current, Ordering::SeqCst);
+            sleep(Duration::from_millis(20));
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            job * 10
+        }
+    });
+
+    assert_eq!(results, vec![0, 10, 20, 30]);
+    assert!(
+        max_inflight.load(Ordering::SeqCst) >= 2,
+        "jobs should overlap when parallelism is greater than one"
+    );
+}
+
+#[test]
+fn parallel_map_handles_empty_and_single_job_inputs() {
+    let empty_results = parallel_map_ordered::<usize, usize, _>(Vec::new(), 8, |job| job * 10);
+    assert!(empty_results.is_empty());
+
+    let single_results = parallel_map_ordered(vec![7usize], 8, |job| job * 10);
+    assert_eq!(single_results, vec![70]);
+}

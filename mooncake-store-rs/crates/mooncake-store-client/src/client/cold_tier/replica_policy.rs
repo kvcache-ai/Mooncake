@@ -1,6 +1,15 @@
 //! Provider-neutral replica placement and read load-balancing policy.
 
-use std::cmp::Ordering;
+// Ignore sub-object capacity noise without using a non-transitive epsilon comparator.
+const WRITE_SCORE_BUCKET_WIDTH: f64 = 1e-5;
+
+fn write_score_bucket(score: f64) -> i64 {
+    if score.is_finite() {
+        (score / WRITE_SCORE_BUCKET_WIDTH).round() as i64
+    } else {
+        0
+    }
+}
 
 /// Provider-computed write suitability for one replica target.
 ///
@@ -53,10 +62,8 @@ impl ReplicaLoadBalanceStrategy for DefaultReplicaLoadBalanceStrategy {
         selected.sort_by(|left, right| {
             let left = &candidates[*left];
             let right = &candidates[*right];
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
+            write_score_bucket(right.score)
+                .cmp(&write_score_bucket(left.score))
                 .then_with(|| left.accumulated_writes.cmp(&right.accumulated_writes))
                 .then_with(|| left.target_id.cmp(right.target_id))
         });
@@ -123,6 +130,27 @@ mod tests {
             ReplicaWriteCandidate {
                 target_id: "target-b",
                 score: 0.0,
+                accumulated_writes: 1,
+            },
+        ];
+
+        assert_eq!(
+            DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, 1),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn write_selection_uses_accumulated_writes_when_scores_are_nearly_equal() {
+        let candidates = [
+            ReplicaWriteCandidate {
+                target_id: "target-a",
+                score: 0.800_003,
+                accumulated_writes: 4,
+            },
+            ReplicaWriteCandidate {
+                target_id: "target-b",
+                score: 0.8,
                 accumulated_writes: 1,
             },
         ];

@@ -17,6 +17,46 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+const OFFLOAD_RUNTIME_MAX_IN_FLIGHT_ENV: &str =
+    "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_MAX_IN_FLIGHT";
+const OFFLOAD_DEVICE_MAX_IN_FLIGHT_ENV: &str = "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_MAX_IN_FLIGHT";
+const OFFLOAD_RUNTIME_OPS_PER_SEC_ENV: &str = "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_OPS_PER_SEC";
+const OFFLOAD_DEVICE_OPS_PER_SEC_ENV: &str = "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_OPS_PER_SEC";
+const FOREGROUND_OFFLOAD_KICK_BATCH_ENV: &str =
+    "MC_STORE_RS_COLD_TIER_FOREGROUND_OFFLOAD_KICK_BATCH";
+
+fn cold_tier_rate_limits_with_overrides(
+    mut config: ColdTierRateLimitConfig,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> ColdTierRateLimitConfig {
+    if let Some(limit) =
+        lookup(OFFLOAD_RUNTIME_MAX_IN_FLIGHT_ENV).and_then(|value| value.parse::<usize>().ok())
+    {
+        config = config.offload_runtime_max_in_flight(limit);
+    }
+    if let Some(limit) =
+        lookup(OFFLOAD_DEVICE_MAX_IN_FLIGHT_ENV).and_then(|value| value.parse::<usize>().ok())
+    {
+        config = config.offload_device_max_in_flight(limit);
+    }
+    if let Some(limit) =
+        lookup(OFFLOAD_RUNTIME_OPS_PER_SEC_ENV).and_then(|value| value.parse::<u32>().ok())
+    {
+        config = config.offload_runtime_ops_per_sec(limit);
+    }
+    if let Some(limit) =
+        lookup(OFFLOAD_DEVICE_OPS_PER_SEC_ENV).and_then(|value| value.parse::<u32>().ok())
+    {
+        config = config.offload_device_ops_per_sec(limit);
+    }
+    if let Some(limit) =
+        lookup(FOREGROUND_OFFLOAD_KICK_BATCH_ENV).and_then(|value| value.parse::<usize>().ok())
+    {
+        config = config.foreground_offload_kick_batch(limit);
+    }
+    config
+}
+
 /// Returns true if offload writes should be deferred when restore reads are
 /// active on the same device. This prevents write bandwidth from competing
 /// with latency-sensitive cold reads on the same SSD.
@@ -63,6 +103,11 @@ impl StorageOwnerState {
         state: Arc<parking_lot::Mutex<super::super::StoreState>>,
         cold_tier: StorageOwnerColdTierConfig,
     ) -> Self {
+        let mut cold_tier = cold_tier;
+        cold_tier.rate_limits =
+            cold_tier_rate_limits_with_overrides(cold_tier.rate_limits, |name| {
+                std::env::var(name).ok()
+            });
         let offload_mode = cold_tier.offload_mode;
         let offload_priority = cold_tier.offload_priority;
         let nof_backing_tracking_enabled = !cold_tier.nof_targets.is_empty();
@@ -737,6 +782,7 @@ impl ColdTierDeviceManager {
             devices: config.devices,
             watermarks: config.watermarks,
             admission: Arc::new(ColdTierAdmission::new(config.rate_limits)),
+            accumulated_writes: parking_lot::Mutex::new(BTreeMap::new()),
             runtime: config.runtime,
         }
     }
@@ -885,16 +931,25 @@ impl ColdTierDeviceManager {
             .into_iter()
             .filter(|device| self.offload_rejection_reason(device, length).is_none())
             .collect();
+        let mut accumulated_writes = self.accumulated_writes.lock();
         let candidates = eligible
             .iter()
             .map(|device| ReplicaWriteCandidate {
                 target_id: &device.device_id,
                 score: self.device_offload_score(device),
-                accumulated_writes: 0,
+                accumulated_writes: accumulated_writes
+                    .get(&device.device_id)
+                    .copied()
+                    .unwrap_or_default(),
             })
             .collect::<Vec<_>>();
-        DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY
-            .select_write_targets(&candidates, n)
+        let selected = DEFAULT_REPLICA_LOAD_BALANCE_STRATEGY.select_write_targets(&candidates, n);
+        for index in &selected {
+            let target_id = &eligible[*index].device_id;
+            let count = accumulated_writes.entry(target_id.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+        selected
             .into_iter()
             .map(|index| eligible[index].clone())
             .collect()
@@ -1090,5 +1145,38 @@ impl ColdTierDeviceManager {
     #[cfg(test)]
     pub(in super::super) fn cache(&self) -> &super::super::SharedColdTierDeviceCache {
         &self.devices
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_override_tests {
+    use super::*;
+
+    #[test]
+    fn offload_rate_limit_overrides_are_applied_without_changing_restore_limits() {
+        let defaults = ColdTierRateLimitConfig::default();
+        let values = BTreeMap::from([
+            (OFFLOAD_RUNTIME_MAX_IN_FLIGHT_ENV, "32".to_string()),
+            (OFFLOAD_DEVICE_MAX_IN_FLIGHT_ENV, "4".to_string()),
+            (OFFLOAD_RUNTIME_OPS_PER_SEC_ENV, "4096".to_string()),
+            (OFFLOAD_DEVICE_OPS_PER_SEC_ENV, "1024".to_string()),
+            (FOREGROUND_OFFLOAD_KICK_BATCH_ENV, "32".to_string()),
+        ]);
+        let configured =
+            cold_tier_rate_limits_with_overrides(defaults, |name| values.get(name).cloned());
+
+        assert_eq!(configured.offload_runtime_max_in_flight, 32);
+        assert_eq!(configured.offload_device_max_in_flight, 4);
+        assert_eq!(configured.offload_runtime_ops_per_sec, 4096);
+        assert_eq!(configured.offload_device_ops_per_sec, 1024);
+        assert_eq!(configured.foreground_offload_kick_batch, 32);
+        assert_eq!(
+            configured.restore_runtime_max_in_flight,
+            defaults.restore_runtime_max_in_flight
+        );
+        assert_eq!(
+            configured.restore_device_max_in_flight,
+            defaults.restore_device_max_in_flight
+        );
     }
 }
