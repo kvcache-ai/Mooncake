@@ -17219,47 +17219,53 @@ fn true_client_shrink_skips_unavailable_old_replica_owner_during_reclaim() {
     let reader_transport = Arc::new(store_a_transport.peer("shrink-dead-reclaim-reader-segment"));
     let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
 
+    // B ranks as primary, A as mirror, and the other authorities rank afterward.
+    // Disabled background sync keeps the pre-drain membership until shrink refreshes it.
     let mut store_a = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-store-a")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "true")
-        .live_client_sync_interval(fast_live_client_sync_interval())
+        .live_client_sync_interval(Duration::ZERO)
         .transport(store_a_transport)
         .local_memory(storage_config())
         .build(test_future_expiry_ms())
         .expect("store-a build should succeed");
     let store_b = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-store-b")
         .state(ClientLifecycleState::Active)
+        .label("route_ephemeral", "false")
         .label("pool", "pool-a")
         .label("storage", "true")
-        .live_client_sync_interval(fast_live_client_sync_interval())
+        .live_client_sync_interval(Duration::ZERO)
         .transport(store_b_transport)
         .local_memory(storage_config())
         .build(test_future_expiry_ms())
         .expect("store-b build should succeed");
     let store_c = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-store-c")
         .state(ClientLifecycleState::Active)
+        .label("route_ephemeral", "true")
         .label("pool", "pool-a")
         .label("storage", "true")
-        .live_client_sync_interval(fast_live_client_sync_interval())
+        .live_client_sync_interval(Duration::ZERO)
         .transport(store_c_transport)
         .local_memory(storage_config())
         .build(test_future_expiry_ms())
         .expect("store-c build should succeed");
     let store_d = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-store-d")
         .state(ClientLifecycleState::Active)
+        .label("route_ephemeral", "true")
         .label("pool", "pool-a")
         .label("storage", "true")
-        .live_client_sync_interval(fast_live_client_sync_interval())
+        .live_client_sync_interval(Duration::ZERO)
         .transport(store_d_transport)
         .local_memory(storage_config())
         .build(test_future_expiry_ms())
         .expect("store-d build should succeed");
     let router = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-router")
         .state(ClientLifecycleState::Active)
+        .label("route_ephemeral", "true")
         .label("pool", "pool-a")
         .label("storage", "false")
-        .live_client_sync_interval(fast_live_client_sync_interval())
+        .live_client_sync_interval(Duration::ZERO)
         .transport(router_transport)
         .local_memory(storage_config())
         .routed_writes(planner, 2)
@@ -17267,9 +17273,10 @@ fn true_client_shrink_skips_unavailable_old_replica_owner_during_reclaim() {
         .expect("router build should succeed");
     let reader = StoreClientBuilder::new(metadata.clone(), "shrink-dead-reclaim-reader")
         .state(ClientLifecycleState::Active)
+        .label("route_ephemeral", "true")
         .label("pool", "pool-a")
         .label("storage", "false")
-        .live_client_sync_interval(fast_live_client_sync_interval())
+        .live_client_sync_interval(Duration::ZERO)
         .transport(reader_transport)
         .local_memory(storage_config())
         .build(test_future_expiry_ms())
@@ -17327,11 +17334,20 @@ fn true_client_shrink_skips_unavailable_old_replica_owner_during_reclaim() {
     );
 
     metadata.hide_runtime_metadata(store_b.runtime_id());
+    store_a
+        .enter_draining()
+        .expect("store-a should publish its draining state");
 
     let migrated = store_a
         .evacuate_owned_replicas()
         .expect("true client shrink should skip reclaim for unavailable old replica owners");
     assert_eq!(migrated, 1);
+
+    let active_runtimes = store_a
+        .active_compatible_runtimes(true)
+        .expect("post-shrink membership refresh should succeed");
+    assert!(!active_runtimes.contains(store_a.runtime_id()));
+    assert!(!active_runtimes.contains(store_b.runtime_id()));
 
     let route = router
         .query_route(key)
