@@ -163,6 +163,7 @@ endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(variadic_serialization_test variadic_serialization_test.cpp)
 add_test(NAME client_hca_affinity_test
          COMMAND client_integration_test
                  --gtest_filter=HcaAffinityTest.*:ReadAffinityTest.*)
