@@ -115,11 +115,11 @@ impl MirrorQueue {
     }
 
     fn try_pop(&self) -> Option<RouteMirrorBatch> {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .batches
-            .pop_front()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.batches.pop_front()
     }
 
     fn shutdown(&self) {
@@ -218,6 +218,9 @@ impl AsyncRouteMirrorWorker {
         let Some(queue) = state.queue.as_ref() else {
             return;
         };
+        if requests.iter().any(is_delete_marker_request) {
+            record_delete_marker_event("propagation_enqueued", 1);
+        }
         let evicted = queue.push(RouteMirrorBatch {
             secondary,
             requests,
@@ -308,7 +311,7 @@ pub(crate) fn mirror_secondary_batch(
         );
         let succeeded = result
             .as_ref()
-            .is_ok_and(|results| results.iter().all(Result::is_ok));
+            .is_ok_and(|results| results.iter().all(|result| result.is_ok()));
         if succeeded {
             if is_delete_marker {
                 record_delete_marker_event("propagation_ok", 1);

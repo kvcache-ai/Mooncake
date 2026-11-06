@@ -88,7 +88,7 @@ impl DeleteMarkerStore {
         self.accounted_bytes = self.accounted_bytes.saturating_add(accounted_bytes);
 
         let mut evicted = Vec::new();
-        while self.accounted_bytes > self.budget_bytes && self.entries.len() > 1 {
+        while self.accounted_bytes > self.budget_bytes {
             let Some((key, marker)) = self.entries.pop_front() else {
                 break;
             };
@@ -145,9 +145,7 @@ fn accounted_entry_bytes(key: &ObjectKey) -> usize {
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
-    value
-        .saturating_add(alignment.saturating_sub(1))
-        .saturating_div(alignment)
+    (value.saturating_add(alignment.saturating_sub(1)) / alignment)
         .saturating_mul(alignment)
 }
 

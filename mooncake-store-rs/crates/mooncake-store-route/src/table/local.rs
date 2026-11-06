@@ -328,6 +328,9 @@ impl LocalRouteTable {
         };
         let marker_blocked = self.delete_marker_blocks_insert(key, expected, next);
         if !matches || marker_blocked {
+            if marker_blocked {
+                record_delete_marker_event("blocked_stale_route", 1);
+            }
             let delete_version = if current.is_none() {
                 marker
             } else {
@@ -362,6 +365,14 @@ impl LocalRouteTable {
 
     pub(crate) fn replace(&mut self, key: &ObjectKey, next: Option<&ObjectRoute>) {
         if self.replace_is_stale(key, None, next) {
+            if next.is_some_and(|route| {
+                route.state != mooncake_store_core::RouteState::Tombstone
+                    && self
+                        .delete_marker(key)
+                        .is_some_and(|marker| route.version <= marker)
+            }) {
+                record_delete_marker_event("blocked_stale_route", 1);
+            }
             return;
         }
         self.apply_update(key, next, None);

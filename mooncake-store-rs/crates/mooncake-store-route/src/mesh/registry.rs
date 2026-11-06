@@ -408,6 +408,7 @@ pub(crate) fn unregister_local_authority(namespace: &str, authority: &ClientStab
                 slot.ref_count -= 1;
             } else {
                 occ.remove();
+                record_delete_marker_state(0, 0, 0);
             }
         }
         dashmap::mapref::entry::Entry::Vacant(_) => {}
