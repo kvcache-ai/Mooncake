@@ -918,6 +918,7 @@ struct LocalAllocatorState {
     segments: BTreeMap<SegmentName, SegmentAllocator>,
     // Exact lookup only; the ready queues maintain retry order.
     pending_allocations: HashMap<AllocationSpan, PendingAllocation>,
+    allocation_pins: BTreeMap<AllocationIdentity, AllocationPinState>,
     // Legacy reservations and publication recovery use separate ready indexes.
     pending_deadlines: BTreeSet<PendingDeadline>,
     // Order deadline buckets and deduplicate exact identities within each bucket.
@@ -988,6 +989,12 @@ impl PendingPublicationAuthorityRetry {
         self.consecutive_failures = 0;
         self.next_attempt_at_ms = 0;
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AllocationPinState {
+    refs: u32,
+    deferred_release_owner: Option<ClientRuntimeId>,
 }
 
 struct UntrackedCandidateScan<'a> {
@@ -1227,6 +1234,8 @@ impl LocalAllocatorState {
         for allocation in pending {
             self.remove_pending_allocation(&allocation);
         }
+        self.allocation_pins
+            .retain(|identity, _| identity.segment_name != *segment_name);
     }
 
     fn reserve_any(
@@ -1369,6 +1378,60 @@ impl LocalAllocatorState {
         length_bytes: u64,
         allocation_id: u64,
     ) -> Result<()> {
+        let span = AllocationSpan {
+            segment_name: segment_name.clone(),
+            offset_bytes,
+            length_bytes,
+        };
+        if let Some(identity) = self.allocation_identity(&span) {
+            if (allocation_id == 0 || allocation_id == identity.allocation_id)
+                && self.allocation_pins.contains_key(&identity)
+            {
+                let pin = self
+                    .allocation_pins
+                    .get_mut(&identity)
+                    .expect("allocation pin checked above");
+                if let Some(deferred_owner) = pin.deferred_release_owner.as_ref() {
+                    if deferred_owner != owner {
+                        return Err(StoreError::Allocator(format!(
+                            "segment release already deferred for {}:{} offset={} len={}",
+                            owner, segment_name.0, offset_bytes, length_bytes
+                        )));
+                    }
+                    if pin.refs != 0 {
+                        return Ok(());
+                    }
+                    let release_result = self
+                        .segments
+                        .get_mut(segment_name)
+                        .ok_or_else(|| {
+                            StoreError::NotFound(format!(
+                                "segment {} not found while retrying deferred release",
+                                segment_name.0
+                            ))
+                        })
+                        .and_then(|segment| {
+                            segment.release(
+                                owner,
+                                segment_name,
+                                offset_bytes,
+                                length_bytes,
+                                allocation_id,
+                            )?;
+                            registry::record_segment(&segment.announcement);
+                            Ok(())
+                        });
+                    if release_result.is_ok() {
+                        self.allocation_pins.remove(&identity);
+                        self.remove_pending_allocation(&span);
+                    }
+                    return release_result;
+                }
+                pin.deferred_release_owner = Some(owner.clone());
+                self.remove_pending_allocation(&span);
+                return Ok(());
+            }
+        }
         let segment = self
             .segments
             .get_mut(segment_name)
@@ -1380,13 +1443,100 @@ impl LocalAllocatorState {
             length_bytes,
             allocation_id,
         )?;
-        self.pending_allocations.remove(&AllocationSpan {
-            segment_name: segment_name.clone(),
-            offset_bytes,
-            length_bytes,
-        });
         registry::record_segment(&segment.announcement);
+        self.remove_pending_allocation(&span);
         Ok(())
+    }
+
+    fn pin_allocation(&mut self, identity: &AllocationIdentity) -> Result<()> {
+        let span = AllocationSpan {
+            segment_name: identity.segment_name.clone(),
+            offset_bytes: identity.offset_bytes,
+            length_bytes: identity.length_bytes,
+        };
+        let current = self.allocation_identity(&span).ok_or_else(|| {
+            StoreError::Allocator(format!(
+                "cannot pin missing allocation {} offset={} len={}",
+                identity.segment_name.0, identity.offset_bytes, identity.length_bytes
+            ))
+        })?;
+        if current != *identity {
+            return Err(StoreError::Allocator(format!(
+                "cannot pin stale allocation {} offset={} expected={} actual={}",
+                identity.segment_name.0,
+                identity.offset_bytes,
+                identity.allocation_id,
+                current.allocation_id
+            )));
+        }
+        let pin = self.allocation_pins.entry(identity.clone()).or_default();
+        pin.refs = pin.refs.checked_add(1).ok_or_else(|| {
+            StoreError::Allocator("allocation pin reference count overflow".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn unpin_allocation(&mut self, identity: &AllocationIdentity) -> Result<()> {
+        let Some(pin) = self.allocation_pins.get_mut(identity) else {
+            return Err(StoreError::InvalidState(format!(
+                "allocation pin is missing for {} offset={} generation={}",
+                identity.segment_name.0, identity.offset_bytes, identity.allocation_id
+            )));
+        };
+        pin.refs = pin.refs.checked_sub(1).ok_or_else(|| {
+            StoreError::InvalidState("allocation pin reference count underflow".to_string())
+        })?;
+        if pin.refs != 0 {
+            return Ok(());
+        }
+        let deferred_release_owner = pin.deferred_release_owner.clone();
+        let Some(owner) = deferred_release_owner else {
+            self.allocation_pins.remove(identity);
+            return Ok(());
+        };
+        let release_result = self
+            .segments
+            .get_mut(&identity.segment_name)
+            .ok_or_else(|| {
+                StoreError::NotFound(format!(
+                    "segment {} not found while completing deferred release",
+                    identity.segment_name.0
+                ))
+            })
+            .and_then(|segment| {
+                segment.release(
+                    &owner,
+                    &identity.segment_name,
+                    identity.offset_bytes,
+                    identity.length_bytes,
+                    identity.allocation_id,
+                )?;
+                registry::record_segment(&segment.announcement);
+                Ok(())
+            });
+        if let Err(error) = release_result {
+            if let Some(pin) = self.allocation_pins.get_mut(identity) {
+                // Keep the deferred owner with no active borrower. A later
+                // stale-allocation reconciliation retries the physical
+                // release before the range can be reused.
+                pin.refs = 0;
+            }
+            return Err(error);
+        }
+        self.allocation_pins.remove(identity);
+        self.remove_pending_allocation(&AllocationSpan {
+            segment_name: identity.segment_name.clone(),
+            offset_bytes: identity.offset_bytes,
+            length_bytes: identity.length_bytes,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn allocation_is_pinned(&self, identity: &AllocationIdentity) -> bool {
+        self.allocation_pins
+            .get(identity)
+            .is_some_and(|pin| pin.refs != 0)
     }
 
     fn mark_pending_allocation(
@@ -1783,6 +1933,13 @@ impl LocalAllocatorState {
             .into_iter()
             .filter(|allocation| !live_allocations.contains(allocation))
             .filter(|allocation| !pending.contains(allocation))
+            .filter(|allocation| {
+                self.allocation_identity(allocation).is_none_or(|identity| {
+                    self.allocation_pins
+                        .get(&identity)
+                        .is_none_or(|pin| pin.refs == 0)
+                })
+            })
             .collect()
     }
 
@@ -2233,4 +2390,77 @@ enum ReclaimMode {
     Immediate,
     Deferred,
 
+}
+
+#[cfg(test)]
+mod offload_pin_tests {
+    use super::*;
+
+    #[test]
+    fn allocation_pin_defers_reuse_until_offload_io_completes() {
+        let owner = ClientRuntimeId::new("pin-owner", ClientEpoch(1));
+        let segment_name = SegmentName::new("pin-segment");
+        let mut allocator = LocalAllocatorState::default();
+        allocator.upsert(&SegmentAnnouncement {
+            owner: owner.clone(),
+            segment_name: segment_name.clone(),
+            transport_endpoint: None,
+            transport_segment_descriptor: None,
+            capacity_bytes: 8192,
+            used_bytes: 0,
+            target_chunks: Vec::new(),
+            state: SegmentLifecycleState::Active,
+            alignment_bytes: 4096,
+            tags: Vec::new(),
+        });
+        let reservation = allocator
+            .reserve_specific(&owner, &segment_name, 4096)
+            .expect("allocation should reserve");
+        let identity = AllocationIdentity {
+            segment_name: segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+            allocation_id: reservation.allocation_id,
+        };
+        allocator
+            .pin_allocation(&identity)
+            .expect("offload should pin the allocation");
+
+        allocator
+            .release(
+                &owner,
+                &segment_name,
+                reservation.offset_bytes,
+                reservation.length_bytes,
+                reservation.allocation_id,
+            )
+            .expect("release should defer while the allocation is pinned");
+        allocator
+            .release(
+                &owner,
+                &segment_name,
+                reservation.offset_bytes,
+                reservation.length_bytes,
+                reservation.allocation_id,
+            )
+            .expect("duplicate deferred release should be idempotent");
+        assert_eq!(allocator.allocation_identity(&AllocationSpan {
+            segment_name: segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+        }), Some(identity.clone()));
+        assert_eq!(allocator.usage_bytes().0, 4096);
+
+        allocator
+            .unpin_allocation(&identity)
+            .expect("last unpin should complete the deferred release");
+        assert_eq!(allocator.usage_bytes().0, 0);
+        assert!(allocator
+            .allocation_identity(&AllocationSpan {
+                segment_name,
+                offset_bytes: reservation.offset_bytes,
+                length_bytes: reservation.length_bytes,
+            })
+            .is_none());
+    }
 }
