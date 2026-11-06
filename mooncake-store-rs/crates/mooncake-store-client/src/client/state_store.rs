@@ -900,28 +900,35 @@ mod state_store_tests {
     fn rebuilt_storage_clocks_start_from_runtime_specific_victims() {
         let runtime_a = ClientRuntimeId::new("storage-owner-a", ClientEpoch(1));
         let runtime_b = ClientRuntimeId::new("storage-owner-b", ClientEpoch(1));
-        let routes_a = (0..512)
-            .map(|index| test_route(&format!("shared-{index:04}"), &runtime_a))
-            .collect::<Vec<_>>();
-        let routes_b = (0..512)
-            .map(|index| test_route(&format!("shared-{index:04}"), &runtime_b))
-            .collect::<Vec<_>>();
-        let tracker_a = HotReplicaTracker::default();
-        let tracker_b = HotReplicaTracker::default();
+        let runtime_c = ClientRuntimeId::new("storage-owner-c", ClientEpoch(1));
+        let first_batch = |runtime: &ClientRuntimeId| {
+            let routes = (0..4096)
+                .map(|index| test_route(&format!("shared-{index:04}"), runtime))
+                .collect::<Vec<_>>();
+            let tracker = HotReplicaTracker::default();
+            tracker.rebuild(&routes, runtime);
+            (0..BACKGROUND_EVICTION_BATCH_SIZE)
+                .map(|_| {
+                    tracker
+                        .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
+                        .expect("runtime should select a full eviction batch")
+                        .route_key
+                })
+                .collect::<BTreeSet<_>>()
+        };
 
-        tracker_a.rebuild(&routes_a, &runtime_a);
-        tracker_b.rebuild(&routes_b, &runtime_b);
+        let victims_a = first_batch(&runtime_a);
+        let victims_b = first_batch(&runtime_b);
+        let victims_c = first_batch(&runtime_c);
 
-        let victim_a = tracker_a
-            .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
-            .expect("runtime a should select an eviction victim");
-        let victim_b = tracker_b
-            .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
-            .expect("runtime b should select an eviction victim");
-
-        assert_ne!(
-            victim_a.route_key, victim_b.route_key,
-            "storage runtimes with the same ordered routes must not start eviction from the same victim"
+        assert_eq!(victims_a.len(), BACKGROUND_EVICTION_BATCH_SIZE);
+        assert_eq!(victims_b.len(), BACKGROUND_EVICTION_BATCH_SIZE);
+        assert_eq!(victims_c.len(), BACKGROUND_EVICTION_BATCH_SIZE);
+        assert!(
+            victims_a.is_disjoint(&victims_b)
+                && victims_a.is_disjoint(&victims_c)
+                && victims_b.is_disjoint(&victims_c),
+            "replica owners with the same ordered routes must start with disjoint eviction batches"
         );
     }
 
