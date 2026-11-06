@@ -274,6 +274,12 @@ fn allocator_pressure_batches_pending_cold_victims() {
         })
         .collect::<Vec<_>>();
 
+    let _generic_materializer_guard = client
+        .storage_owner
+        .pending_offloads
+        .try_begin_materialization()
+        .expect("test should reserve the generic materializer guard");
+
     assert!(
         client
             .storage_owner
@@ -303,6 +309,327 @@ fn allocator_pressure_batches_pending_cold_victims() {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_default();
     assert_eq!(backend_batches, 1, "pending victims should share one backend write batch");
+
+    let _ = std::fs::remove_dir_all(cold_root);
+}
+
+#[test]
+fn allocator_pressure_batches_hot_only_cold_victims() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let cold_root = cold_tier_test_root("background-eviction-hot-only-batch");
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "background-eviction-hot-only-batch")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "background-eviction-hot-only-batch-segment",
+        )))
+        .local_memory(
+            storage_config_with_bytes(256).eviction_poll_interval(Duration::ZERO),
+        )
+        .cold_tier_target(cold_tier_test_config_with_root(
+            "background-eviction-hot-only-batch",
+            cold_root.clone(),
+        ))
+        .cold_tier_offload_mode(ColdTierOffloadMode::EvictTriggered)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed with cold tier target");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    client.cold_tier.shutdown();
+
+    let keys = (0..8)
+        .map(|index| {
+            let key = format!("background-eviction-hot-only-{index}");
+            client
+                .put(&key, &[index as u8; 20])
+                .expect("put should succeed");
+            let route = client
+                .query_route(&key)
+                .expect("route query should succeed")
+                .expect("hot route should exist");
+            assert!(route.cold_backing.is_none());
+            key
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        client
+            .storage_owner
+            .evict_one_for_reservation_blocking(None)
+            .expect("allocator-pressure eviction should succeed")
+    );
+    for key in &keys {
+        let route = client
+            .query_route(key)
+            .expect("route query should succeed")
+            .expect("cold-backed route should remain after eviction");
+        assert!(route.replicas.is_empty());
+        assert!(route.cold_backing.as_ref().is_some_and(|backing| {
+            backing.state == mooncake_store_core::ColdBackingState::Materialized
+        }));
+    }
+
+    let metrics = render_prometheus_metrics();
+    let backend_batches = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("mooncake_store_operation_total{")
+                && line.contains("operation=\"cold_offload_backend_write_batch\"")
+                && line.contains("status=\"ok\"")
+        })
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    assert_eq!(
+        backend_batches, 2,
+        "hot-only victims should drain consecutive device-sized waves without admission backoff"
+    );
+
+    let _ = std::fs::remove_dir_all(cold_root);
+}
+
+#[test]
+fn background_materializer_drains_single_target_admission_waves() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let cold_root = cold_tier_test_root("background-single-target-admission-waves");
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "background-single-target-admission-waves")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "background-single-target-admission-waves-segment",
+        )))
+        .local_memory(storage_config_with_bytes(256).eviction_poll_interval(Duration::ZERO))
+        .cold_tier_target(cold_tier_test_config_with_root(
+            "background-single-target-admission-waves",
+            cold_root.clone(),
+        ))
+        .cold_tier_offload_mode(ColdTierOffloadMode::Passthrough)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed with cold tier target");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    client.cold_tier.shutdown();
+
+    for index in 0..8 {
+        client
+            .put(
+                &format!("background-single-target-admission-wave-{index}"),
+                &[index as u8; 20],
+            )
+            .expect("put should succeed");
+    }
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads_bounded(8)
+            .expect("bounded background materialization should succeed"),
+        8,
+        "one background pass should consume every requested single-target wave"
+    );
+
+    let metrics = render_prometheus_metrics();
+    let backend_batches = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("mooncake_store_operation_total{")
+                && line.contains("operation=\"cold_offload_backend_write_batch\"")
+                && line.contains("status=\"ok\"")
+        })
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    assert_eq!(backend_batches, 2, "eight writes should use two four-entry waves");
+    let admission_retries = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("mooncake_store_cold_tier_operation_total{")
+                && line.contains("operation=\"offload\"")
+                && line.contains("result=\"retry\"")
+                && line.contains("error_kind=\"admission\"")
+        })
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    assert_eq!(
+        admission_retries, 1,
+        "a full device window should defer the remaining entries as one wave"
+    );
+
+    let _ = std::fs::remove_dir_all(cold_root);
+}
+
+#[test]
+fn stale_pending_entry_does_not_reoffload_materialized_route() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let cold_root = cold_tier_test_root("stale-pending-materialized-route");
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "stale-pending-materialized-route")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "stale-pending-materialized-route-segment",
+        )))
+        .local_memory(
+            storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO),
+        )
+        .cold_tier_target(cold_tier_test_config_with_root(
+            "stale-pending-materialized-route",
+            cold_root.clone(),
+        ))
+        .cold_tier_offload_mode(ColdTierOffloadMode::Passthrough)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed with cold tier target");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    client.cold_tier.shutdown();
+
+    client
+        .put("stale-pending-materialized-route", b"payload")
+        .expect("put should succeed");
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads()
+            .expect("initial materialization should succeed"),
+        1
+    );
+    let materialized = client
+        .query_route("stale-pending-materialized-route")
+        .expect("route query should succeed")
+        .expect("materialized route should exist");
+    let backing_before = materialized
+        .cold_backing
+        .as_ref()
+        .expect("materialized route should have cold backing")
+        .clone();
+    let length = materialized
+        .replicas
+        .first()
+        .expect("hot replica should remain")
+        .length;
+    assert!(client.storage_owner.pending_offloads.push(
+        materialized.key.clone(),
+        materialized.version,
+        Some(length),
+    ));
+
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads()
+            .expect("stale materialization pass should succeed"),
+        0,
+        "a stale queue entry must not write a new backing for an already materialized route"
+    );
+    let after = client
+        .query_route("stale-pending-materialized-route")
+        .expect("route query should succeed")
+        .expect("materialized route should remain");
+    assert_eq!(after.version, materialized.version);
+    assert_eq!(after.cold_backing.as_ref(), Some(&backing_before));
+    assert_eq!(
+        client.storage_owner.pending_offloads.len(),
+        0,
+        "the stale queue entry should be retired after observing materialized backing"
+    );
+
+    let metrics = render_prometheus_metrics();
+    let backend_outputs = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("mooncake_store_operation_bytes_out_total{")
+                && line.contains("operation=\"cold_offload_backend_write_batch\"")
+                && line.contains("status=\"ok\"")
+        })
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    assert_eq!(backend_outputs, 1, "the stale entry must not write again");
+
+    let _ = std::fs::remove_dir_all(cold_root);
+}
+
+#[test]
+fn forced_eviction_preserves_in_flight_offload_owner() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let cold_root = cold_tier_test_root("forced-eviction-in-flight-owner");
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "forced-eviction-in-flight-owner")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "forced-eviction-in-flight-owner-segment",
+        )))
+        .local_memory(
+            storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO),
+        )
+        .cold_tier_target(cold_tier_test_config_with_root(
+            "forced-eviction-in-flight-owner",
+            cold_root.clone(),
+        ))
+        .cold_tier_offload_mode(ColdTierOffloadMode::Passthrough)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed with cold tier target");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    client.cold_tier.shutdown();
+
+    client
+        .put("forced-eviction-in-flight-owner", b"payload")
+        .expect("put should succeed");
+    let route = client
+        .query_route("forced-eviction-in-flight-owner")
+        .expect("route query should succeed")
+        .expect("pending route should exist");
+    let claimed = client
+        .storage_owner
+        .pending_offloads
+        .claim(&route.key, route.version)
+        .expect("test should own the pending offload");
+
+    assert!(
+        !client
+            .storage_owner
+            .evict_one_blocking(None)
+            .expect("eviction should safely skip an in-flight offload"),
+        "forced eviction must not steal another materializer's in-flight key"
+    );
+    let pending = client
+        .query_route("forced-eviction-in-flight-owner")
+        .expect("route query should succeed")
+        .expect("pending route should remain hot");
+    assert_eq!(pending.replicas.len(), 1);
+    assert!(pending.cold_backing.as_ref().is_some_and(|backing| {
+        backing.state == mooncake_store_core::ColdBackingState::PendingOffload
+    }));
+
+    client.storage_owner.pending_offloads.retry(claimed);
+    assert!(
+        client
+            .storage_owner
+            .evict_one_blocking(None)
+            .expect("eviction should proceed after the owner releases the key")
+    );
+    let materialized = client
+        .query_route("forced-eviction-in-flight-owner")
+        .expect("route query should succeed")
+        .expect("cold-only route should remain");
+    assert!(materialized.replicas.is_empty());
+    assert!(materialized.cold_backing.as_ref().is_some_and(|backing| {
+        backing.state == mooncake_store_core::ColdBackingState::Materialized
+    }));
 
     let _ = std::fs::remove_dir_all(cold_root);
 }
