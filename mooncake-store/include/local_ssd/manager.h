@@ -11,6 +11,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
+#include "local_ssd/offload_queue_limits.h"
 #include "mutex.h"
 #include "tenant_id.h"
 #include "types.h"
@@ -19,7 +20,8 @@ namespace mooncake {
 
 class LocalSsdTaskMailbox {
    public:
-    explicit LocalSsdTaskMailbox(bool enable_offloading);
+    explicit LocalSsdTaskMailbox(bool enable_offloading,
+                                 OffloadQueueLimits limits = {});
 
     ErrorCode EnqueueOffload(OffloadTaskItem task, size_t limit);
     std::vector<OffloadTaskItem> SetOffloadingAndTakePending(bool enabled);
@@ -36,8 +38,10 @@ class LocalSsdTaskMailbox {
     bool ConsumeRemoveAll();
 
    private:
+    const OffloadQueueLimits offload_limits_;
     mutable Mutex mutex_;
     bool enable_offloading_ GUARDED_BY(mutex_);
+    uint64_t pending_offload_bytes_ GUARDED_BY(mutex_){0};
     std::unordered_map<std::string, OffloadTaskItem> pending_offloads_
         GUARDED_BY(mutex_);
     // Dedup map + recency order. seq is monotone; enqueue, a duplicate
@@ -58,6 +62,9 @@ class LocalSsdTaskMailbox {
 
 class LocalSsdManager {
    public:
+    explicit LocalSsdManager(OffloadQueueLimits limits = {})
+        : offload_limits_(limits) {}
+
     struct CapacityChange {
         int64_t previous_bytes;
         int64_t current_bytes;
@@ -108,9 +115,11 @@ class LocalSsdManager {
     void Clear();
 
    private:
+    const OffloadQueueLimits offload_limits_;
+
     struct ClientRecord {
-        explicit ClientRecord(bool enable_offloading)
-            : mailbox(enable_offloading) {}
+        ClientRecord(bool enable_offloading, OffloadQueueLimits limits)
+            : mailbox(enable_offloading, limits) {}
 
         // Unregistration removes the record from clients_ first, then takes
         // this lock exclusively to wait for operations that already found it.
