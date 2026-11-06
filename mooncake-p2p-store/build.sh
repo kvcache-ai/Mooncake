@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if [ "$#" -ne 6 ]; then
-    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR"
+if [ "$#" -lt 6 ] || [ "$#" -gt 7 ]; then
+    echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR [USE_TENT]"
     exit 1
 fi
 
@@ -24,6 +24,7 @@ USE_REDIS=$3
 USE_HTTP=$4
 USE_ETCD_LEGACY=$5
 BUILD_DIR=$6
+USE_TENT=${7:-OFF}
 
 cd "src/p2pstore"
 if [ $? -ne 0 ]; then
@@ -35,7 +36,14 @@ EXT_LDFLAGS="-L$BUILD_DIR/mooncake-transfer-engine/src"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/common/base"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/src"
-EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -lmlx5 -ljsoncpp -lmooncake_common -lm"
+EXT_LDFLAGS+=" -ltransfer_engine"
+if [ "$USE_TENT" = "ON" ]; then
+    # libtransfer_engine.a references mooncake::tent::* from its TENT
+    # compatibility branches; resolve them from the shared TENT library.
+    TENT_LIB_DIR="$BUILD_DIR/mooncake-transfer-engine/tent/src"
+    EXT_LDFLAGS+=" -L$TENT_LIB_DIR -ltent_shared -Wl,-rpath,$TENT_LIB_DIR"
+fi
+EXT_LDFLAGS+=" -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -lmlx5 -ljsoncpp -lmooncake_common -lm"
 
 if [ -d "/usr/local/cuda/lib64/stubs" ]; then
     EXT_LDFLAGS+=" -L/usr/local/cuda/lib64/stubs"
