@@ -222,6 +222,26 @@ impl EmbeddedWrhRouteDirectory {
         Ok(authorities.into_values().collect())
     }
 
+    fn allocation_confirmation_authorities(
+        &self,
+        observer: &ClientLease,
+        current_candidates: &[ClientLease],
+    ) -> Result<Vec<ClientLease>> {
+        let retained_candidates =
+            retained_authority_candidates(self.membership.as_ref(), observer)?;
+        let mut authorities = BTreeMap::<String, ClientLease>::new();
+        for authority in current_candidates.iter().chain(&retained_candidates) {
+            let stable_id = authority.runtime.stable_id.0.clone();
+            match authorities.get(&stable_id) {
+                Some(current) if current.runtime.epoch >= authority.runtime.epoch => {}
+                _ => {
+                    authorities.insert(stable_id, authority.clone());
+                }
+            }
+        }
+        Ok(authorities.into_values().collect())
+    }
+
     fn local_authority_service(
         &self,
         authority: &ClientStableId,
@@ -1247,18 +1267,20 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         if identities.is_empty() {
             return Ok(Vec::new());
         }
-        let candidates = self.authority_candidates_force_refresh(observer)?;
-        if candidates.is_empty() {
+        let current_candidates = self.authority_candidates(observer)?;
+        let expected_members = current_candidates
+            .iter()
+            .map(|authority| authority.runtime.clone())
+            .collect::<BTreeSet<_>>();
+        let authorities =
+            self.allocation_confirmation_authorities(observer, &current_candidates)?;
+        if authorities.is_empty() {
             return Err(StoreError::Transport(
                 "allocation reference query has no live route authorities".to_string(),
             ));
         }
-        let expected_members = candidates
-            .iter()
-            .map(|authority| authority.runtime.clone())
-            .collect::<BTreeSet<_>>();
         let mut consensus = vec![None; identities.len()];
-        for authority in &candidates {
+        for authority in &authorities {
             let references =
                 self.get_allocation_route_references_from_authority(authority, identities)?;
             if references.len() != identities.len() {
@@ -1278,7 +1300,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             }
         }
         let refreshed_members = self
-            .authority_candidates_force_refresh(observer)?
+            .authority_candidates(observer)?
             .into_iter()
             .map(|authority| authority.runtime)
             .collect::<BTreeSet<_>>();
