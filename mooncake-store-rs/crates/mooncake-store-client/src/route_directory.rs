@@ -97,10 +97,15 @@ pub(crate) fn authority_list_routes_by_replica_owner_page(
     authority: &ClientStableId,
     owner: &ClientRuntimeId,
     cursor: Option<&str>,
+    snapshot_epoch: Option<u64>,
     limit: usize,
 ) -> Result<RouteOwnerPage> {
-    LocalRouteAuthority::new(namespace, authority.clone())
-        .list_routes_by_replica_owner_page(owner, cursor, limit)
+    LocalRouteAuthority::new(namespace, authority.clone()).list_routes_by_replica_owner_page(
+        owner,
+        cursor,
+        snapshot_epoch,
+        limit,
+    )
 }
 
 pub(crate) fn authority_compare_and_swap(

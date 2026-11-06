@@ -34,6 +34,7 @@ pub enum RouteControlRequest {
         authority: ClientStableId,
         owner: ClientRuntimeId,
         cursor: Option<String>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     },
     GetAllocationReferences {
@@ -144,6 +145,7 @@ pub fn serve_route_control_request(
             authority,
             owner,
             cursor,
+            snapshot_epoch,
             limit,
         } => service
             .list_routes_by_replica_owner_page(
@@ -151,6 +153,7 @@ pub fn serve_route_control_request(
                 &authority,
                 &owner,
                 cursor.as_deref(),
+                snapshot_epoch,
                 limit,
             )
             .map(RouteControlResponse::ListByReplicaOwner),
@@ -315,6 +318,7 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         authority: &ClientStableId,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> Result<RouteOwnerPage> {
         let response = self.transport.send_route_control(
@@ -324,6 +328,7 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
                 authority: authority.clone(),
                 owner: owner.clone(),
                 cursor: cursor.map(ToOwned::to_owned),
+                snapshot_epoch,
                 limit,
             },
         )?;

@@ -582,6 +582,27 @@ pub trait RouteDirectory: Send + Sync {
         Ok(())
     }
 
+    /// Visits an owner route set only when the directory's ownership listing is
+    /// complete. Callers that release storage or replace derived state must use
+    /// this variant instead of the best-effort streaming visitor above.
+    ///
+    /// Direct metadata directories expose an all-or-error owner listing and
+    /// inherit this implementation. Paged remote directories must override it
+    /// to validate their continuation snapshot before callers commit
+    /// irreversible reclamation. The visitor may accumulate provisional state,
+    /// but must defer side effects until this method returns `Ok(())`.
+    fn visit_routes_by_replica_owner_consistent(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<()> {
+        for route in self.list_routes_by_replica_owner(observer, owner)? {
+            visitor(route)?;
+        }
+        Ok(())
+    }
+
     fn list_routes_by_cold_backing(
         &self,
         _observer: &ClientLease,

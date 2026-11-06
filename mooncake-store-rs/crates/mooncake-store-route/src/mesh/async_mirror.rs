@@ -318,6 +318,7 @@ mod tests {
             _authority: &ClientStableId,
             _owner: &ClientRuntimeId,
             _cursor: Option<&str>,
+            _snapshot_epoch: Option<u64>,
             _limit: usize,
         ) -> Result<crate::RouteOwnerPage> {
             Ok(crate::RouteOwnerPage::empty())

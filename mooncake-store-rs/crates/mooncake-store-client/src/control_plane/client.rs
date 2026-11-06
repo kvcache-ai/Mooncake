@@ -97,6 +97,7 @@ fn decode_route_list_by_replica_owner_reply(
         mooncake_store_route::RouteOwnerPage {
             routes,
             next_cursor: reply.next_cursor,
+        snapshot_epoch: reply.snapshot_epoch,
         },
     ))
 }
@@ -127,6 +128,7 @@ mod owner_page_decode_tests {
             routes,
             error: None,
             next_cursor: None,
+            snapshot_epoch: None,
         })
         .expect_err("an oversized transport page must fail closed");
         assert!(matches!(error, StoreError::Transport(_)));
@@ -222,9 +224,10 @@ impl ControlPlaneClient {
                 authority,
                 owner,
                 cursor,
+                snapshot_epoch,
                 limit,
             } => self.send_route_list_by_replica_owner(
-                lease, namespace, authority, owner, cursor, limit,
+                lease, namespace, authority, owner, cursor, snapshot_epoch, limit,
             ),
             RouteControlRequest::GetAllocationReferences {
                 namespace,
@@ -393,6 +396,7 @@ impl ControlPlaneClient {
         authority: ClientStableId,
         owner: ClientRuntimeId,
         cursor: Option<String>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> Result<RouteControlResponse> {
         let request = pb::ListRoutesByReplicaOwnerRequest {
@@ -400,6 +404,7 @@ impl ControlPlaneClient {
             authority: authority.0.clone(),
             owner: Some(pb_runtime_id(&owner)),
             cursor,
+            snapshot_epoch,
             limit: limit.try_into().unwrap_or(u32::MAX),
         };
         match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
@@ -606,6 +611,7 @@ impl ControlPlaneClient {
                 authority: authority.clone(),
                 owner: owner.clone(),
                 cursor: None,
+                snapshot_epoch: None,
                 limit: mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE,
             },
         )?;
@@ -1452,4 +1458,38 @@ pub(super) fn fail_stream_session(session: &ControlStreamSession, message: Strin
     for (_, tx) in pending {
         let _ = tx.send(Err(StoreError::Transport(message.clone())));
     }
+}
+
+impl ControlPlaneClient {
+    #[cfg(test)]
+    pub(crate) fn list_routes_by_replica_owner_page(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
+        limit: usize,
+    ) -> Result<mooncake_store_route::RouteOwnerPage> {
+        let response = self.send_route_control(
+            lease,
+            RouteControlRequest::ListByReplicaOwner {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                owner: owner.clone(),
+                cursor: cursor.map(ToOwned::to_owned),
+                snapshot_epoch,
+                limit,
+            },
+        )?;
+        match response {
+            RouteControlResponse::ListByReplicaOwner(page) => Ok(page),
+            _ => Err(StoreError::Transport(
+                "test list_routes_by_replica_owner_page returned non-page route response"
+                    .to_string(),
+            )),
+        }
+    }
+
 }
