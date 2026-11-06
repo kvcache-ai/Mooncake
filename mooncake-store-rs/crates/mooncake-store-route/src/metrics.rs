@@ -38,14 +38,17 @@ pub(crate) fn record_route_repair_metric(operation: &'static str) {
     route_metrics_sink().read().record_route_repair(operation);
 }
 
-pub(crate) fn record_cas_outcome(cas: &CasResult, next: Option<&ObjectRoute>, key: &ObjectKey) {
+pub(crate) fn record_cas_outcome(cas: &CasResult) {
     if cas.applied {
         route_metrics_sink().read().record_route_cas("ok");
-        match next {
-            Some(route) => route_metrics_sink().read().record_route(route),
-            None => route_metrics_sink().read().remove_route(key),
-        }
         return;
     }
     route_metrics_sink().read().record_route_cas("conflict");
+}
+
+pub(crate) fn record_authoritative_route_update(next: Option<&ObjectRoute>, key: &ObjectKey) {
+    match next {
+        Some(route) => route_metrics_sink().read().record_route(route),
+        None => route_metrics_sink().read().remove_route(key),
+    }
 }

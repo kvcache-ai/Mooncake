@@ -9,7 +9,7 @@ use mooncake_store_core::{
     RouteVersion, StoreError,
 };
 
-use crate::metrics::record_cas_outcome;
+use crate::metrics::record_authoritative_route_update;
 use crate::{RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
 
 fn route_has_materialized_cold_backing(route: &ObjectRoute) -> bool {
@@ -316,7 +316,6 @@ impl LocalRouteTable {
                 current,
                 version_floor,
             };
-            record_cas_outcome(&result, next, key);
             return result;
         }
 
@@ -326,7 +325,6 @@ impl LocalRouteTable {
             current: next.cloned(),
             version_floor: None,
         };
-        record_cas_outcome(&result, next, key);
         result
     }
 
@@ -417,6 +415,7 @@ impl LocalRouteTable {
                 }
             }
         }
+        record_authoritative_route_update(next, key);
     }
 
     fn bump_owner_epochs(&mut self, old: Option<&ObjectRoute>, next: Option<&ObjectRoute>) {
