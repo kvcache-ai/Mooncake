@@ -1977,6 +1977,18 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         )
     }
 
+    fn get_version_floor(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
+        self.get_delete_marker(observer, key)
+    }
+
+    fn get_version_floors(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Vec<Option<RouteVersion>> {
+        self.get_delete_markers(observer, keys)
+    }
+
     fn get_delete_marker(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
         let candidates = self.authority_candidates(observer).ok()?;
         let ranked = ranked_authorities(&self.namespace, &candidates, key);
