@@ -71,6 +71,12 @@ std::string pickRdmaDevice() {
     return name;
 }
 
+std::string handshakeName() {
+    const char* ip = std::getenv("MC_TEST_LOCAL_IP");
+    if (!ip || !*ip) ip = "127.0.0.1";
+    return std::string(ip) + ":0";
+}
+
 bool sliceTimeoutDisablesEvents() {
     const char* value = std::getenv("MC_SLICE_TIMEOUT");
     if (!value || !*value) return false;
@@ -128,7 +134,7 @@ class RdmaCompletionFdTest : public ::testing::Test {
     std::unique_ptr<TransferEngine> makeEngine() {
         auto engine = std::make_unique<TransferEngine>(
             true, std::vector<std::string>{device_});
-        if (engine->init("P2PHANDSHAKE", "127.0.0.1:0")) return nullptr;
+        if (engine->init("P2PHANDSHAKE", handshakeName())) return nullptr;
         return engine;
     }
 
