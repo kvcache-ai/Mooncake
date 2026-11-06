@@ -1021,7 +1021,16 @@ void TransferEngineOperationState::wait_for_completion() {
             LOG(ERROR) << "Failed to complete transfers after "
                        << timeout_milliseconds << " milliseconds for batch "
                        << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
+            {
+                // result_ is shared with concurrent completion paths
+                // (is_completed()/check_task_status() hold mutex_ when they
+                // set it, and the event-driven branch below wraps its
+                // set_result_internal() in the same lock). Lock this path
+                // too, or a late completion racing the timeout is a data
+                // race on result_.
+                std::lock_guard<std::mutex> lock(mutex_);
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+            }
             return;
         }
 
