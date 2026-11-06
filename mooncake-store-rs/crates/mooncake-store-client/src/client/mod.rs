@@ -40,7 +40,7 @@ use crate::control_plane::{
 };
 use crate::memory::{
     execute_copy_instructions, LocalMemoryConfig, LocalMemoryState, PreparedCopy, RegionAllocation,
-    ScratchReservation, StorageExtentInfo, StorageSegmentSpec,
+    ScratchReservation, StorageExtentInfo, StorageRegionSlice, StorageSegmentSpec,
 };
 use crate::observability::{
     record_api_items, registry, ApiItemTrace, ApiItemsTraceRecord, OperationTracker,

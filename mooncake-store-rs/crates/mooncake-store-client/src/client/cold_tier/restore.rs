@@ -1956,12 +1956,12 @@ fn process_device_group(
             .map(|&gi| {
                 let entry = &group[gi];
                 let slot = staged_slots[gi].as_ref().unwrap();
-                let dst = unsafe {
-                    std::slice::from_raw_parts_mut(slot.addr, entry.cold_backing.length as usize)
-                };
+                let dst = unsafe { std::slice::from_raw_parts_mut(slot.addr, slot.io_len()) };
                 ColdObjectRead {
                     cold_backing: &entry.cold_backing,
                     dst,
+                    allow_intermediate_buffer: false,
+                    allow_padded_direct_read: true,
                 }
             })
             .collect();
@@ -2531,9 +2531,8 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
     let mut ssd_io_us: u64 = 0;
     let mut checksum_us: u64 = 0;
     let ssd_read_result = (|| -> Result<()> {
-        let dst = unsafe {
-            std::slice::from_raw_parts_mut(staging_slot.addr, cold_backing.length as usize)
-        };
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(staging_slot.addr, staging_slot.io_len()) };
         let t_backend = std::time::Instant::now();
         let backend = storage_owner.cold_tier_devices.backend_for_with_refresh(
             storage_owner.metadata.as_ref(),
@@ -2543,7 +2542,20 @@ pub(in super::super) fn execute_owner_cold_restore_ssd_phase_staging(
         backend_resolve_us = t_backend.elapsed().as_micros() as u64;
 
         let t_io = std::time::Instant::now();
-        let read_result = backend.get_object_into(&cold_backing, dst)?;
+        let mut read = [ColdObjectRead {
+            cold_backing: &cold_backing,
+            dst,
+            allow_intermediate_buffer: false,
+            allow_padded_direct_read: true,
+        }];
+        let read_result = backend
+            .get_objects_into_batch(&mut read)
+            .pop()
+            .unwrap_or_else(|| {
+                Err(StoreError::InvalidState(
+                    "empty staging SSD read result".to_string(),
+                ))
+            })?;
         ssd_io_us = t_io.elapsed().as_micros() as u64;
 
         let bytes_read = read_result.ok_or_else(|| {

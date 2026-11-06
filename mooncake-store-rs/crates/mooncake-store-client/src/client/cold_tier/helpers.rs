@@ -330,6 +330,8 @@ pub(in super::super) fn with_disjoint_restore_caller_buffers(
             dst: slots[*index]
                 .take()
                 .expect("each restore read index should be unique"),
+            allow_intermediate_buffer: false,
+            allow_padded_direct_read: false,
         })
         .collect::<Vec<_>>();
     indices.into_iter().zip(f(&mut reads)).collect()
@@ -350,9 +352,9 @@ pub(in super::super) fn read_local_hot_replica_payload(
             )));
         }
     }
-    let payload = copy_replica_payload_from_local_memory(state, replica).or_else(|_| {
+    let payload = pin_replica_payload_in_local_memory(allocator, state, replica).or_else(|_| {
         load_offload_source(backend, route)?
-            .map(PendingOffloadPayload::new)
+            .map(PendingOffloadPayload::from_vec)
             .ok_or_else(|| {
                 StoreError::NotFound(format!(
                     "route {} has no source payload available for offload",
@@ -386,7 +388,7 @@ pub(in super::super) fn local_hot_replica_checksum(
             )));
         }
     }
-    let payload = copy_replica_payload_from_local_memory(state, replica)?;
+    let payload = pin_replica_payload_in_local_memory(allocator, state, replica)?;
     if payload.len() != replica.length as usize {
         return Err(StoreError::InvalidState(format!(
             "route {} local payload length mismatch while checksumming: expected {} actual {}",
@@ -398,20 +400,12 @@ pub(in super::super) fn local_hot_replica_checksum(
     Ok(payload_checksum(payload.as_slice()))
 }
 
-fn copy_replica_payload_from_local_memory(
+fn pin_replica_payload_in_local_memory(
+    allocator: &Arc<Mutex<LocalAllocatorState>>,
     state: &Arc<Mutex<StoreState>>,
     replica: &ReplicaRoute,
 ) -> Result<PendingOffloadPayload> {
-    let payload = {
-        let state = state.lock();
-        let addr = state
-            .memory_ref()?
-            .storage_address(&replica.segment_name, replica.segment_offset as usize)?;
-        // Keep pending offload materialization independent from hot-slot reuse.
-        // The route/allocator state may move on before the backend write runs.
-        unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), replica.length as usize).to_vec() }
-    };
-    Ok(PendingOffloadPayload::new(payload))
+    PendingOffloadPayload::pin_local_memory(allocator, state, replica)
 }
 
 fn load_offload_source(

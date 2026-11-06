@@ -1380,7 +1380,7 @@ fn cold_restore_large_checkpoint_batch_uses_caller_buffers_without_cross_object_
 }
 
 #[test]
-fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
+fn pending_offload_materialization_pins_and_borrows_hot_payload() {
     let _cold_guard = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let root = cold_tier_test_root("pending-offload-snapshot-after-prepare");
@@ -1437,7 +1437,6 @@ fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
         .expect("pending offload should prepare");
     assert_eq!(prepared.len(), 1);
 
-    let replacement = vec![0xA5u8; original.len()];
     let addr = {
         let state = client.state.lock();
         state
@@ -1446,20 +1445,29 @@ fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
             .storage_address(&replica.segment_name, replica.segment_offset as usize)
             .expect("replica address should resolve")
     };
-    unsafe {
-        std::ptr::copy_nonoverlapping(replacement.as_ptr(), addr.cast::<u8>(), replacement.len());
-    }
     assert_eq!(
-        prepared[0].payload.as_slice(),
-        original.as_slice(),
-        "prepared offload payload must not observe later hot-slot mutation"
+        prepared[0].payload.as_slice().as_ptr(),
+        addr.cast::<u8>(),
+        "pending offload must borrow the hot allocation without copying"
     );
+    let allocation_identity = AllocationIdentity {
+        segment_name: replica.segment_name.clone(),
+        offset_bytes: replica.segment_offset,
+        length_bytes: replica.length,
+        allocation_id: replica
+            .allocation_id
+            .expect("local hot replica should have an allocation generation"),
+    };
+    assert!(client
+        .allocator
+        .lock()
+        .allocation_is_pinned(&allocation_identity));
 
     let mut first_error = None;
     let materialized = client
         .storage_owner
         .materialize_prepared_pending_offload_batch(&prepared, &mut first_error)
-        .expect("prepared offload should materialize from owned snapshot");
+        .expect("prepared offload should materialize from pinned hot memory");
     assert_eq!(materialized, 1, "unexpected offload error: {first_error:?}");
 
     let route = client
@@ -1474,6 +1482,11 @@ fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
         materialized.state,
         mooncake_store_core::ColdBackingState::Materialized
     );
+    drop(prepared);
+    assert!(!client
+        .allocator
+        .lock()
+        .allocation_is_pinned(&allocation_identity));
     let backend = client
         .storage_owner
         .cold_tier_devices

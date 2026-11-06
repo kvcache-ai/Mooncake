@@ -408,6 +408,14 @@ pub(super) struct ColdObjectWrite<'a> {
 pub(super) struct ColdObjectRead<'a, 'b> {
     pub(super) cold_backing: &'a mooncake_store_core::ColdBackingRoute,
     pub(super) dst: &'b mut [u8],
+    /// Whether the backend may read through an intermediate coalescing/bounce
+    /// buffer. Restore-to-staging sets this to false so disk I/O targets the
+    /// final staging allocation directly.
+    pub(super) allow_intermediate_buffer: bool,
+    /// Whether an extent-store backend may read trailing physical padding into
+    /// this destination. Only the padded owner-restore staging allocation opts
+    /// in; ordinary get-into callers must observe logical-length writes.
+    pub(super) allow_padded_direct_read: bool,
 }
 
 /// A batched cold tier read request that returns an owned or pinned payload without copying.
