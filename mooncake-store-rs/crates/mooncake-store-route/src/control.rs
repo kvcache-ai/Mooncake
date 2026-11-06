@@ -5,7 +5,9 @@ use mooncake_store_core::{
     ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest, StoreError,
 };
 
-use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteOwnerPage};
+use crate::shim::{
+    RouteAuthorityClient, RouteAuthorityService, RouteOwnerPage, RouteOwnerPageQuery,
+};
 
 #[derive(Clone, Debug)]
 pub enum RouteControlRequest {
@@ -316,20 +318,17 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         lease: &ClientLease,
         namespace: &str,
         authority: &ClientStableId,
-        owner: &ClientRuntimeId,
-        cursor: Option<&str>,
-        snapshot_epoch: Option<u64>,
-        limit: usize,
+        query: &RouteOwnerPageQuery,
     ) -> Result<RouteOwnerPage> {
         let response = self.transport.send_route_control(
             lease,
             RouteControlRequest::ListByReplicaOwner {
                 namespace: namespace.to_string(),
                 authority: authority.clone(),
-                owner: owner.clone(),
-                cursor: cursor.map(ToOwned::to_owned),
-                snapshot_epoch,
-                limit,
+                owner: query.owner.clone(),
+                cursor: query.cursor.clone(),
+                snapshot_epoch: query.snapshot_epoch,
+                limit: query.limit,
             },
         )?;
         let RouteControlResponse::ListByReplicaOwner(page) = response else {

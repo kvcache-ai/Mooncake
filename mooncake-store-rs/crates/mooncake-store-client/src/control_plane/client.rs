@@ -1,6 +1,8 @@
 use super::codec::*;
 use super::*;
-use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
+use mooncake_store_route::{
+    RouteControlRequest, RouteControlResponse, RouteControlTransport, RouteOwnerPageQuery,
+};
 
 impl RouteControlTransport for ControlPlaneClient {
     fn send_route_control(
@@ -227,7 +229,7 @@ impl ControlPlaneClient {
                 snapshot_epoch,
                 limit,
             } => self.send_route_list_by_replica_owner(
-                lease, namespace, authority, owner, cursor, snapshot_epoch, limit,
+                lease, namespace, authority, RouteOwnerPageQuery { owner, cursor, snapshot_epoch, limit },
             ),
             RouteControlRequest::GetAllocationReferences {
                 namespace,
@@ -394,18 +396,15 @@ impl ControlPlaneClient {
         lease: &ClientLease,
         namespace: String,
         authority: ClientStableId,
-        owner: ClientRuntimeId,
-        cursor: Option<String>,
-        snapshot_epoch: Option<u64>,
-        limit: usize,
+        query: RouteOwnerPageQuery,
     ) -> Result<RouteControlResponse> {
         let request = pb::ListRoutesByReplicaOwnerRequest {
             namespace,
             authority: authority.0.clone(),
-            owner: Some(pb_runtime_id(&owner)),
-            cursor,
-            snapshot_epoch,
-            limit: limit.try_into().unwrap_or(u32::MAX),
+            owner: Some(pb_runtime_id(&query.owner)),
+            cursor: query.cursor,
+            snapshot_epoch: query.snapshot_epoch,
+            limit: query.limit.try_into().unwrap_or(u32::MAX),
         };
         match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
             request_id,
@@ -433,7 +432,7 @@ impl ControlPlaneClient {
             Err(error) => {
                 warn!(
                     authority = %authority,
-                    owner = %owner,
+                    owner = %query.owner,
                     error = %error,
                     "control stream list_routes_by_replica_owner failed; falling back to unary rpc"
                 );
@@ -1467,20 +1466,17 @@ impl ControlPlaneClient {
         lease: &ClientLease,
         namespace: &str,
         authority: &ClientStableId,
-        owner: &ClientRuntimeId,
-        cursor: Option<&str>,
-        snapshot_epoch: Option<u64>,
-        limit: usize,
+        query: RouteOwnerPageQuery,
     ) -> Result<mooncake_store_route::RouteOwnerPage> {
         let response = self.send_route_control(
             lease,
             RouteControlRequest::ListByReplicaOwner {
                 namespace: namespace.to_string(),
                 authority: authority.clone(),
-                owner: owner.clone(),
-                cursor: cursor.map(ToOwned::to_owned),
-                snapshot_epoch,
-                limit,
+                owner: query.owner,
+                cursor: query.cursor,
+                snapshot_epoch: query.snapshot_epoch,
+                limit: query.limit,
             },
         )?;
         match response {

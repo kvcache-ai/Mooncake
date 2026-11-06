@@ -249,6 +249,7 @@ pub(crate) fn mirror_secondary_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shim::RouteOwnerPageQuery;
     use mooncake_store_core::{CasResult, ClientRuntimeId, ObjectKey, ObjectRoute, Result};
 
     struct RecordingAuthorityClient {
@@ -316,10 +317,7 @@ mod tests {
             _lease: &ClientLease,
             _namespace: &str,
             _authority: &ClientStableId,
-            _owner: &ClientRuntimeId,
-            _cursor: Option<&str>,
-            _snapshot_epoch: Option<u64>,
-            _limit: usize,
+            _query: &RouteOwnerPageQuery,
         ) -> Result<crate::RouteOwnerPage> {
             Ok(crate::RouteOwnerPage::empty())
         }
