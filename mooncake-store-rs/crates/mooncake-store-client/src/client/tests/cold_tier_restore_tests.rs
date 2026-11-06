@@ -576,6 +576,91 @@ fn debug_evict_all_waits_for_pending_offload_claim_race() {
 }
 
 #[test]
+fn debug_evict_all_completes_while_delete_reclaim_is_pending() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root = cold_tier_test_root("debug-evict-all-pending-delete");
+    let client = Arc::new(
+        StoreClientBuilder::new(metadata, "debug-evict-all-pending-delete")
+            .state(ClientLifecycleState::Active)
+            .label("storage", "true")
+            .transport(Arc::new(TestTransport::new(
+                "debug-evict-all-pending-delete-segment",
+            )))
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .numa_aware(false)
+                    .storage_bytes(512)
+                    .scratch_bytes(4096)
+                    .alignment(1)
+                    // remove 后保持回收未到期，固定 route 已删除但 allocator
+                    // 仍存活的 DeletePending 中间态。
+                    .reclaim_grace_ms(60_000)
+                    .eviction_poll_interval(Duration::ZERO),
+            )
+            .cold_tier_target(ColdTierTargetConfig::directory(
+                "debug-evict-all-pending-delete",
+                ColdTierKind::Ssd,
+                root.clone(),
+            ))
+            .build(test_future_expiry_ms())
+            .expect("client build should succeed"),
+    );
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route = client
+        .put("pending-delete-key", b"pending-delete-payload")
+        .expect("put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+    wait_for_materialized_cold_backing(&client, "pending-delete-key");
+
+    client
+        .remove("pending-delete-key", true)
+        .expect("remove should publish the logical delete");
+    assert!(
+        client
+            .query_route("pending-delete-key")
+            .expect("route query should succeed")
+            .is_none(),
+        "delete must become externally visible before local reclaim finishes"
+    );
+    assert_eq!(
+        client.storage_owner.pending_deletes.lock().entries.len(),
+        1,
+        "the allocator owner must retain the exact generation until its grace expires"
+    );
+
+    let evictions = (0..2)
+        .map(|_| {
+            let client = client.clone();
+            std::thread::spawn(move || client.debug_evict_all())
+        })
+        .collect::<Vec<_>>();
+
+    for eviction in evictions {
+        let result = eviction
+            .join()
+            .expect("concurrent evict-all worker should join")
+            .expect("evict-all should handle a delete pending entry");
+        assert!(
+            result.completed,
+            "logically deleted replicas must not block evict-all: {result:?}"
+        );
+        assert_eq!(result.remaining_hot_replicas, 0);
+    }
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        route.replicas[0].length,
+        "evict-all must not release a DeletePending allocation before its grace expires"
+    );
+    assert_eq!(client.storage_owner.pending_deletes.lock().entries.len(), 1);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn debug_evict_all_removes_all_dram_replicas() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
