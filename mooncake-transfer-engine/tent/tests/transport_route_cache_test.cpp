@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -49,6 +50,9 @@ class FakeTransport : public Transport {
 
     std::atomic<int> submit_calls{0};
     std::atomic<int> submitted_tasks{0};
+    // Fired from selection. A publish here happens after findBuffer keys were
+    // copied and before the route is stored.
+    mutable std::function<void()> on_capabilities;
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -118,6 +122,11 @@ class FakeTransport : public Transport {
     }
 
     bool warmupMemory(void*, size_t) override { return false; }
+
+    const Capabilities capabilities() const override {
+        if (on_capabilities) on_capabilities();
+        return caps;
+    }
 
     const char* getName() const override {
         return self_type_ == RDMA ? "<fake-rdma>" : "<fake-tcp>";
@@ -201,8 +210,8 @@ class TransportRouteCacheTest : public ::testing::TestWithParam<bool> {
 
     uint8_t* registerBytes(size_t bytes, uint8_t fill) {
         buffers_.emplace_back(bytes, fill);
-        EXPECT_TRUE(engine_->registerLocalMemory(buffers_.back().data(), bytes)
-                        .ok());
+        EXPECT_TRUE(
+            engine_->registerLocalMemory(buffers_.back().data(), bytes).ok());
         return buffers_.back().data();
     }
 
@@ -284,6 +293,28 @@ TEST_P(TransportRouteCacheTest, UnspecMissIsNotCached) {
     // Caching the miss would report 2.
     EXPECT_EQ(submitAndCountResolves({a, b}), 4u);
     EXPECT_EQ(rdma_->submitted_tasks.load() + tcp_->submitted_tasks.load(), 0);
+}
+
+TEST_P(TransportRouteCacheTest, SnapshotPublishSkipsRouteCache) {
+    uint8_t* base = registerBytes(2 * kStride, 0xb1);
+    auto reqs = stridedWrites(base, 2);
+    for (const char* which : {"local", "remote"}) {
+        SCOPED_TRACE(which);
+        bool published = false;
+        auto publish_once = [&]() {
+            if (published) return;
+            published = true;
+            engine_->publishSegmentSnapshotForTest(std::string(which) ==
+                                                   "local");
+        };
+        rdma_->on_capabilities = publish_once;
+        tcp_->on_capabilities = publish_once;
+        // Same MR would resolve once. The publication moves a generation the
+        // key was drawn from, so the second owner resolves again.
+        EXPECT_EQ(submitAndCountResolves(reqs), 2u);
+        rdma_->on_capabilities = nullptr;
+        tcp_->on_capabilities = nullptr;
+    }
 }
 
 TEST_P(TransportRouteCacheTest, HashMapHitAfterInterleaving) {

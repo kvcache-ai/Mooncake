@@ -73,6 +73,16 @@ class SegmentManager {
     // Invalidates all threads' caches.
     Status invalidateAllCacheForRemote(const std::string &segment_name);
 
+    // Generations observed by getLocal() and getRemoteCached(). prepareSubmit
+    // samples these around its findBuffer pass and stops reusing a route when
+    // either one moves.
+    uint64_t localDescVersion() const {
+        return local_desc_version_.load(std::memory_order_acquire);
+    }
+    uint64_t remoteCacheVersion() const {
+        return version_.load(std::memory_order_relaxed);
+    }
+
     // Execute an operation with automatic cache invalidation and retry.
     //
     // This helper wraps segment cache lookups with automatic retry logic:

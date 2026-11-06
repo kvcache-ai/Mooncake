@@ -2287,6 +2287,16 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     }
 }
 
+void TransferEngineImpl::publishSegmentSnapshotForTest(bool local) {
+    if (local) {
+        (void)metadata_->segmentManager().updateLocal(
+            [](SegmentDesc&) { return Status::OK(); });
+        return;
+    }
+    (void)metadata_->segmentManager().invalidateAllCacheForRemote(
+        "route-cache-test");
+}
+
 SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
                                                      int transport_index,
                                                      bool invalidate_on_fail,
@@ -2325,6 +2335,11 @@ Status TransferEngineImpl::prepareSubmit(
     }
     const size_t start_task_id = batch->task_list.size();
     prepared.submit_time = std::chrono::steady_clock::now();
+    // Sample before findBuffer. A publication during or after that pass makes
+    // the copied BufferKeys name a snapshot resolveTransport no longer reads.
+    auto& segments = metadata_->segmentManager();
+    const uint64_t route_local_epoch = segments.localDescVersion();
+    const uint64_t route_remote_epoch = segments.remoteCacheVersion();
     auto merge_boundaries = resolveRequestBoundaries(
         metadata_.get(), request_list, hp_tcp_transport_config_);
     auto merged =
@@ -2366,8 +2381,14 @@ Status TransferEngineImpl::prepareSubmit(
 
     prepared.owners.reserve(merged.request_list.size());
 
-    // One prepareSubmit. Keys come from the precomputed findBuffer results.
-    // After a peer snapshot refresh, later owners of that peer skip the cache.
+    // Keys are the findBuffer hits from the epochs sampled above. Skip the
+    // cache after a peer refresh, or for the rest of the submit once either
+    // epoch moves, so an old BufferKey cannot select a new MR's route.
+    auto routeSnapshotsCurrent = [&]() {
+        return segments.localDescVersion() == route_local_epoch &&
+               segments.remoteCacheVersion() == route_remote_epoch;
+    };
+    bool route_cache_live = routeSnapshotsCurrent();
     std::unordered_map<RouteCacheKey, SelectionResult, RouteCacheKeyHash>
         route_cache;
     std::unordered_set<SegmentID> refreshed_targets;
@@ -2380,17 +2401,23 @@ Status TransferEngineImpl::prepareSubmit(
         owner.request = merged.request_list[owner_id];
         const auto& req = owner.request;
         const auto& boundary = merge_boundaries[merged.first_public[owner_id]];
-        const bool cacheable = boundary.source_key && boundary.target_key &&
+        if (route_cache_live && !routeSnapshotsCurrent()) {
+            route_cache_live = false;
+            last_key.reset();
+        }
+        const bool cacheable = route_cache_live && boundary.source_key &&
+                               boundary.target_key &&
                                !refreshed_targets.contains(req.target_id);
         if (!cacheable) {
             bool refreshed = false;
             owner.route = resolveTransport(req, 0, true, &refreshed);
+            if (!routeSnapshotsCurrent()) route_cache_live = false;
             if (refreshed) refreshed_targets.insert(req.target_id);
             last_key.reset();
         } else {
-            RouteCacheKey key{req.target_id,     req.transport_hint,
-                              req.intent_type,   req.priority,
-                              req.length,        *boundary.source_key,
+            RouteCacheKey key{req.target_id,        req.transport_hint,
+                              req.intent_type,      req.priority,
+                              req.length,           *boundary.source_key,
                               *boundary.target_key, req.policy_name};
             if (last_key && key == *last_key) {
                 owner.route = last_route;
@@ -2402,10 +2429,12 @@ Status TransferEngineImpl::prepareSubmit(
             } else {
                 bool refreshed = false;
                 owner.route = resolveTransport(req, 0, true, &refreshed);
+                if (!routeSnapshotsCurrent()) route_cache_live = false;
                 if (refreshed) {
                     refreshed_targets.insert(req.target_id);
                     last_key.reset();
-                } else if (owner.route.transport != UNSPEC) {
+                } else if (route_cache_live &&
+                           owner.route.transport != UNSPEC) {
                     route_cache.emplace(key, owner.route);
                     last_key = std::move(key);
                     last_route = owner.route;

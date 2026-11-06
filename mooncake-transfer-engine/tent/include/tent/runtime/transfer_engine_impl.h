@@ -395,6 +395,11 @@ class TransferEngineImpl {
         transport_resolve_calls_.store(0, std::memory_order_relaxed);
     }
 
+    // Publish an empty local snapshot, or bump the remote-cache generation,
+    // without changing buffer contents. Route-cache tests use this from inside
+    // one submit to show a newer generation is not reused.
+    void publishSegmentSnapshotForTest(bool local);
+
     Status publishRuntimeConfigForTest(
         std::shared_ptr<const RuntimeConfigSnapshot> snapshot) {
         if (!snapshot) {
