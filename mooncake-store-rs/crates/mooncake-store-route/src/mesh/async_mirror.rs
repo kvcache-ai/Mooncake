@@ -27,9 +27,10 @@ fn mirror_queue_capacity() -> usize {
 }
 
 fn is_delete_marker_request(request: &RouteCasRequest) -> bool {
-    request.next.as_ref().is_none_or(|route| {
-        route.state == mooncake_store_core::RouteState::Tombstone
-    })
+    request
+        .next
+        .as_ref()
+        .is_none_or(|route| route.state == mooncake_store_core::RouteState::Tombstone)
 }
 
 fn mirror_retry_attempts() -> usize {
@@ -88,7 +89,10 @@ impl MirrorQueue {
     }
 
     fn push(&self, batch: RouteMirrorBatch) -> Option<RouteMirrorBatch> {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let evicted = if state.batches.len() == self.capacity {
             state.batches.pop_front()
         } else {
@@ -100,7 +104,10 @@ impl MirrorQueue {
     }
 
     fn pop_wait(&self) -> Option<RouteMirrorBatch> {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         while state.batches.is_empty() && !state.shutdown {
             let waited = self
                 .ready
@@ -123,7 +130,10 @@ impl MirrorQueue {
     }
 
     fn shutdown(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         state.shutdown = true;
         self.ready.notify_all();
     }
@@ -303,12 +313,7 @@ pub(crate) fn mirror_secondary_batch(
     };
     let base_delay = mirror_retry_base_delay();
     for attempt in 0..attempts {
-        let result = mirror_secondary_batch_once(
-            namespace,
-            authority_client,
-            secondary,
-            requests,
-        );
+        let result = mirror_secondary_batch_once(namespace, authority_client, secondary, requests);
         let succeeded = result
             .as_ref()
             .is_ok_and(|results| results.iter().all(|result| result.is_ok()));
