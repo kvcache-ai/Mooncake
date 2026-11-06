@@ -2348,9 +2348,7 @@ mod owner_page_contract_tests {
             self.get_allocation_route_references(lease, namespace, authority, identities)?
                 .into_iter()
                 .map(|state| match state {
-                    AllocationRouteReferenceState::Absent => {
-                        Ok(AllocationRouteReference::absent())
-                    }
+                    AllocationRouteReferenceState::Absent => Ok(AllocationRouteReference::absent()),
                     AllocationRouteReferenceState::Conflict => {
                         Ok(AllocationRouteReference::conflict())
                     }
@@ -2523,10 +2521,7 @@ mod owner_page_contract_tests {
             Arc::new(InMemoryMetadataBackend::new()),
             &observer,
             Arc::new(ConfirmationClient {
-                routes: BTreeMap::from([(
-                    "authority-a".to_string(),
-                    Some(referenced.clone()),
-                )]),
+                routes: BTreeMap::from([("authority-a".to_string(), Some(referenced.clone()))]),
                 allocation_references: BTreeMap::new(),
             }),
             Arc::new(TestMembership {
