@@ -124,8 +124,9 @@ On Intel XPU the native buffer is a SYCL implementation
 Python wrapper and the `ep_py.cpp` bindings are shared with CUDA, as is the
 host bookkeeping that pairs each combine with its dispatch
 (`mooncake_ep_dispatch_slots.h`); the kernels and transport are XPU-specific.
-Peers on the node are reached over IPC, and ranks on other nodes over RDMA
-when the build has the verbs path:
+Peers on the node are reached over IPC by default, and ranks on other nodes
+over RDMA when the build has the verbs path. Peers on the node can also be
+reached over RDMA instead (see `MC_EP_RANKS_PER_NODE` below):
 
 - Peers share one device buffer through Level Zero IPC handles, exchanged over
   the process group like the CUDA IPC handles. Ranks must be on one host and in
@@ -150,10 +151,10 @@ when the build has the verbs path:
 
 Ranks count as on another node when they are on another host or in another
 PID namespace. `MC_EP_RANKS_PER_NODE=n` instead places rank `r` on node
-`r // n`, so one host with an RDMA NIC per XPU can test the inter-node path:
-with `n=1` every peer is reached over RDMA, with `n=4` on 8 XPUs pairs within
-each group of four use IPC and pairs across them RDMA. The inter-node path
-has so far been run on one such host only.
+`r // n`, which decides for each pair of ranks on a host whether they use IPC
+or RDMA: with `n=1` every peer is reached over RDMA, with `n=4` on 8 XPUs
+pairs within each group of four use IPC and pairs across them RDMA. RDMA
+between peers on the node needs an RDMA NIC per XPU.
 
 ## JIT kernel compilation
 
