@@ -22287,6 +22287,10 @@ fn migration_applied_reply_loss_keeps_publicly_readable_generation() {
     assert_eq!(reader.get(key).unwrap(), payload, "an applied route must keep its generation after the CAS reply is lost");
 }
 
+mod allocation_lifecycle_tests;
 mod background_eviction_alignment_tests;
 mod clock_hit_alignment_tests;
 mod offload_waves_alignment_tests;
+mod pinned_reconcile_review_tests;
+mod publication_failure_tests;
+mod readable_filter_baseline_tests;
