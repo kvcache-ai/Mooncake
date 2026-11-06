@@ -872,38 +872,46 @@ mod tests {
 
     #[test]
     fn owner_route_pages_are_sorted_bounded_and_resume_after_cursor() {
-        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
-        let mut table = LocalRouteTable::default();
-        for key in ["route-c", "route-a", "route-b"] {
-            let key = ObjectKey::new(key.to_string());
-            table.replace(&key, Some(&test_route(&key, 1)));
+        for (keys, expected_second) in [
+            (vec!["route-c", "route-a", "route-b"], vec!["route-c"]),
+            (
+                vec!["route-c", "route-a", "route-b", "route-d"],
+                vec!["route-c", "route-d"],
+            ),
+        ] {
+            let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+            let mut table = LocalRouteTable::default();
+            for key in keys {
+                let key = ObjectKey::new(key.to_string());
+                table.replace(&key, Some(&test_route(&key, 1)));
+            }
+
+            let first = table
+                .list_by_replica_owner_page_at_epoch(&owner, None, 2, None)
+                .expect("first page should establish a snapshot epoch");
+            assert_eq!(
+                first
+                    .routes
+                    .iter()
+                    .map(|route| route.key.0.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["route-a", "route-b"]
+            );
+            assert_eq!(first.next_cursor.as_deref(), Some("route-b"));
+
+            let second = table
+                .list_by_replica_owner_page_at_epoch(&owner, first.next_cursor.as_deref(), 2, None)
+                .expect("second page should establish a snapshot epoch");
+            assert_eq!(
+                second
+                    .routes
+                    .iter()
+                    .map(|route| route.key.0.as_str())
+                    .collect::<Vec<_>>(),
+                expected_second
+            );
+            assert_eq!(second.next_cursor, None);
         }
-
-        let first = table
-            .list_by_replica_owner_page_at_epoch(&owner, None, 2, None)
-            .expect("first page should establish a snapshot epoch");
-        assert_eq!(
-            first
-                .routes
-                .iter()
-                .map(|route| route.key.0.as_str())
-                .collect::<Vec<_>>(),
-            vec!["route-a", "route-b"]
-        );
-        assert_eq!(first.next_cursor.as_deref(), Some("route-b"));
-
-        let second = table
-            .list_by_replica_owner_page_at_epoch(&owner, first.next_cursor.as_deref(), 2, None)
-            .expect("second page should establish a snapshot epoch");
-        assert_eq!(
-            second
-                .routes
-                .iter()
-                .map(|route| route.key.0.as_str())
-                .collect::<Vec<_>>(),
-            vec!["route-c"]
-        );
-        assert_eq!(second.next_cursor, None);
     }
 
     #[test]
