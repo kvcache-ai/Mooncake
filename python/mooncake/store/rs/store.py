@@ -60,6 +60,7 @@ _CACHE_COMPAT_POLICY = {
     "get_size": _CACHE_STATUS,
     "remove": _CACHE_STATUS,
     "batch_remove": _CACHE_STATUS_LIST,
+    "remove_all": _CACHE_STATUS,
 }
 
 
@@ -1094,35 +1095,13 @@ class MooncakeDistributedStore:
         return result
 
     def remove_all(self, force: bool = False):
-        try:
-            removed = self._invoke("remove_all", force=force)
-            if int(removed) >= 0:
-                self._tracked_keys.clear()
-            return removed
-        except Exception:
-            pass
-        removed = 0
-        for (tenant, domain, object_set), keys in self._group_tracked_keys().items():
-            original_domain = self._default_domain
-            original_object_set = self._default_object_set
-            self._default_domain = domain
-            self._default_object_set = object_set
-            try:
-                statuses = self._invoke_cache(
-                    "batch_remove",
-                    keys,
-                    fallback_count=len(keys),
-                    force=force,
-                    tenant=tenant,
-                )
-                for key, status in zip(keys, statuses):
-                    if int(status) == 0:
-                        self._forget_keys([key], tenant=tenant)
-                        removed += 1
-            finally:
-                self._default_domain = original_domain
-                self._default_object_set = original_object_set
-        return removed
+        """Run the native storage owner's evict-all operation.
+
+        Returns the evicted replica count on success and ``-1`` when the
+        optional cache operation fails. Cold data is retained. ``force`` does
+        not alter eviction policy.
+        """
+        return self._invoke_cache("remove_all", force=force)
 
     def start_metrics_server(self, bind_addr: str = "127.0.0.1:0") -> str:
         return self._invoke("start_metrics_server", bind_addr)
