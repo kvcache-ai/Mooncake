@@ -3163,6 +3163,13 @@ mod tests {
         store.enter_standby().expect("standby should succeed");
         store.activate().expect("activate should succeed");
 
+        let dispatcher = store
+            .real_dispatcher()
+            .expect("real dispatcher should remain available");
+        dispatcher
+            .run(|client| client.put("native-evict-all", b"native-payload"))
+            .expect("native write should succeed");
+
         store
             .remove("alpha", false, None)
             .expect("remove should succeed");
@@ -3172,11 +3179,17 @@ mod tests {
                 .expect("batch_remove should succeed"),
             vec![0, 0]
         );
+        let evicted = store
+            .remove_all(false)
+            .expect("real remove_all should use native evict-all");
         assert!(
-            store
-                .remove_all(false)
-                .expect("real remove_all should use native evict-all")
-                >= 0
+            evicted > 0,
+            "native evict-all should evict the direct write"
+        );
+        let native_read = dispatcher.run(|client| client.get("native-evict-all"));
+        assert!(
+            matches!(native_read, Err(StoreError::NotFound(_))),
+            "native evict-all should remove the direct write from DRAM: {native_read:?}"
         );
         assert!(!store.metrics_text().is_empty());
 
