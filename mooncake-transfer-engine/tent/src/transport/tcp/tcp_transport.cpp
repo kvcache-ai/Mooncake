@@ -216,7 +216,7 @@ Status TcpTransport::uninstallImpl(bool force) {
     Status result = Status::OK();
     if (installed_) {
         if (metadata_) {
-            auto& registry = metadata_->tcpBufferRegistry();
+            auto &registry = metadata_->tcpBufferRegistry();
             if (!force && !registry.empty()) {
                 return Status::InvalidArgument(
                     "Cannot uninstall TCP transport with registered "

@@ -750,15 +750,13 @@ TEST(TcpTransportIdentityTest, RealRpcLeasesDrainRemoveAndUninstall) {
     std::promise<void> read_entered;
     std::promise<void> read_resume;
     auto read_resumed = read_resume.get_future().share();
-    TcpBufferRegistryTestPeer::setAcquireHook(metadata->tcpBufferRegistry(),
-                                              [&](uint64_t acquired) {
-                                                  if (acquired != registration ||
-                                                      !block_first_read.exchange(
-                                                          false))
-                                                      return;
-                                                  read_entered.set_value();
-                                                  read_resumed.wait();
-                                              });
+    TcpBufferRegistryTestPeer::setAcquireHook(
+        metadata->tcpBufferRegistry(), [&](uint64_t acquired) {
+            if (acquired != registration || !block_first_read.exchange(false))
+                return;
+            read_entered.set_value();
+            read_resumed.wait();
+        });
     auto read = std::async(std::launch::async, [&] {
         return ControlClient::recvData(name, buffer.addr, received.data(),
                                        received.size());
