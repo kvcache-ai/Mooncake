@@ -261,7 +261,11 @@ class EngramStore:
                 if name not in self._cuda_tables:
                     self._cuda_tables[name] = _engram_cuda.LocalTable(self._open(name))
                 tables.append(self._cuda_tables[name])
-            self._cuda_lookups[key] = _engram_cuda.Lookup(tables, offsets)
+            lookup = _engram_cuda.Lookup(tables, offsets)
+            # A failed first run must not cache a lookup on the wrong device.
+            lookup.run(ids, out, stream)
+            self._cuda_lookups[key] = lookup
+            return
         self._cuda_lookups[key].run(ids, out, stream)
 
     def remove(self, table_id):
@@ -275,8 +279,8 @@ class EngramStore:
             with open(str(path) + ".lock", "a+b") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 if path.exists():
-                    (path / "rows").unlink()
-                    (path / "layout.json").unlink()
+                    (path / "rows").unlink(missing_ok=True)
+                    (path / "layout.json").unlink(missing_ok=True)
                     path.rmdir()
 
     def close(self):

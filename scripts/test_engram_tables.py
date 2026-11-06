@@ -1,6 +1,8 @@
 """Table API contracts; CUDA tests require a USE_CUDA build on NVIDIA hardware."""
 
+import errno
 import gc
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -113,6 +115,36 @@ def test_later_table_open_failure_preserves_output(tmp_path, failure):
         assert np.all(output == 201)
 
 
+@pytest.mark.parametrize("failure", ["rows", "layout.json", "directory"])
+def test_remove_can_retry_after_io_failure(tmp_path, monkeypatch, failure):
+    store, rows, specs = make_store(tmp_path)
+    store.close()
+    with EngramStore(tables=specs, namespace="test/v1", local_dir=tmp_path) as remover:
+        path = remover._path("a")
+        method = "rmdir" if failure == "directory" else "unlink"
+        target = path if failure == "directory" else path / failure
+        original = getattr(Path, method)
+
+        def fail_remove(self, *args, **kwargs):
+            if self == target:
+                raise OSError(errno.EIO, "injected removal failure")
+            return original(self, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, method, fail_remove)
+            with pytest.raises(OSError, match="injected removal failure") as error:
+                remover.remove("a")
+            assert error.value.errno == errno.EIO
+
+        remover.remove("a")
+        remover.remove("a")
+        assert not path.exists()
+        remover.populate("a", rows ^ 127)
+        output = np.empty((1, 1, 17), np.uint8)
+        remover.lookup(["a"], np.array([[3]], np.int64), output)
+        np.testing.assert_array_equal(output[0, 0], rows[3] ^ 127)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_lookup_snapshots_table_name_generator(tmp_path, device):
     if device == "cuda":
@@ -164,6 +196,33 @@ def test_namespace_layout_and_empty_table(tmp_path):
         empty.lookup(["a"], np.array([[-1]], np.int64), output)
         assert np.all(output == 123)
         empty.lookup(["a"], np.empty((0, 1), np.int64), output[:0])
+
+
+def test_cuda_lookup_can_retry_after_current_device_mismatch(tmp_path):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("mooncake._engram_cuda")
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    store, rows, _ = make_store(tmp_path)
+    try:
+        with torch.cuda.device(1):
+            ids = torch.tensor([[3]], dtype=torch.int64, device="cuda:1")
+            output = torch.full((1, 1, 17), 201, dtype=torch.uint8, device="cuda:1")
+        with torch.cuda.device(0):
+            with pytest.raises(ValueError, match="current CUDA device must match"):
+                store.lookup(
+                    ["a"], ids, output, stream=torch.cuda.current_stream().cuda_stream
+                )
+        with torch.cuda.device(1):
+            assert torch.all(output == 201).item()
+            for row in (3, 8):
+                ids.fill_(row)
+                store.lookup(
+                    ["a"], ids, output, stream=torch.cuda.current_stream().cuda_stream
+                )
+                np.testing.assert_array_equal(output.cpu().numpy()[0, 0], rows[row])
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("head_major", [False, True])
