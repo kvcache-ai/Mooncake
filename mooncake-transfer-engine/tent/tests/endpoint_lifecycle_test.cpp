@@ -301,6 +301,36 @@ TEST(EndpointLifecycleTest, NotifyQpAttrsDefaultsMatchDataQp) {
     EXPECT_EQ(rts.rnr_retry, 7);
 }
 
+TEST(EndpointLifecycleTest, NegotiatedPathMtu) {
+    struct {
+        ibv_mtu local;
+        uint32_t peer_bytes;
+        ibv_mtu fallback;
+        ibv_mtu expected;
+    } cases[] = {
+        {IBV_MTU_4096, 0, IBV_MTU_1024, IBV_MTU_1024},  // peer reports none
+        {IBV_MTU_4096, 1024, IBV_MTU_1024, IBV_MTU_1024},
+        {IBV_MTU_1024, 4096, IBV_MTU_1024, IBV_MTU_1024},
+        {IBV_MTU_4096, 4096, IBV_MTU_1024, IBV_MTU_4096},
+        {IBV_MTU_4096, 2048, IBV_MTU_512, IBV_MTU_2048},
+        {IBV_MTU_4096, 3000, IBV_MTU_1024, IBV_MTU_1024},
+        {IBV_MTU_4096, 8192, IBV_MTU_1024, IBV_MTU_1024},
+        {IBV_MTU_4096, IBV_MTU_4096, IBV_MTU_1024, IBV_MTU_1024},  // not bytes
+    };
+    for (const auto& c : cases) {
+        EXPECT_EQ(negotiatedPathMtu(c.local, c.peer_bytes, c.fallback),
+                  c.expected)
+            << c.local << " " << c.peer_bytes;
+    }
+    for (ibv_mtu mtu :
+         {IBV_MTU_256, IBV_MTU_512, IBV_MTU_1024, IBV_MTU_2048, IBV_MTU_4096})
+        EXPECT_EQ(negotiatedPathMtu(IBV_MTU_4096, pathMtuBytes(mtu),
+                                    static_cast<ibv_mtu>(0)),
+                  mtu);
+    EXPECT_EQ(pathMtuBytes(IBV_MTU_256), 256u);
+    EXPECT_EQ(pathMtuBytes(IBV_MTU_4096), 4096u);
+}
+
 TEST(EndpointLifecycleTest, NotifyLocalFaultKeepsEndpointServingData) {
     // A fault confined to the notify QP must not retire the endpoint: doing so
     // moves every data QP to ERR and flushes in-flight transfers.

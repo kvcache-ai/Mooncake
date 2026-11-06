@@ -61,6 +61,10 @@ struct EndPointParams {
     int signal_interval = 1;
     int max_inline_bytes = 64;
     ibv_mtu path_mtu = IBV_MTU_4096;
+    // path_mtu as configured; path_mtu itself is lowered to the smallest
+    // active MTU of all NICs and is what peers that predate the MTU
+    // exchange get.
+    ibv_mtu max_path_mtu = IBV_MTU_4096;
 
     // Named QP pools. Empty (default) = today's behavior: a single homogeneous
     // run of qp_mul_factor data QPs, all handshaked with the global SL/TC. When
@@ -187,6 +191,22 @@ inline NotifyQpRtrAttrs buildNotifyQpRtrAttrs(const EndPointParams& params) {
 inline NotifyQpRtsAttrs buildNotifyQpRtsAttrs(const EndPointParams& params) {
     return {params.send_timeout, params.send_retry_count,
             /*rnr_retry=*/7, /*max_rd_atomic=*/1};
+}
+
+// Path MTU in bytes, as BootstrapDesc carries it.
+inline uint32_t pathMtuBytes(ibv_mtu mtu) { return 128u << mtu; }
+
+// Both ends of an RC connection must use the same path MTU: the smaller of
+// this end's and the one the peer reported. A peer that reports none, or a
+// value that is not a path MTU, gets `fallback`, the engine-wide value used
+// before the MTU was exchanged.
+inline ibv_mtu negotiatedPathMtu(ibv_mtu local, uint32_t peer_bytes,
+                                 ibv_mtu fallback) {
+    for (ibv_mtu peer :
+         {IBV_MTU_256, IBV_MTU_512, IBV_MTU_1024, IBV_MTU_2048, IBV_MTU_4096})
+        if (pathMtuBytes(peer) == peer_bytes)
+            return peer < local ? peer : local;
+    return fallback;
 }
 
 struct WorkerParams {

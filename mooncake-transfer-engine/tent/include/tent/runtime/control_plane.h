@@ -52,11 +52,30 @@ struct BootstrapDesc {
     std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
+    // Path MTU of local_nic_path in bytes; 0 from peers that predate it.
+    uint32_t path_mtu = 0;
 
-   public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
-                                   qp_num, local_lid, local_gid, reply_msg,
-                                   notify_qp_num);
+    friend void to_json(nlohmann::json& j, const BootstrapDesc& desc) {
+        j = nlohmann::json{{"local_nic_path", desc.local_nic_path},
+                           {"peer_nic_path", desc.peer_nic_path},
+                           {"qp_num", desc.qp_num},
+                           {"local_lid", desc.local_lid},
+                           {"local_gid", desc.local_gid},
+                           {"reply_msg", desc.reply_msg},
+                           {"notify_qp_num", desc.notify_qp_num},
+                           {"path_mtu", desc.path_mtu}};
+    }
+
+    friend void from_json(const nlohmann::json& j, BootstrapDesc& desc) {
+        j.at("local_nic_path").get_to(desc.local_nic_path);
+        j.at("peer_nic_path").get_to(desc.peer_nic_path);
+        j.at("qp_num").get_to(desc.qp_num);
+        j.at("local_lid").get_to(desc.local_lid);
+        j.at("local_gid").get_to(desc.local_gid);
+        j.at("reply_msg").get_to(desc.reply_msg);
+        j.at("notify_qp_num").get_to(desc.notify_qp_num);
+        desc.path_mtu = j.value("path_mtu", uint32_t{0});
+    }
 };
 
 // UB/URMA has Jetty, JFC and EID concepts that are not wire-compatible with
