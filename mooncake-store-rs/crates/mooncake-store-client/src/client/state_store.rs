@@ -3233,7 +3233,7 @@ impl StorageOwnerState {
             let mut clock = StorageClockState::for_runtime(&self.runtime);
             let mut route_count = 0usize;
             self.route_ops
-                .visit_routes_by_replica_owner(&self.runtime, &mut |route| {
+                .visit_routes_by_replica_owner_consistent(&self.runtime, &mut |route| {
                     clock.track_route(&route, &self.runtime);
                     route_count = route_count.saturating_add(1);
                     Ok(())
