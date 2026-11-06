@@ -7,6 +7,7 @@
 #include <chrono>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
@@ -279,8 +280,12 @@ Status UbWorkers::submit(const UbTask::Ptr& task, uint64_t device_mask) {
     return submitBatch({task}, device_mask);
 }
 
+thread_local bool UbWorkers::fail_second_enqueue_for_test_ = false;
+
 Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
                               uint64_t device_mask) {
+    const bool fail_second_enqueue =
+        std::exchange(fail_second_enqueue_for_test_, false);
     if (!accepting_.load(std::memory_order_acquire)) {
         return Status::InvalidArgument(
             "UB workers are not accepting work" LOC_MARK);
@@ -317,37 +322,37 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
         }
     }
 
-    Status failure = Status::OK();
-    bool notify = false;
+    bool enqueue_failed = false;
     size_t marked_count = 0;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (!accepting_.load(std::memory_order_relaxed)) {
-            failure = Status::InvalidArgument(
+            return Status::InvalidArgument(
                 "UB workers stopped during submission" LOC_MARK);
         }
 
-        if (failure.ok()) {
-            for (const auto& item : pending) {
-                if (!item.slice->markQueued()) {
-                    failure = Status::InvalidArgument(
-                        "UB task changed while it was being "
-                        "submitted" LOC_MARK);
-                    break;
-                }
-                ++marked_count;
-            }
+        for (const auto& item : pending) {
+            if (!item.slice->markQueued()) break;
+            ++marked_count;
         }
 
-        if (failure.ok()) {
+        if (marked_count == pending.size()) {
             std::array<size_t, PRIO_LOW + 1> inserted_counts{};
             try {
-                for (const auto& item : pending) {
+                for (size_t index = 0; index < pending.size(); ++index) {
+                    if (fail_second_enqueue && index == 1) {
+                        throw std::length_error("Injected UB enqueue failure");
+                    }
+                    const auto& item = pending[index];
                     queues_[item.priority].push_back(item);
                     ++inserted_counts[item.priority];
                 }
-                notify = !pending.empty();
             } catch (const std::bad_alloc&) {
+                enqueue_failed = true;
+            } catch (const std::length_error&) {
+                enqueue_failed = true;
+            }
+            if (enqueue_failed) {
                 for (size_t priority = 0; priority < queues_.size();
                      ++priority) {
                     while (inserted_counts[priority] != 0) {
@@ -355,22 +360,25 @@ Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
                         --inserted_counts[priority];
                     }
                 }
-                failure = Status::InternalError(
-                    "Unable to enqueue UB task batch" LOC_MARK);
             }
         }
     }
 
-    if (!failure.ok()) {
-        // A markQueued() race or allocation failure may occur after earlier
+    if (enqueue_failed || marked_count != pending.size()) {
+        // A markQueued() failure or enqueue exception may occur after earlier
         // slices changed state. None of them are visible to posting workers;
         // cancel the private tasks so no slice remains orphaned in kQueued.
         for (size_t index = 0; index < marked_count; ++index) {
             (void)pending[index].task->requestCancellation();
         }
-        return failure;
+        if (enqueue_failed) {
+            return Status::InternalError(
+                "Unable to enqueue UB task batch" LOC_MARK);
+        }
+        return Status::InvalidArgument(
+            "UB task changed while it was being submitted" LOC_MARK);
     }
-    if (notify) queue_cv_.notify_all();
+    if (!pending.empty()) queue_cv_.notify_all();
     return Status::OK();
 }
 

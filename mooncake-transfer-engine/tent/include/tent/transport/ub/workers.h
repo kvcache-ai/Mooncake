@@ -159,6 +159,11 @@ class UbWorkers final {
     [[nodiscard]] size_t inflightCount() const;
 
    private:
+    friend class UbWorkersTestPeer;
+    // Scoped to the submitting thread so transport tests can exercise the
+    // real workers without changing their lifecycle or racing posting lanes.
+    static thread_local bool fail_second_enqueue_for_test_;
+
     struct PendingSlice {
         // Keep the task alive until every queued/in-flight slice reaches a
         // terminal state. Callers may release the sub-batch handle before the
