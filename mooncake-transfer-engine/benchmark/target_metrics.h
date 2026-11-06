@@ -61,7 +61,7 @@ struct TargetMetricsReport {
 TargetMetricsReport calculateTargetMetrics(
     size_t block_size, size_t batch_size, int num_threads,
     const std::string& backend, const std::string& op_type,
-    std::vector<TargetBenchStats>* stats);
+    const std::vector<TargetBenchStats>* stats);
 
 void printTargetMetrics(const TargetMetricsReport& report);
 

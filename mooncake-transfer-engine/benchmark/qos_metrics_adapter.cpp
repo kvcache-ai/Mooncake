@@ -19,10 +19,10 @@ namespace tent {
 
 std::vector<QosClassSample> makeQosClassSamples(
     const std::vector<QosClassConfig>& classes,
-    std::vector<XferBenchStats>* stats) {
+    const std::vector<XferBenchStats>* stats) {
     std::vector<QosClassSample> samples(classes.size());
     for (size_t i = 0; i < classes.size(); ++i) {
-        auto& class_stats = (*stats)[i];
+        const auto& class_stats = (*stats)[i];
         auto& sample = samples[i];
         sample.operations = class_stats.transfer_duration.count();
         sample.total_duration_us = class_stats.total_duration.avg();
@@ -39,7 +39,7 @@ std::vector<QosClassSample> makeQosClassSamples(
 QosMetricsReport calculateQosMetricsFromBenchStats(
     size_t block_size, size_t batch_size, int num_threads,
     const std::vector<QosClassConfig>& classes,
-    std::vector<XferBenchStats>* stats, double link_capacity_gbps,
+    const std::vector<XferBenchStats>* stats, double link_capacity_gbps,
     const std::vector<uint64_t>& bytes_per_operation) {
     auto samples = makeQosClassSamples(classes, stats);
     if (bytes_per_operation.size() == samples.size()) {
