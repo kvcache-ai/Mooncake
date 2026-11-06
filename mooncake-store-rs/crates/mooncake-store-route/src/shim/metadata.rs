@@ -62,7 +62,7 @@ impl RouteDirectory for MetadataRouteDirectory {
             .metadata
             .compare_and_swap_object_route(key, expected, next);
         if let Ok(cas) = &result {
-            record_cas_outcome(cas, next, key);
+            record_cas_outcome(cas);
         }
         result
     }

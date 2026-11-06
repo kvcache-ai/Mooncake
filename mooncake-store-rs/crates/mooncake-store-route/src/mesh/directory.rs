@@ -1803,7 +1803,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 }
             }
             if let Ok(cas) = &result {
-                record_cas_outcome(cas, request.next.as_ref(), &request.key);
+                record_cas_outcome(cas);
             }
             results.push(result);
         }
