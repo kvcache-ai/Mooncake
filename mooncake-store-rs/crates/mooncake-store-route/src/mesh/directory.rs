@@ -198,19 +198,16 @@ impl EmbeddedWrhRouteDirectory {
         let retained_candidates =
             retained_authority_candidates(self.membership.as_ref(), observer)?;
         let mut authorities = BTreeMap::<String, ClientLease>::new();
-        for authority in ranked_top_authorities(
-            &self.namespace,
-            current_candidates,
-            key,
-            self.route_topk,
-        )
-        .into_iter()
-        .chain(ranked_top_authorities(
-            &self.namespace,
-            &retained_candidates,
-            key,
-            self.route_topk,
-        )) {
+        for authority in
+            ranked_top_authorities(&self.namespace, current_candidates, key, self.route_topk)
+                .into_iter()
+                .chain(ranked_top_authorities(
+                    &self.namespace,
+                    &retained_candidates,
+                    key,
+                    self.route_topk,
+                ))
+        {
             let stable_id = authority.runtime.stable_id.0.clone();
             match authorities.get(&stable_id) {
                 Some(current) if current.runtime.epoch >= authority.runtime.epoch => {}
@@ -2283,8 +2280,8 @@ mod owner_page_contract_tests {
 
         assert!(matches!(
             directory
-            .confirm_replica_reference(&observer, &referenced.key, &referenced.replicas[0])
-            .expect("an exact reference on any proof authority must retain the allocation"),
+                .confirm_replica_reference(&observer, &referenced.key, &referenced.replicas[0])
+                .expect("an exact reference on any proof authority must retain the allocation"),
             RouteReplicaReference::Referenced(_)
         ));
     }
@@ -2460,11 +2457,7 @@ mod owner_page_contract_tests {
 
         assert!(matches!(
             directory
-                .confirm_replica_reference(
-                    &observer,
-                    &referenced.key,
-                    &referenced.replicas[0],
-                )
+                .confirm_replica_reference(&observer, &referenced.key, &referenced.replicas[0],)
                 .expect("a retained exact reference must keep the allocation"),
             RouteReplicaReference::Referenced(_)
         ));
