@@ -10,9 +10,16 @@ use mooncake_store_core::{
 
 pub const DEFAULT_ROUTE_OWNER_PAGE_SIZE: usize = 256;
 
+/// Authority-local state for one object key.
+///
+/// A record may temporarily contain both a live route and a delete version while
+/// authorities converge. Callers must prefer the delete version when it is
+/// greater than or equal to the live route version.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouteAuthorityRecord {
+    /// The live route currently retained by this authority, if any.
     pub route: Option<ObjectRoute>,
+    /// The highest retained delete version for the key, if any.
     pub delete_version: Option<RouteVersion>,
 }
 

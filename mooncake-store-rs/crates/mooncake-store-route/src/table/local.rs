@@ -326,7 +326,7 @@ impl LocalRouteTable {
             (Some(version), None, Some(marker)) => marker == version,
             _ => false,
         };
-        let marker_blocked = self.delete_marker_blocks_insert(key, expected, next);
+        let marker_blocked = self.delete_marker_blocks_insert(key, next);
         if !matches || marker_blocked {
             if marker_blocked {
                 record_delete_marker_event("blocked_stale_route", 1);
@@ -363,12 +363,7 @@ impl LocalRouteTable {
 
     pub(crate) fn replace(&mut self, key: &ObjectKey, next: Option<&ObjectRoute>) {
         if self.replace_is_stale(key, None, next) {
-            if next.is_some_and(|route| {
-                route.state != mooncake_store_core::RouteState::Tombstone
-                    && self
-                        .delete_marker(key)
-                        .is_some_and(|marker| route.version <= marker)
-            }) {
+            if self.delete_marker_blocks_insert(key, next) {
                 record_delete_marker_event("blocked_stale_route", 1);
             }
             return;
@@ -379,6 +374,9 @@ impl LocalRouteTable {
     pub(crate) fn replace_many(&mut self, requests: &[RouteCasRequest]) {
         for request in requests {
             if self.replace_is_stale(&request.key, request.expected, request.next.as_ref()) {
+                if self.delete_marker_blocks_insert(&request.key, request.next.as_ref()) {
+                    record_delete_marker_event("blocked_stale_route", 1);
+                }
                 continue;
             }
             self.apply_update(&request.key, request.next.as_ref(), request.expected);
@@ -422,7 +420,6 @@ impl LocalRouteTable {
     fn delete_marker_blocks_insert(
         &self,
         key: &ObjectKey,
-        _expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> bool {
         let Some(route) = next else {
@@ -640,6 +637,7 @@ mod tests {
     struct RecordingRouteMetricsSink {
         cas_outcomes: Mutex<Vec<&'static str>>,
         routes: Mutex<HashMap<String, ObjectRoute>>,
+        delete_marker_events: Mutex<Vec<(&'static str, u64)>>,
     }
 
     impl RouteMetricsSink for RecordingRouteMetricsSink {
@@ -661,7 +659,9 @@ mod tests {
         }
         fn record_delete_marker_state(&self, _entries: u64, _bytes: u64, _budget_bytes: u64) {}
 
-        fn record_delete_marker_event(&self, _event: &'static str, _count: u64) {}
+        fn record_delete_marker_event(&self, event: &'static str, count: u64) {
+            self.delete_marker_events.lock().unwrap().push((event, count));
+        }
     }
 
     fn test_route(key: &ObjectKey, version: u64) -> ObjectRoute {
@@ -745,6 +745,31 @@ mod tests {
             "delayed mirror replace must not resurrect an evicted route"
         );
         assert_eq!(table.delete_marker(&key), Some(RouteVersion(3)));
+    }
+
+    #[test]
+    fn replace_many_records_routes_blocked_by_delete_markers() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let sink = Arc::new(RecordingRouteMetricsSink::default());
+        set_route_metrics_sink(sink.clone());
+        let key = ObjectKey::new("batch-marker-metric".to_string());
+        let route = test_route(&key, 3);
+        let mut table = LocalRouteTable::default();
+
+        table.replace(&key, Some(&route));
+        table.replace(&key, None);
+        sink.delete_marker_events.lock().unwrap().clear();
+        table.replace_many(&[RouteCasRequest {
+            key,
+            expected: None,
+            next: Some(route),
+        }]);
+
+        assert!(sink
+            .delete_marker_events
+            .lock()
+            .unwrap()
+            .contains(&("blocked_stale_route", 1)));
     }
 
     #[test]

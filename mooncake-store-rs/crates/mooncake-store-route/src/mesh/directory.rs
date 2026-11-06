@@ -104,6 +104,8 @@ fn merge_allocation_route_reference(
     }
 }
 
+/// Resolves one authority record with the cluster-wide version rule: a live
+/// route wins only when its version is strictly newer than the delete marker.
 fn route_from_authority_record(
     key: &ObjectKey,
     record: RouteAuthorityRecord,
@@ -122,6 +124,8 @@ fn route_from_authority_record(
         .map(|version| delete_marker_route(key, version))
 }
 
+/// Builds the minimal Tombstone route used to carry a Delete Marker through
+/// the existing route-control wire contract.
 fn delete_marker_route(key: &ObjectKey, version: RouteVersion) -> ObjectRoute {
     ObjectRoute {
         key: key.clone(),
@@ -302,6 +306,8 @@ impl EmbeddedWrhRouteDirectory {
         key: &ObjectKey,
         current_candidates: &[ClientLease],
     ) -> Vec<ClientLease> {
+        // Deletes fan out to the deduplicated current/retained Top-2K union.
+        // When both snapshots contain one stable ID, the newer epoch wins.
         let limit = self.route_topk.saturating_mul(2);
         let retained =
             retained_authority_candidates(self.membership.as_ref(), observer).unwrap_or_default();
@@ -2014,14 +2020,17 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
     fn get_delete_marker(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
         let candidates = self.authority_candidates(observer).ok()?;
         let ranked = ranked_authorities(&self.namespace, &candidates, key);
-        for authority in ranked.iter().take(self.route_topk) {
-            if let Some(floor) =
-                authority_get_delete_marker(&self.namespace, &authority.runtime.stable_id, key)
-            {
-                return Some(floor);
-            }
-        }
-        None
+        ranked
+            .iter()
+            .take(self.route_topk)
+            .filter_map(|authority| {
+                authority_get_delete_marker(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    key,
+                )
+            })
+            .max()
     }
 
     fn get_delete_markers(
@@ -2039,13 +2048,10 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             .iter()
             .map(|key| ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk))
             .collect::<Vec<_>>();
-        let mut floors = vec![None; keys.len()];
+        let mut delete_versions = vec![None; keys.len()];
         for rank in 0..self.route_topk {
             let mut by_authority = BTreeMap::<ClientStableId, Vec<(usize, ObjectKey)>>::new();
             for (index, authorities) in ranked_authorities.iter().enumerate() {
-                if floors[index].is_some() {
-                    continue;
-                }
                 let Some(authority) = authorities.get(rank) else {
                     continue;
                 };
@@ -2062,18 +2068,19 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     .iter()
                     .map(|(_, key)| key.clone())
                     .collect::<Vec<_>>();
-                for ((index, _), floor) in entries.into_iter().zip(authority_get_delete_markers(
-                    &self.namespace,
-                    &authority,
-                    &lookup_keys,
-                )) {
-                    if floor.is_some() {
-                        floors[index] = floor;
+                for ((index, _), delete_version) in entries.into_iter().zip(
+                    authority_get_delete_markers(&self.namespace, &authority, &lookup_keys),
+                ) {
+                    if let Some(delete_version) = delete_version {
+                        delete_versions[index] = Some(
+                            delete_versions[index]
+                                .map_or(delete_version, |current| current.max(delete_version)),
+                        );
                     }
                 }
             }
         }
-        floors
+        delete_versions
     }
 
     fn flush_pending_route_mirrors(&self) {
@@ -2896,6 +2903,57 @@ mod owner_page_contract_tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn delete_marker_queries_merge_highest_authority_version() {
+        let observer = test_lease("observer-delete-marker-merge");
+        let peer = test_lease("peer-delete-marker-merge");
+        let candidates = vec![observer.clone(), peer.clone()];
+        let key = ObjectKey::new("delete-marker-merge-key".to_string());
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: candidates.clone(),
+            }),
+        );
+        register_local_authority(
+            &directory.namespace,
+            &peer.runtime.stable_id,
+            DEFAULT_DELETE_MARKER_BUDGET_BYTES,
+        );
+
+        let ranked = ranked_top_authorities(&directory.namespace, &candidates, &key, 2);
+        for (authority, version) in ranked.iter().zip([RouteVersion(4), RouteVersion(9)]) {
+            crate::mesh::registry::authority_replace_many(
+                &directory.namespace,
+                &authority.runtime.stable_id,
+                &[RouteCasRequest {
+                    key: key.clone(),
+                    expected: Some(version),
+                    next: None,
+                }],
+            )
+            .expect("delete marker should install on local authority");
+        }
+
+        assert_eq!(
+            directory.get_delete_marker(&observer, &key),
+            Some(RouteVersion(9))
+        );
+        assert_eq!(
+            directory.get_delete_markers(&observer, std::slice::from_ref(&key)),
+            vec![Some(RouteVersion(9))]
+        );
+
+        unregister_local_authority(&directory.namespace, &peer.runtime.stable_id);
     }
 
     #[test]
