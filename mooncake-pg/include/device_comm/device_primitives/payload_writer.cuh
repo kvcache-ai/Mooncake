@@ -6,7 +6,7 @@
 #include <cooperative_groups.h>
 
 #include "common_types.h"
-#include "device_comm/device_utils/device_assert.cuh"
+#include "pg_assert.h"
 #include "device_comm/device_transfer/transfer_lane.cuh"
 
 namespace mooncake {
@@ -78,7 +78,7 @@ class PayloadWriteView {
     [[nodiscard]] __device__ __forceinline__ TransferTicket
     publish(const PayloadPublishRequest& request,
             cooperative_groups::thread_block block) const {
-        PG_DEVICE_ASSERT(request.size <= capacity_);
+        PG_ASSERT(request.size <= capacity_);
 
         switch (path_) {
             case PayloadWritePath::Direct: {
@@ -89,7 +89,7 @@ class PayloadWriteView {
                 // FIXME: Revisit the ordering contract and this assertion when
                 // another route gains direct mappings, since Direct will no
                 // longer necessarily imply P2P.
-                PG_DEVICE_ASSERT(route_type_ == DeviceRouteType::P2p);
+                PG_ASSERT(route_type_ == DeviceRouteType::P2p);
                 SignalRequest signal;
                 signal.signal = request.signal;
                 signal.timeout_ticks = request.timeout_ticks;
@@ -106,7 +106,7 @@ class PayloadWriteView {
                 return lane_.put(peer_, put, block);
             }
         }
-        PG_DEVICE_UNREACHABLE();
+        PG_UNREACHABLE();
         return lane_.signal(peer_, SignalRequest{}, block);
     }
 
@@ -161,15 +161,15 @@ class PayloadWriter {
           peer_(peer),
           staging_(staging),
           remote_region_(remote_region) {
-        PG_DEVICE_ASSERT(peer_ != kInvalidGlobalRank);
+        PG_ASSERT(peer_ != kInvalidGlobalRank);
         route_type_ = transfer_handle.routeType(peer_);
         payload_base_ =
             transfer_handle.remotePtr(peer_, remote_region_.region_offset);
         if (payload_base_) {
             path_ = PayloadWritePath::Direct;
         } else {
-            PG_DEVICE_ASSERT(staging_.ptr != nullptr);
-            PG_DEVICE_ASSERT(staging_.size != 0);
+            PG_ASSERT(staging_.ptr != nullptr);
+            PG_ASSERT(staging_.size != 0);
             path_ = PayloadWritePath::Staging;
             payload_base_ = staging_.ptr;
         }
@@ -190,18 +190,17 @@ class PayloadWriter {
     [[nodiscard]] __device__ __forceinline__ PayloadWriteView
     view(uint64_t staging_offset, uint64_t remote_offset,
          uint64_t capacity) const {
-        PG_DEVICE_ASSERT(remote_offset <= remote_region_.size);
-        PG_DEVICE_ASSERT(capacity <= remote_region_.size - remote_offset);
-        PG_DEVICE_ASSERT(remote_region_.region_offset <=
-                         UINT64_MAX - remote_offset);
+        PG_ASSERT(remote_offset <= remote_region_.size);
+        PG_ASSERT(capacity <= remote_region_.size - remote_offset);
+        PG_ASSERT(remote_region_.region_offset <= UINT64_MAX - remote_offset);
 
         const auto selected_path = path();
         void* destination = nullptr;
         if (selected_path == PayloadWritePath::Direct) {
             destination = static_cast<char*>(payload_base_) + remote_offset;
         } else {
-            PG_DEVICE_ASSERT(staging_offset <= staging_.size);
-            PG_DEVICE_ASSERT(capacity <= staging_.size - staging_offset);
+            PG_ASSERT(staging_offset <= staging_.size);
+            PG_ASSERT(capacity <= staging_.size - staging_offset);
             destination = static_cast<char*>(payload_base_) + staging_offset;
         }
 

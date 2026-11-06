@@ -2,8 +2,6 @@
 #define MOONCAKE_PG_ERROR_TYPES_H
 
 #include <cstdint>
-#include <sstream>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -11,12 +9,9 @@
 
 #include <ylt/util/expected.hpp>
 
-namespace mooncake {
+#include "pg_assert.h"
 
-class PGAssertionException : public std::runtime_error {
-   public:
-    using std::runtime_error::runtime_error;
-};
+namespace mooncake {
 
 // Keep the order and values synchronized with mooncakePgResult_t.
 enum class PGErrorCode : uint8_t {
@@ -41,25 +36,8 @@ using PGResult = ylt::expected<T, PGError>;
 
 namespace detail {
 
-template <typename... Args>
-[[noreturn]] inline void throwPGAssertFailure(Args&&... args) {
-    std::ostringstream message;
-    (message << ... << std::forward<Args>(args));
-    throw PGAssertionException(message.str());
-}
-
-template <typename T>
-struct IsPGResult : std::false_type {};
-
 template <typename T>
 struct IsPGResult<ylt::expected<T, PGError>> : std::true_type {};
-
-template <typename T>
-using RemoveCVRef =
-    typename std::remove_cv<typename std::remove_reference<T>::type>::type;
-
-template <typename T>
-inline constexpr bool is_pg_result_v = IsPGResult<RemoveCVRef<T>>::value;
 
 inline PGError addPGErrorContext(PGError error, std::string_view expression,
                                  std::string_view function,
@@ -98,16 +76,7 @@ inline auto makePGError(PGErrorCode code, std::string message) {
 
 }  // namespace mooncake
 
-#define PG_ASSERT(condition, ...)                                       \
-    do {                                                                \
-        static_assert(                                                  \
-            !::mooncake::detail::is_pg_result_v<decltype((condition))>, \
-            "PG_ASSERT does not accept PGResult");                      \
-        if (!(condition)) {                                             \
-            ::mooncake::detail::throwPGAssertFailure(__VA_ARGS__);      \
-        }                                                               \
-    } while (false)
-
+// Evaluate operations in every build; only their result checks are debug-only.
 #define PG_ASSERT_OK(expression)                                               \
     do {                                                                       \
         auto&& pg_result_internal = (expression);                              \
@@ -116,10 +85,8 @@ inline auto makePGError(PGErrorCode code, std::string message) {
                 ::mooncake::detail::RemoveCVRef<decltype(pg_result_internal)>, \
                 ::mooncake::PGResult<void>>,                                   \
             "PG_ASSERT_OK requires PGResult<void>");                           \
-        if (!pg_result_internal.has_value()) {                                 \
-            ::mooncake::detail::throwPGAssertFailure(                          \
-                #expression, " failed: ", pg_result_internal.error().message); \
-        }                                                                      \
+        PG_ASSERT(pg_result_internal.has_value(), #expression,                 \
+                  " failed: ", pg_result_internal.error().message);            \
     } while (false)
 
 #define PG_ASSERT_CUDA(expression)                                          \
