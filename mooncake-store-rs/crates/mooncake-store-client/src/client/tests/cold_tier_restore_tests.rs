@@ -2801,3 +2801,90 @@ fn cold_delete_reclaims_used_bytes_via_owner_pending_queue() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[test]
+fn cold_restore_unknown_cas_preserves_modern_remote_owner_allocation() {
+    let _metrics_guard = metrics_test_lock().lock();
+    let _cold_guard = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root = cold_tier_test_root("restore-unknown-modern-owner");
+    let owner_transport = Arc::new(TestTransport::new("restore-unknown-owner-segment"));
+    let reader_transport = Arc::new(owner_transport.peer("restore-unknown-reader-segment"));
+    let target = ColdTierTargetConfig::directory(
+        "restore-unknown-device", ColdTierKind::Ssd, root.clone(),
+    );
+    let mut reader = StoreClientBuilder::new(metadata.clone(), "restore-unknown-reader")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "false")
+        .transport(reader_transport)
+        .local_memory(storage_config_with_bytes(0))
+        .routed_writes(PlacementPlanner::new(metadata.clone()).require_label("storage", "true"), 1)
+        .cold_tier_target(target.clone())
+        .cold_tier_offload_mode(ColdTierOffloadMode::EvictTriggered)
+        .build(test_future_expiry_ms())
+        .expect("reader should build");
+    reader.register_local_memory().expect("reader memory should register");
+    let owner = StoreClientBuilder::new(metadata.clone(), "restore-unknown-owner")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(owner_transport)
+        .local_memory(storage_config_with_bytes(64))
+        .cold_tier_target(target)
+        .cold_tier_offload_mode(ColdTierOffloadMode::Passthrough)
+        .build(test_future_expiry_ms())
+        .expect("owner should build");
+    owner.register_local_memory().expect("owner memory should register");
+    wait_for_membership_convergence(&[&owner, &reader]);
+    assert!(owner.lease().compatibility.supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY));
+    assert!(reader.lease().compatibility.supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY));
+    assert_ne!(owner.runtime_id(), reader.runtime_id());
+
+    let payload = b"0123456789abcdef";
+    owner.put("restore-unknown-key", payload).expect("public seed put should succeed");
+    wait_for_materialized_cold_backing(&owner, "restore-unknown-key");
+    let evicted = owner.debug_evict_all().expect("public eviction should preserve the materialized backing");
+    assert_eq!(evicted.dropped_without_cold, 0);
+    let route = owner.query_route("restore-unknown-key").expect("cold route query")
+        .expect("public seed route should exist");
+    assert!(route.replicas.is_empty(), "public eviction must produce a cold-only route");
+    assert_eq!(route.cold_backing.as_ref().expect("cold backing must exist").state,
+        mooncake_store_core::ColdBackingState::Materialized);
+    let lost_reply = Arc::new(ApplyThenFailRouteDirectory {
+        inner: reader.route_directory.clone(),
+        fail_once: AtomicBool::new(true),
+        confirmation_fails: AtomicBool::new(false),
+    });
+    reader.route_directory = lost_reply.clone();
+    let reserve_calls = || snapshot_metrics().operations.iter()
+        .filter(|metric| metric.operation.starts_with("control_allocator_batch_reserve"))
+        .map(|metric| metric.calls_total).sum::<u64>();
+    let reserves_before_get = reserve_calls();
+    assert_eq!(reader.get("restore-unknown-key").expect("public cold get should succeed"), payload);
+    reader.wait_for_restore_promotions();
+    let remote_reserves = reserve_calls().saturating_sub(reserves_before_get);
+    eprintln!("PUBLIC_REPRO remote_owner_reservation_rpc_calls={remote_reserves}");
+    assert!(remote_reserves > 0, "public cold get must reserve through the production allocator RPC");
+    assert!(!lost_reply.fail_once.load(Ordering::SeqCst), "promotion must apply CAS before reply loss");
+    let promoted = reader.query_route("restore-unknown-key").expect("promoted route query")
+        .expect("applied promotion route must exist");
+    let hot = promoted.replicas.first().expect("promotion must publish a hot allocation");
+    assert_eq!(&hot.owner, owner.runtime_id(), "promotion must reserve through the distinct owner RPC");
+    assert!(hot.allocation_id.is_some_and(|id| id != 0));
+
+    let replacement = b"abcdefghijklmnop";
+    reader.put("restore-unknown-next", replacement).expect("public routed put should succeed");
+    let next = reader.query_route("restore-unknown-next").expect("new route query")
+        .expect("new public put route must exist");
+    let fresh = next.replicas.first().expect("new route must have a replica");
+    let reread = reader.get("restore-unknown-key");
+    eprintln!("PUBLIC_REPRO applied_generation={:?} applied_offset={} fresh_generation={:?} fresh_offset={} reread={:?}",
+        hot.allocation_id, hot.segment_offset, fresh.allocation_id, fresh.segment_offset, reread);
+    assert_ne!((&fresh.owner, &fresh.segment_name, fresh.segment_offset),
+        (&hot.owner, &hot.segment_name, hot.segment_offset),
+        "unknown promotion CAS must retain the modern owner allocation instead of reusing its hot range");
+    assert_eq!(reread.expect("public get must keep reading the promoted allocation"), payload);
+    assert_eq!(reader.get("restore-unknown-next").expect("new public object should read"), replacement);
+    drop(reader);
+    drop(owner);
+    let _ = std::fs::remove_dir_all(root);
+}
