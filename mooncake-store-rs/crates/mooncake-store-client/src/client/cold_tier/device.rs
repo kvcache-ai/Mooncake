@@ -65,6 +65,7 @@ impl StorageOwnerState {
     ) -> Self {
         let offload_mode = cold_tier.offload_mode;
         let offload_priority = cold_tier.offload_priority;
+        let nof_backing_tracking_enabled = !cold_tier.nof_targets.is_empty();
         let staging_pool_bytes = std::env::var("MC_STORE_RS_STAGING_POOL_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -82,6 +83,7 @@ impl StorageOwnerState {
             state,
             cold_tier_devices: ColdTierDeviceManager::new(cold_tier),
             hot_replicas,
+            nof_backing_tracking_enabled,
             nof_backings: super::super::HotReplicaTracker::default(),
             pending_offloads: super::super::ColdTierOffloadManager::new(offload_priority),
             cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),

@@ -1152,7 +1152,18 @@ mod state_store_tests {
         });
 
         let mut clock = StorageClockState::default();
+        let unrelated = ObjectKey("unrelated".to_string());
+        clock.mark_tracked_hot_keys(std::slice::from_ref(&unrelated));
+        assert!(clock.pending_hot_keys.is_empty());
+
         clock.sync_nof_route(&route, &runtime, false);
+        clock.mark_tracked_hot_keys(&[route.key.clone(), unrelated.clone()]);
+        assert!(!clock.pending_hot_keys.contains(&unrelated));
+        assert!(clock
+            .entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .any(|entry| entry.id.route_key == route.key && entry.hot));
 
         let victim = clock
             .pick_victim(
@@ -1243,7 +1254,10 @@ mod state_store_tests {
 impl StorageOwnerState {
     fn report_route_hits(&self, keys: &[ObjectKey]) -> RouteTrafficReport {
         let report = self.hot_replicas.clock.lock().mark_hot_keys(keys);
-        self.nof_backings.clock.lock().mark_hot_keys(keys);
+        if !self.nof_backing_tracking_enabled {
+            return report;
+        }
+        self.nof_backings.clock.lock().mark_tracked_hot_keys(keys);
         report
     }
 
@@ -1254,11 +1268,17 @@ impl StorageOwnerState {
             .sum();
         let mut allocator = self.allocator.lock();
         let mut clock = self.hot_replicas.clock.lock();
-        let mut nof_clock = self.nof_backings.clock.lock();
         for route in routes {
             allocator.clear_pending_route(route, &self.runtime);
             clock.sync_fresh_route(route, &self.runtime);
-            nof_clock.sync_nof_route(route, &self.runtime, true);
+        }
+        if self.nof_backing_tracking_enabled
+            && routes.iter().any(route_has_materialized_nof_backing)
+        {
+            let mut nof_clock = self.nof_backings.clock.lock();
+            for route in routes {
+                nof_clock.sync_nof_route(route, &self.runtime, true);
+            }
         }
         RouteTrafficReport::new(routes.len(), bytes)
     }
@@ -1266,10 +1286,14 @@ impl StorageOwnerState {
     fn track_route(&self, route: &ObjectRoute) {
         let mut allocator = self.allocator.lock();
         let mut clock = self.hot_replicas.clock.lock();
-        let mut nof_clock = self.nof_backings.clock.lock();
         allocator.clear_pending_route(route, &self.runtime);
         clock.track_fresh_route(route, &self.runtime);
-        nof_clock.sync_nof_route(route, &self.runtime, true);
+        if self.nof_backing_tracking_enabled && route_has_materialized_nof_backing(route) {
+            self.nof_backings
+                .clock
+                .lock()
+                .sync_nof_route(route, &self.runtime, true);
+        }
     }
 
     fn untrack_route(&self, route: &ObjectRoute) {
@@ -1277,16 +1301,22 @@ impl StorageOwnerState {
             .clock
             .lock()
             .untrack_route(route, &self.runtime);
-        self.nof_backings.clock.lock().remove_key(&route.key);
+        if self.nof_backing_tracking_enabled && route.nof_backing.is_some() {
+            self.nof_backings.clock.lock().remove_key(&route.key);
+        }
     }
 
     fn sync_route(&self, route: &ObjectRoute) {
         let mut allocator = self.allocator.lock();
         let mut clock = self.hot_replicas.clock.lock();
-        let mut nof_clock = self.nof_backings.clock.lock();
         allocator.clear_pending_route(route, &self.runtime);
         clock.sync_route(route, &self.runtime);
-        nof_clock.sync_nof_route(route, &self.runtime, false);
+        if self.nof_backing_tracking_enabled && route_has_materialized_nof_backing(route) {
+            self.nof_backings
+                .clock
+                .lock()
+                .sync_nof_route(route, &self.runtime, false);
+        }
     }
 
     fn enqueue_delete_pending(&self, entries: &[DeletePendingEntry]) -> Result<usize> {
@@ -3277,6 +3307,13 @@ pub(in crate::client) fn nof_backing_clock_segment(target_id: &str) -> SegmentNa
     SegmentName::new(format!("__nof_backing__/{target_id}"))
 }
 
+fn route_has_materialized_nof_backing(route: &ObjectRoute) -> bool {
+    route
+        .nof_backing
+        .as_ref()
+        .is_some_and(|backing| backing.state == mooncake_store_core::ColdBackingState::Materialized)
+}
+
 impl StorageClockState {
     const READ_HOT_CLOCK_CREDIT: u8 = 2;
 
@@ -3459,6 +3496,21 @@ impl StorageClockState {
     }
 
     fn mark_hot_keys(&mut self, keys: &[ObjectKey]) -> RouteTrafficReport {
+        self.mark_hot_keys_inner(keys, true)
+    }
+
+    fn mark_tracked_hot_keys(&mut self, keys: &[ObjectKey]) -> RouteTrafficReport {
+        if self.by_key.is_empty() {
+            return RouteTrafficReport::new(keys.len(), 0);
+        }
+        self.mark_hot_keys_inner(keys, false)
+    }
+
+    fn mark_hot_keys_inner(
+        &mut self,
+        keys: &[ObjectKey],
+        remember_untracked: bool,
+    ) -> RouteTrafficReport {
         let mut slots = Vec::new();
         let mut bytes = 0u64;
         for key in keys {
@@ -3474,7 +3526,7 @@ impl StorageClockState {
             }
             if tracked {
                 self.pending_hot_keys.remove(key);
-            } else {
+            } else if remember_untracked {
                 self.pending_hot_keys.insert(key.clone());
             }
         }
