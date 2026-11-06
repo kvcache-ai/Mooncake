@@ -21989,3 +21989,5 @@ fn background_watermark_batch_retains_all_tokens_when_complete_reply_is_lost() {
     assert!(owner.pending_evictions.lock().is_empty());
     assert_eq!(owner.allocator.lock().usage_bytes().0, 0);
 }
+
+mod batch_put_status_tests;
