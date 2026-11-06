@@ -170,7 +170,8 @@ class RecordingObjectStore final : public SnapshotObjectStore {
 };
 
 std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
-                        int64_t lease_id = 101, bool with_weights = false) {
+                        int64_t lease_id = 101, bool with_weights = false,
+                        bool with_objects = false) {
     ha::BatchOpLogSnapshotManifest manifest;
     manifest.snapshot_id = ha::BuildBatchOpLogSnapshotId(batch, lease_id);
     manifest.last_included_batch_id = batch;
@@ -186,7 +187,7 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
                                       1, 1, Crc32cValue("o", 1)});
     store.objects[manifest.segments.key] = {'s'};
     store.objects[manifest.object_chunks[0].key] = {'o'};
-    if (with_weights) {
+    if (with_weights || with_objects) {
         manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
         manifest.weight_metadata = ha::BatchOpLogSnapshotObjectDescriptor{
@@ -194,6 +195,15 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
                                                          manifest.snapshot_id),
             1, Crc32cValue("w", 1)};
         store.objects[manifest.weight_metadata->key] = {'w'};
+    }
+    if (with_objects) {
+        manifest.schema_version = ha::kBatchOpLogObjectSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogObjectSnapshotFormat;
+        manifest.object_storage = ha::BatchOpLogSnapshotObjectDescriptor{
+            ha::BuildBatchOpLogSnapshotObjectStorageKey(root,
+                                                        manifest.snapshot_id),
+            1, Crc32cValue("a", 1)};
+        store.objects[manifest.object_storage->key] = {'a'};
     }
     const auto bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
     ha::BatchOpLogSnapshotDescriptor descriptor;
@@ -251,6 +261,26 @@ TEST_F(PruningTest, MissingWeightArtifactDoesNotAdvanceFloorOrDeleteLog) {
     for (const auto& id : {"20-101", "10-101"}) {
         const auto key =
             ha::BuildBatchOpLogSnapshotWeightMetadataKey("snapshots", id);
+        const auto bytes = store.objects.at(key);
+        store.objects.erase(key);
+        EXPECT_NE(ErrorCode::OK, Run());
+        EXPECT_FALSE(backend.values.contains(floor_key));
+        EXPECT_EQ(0u, backend.delete_count);
+        store.objects[key] = bytes;
+    }
+    EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ("10", backend.values.at(floor_key));
+    EXPECT_EQ(1u, backend.delete_count);
+}
+
+TEST_F(PruningTest, MissingObjectArtifactDoesNotAdvanceFloorOrDeleteLog) {
+    latest = AddSnapshot(store, 20, 101, true, true);
+    fallback = AddSnapshot(store, 10, 101, true, true);
+    backend.Put(latest_key, latest);
+    backend.Put(fallback_key, fallback);
+    for (const auto& id : {"20-101", "10-101"}) {
+        const auto key =
+            ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", id);
         const auto bytes = store.objects.at(key);
         store.objects.erase(key);
         EXPECT_NE(ErrorCode::OK, Run());
