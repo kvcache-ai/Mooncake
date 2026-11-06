@@ -643,6 +643,8 @@ jobs:
       # engine behavior stays classic; TENT activates via MC_USE_TENT=1 set
       # by tone_tests/scripts/common.sh.
       use-tent: true
+      # The T-One wheel also carries the metrics instrumentation.
+      tent-metrics: true
 
   # arm64 default wheels use a different transport set (USE_MNNVL) than
   # x86_64 (USE_INTRA_NVLINK), so build one here instead of only at release.
@@ -656,6 +658,8 @@ jobs:
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cu130-arm64
       version-override: 0.0.0.dev0
+      # Release wheels ship TENT on arm64, so build and import it here as well.
+      use-tent: true
 
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]

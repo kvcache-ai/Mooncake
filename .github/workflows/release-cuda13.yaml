@@ -21,6 +21,7 @@ jobs:
       variant: cuda13
       architecture: ${{ matrix.architecture }}
       artifact-prefix: ${{ matrix.artifact-prefix }}
+      use-tent: true
 
   publish-release:
     if: ${{ !contains(github.ref_name, '-') }}
