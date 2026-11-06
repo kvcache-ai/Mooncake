@@ -786,7 +786,7 @@ mod state_store_tests {
     }
 
     #[test]
-    fn pending_hot_keys_accumulates_without_bound() {
+    fn tracked_route_hits_do_not_accumulate_pending_hot_keys() {
         let runtime = test_runtime();
         let mut clock = StorageClockState::default();
 
@@ -799,9 +799,50 @@ mod state_store_tests {
 
         assert_eq!(
             clock.pending_hot_keys.len(),
-            100,
-            "pending_hot_keys grows with every unique key accessed"
+            0,
+            "hits for already tracked routes should be applied directly"
         );
+    }
+
+    #[test]
+    fn pending_route_hit_is_consumed_when_route_arrives() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+        let mut route = test_route("delayed-route", &runtime);
+        let mut second_replica = route.replicas[0].clone();
+        second_replica.segment_name = SegmentName("seg-1".to_string());
+        route.replicas.push(second_replica);
+
+        clock.mark_hot_keys(std::slice::from_ref(&route.key));
+        assert_eq!(clock.pending_hot_keys.len(), 1);
+
+        clock.track_route(&route, &runtime);
+
+        assert!(clock.pending_hot_keys.is_empty());
+        assert_eq!(
+            clock
+                .entries
+                .iter()
+                .filter_map(Option::as_ref)
+                .filter(|entry| entry.hot)
+                .count(),
+            2,
+            "the pending hit should mark every local replica hot"
+        );
+    }
+
+    #[test]
+    fn removed_clock_slots_are_recorded_for_constant_time_reuse() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+        let first = test_route("first", &runtime);
+        let second = test_route("second", &runtime);
+        clock.track_route(&first, &runtime);
+        clock.track_route(&second, &runtime);
+
+        clock.remove_key(&first.key);
+
+        assert_eq!(clock.free_slots, vec![0]);
     }
 
     #[test]
