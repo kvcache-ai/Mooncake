@@ -2,11 +2,14 @@ pub(crate) type SharedLiveClientCache = Arc<Mutex<LiveClientCache>>;
 pub(crate) type SharedSuspectRuntimeCache = Arc<Mutex<SuspectRuntimeCache>>;
 include!("cold_tier_state.rs");
 
+pub(crate) const RETAINED_MEMBERSHIP_TTL: Duration = Duration::from_secs(300);
+
 #[derive(Default)]
 pub(crate) struct LiveClientCache {
     refreshed_at: Option<Instant>,
     leases: Vec<ClientLease>,
     retained_leases: Vec<ClientLease>,
+    retained_at: Option<Instant>,
     tenant_quota_policies: BTreeMap<String, TenantQuotaPolicyCacheEntry>,
 }
 
@@ -17,11 +20,20 @@ impl LiveClientCache {
     }
 
     pub(crate) fn store(&mut self, leases: Vec<ClientLease>) {
+        let leases = filter_live_client_leases(&leases);
         if self.refreshed_at.is_some() {
-            self.retained_leases = std::mem::take(&mut self.leases);
+            if !membership_equivalent(&self.leases, &leases) {
+                self.retained_leases = std::mem::take(&mut self.leases);
+                self.retained_at = Some(Instant::now());
+            } else if self.retained_at.is_some_and(|retained_at| {
+                retained_at.elapsed() >= RETAINED_MEMBERSHIP_TTL
+            }) {
+                self.retained_leases = leases.clone();
+                self.retained_at = None;
+            }
         }
         self.refreshed_at = Some(Instant::now());
-        self.leases = filter_live_client_leases(&leases);
+        self.leases = leases;
     }
 
     pub(crate) fn retained_snapshot(&self) -> Option<Vec<ClientLease>> {
@@ -85,6 +97,18 @@ impl LiveClientCache {
             })
             .collect()
     }
+}
+
+fn membership_equivalent(left: &[ClientLease], right: &[ClientLease]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|expected| {
+            right.iter().any(|candidate| {
+                candidate.runtime == expected.runtime
+                    && candidate.state == expected.state
+                    && candidate.compatibility == expected.compatibility
+                    && candidate.endpoints == expected.endpoints
+            })
+        })
 }
 
 #[derive(Default)]
