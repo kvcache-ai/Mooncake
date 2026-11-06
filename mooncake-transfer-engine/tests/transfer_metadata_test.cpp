@@ -508,6 +508,156 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
 }
 
+// Regression for the "invalidate evicts id->desc and kills valid in-flight
+// transfers to the same segment" hazard.
+//
+// Scenario: a client opened a segment once and cached it under a numeric id
+// (here kId). In-flight request A targets a VALID, registered offset and its
+// transport worker re-reads getSegmentDescByID(kId) on every post/retry.
+// Request B targets a bad/not-yet-registered offset on the SAME segment;
+// selectTransport() calls invalidateSegmentCacheByID(kId) to self-heal.
+//
+// Method B contract: invalidate drops ONLY name->id and KEEPS id->desc, so
+// A's in-flight reads keep succeeding while a NEW openSegment() re-fetches
+// under a fresh id. Erasing id->desc would make A read null and fail.
+TEST(TransferMetadataInvalidateTest, KeepsIdDescForInflightAfterInvalidate) {
+    // metacache=true (cache-read path), no polling thread (interval=0).
+    ScopedMetadataRefreshConfig restore(0, true);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    const std::string kName = "172.16.240.8:12781";
+    const TransferMetadata::SegmentID kId = 424242;  // not LOCAL_SEGMENT_ID
+    ASSERT_EQ(
+        client.addLocalSegment(kId, kName, makeRdmaSegmentDesc(kName, 0x1000)),
+        0);
+
+    // In-flight A holds kId and resolves the descriptor before B fails.
+    auto before = client.getSegmentDescByID(kId, false);
+    ASSERT_TRUE(before);
+    ASSERT_FALSE(before->buffers.empty());
+
+    // B hit a bad offset on the same segment -> recovery invalidate.
+    // Exactly one name->id mapping is dropped; id->desc is untouched.
+    EXPECT_EQ(client.invalidateSegmentCacheByID(kId), 1);
+
+    // Method B: A's in-flight reads still see a valid descriptor.
+    auto after = client.getSegmentDescByID(kId, false);
+    ASSERT_TRUE(after)
+        << "in-flight holder was wrongly killed: id->desc was erased";
+    EXPECT_EQ(after, before);
+
+    // name->id is gone -> a new openSegment would re-fetch under a fresh
+    // id. A second invalidate finds no name->id left to drop (returns 0),
+    // confirming id->desc is not what drives the count.
+    EXPECT_EQ(client.invalidateSegmentCacheByID(kId), 0);
+    EXPECT_TRUE(client.getSegmentDescByID(kId, false));
+}
+
+// Concurrent variant: a reader thread emulates in-flight request A's
+// transport worker hammering getSegmentDescByID(kId) (as workers do for every
+// slice/post/retry), while the main thread REPEATEDLY triggers the
+// bad-address invalidate on the same segment. The reader must NEVER observe
+// a null descriptor.
+TEST(TransferMetadataInvalidateTest,
+     ConcurrentValidReadSurvivesRepeatedBadAddressInvalidate) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    const std::string kName = "172.16.240.8:12781";
+    const TransferMetadata::SegmentID kId = 424242;
+    ASSERT_EQ(
+        client.addLocalSegment(kId, kName, makeRdmaSegmentDesc(kName, 0x1000)),
+        0);
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> saw_null{false};
+    std::atomic<uint64_t> reads{0};
+
+    // The in-flight transfer holds the descriptor for its whole lifetime (a
+    // transport worker keeps the shared_ptr across all its slices). While it
+    // is held, use_count > 1, so neither the invalidate itself nor the lazy
+    // orphan GC may reclaim it -- and concurrent reads must never see null.
+    auto inflight_hold = client.getSegmentDescByID(kId, false);
+    ASSERT_TRUE(inflight_hold);
+
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            auto d = client.getSegmentDescByID(kId, false);
+            if (!d) saw_null.store(true, std::memory_order_relaxed);
+            reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    // Let the reader spin up before we start invalidating.
+    while (reads.load(std::memory_order_relaxed) < 1000)
+        std::this_thread::yield();
+
+    // Repeatedly trigger the bad-address recovery path on the same segment.
+    for (int i = 0; i < 5000; ++i) client.invalidateSegmentCacheByID(kId);
+
+    // Ensure the reader keeps going well past the last invalidate.
+    const uint64_t target = reads.load(std::memory_order_relaxed) + 5000;
+    while (reads.load(std::memory_order_relaxed) < target)
+        std::this_thread::yield();
+
+    stop.store(true, std::memory_order_relaxed);
+    reader.join();
+
+    EXPECT_FALSE(saw_null.load(std::memory_order_relaxed))
+        << "in-flight reader observed a null descriptor: invalidate evicted "
+           "id->desc (method B violated), which would fail valid concurrent "
+           "transfers to the same segment";
+}
+
+// Regression for the lazy orphan reclamation layered on top of method B.
+//
+// Method B keeps id->desc alive after dropping name->id so in-flight
+// transfers are not killed; those kept entries would otherwise accumulate as
+// orphans. The lazy GC (inside invalidateSegmentCacheByID) reclaims an orphan
+// once no in-flight holder references its descriptor anymore (shared_ptr
+// use_count<=1).
+//
+// This verifies BOTH halves of the contract:
+//   1. While an in-flight holder still references the descriptor, invalidate
+//      does NOT reclaim it -- the in-flight transfer keeps seeing a valid
+//      descriptor.
+//   2. Once the holder releases it, the next invalidate reclaims the orphan
+//      (getSegmentDescByID then misses).
+TEST(TransferMetadataInvalidateTest,
+     LazyReclaimsOrphanOnlyWhenNoInflightHolder) {
+    ScopedMetadataRefreshConfig restore(0, true);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    const std::string kName = "172.16.240.8:12781";
+    const TransferMetadata::SegmentID kId = 515151;
+    ASSERT_EQ(
+        client.addLocalSegment(kId, kName, makeRdmaSegmentDesc(kName, 0x1000)),
+        0);
+
+    // In-flight request A resolves and HOLDS the descriptor (mirrors a
+    // transport worker that cached the shared_ptr for its slices) ->
+    // use_count > 1.
+    auto inflight = client.getSegmentDescByID(kId, false);
+    ASSERT_TRUE(inflight);
+
+    // B hits a bad offset -> invalidate. name->id is dropped (returns 1), but
+    // because A still holds the descriptor the id->desc entry MUST be kept.
+    EXPECT_EQ(client.invalidateSegmentCacheByID(kId), 1);
+    ASSERT_TRUE(client.getSegmentDescByID(kId, false))
+        << "orphan reclaimed while an in-flight holder still references it";
+    EXPECT_EQ(client.getSegmentDescByID(kId, false), inflight);
+
+    // A finishes: release the in-flight reference (use_count drops to 1).
+    inflight.reset();
+
+    // Any subsequent invalidate triggers the lazy GC; now that nobody
+    // references the descriptor, the orphan is reclaimed.
+    client.invalidateSegmentCacheByID(kId);
+    EXPECT_FALSE(client.getSegmentDescByID(kId, false))
+        << "orphan was not reclaimed after its last in-flight holder released "
+           "it";
+}
+
 TEST(TransferMetadataVersionTest, SyncAcceptsNewerMetadataVersion) {
     constexpr uint64_t kInitialAddr = 0x1000;
     constexpr uint64_t kUpdatedAddr = 0x2000;
