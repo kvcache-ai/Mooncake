@@ -9,6 +9,8 @@
 #include <glog/logging.h>
 #include <json/json.h>
 
+#include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "rpc_helper.h"
 #include "utils/scoped_vlog_timer.h"
@@ -16,12 +18,30 @@
 
 namespace mooncake {
 
+namespace {
+
+std::string GetMasterMetricsSummary() {
+    std::string summary =
+        P2PMasterMetricManager::instance().get_summary_string();
+    summary += " | ";
+    summary += HAMetricManager::instance().get_summary_string();
+    return summary;
+}
+
+}  // namespace
+
 P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
                                          ViewVersionId view_version)
     : master_service_(config, view_version),
       http_server_(4, static_cast<uint16_t>(config.metrics.http_port)),
       metric_report_running_(config.metrics.enable_reporting),
-      heartbeat_rpc_port_(config.rpc.heartbeat_port) {}
+      heartbeat_rpc_port_(config.rpc.heartbeat_port) {
+    HAStatusManager::instance().Configure(
+        config.ha.enabled, config.cluster_id,
+        config.rpc.address + ":" + std::to_string(config.rpc.port),
+        config.oplog.latest_stall_timeout_sec,
+        config.oplog.catchup_stall_timeout_sec);
+}
 
 P2PMasterRpcService::~P2PMasterRpcService() {
     metric_report_running_ = false;
@@ -31,14 +51,17 @@ P2PMasterRpcService::~P2PMasterRpcService() {
     http_server_.stop();
 }
 
+void P2PMasterRpcService::SetStepdownCallback(std::function<void()> callback) {
+    stepdown_callback_ = std::move(callback);
+}
+
 void P2PMasterRpcService::init() {
     init_http_server();
 
     if (metric_report_running_) {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_) {
-                std::string metrics_summary =
-                    P2PMasterMetricManager::instance().get_summary_string();
+                const std::string metrics_summary = GetMasterMetricsSummary();
                 LOG(INFO) << "Master Metrics: " << metrics_summary;
                 std::this_thread::sleep_for(
                     std::chrono::seconds(kP2PMetricReportIntervalSeconds));
@@ -52,17 +75,32 @@ void P2PMasterRpcService::init_http_server() {
 
     http_server_.set_http_handler<GET>(
         "/metrics", [](coro_http_request& req, coro_http_response& resp) {
-            std::string metrics =
+            auto metrics =
                 P2PMasterMetricManager::instance().serialize_metrics();
+            metrics += HAMetricManager::instance().serialize_metrics();
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, std::move(metrics));
         });
 
     http_server_.set_http_handler<GET>(
+        "/ha/status", [](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            resp.set_status_and_content(
+                status_type::ok, HAStatusManager::instance().SerializeJson());
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/ha/doctor", [](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            resp.set_status_and_content(
+                status_type::ok,
+                HAStatusManager::instance().SerializeDoctorJson());
+        });
+
+    http_server_.set_http_handler<GET>(
         "/metrics/summary",
         [](coro_http_request& req, coro_http_response& resp) {
-            std::string summary =
-                P2PMasterMetricManager::instance().get_summary_string();
+            std::string summary = GetMasterMetricsSummary();
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, std::move(summary));
         });
@@ -99,6 +137,30 @@ void P2PMasterRpcService::init_http_server() {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, "OK");
         });
+
+    http_server_.set_http_handler<
+        POST>("/ha/stepdown", [this](coro_http_request& req,
+                                     coro_http_response& resp) {
+        resp.add_header("Content-Type", "application/json; charset=utf-8");
+        if (!stepdown_callback_) {
+            resp.set_status_and_content(
+                status_type::service_unavailable,
+                "{\"success\":false,\"error\":\"stepdown callback is not "
+                "installed\"}");
+            return;
+        }
+        if (stepdown_requested_.exchange(true)) {
+            resp.set_status_and_content(
+                status_type::service_unavailable,
+                "{\"success\":false,\"error\":\"stepdown already requested\"}");
+            return;
+        }
+        LOG(INFO) << "P2P master stepdown requested";
+        stepdown_callback_();
+        resp.set_status_and_content(
+            status_type::ok,
+            "{\"success\":true,\"message\":\"stepdown accepted\"}");
+    });
 
     http_server_.set_http_handler<GET>(
         "/batch_query_routes",

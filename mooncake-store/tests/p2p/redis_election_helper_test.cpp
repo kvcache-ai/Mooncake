@@ -10,6 +10,8 @@
 #include "types.h"
 
 #ifdef STORE_USE_REDIS
+#include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/redis_election_helper.h"
 #include "p2p/ha/p2p_master_view.h"
 #include "redis_test_utils.h"
@@ -140,7 +142,35 @@ TEST_F(RedisElectionHelperTest, ElectLeaderAndGetMasterView) {
     RedisReplyPtr raw((redisReply*)redisCommand(
         ctx, "GET %b", master_view_key.data(), master_view_key.size()));
     ASSERT_TRUE(raw && raw->type == REDIS_REPLY_STRING);
-    EXPECT_NE(std::string(raw->str, raw->len).find("candidate_id"),
+    EXPECT_NE(std::string(raw->str, raw->len).find("instance_id"),
+              std::string::npos);
+    redisFree(ctx);
+}
+
+TEST_F(RedisElectionHelperTest, ElectLeaderUsesConfiguredInstanceId) {
+    const std::string instance_id = "master-instance-for-election";
+    RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                               FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                               FLAGS_redis_username, instance_id);
+    ASSERT_EQ(ErrorCode::OK, helper.Connect());
+
+    ViewVersionId version = 0;
+    int lease_id = 0;
+    helper.ElectLeader("10.0.0.10:50051", version, lease_id);
+    ASSERT_GT(version, 0u);
+    ASSERT_GT(lease_id, 0);
+
+    auto [host, port] = ParseRedisEndpoint();
+    redisContext* ctx = redisConnect(host.c_str(), port);
+    ASSERT_TRUE(AuthenticateRedisContext(ctx, FLAGS_redis_username,
+                                         FLAGS_redis_password));
+    std::string master_view_key =
+        "mooncake:{" + FLAGS_cluster_id + "}:master_view";
+    RedisReplyPtr raw((redisReply*)redisCommand(
+        ctx, "GET %b", master_view_key.data(), master_view_key.size()));
+    ASSERT_TRUE(raw && raw->type == REDIS_REPLY_STRING);
+    const std::string value(raw->str, raw->len);
+    EXPECT_NE(value.find("\"instance_id\":\"" + instance_id + "\""),
               std::string::npos);
     redisFree(ctx);
 }
@@ -226,6 +256,8 @@ TEST_F(RedisElectionHelperTest, ElectionScriptPublishesEvent) {
 // === Test 3: KeepLeader keeps key alive past TTL ===
 
 TEST_F(RedisElectionHelperTest, KeepLeaderRenewsTTL) {
+    HAMetricManager::instance().set_election_last_successful_renew_timestamp_ms(
+        0);
     RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
                                FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
                                FLAGS_redis_username);
@@ -246,6 +278,9 @@ TEST_F(RedisElectionHelperTest, KeepLeaderRenewsTTL) {
     ViewVersionId got_version = 0;
     EXPECT_EQ(ErrorCode::OK, helper.GetMasterView(got_address, got_version));
     EXPECT_EQ(got_address, master_address);
+    EXPECT_GT(HAMetricManager::instance()
+                  .get_election_last_successful_renew_timestamp_ms(),
+              0);
 
     // Cancel keep-alive and join
     helper.CancelKeepAlive();
@@ -615,6 +650,11 @@ TEST_F(RedisElectionHelperTest, ParseLeaderValueMissingFields) {
 // Covers: redis_election_helper.cpp:477-479, 484
 
 TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
+    const auto before_renew_failures =
+        HAMetricManager::instance().get_election_renew_failures_total();
+    auto& ha_status = HAStatusManager::instance();
+    ha_status.Reset();
+    ha_status.Configure(true, FLAGS_cluster_id, "test-primary");
     const int short_ttl = 2;
     RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
                                FLAGS_redis_password, 0, short_ttl, 1,
@@ -649,6 +689,11 @@ TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
                        .count();
     // Should exit promptly (within heartbeat interval + margin), not hang
     EXPECT_LT(elapsed, (short_ttl + 5) * 1000);
+    EXPECT_EQ(before_renew_failures + 1,
+              HAMetricManager::instance().get_election_renew_failures_total());
+    EXPECT_NE(ha_status.SerializeDoctorJson().find("LEADERSHIP_LOST"),
+              std::string::npos);
+    ha_status.Reset();
 }
 
 // === Test 17: WatchLeader polling fallback ===
@@ -656,7 +701,12 @@ TEST_F(RedisElectionHelperTest, KeepLeaderLosesLeadership) {
 // We use CLIENT KILL to break subscribe_ctx_ so SUBSCRIBE command fails,
 // forcing WatchLeader to fall through to the pure polling path.
 
-TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
+TEST_F(RedisElectionHelperTest, PollLeaderOnceRecordsAndClearsWatchFailure) {
+    auto& ha_status = HAStatusManager::instance();
+    ha_status.Reset();
+    ha_status.Configure(true, FLAGS_cluster_id, "test-standby");
+    ha_status.SetRoleState("standby", "WATCHING");
+
     RedisElectionHelper helper(FLAGS_cluster_id, FLAGS_redis_endpoint,
                                FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
                                FLAGS_redis_username);
@@ -675,6 +725,8 @@ TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
     redisContext* context = nullptr;
     EXPECT_FALSE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
     EXPECT_EQ(context, nullptr);
+    EXPECT_NE(ha_status.SerializeDoctorJson().find("ELECTION_WATCH_FAILED"),
+              std::string::npos);
 
     const auto leader_value = RedisElectionHelper::SerializeLeaderValue(
         "primary:50051", 1, FLAGS_redis_ttl_sec);
@@ -687,6 +739,8 @@ TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
     ASSERT_TRUE(reply && reply->type == REDIS_REPLY_STATUS);
     EXPECT_FALSE(RedisElectionHelperTestPeer::PollLeaderOnce(helper, context));
     ASSERT_NE(context, nullptr);
+    EXPECT_EQ(ha_status.SerializeDoctorJson().find("ELECTION_WATCH_FAILED"),
+              std::string::npos);
 
     reply.reset(
         (redisReply*)redisCommand(admin, "DEL %b", key.data(), key.size()));
@@ -696,6 +750,7 @@ TEST_F(RedisElectionHelperTest, PollLeaderOnceHandlesGetErrors) {
 
     redisFree(context);
     redisFree(admin);
+    ha_status.Reset();
 }
 
 TEST_F(RedisElectionHelperTest, WatchLeaderPollingFallback) {

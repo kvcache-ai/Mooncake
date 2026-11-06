@@ -24,6 +24,7 @@
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/p2p_standby_snapshot_service.h"
 #include "p2p/master/p2p_master_service.h"
 #include "p2p/ha/redis_util.h"
@@ -289,9 +290,17 @@ class RedisOpLogStoreTest : public ::testing::Test {
 };
 
 TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
+    HAMetricManager::instance().set_oplog_last_successful_write_timestamp_ms(0);
+    HAMetricManager::instance().set_oplog_consecutive_write_failures(7);
+
     auto writer = CreateWriter();
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
+    EXPECT_GT(HAMetricManager::instance()
+                  .get_oplog_last_successful_write_timestamp_ms(),
+              0);
+    EXPECT_EQ(
+        0, HAMetricManager::instance().get_oplog_consecutive_write_failures());
 
     auto reader = CreateReader();
     OpLogEntry entry;
@@ -302,6 +311,20 @@ TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
     uint64_t latest = 0;
     ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
     EXPECT_EQ(2u, latest);
+}
+
+TEST_F(RedisOpLogStoreTest, PrimaryLatestSequenceUpdatesAppliedMetric) {
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
+    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(2));
+    HAMetricManager::instance().set_oplog_applied_sequence_id(0);
+
+    uint64_t latest = 0;
+    ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
+    EXPECT_EQ(2u, latest);
+    EXPECT_EQ(static_cast<int64_t>(latest),
+              HAMetricManager::instance().get_oplog_applied_sequence_id());
 }
 
 TEST_F(RedisOpLogStoreTest, OpLogKeysDoNotUseRedisHashTags) {
@@ -386,6 +409,20 @@ TEST_F(RedisOpLogStoreTest, AsyncWriteEventuallyAdvancesLatest) {
     ASSERT_EQ(2u, entries.size());
     EXPECT_EQ(1u, entries[0].sequence_id);
     EXPECT_EQ(2u, entries[1].sequence_id);
+}
+
+TEST_F(RedisOpLogStoreTest, DrainWritingWaitsForCommits) {
+    std::shared_ptr<RedisOpLogStore> writer(CreateWriter());
+    OpLogManager manager;
+    manager.SetOpLogStore(writer);
+
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), false));
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), false));
+
+    const auto drain = manager.DrainWriting(3000);
+    EXPECT_TRUE(drain.drained);
+    EXPECT_EQ(2u, drain.committed_sequence_id);
+    EXPECT_EQ(2u, drain.max_known_sequence_id);
 }
 
 TEST_F(RedisOpLogStoreTest, ReadSinceHonorsCommittedLatest) {
@@ -514,6 +551,44 @@ TEST_F(RedisOpLogStoreTest, LatestWriteFailureRetriesWithoutNewEntry) {
     EXPECT_EQ(1u, latest);
 }
 
+TEST_F(RedisOpLogStoreTest, LatestStallOnlyTimesBusyPendingWork) {
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, cluster_id_, "test-primary", 1);
+    status.SetLeader("test-primary", 1);
+    status.SetRoleState("primary", "RUNNING");
+    auto has_stall_issue = [&] {
+        return status.SerializeDoctorJson().find("OPLOG_LATEST_STALLED") !=
+               std::string::npos;
+    };
+    auto writer = CreateWriter();
+    // Seq=3 is persisted but cannot commit latest without seq=1 and seq=2.
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(3), false), ErrorCode::OK);
+    const auto stall_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!has_stall_issue() &&
+           std::chrono::steady_clock::now() < stall_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(has_stall_issue());
+
+    // Additional work does not restart the timer.
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    EXPECT_TRUE(has_stall_issue());
+
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(2), true), ErrorCode::OK);
+    uint64_t latest = 0;
+    ASSERT_EQ(writer->GetLocalCommittedSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 3u);
+    EXPECT_FALSE(has_stall_issue());
+
+    // Rewriting an already committed entry cannot arm a new timer.
+    ASSERT_EQ(writer->WriteOpLog(MakeEntry(3), true), ErrorCode::OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    EXPECT_FALSE(has_stall_issue());
+    status.Reset();
+}
+
 TEST_F(RedisOpLogStoreTest, RejectsInvalidWriteBatchSize) {
     for (size_t batch_size : {size_t{0}, kMaxRedisOpLogWriteBatchSize + 1}) {
         auto writer = OpLogStoreFactory::Create(
@@ -554,6 +629,130 @@ TEST_F(RedisOpLogStoreTest, ConfiguredBatchSizeAboveDefaultIsUsed) {
     EXPECT_EQ(1000u, latest);
     EXPECT_GT(max_pipelined_sets.load(), 64u);
     EXPECT_LE(max_pipelined_sets.load(), 128u);
+}
+
+class RedisOpLogDoctorTest : public RedisOpLogStoreTest {
+   protected:
+    void SetUp() override {
+        RedisOpLogStoreTest::SetUp();
+        if (IsSkipped()) return;
+        auto [host, port] = ParseEndpoint();
+        admin_.reset(redisConnect(host.c_str(), port));
+        ASSERT_TRUE(testing::AuthenticateRedisContext(
+            admin_.get(), redis_username_, redis_password_));
+        user_ = cluster_id_ + "_doctor";
+        ASSERT_TRUE(AllowEntries("*[3-9]"));
+        status_.Reset();
+        status_.Configure(true, cluster_id_, "test-primary", 1);
+        status_.SetLeader("test-primary", 1);
+        status_.SetMasterView("test-primary", 1);
+        status_.SetRoleState("primary", "RUNNING");
+        writer_ = std::make_unique<RedisOpLogStore>(
+            cluster_id_, redis_endpoint_, true, 10, "doctor-test", user_);
+        ASSERT_EQ(writer_->Init(), ErrorCode::OK);
+    }
+
+    void TearDown() override {
+        writer_.reset();
+        if (admin_ && !user_.empty()) {
+            RedisReplyPtr reply((redisReply*)redisCommand(
+                admin_.get(), "ACL DELUSER %s", user_.c_str()));
+        }
+        status_.Reset();
+        RedisOpLogStoreTest::TearDown();
+    }
+
+    bool AllowEntries(const char* pattern) {
+        RedisReplyPtr reply((redisReply*)redisCommand(
+            admin_.get(),
+            "ACL SETUSER %s reset on >doctor-test +@all "
+            "~mooncake:%s:oplog:latest "
+            "~mooncake:%s:oplog:trimmed "
+            "~mooncake:%s:oplog:entry:%s",
+            user_.c_str(), cluster_id_.c_str(), cluster_id_.c_str(),
+            cluster_id_.c_str(), pattern));
+        return reply && reply->type == REDIS_REPLY_STATUS;
+    }
+
+    template <typename Predicate>
+    bool WaitUntil(Predicate predicate) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return predicate();
+    }
+
+    bool HasFailureCount(size_t count) {
+        const auto report = status_.SerializeDoctorJson();
+        return count == 0
+                   ? report.find("OPLOG_WRITE_FAILED") == std::string::npos
+                   : report.find("unrecovered_writes=" +
+                                 std::to_string(count)) != std::string::npos;
+    }
+
+    HAStatusManager& status_{HAStatusManager::instance()};
+    std::unique_ptr<redisContext, decltype(&redisFree)> admin_{nullptr,
+                                                               &redisFree};
+    std::string user_;
+    std::unique_ptr<RedisOpLogStore> writer_;
+};
+
+TEST_F(RedisOpLogDoctorTest, TracksFailuresUntilEachEntryRecovers) {
+    const auto retries =
+        HAMetricManager::instance().get_oplog_write_retries_total();
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1), false), ErrorCode::OK);
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(2), false), ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] {
+        return HAMetricManager::instance().get_oplog_write_retries_total() >=
+               retries + 6;
+    }));
+    EXPECT_TRUE(HasFailureCount(2));  // Repeated retries do not add failures.
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(3), false), ErrorCode::OK);
+    OpLogEntry entry;
+    ASSERT_TRUE(WaitUntil(
+        [&] { return writer_->ReadOpLog(3, entry) == ErrorCode::OK; }));
+    EXPECT_TRUE(
+        HasFailureCount(2));  // Another worker's success cannot clear it.
+
+    ASSERT_TRUE(AllowEntries("*[2-9]"));
+    ASSERT_TRUE(WaitUntil([&] { return HasFailureCount(1); }));
+    EXPECT_NE(status_.SerializeDoctorJson().find("degraded"),
+              std::string::npos);
+    // Leave seq=5 waiting for missing seq=4, so recovery need not drain the
+    // queue.
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(5), false), ErrorCode::OK);
+    ASSERT_TRUE(AllowEntries("*"));
+    ASSERT_TRUE(WaitUntil([&] { return HasFailureCount(0); }));
+    EXPECT_GT(HAMetricManager::instance().get_oplog_async_queue_size(), 0);
+    EXPECT_NE(status_.SerializeDoctorJson().find("\"ok\""), std::string::npos);
+}
+
+TEST_F(RedisOpLogDoctorTest, ClearsDroppedAndStoppedFailuresIndependently) {
+    ASSERT_EQ(writer_->WriteOpLog(MakeEntry(1, "required"), false),
+              ErrorCode::OK);
+    ASSERT_EQ(writer_->WriteOpLog(
+                  MakeEntry(2, "optional", OpType_PUBLISH_ROUTE), false),
+              ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] { return HasFailureCount(2); }));
+    ASSERT_TRUE(WaitUntil([&] {
+        return HAMetricManager::instance().get_oplog_async_queue_size() == 1;
+    }));
+    EXPECT_TRUE(HasFailureCount(1));
+    writer_->StopWriting();
+    EXPECT_TRUE(HasFailureCount(0));
+}
+
+TEST_F(RedisOpLogDoctorTest, DroppingLastFailedEntryClearsIssue) {
+    ASSERT_EQ(writer_->WriteOpLog(
+                  MakeEntry(1, "optional", OpType_PUBLISH_ROUTE), false),
+              ErrorCode::OK);
+    ASSERT_TRUE(WaitUntil([&] { return HasFailureCount(1); }));
+    ASSERT_TRUE(WaitUntil([&] {
+        return HAMetricManager::instance().get_oplog_async_queue_size() == 0;
+    }));
+    EXPECT_TRUE(HasFailureCount(0));
 }
 
 TEST_F(RedisOpLogStoreTest, BypassOverflowCreatesReadableGap) {

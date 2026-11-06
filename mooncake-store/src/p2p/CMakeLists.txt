@@ -27,6 +27,7 @@ set(MOONCAKE_P2P_MASTER_SOURCES
     ha/standby_state_machine.cpp
     ha/p2p_master_view.cpp
     ha/ha_metric_manager.cpp
+    ha/ha_status.cpp
 )
 
 # Find hiredis for Redis election backend

@@ -15,6 +15,7 @@
 #include "mock_oplog_store.h"
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "types.h"
 
 using mooncake::test::MockOpLogStore;
@@ -468,6 +469,26 @@ TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
 }
 
 // ========== Pending entries tests ==========
+
+TEST_F(OpLogApplierTest, PendingOverflowAppearsInDoctor) {
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, cluster_id_, "local");
+    status.SetRoleState("standby", "WATCHING");
+
+    for (uint64_t seq = 2; seq <= 1001; ++seq) {
+        EXPECT_FALSE(applier_->ApplyOpLogEntry(MakeEntry(
+            seq, OpType_PUBLISH_ROUTE, "key", MakeValidPayload("key"))));
+    }
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(1002, OpType_PUBLISH_ROUTE, "key", MakeValidPayload("key"))));
+    EXPECT_NE(status.SerializeDoctorJson().find("OPLOG_PENDING_REJECTED"),
+              std::string::npos);
+    EXPECT_NE(
+        status.SerializeDoctorJson().find("first_rejected_sequence_id=1002"),
+        std::string::npos);
+    status.Reset();
+}
 
 TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
     OpLogEntry entry1 =

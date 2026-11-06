@@ -49,6 +49,25 @@ TEST_F(HAMetricManagerTest, TestSetOpLogAsyncQueueSize) {
     EXPECT_EQ(5, M().get_oplog_async_queue_size());
 }
 
+TEST_F(HAMetricManagerTest, TestSetOpLogTrimProgress) {
+    M().set_oplog_trimmed_sequence_id(123);
+    M().set_oplog_gc_cursor_sequence_id(100);
+    EXPECT_EQ(123, M().get_oplog_trimmed_sequence_id());
+    EXPECT_EQ(100, M().get_oplog_gc_cursor_sequence_id());
+}
+
+TEST_F(HAMetricManagerTest, TestSetElectionAndOpLogHealthMetrics) {
+    M().set_election_last_successful_renew_timestamp_ms(12345);
+    M().set_oplog_last_successful_write_timestamp_ms(23456);
+    M().set_oplog_consecutive_write_failures(3);
+    M().set_oplog_snapshot_ready_standby_count(2);
+
+    EXPECT_EQ(12345, M().get_election_last_successful_renew_timestamp_ms());
+    EXPECT_EQ(23456, M().get_oplog_last_successful_write_timestamp_ms());
+    EXPECT_EQ(3, M().get_oplog_consecutive_write_failures());
+    EXPECT_EQ(2, M().get_oplog_snapshot_ready_standby_count());
+}
+
 TEST_F(HAMetricManagerTest, TestIncOpLogSkippedEntries) {
     auto before = M().get_oplog_skipped_entries_total();
     M().inc_oplog_skipped_entries();
@@ -75,12 +94,16 @@ TEST_F(HAMetricManagerTest, TestIncGapResolveCounters) {
 TEST_F(HAMetricManagerTest, TestIncOpLogWriteFailuresAndRetries) {
     auto before_failures = M().get_oplog_write_failures_total();
     auto before_retries = M().get_oplog_write_retries_total();
+    auto before_renew_failures = M().get_election_renew_failures_total();
 
     M().inc_oplog_write_failures(4);
     M().inc_oplog_write_retries(5);
+    M().inc_election_renew_failures(2);
 
     EXPECT_EQ(before_failures + 4, M().get_oplog_write_failures_total());
     EXPECT_EQ(before_retries + 5, M().get_oplog_write_retries_total());
+    EXPECT_EQ(before_renew_failures + 2,
+              M().get_election_renew_failures_total());
 }
 
 TEST_F(HAMetricManagerTest, TestIncWatchDisconnectionsAndAppliedEntries) {
@@ -120,6 +143,17 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
     M().observe_oplog_redis_pipeline_batch_size(64);
     M().inc_oplog_redis_pipeline_batch_failures();
     M().inc_oplog_redis_pipeline_batch_retries();
+    M().set_election_last_successful_renew_timestamp_ms(12345);
+    M().set_oplog_last_successful_write_timestamp_ms(23456);
+    M().set_oplog_consecutive_write_failures(3);
+    M().set_oplog_snapshot_ready_standby_count(2);
+    M().set_oplog_trimmed_sequence_id(80);
+    M().set_oplog_gc_cursor_sequence_id(70);
+    M().set_election_last_successful_renew_timestamp_ms(12345);
+    M().inc_election_renew_failures();
+    M().inc_oplog_trim_advance_success();
+    M().inc_oplog_gc_deleted_entries();
+    M().inc_oplog_trim_failures();
 
     std::string text = M().serialize_metrics();
     EXPECT_FALSE(text.empty());
@@ -141,6 +175,22 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
               text.find("ha_oplog_redis_pipeline_batch_failures_total"));
     EXPECT_NE(std::string::npos,
               text.find("ha_oplog_redis_pipeline_batch_retries_total"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_election_last_successful_renew_timestamp_ms"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_last_successful_write_timestamp_ms"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_consecutive_write_failures"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_snapshot_ready_standby_count"));
+    EXPECT_NE(std::string::npos, text.find("ha_election_renew_failures_total"));
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_trimmed_sequence_id"));
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_gc_cursor_sequence_id"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_trim_advance_success_total"));
+    EXPECT_NE(std::string::npos,
+              text.find("ha_oplog_gc_deleted_entries_total"));
+    EXPECT_NE(std::string::npos, text.find("ha_oplog_trim_failures_total"));
     EXPECT_EQ(std::string::npos, text.find("ha_oplog_etcd_write"));
 }
 
@@ -150,12 +200,19 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
     M().set_standby_degraded(true);
     M().set_primary_degraded(true);
     M().set_oplog_last_successful_poll_timestamp_ms(12345);
+    M().set_oplog_trimmed_sequence_id(90);
+    M().set_oplog_gc_cursor_sequence_id(80);
+    M().set_election_last_successful_renew_timestamp_ms(23456);
+    M().set_oplog_last_successful_write_timestamp_ms(34567);
+    M().set_oplog_consecutive_write_failures(3);
+    M().set_oplog_snapshot_ready_standby_count(2);
     M().set_p2p_snapshot_bootstrap_baseline_sequence_id(101);
     M().set_p2p_bootstrap_catchup_target_sequence_id(120);
     M().observe_election_duration_ms(10);
     M().inc_election_attempts();
     M().inc_election_failures();
     M().inc_election_leadership_lost();
+    M().inc_election_renew_failures();
     M().inc_election_reconnects();
     M().inc_election_watch_failures();
     M().inc_election_polling_fallbacks();
@@ -188,10 +245,17 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
              "ha_standby_degraded",
              "ha_primary_degraded",
              "ha_oplog_last_successful_poll_timestamp_ms",
+             "ha_oplog_trimmed_sequence_id",
+             "ha_oplog_gc_cursor_sequence_id",
+             "ha_election_last_successful_renew_timestamp_ms",
+             "ha_oplog_last_successful_write_timestamp_ms",
+             "ha_oplog_consecutive_write_failures",
+             "ha_oplog_snapshot_ready_standby_count",
              "ha_p2p_snapshot_bootstrap_baseline_sequence_id",
              "ha_p2p_bootstrap_catchup_target_sequence_id",
              "ha_election_failures_total",
              "ha_election_leadership_lost_total",
+             "ha_election_renew_failures_total",
              "ha_election_reconnects_total",
              "ha_election_watch_failures_total",
              "ha_election_polling_fallbacks_total",
@@ -226,12 +290,21 @@ TEST_F(HAMetricManagerTest, TestGetSummaryString) {
     M().set_oplog_last_sequence_id(100);
     M().set_oplog_applied_sequence_id(95);
     M().set_oplog_standby_lag(5);
+    M().set_oplog_consecutive_write_failures(3);
+    M().set_oplog_snapshot_ready_standby_count(2);
+    M().set_oplog_trimmed_sequence_id(90);
+    M().set_oplog_gc_cursor_sequence_id(80);
 
     std::string summary = M().get_summary_string();
     EXPECT_FALSE(summary.empty());
     // Summary string should contain key fields
     EXPECT_NE(std::string::npos, summary.find("last_seq"));
     EXPECT_NE(std::string::npos, summary.find("applied_seq"));
+    EXPECT_NE(std::string::npos, summary.find("consecutive_write_fail=3"));
+    EXPECT_NE(std::string::npos, summary.find("snapshot_ready_standby=2"));
+    EXPECT_NE(std::string::npos, summary.find("trimmed_seq"));
+    EXPECT_NE(std::string::npos, summary.find("gc_cursor"));
+    EXPECT_NE(std::string::npos, summary.find("renew_fail"));
 }
 
 // ========== Singleton tests ==========
