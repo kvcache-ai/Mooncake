@@ -410,6 +410,11 @@ impl StoreClient {
                     .take(requests.len())
                     .collect()
             }
+            Err(error @ StoreError::Backpressure(_)) => {
+                std::iter::repeat_with(|| Err(error.clone()))
+                    .take(requests.len())
+                    .collect()
+            }
             Err(error) if requests.len() == 1 => vec![Err(error)],
             Err(error) => {
                 debug!(
@@ -759,6 +764,8 @@ impl StoreClient {
                 });
             }
 
+            let mut last_backpressure = None;
+
             let mut reservation_order = pending
                 .iter()
                 .enumerate()
@@ -828,6 +835,9 @@ impl StoreClient {
                 }
                 if let Some(key) = exhausted_key {
                     release_pending(&pending, "batch_put_reserve_failed");
+                    if let Some(error) = last_backpressure {
+                        return Err(BatchPutReserveStageError::terminal(error));
+                    }
                     return Err(BatchPutReserveStageError::retryable(
                         StoreError::InvalidState(format!(
                             "not enough writable owners for key {key}"
@@ -852,6 +862,9 @@ impl StoreClient {
                             pending[index].reservations.push(reservation);
                         }
                         Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                            if matches!(error, StoreError::Backpressure(_)) {
+                                last_backpressure = Some(error.clone());
+                            }
                             exhausted_candidates += 1;
                             debug!(
                                 key = %pending[index].scoped_key.0,
@@ -879,6 +892,9 @@ impl StoreClient {
                         || entry.next_candidate >= entry.candidates.len()
                 }) {
                     release_pending(&pending, "batch_put_reserve_failed");
+                    if let Some(error) = last_backpressure {
+                        return Err(BatchPutReserveStageError::terminal(error));
+                    }
                     return Err(BatchPutReserveStageError::retryable(
                         StoreError::InvalidState(
                             "batch put exhausted all placement candidates".to_string(),
@@ -1405,6 +1421,7 @@ impl StoreClient {
                         .iter()
                         .flat_map(|entry| entry.targets.iter().cloned())
                         .collect::<Vec<_>>();
+                    release_prepared(&prepared, "batch_put_remote_write_failed");
                     self.note_remote_write_failure(
                         &failed_targets,
                         &error,

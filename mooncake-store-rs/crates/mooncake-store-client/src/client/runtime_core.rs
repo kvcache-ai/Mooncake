@@ -1001,6 +1001,7 @@ impl StoreClient {
         soft && matches!(
             error,
             StoreError::Allocator(_)
+                | StoreError::Backpressure(_)
                 | StoreError::NotFound(_)
                 | StoreError::InvalidState(_)
                 | StoreError::Transport(_)
@@ -1041,6 +1042,7 @@ impl StoreClient {
         let mut targets = Vec::with_capacity(policy.replica_count);
         let mut reservations = Vec::with_capacity(policy.replica_count);
         let mut excluded = BTreeSet::new();
+        let mut last_backpressure;
         let rollback = |this: &Self,
                         reservations: &[mooncake_store_core::SegmentReservation],
                         reason: &str| {
@@ -1058,28 +1060,35 @@ impl StoreClient {
                 reservations: &mut reservations,
             };
 
-            if let Err(error) = self.reserve_preferred_segments(
+            last_backpressure = match self.reserve_preferred_segments(
                 &mut preferred,
                 &policy.required_preferred_segments,
                 PreferredSegmentSource::Request,
                 false,
             ) {
-                rollback(
-                    self,
-                    preferred.reservations,
-                    "reserve_required_segments_failed",
-                );
-                return Err(error);
-            }
+                Ok(error) => error,
+                Err(error) => {
+                    rollback(
+                        self,
+                        preferred.reservations,
+                        "reserve_required_segments_failed",
+                    );
+                    return Err(error);
+                }
+            };
             if preferred.targets.len() != policy.replica_count {
-                if let Err(error) = self.reserve_preferred_segments(
+                match self.reserve_preferred_segments(
                     &mut preferred,
                     &policy.hint_preferred_segments,
                     PreferredSegmentSource::TenantPolicy,
                     true,
                 ) {
-                    rollback(self, preferred.reservations, "reserve_hint_segments_failed");
-                    return Err(error);
+                    Ok(Some(error)) => last_backpressure = Some(error),
+                    Ok(None) => {}
+                    Err(error) => {
+                        rollback(self, preferred.reservations, "reserve_hint_segments_failed");
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -1114,6 +1123,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     debug!(
                         tenant,
                         key,
@@ -1147,6 +1159,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     debug!(
                         tenant,
                         key,
@@ -1191,6 +1206,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     debug!(
                         tenant,
                         key,
@@ -1241,6 +1259,9 @@ impl StoreClient {
         }
 
         rollback(self, &reservations, "reserve_replica_targets_incomplete");
+        if let Some(error) = last_backpressure {
+            return Err(error);
+        }
         Err(StoreError::InvalidState(format!(
             "not enough writable placement targets: reserved={} need={}",
             targets.len(),
@@ -1254,7 +1275,8 @@ impl StoreClient {
         segments: &[SegmentName],
         source: PreferredSegmentSource,
         soft: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<StoreError>> {
+        let mut last_backpressure = None;
         for segment in segments {
             match self.lookup_preferred_segment(segment) {
                 Ok(segment_owner) => {
@@ -1286,10 +1308,13 @@ impl StoreClient {
                             preferred.targets.push(target);
                             preferred.reservations.push(reservation);
                             if preferred.targets.len() == preferred.replica_count {
-                                return Ok(());
+                                return Ok(last_backpressure);
                             }
                         }
                         Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                            if matches!(error, StoreError::Backpressure(_)) {
+                                last_backpressure = Some(error.clone());
+                            }
                             self.log_skipped_preferred_segment(
                                 preferred.tenant,
                                 preferred.key,
@@ -1303,6 +1328,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     self.log_skipped_preferred_segment(
                         preferred.tenant,
                         preferred.key,
@@ -1315,7 +1343,7 @@ impl StoreClient {
                 Err(error) => return Err(error),
             }
         }
-        Ok(())
+        Ok(last_backpressure)
     }
 
     fn log_skipped_preferred_segment(

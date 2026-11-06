@@ -7245,6 +7245,11 @@ fn routed_batch_put_from_retries_after_mid_transfer_failure_and_uses_surviving_p
         "failed batch write target should be quarantined before retrying placement"
     );
     assert_eq!(
+        store_a.allocator.lock().usage_bytes().0,
+        0,
+        "failed remote writes must release prepared reservations before retrying"
+    );
+    assert_eq!(
         reader
             .get("batch-put-retry-key-a")
             .expect("reader should see first retried write"),
@@ -7255,6 +7260,141 @@ fn routed_batch_put_from_retries_after_mid_transfer_failure_and_uses_surviving_p
             .get("batch-put-retry-key-b")
             .expect("reader should see second retried write"),
         source_b
+    );
+}
+
+#[test]
+fn ambiguous_remote_write_failure_does_not_quarantine_every_target() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("ambiguous-write-writer-segment"));
+    let writer = StoreClientBuilder::new(metadata, "ambiguous-write-writer")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let runtime_a = ClientRuntimeId::new("ambiguous-write-store-a", ClientEpoch(1));
+    let runtime_b = ClientRuntimeId::new("ambiguous-write-store-b", ClientEpoch(1));
+    let targets = [
+        ReplicaWriteTarget {
+            storage_runtime: runtime_a.clone(),
+            segment_name: SegmentName::new("ambiguous-write-store-a-segment"),
+            transport_endpoint: None,
+            target_chunks: Vec::new(),
+        },
+        ReplicaWriteTarget {
+            storage_runtime: runtime_b.clone(),
+            segment_name: SegmentName::new("ambiguous-write-store-b-segment"),
+            transport_endpoint: None,
+            target_chunks: Vec::new(),
+        },
+    ];
+
+    writer.note_remote_write_failure(
+        &targets,
+        &StoreError::Transport("ambiguous batch failure".to_string()),
+        "test_ambiguous_remote_write_failure",
+    );
+
+    let mut suspects = writer.suspect_runtime_cache.lock();
+    assert!(!suspects.contains(&runtime_a));
+    assert!(!suspects.contains(&runtime_b));
+}
+
+#[test]
+fn allocator_backpressure_skips_only_soft_placement_candidates() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("backpressure-writer-segment"));
+    let writer = StoreClientBuilder::new(metadata, "backpressure-writer")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let error = StoreError::Backpressure("pending publication ledger is full".to_string());
+
+    assert!(writer.should_skip_candidate(&error, true));
+    assert!(!writer.should_skip_candidate(&error, false));
+}
+
+#[test]
+fn routed_put_skips_owner_with_full_publication_ledger() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("ledger-full-store-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("ledger-full-store-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("ledger-full-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "ledger-full-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .allocation_lifecycle(
+            AllocationLifecycleConfig::new()
+                .max_pending_publications(1)
+                .max_pending_publication_bytes(1024),
+        )
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "ledger-full-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata, "ledger-full-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer]);
+
+    let _held = store_a
+        .reserve_local_pending(store_a.runtime_id(), None, 16)
+        .expect("first pending publication should fill store-a ledger");
+    let route = writer
+        .put_with_policy(
+            "ledger-full-key",
+            b"ledger-full-payload",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("writer should skip a saturated soft owner");
+
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(route.replicas[0].owner, *store_b.runtime_id());
+    assert!(
+        !writer
+            .suspect_runtime_cache
+            .lock()
+            .contains(store_a.runtime_id()),
+        "allocator backpressure must not quarantine the saturated owner"
     );
 }
 
