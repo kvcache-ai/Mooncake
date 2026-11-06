@@ -22316,5 +22316,6 @@ mod background_eviction_alignment_tests;
 mod clock_hit_alignment_tests;
 mod offload_waves_alignment_tests;
 mod pinned_reconcile_review_tests;
+mod public_placement_rollback_tests;
 mod publication_failure_tests;
 mod readable_filter_baseline_tests;
