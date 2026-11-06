@@ -95,7 +95,7 @@ pub struct AllocationLifecycleConfig {
 impl Default for AllocationLifecycleConfig {
     fn default() -> Self {
         Self {
-            max_pending_publications: 4096,
+            max_pending_publications: 8192,
             max_pending_publication_bytes: 1024 * 1024 * 1024,
         }
     }
