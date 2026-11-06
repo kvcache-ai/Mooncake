@@ -1781,12 +1781,26 @@ impl StorageOwnerState {
             )));
         }
         if has_usable_cold_tier_device {
-            let pending_routes = routes
-                .iter()
-                .filter_map(Option::as_ref)
-                .filter(|route| cold_tier::pending_persistent_backing(route).is_some())
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut pending_routes = Vec::new();
+            for route in routes.iter().filter_map(Option::as_ref) {
+                if cold_tier::pending_persistent_backing(route).is_some() {
+                    pending_routes.push(route.clone());
+                    continue;
+                }
+                if route.state != RouteState::Active
+                    || route.cold_backing.is_some()
+                    || route.nof_backing.is_some()
+                {
+                    continue;
+                }
+                if let Some(published) =
+                    cold_tier::publish_pending_cold_backing_for_eviction(self, route)?
+                {
+                    if cold_tier::pending_persistent_backing(&published).is_some() {
+                        pending_routes.push(published);
+                    }
+                }
+            }
             if !pending_routes.is_empty() {
                 cold_tier::materialize_pending_offload_routes_bounded(self, &pending_routes)?;
                 routes = self.route_ops.load_routes_bounded(&keys)?;

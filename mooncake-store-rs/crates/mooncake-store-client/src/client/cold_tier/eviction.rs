@@ -2,9 +2,7 @@ use super::super::{
     refresh_cold_tier_device_cache, ClockEntryId, DebugEvictAllResult, ObjectRoute, OperationTracker,
     PendingOffloadPrepareOutcome, RestorePromotionQueue, Result, StorageOwnerState,
 };
-use super::{
-    local_hot_replica_checksum, pending_persistent_backing, read_local_hot_replica_payload,
-};
+use super::{local_hot_replica_checksum, read_local_hot_replica_payload};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
@@ -308,21 +306,8 @@ impl StorageOwnerState {
             } else {
                 BTreeMap::new()
             };
-            let entry = match self.pending_offloads.claim(&route.key, route.version) {
-                Some(entry) => entry,
-                None => {
-                    let length_bytes =
-                        pending_persistent_backing(route).map(|backing| backing.length);
-                    self.pending_offloads.requeue_for_debug_evict_all(
-                        route.key.clone(),
-                        route.version,
-                        length_bytes,
-                    );
-                    let Some(entry) = self.pending_offloads.claim(&route.key, route.version) else {
-                        return Ok(false);
-                    };
-                    entry
-                }
+            let Some(entry) = self.pending_offloads.claim(&route.key, route.version) else {
+                return Ok(false);
             };
             let key = entry.key.clone();
             let prepare_result =
