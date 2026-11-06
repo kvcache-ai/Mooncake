@@ -206,6 +206,7 @@ fn validate_owner_route_page(
 }
 
 impl EmbeddedWrhRouteDirectory {
+    #[cfg(test)]
     fn new(
         route_topk: usize,
         metadata: Arc<dyn MetadataBackend>,
