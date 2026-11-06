@@ -9,7 +9,9 @@
 #include <errno.h>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
+#include <future>
 
 #include <array>
 #include <cctype>
@@ -29,6 +31,8 @@
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "crc32c.h"
+#include "environ.h"
+#include "environment_variables.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -1619,22 +1623,6 @@ BucketStorageBackend::BucketStorageBackend(
         disks_[i].max_total_size =
             use_per_disk ? per_disk[i] : bucket_backend_config_.max_total_size;
     }
-
-    // Allocate aligned buffer for O_DIRECT I/O operations
-    void* buf = nullptr;
-    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
-    if (ret != 0) {
-        LOG(ERROR)
-            << "BucketStorageBackend: Failed to allocate aligned buffer: "
-            << strerror(ret);
-    } else {
-        aligned_io_buffer_.reset(buf);
-        // Update the deleter to use free
-        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
-            buf, [](void* p) { free(p); });
-        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
-                  << " bytes aligned buffer at " << buf;
-    }
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -2128,12 +2116,48 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
     return {};
 }
 
+namespace {
+// Shared selector for bucket direct-write implementations. The aligned layout
+// will be added separately; do not silently treat it as packed or buffered.
+tl::expected<bool, ErrorCode> ReadPackedBucketDirectWrite() {
+    const auto setting = Environ::ReadOr(
+        BucketBackendEnvironmentVariables::MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE,
+        std::string{"0"});
+    if (setting == "0" || setting == "false") return false;
+    if (setting == "packed" || setting == "true" || setting == "1") return true;
+    if (setting == "aligned") {
+        LOG(ERROR) << "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=aligned is not yet "
+                      "supported by this build";
+    } else {
+        LOG(ERROR) << "Invalid MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE='"
+                   << setting << "'; expected 0/false or packed/true/1";
+    }
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+}
+}  // namespace
+
 tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
     namespace fs = std::filesystem;
     try {
         if (initialized_.load(std::memory_order_acquire)) {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        const auto direct_write = ReadPackedBucketDirectWrite();
+        if (!direct_write) return tl::make_unexpected(direct_write.error());
+        if (direct_write.value()) {
+#ifdef USE_URING
+            if (!file_storage_config_.use_uring) {
+                LOG(WARNING)
+                    << "Packed bucket direct writes require "
+                       "MOONCAKE_OFFLOAD_USE_URING=true; using buffered bucket "
+                       "writes";
+            }
+#else
+            LOG(WARNING) << "Packed bucket direct writes require a build with "
+                            "liburing; using buffered bucket writes";
+#endif
         }
 
         SharedMutexLocker lock(&mutex_);
@@ -2845,40 +2869,79 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-        // Allocate aligned buffer if needed
-        void* write_buffer = nullptr;
-        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
-                                                           [](void*) {}};
-
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
-        } else {
-            // Allocate a temporary larger buffer
+        // One buffer per writing thread: reuse faulted pages across buckets,
+        // and avoid sharing scratch memory between concurrent writers.
+        struct WriteBuffer {
+            std::unique_ptr<void, void (*)(void*)> data{nullptr, free};
+            size_t capacity = 0;
+        };
+        thread_local WriteBuffer scratch;
+        if (scratch.capacity < aligned_size) {
             void* buf = nullptr;
-            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
+            const int ret =
+                posix_memalign(&buf, kDirectIOAlignment, aligned_size);
             if (ret != 0) {
-                LOG(ERROR)
-                    << "Failed to allocate aligned buffer for WriteBucket: "
-                    << strerror(ret);
+                LOG(ERROR) << "Cannot allocate bucket write buffer: "
+                           << strerror(ret);
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
-            temp_buffer.reset(buf);
-            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
-                buf, [](void* p) { free(p); });
-            write_buffer = buf;
-            LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
-                         << " requires " << aligned_size
-                         << " bytes, exceeds buffer size " << kAlignedBufferSize
-                         << ", using temporary allocation";
+            scratch.data.reset(buf);
+            scratch.capacity = aligned_size;
         }
+        void* write_buffer = scratch.data.get();
 
-        // Aggregate all iovs data into the aligned buffer
-        char* dst = static_cast<char*>(write_buffer);
-        for (const auto& iov : iovs) {
-            memcpy(dst, iov.iov_base, iov.iov_len);
-            dst += iov.iov_len;
+        // Copy disjoint byte ranges without changing the persisted layout.
+        // Parallel packing is opt-in; small buckets stay on the caller thread.
+        const unsigned copy_threads =
+            total_size < 16 * 1024 * 1024
+                ? 1
+                : static_cast<unsigned>(std::clamp(
+                      Environ::ReadOr(BucketBackendEnvironmentVariables::
+                                          MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS,
+                                      1),
+                      1, 8));
+        const size_t range_size = align_up(
+            (total_size + copy_threads - 1) / copy_threads, kDirectIOAlignment);
+        const auto copy_range = [&](unsigned worker) {
+            const size_t begin = worker * range_size;
+            const size_t end = std::min(total_size, begin + range_size);
+            size_t offset = 0;
+            for (const auto& iov : iovs) {
+                const size_t first = std::max(begin, offset);
+                const size_t last = std::min(end, offset + iov.iov_len);
+                if (first < last) {
+                    memcpy(
+                        static_cast<char*>(write_buffer) + first,
+                        static_cast<const char*>(iov.iov_base) + first - offset,
+                        last - first);
+                }
+                offset += iov.iov_len;
+                if (offset >= end) break;
+            }
+        };
+        std::vector<std::future<void>> copies;
+        try {
+            copies.reserve(copy_threads - 1);
+            for (unsigned worker = 1; worker < copy_threads; ++worker) {
+                copies.emplace_back(
+                    std::async(std::launch::async, copy_range, worker));
+            }
+            copy_range(0);
+            for (auto& copy : copies) copy.get();
+        } catch (const std::exception& error) {
+            // If thread creation fails, first finish every in-flight copy,
+            // then fill the entire buffer synchronously before submitting I/O.
+            for (auto& copy : copies)
+                if (copy.valid()) copy.wait();
+            LOG(WARNING) << "Parallel bucket packing unavailable: "
+                         << error.what();
+            char* dest = static_cast<char*>(write_buffer);
+            for (const auto& iov : iovs) {
+                memcpy(dest, iov.iov_base, iov.iov_len);
+                dest += iov.iov_len;
+            }
         }
+        char* dst = static_cast<char*>(write_buffer) + total_size;
 
         // Zero-pad the remaining bytes
         if (aligned_size > total_size) {
@@ -3978,10 +4041,18 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT only for reads: write latency is not sensitive in this
-    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
-    // corrupts meta file parsing and wastes disk space on data files.
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    // Data buckets can use the existing aligned io_uring write path.
+    // Keep protobuf metadata buffered: padding .meta changes its encoding.
+    // Opt in explicitly so deployments can roll back by configuration.
+    bool direct_write = false;
+    if (mode == FileMode::Write && path.ends_with(BUCKET_DATA_FILE_SUFFIX)) {
+        const auto packed = ReadPackedBucketDirectWrite();
+        if (!packed) return tl::make_unexpected(packed.error());
+        direct_write = packed.value();
+    }
+    const bool use_direct = file_storage_config_.use_uring &&
+                            (mode == FileMode::Read || direct_write);
+    if (use_direct) {
         flags |= O_DIRECT;
     }
 #endif
@@ -3993,7 +4064,7 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    if (use_direct) {
         return std::make_unique<UringFile>(path, fd, 32, true);
     }
 #endif
