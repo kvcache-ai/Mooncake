@@ -2049,6 +2049,8 @@ fn run_minimal_lifecycle_write_benchmark(
     owner.register_local_memory()?;
     router.register_local_memory()?;
     heartbeat_clients(&mut [&mut owner, &mut router])?;
+    // Batch sizes share this owner/router and retain prior runtime state.
+    // This is a sequence measurement, not an independent performance comparison.
     run_batch_put_benchmark(&mut router, value_size, iterations, &mut [&mut owner])
 }
 
