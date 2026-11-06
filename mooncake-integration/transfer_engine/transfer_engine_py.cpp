@@ -536,7 +536,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     return 0;
 }
 
-int TransferEnginePy::getRpcPort() { return engine_ ? engine_->getRpcPort() : 0; }
+int TransferEnginePy::getRpcPort() {
+    return engine_ ? engine_->getRpcPort() : 0;
+}
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     if (allocateMemory == nullptr || freeMemory == nullptr) {

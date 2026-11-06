@@ -59,9 +59,9 @@ Status CentralSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
         *desc = json::parse(jstr).get<SegmentDesc>();
     } catch (const json::exception &error) {
         desc = nullptr;
-        return Status::MetadataError(
-            "Failed to parse segment descriptor " + segment_name + ": " +
-            error.what() + LOC_MARK);
+        return Status::MetadataError("Failed to parse segment descriptor " +
+                                     segment_name + ": " + error.what() +
+                                     LOC_MARK);
     }
     return Status::OK();
 }
@@ -129,9 +129,9 @@ Status PeerSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
         *desc = json::parse(response).get<SegmentDesc>();
     } catch (const json::exception &error) {
         desc = nullptr;
-        return Status::MetadataError(
-            "Failed to parse segment descriptor " + segment_name + ": " +
-            error.what() + LOC_MARK);
+        return Status::MetadataError("Failed to parse segment descriptor " +
+                                     segment_name + ": " + error.what() +
+                                     LOC_MARK);
     }
     return Status::OK();
 }
