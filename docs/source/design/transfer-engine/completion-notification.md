@@ -1,8 +1,9 @@
 # Completion eventfd wait (RFC #5164 v1)
 
-Sketch of the supported polling-free path. Classic TE RDMA only; TENT
-returns `completionFd() == -1`. One engine-owned fd is shared by every
-opted-in batch, so a readable fd may belong to some other batch.
+Classic Transfer Engine only. TENT returns `completionFd() == -1`. One
+engine-owned fd is shared by every opted-in batch, so a readable fd may
+belong to some other batch. `drainCompletions` does not free the batch
+handle.
 
 ```text
 fd = engine.completionFd()
@@ -44,36 +45,51 @@ while not settled:
 engine.freeBatchID(batch)
 ```
 
-Python:
+Python, including an asyncio wait:
 
 ```python
-fd = engine.completion_fd()
-try:
-    batch_id = engine.batch_transfer_async(
-        ..., enable_completion_notification=True)
-except CompletionNotificationFallback:
-    # Poll-driven transport. Use the ordinary submit/poll path.
-    ...
-except RuntimeError:
-    # openSegment, a length mismatch, or a failed notification submit.
-    # Buffers may be reused unless the message says they are still in use.
-    ...
-else:
+import asyncio
+
+async def wait_for_batch(engine, batch_id):
+    fd = engine.completion_fd()
+    loop = asyncio.get_running_loop()
     target = None
     while target is None:
-        # wait on fd (epoll / asyncio.add_reader)
+        readable = loop.create_future()
+        loop.add_reader(fd, readable.set_result, None)
+        try:
+            await readable
+        finally:
+            loop.remove_reader(fd)
         for row in engine.drain_completions():
             if row["batch_id"] == batch_id:
                 target = row
+    return target
+
+async def run(engine):
+    try:
+        batch_id = engine.batch_transfer_async(
+            target_hostname, buffers, peer_addrs, lengths, opcode,
+            enable_completion_notification=True)
+    except CompletionNotificationFallback:
+        # Poll-driven transport. Use the ordinary submit/poll path.
+        return
+    except RuntimeError:
+        # openSegment, a length mismatch, or a failed notification submit.
+        # Buffers may be reused unless the message says they are still in use.
+        return
     # `target` means every submitted task has settled. Then:
+    target = await wait_for_batch(engine, batch_id)
     engine.free_batch_id(batch_id)
+    return target
 ```
 
 Notes:
 
-- Local completion only; peer notify still goes through
+- Local completion only. Peer notify still goes through
   `getBatchTransferStatus` → `sendNotifyByID`.
 - v1 does not publish `TIMEOUT` / `CANCELED` onto the fd.
 - Closing the fd does not by itself wake a poller blocked on a dup.
   Engine destruction writes the counter first; that write is the wake.
-- See unit coverage in `tests/batch_counter_wait_test.cpp`.
+- Unit coverage is in `tests/batch_counter_wait_test.cpp`. Real RDMA
+  coverage is `tests/rdma_completion_fd_test.cpp` (`ctest -L rdma`).

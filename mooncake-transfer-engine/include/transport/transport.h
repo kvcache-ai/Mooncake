@@ -389,10 +389,17 @@ class Transport {
 
             auto prev = batch_desc.finished_task_count.fetch_add(
                 1, std::memory_order_acq_rel);
-            // Same boundary as publishTerminalIfDone and
-            // getBatchTransferStatus: submitted tasks, not capacity.
-            if (prev + 1 == batch_desc.task_list.size()) {
-                // Last submitted task: wake up waiting thread directly.
+            // #5147 sync wait stays on allocated capacity. A legacy batch
+            // may submit again, so this thread must not read task_list.size()
+            // unless the batch opted into the eventfd path, which rejects a
+            // second submit and keeps that size stable. publishTerminalIfDone
+            // is the only submitted-count boundary.
+            const uint64_t wake_at =
+                batch_desc.event_enabled
+                    ? static_cast<uint64_t>(batch_desc.task_list.size())
+                    : static_cast<uint64_t>(batch_desc.batch_size);
+            if (prev + 1 == wake_at) {
+                // Wake transferSync on the boundary chosen above.
                 // Publish completion under the same mutex used by the waiter
                 // to avoid lost notifications.
                 //

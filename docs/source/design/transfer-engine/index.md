@@ -654,3 +654,11 @@ increase(mooncake_te_read_size_bytes_sum[2m])
 
 transfer-engine-bench-tuning
 :::
+
+## Completion notification
+
+:::{toctree}
+:maxdepth: 1
+
+completion-notification
+:::
