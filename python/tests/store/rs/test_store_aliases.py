@@ -84,3 +84,90 @@ def test_get_batch_delegates_to_batch_get(store_module) -> None:
     assert result == [b"one", b"two"]
     assert len(calls) == 1
     assert calls[0][0] == "batch_get"
+
+
+def test_remove_all_real_path_returns_success_count(store_module, caplog) -> None:
+    store = object.__new__(store_module.MooncakeDistributedStore)
+    calls = []
+
+    class Native:
+        def remove_all(self, **kwargs):
+            calls.append(kwargs)
+            return 7
+
+    store._native = Native()
+    store._worker = None
+    assert store.remove_all(force=True) == 7
+    assert calls == [{"force": True}]
+
+def test_remove_all_worker_path_returns_success_count(store_module, caplog) -> None:
+    store = object.__new__(store_module.MooncakeDistributedStore)
+    calls = []
+
+    class Worker:
+        def call(self, name, *args, **kwargs):
+            calls.append((name, args, kwargs))
+            return 3
+
+    store._native = object()
+    store._worker = Worker()
+    assert store.remove_all() == 3
+    assert calls == [("remove_all", (), {"force": False})]
+
+def test_remove_all_worker_failure_keeps_worker_usable(store_module, caplog) -> None:
+    store = object.__new__(store_module.MooncakeDistributedStore)
+    results = iter([RuntimeError("worker remove_all timed out"), 2])
+
+    class Worker:
+        def call(self, name, *args, **kwargs):
+            result = next(results)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    store._native = object()
+    store._worker = Worker()
+    with caplog.at_level("ERROR"):
+        assert store.remove_all() == -1
+    assert store.remove_all() == 2
+
+def test_remove_all_native_failure_returns_soft_failure_and_logs(store_module, caplog) -> None:
+    store = object.__new__(store_module.MooncakeDistributedStore)
+
+    class Native:
+        def remove_all(self, **kwargs):
+            raise RuntimeError("real remove_all did not complete (evicted=3)")
+
+    store._native = Native()
+    store._worker = None
+    with caplog.at_level("ERROR"):
+        assert store.remove_all() == -1
+    assert "remove_all raised an exception" in caplog.text
+
+def test_remove_all_timeout_keeps_wrapper_usable(store_module, caplog) -> None:
+    store = object.__new__(store_module.MooncakeDistributedStore)
+    results = iter([TimeoutError("evict-all timed out"), 5])
+
+    class Native:
+        def remove_all(self, **kwargs):
+            result = next(results)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    store._native = Native()
+    store._worker = None
+    with caplog.at_level("ERROR"):
+        assert store.remove_all() == -1
+    assert store.remove_all() == 5
+
+def test_remove_all_preserves_direct_negative_status(store_module, caplog) -> None:
+    store = object.__new__(store_module.MooncakeDistributedStore)
+
+    class Native:
+        def remove_all(self, **kwargs):
+            return -1
+
+    store._native = Native()
+    store._worker = None
+    assert store.remove_all() == -1
