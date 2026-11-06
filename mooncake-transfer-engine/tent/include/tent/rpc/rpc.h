@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <list>
 #include <string>
 #include <thread>
 #include <vector>
@@ -123,7 +124,15 @@ class CoroRpcAgent {
     coro_rpc::coro_rpc_server *server_ = nullptr;
 
     std::mutex pools_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;
+    // Bound address churn (including peers restarting on new ports). Active
+    // calls retain their pool independently of this idle-connection cache.
+    static constexpr size_t kMaxCachedPools = 128;
+    struct PoolEntry {
+        std::shared_ptr<ClientPool> pool;
+        std::list<std::string>::iterator recency;
+    };
+    std::list<std::string> pool_recency_;
+    std::unordered_map<std::string, PoolEntry> pools_;
 
     std::mutex func_map_mutex_;
     std::unordered_map<int, Handler> func_map_;
