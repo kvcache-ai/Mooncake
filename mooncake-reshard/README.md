@@ -323,6 +323,55 @@ lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
 semantics. Legacy logical planning permits omission for compatibility; the
 Runtime-to-Runtime executor requires an explicit snapshot and operation ID.
 
+A descriptor defaults to `components=(KEY, VALUE)`. Single-component resources
+can declare `LATENT`, `CONV`, or `SSM`; their shard-unit width is `key_head_dim`
+(`value_head_dim` remains the width of `VALUE`). Components share the descriptor's
+layer set, dtype and ownership. Use separate resources for different dtypes or
+shard axes, such as a BF16 convolution buffer and an FP32 recurrent state.
+Existing K/V JSON and canonical identities remain unchanged.
+
+For MLA, declare one global latent unit and explicit TP replicas, so the planner
+chooses one source replica per target. For recurrent state, use `page_size=1`
+and let the framework map request slots to rows. GDN convolution Q/K/V groups
+must be separate resources because each group is independently TP-sharded.
+`NHD_STRIDED` permits a row pitch larger than its contiguous head/dimension
+payload; `nbytes` describes the physical span including gaps. Storage offsets
+can select a group within a fused allocation. The ordinary `NHD` contract
+continues to require dense rows. These are byte-copy layouts, not dtype
+conversion, quantization, or arbitrary tensor transposition.
+
+Overlap checks for equal row strides are independent of row capacity. Validation
+is capped at 1,000,000 candidate-pair/expanded-interval work units per call;
+mixed-stride layouts exceeding that budget fail before their rows are expanded.
+
+Bindings with independent lifetimes must register regions with
+`owner_id=binding.digest`. Validation and execution, including cached results,
+require that claim to remain active on every region. Omitting `owner_id` retains
+the legacy runtime-wide claim, which authorizes all matching local bindings until
+released. Other owner IDs can pin memory but do not authorize binding execution.
+
+The framework retains responsibility for token-page and state-slot mappings,
+cache lifetime, coordinating all resources, and withholding request completion
+until every required resource writer succeeds. Mooncake does not infer model
+architecture or treat recurrent state as token-indexed KV.
+
+For a recurrent-state operation, the snapshot's row interval identifies the
+selected state slots in a framework-defined logical order, not all tokens of
+the requests. Source and target must agree on that order and on the state
+checkpoint; the framework supplies fingerprints that bind those semantics.
+Physical slot IDs can differ: export resolved ranges mapping each logical row
+to its local slot, or use `resolve_contiguous_runtime_binding` with an explicit
+`first_token_offset` for a contiguous run of rows, including `NHD_STRIDED` views.
+Only the selected payload bytes are copied; padding and other fused groups
+remain untouched. One operation covers one resource, so a hybrid request with
+K/V, convolution and recurrent state needs a framework-level completion barrier
+across those resources.
+
+These extensions apply to runtime-to-runtime transfers. Store reshard currently
+accepts only `(KEY, VALUE)` with an `NHD` descriptor and rejects state resources
+and `NHD_STRIDED` descriptors. Existing K/V model-domain keys, Store layout and
+manifest identities, and JSON encodings are preserved.
+
 The KV-cache implementation is split by responsibility:
 
 - `snapshot.py` defines content identity;
