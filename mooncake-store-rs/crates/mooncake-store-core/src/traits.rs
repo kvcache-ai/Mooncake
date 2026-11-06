@@ -507,6 +507,18 @@ pub trait RouteDirectory: Send + Sync {
         ))
     }
 
+    /// Returns exact route keys for lifecycle recovery. This is intentionally a
+    /// separate background-only query so normal allocator reserve stays key-free.
+    fn get_allocation_route_reference_keys_consistent(
+        &self,
+        _observer: &ClientLease,
+        _identities: &[crate::route::AllocationRouteIdentity],
+    ) -> Result<Vec<crate::route::AllocationRouteReference>> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not provide allocation reference key queries".to_string(),
+        ))
+    }
+
     fn compare_and_swap_object_route(
         &self,
         observer: &ClientLease,

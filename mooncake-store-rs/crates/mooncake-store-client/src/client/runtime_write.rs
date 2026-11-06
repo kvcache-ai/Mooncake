@@ -798,6 +798,7 @@ impl StoreClient {
                         storage_runtime,
                         segment_name,
                         length_bytes: entry.value_len as u64,
+                        route_key: Some(entry.scoped_key.clone()),
                     });
                 }
                 if let Some(key) = exhausted_key {

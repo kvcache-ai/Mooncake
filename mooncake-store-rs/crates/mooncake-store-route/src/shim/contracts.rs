@@ -3,9 +3,9 @@
 use std::time::Instant;
 
 use mooncake_store_core::{
-    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
-    ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest, RouteVersion,
-    StoreError,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest,
+    RouteVersion, StoreError,
 };
 
 pub const DEFAULT_ROUTE_OWNER_PAGE_SIZE: usize = 256;
@@ -90,6 +90,18 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
             "route authority client does not support allocation reference queries".to_string(),
         ))
     }
+
+    fn get_allocation_route_reference_keys(
+        &self,
+        _lease: &ClientLease,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        _identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        Err(StoreError::Unsupported(
+            "route authority client does not support allocation reference key queries".to_string(),
+        ))
+    }
 }
 
 pub trait RouteAuthorityService: Send + Sync {
@@ -137,6 +149,17 @@ pub trait RouteAuthorityService: Send + Sync {
     ) -> Result<Vec<AllocationRouteReferenceState>> {
         Err(StoreError::Unsupported(
             "route authority does not implement allocation reference queries".to_string(),
+        ))
+    }
+
+    fn get_allocation_route_reference_keys(
+        &self,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        _identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        Err(StoreError::Unsupported(
+            "route authority does not implement allocation reference key queries".to_string(),
         ))
     }
 

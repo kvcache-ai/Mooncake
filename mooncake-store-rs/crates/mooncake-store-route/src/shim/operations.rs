@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use mooncake_store_core::{
-    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
-    ClientRuntimeId, ColdBackingRouteFilter, MetadataBackend, NamespaceScope, ObjectKey,
-    ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ClientRuntimeId, ColdBackingRouteFilter, MetadataBackend, NamespaceScope,
+    ObjectKey, ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
     RouteReplicaReference, RouteState, RouteVersion,
 };
 
@@ -93,6 +93,14 @@ impl RouteOperations {
     ) -> Result<Vec<AllocationRouteReferenceState>> {
         self.directory
             .get_allocation_route_references_consistent(&self.observer, identities)
+    }
+
+    pub fn get_allocation_route_reference_keys_consistent(
+        &self,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        self.directory
+            .get_allocation_route_reference_keys_consistent(&self.observer, identities)
     }
 
     pub fn load_active_route_and_report<R: RouteHitReporter>(

@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use mooncake_store_core::{
-    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
-    ClientRuntimeId, ClientStableId, MetadataBackend, ObjectKey, ObjectRoute, Result,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, ObjectKey, ObjectRoute, Result,
     RouteCasRequest, RouteControlMode, RouteDirectory, RouteVersion,
 };
 use mooncake_store_route::{
@@ -74,6 +74,15 @@ pub(crate) fn authority_get_allocation_route_references(
 ) -> Result<Vec<AllocationRouteReferenceState>> {
     LocalRouteAuthority::new(namespace, authority.clone())
         .get_allocation_route_references(identities)
+}
+
+pub(crate) fn authority_get_allocation_route_reference_keys(
+    namespace: &str,
+    authority: &ClientStableId,
+    identities: &[AllocationRouteIdentity],
+) -> Result<Vec<AllocationRouteReference>> {
+    LocalRouteAuthority::new(namespace, authority.clone())
+        .get_allocation_route_reference_keys(identities)
 }
 
 pub(crate) fn authority_contains_many(

@@ -1237,15 +1237,11 @@ impl StorageOwnerState {
             .iter()
             .map(|route| route_storage_bytes(route, &self.runtime))
             .sum();
-        {
-            let mut allocator = self.allocator.lock();
-            for route in routes {
-                allocator.clear_pending_route(route, &self.runtime);
-            }
-        }
+        let mut allocator = self.allocator.lock();
         let mut clock = self.hot_replicas.clock.lock();
         let mut nof_clock = self.nof_backings.clock.lock();
         for route in routes {
+            allocator.clear_pending_route(route, &self.runtime);
             clock.sync_fresh_route(route, &self.runtime);
             nof_clock.sync_nof_route(route, &self.runtime, true);
         }
@@ -1280,6 +1276,7 @@ impl StorageOwnerState {
         let started = Instant::now();
         let used_before = self.allocator.lock().usage_bytes().0;
         let result = (|| {
+            let _ = self.recover_due_pending_publications()?;
             let mut evicted = self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)?;
             let (used_bytes, capacity_bytes) = self.allocator.lock().usage_bytes();
             if capacity_bytes == 0 {
@@ -1620,6 +1617,9 @@ impl StorageOwnerState {
         &self,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<bool> {
+        if self.recover_due_pending_publications()? > 0 {
+            return Ok(true);
+        }
         if self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)? > 0 {
             return Ok(true);
         }
@@ -1631,6 +1631,171 @@ impl StorageOwnerState {
         // successful-pass interval, but the candidate reconciler still
         // enforces its 100ms singleflight cadence and all safety fences.
         Ok(self.reconcile_stale_clock_candidates(preferred_segment, true)? > 0)
+    }
+
+    fn recover_due_pending_publications(&self) -> Result<usize> {
+        const PENDING_PUBLICATION_CONFIRMATION_BATCH: usize = 64;
+        const PENDING_PUBLICATION_RETRY_DELAY_MS: u64 = 1_000;
+
+        let publications = self
+            .allocator
+            .lock()
+            .claim_due_pending_publications(now_ms(), PENDING_PUBLICATION_CONFIRMATION_BATCH);
+        if publications.is_empty() {
+            return Ok(0);
+        }
+        let identities = publications
+            .iter()
+            .map(|publication| AllocationRouteIdentity {
+                owner: self.runtime.clone(),
+                segment_name: publication.identity.segment_name.clone(),
+                offset_bytes: publication.identity.offset_bytes,
+                length_bytes: publication.identity.length_bytes,
+                allocation_id: publication.identity.allocation_id,
+            })
+            .collect::<Vec<_>>();
+        let references = match self
+            .route_ops
+            .get_allocation_route_reference_keys_consistent(&identities)
+        {
+            Ok(references) if references.len() == publications.len() => references,
+            Ok(references) => {
+                debug!(
+                    runtime = %self.runtime,
+                    expected = publications.len(),
+                    actual = references.len(),
+                    "pending publication confirmation returned an incomplete result"
+                );
+                self.retry_pending_publications(
+                    &publications,
+                    now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                );
+                return Ok(0);
+            }
+            Err(error) => {
+                debug!(
+                    runtime = %self.runtime,
+                    pending = publications.len(),
+                    error = %error,
+                    "pending publication confirmation is indeterminate; retaining reservations"
+                );
+                self.retry_pending_publications(
+                    &publications,
+                    now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                );
+                return Ok(0);
+            }
+        };
+
+        let mut recovered = 0usize;
+        for (publication, reference) in publications.iter().zip(references) {
+            match reference.state {
+                mooncake_store_core::AllocationRouteReferenceState::Exact => {
+                    let Some(route_key) = reference.route_key else {
+                        debug!(
+                            runtime = %self.runtime,
+                            allocation_id = publication.identity.allocation_id,
+                            "exact pending publication reference is missing its route key"
+                        );
+                        self.retry_pending_publications(
+                            std::slice::from_ref(publication),
+                            now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                        );
+                        continue;
+                    };
+                    let replica = ReplicaRoute {
+                        owner: self.runtime.clone(),
+                        segment_name: publication.identity.segment_name.clone(),
+                        allocation_id: Some(publication.identity.allocation_id),
+                        offset: None,
+                        segment_offset: publication.identity.offset_bytes,
+                        length: publication.identity.length_bytes,
+                        checksum: None,
+                        tier: mooncake_store_core::ReplicaTier::Dram,
+                        priority: 0,
+                    };
+                    match self
+                        .route_ops
+                        .confirm_replica_reference(&route_key, &replica)
+                    {
+                        Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
+                            self.track_route(&route);
+                            registry::record_eviction_guard_event(
+                                "pending_publication",
+                                "finalized",
+                            );
+                        }
+                        Ok(mooncake_store_core::RouteReplicaReference::Absent) => {
+                            self.retry_pending_publications(
+                                std::slice::from_ref(publication),
+                                now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                            );
+                        }
+                        Err(error) => {
+                            debug!(
+                                runtime = %self.runtime,
+                                key = %route_key.0,
+                                allocation_id = publication.identity.allocation_id,
+                                error = %error,
+                                "pending publication route confirmation is indeterminate"
+                            );
+                            self.retry_pending_publications(
+                                std::slice::from_ref(publication),
+                                now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                            );
+                        }
+                    }
+                }
+                mooncake_store_core::AllocationRouteReferenceState::Absent => {
+                    let release = self.allocator.lock().release(
+                        &self.runtime,
+                        &publication.identity.segment_name,
+                        publication.identity.offset_bytes,
+                        publication.identity.length_bytes,
+                        publication.identity.allocation_id,
+                    );
+                    match release {
+                        Ok(()) => {
+                            registry::record_eviction_guard_event(
+                                "pending_publication",
+                                "released",
+                            );
+                            recovered = recovered.saturating_add(1);
+                        }
+                        Err(error) => {
+                            debug!(
+                                runtime = %self.runtime,
+                                allocation_id = publication.identity.allocation_id,
+                                error = %error,
+                                "pending publication release failed; retaining reservation"
+                            );
+                            self.retry_pending_publications(
+                                std::slice::from_ref(publication),
+                                now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                            );
+                        }
+                    }
+                }
+                mooncake_store_core::AllocationRouteReferenceState::Conflict => {
+                    self.retry_pending_publications(
+                        std::slice::from_ref(publication),
+                        now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                    );
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
+    fn retry_pending_publications(
+        &self,
+        publications: &[PendingPublication],
+        next_attempt_at_ms: u64,
+    ) {
+        let mut allocator = self.allocator.lock();
+        for publication in publications {
+            allocator.retry_pending_publication(publication, next_attempt_at_ms);
+        }
     }
 
     fn evict_one_blocking(&self, preferred_segment: Option<&SegmentName>) -> Result<bool> {

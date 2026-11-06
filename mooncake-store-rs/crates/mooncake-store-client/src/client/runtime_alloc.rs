@@ -209,6 +209,7 @@ impl StoreClient {
         });
     }
 
+    #[cfg(test)]
     fn reserve_specific_segment(
         &self,
         storage_runtime: &ClientRuntimeId,
@@ -216,11 +217,29 @@ impl StoreClient {
         length_bytes: usize,
         require_local_memory: bool,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
-        let reservation = self.reserve_segment_allocation(
+        self.reserve_specific_segment_for_route(
+            storage_runtime,
+            segment_name,
+            length_bytes,
+            require_local_memory,
+            None,
+        )
+    }
+
+    fn reserve_specific_segment_for_route(
+        &self,
+        storage_runtime: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: usize,
+        require_local_memory: bool,
+        route_key: Option<&ObjectKey>,
+    ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
+        let reservation = self.reserve_segment_allocation_for_route(
             storage_runtime,
             Some(segment_name),
             length_bytes as u64,
             require_local_memory,
+            route_key,
         )?;
         self.resolve_reserved_replica_write_target(storage_runtime, reservation)
     }
@@ -262,7 +281,7 @@ impl StoreClient {
             storage_runtime: ClientRuntimeId,
             lease: ClientLease,
             any_indices: Vec<usize>,
-            any_lengths: Vec<u64>,
+            any_ops: Vec<ReserveAnyOp>,
             specific_indices: Vec<usize>,
             specific_ops: Vec<ReserveSpecificOp>,
         }
@@ -279,11 +298,12 @@ impl StoreClient {
         for (index, request) in requests.iter().enumerate() {
             if request.storage_runtime == self.lease.runtime {
                 resolved[index] = Some(
-                    self.reserve_segment_allocation(
+                    self.reserve_segment_allocation_for_route(
                         &request.storage_runtime,
                         request.segment_name.as_ref(),
                         request.length_bytes,
                         request.require_local_memory,
+                        request.route_key.as_ref(),
                     )
                     .and_then(|reservation| {
                         self.resolve_reserved_replica_write_target(
@@ -326,10 +346,13 @@ impl StoreClient {
         let remote_jobs = remote_groups
             .into_iter()
             .map(|(storage_runtime, group)| {
-                let any_lengths = group
+                let any_ops = group
                     .any_indices
                     .iter()
-                    .map(|index| requests[*index].length_bytes)
+                    .map(|index| ReserveAnyOp {
+                        length_bytes: requests[*index].length_bytes,
+                        route_key: None,
+                    })
                     .collect::<Vec<_>>();
                 let specific_ops = group
                     .specific_indices
@@ -338,28 +361,29 @@ impl StoreClient {
                         segment_name: requests[*index]
                             .segment_name
                             .clone()
-                            .expect("specific reservation batch item must carry a segment name"),
+                        .expect("specific reservation batch item must carry a segment name"),
                         length_bytes: requests[*index].length_bytes,
+                        route_key: None,
                     })
                     .collect::<Vec<_>>();
                 RemoteReservationJob {
                     storage_runtime,
                     lease: group.lease,
                     any_indices: group.any_indices,
-                    any_lengths,
+                    any_ops,
                     specific_indices: group.specific_indices,
                     specific_ops,
                 }
             })
             .collect::<Vec<_>>();
         let remote_results = run_bounded_parallel_jobs(remote_jobs, 8, move |job| {
-            let any_results = if job.any_lengths.is_empty() {
+            let any_results = if job.any_ops.is_empty() {
                 None
             } else {
-                Some(control_client.batch_reserve_any(
+                Some(control_client.batch_reserve_any_with_pending_publication(
                     &job.lease,
                     &job.storage_runtime,
-                    &job.any_lengths,
+                    &job.any_ops,
                 ))
             };
             let specific_results = if job.specific_ops.is_empty() {
@@ -1394,18 +1418,35 @@ impl StoreClient {
         Ok(())
     }
 
+    #[cfg(test)]
     fn reserve_storage_runtime_segment(
         &self,
         storage_runtime: &ClientRuntimeId,
         length_bytes: usize,
         require_local_memory: bool,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
+        self.reserve_storage_runtime_segment_for_route(
+            storage_runtime,
+            length_bytes,
+            require_local_memory,
+            None,
+        )
+    }
+
+    fn reserve_storage_runtime_segment_for_route(
+        &self,
+        storage_runtime: &ClientRuntimeId,
+        length_bytes: usize,
+        require_local_memory: bool,
+        route_key: Option<&ObjectKey>,
+    ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
         self.flush_due_reclaims_best_effort();
-        let reservation = self.reserve_segment_allocation(
+        let reservation = self.reserve_segment_allocation_for_route(
             storage_runtime,
             None,
             length_bytes as u64,
             require_local_memory,
+            route_key,
         )?;
         debug!(
             storage_runtime = %storage_runtime,

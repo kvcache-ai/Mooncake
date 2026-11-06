@@ -1433,6 +1433,7 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
             &[ReserveSpecificOp {
                 segment_name: SegmentName::new("segment-c"),
                 length_bytes: 48,
+                route_key: None,
             }],
         )
         .expect("batch reserve_specific should succeed");
@@ -2355,6 +2356,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .reserve_any(Request::new(pb::ReserveAnyRequest {
                 owner: None,
                 length_bytes: 64,
+                route_key: String::new(),
             }))
             .await
             .expect("reserve_any should reply")
@@ -2365,6 +2367,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .batch_reserve_any(Request::new(pb::BatchReserveAnyRequest {
                 owner: None,
                 length_bytes: vec![8, 16],
+                route_keys: Vec::new(),
             }))
             .await
             .expect_err("batch reserve_any requires owner");
@@ -2375,6 +2378,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: None,
                 segment_name: "segment-a".to_string(),
                 length_bytes: 32,
+                route_key: String::new(),
             }))
             .await
             .expect("reserve_specific should reply")
@@ -2387,6 +2391,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 entries: vec![pb::ReserveSpecificEntry {
                     segment_name: "segment-a".to_string(),
                     length_bytes: 32,
+                    route_key: String::new(),
                 }],
             }))
             .await
@@ -2661,6 +2666,7 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
             &[ReserveSpecificOp {
                 segment_name: SegmentName::new("segment-z"),
                 length_bytes: 24,
+                route_key: None,
             }],
         )
         .expect("fallback reserve_specific should succeed");

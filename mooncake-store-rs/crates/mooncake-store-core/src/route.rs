@@ -231,6 +231,39 @@ pub enum AllocationRouteReferenceState {
     Conflict,
 }
 
+/// One authority's exact allocation observation for background lifecycle recovery.
+///
+/// `route_key` is present only for a single exact active route. Multiple matching
+/// keys are reported as `Conflict` so a reclaim caller remains fail-closed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AllocationRouteReference {
+    pub state: AllocationRouteReferenceState,
+    pub route_key: Option<ObjectKey>,
+}
+
+impl AllocationRouteReference {
+    pub fn absent() -> Self {
+        Self {
+            state: AllocationRouteReferenceState::Absent,
+            route_key: None,
+        }
+    }
+
+    pub fn exact(route_key: ObjectKey) -> Self {
+        Self {
+            state: AllocationRouteReferenceState::Exact,
+            route_key: Some(route_key),
+        }
+    }
+
+    pub fn conflict() -> Self {
+        Self {
+            state: AllocationRouteReferenceState::Conflict,
+            route_key: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CasResult {
     pub applied: bool,

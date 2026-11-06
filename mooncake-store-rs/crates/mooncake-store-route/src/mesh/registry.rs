@@ -3,9 +3,9 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use mooncake_store_core::{
-    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientRuntimeId,
-    ClientStableId, ColdBackingState, NamespaceScope, ObjectKey, ObjectRoute, Result,
-    ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientRuntimeId, ClientStableId, ColdBackingState, NamespaceScope, ObjectKey, ObjectRoute,
+    Result, ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
 };
 use parking_lot::Mutex as ParkingMutex;
 
@@ -159,6 +159,22 @@ pub(crate) fn authority_get_allocation_route_references(
         return Err(not_attached(authority));
     }
     slot.table.allocation_route_references(identities)
+}
+
+pub(crate) fn authority_get_allocation_route_reference_keys(
+    namespace: &str,
+    authority: &ClientStableId,
+    identities: &[AllocationRouteIdentity],
+) -> Result<Vec<AllocationRouteReference>> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    slot.table.allocation_route_reference_keys(identities)
 }
 
 pub(crate) fn authority_list_routes_by_replica_owner_page(
