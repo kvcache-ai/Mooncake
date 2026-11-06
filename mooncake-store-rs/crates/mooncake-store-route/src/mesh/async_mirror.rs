@@ -571,7 +571,9 @@ mod tests {
     #[test]
     fn request_classifier_distinguishes_live_routes_and_deletes() {
         assert!(!is_delete_marker_request(&test_cas_request("live")));
-        assert!(is_delete_marker_request(&test_delete_cas_request("deleted")));
+        assert!(is_delete_marker_request(&test_delete_cas_request(
+            "deleted"
+        )));
     }
 
     #[test]
