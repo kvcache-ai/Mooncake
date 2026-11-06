@@ -1078,7 +1078,9 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     attr.port_num = context().portNum();
     attr.pkey_index = params_->pkey_index;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                           IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
+                           IBV_ACCESS_REMOTE_WRITE;
+    if (context_->supportsRdmaAtomic())
+        attr.qp_access_flags |= IBV_ACCESS_REMOTE_ATOMIC;
     int ret = context_->verbs_.ibv_modify_qp(
         qp, &attr,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
@@ -1123,7 +1125,8 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     attr.ah_attr.port_num = context().portNum();
     attr.dest_qp_num = peer_qp_num;
     attr.rq_psn = params_->rq_psn;
-    attr.max_dest_rd_atomic = params_->max_dest_rd_atomic;
+    attr.max_dest_rd_atomic =
+        context_->clampDestRdAtomic(params_->max_dest_rd_atomic);
     attr.min_rnr_timer = params_->min_rnr_timer;
     ret = context_->verbs_.ibv_modify_qp(
         qp, &attr,
@@ -1148,7 +1151,7 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     attr.retry_cnt = params_->send_retry_count;
     attr.rnr_retry = params_->send_rnr_count;
     attr.sq_psn = params_->sq_psn;
-    attr.max_rd_atomic = params_->max_rd_atomic;
+    attr.max_rd_atomic = context_->clampInitRdAtomic(params_->max_rd_atomic);
     ret = context_->verbs_.ibv_modify_qp(
         qp, &attr,
         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
@@ -1294,7 +1297,7 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.path_mtu = rtr.path_mtu;
     qp_attr.dest_qp_num = peer_qp_num;
     qp_attr.rq_psn = 0;
-    qp_attr.max_dest_rd_atomic = rtr.max_dest_rd_atomic;
+    qp_attr.max_dest_rd_atomic = ctx->clampDestRdAtomic(rtr.max_dest_rd_atomic);
     qp_attr.min_rnr_timer = rtr.min_rnr_timer;
     qp_attr.ah_attr.is_global = 1;
 #ifdef USE_SHCA
@@ -1328,7 +1331,7 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.timeout = rts.timeout;
     qp_attr.retry_cnt = rts.retry_cnt;
     qp_attr.rnr_retry = rts.rnr_retry;
-    qp_attr.max_rd_atomic = rts.max_rd_atomic;
+    qp_attr.max_rd_atomic = ctx->clampInitRdAtomic(rts.max_rd_atomic);
 
     ret = ibv_modify_qp(qp, &qp_attr,
                         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |

@@ -77,9 +77,23 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    // Reads [offset, offset + length) of each value. Returned pointers address
+    // the first requested byte, not the start of the object.
+    tl::expected<BatchGetResult, ErrorCode> BatchGetRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes);
+
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
+
+    tl::expected<LocalBatchResult, ErrorCode> BatchGetLocalRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes);
 
     [[nodiscard]] bool HasPinnedRestoreArena() const {
         return pinned_restore_arena_allocator_ != nullptr;
@@ -258,6 +272,15 @@ class FileStorage {
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
 
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans);
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes, bool prefer_pinned);
+
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
         std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
@@ -290,6 +313,9 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
+    // which the destructor must unregister before the buffer is freed.
+    bool uring_buffer_registered_ = false;
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;

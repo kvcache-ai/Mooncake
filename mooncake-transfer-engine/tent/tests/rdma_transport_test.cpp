@@ -38,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -554,11 +555,14 @@ std::shared_ptr<Topology> topologyWithRdmaNics(size_t count) {
 
 class RdmaSliceMetadataLifetimeTest : public ::testing::Test {
    protected:
+    virtual const char* gpuLocation() const { return "cuda:0"; }
+
     void SetUp() override {
         topology_ = topologyWithRdmaNics(2);
         Topology::MemEntry gpu_memory;
-        gpu_memory.name = "cuda:0";
-        gpu_memory.type = Topology::MEM_CUDA;
+        gpu_memory.name = gpuLocation();
+        gpu_memory.type =
+            gpu_memory.name == "mlu:0" ? Topology::MEM_MLU : Topology::MEM_CUDA;
         gpu_memory.numa_node = 0;
         gpu_memory.device_list[0] = {0, 1};
         topology_->mem_list_.push_back(std::move(gpu_memory));
@@ -580,7 +584,7 @@ class RdmaSliceMetadataLifetimeTest : public ::testing::Test {
                             buffer.addr =
                                 reinterpret_cast<uint64_t>(buffer_.data());
                             buffer.length = buffer_.size();
-                            buffer.location = "cuda:0";
+                            buffer.location = gpuLocation();
                             buffer.lkey = {101, 102};
                             buffer.rkey = {201, 202};
                             memory.buffers = {buffer};
@@ -647,6 +651,78 @@ class RdmaSliceMetadataLifetimeTest : public ::testing::Test {
     Request request_{};
     std::vector<char> buffer_ = std::vector<char>(kMetadataLifetimeBlockSize);
 };
+
+class RdmaMluSliceMetadataLifetimeTest : public RdmaSliceMetadataLifetimeTest {
+   protected:
+    const char* gpuLocation() const override { return "mlu:0"; }
+
+    void TearDown() override {
+        auto& gdr = GdrReachability::instance();
+        gdr.reportLocalSuccess("mlx5_0", 0);
+        gdr.reportRemoteSuccess("different-machine", "mlx5_0", 0);
+        RdmaSliceMetadataLifetimeTest::TearDown();
+    }
+};
+
+TEST_F(RdmaMluSliceMetadataLifetimeTest,
+       FailedRailIsExcludedFromAllocationAndRetry) {
+    batch_->device_mask = 1ULL << 0;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* first = static_cast<RdmaSubBatch*>(batch_)->slice_chain[0];
+    ASSERT_NE(first, nullptr);
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, first).ok());
+    EXPECT_EQ(first->source_gpu_ordinal, 0);
+    EXPECT_EQ(first->target_gpu_ordinal, 0);
+    EXPECT_EQ(first->source_nic_name, "mlx5_0");
+    ASSERT_EQ(first->target_nic_name, "mlx5_0");
+
+    // The completion path reports failures using the ordinals cached above.
+    auto& gdr = GdrReachability::instance();
+    for (int i = 0; i < kGdrFailureThreshold; ++i) {
+        gdr.reportLocalFailure(first->source_nic_name,
+                               first->source_gpu_ordinal);
+        gdr.reportRemoteFailure(first->target_machine_id,
+                                first->target_nic_name,
+                                first->target_gpu_ordinal);
+    }
+    EXPECT_FALSE(gdr.localReachable("mlx5_0", 0));
+    EXPECT_FALSE(gdr.remoteReachable("different-machine", "mlx5_0", 0));
+
+    int selected = -1;
+    ASSERT_TRUE(workers_->getDeviceSelector()
+                    ->allocate(request_.length, "mlu:0", selected)
+                    .ok());
+    EXPECT_EQ(selected, 1);
+    ASSERT_TRUE(workers_->getDeviceSelector()
+                    ->release(selected, request_.length, 0.0)
+                    .ok());
+
+    // With only the remote side excluded, optimal selection must reject its
+    // initial pair and find a different target NIC.
+    gdr.reportLocalSuccess("mlx5_0", 0);
+    RdmaTask task;
+    task.request = request_;
+    task.device_mask = ~0ULL;
+    RdmaSlice next;
+    next.task = &task;
+    next.source_addr = request_.source;
+    next.target_addr = request_.target_offset;
+    next.length = request_.length;
+    next.source_dev_id = 0;
+    next.target_dev_id = 0;
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, &next).ok());
+    EXPECT_EQ(next.source_dev_id, 0);
+    EXPECT_EQ(next.target_dev_id, 1);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &next, 0, 0);
+
+    // A retry must also skip the excluded pair when scanning fallback NICs.
+    next.source_dev_id = -1;
+    next.target_dev_id = -1;
+    next.retry_count = 1;
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, &next).ok());
+    EXPECT_EQ(next.target_dev_id, 1);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &next, 0, 0);
+}
 
 TEST_F(RdmaSliceMetadataLifetimeTest,
        GdrCompletionUsesSliceMetadataAfterTopologyRefresh) {
@@ -2320,6 +2396,37 @@ TEST_F(RdmaContextDmabufTest, ExportableMemoryUsesDmabufRegistration) {
     close(fd);
 }
 
+TEST_F(RdmaContextDmabufTest, CallerOwnedExportIsClosedAfterRegistration) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out.fd = fd;
+        out.offset = 128;
+        out.close_fd = true;
+        return Status::OK();
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 1024,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_EQ(mr, &fake_mr.dmabuf_mr);
+    EXPECT_EQ(fake_mr.last_fd, fd);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, CallerOwnedExportIsClosedOnRegistrationFailure) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out.fd = fd;
+        out.close_fd = true;
+        return Status::OK();
+    });
+    fake_mr.fail_dmabuf_reg = true;
+    EXPECT_EQ(context_->registerMemReg(host_buffer_.data(), 1024,
+                                       IBV_ACCESS_LOCAL_WRITE),
+              nullptr);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+}
+
 TEST_F(RdmaContextDmabufTest, HostMemoryTakesThePlainPath) {
     int exporter_calls = 0;
     context_->setDmabufExporter([&](void*, size_t, DmabufExport&) {
@@ -2419,6 +2526,20 @@ TEST_F(RdmaContextDmabufTest, VerbsWithoutDmabufNeverConsultTheExporter) {
     EXPECT_EQ(exporter_calls, 0);
     EXPECT_EQ(fake_mr.reg_mr_calls, 1);
     EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, SharedExportWithoutDmabufVerbsFails) {
+    RdmaContextTestPeer::verbs(*context_).ibv_reg_dmabuf_mr = nullptr;
+    DmabufExport shared;
+    shared.fd = openFd();
+    shared.close_fd = true;
+    EXPECT_EQ(context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE, &shared),
+              nullptr);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+    // This context must not close the caller's shared export on failure.
+    EXPECT_TRUE(fdOpen(shared.fd));
+    close(shared.fd);
 }
 
 TEST(RdmaContextDmabufSymbolTest, LoaderExposesOptionalDmabufVerb) {
@@ -5570,6 +5691,7 @@ struct FakeMrVerbs {
     std::atomic<int> next_slot[kNics]{};
     std::atomic<int> reg_calls[kNics]{};
     std::atomic<int> dereg_calls[kNics]{};
+    int dmabuf_fd[kNics][kSlots]{};
     // Registrations the fake refuses: NIC index, and either any address
     // (nullptr) or one specific buffer.
     std::atomic<int> fail_nic{-1};
@@ -5598,6 +5720,22 @@ ibv_mr* fakeRegMr(ibv_pd* pd, void* addr, size_t length, int) {
     mr->length = length;
     mr->lkey = 0x100 * (nic + 1) + slot;
     mr->rkey = 0x1000 * (nic + 1) + slot;
+    return mr;
+}
+
+ibv_mr* fakeRegDmabufMr(ibv_pd* pd, uint64_t offset, size_t length,
+                        uint64_t iova, int fd, int access) {
+    // Check during every import, including a failing NIC and the second NIC
+    // in the sequential batch path: a borrowed fd must remain open for both.
+    EXPECT_NE(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(offset, 17u);
+    auto* mr = fakeRegMr(pd, reinterpret_cast<void*>(iova), length, access);
+    if (mr) {
+        const int nic = fake_mr.nicOf(pd);
+        const auto slot = mr - &fake_mr.mr[nic][0];
+        fake_mr.dmabuf_fd[nic][slot] = fd;
+        mr->addr = reinterpret_cast<void*>(offset);
+    }
     return mr;
 }
 
@@ -5689,6 +5827,94 @@ TEST_F(RdmaBufferRegistrationTest, EveryNicRegistersAndKeysAreNicIndexed) {
     EXPECT_EQ(fake_mr.dereg_calls[1].load(), 1);
     EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 0u);
     EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 0u);
+}
+
+// Single-buffer registration runs NICs in parallel; a batch registers each
+// buffer's NICs sequentially. Exercise both with owned and borrowed exports,
+// including rollback when the second NIC refuses an import.
+class RdmaSharedDmabufTest
+    : public RdmaBufferRegistrationTest,
+      public ::testing::WithParamInterface<std::tuple<bool, bool, bool>> {
+   protected:
+    void TearDown() override {
+        RdmaBufferRegistrationTest::TearDown();
+        for (const auto& entry : exports_) {
+            if (fcntl(entry.second, F_GETFD) != -1) close(entry.second);
+        }
+    }
+
+    std::mutex exports_mutex_;
+    std::vector<std::pair<void*, int>> exports_;
+};
+
+TEST_P(RdmaSharedDmabufTest,
+       ExportsOncePerBufferAndSharesUntilAllImportsFinish) {
+    const auto [batch, owned, fail] = GetParam();
+    for (auto& context : contexts_) {
+        RdmaContextTestPeer::verbs(*context).ibv_reg_dmabuf_mr =
+            fakeRegDmabufMr;
+        context->setDmabufExporter([&](void* addr, size_t, DmabufExport& out) {
+            out.fd = open("/dev/null", O_RDONLY);
+            EXPECT_GE(out.fd, 0);
+            out.offset = 17;
+            out.close_fd = owned;
+            std::lock_guard<std::mutex> lock(exports_mutex_);
+            exports_.emplace_back(addr, out.fd);
+            return Status::OK();
+        });
+    }
+    if (fail) {
+        fake_mr.fail_nic = 1;
+        fake_mr.fail_addr = buffer_a_;
+    }
+    std::vector<BufferDesc> descs{describe(buffer_a_, sizeof(buffer_a_))};
+    if (batch) descs.push_back(describe(buffer_b_, sizeof(buffer_b_)));
+    auto status = batch ? manager_.addBuffer(descs, options_)
+                        : manager_.addBuffer(descs.front(), options_);
+    EXPECT_EQ(status.ok(), !fail) << status;
+    ASSERT_EQ(exports_.size(), descs.size());
+    for (const auto& entry : exports_) {
+        EXPECT_EQ(fcntl(entry.second, F_GETFD) != -1, !owned);
+        for (int nic = 0; nic < FakeMrVerbs::kNics; ++nic) {
+            bool found = false;
+            for (int slot = 0; slot < fake_mr.next_slot[nic].load(); ++slot) {
+                if (fake_mr.dmabuf_fd[nic][slot] == entry.second) found = true;
+            }
+            if (fail && nic == 1 && entry.first == buffer_a_) continue;
+            EXPECT_TRUE(found);
+        }
+    }
+    for (int nic = 0; nic < FakeMrVerbs::kNics; ++nic) {
+        EXPECT_EQ(fake_mr.reg_calls[nic].load(), descs.size());
+        EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[nic]),
+                  fail ? 0u : descs.size());
+        if (fail)
+            EXPECT_EQ(fake_mr.dereg_calls[nic].load(),
+                      descs.size() - (nic == 1 ? 1 : 0));
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(ParallelAndSequential, RdmaSharedDmabufTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Bool(),
+                                            ::testing::Bool()));
+
+TEST_F(RdmaBufferRegistrationTest, ExportFailureDoesNotRegisterAnyNic) {
+    int export_calls = 0;
+    for (auto& context : contexts_) {
+        RdmaContextTestPeer::verbs(*context).ibv_reg_dmabuf_mr =
+            fakeRegDmabufMr;
+        context->setDmabufExporter([&](void*, size_t, DmabufExport&) {
+            ++export_calls;
+            return Status::InternalError("dma-buf export failed");
+        });
+    }
+    auto desc = describe(buffer_a_, sizeof(buffer_a_));
+    EXPECT_FALSE(manager_.addBuffer(desc, options_).ok());
+    EXPECT_EQ(export_calls, 1);
+    EXPECT_EQ(fake_mr.reg_calls[0].load(), 0);
+    EXPECT_EQ(fake_mr.reg_calls[1].load(), 0);
+    EXPECT_TRUE(desc.rkey.empty());
 }
 
 TEST_F(RdmaBufferRegistrationTest,

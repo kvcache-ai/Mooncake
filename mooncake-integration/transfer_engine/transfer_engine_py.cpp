@@ -1417,12 +1417,14 @@ int TransferEnginePy::batchUnregisterMemory(
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      const std::string& location,
                                      bool remote_accessible) {
+    pybind11::gil_scoped_release release;
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     return engine_->registerLocalMemory(buffer, capacity, location,
                                         remote_accessible);
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
+    pybind11::gil_scoped_release release;
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     return engine_->unregisterLocalMemory(buffer);
 }
@@ -1556,6 +1558,16 @@ void TransferEnginePy::batchTransferOnCuda(
         entry.nic_hint = nic_hint_id;
         entries.push_back(entry);
         total_bytes += lengths[i];
+    }
+
+    auto target_segment_desc =
+        engine_->getMetadata()->getSegmentDescByID(handle);
+    if (target_segment_desc &&
+        isCudaHostFuncUnsupportedProtocol(target_segment_desc->protocol)) {
+        throw std::runtime_error(
+            "transfer_*_on_cuda does not support nvlink_intra because CUDA "
+            "host functions cannot call CUDA APIs; use transfer_sync_* or "
+            "another transport");
     }
 
     auto batch_id = engine_->allocateBatchID(batch_size);
