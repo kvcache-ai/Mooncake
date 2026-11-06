@@ -897,8 +897,10 @@ mod state_store_tests {
     }
 
     #[test]
-    fn rebuilt_storage_clocks_start_from_runtime_specific_victims() {
+    fn rebuilt_storage_clocks_are_stable_per_runtime_and_desynchronized_across_runtimes() {
         let runtime_a = ClientRuntimeId::new("storage-owner-a", ClientEpoch(1));
+        let runtime_a_same = ClientRuntimeId::new("storage-owner-a", ClientEpoch(1));
+        let runtime_a_next_epoch = ClientRuntimeId::new("storage-owner-a", ClientEpoch(2));
         let runtime_b = ClientRuntimeId::new("storage-owner-b", ClientEpoch(1));
         let runtime_c = ClientRuntimeId::new("storage-owner-c", ClientEpoch(1));
         let first_batch = |runtime: &ClientRuntimeId| {
@@ -918,10 +920,14 @@ mod state_store_tests {
         };
 
         let victims_a = first_batch(&runtime_a);
+        let victims_a_rebuilt = first_batch(&runtime_a_same);
+        let victims_a_next_epoch = first_batch(&runtime_a_next_epoch);
         let victims_b = first_batch(&runtime_b);
         let victims_c = first_batch(&runtime_c);
 
         assert_eq!(victims_a.len(), BACKGROUND_EVICTION_BATCH_SIZE);
+        assert_eq!(victims_a, victims_a_rebuilt);
+        assert_ne!(victims_a, victims_a_next_epoch);
         assert_eq!(victims_b.len(), BACKGROUND_EVICTION_BATCH_SIZE);
         assert_eq!(victims_c.len(), BACKGROUND_EVICTION_BATCH_SIZE);
         assert!(

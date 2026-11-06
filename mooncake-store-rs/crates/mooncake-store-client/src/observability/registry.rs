@@ -1897,3 +1897,74 @@ fn cold_tier_device_state_label(state: ColdTierDeviceState) -> &'static str {
         ColdTierDeviceState::Failed => "failed",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mooncake_store_core::{
+        ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, ReplicaRoute, RouteState,
+        RouteVersion, SegmentName,
+    };
+
+    fn route(key: &str, replicas: &[(&str, ReplicaTier)]) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(key),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: replicas
+                .iter()
+                .enumerate()
+                .map(|(index, (owner, tier))| ReplicaRoute {
+                    owner: ClientRuntimeId::new(*owner, ClientEpoch(1)),
+                    segment_name: SegmentName::new(format!("segment-{index}")),
+                    allocation_id: Some(index as u64),
+                    offset: Some(0),
+                    segment_offset: 0,
+                    length: 1,
+                    checksum: None,
+                    tier: *tier,
+                    priority: index as u16,
+                })
+                .collect(),
+            cold_backing: None,
+            nof_backing: None,
+        }
+    }
+
+    #[test]
+    fn route_metrics_handle_empty_identical_and_duplicate_replicas() {
+        let mut registry = MetricsRegistry::default();
+        let empty = route("tenant-a::key", &[]);
+        registry.routes.insert(empty.key.0.clone(), empty.clone());
+        registry.routes.insert(empty.key.0.clone(), empty);
+        assert_eq!(registry.object_route_snapshot()[0].value, 1.0);
+        assert!(registry.replica_distribution_snapshot().is_empty());
+
+        let duplicates = route(
+            "tenant-a::key",
+            &[
+                ("runtime-a", ReplicaTier::Dram),
+                ("runtime-a", ReplicaTier::Dram),
+            ],
+        );
+        registry
+            .routes
+            .insert(duplicates.key.0.clone(), duplicates.clone());
+        registry
+            .routes
+            .insert(duplicates.key.0.clone(), duplicates.clone());
+        assert_eq!(registry.object_route_snapshot()[0].value, 1.0);
+        let replicas = registry.replica_distribution_snapshot();
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(replicas[0].value, 2.0);
+        registry.routes.remove(&duplicates.key.0);
+        assert!(registry.object_route_snapshot().is_empty());
+        assert!(registry.replica_distribution_snapshot().is_empty());
+    }
+}
