@@ -1502,6 +1502,8 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
                 .expect("sample route should carry allocation generation"),
         },
         reclaim_grace_ms: 0,
+        prepare_only: false,
+        expected_route_version: Some(delete_route.version),
     };
     assert_eq!(
         client
@@ -2858,6 +2860,8 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
                 .expect("sample route should carry allocation generation"),
         },
         reclaim_grace_ms: 0,
+        prepare_only: false,
+        expected_route_version: Some(delete_route.version),
     };
     assert_eq!(
         client

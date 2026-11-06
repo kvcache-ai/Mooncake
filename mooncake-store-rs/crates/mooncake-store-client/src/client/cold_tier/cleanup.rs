@@ -9,6 +9,7 @@ use super::super::{
 };
 use super::{
     backend_remove_cold_payload, backend_remove_pending_source, persistent_backing_contains_target,
+    same_cold_payload,
 };
 use mooncake_store_core::{ClientRuntimeId, ColdTierDeviceRecord};
 use std::collections::BTreeMap;
@@ -94,57 +95,69 @@ impl StorageOwnerState {
             let routes = self.metadata.as_ref().list_object_routes_by_cold_backing(
                 &mooncake_store_core::ColdBackingRouteFilter {
                     device_id: device_id.map(str::to_string),
-                    state: Some(mooncake_store_core::ColdBackingState::PendingDelete),
                     limit: Some(limit),
                     ..mooncake_store_core::ColdBackingRouteFilter::default()
                 },
             )?;
             let mut result = PendingDeleteGcResult::default();
-            for route in routes {
+            for listed_route in routes {
                 if result.scanned_routes >= limit {
                     break;
                 }
                 result.scanned_routes = result.scanned_routes.saturating_add(1);
-                let Some(cold_backing) = route.cold_backing.as_ref() else {
+                let Some(listed_backing) = listed_route.cold_backing.as_ref() else {
                     continue;
                 };
-                if cold_backing.state != mooncake_store_core::ColdBackingState::PendingDelete {
+                if listed_backing.state != mooncake_store_core::ColdBackingState::PendingDelete
+                    && !(listed_route.state == RouteState::Deleting
+                        && listed_backing.state
+                            == mooncake_store_core::ColdBackingState::Materialized)
+                {
                     continue;
                 }
+                let Some(route) = self.claim_cold_backing_for_gc(&listed_route, listed_backing)?
+                else {
+                    continue;
+                };
+                let cold_backing = route
+                    .cold_backing
+                    .as_ref()
+                    .expect("GC claim retains cold backing")
+                    .clone();
 
-                let backend = match self.cold_tier_devices.backend_for(cold_backing) {
+                let backend = match self.cold_tier_devices.backend_for(&cold_backing) {
                     Ok(backend) => backend,
                     Err(error) => {
                         result.backend_errors = result.backend_errors.saturating_add(1);
                         self.record_cold_tier_cleanup_error(
-                            cold_tier_device_id(cold_backing),
+                            cold_tier_device_id(&cold_backing),
                             &error,
                         );
                         continue;
                     }
                 };
                 let removed_cold_payload =
-                    match backend_remove_cold_payload(backend.as_ref(), cold_backing) {
+                    match backend_remove_cold_payload(backend.as_ref(), &cold_backing) {
                         Ok(removed) => removed,
                         Err(error) => {
                             result.backend_errors = result.backend_errors.saturating_add(1);
                             self.record_cold_tier_cleanup_error(
-                                cold_tier_device_id(cold_backing),
+                                cold_tier_device_id(&cold_backing),
                                 &error,
                             );
                             continue;
                         }
                     };
                 let removed_pending_source =
-                    match backend_remove_pending_source(backend.as_ref(), cold_backing) {
+                    match backend_remove_pending_source(backend.as_ref(), &cold_backing) {
                         Ok(removed) => removed,
                         Err(error) => {
                             result.backend_errors = result.backend_errors.saturating_add(1);
                             self.record_cold_tier_cleanup_error(
-                                cold_tier_device_id(cold_backing),
+                                cold_tier_device_id(&cold_backing),
                                 &error,
                             );
-                            false
+                            continue;
                         }
                     };
 
@@ -168,7 +181,7 @@ impl StorageOwnerState {
                     }
                 }
 
-                let next = if route.replicas.is_empty() {
+                let next = if route.state == RouteState::Deleting || route.replicas.is_empty() {
                     None
                 } else {
                     let mut next = route.clone();
@@ -185,7 +198,7 @@ impl StorageOwnerState {
                     info!(
                         runtime = %self.runtime,
                         key = %route.key.0,
-                        cold_tier_id = %cold_tier_device_id(cold_backing),
+                        cold_tier_id = %cold_tier_device_id(&cold_backing),
                         object_locator = %cold_backing.object_locator,
                         length = cold_backing.length,
                         removed_cold_payload,
@@ -204,7 +217,7 @@ impl StorageOwnerState {
                             result.pending_source_deleted.saturating_add(1);
                     }
                     self.apply_cold_tier_usage_delta(
-                        cold_tier_device_id(cold_backing),
+                        cold_tier_device_id(&cold_backing),
                         -(cold_backing.length as i64),
                         0,
                     )?;
@@ -214,6 +227,7 @@ impl StorageOwnerState {
                     if let Some(next) = next.as_ref() {
                         self.sync_route(next);
                     } else {
+                        self.enqueue_local_hot_reclaims(&route);
                         self.hot_replicas.remove_key(&route.key);
                     }
                 } else if let Some(current) = cas.current.as_ref() {
@@ -234,6 +248,86 @@ impl StorageOwnerState {
                 .unwrap_or_default(),
         );
         result
+    }
+
+    fn claim_cold_backing_for_gc(
+        &self,
+        listed_route: &ObjectRoute,
+        listed_backing: &mooncake_store_core::ColdBackingRoute,
+    ) -> Result<Option<ObjectRoute>> {
+        let Some(current) = self.route_ops.load_route(&listed_route.key)? else {
+            self.hot_replicas.remove_key(&listed_route.key);
+            return Ok(None);
+        };
+        let Some(current_backing) = current.cold_backing.as_ref() else {
+            self.sync_route(&current);
+            return Ok(None);
+        };
+        if !same_cold_payload(current_backing, listed_backing) {
+            self.sync_route(&current);
+            return Ok(None);
+        }
+        let eligible = match current.state {
+            RouteState::Active => {
+                current_backing.state == mooncake_store_core::ColdBackingState::PendingDelete
+            }
+            RouteState::Deleting => matches!(
+                current_backing.state,
+                mooncake_store_core::ColdBackingState::Materialized
+                    | mooncake_store_core::ColdBackingState::PendingDelete
+            ),
+            _ => false,
+        };
+        if !eligible {
+            self.sync_route(&current);
+            return Ok(None);
+        }
+        let mut claimed = current.clone();
+        claimed.version = claimed.version.next();
+        if let Some(backing) = claimed.cold_backing.as_mut() {
+            backing.state = mooncake_store_core::ColdBackingState::PendingDelete;
+        }
+        let cas = self.route_ops.compare_and_swap_route(
+            &current.key,
+            Some(current.version),
+            Some(&claimed),
+        )?;
+        if cas.applied {
+            self.sync_route(&claimed);
+            Ok(Some(claimed))
+        } else {
+            if let Some(current) = cas.current.as_ref() {
+                self.sync_route(current);
+            }
+            Ok(None)
+        }
+    }
+
+    fn enqueue_local_hot_reclaims(&self, route: &ObjectRoute) {
+        let entries = route
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner == self.runtime)
+            .filter_map(|replica| {
+                let allocation_id = replica.allocation_id.filter(|id| *id != 0)?;
+                Some(crate::control_plane::DeletePendingEntry {
+                    route_key: route.key.clone(),
+                    identity: mooncake_store_core::AllocationRouteIdentity {
+                        owner: replica.owner.clone(),
+                        segment_name: replica.segment_name.clone(),
+                        offset_bytes: replica.segment_offset,
+                        length_bytes: replica.length,
+                        allocation_id,
+                    },
+                    reclaim_grace_ms: 0,
+                    prepare_only: false,
+                    expected_route_version: Some(route.version),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !entries.is_empty() {
+            let _ = self.enqueue_delete_pending(&entries);
+        }
     }
 
     pub(in super::super) fn free_cold_tier_until_low_watermark(&self) -> Result<usize> {

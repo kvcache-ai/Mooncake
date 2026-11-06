@@ -141,6 +141,8 @@ pub(crate) struct DeletePendingEntry {
     pub route_key: ObjectKey,
     pub identity: AllocationRouteIdentity,
     pub reclaim_grace_ms: u64,
+    pub prepare_only: bool,
+    pub expected_route_version: Option<mooncake_store_core::RouteVersion>,
 }
 
 pub(crate) trait EvictionService: Send + Sync {
