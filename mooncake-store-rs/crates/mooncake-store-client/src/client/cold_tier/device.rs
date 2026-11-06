@@ -73,6 +73,7 @@ impl StorageOwnerState {
             Duration::from_millis(cold_tier.rate_limits.staging_slot_ttl_ms.max(1));
         let restore_max_distinct_flights = cold_tier.rate_limits.restore_max_distinct_flights;
         let hot_replicas = super::super::HotReplicaTracker::for_runtime(&runtime);
+        let stale_candidate_reconcile_started_at_ms = current_time_ms();
         Self {
             runtime,
             route_ops,
@@ -85,7 +86,16 @@ impl StorageOwnerState {
             pending_offloads: super::super::ColdTierOffloadManager::new(offload_priority),
             cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),
             initial_cold_backing_repair_at_ms: AtomicU64::new(0),
-            stale_reclaim_scan_completed_at_ms: AtomicU64::new(0),
+            pending_evictions: parking_lot::Mutex::new(BTreeMap::new()),
+            // Treat startup as the last successful baseline so an idle owner
+            // does not immediately spend an eviction on reconciliation.
+            stale_candidate_reconcile_completed_at_ms: AtomicU64::new(
+                stale_candidate_reconcile_started_at_ms,
+            ),
+            stale_candidate_reconcile_started_at_ms: AtomicU64::new(
+                stale_candidate_reconcile_started_at_ms,
+            ),
+            stale_candidate_reconcile_in_progress: AtomicBool::new(false),
             offload_mode,
             offload_priority,
             owner_cold_restore_flights: super::super::OwnerColdRestoreFlightMap::new(

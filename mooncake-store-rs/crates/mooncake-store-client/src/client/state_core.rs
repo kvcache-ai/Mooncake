@@ -338,7 +338,12 @@ struct StorageOwnerState {
     pending_offloads: ColdTierOffloadManager,
     cold_tier_cleanup: ColdTierCleanupManager,
     initial_cold_backing_repair_at_ms: AtomicU64,
-    stale_reclaim_scan_completed_at_ms: AtomicU64,
+    pending_evictions: Mutex<BTreeMap<AllocationIdentity, PendingEviction>>,
+    // Bounded candidate reconciliation is independent from owner-wide audit.
+    // Normal CLOCK eviction only reaches it for a known stale candidate.
+    stale_candidate_reconcile_completed_at_ms: AtomicU64,
+    stale_candidate_reconcile_started_at_ms: AtomicU64,
+    stale_candidate_reconcile_in_progress: AtomicBool,
     offload_mode: ColdTierOffloadMode,
     offload_priority: ColdTierOffloadPriorityConfig,
     owner_cold_restore_flights: OwnerColdRestoreFlightMap,
@@ -368,6 +373,7 @@ struct ClockEntryId {
     route_key: ObjectKey,
     segment_name: SegmentName,
     segment_offset: u64,
+    allocation_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +383,53 @@ struct ClockEntry {
     hot: bool,
     hot_credit: u8,
     fresh_write: bool,
+}
+
+/// The exact local allocator record an eviction is allowed to release.
+///
+/// Segment names are unique for a runtime incarnation today. A future protocol
+/// that permits same-name segment recreation must add its incarnation here and
+/// to `ReplicaRoute` before treating it as destructively reusable.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct AllocationIdentity {
+    segment_name: SegmentName,
+    offset_bytes: u64,
+    length_bytes: u64,
+    allocation_id: u64,
+}
+
+#[derive(Clone, Debug)]
+struct EvictionToken {
+    identity: AllocationIdentity,
+    kind: PendingEvictionKind,
+    route_key: Option<ObjectKey>,
+    expected_version: RouteVersion,
+    evicted_replica: Option<ReplicaRoute>,
+    clock_id: Option<ClockEntryId>,
+    next_route: Option<ObjectRoute>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingEvictionKind {
+    RouteCas,
+    AllocationCandidate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingEvictionPhase {
+    Prepared,
+    ReadyToCommit,
+    PendingConfirmation,
+    PendingAllocationConfirmation,
+}
+
+#[derive(Clone, Debug)]
+struct PendingEviction {
+    token: EvictionToken,
+    phase: PendingEvictionPhase,
+    confirmation_attempts: u32,
+    next_attempt_at_ms: u64,
+    confirmation_in_progress: bool,
 }
 
 #[derive(Default)]
@@ -391,7 +444,31 @@ struct RouteWritePermit<'a> {
 #[derive(Default)]
 struct LocalAllocatorState {
     segments: BTreeMap<SegmentName, SegmentAllocator>,
-    pending_allocations: BTreeMap<AllocationSpan, u64>,
+    pending_allocations: BTreeMap<AllocationSpan, PendingAllocation>,
+    reconcile_candidate_cursor: Option<AllocationIdentity>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingAllocation {
+    deadline_ms: u64,
+}
+
+struct UntrackedCandidateScan<'a> {
+    tracked_identities: &'a BTreeSet<AllocationIdentity>,
+    legacy_tracked_spans: &'a BTreeSet<AllocationSpan>,
+    pending_evictions: &'a BTreeSet<AllocationIdentity>,
+    now_ms: u64,
+    preferred_segment: Option<&'a SegmentName>,
+    candidate_limit: usize,
+    inspection_limit: usize,
+    start_after: Option<&'a AllocationIdentity>,
+    stop_at: Option<&'a AllocationIdentity>,
+}
+
+#[derive(Default)]
+struct UntrackedCandidateScanProgress {
+    inspected: usize,
+    last_scanned: Option<AllocationIdentity>,
 }
 
 impl LocalAllocatorState {
@@ -440,6 +517,149 @@ impl LocalAllocatorState {
             .values()
             .flat_map(|segment| segment.allocations())
             .collect()
+    }
+
+    fn allocation_id(&self, allocation: &AllocationSpan) -> Option<u64> {
+        self.segments
+            .get(&allocation.segment_name)?
+            .allocation_id(allocation.offset_bytes, allocation.length_bytes)
+    }
+
+    fn allocation_identity(&self, allocation: &AllocationSpan) -> Option<AllocationIdentity> {
+        self.allocation_id(allocation)
+            .map(|allocation_id| AllocationIdentity {
+                segment_name: allocation.segment_name.clone(),
+                offset_bytes: allocation.offset_bytes,
+                length_bytes: allocation.length_bytes,
+                allocation_id,
+            })
+    }
+
+    /// Selects only a bounded number of allocator-owned records that neither
+    /// CLOCK nor an in-flight eviction token currently owns. The cursor moves
+    /// across calls so a large allocator is never converted into a full scan.
+    fn untracked_reconcile_candidates(
+        &mut self,
+        tracked_identities: &BTreeSet<AllocationIdentity>,
+        legacy_tracked_spans: &BTreeSet<AllocationSpan>,
+        pending_evictions: &BTreeSet<AllocationIdentity>,
+        now_ms: u64,
+        preferred_segment: Option<&SegmentName>,
+        limit: usize,
+    ) -> Vec<AllocationIdentity> {
+        const INSPECTION_LIMIT: usize = 256;
+        if limit == 0 {
+            return Vec::new();
+        }
+        let cursor = self.reconcile_candidate_cursor.clone();
+        let mut candidates = Vec::with_capacity(limit);
+        let mut progress = UntrackedCandidateScanProgress::default();
+        self.append_untracked_reconcile_candidates(
+            UntrackedCandidateScan {
+                tracked_identities,
+                legacy_tracked_spans,
+                pending_evictions,
+                now_ms,
+                preferred_segment,
+                candidate_limit: limit,
+                inspection_limit: INSPECTION_LIMIT,
+                start_after: cursor.as_ref(),
+                stop_at: None,
+            },
+            &mut candidates,
+            &mut progress,
+        );
+        if candidates.len() < limit && progress.inspected < INSPECTION_LIMIT && cursor.is_some() {
+            self.append_untracked_reconcile_candidates(
+                UntrackedCandidateScan {
+                    tracked_identities,
+                    legacy_tracked_spans,
+                    pending_evictions,
+                    now_ms,
+                    preferred_segment,
+                    candidate_limit: limit,
+                    inspection_limit: INSPECTION_LIMIT,
+                    start_after: None,
+                    stop_at: cursor.as_ref(),
+                },
+                &mut candidates,
+                &mut progress,
+            );
+        }
+        if progress.last_scanned.is_some() {
+            self.reconcile_candidate_cursor = progress.last_scanned;
+        }
+        candidates
+    }
+
+    fn append_untracked_reconcile_candidates(
+        &self,
+        scan: UntrackedCandidateScan<'_>,
+        candidates: &mut Vec<AllocationIdentity>,
+        progress: &mut UntrackedCandidateScanProgress,
+    ) {
+        let segment_start = scan.start_after.map_or(
+            std::ops::Bound::Unbounded,
+            |cursor| std::ops::Bound::Included(&cursor.segment_name),
+        );
+        for (segment_name, segment) in self
+            .segments
+            .range((segment_start, std::ops::Bound::Unbounded))
+        {
+            if scan
+                .stop_at
+                .is_some_and(|cursor| segment_name > &cursor.segment_name)
+            {
+                return;
+            }
+            let offset_start = scan
+                .start_after
+                .filter(|cursor| cursor.segment_name == *segment_name)
+                .map_or(std::ops::Bound::Unbounded, |cursor| {
+                    std::ops::Bound::Included(cursor.offset_bytes)
+                });
+            for (offset_bytes, allocation) in segment
+                .allocations
+                .range((offset_start, std::ops::Bound::Unbounded))
+            {
+                if progress.inspected >= scan.inspection_limit
+                    || candidates.len() >= scan.candidate_limit
+                {
+                    return;
+                }
+                let identity = AllocationIdentity {
+                    segment_name: segment_name.clone(),
+                    offset_bytes: *offset_bytes,
+                    length_bytes: allocation.length_bytes,
+                    allocation_id: allocation.allocation_id,
+                };
+                if scan.start_after.is_some_and(|cursor| identity <= *cursor) {
+                    continue;
+                }
+                if scan.stop_at.is_some_and(|cursor| identity > *cursor) {
+                    return;
+                }
+                progress.inspected = progress.inspected.saturating_add(1);
+                progress.last_scanned = Some(identity.clone());
+                let span = AllocationSpan {
+                    segment_name: identity.segment_name.clone(),
+                    offset_bytes: identity.offset_bytes,
+                    length_bytes: identity.length_bytes,
+                };
+                if scan
+                    .preferred_segment
+                    .is_some_and(|segment| identity.segment_name != *segment)
+                    || identity.allocation_id == 0
+                    || scan.tracked_identities.contains(&identity)
+                    || scan.legacy_tracked_spans.contains(&span)
+                    || scan.pending_evictions.contains(&identity)
+                    || self.is_pending_allocation(&span, scan.now_ms)
+                {
+                    continue;
+                }
+                candidates.push(identity);
+            }
+        }
     }
 
     fn update_state(
@@ -499,6 +719,17 @@ impl LocalAllocatorState {
         }))
     }
 
+    fn reserve_any_with_pending(
+        &mut self,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+        deadline_ms: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let reservation = self.reserve_any(owner, length_bytes)?;
+        self.mark_pending_reservation(&reservation, deadline_ms);
+        Ok(reservation)
+    }
+
     fn reserve_specific(
         &mut self,
         owner: &ClientRuntimeId,
@@ -511,6 +742,18 @@ impl LocalAllocatorState {
             .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
         let reservation = segment.reserve(owner, segment_name, length_bytes)?;
         registry::record_segment(&segment.announcement);
+        Ok(reservation)
+    }
+
+    fn reserve_specific_with_pending(
+        &mut self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+        deadline_ms: u64,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        let reservation = self.reserve_specific(owner, segment_name, length_bytes)?;
+        self.mark_pending_reservation(&reservation, deadline_ms);
         Ok(reservation)
     }
 
@@ -555,7 +798,9 @@ impl LocalAllocatorState {
                 offset_bytes,
                 length_bytes,
             },
-            deadline_ms,
+            PendingAllocation {
+                deadline_ms,
+            },
         );
     }
 
@@ -584,14 +829,24 @@ impl LocalAllocatorState {
 
     fn pending_allocations(&mut self, now_ms: u64) -> BTreeSet<AllocationSpan> {
         self.pending_allocations
-            .retain(|_, deadline_ms| *deadline_ms > now_ms);
-        self.pending_allocations.keys().cloned().collect()
+            .iter()
+            .filter(|(_, pending)| pending.deadline_ms > now_ms)
+            .map(|(allocation, _)| allocation.clone())
+            .collect()
+    }
+
+    fn is_pending_allocation(&self, allocation: &AllocationSpan, now_ms: u64) -> bool {
+        self.pending_allocations
+            .get(allocation)
+            .is_some_and(|pending| pending.deadline_ms > now_ms)
     }
 
     fn next_pending_deadline_ms(&mut self, now_ms: u64) -> Option<u64> {
         self.pending_allocations
-            .retain(|_, deadline_ms| *deadline_ms > now_ms);
-        self.pending_allocations.values().min().copied()
+            .values()
+            .map(|pending| pending.deadline_ms)
+            .filter(|deadline_ms| *deadline_ms > now_ms)
+            .min()
     }
 
     fn stale_allocations(
@@ -607,30 +862,6 @@ impl LocalAllocatorState {
             .collect()
     }
 
-    fn releasable_stale_candidates(
-        &mut self,
-        candidates: &BTreeSet<AllocationSpan>,
-        live_allocations: &BTreeSet<AllocationSpan>,
-        now_ms: u64,
-    ) -> Vec<AllocationSpan> {
-        let pending = self.pending_allocations(now_ms);
-        candidates
-            .iter()
-            .filter(|allocation| !live_allocations.contains(*allocation))
-            .filter(|allocation| !pending.contains(*allocation))
-            .filter(|allocation| {
-                self.segments
-                    .get(&allocation.segment_name)
-                    .is_some_and(|segment| {
-                        segment.contains_allocation(
-                            allocation.offset_bytes,
-                            allocation.length_bytes,
-                        )
-                    })
-            })
-            .cloned()
-            .collect()
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -672,12 +903,6 @@ impl SegmentAllocator {
         self.cursor_bytes = self.cursor_bytes.max(next.used_bytes);
     }
 
-    fn contains_allocation(&self, offset_bytes: u64, length_bytes: u64) -> bool {
-        self.allocations
-            .get(&offset_bytes)
-            .is_some_and(|stored| stored.length_bytes == length_bytes)
-    }
-
     fn remaining_capacity(&self) -> u64 {
         self.announcement
             .capacity_bytes
@@ -693,6 +918,13 @@ impl SegmentAllocator {
                 length_bytes: allocation.length_bytes,
             })
             .collect()
+    }
+
+    fn allocation_id(&self, offset_bytes: u64, length_bytes: u64) -> Option<u64> {
+        self.allocations
+            .get(&offset_bytes)
+            .filter(|allocation| allocation.length_bytes == length_bytes)
+            .map(|allocation| allocation.allocation_id)
     }
 
     fn take_allocation_id(&mut self) -> Result<u64> {
