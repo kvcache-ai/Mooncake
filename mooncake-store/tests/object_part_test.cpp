@@ -160,9 +160,6 @@ TEST_F(OplogPayloadTest, EveryOplogMetadataSerializerCarriesTheChecksum) {
         test::MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
             service, object_metadata),
         test::MasterServiceTestPeer::
-            SerializeMetadataForOpLogWithoutMemReplicasForTesting(
-                service, object_metadata),
-        test::MasterServiceTestPeer::
             SerializeMetadataForOpLogFromReplicaDescriptorsForTesting(
                 service, object_metadata, {})};
 

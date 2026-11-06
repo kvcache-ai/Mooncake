@@ -63,14 +63,13 @@
 
 namespace mooncake {
 
-class EtcdOpLogStore;
 class ShardAllocator;
 class DfsAllocatorInterface;
 class ImmutableBucketAllocator;
+class KvcsCapacityProvider;
 
 // Forward declarations
 class AllocationStrategy;
-class EvictionStrategy;
 class HaKvBackend;
 class HttpMetadataServer;
 class OpLogBatchStorage;
@@ -360,22 +359,15 @@ class MasterService {
      * @param segment_name The name of the segment (storage device) to clear
      * from. If empty, clears replicas from all segments for the given
      * client_id.
+     * @param tenant_id The tenant that owns the keys.
      * @return An expected object containing a vector of successfully cleared
      * keys on success, or an ErrorCode on failure. Only successfully
      * cleared keys are included in the result.
      */
-    // Existing key-only overload (signature unchanged): kept for legacy
-    // callers; delegates with "default".
-    auto BatchReplicaClear(const std::vector<std::string>& object_keys,
-                           const UUID& client_id,
-                           const std::string& segment_name)
-        -> tl::expected<std::vector<std::string>, ErrorCode>;
-
-    // New: tenant-aware overload
-    auto BatchReplicaClear(const std::vector<std::string>& object_keys,
-                           const UUID& client_id,
-                           const std::string& segment_name,
-                           const std::string& tenant_id)
+    auto BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name,
+        const std::string& tenant_id = std::string(TenantId::kDefaultValue))
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
@@ -594,7 +586,8 @@ class MasterService {
      * caller's query and this call is left untouched.
      * @param client_id The client performing the eviction
      * @param key The object key whose disk replica was evicted
-     * @param replica_type DISK or LOCAL_DISK
+     * @param replica_type DISK, LOCAL_DISK, or DFS. DFS is accepted only for
+     * a KVCS object-storage replica through this conditional API.
      * @param expected_replica_id The replica id the caller failed on
      * @return true if the replica was evicted, false if the precondition did
      * not hold (the replica was replaced or is already gone), or an error
@@ -911,13 +904,6 @@ class MasterService {
         const std::vector<std::string>& targets);
 
     /**
-     * @brief Submit a dynamic replica action proposal after Master-side
-     * hotness admission.
-     */
-    tl::expected<ReplicaActionLease, ErrorCode> SubmitReplicaActionProposal(
-        const ReplicaActionProposal& proposal);
-
-    /**
      * @brief Create a move task to move an object's replica from source segment
      * to target segment
      * @return Move task ID on success, ErrorCode on failure
@@ -991,6 +977,75 @@ class MasterService {
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     /**
+     * @brief Restore lifecycle state machine (RFC #4700, slice 1).
+     *
+     * The machine below is the one proposed by the RFC:
+     *
+     *   Constructed -> Recovering -> Ready -> Serving
+     *        |              |           (non-HA: Constructed -> Ready)
+     *        +----------> Failed
+     *
+     * The absence of a Serving -> Recovering edge is a proposed constraint,
+     * not an established API guarantee. Slice 1 wires the transitions that
+     * exist today and uses the state to pause business workers while a
+     * promotion restore is in flight; the master_state_mutex_ stays in
+     * place, so this slice changes no locking behavior. The Stopping state
+     * and the RPC-level admission gate land with the follow-up slices that
+     * actually remove the global lock from ordinary paths.
+     *
+     * Serving is a commitment about restore, not an observation about
+     * reachability. It marks the point after which this instance refuses
+     * restore; it does NOT mean the RPC endpoint is already accepting
+     * requests. Each entry point commits at the moment its instance stops
+     * needing restore, which lands on both sides of the publish boundary:
+     *
+     *   non-HA master    Constructed -> Ready -> Serving, then register RPC.
+     *                    There is no restore path, so committing early is free.
+     *   EmbeddedMaster   Constructed -> Ready -> Serving, then register RPC.
+     *                    Same reasoning, aligned with the non-HA path so that
+     *                    the contract does not depend on the entry point.
+     *   HA supervisor    promotion restore -> Ready, publish readiness, then
+     *                    Ready -> Serving. The commit is last because the term
+     *                    is only committed once readiness is out; a failed
+     *                    publication destroys the instance (release_service)
+     *                    rather than reusing it, so the retry builds a fresh
+     *                    service and no Serving -> Recovering edge is needed.
+     *
+     * The invariant the follow-up admission work can rely on is the same on
+     * every path: once Serving is observed, restore cannot happen for this
+     * instance, so an admission decision taken in that state needs no
+     * restore-window reasoning. Callers that need "is it reachable yet" must
+     * consult the transport, not this state machine.
+     */
+    enum class RestoreLifecycleState {
+        kConstructed,  // components built; workers admitted (see below)
+        kRecovering,   // HA promotion restore in flight; workers paused
+        kReady,        // restore + durable repair done; serving not activated
+        kServing,      // committed to normal operation; restore refused
+        kFailed,       // restore failed; the candidate must be destroyed
+    };
+
+    /// Current lifecycle state; safe to call from any thread.
+    RestoreLifecycleState GetRestoreLifecycleState() const;
+
+    /**
+     * @brief Non-HA initialization step: Constructed -> Ready.
+     * The non-HA and embedded paths have no restore, so they open the
+     * lifecycle directly. Refuses (logs) any other source state.
+     */
+    void MarkReadyForServing();
+
+    /**
+     * @brief Activate serving: Ready -> Serving.
+     * The commit point: after this, restore is refused for the lifetime of
+     * this instance. Whether it runs before or after the transport starts
+     * accepting requests depends on the entry point -- see the contract
+     * above. Refuses (logs) any other source state: serving must never be
+     * activated on a service whose restore did not succeed.
+     */
+    void ActivateServing();
+
+    /**
      * @brief Query the status of a task
      * @return Task basic info
      */
@@ -1042,7 +1097,25 @@ class MasterService {
     void StopHttpMetadataCleanup();
 
    private:
+    // Lifecycle wrapper around the restore implementation: performs the
+    // {Constructed, Ready, Failed} -> Recovering -> {Ready, Failed}
+    // transitions so a promotion restore has an explicit lifecycle
+    // bookkeeping point (RFC #4700, slice 1). Entry from Serving is
+    // refused per the RFC's proposed no-cycles constraint; the existing
+    // restore retry semantics (replacement restore from Ready or Failed)
+    // are unchanged and remain covered by the HA tests.
     tl::expected<void, ErrorCode> RestoreFromStandbyState(
+        const std::vector<StandbyObjectEntry>* legacy_objects,
+        const StandbyMetadataStore* metadata_store,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments,
+        size_t chunk_object_count,
+        std::optional<ReplicaID> expected_max_replica_id,
+        const WeightMetadataSnapshot* legacy_weight_metadata);
+
+    // The restore implementation itself; entered only through
+    // RestoreFromStandbyState above.
+    tl::expected<void, ErrorCode> RestoreFromStandbyStateCore(
         const std::vector<StandbyObjectEntry>* legacy_objects,
         const StandbyMetadataStore* metadata_store,
         uint64_t initial_oplog_sequence_id,
@@ -1423,6 +1496,7 @@ class MasterService {
     auto InsertMetadata(MetadataAccessorRW& accessor, const UUID& client_id,
                         uint64_t value_length, const ReplicateConfig& config,
                         const std::string& group_id,
+                        const std::string& residency_affinity_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
                         std::vector<Replica>&& replicas,
@@ -1438,6 +1512,7 @@ class MasterService {
         MetadataAccessorRW& accessor, const UUID& client_id,
         uint64_t value_length, const ReplicateConfig& config,
         const std::string& writer_host_id, const std::string& group_id,
+        const std::string& residency_affinity_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         std::optional<std::chrono::system_clock::time_point>
@@ -1452,6 +1527,7 @@ class MasterService {
         // The writer's host, for same-node placement; empty when unused.
         std::string writer_host_id;
         std::string group_id;
+        std::string residency_affinity_id;
     };
 
     // One part's write, with the key held and the tenant admitted. The batch
@@ -1466,11 +1542,14 @@ class MasterService {
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // One part's End, with the key held: that part's replicas become complete
-    // and its write closes.
-    auto PutEndPartLocked(MetadataAccessorRW& accessor, const UUID& client_id,
-                          const ObjectMeta& object_meta,
-                          ReplicaType replica_type, uint32_t part_index,
-                          std::optional<std::vector<ReplicaID>> replica_ids)
+    // and its write closes. `held_import_write` takes the group's import write
+    // guard so that it outlives the object-level End, whose durable record is
+    // the write the guard covers.
+    auto PutEndPartLocked(
+        MetadataAccessorRW& accessor, const UUID& client_id,
+        const ObjectMeta& object_meta, ReplicaType replica_type,
+        uint32_t part_index, std::optional<std::vector<ReplicaID>> replica_ids,
+        std::optional<WeightStoreManager::ImportWriteGuard>* held_import_write)
         -> tl::expected<void, ErrorCode>;
 
     // What the object as a whole owes the Ends just run, asked once per object:
@@ -1570,6 +1649,9 @@ class MasterService {
     void RunDfsEviction();
     void RunShardDfsEviction();
     void RunBucketDfsEviction();
+    void InitKvcsDfsEviction();
+    void RefreshKvcsDfsUsage();
+    void RunKvcsDfsEviction(const DfsUsageSnapshot& usage);
     bool RunBucketDfsEvictionInternal(bool force_one);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
@@ -1612,6 +1694,7 @@ class MasterService {
     DeadlineScheduler<GracefulUnmountDeadlineRecord>
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
+    BackgroundWorker kvcs_capacity_refresh_worker_;
     const bool enable_async_segment_cleanup_;
 
     /**
@@ -1677,6 +1760,8 @@ class MasterService {
     // starts.
     struct MemoryEviction;
     std::unique_ptr<MemoryEviction> memory_eviction_;
+    struct KvcsDfsEviction;
+    std::unique_ptr<KvcsDfsEviction> kvcs_dfs_eviction_;
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -1972,13 +2057,9 @@ class MasterService {
     const uint32_t nof_heartbeat_failures_threshold_;
 
     struct NoFHeartbeatState {
-        UUID owner_client_id{0, 0};
-        std::string segment_name;
-        std::string te_endpoint;
         std::chrono::steady_clock::time_point next_probe_at{};
         std::chrono::steady_clock::time_point last_success_at{};
         uint32_t consecutive_failures{0};
-        std::string last_error_reason;
     };
     std::mutex nof_heartbeat_mutex_;
     std::unordered_map<UUID, NoFHeartbeatState, boost::hash<UUID>>
@@ -2107,6 +2188,14 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
+    bool use_kvcs_{false};
+    std::unique_ptr<KvcsCapacityProvider> dfs_kvcs_capacity_provider_;
+    std::chrono::seconds dfs_kvcs_capacity_check_interval_{5};
+    bool dfs_kvcs_eviction_enabled_{false};
+    double dfs_kvcs_eviction_high_watermark_{0.9};
+    double dfs_kvcs_eviction_low_watermark_{0.7};
+    mutable std::mutex dfs_kvcs_usage_mutex_;
+    DfsUsageSnapshot dfs_kvcs_usage_;
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
     ShardAllocator* shard_allocator_{nullptr};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
@@ -2124,6 +2213,24 @@ class MasterService {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     mutable std::shared_mutex master_state_mutex_;
+
+    // Restore lifecycle state (RFC #4700, slice 1). Declared next to
+    // master_state_mutex_ because the follow-up slices replace that lock's
+    // restore-window protection with this state machine. kConstructed keeps
+    // business workers admitted so direct construction in tests keeps the
+    // constructor-starts-workers behavior; tightening that to "paused until
+    // activation" is part of the later slices once callers carry explicit
+    // activation. The embedded master no longer relies on this: it commits
+    // Constructed -> Ready -> Serving before it serves RPCs.
+    std::atomic<RestoreLifecycleState> lifecycle_state_{
+        RestoreLifecycleState::kConstructed};
+
+    // True in every lifecycle state except the restore windows
+    // (kRecovering / kFailed). Background workers that mutate business
+    // metadata consult this at the top of each loop iteration so a
+    // promotion restore never races them, independent of
+    // master_state_mutex_.
+    bool AdmitsBusinessWorkers() const;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
@@ -2200,8 +2307,6 @@ class MasterService {
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
 
-    tl::expected<void, ErrorCode> ValidateDrainRequest(
-        const CreateDrainJobRequest& request);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
         ScopedSegmentAccess& segment_access,
         const CreateDrainJobRequest& request);
@@ -2343,8 +2448,6 @@ class MasterService {
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& keep) const;
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
-    std::string SerializeMetadataForOpLogWithoutMemReplicas(
-        const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas) const;
@@ -2418,27 +2521,20 @@ class MasterService {
         const ObjectMetadata& metadata) const;
 
     /**
-     * Segment lifecycle persist helper. Tries to durably persist the
-     * SEGMENT_MOUNT / SEGMENT_UNMOUNT entry up-front; on failure enqueues
-     * the same OpLogEntry (with its already-allocated sequence_id) for
-     * background retry so the standby segment registry eventually
-     * converges. Suitable for paths where the local segment commit has
-     * already happened (UnmountSegment) and rolling back is impossible.
+     * Appends a SEGMENT_MOUNT / SEGMENT_UNMOUNT entry without waiting for it
+     * to become durable. The local segment change has already happened and
+     * cannot be rolled back, so a failed append is only logged; nothing
+     * retries it.
      */
-    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                        const std::string& key,
-                                        const std::string& payload);
-    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                        const TenantId& tenant_id,
-                                        const std::string& key,
-                                        const std::string& payload);
+    void PersistSegmentOpForHA(const char* why, OpType type,
+                               const std::string& key,
+                               const std::string& payload);
 
     /**
-     * Helper to persist REMOVE OpLog for a key with strong-consistency.
-     * @return OK on success, error on persist failure (caller must skip erase)
+     * Appends a REMOVE entry for the key, without waiting for it to become
+     * durable.
+     * @return OK on success, error on append failure (caller must skip erase)
      */
-    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
-                                                     const std::string& key);
     tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
                                                      const TenantId& tenant_id,
                                                      const std::string& key);

@@ -364,6 +364,10 @@ void ActivateServingState(MasterAdminServer& admin_server,
     admin_server.SetServiceAvailable(true);
     SetRuntimeState(admin_server, MasterRuntimeState::kServing);
     label_reconciler.SetLeader(true);
+    // RFC #4700 slice 1: the promotion restore already moved the service
+    // Constructed -> Recovering -> Ready; this is the Ready -> Serving
+    // edge, taken only after readiness is published.
+    service->ActivateServing();
 }
 
 void DeactivateServingState(MasterAdminServer& admin_server,

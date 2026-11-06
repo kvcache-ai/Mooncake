@@ -83,6 +83,20 @@ Status CudaPlatform::free(void* ptr, size_t size) {
     return Status::OK();
 }
 
+Status CudaPlatform::allocatePinnedHost(void** pptr, size_t size) {
+    // Portable, so copies against any device's memory run as DMA. Like any
+    // CUDA runtime call this initializes the calling thread's current device
+    // if it has no context yet.
+    CHECK_CUDA(cudaHostAlloc(pptr, size, cudaHostAllocPortable));
+    return Status::OK();
+}
+
+Status CudaPlatform::freePinnedHost(void* ptr, size_t size) {
+    (void)size;
+    CHECK_CUDA(cudaFreeHost(ptr));
+    return Status::OK();
+}
+
 Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // Use cudaMemcpyAsync with a non-blocking stream instead of cudaMemcpy(),
     // as the latter relies on the legacy default stream and can introduce

@@ -230,6 +230,28 @@ target_include_directories(transfer_engine_config_override_test
 add_test(NAME transfer_engine_config_override_test
          COMMAND transfer_engine_config_override_test)
 
+# Platform::getLoader is a process-wide singleton. Keep this regression in a
+# dedicated CPU-only process so its first call always exercises the null-config
+# initialization path without probing accelerator hardware.
+if(NOT USE_CUDA
+   AND NOT USE_HIP
+   AND NOT USE_SUNRISE
+   AND NOT USE_ASCEND
+   AND NOT USE_ASCEND_DIRECT
+   AND NOT USE_MEMFABRIC
+   AND NOT USE_TPU
+   AND NOT USE_MLU
+   AND NOT USE_XPU)
+  add_executable(tent_platform_default_config_test
+                 platform_default_config_test.cpp)
+  target_link_libraries(tent_platform_default_config_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_platform_default_config_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_platform_default_config_test
+           COMMAND tent_platform_default_config_test)
+endif()
+
 add_executable(tent_tcp_transport_test tcp_transport_test.cpp)
 target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
                                                       tent_link_group)
@@ -448,7 +470,9 @@ if(TARGET tent_xport_gds)
     "-Wl,--wrap=cuFileBatchIOCancel"
     "-Wl,--wrap=cuFileBatchIOSubmit"
     "-Wl,--wrap=cuFileHandleRegister"
-    "-Wl,--wrap=cuFileHandleDeregister")
+    "-Wl,--wrap=cuFileHandleDeregister"
+    "-Wl,--wrap=cuFileBufRegister"
+    "-Wl,--wrap=cuFileBufDeregister")
   target_include_directories(tent_gds_transport_status_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_gds_transport_status_test
@@ -798,6 +822,18 @@ if(USE_XPU)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_xpu_ipc_process_test COMMAND tent_xpu_ipc_process_test)
   set_tests_properties(tent_xpu_ipc_process_test PROPERTIES TIMEOUT 300)
+
+  # XPU <-> file through GDS on the cuFile-compatible library. Skips unless
+  # MC_TENT_XPU_GDS_DIR names a directory on a file system the library supports.
+  if(USE_XPU_GDS)
+    add_executable(tent_xpu_gds_file_test xpu/xpu_gds_file_test.cpp)
+    target_link_libraries(tent_xpu_gds_file_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+    target_include_directories(tent_xpu_gds_file_test
+                               PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    add_test(NAME tent_xpu_gds_file_test COMMAND tent_xpu_gds_file_test)
+    set_tests_properties(tent_xpu_gds_file_test PROPERTIES TIMEOUT 300)
+  endif()
 endif()
 
 # NOT registered via add_test: the test needs a real CUDA device (it exports a

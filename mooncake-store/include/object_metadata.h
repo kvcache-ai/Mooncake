@@ -93,9 +93,11 @@ struct ObjectMetadata {
     ObjectMetadata(
         size_t part_count, TenantId tenant_id_, std::string user_key_,
         std::string group_id_, ObjectDataType data_type_, bool hard_pinned_,
-        std::optional<std::chrono::system_clock::time_point> soft_pin_deadline_)
+        std::optional<std::chrono::system_clock::time_point> soft_pin_deadline_,
+        std::string residency_affinity_id_ = "")
         : data_type(data_type_),
           group_id(std::move(group_id_)),
+          residency_affinity_id(std::move(residency_affinity_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
           soft_pin_timeout(std::move(soft_pin_deadline_)),
@@ -117,6 +119,7 @@ struct ObjectMetadata {
 
     const ObjectDataType data_type{ObjectDataType::UNKNOWN};
     const std::string group_id;
+    const std::string residency_affinity_id;
     const TenantId tenant_id;
     const std::string user_key;
 

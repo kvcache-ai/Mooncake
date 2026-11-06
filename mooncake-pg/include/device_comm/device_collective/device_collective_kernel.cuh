@@ -4,59 +4,63 @@
 #include <cooperative_groups.h>
 #include <cuda/atomic>
 
+#include "common_types.h"
 #include "device_comm/device_utils/d2h_request_slot.cuh"
-#include "device_comm/device_utils/device_assert.cuh"
+#include "pg_assert.h"
 #include "device_comm/device_collective/device_control_update.cuh"
 #include "device_comm/device_collective/device_collective_types.cuh"
 #include "device_comm/device_transfer/transfer_lane.cuh"
 
 namespace mooncake {
 
-struct CollectivePreparationResult {
-    InGroupRank failed_rank = kInvalidInGroupRank;
+enum class CollectiveExecution { SingleCTA, MultiCTA };
 
-    [[nodiscard]] __device__ __forceinline__ bool succeeded() const {
-        return failed_rank == kInvalidInGroupRank;
+namespace detail {
+
+struct NoCollectivePreparation {
+    __device__ __forceinline__ CollectiveStepResult operator()() const {
+        return {};
     }
 };
 
-// An algorithm describes only the peers whose control state must match before
-// communication starts. The common startup path owns the synchronization
-// procedure itself.
-struct ViewEpochPeer {
-    GlobalRank global_rank = kInvalidGlobalRank;
-    InGroupRank in_group_rank = kInvalidInGroupRank;
-    uint64_t signal_offset = 0;
-};
+__device__ __forceinline__ void drainCollectiveTransfers(
+    const DeviceTransferHandle& handle, RemotePeerList remote_peers) {
+    PG_ASSERT(remote_peers.size() <= kMaxNumRanks);
+    if (remote_peers.size() == 0) return;
+    GlobalRank transfer_peers[kMaxNumRanks];
+    uint32_t peer_index = 0;
+    for (const auto& peer : remote_peers) {
+        transfer_peers[peer_index++] = peer.global_rank;
+    }
+    drainTransfers(handle, transfer_peers, remote_peers.size());
+}
 
-// Publish this invocation's View epoch to every required peer before waiting
-// for any peer. This ordering prevents peers from forming a startup cycle.
-[[nodiscard]] __device__ __forceinline__ CollectivePreparationResult
+// Publish to all required peers before waiting, avoiding a startup cycle.
+[[nodiscard]] __device__ __forceinline__ CollectiveStepResult
 synchronizeCollectiveViewEpoch(uint64_t view_epoch, uint64_t timeout_ticks,
                                const uint64_t* view_epoch_signals,
-                               const ViewEpochPeer* peers, uint32_t peer_count,
+                               RemotePeerList remote_peers,
                                const TransferLane& lane,
                                cooperative_groups::thread_block block) {
-    PG_DEVICE_ASSERT(view_epoch != kInvalidViewEpoch);
-    PG_DEVICE_ASSERT(view_epoch_signals);
-    PG_DEVICE_ASSERT(peers || peer_count == 0);
+    PG_ASSERT(view_epoch != kInvalidViewEpoch);
+    PG_ASSERT(view_epoch_signals);
 
     // Phase 1 publishes to every peer before any wait begins.
     InGroupRank failed_rank = kInvalidInGroupRank;
-    for (uint32_t index = 0; index < peer_count; ++index) {
-        const auto& peer = peers[index];
-        PG_DEVICE_ASSERT(peer.global_rank != kInvalidGlobalRank);
-        PG_DEVICE_ASSERT(peer.in_group_rank != kInvalidInGroupRank);
+    for (const auto& peer : remote_peers) {
+        const auto rank = peer.in_group_rank;
+        PG_ASSERT(rank >= 0 && static_cast<uint32_t>(rank) < kMaxNumRanks);
+        PG_ASSERT(peer.global_rank != kInvalidGlobalRank);
 
         SignalRequest request;
         request.signal.kind = SignalAction::Kind::Set;
-        request.signal.remote_offset = peer.signal_offset;
+        request.signal.remote_offset = peer.view_epoch_signal_offset;
         request.signal.set.value = view_epoch;
         request.timeout_ticks = timeout_ticks;
         if (lane.signal(peer.global_rank, request, block).wait(block) !=
                 TransferResult::Succeeded &&
             failed_rank == kInvalidInGroupRank) {
-            failed_rank = peer.in_group_rank;
+            failed_rank = rank;
         }
     }
     if (failed_rank != kInvalidInGroupRank) {
@@ -64,41 +68,44 @@ synchronizeCollectiveViewEpoch(uint64_t view_epoch, uint64_t timeout_ticks,
     }
 
     // Phase 2 waits on the local signal owned by each peer.
-    for (uint32_t index = 0; index < peer_count; ++index) {
-        const auto& peer = peers[index];
+    for (const auto& peer : remote_peers) {
+        const auto rank = peer.in_group_rank;
         SignalWaitRequest request;
-        request.local_ptr = view_epoch_signals + peer.in_group_rank;
+        request.local_ptr = view_epoch_signals + rank;
         request.least = view_epoch;
         request.timeout_ticks = timeout_ticks;
         const auto ready = lane.waitSignal(request, block);
         if (ready.status != SignalWaitStatus::Reached ||
             ready.observed != view_epoch) {
-            return {.failed_rank = peer.in_group_rank};
+            return {.failed_rank = rank};
         }
     }
     return {};
 }
 
-// Elect the first resident CTA to apply one pending control update, then check
-// the updated Plan's required view-epoch peers. Every other CTA stays outside
-// algorithm state until preparation succeeds or reports one failed peer.
-//
-// The first CTA to reach this function becomes the startup leader. CUDA does
-// not guarantee that block 0 becomes resident first; if resident CTAs waited
-// for an unscheduled block 0, they could occupy every available CTA slot and
-// prevent block 0 from ever running.
-//
-// InvocationState is reused across kernel launches. StrongStream guarantees
-// that only one collective invocation uses it at a time.
-template <typename Plan, typename PrepareAlgorithm>
-[[nodiscard]] __device__ __forceinline__ CollectivePreparationResult
-prepareCollectiveInvocation(PlanSlot<Plan>* plan_slot,
-                            const uint64_t* view_epoch_signals,
-                            InvocationState* invocation,
-                            ControlMailbox* control_mailbox,
-                            uint32_t lane_index,
-                            PrepareAlgorithm prepare_algorithm,
-                            cooperative_groups::thread_block block) {
+// Apply control updates before the startup CTA reads algorithm state.
+template <typename Plan, typename Prepare>
+[[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+prepareCollectiveInvocation(Plan* plan,
+                            const CollectiveRuntimeBindings& collective,
+                            cooperative_groups::thread_block block,
+                            Prepare prepare) {
+    PG_ASSERT(plan && collective.control_mailbox);
+    if (block.thread_rank() == 0)
+        applyPendingControlUpdate(
+            &collective.control_mailbox->control_update_slot);
+    block.sync();
+    PG_ASSERT(plan->status == DevicePlanStatus::Ready);
+    return prepare();
+}
+
+template <typename Plan, typename Prepare>
+[[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+beginMultiCTAInvocation(Plan* plan, const CollectiveRuntimeBindings& collective,
+                        cooperative_groups::thread_block block,
+                        Prepare prepare) {
+    auto* const invocation = collective.invocation_state;
+    PG_ASSERT(invocation);
     __shared__ uint32_t is_startup_leader;
     if (block.thread_rank() == 0) {
         cuda::atomic_ref<uint32_t, cuda::thread_scope_device>
@@ -110,14 +117,8 @@ prepareCollectiveInvocation(PlanSlot<Plan>* plan_slot,
     block.sync();
 
     if (is_startup_leader != 0) {
-        if (block.thread_rank() == 0) {
-            applyPendingControlUpdate(&control_mailbox->control_update_slot);
-        }
-        block.sync();
-
-        PG_DEVICE_ASSERT(plan_slot->status == DevicePlanStatus::Ready);
-        const auto preparation = prepare_algorithm(
-            plan_slot->plan, view_epoch_signals, lane_index, block);
+        const auto preparation =
+            prepareCollectiveInvocation(plan, collective, block, prepare);
         block.sync();
         if (block.thread_rank() == 0) {
             invocation->failed_rank = preparation.failed_rank;
@@ -137,17 +138,28 @@ prepareCollectiveInvocation(PlanSlot<Plan>* plan_slot,
     return {.failed_rank = invocation->failed_rank};
 }
 
-// Completes this channel after success or a locally detected failure. Only a
-// detecting channel supplies a failed rank; the first detector records the
-// failure metadata.
-template <typename DrainTransfers>
-__device__ __noinline__ void completeChannel(
-    InvocationState* invocation, ControlMailbox* control_mailbox,
-    DrainTransfers drain_transfers, cooperative_groups::thread_block block,
+// One thread recovers after every CTA has stopped using the old Plan.
+static __device__ __noinline__ void recoverCollectiveFailure(
+    const CollectiveRuntimeBindings& collective, RemotePeerList remote_peers,
+    InGroupRank failed_rank, uint64_t failed_hint_address) {
+    drainCollectiveTransfers(*collective.transfer_handle, remote_peers);
+    collective.control_mailbox->recovery
+        .submit(CollectiveFailureReport{
+            .failed_rank = failed_rank,
+            .failed_hint_address = failed_hint_address,
+        })
+        .wait();
+    applyPinnedControlUpdate(&collective.control_mailbox->control_update_slot);
+}
+
+// Every CTA arrives once; the last arrival owns recovery and state reset.
+static __device__ __noinline__ void finishMultiCTAInvocation(
+    const CollectiveRuntimeBindings& collective, RemotePeerList remote_peers,
+    cooperative_groups::thread_block block,
     InGroupRank detected_failed_rank = kInvalidInGroupRank,
     int32_t* failed_ranks_hint = nullptr) {
-    // No thread may publish channel completion while another thread in the CTA
-    // can still access the current Plan or algorithm buffers.
+    auto* const invocation = collective.invocation_state;
+    // Finish all accesses to the current Plan before publishing completion.
     block.sync();
     if (block.thread_rank() == 0) {
         cuda::atomic_ref<uint32_t, cuda::thread_scope_device> failure_latched(
@@ -179,17 +191,9 @@ __device__ __noinline__ void completeChannel(
             completion_arrival_count.fetch_add(1, cuda::memory_order_acq_rel);
         if (previous_arrival_count + 1 == gridDim.x) {
             if (failure_latched.load(cuda::memory_order_relaxed) != 0) {
-                // A failed channel may leave payload transfers outstanding.
-                // Drain before recovery can replace algorithm state.
-                drain_transfers();
-
-                control_mailbox->recovery
-                    .submit(CollectiveFailureReport{
-                        .failed_rank = invocation->failed_rank,
-                        .failed_hint_address = invocation->failed_hint_address,
-                    })
-                    .wait();
-                applyPinnedControlUpdate(&control_mailbox->control_update_slot);
+                recoverCollectiveFailure(collective, remote_peers,
+                                         invocation->failed_rank,
+                                         invocation->failed_hint_address);
             }
 
             // Every CTA has finished using these fields, and StrongStream
@@ -202,6 +206,47 @@ __device__ __noinline__ void completeChannel(
         }
     }
     block.sync();
+}
+
+}  // namespace detail
+
+// Run preparation on the startup CTA and share its result with every CTA.
+// StrongStream serializes invocations; preparation chooses the protocol sync.
+template <CollectiveExecution Execution, typename Plan,
+          typename Prepare = detail::NoCollectivePreparation>
+[[nodiscard]] __device__ __forceinline__ CollectiveStepResult
+beginCollectiveInvocation(Plan* plan,
+                          const CollectiveRuntimeBindings& collective,
+                          cooperative_groups::thread_block block,
+                          Prepare prepare = {}) {
+    if constexpr (Execution == CollectiveExecution::SingleCTA) {
+        return detail::prepareCollectiveInvocation(plan, collective, block,
+                                                   prepare);
+    } else {
+        return detail::beginMultiCTAInvocation(plan, collective, block,
+                                               prepare);
+    }
+}
+
+// Called once per CTA after its last access to algorithm state.
+template <CollectiveExecution Execution>
+__device__ __forceinline__ void finishCollectiveInvocation(
+    const CollectiveRuntimeBindings& collective, RemotePeerList remote_peers,
+    cooperative_groups::thread_block block,
+    InGroupRank detected_failed_rank = kInvalidInGroupRank,
+    int32_t* failed_ranks_hint = nullptr) {
+    if constexpr (Execution == CollectiveExecution::SingleCTA) {
+        if (detected_failed_rank == kInvalidInGroupRank) return;
+        block.sync();
+        if (block.thread_rank() == 0)
+            detail::recoverCollectiveFailure(
+                collective, remote_peers, detected_failed_rank,
+                reinterpret_cast<uint64_t>(failed_ranks_hint));
+    } else {
+        detail::finishMultiCTAInvocation(collective, remote_peers, block,
+                                         detected_failed_rank,
+                                         failed_ranks_hint);
+    }
 }
 
 }  // namespace mooncake

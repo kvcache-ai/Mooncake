@@ -44,6 +44,10 @@ constexpr const char* kStoreKey = "store";
 constexpr const char* kFabricKey = "fabric_memory";
 constexpr const char* kFabricFlatPrefix = "fabric_memory.";
 constexpr const char* kRocePrefix = "roce:";
+constexpr const char* kCommResourceConfigKey = "comm_resource_config";
+constexpr const char* kNicTopoPathKey = "nic_topo_path";
+constexpr const char* kNicTopoPathFlatKey =
+    "comm_resource_config.nic_topo_path";
 
 using json = nlohmann::json;
 
@@ -152,10 +156,77 @@ std::string ResolveGlobalResourceConfig(const std::string& raw,
     return normal.dump();
 }
 
+// True when comm_resource_config.nic_topo_path is set to a non-empty string,
+// accepting either the flat key or the nested comm_resource_config object.
+// An explicit empty string counts as "not configured" (matching HIXL).
+bool NicTopoPathIsSet(const json& root) {
+    if (!root.is_object()) {
+        return false;
+    }
+    auto flat = root.find(kNicTopoPathFlatKey);
+    if (flat != root.end() && flat->is_string() &&
+        !flat->get<std::string>().empty()) {
+        return true;
+    }
+    auto comm = root.find(kCommResourceConfigKey);
+    if (comm != root.end() && comm->is_object()) {
+        auto nested = comm->find(kNicTopoPathKey);
+        if (nested != comm->end() && nested->is_string() &&
+            !nested->get<std::string>().empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 bool ParseEnvEnabled(const char* name) {
     return EnvFlagIsOne(std::getenv(name));
+}
+
+std::string InjectNicTopoPathFromCustomTopoTent(
+    const std::string& resolved_config, const std::string& custom_topo_json) {
+    // TE support for configuring HIXL's comm_resource_config.nic_topo_path:
+    // the custom topology path is written into it when it is empty.
+    if (custom_topo_json.empty()) {
+        return resolved_config;
+    }
+
+    json root;
+    if (resolved_config.empty()) {
+        root = json::object();
+    } else {
+        root = json::parse(resolved_config, nullptr, false);
+        if (root.is_discarded() || !root.is_object()) {
+            LOG(WARNING)
+                << "Cannot inject custom topology path into "
+                   "comm_resource_config.nic_topo_path: GlobalResourceConfig "
+                   "is not a JSON object";
+            return resolved_config;
+        }
+    }
+
+    // An explicitly configured nic_topo_path always wins over the custom
+    // topology path.
+    if (NicTopoPathIsSet(root)) {
+        return resolved_config;
+    }
+
+    // Prefer the nested form when comm_resource_config already exists so HIXL
+    // sees a single representation; drop any stale flat key in that case
+    // (mirrors WithHixlListenPort).
+    auto comm = root.find(kCommResourceConfigKey);
+    if (comm != root.end() && comm->is_object()) {
+        (*comm)[kNicTopoPathKey] = custom_topo_json;
+        root.erase(kNicTopoPathFlatKey);
+    } else {
+        root[kNicTopoPathFlatKey] = custom_topo_json;
+    }
+    LOG(INFO) << "[AscendTE] comm_resource_config.nic_topo_path is empty, "
+                 "injecting custom topology path: "
+              << custom_topo_json;
+    return root.dump();
 }
 
 AscendDirectOptions LoadAscendDirectOptions(
@@ -240,6 +311,14 @@ AscendDirectOptions LoadAscendDirectOptions(
 
     options.roce_mode = ParseEnvEnabled("HCCL_INTRA_ROCE_ENABLE") ||
                         HasRoceProtocolDesc(resolved);
+    // TE support for configuring HIXL's nic_topo_path from the custom topology
+    // path (topology/custom_json_path). HIXL decides whether to consume it
+    // based on protocol_desc.
+    const std::string custom_topo_json =
+        conf ? conf->get("topology/custom_json_path", std::string())
+             : std::string();
+    options.global_resource_config = InjectNicTopoPathFromCustomTopoTent(
+        options.global_resource_config, custom_topo_json);
     return options;
 }
 

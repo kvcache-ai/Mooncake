@@ -1355,8 +1355,12 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     const std::string endpoint = "checksum_restore_segment";
     auto legacy_object = MakeStandbyObject("checksum_legacy_key", endpoint);
     legacy_object.metadata.object_checksum = 0x1234;
+    legacy_object.metadata.session_id = "legacy-session";
+    legacy_object.metadata.residency_affinity_id = "legacy-affinity";
     auto batch_object = MakeStandbyObject("checksum_batch_key", endpoint);
     batch_object.metadata.object_checksum = 0;
+    batch_object.metadata.session_id = "batch-session";
+    batch_object.metadata.residency_affinity_id = "batch-affinity";
 
     MasterService legacy_service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -1372,6 +1376,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     const ObjectPart* legacy_part = legacy_accessor.Get().GetPart(0);
     ASSERT_NE(legacy_part, nullptr);
     EXPECT_EQ(legacy_part->checksum(), std::optional<uint64_t>(0x1234));
+    EXPECT_EQ("legacy-session", legacy_accessor.Get().WriteSessionId());
+    EXPECT_EQ("legacy-affinity", legacy_accessor.Get().residency_affinity_id);
 
     auto source = std::make_unique<StandbyMetadataStore>();
     ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
@@ -1393,6 +1399,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     const ObjectPart* batch_part = batch_accessor.Get().GetPart(0);
     ASSERT_NE(batch_part, nullptr);
     EXPECT_EQ(batch_part->checksum(), std::optional<uint64_t>(0));
+    EXPECT_EQ("batch-session", batch_accessor.Get().WriteSessionId());
+    EXPECT_EQ("batch-affinity", batch_accessor.Get().residency_affinity_id);
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
@@ -7499,7 +7507,12 @@ TEST_F(MasterServiceHATest,
                       .set_enable_oplog(true)
                       .set_weight_management_oplog_capability_confirmed(true)
                       .set_cluster_id(cluster_id)
-                      .set_oplog_batch_max_entries(1)
+                      // UnmountSegment below queues one stale-handle cleanup
+                      // per object plus SEGMENT_UNMOUNT back to back, before
+                      // the writer thread can take the previous entry. With
+                      // a single slot those Reserve() calls race the writer
+                      // and fail with TASK_PENDING_LIMIT_EXCEEDED.
+                      .set_oplog_batch_max_entries(16)
                       .build();
     MasterService service(config);
     auto* writer = InstallGatedWriter(service, backend);
@@ -7536,7 +7549,7 @@ TEST_F(MasterServiceHATest,
                                      replicate));
         ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
                                    ReplicaType::MEMORY));
-        // PutEnd returns before durability; drain the single-entry writer.
+        // PutEnd returns before durability; wait for this entry to land.
         ASSERT_TRUE(writer->RunCallbacksThrough(put_sequence++));
     }
     const auto ready = service.CommitWeightImport({

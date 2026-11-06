@@ -16,6 +16,7 @@
 #include "error_types.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
+#include "pg_host_ip_resolve.h"
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 #include "device_comm/device_collective/device_collective.h"
 #include "device_comm/device_collective/device_collective_workspace.h"
@@ -28,16 +29,26 @@ namespace {
 // A non-zero operation size is required to ensure that the worker creates a
 // task for the barrier.
 constexpr size_t kBarrierDummySize = 1;
+
+PGResult<void> ApplyResolvedHostIp(std::string& host_ip) {
+    auto resolved = MaybeResolveRoutableHostIpFromEnv(host_ip);
+    if (resolved.outcome == HostIpResolveOutcome::FailFast) {
+        return makePGError(PGErrorCode::InvalidArgument,
+                           std::move(resolved.error_message));
+    }
+    host_ip = std::move(resolved.host_ip);
+    return {};
+}
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
 constexpr size_t kDefaultDeviceCollectiveBufferSize =
     32ull * 1024 * 1024;  // 32 MiB
-constexpr size_t kDefaultDeviceCollectiveControlReserve =
-    8ull * 1024 * 1024;  // 8 MiB
+constexpr size_t kDefaultCommunicatorResourceReserve =
+    64ull * 1024 * 1024;  // 64 MiB
 
 // Only remotely published resources occupy the eager peer-accessible region.
 // DTS allocates the local staging region lazily if a selected route needs one.
 constexpr size_t kDefaultPeerAccessibleCapacity =
-    kDefaultDeviceCollectiveBufferSize + kDefaultDeviceCollectiveControlReserve;
+    kDefaultDeviceCollectiveBufferSize + kDefaultCommunicatorResourceReserve;
 constexpr size_t kDefaultLocalStagingCapacity =
     kDefaultDeviceCollectiveBufferSize;
 
@@ -64,6 +75,24 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
     return config;
 }
 #endif
+
+PGResult<std::optional<DeviceAllReduceAlgorithm>>
+loadCollectiveAlgorithmFromEnvironment() {
+    const char* raw_value = std::getenv("MOONCAKE_PG_COLLECTIVE_ALGORITHM");
+    if (!raw_value || std::string_view(raw_value) == "auto") {
+        return std::optional<DeviceAllReduceAlgorithm>{};
+    }
+    const std::string_view value(raw_value);
+    if (value == "ring") {
+        return std::optional{DeviceAllReduceAlgorithm::Ring};
+    }
+    if (value == "oneshot") {
+        return std::optional{DeviceAllReduceAlgorithm::OneShot};
+    }
+    return makePGError(PGErrorCode::InvalidArgument,
+                       "MOONCAKE_PG_COLLECTIVE_ALGORITHM must be 'auto', "
+                       "'ring', or 'oneshot'");
+}
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
                         cudaStream_t stream) {
@@ -217,6 +246,11 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
         PG_VALIDATE_ARG(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
                         "MACA PG requires MC_MACA_HOST_TRANSPORT=1");
 #endif
+        // P2PHANDSHAKE publishes host_ip:<rpc_port> as the segment name. The
+        // default host_ip is 127.0.0.1, which hangs multi-node jobs that forget
+        // set_host_ip(); resolve a routable address when MASTER_ADDR indicates
+        // multi-node (#4981).
+        PG_TRY(ApplyResolvedHostIp(host_ip));
         PG_TRY_TE(engine->init(P2PHANDSHAKE, host_ip));
         engine_initialized = true;
     }
@@ -272,8 +306,12 @@ PGResult<std::string> MooncakePGContext::launchCoordinator() {
     PG_VALIDATE_STATE(global_rank == 0,
                       "only global rank 0 may start the coordinator");
     if (!coordinator_host) {
+        // The coordinator publishes one algorithm policy for every rank.
+        PG_TRY(auto all_reduce_algorithm,
+               loadCollectiveAlgorithmFromEnvironment());
         auto candidate = std::make_unique<CoordinatorHost>(
-            host_ip, max_world_size, fault_reconciliation_window_us);
+            host_ip, max_world_size, fault_reconciliation_window_us,
+            all_reduce_algorithm);
         PG_TRY(candidate->start());
         coordinator_host = std::move(candidate);
     }

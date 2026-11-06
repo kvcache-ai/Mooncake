@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <thread>
@@ -36,6 +37,7 @@
 #include "buffer_range_index.h"
 #include "common.h"
 #include "config.h"
+#include "hip_device_guard.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
@@ -44,6 +46,22 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 
 namespace mooncake {
+
+namespace {
+
+// Mirrors the ownership test the submit path already uses (see the
+// buffer.protocol checks below): descs published by this transport, plus
+// legacy descs with no protocol field. Without this, RDMA's removal can
+// erase a same-address desc belonging to HIP/nvlink, which now filter.
+bool isOwnRdmaDesc(const TransferMetadata::BufferDesc &desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return desc.protocol.empty() || desc.protocol == "rdma";
+#else
+    return desc.shm_name.empty();
+#endif
+}
+
+}  // namespace
 
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
@@ -168,6 +186,88 @@ bool has_ibv_reg_mr_iova2(void) {
     return sym != NULL;
 }
 
+static void deregKfdPinAnchor(ibv_mr *mr) {
+    int ret = ibv_dereg_mr(mr);
+    if (ret)
+        LOG(WARNING) << "Failed to release KFD pin anchor: " << strerror(ret);
+}
+
+#ifdef USE_HIP_DMABUF
+// Whether HIP allocations get a KFD pin anchor. Process-wide: it depends on
+// the amdgpu driver and on whether any NIC takes a peer-memory MR.
+enum KfdPinAnchorState { kKfdPinUnprobed, kKfdPinAnchor, kKfdPinNoAnchor };
+
+static std::atomic<KfdPinAnchorState> &kfdPinAnchorState() {
+    static std::atomic<KfdPinAnchorState> state{
+        globalConfig().hip_kfd_pin_fix == HipKfdPinFix::OFF ? kKfdPinNoAnchor
+        : globalConfig().hip_kfd_pin_fix == HipKfdPinFix::FORCE
+            ? kKfdPinAnchor
+            : kKfdPinUnprobed};
+    return state;
+}
+
+static constexpr size_t kKfdPinProbeBytes = 64ull << 20;
+
+// Pins one page of a private, never-pinned allocation through dma-buf: a fixed
+// driver keeps KFD free VRAM flat, one that charges dma-buf pins twice drops it
+// by the whole allocation. A caller's buffer cannot serve, as it may already
+// be pinned or exceed the free VRAM that hipMemGetInfo clamps at 0. Anything
+// else, e.g. a concurrent allocation, leaves the decision to the next
+// registration.
+static KfdPinAnchorState probeKfdPin(ibv_pd *pd, int device) {
+    HipDeviceGuard guard(device);
+    void *buf = nullptr;
+    if (!guard.set_ok() || hipMalloc(&buf, kKfdPinProbeBytes) != hipSuccess) {
+        (void)hipGetLastError();
+        LOG(WARNING) << "KFD pin probe: cannot allocate its "
+                     << (kKfdPinProbeBytes >> 20) << " MiB on GPU " << device
+                     << "; probing again at the next registration";
+        return kKfdPinUnprobed;
+    }
+    DmabufExport exp;
+    const int64_t size = kKfdPinProbeBytes;
+    int64_t drop = 0;
+    KfdPinAnchorState result = kKfdPinUnprobed;
+    if (RdmaContext::exportDmabuf(buf, kKfdPinProbeBytes, exp) == 0 &&
+        exp.method == DmabufExport::Method::kDmabufReg) {
+        for (int attempt = 0; attempt < 3 && result == kKfdPinUnprobed;
+             ++attempt) {
+            size_t before = 0, after = 0, total = 0;
+            if (hipMemGetInfo(&before, &total) != hipSuccess ||
+                before < kKfdPinProbeBytes)
+                break;
+            ibv_mr *mr = ibv_reg_dmabuf_mr(pd, exp.offset, getpagesize(),
+                                           reinterpret_cast<uintptr_t>(buf),
+                                           exp.fd, IBV_ACCESS_LOCAL_WRITE);
+            if (!mr) break;
+            const bool measured = hipMemGetInfo(&after, &total) == hipSuccess;
+            if (int ret = ibv_dereg_mr(mr)) {
+                LOG(WARNING) << "Failed to deregister KFD pin probe MR: "
+                             << strerror(ret);
+                break;
+            }
+            if (!measured) break;
+            drop = (int64_t)before - (int64_t)after;
+            if (std::llabs(drop) < size / 4)
+                result = kKfdPinNoAnchor;
+            else if (std::llabs(drop - size) < size / 4)
+                result = kKfdPinAnchor;
+        }
+    }
+    RdmaContext::closeDmabufExport(exp);
+    (void)hipFree(buf);
+    LOG(INFO) << "KFD pin probe: a dma-buf pin of a private " << (size >> 20)
+              << " MiB allocation lowered KFD free VRAM by " << drop / (1 << 20)
+              << " MiB; "
+              << (result == kKfdPinAnchor ? "holding one peer-memory pin per "
+                                            "registered allocation"
+                  : result == kKfdPinNoAnchor
+                      ? "the driver counts it once, no anchor needed"
+                      : "inconclusive, probing again at the next registration");
+    return result;
+}
+#endif
+
 RdmaTransport::RdmaTransport() {
     MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
     if (MCIbRelaxedOrderingMode == 0) {
@@ -199,6 +299,9 @@ RdmaTransport::~RdmaTransport() {
 #endif
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
+    for (auto &[_, anchor] : kfd_pin_anchors_) deregKfdPinAnchor(anchor.mr);
+    kfd_pin_anchors_.clear();
+    kfd_pin_anchor_of_buffer_.clear();
     context_list_.clear();
 }
 
@@ -371,6 +474,16 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
     } dmabuf_closer{dmabuf_exp};
 
+    // Taken before the first dma-buf pin and dropped after any rollback below.
+    struct KfdPinAnchorGuard {
+        RdmaTransport *transport;
+        void *addr;
+        bool held;
+        ~KfdPinAnchorGuard() {
+            if (held) transport->releaseKfdPinAnchor(addr);
+        }
+    } kfd_pin_anchor{this, addr, acquireKfdPinAnchor(addr, dmabuf_exp)};
+
     // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
     // max_mr_size, but the metadata would still advertise the full BufferDesc
     // length, so any remote RDMA op past the boundary fails with
@@ -486,7 +599,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         size_t n = std::min(committed, chunks.size());
         for (size_t ri = 0; ri < n; ++ri) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                chunks[ri].first, /*update_metadata=*/false);
+                chunks[ri].first, isOwnRdmaDesc, /*update_metadata=*/false);
             if (rc)
                 LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
                                 "at "
@@ -660,6 +773,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         for (auto &c : chunks) chunk_addrs.push_back((uint64_t)c.first);
         chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
     }
+    kfd_pin_anchor.held = false;
     return 0;
 }
 
@@ -694,7 +808,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         // chunk); publish once after all removals, below.
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+                reinterpret_cast<void *>(ca), isOwnRdmaDesc,
+                /*update_metadata=*/false);
             // ERR_ADDRESS_NOT_REGISTERED means an earlier attempt already
             // removed this chunk's metadata and then failed partway through
             // deregistration: tolerate it so the retry reaches the MR cleanup.
@@ -712,6 +827,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             if (use_parallel_unreg == -1)
                 use_parallel_unreg = context_list_.size() > 1;
         }
+        int mr_err = 0;
         if (use_parallel_unreg) {
             std::vector<std::thread> threads;
             threads.reserve(context_list_.size());
@@ -727,7 +843,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
             }
             for (auto &t : threads) t.join();
             for (int rc : ret_codes)
-                if (rc && !first_err) first_err = rc;
+                if (rc && !mr_err) mr_err = rc;
         } else {
             for (uint64_t ca : chunk_addrs)
                 for (auto &context : context_list_) {
@@ -736,10 +852,12 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                     if (ret) {
                         LOG(ERROR) << "Failed to unregister chunk MR at "
                                    << reinterpret_cast<void *>(ca);
-                        if (!first_err) first_err = ret;
+                        if (!mr_err) mr_err = ret;
                     }
                 }
         }
+        if (!mr_err) releaseKfdPinAnchor(addr);
+        if (!first_err) first_err = mr_err;
 
         // Single metadata publish covering all removed chunks.
         if (update_metadata) {
@@ -753,7 +871,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         return first_err;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, isOwnRdmaDesc,
+                                                update_metadata);
     // A missing metadata entry does NOT prove the MRs are gone: a partial
     // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
     // But a missing entry also occurs for an address that was never a
@@ -819,6 +938,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         }
         return dereg_err;
     }
+    releaseKfdPinAnchor(addr);
 
     // Confirmed cleanup: report success so the engine erases its region
     // record and the same range can be registered again.
@@ -837,6 +957,69 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         pending_dereg_.erase((uint64_t)addr);
     }
     return 0;
+}
+
+bool RdmaTransport::acquireKfdPinAnchor(void *addr, const DmabufExport &exp) {
+#ifdef USE_HIP_DMABUF
+    auto &state = kfdPinAnchorState();
+    if (!exp.alloc_base || state.load() == kKfdPinNoAnchor) return false;
+    if (state.load() == kKfdPinUnprobed) {
+        ibv_pd *pd = nullptr;
+        for (auto &context : context_list_)
+            if ((pd = context->pd())) break;
+        if (!pd) return false;
+        // HIP registrations wait here instead of pinning during the probe.
+        static std::mutex probe_mutex;
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        if (state.load() == kKfdPinUnprobed)
+            state.store(probeKfdPin(pd, exp.device));
+        if (state.load() != kKfdPinAnchor) return false;
+    }
+
+    std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
+    auto base = reinterpret_cast<uintptr_t>(exp.alloc_base);
+    if (!kfd_pin_anchor_of_buffer_
+             .emplace(reinterpret_cast<uintptr_t>(addr), base)
+             .second)
+        return false;
+    auto &anchor = kfd_pin_anchors_[base];
+    if (!anchor.mr) {
+        // The peer-memory client pins the whole allocation for any range.
+        for (auto &context : context_list_) {
+            if (!context->pd()) continue;
+            anchor.mr = ibv_reg_mr(context->pd(), exp.alloc_base, getpagesize(),
+                                   IBV_ACCESS_LOCAL_WRITE);
+            if (anchor.mr) break;
+        }
+        if (!anchor.mr) {
+            const int err = errno;
+            if (state.exchange(kKfdPinNoAnchor) == kKfdPinAnchor)
+                LOG(WARNING)
+                    << "amdgpu peer-memory pin unavailable (" << strerror(err)
+                    << "); KFD will count registered GPU memory "
+                       "twice in its free VRAM";
+            kfd_pin_anchors_.erase(base);
+            kfd_pin_anchor_of_buffer_.erase(reinterpret_cast<uintptr_t>(addr));
+            return false;
+        }
+    }
+    ++anchor.refs;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void RdmaTransport::releaseKfdPinAnchor(void *addr) {
+    std::lock_guard<std::mutex> lock(kfd_pin_anchor_mutex_);
+    auto owner =
+        kfd_pin_anchor_of_buffer_.find(reinterpret_cast<uintptr_t>(addr));
+    if (owner == kfd_pin_anchor_of_buffer_.end()) return;
+    auto anchor = kfd_pin_anchors_.find(owner->second);
+    kfd_pin_anchor_of_buffer_.erase(owner);
+    if (--anchor->second.refs) return;
+    deregKfdPinAnchor(anchor->second.mr);
+    kfd_pin_anchors_.erase(anchor);
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
@@ -1028,7 +1211,15 @@ Status RdmaTransport::submitTransfer(
 #endif
         task_list.push_back(&task);
     }
-    return submitTransferTask(task_list);
+    return submitTransferTaskWithSeal(task_list);
+}
+
+Status RdmaTransport::submitTransferTaskWithSeal(
+    const std::vector<TransferTask *> &task_list) {
+    for (auto *task : task_list) Slice::unsealTaskSubmission(task);
+    auto status = submitTransferTask(task_list);
+    for (auto *task : task_list) Slice::sealTaskSubmission(task);
+    return status;
 }
 
 Status RdmaTransport::submitTransferTask(
@@ -1052,6 +1243,15 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    size_t pending_slice_count = 0;
+    auto flush_pending_slices = [&]() {
+        for (auto &entry : slices_to_post) {
+            if (entry.second.empty()) continue;
+            entry.first->submitPostSend(entry.second);
+            entry.second.clear();
+        }
+        pending_slice_count = 0;
+    };
     auto fail_unposted_slices = [&]() {
         for (auto &entry : slices_to_post)
             for (auto *slice : entry.second) slice->markFailed();
@@ -1084,7 +1284,6 @@ Status RdmaTransport::submitTransferTask(
         fail_unposted_slices();
         fail_unstarted_tasks(task_index + 1);
     };
-    uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
     BatchRdmaDeviceCache local_device_cache;
     int last_local_buffer_id = -1;
@@ -1096,7 +1295,6 @@ Status RdmaTransport::submitTransferTask(
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
         const size_t current_task_index = task_index;
-        nr_slices = 0;
         assert(task.request);
         auto &request = task.request[request_index++];
         if (request_index == task.request_count) {
@@ -1158,10 +1356,6 @@ Status RdmaTransport::submitTransferTask(
 
             Slice *slice = getSliceCache().allocate();
             assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
-            }
-
             slice->source_addr = (char *)request.source + offset;
             slice->length = slice_length;
             slice->source_location.clear();
@@ -1250,19 +1444,16 @@ Status RdmaTransport::submitTransferTask(
                 __sync_fetch_and_add(&task.slice_count, 1);
             }
 
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
-                nr_slices = 0;
-            }
+            // Flush prepared slices so TE worker post can overlap with slice
+            // preparation
+            if (++pending_slice_count >= kSubmitWatermark)
+                flush_pending_slices();
 
             offset += slice->length;
         }
     }
 
-    for (auto &entry : slices_to_post)
-        if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
+    flush_pending_slices();
     return Status::OK();
 }
 
