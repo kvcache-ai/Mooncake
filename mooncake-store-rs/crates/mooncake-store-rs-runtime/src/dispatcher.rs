@@ -911,12 +911,12 @@ impl StoreDispatcher {
     }
 
     pub async fn remove_all(&self, force: bool) -> Result<(i32, i64), StoreError> {
-        self.run_async(move |client| Ok(execute_remove_all(client, force)))
+        self.run_async(move |client| execute_remove_all(client, force))
             .await
     }
 
     pub fn remove_all_blocking(&self, force: bool) -> Result<(i32, i64), StoreError> {
-        self.run(move |client| Ok(execute_remove_all(client, force)))
+        self.run(move |client| execute_remove_all(client, force))
     }
 
     pub fn shutdown(&self) {
@@ -1737,14 +1737,12 @@ fn execute_batch_remove(
         .collect()
 }
 
-fn execute_remove_all(client: &StoreClient, force: bool) -> (i32, i64) {
+fn execute_remove_all(client: &StoreClient, force: bool) -> Result<(i32, i64), StoreError> {
     // Keep the public `force` argument for Mooncake compatibility. Store-RS
     // evict-all has one owner-local behavior and does not vary with `force`.
     let _ = force;
-    match client.debug_evict_all() {
-        Ok(result) => remove_all_result_status(result.completed, result.evicted),
-        Err(_) => (-1, 0),
-    }
+    let result = client.debug_evict_all()?;
+    Ok(remove_all_result_status(result.completed, result.evicted))
 }
 
 fn remove_all_result_status(completed: bool, evicted: usize) -> (i32, i64) {
