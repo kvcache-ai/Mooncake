@@ -310,13 +310,7 @@ impl EmbeddedWrhRouteDirectory {
         let limit = self.route_topk.saturating_mul(2);
         let retained =
             retained_authority_candidates(self.membership.as_ref(), observer).unwrap_or_default();
-        ranked_merged_authorities(
-            &self.namespace,
-            current_candidates,
-            &retained,
-            key,
-            limit,
-        )
+        ranked_merged_authorities(&self.namespace, current_candidates, &retained, key, limit)
     }
 
     fn eviction_confirmation_authorities(
@@ -2853,16 +2847,11 @@ mod owner_page_contract_tests {
             .into_iter()
             .map(|lease| lease.runtime.stable_id.0)
             .collect::<BTreeSet<_>>();
-        let expected = ranked_merged_authorities(
-            &directory.namespace,
-            &current,
-            &retained,
-            &key,
-            4,
-        )
-            .into_iter()
-            .map(|lease| lease.runtime.stable_id.0)
-            .collect::<BTreeSet<_>>();
+        let expected =
+            ranked_merged_authorities(&directory.namespace, &current, &retained, &key, 4)
+                .into_iter()
+                .map(|lease| lease.runtime.stable_id.0)
+                .collect::<BTreeSet<_>>();
 
         assert_eq!(actual, expected);
         assert!(actual.len() <= 4);
