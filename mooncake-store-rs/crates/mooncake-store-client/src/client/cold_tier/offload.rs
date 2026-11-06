@@ -22,6 +22,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod waves;
+
+use waves::{materialize_claimed_pending_offload_waves, retry_admission_deferred};
+
 const PENDING_OFFLOAD_ADMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub(in super::super) fn enqueue_pending_offload(
@@ -388,69 +392,6 @@ fn ensure_pending_offload_work_available(storage_owner: &StorageOwnerState) -> R
     Ok(())
 }
 
-fn offload_target_parallelism() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(32)
-}
-
-fn materialize_ready_pending_offload_groups(
-    storage_owner: &StorageOwnerState,
-    pending: &mut [PendingOffloadMaterialization],
-) -> Result<usize> {
-    pending.sort_by(|left, right| {
-        left.cold_backing
-            .cold_tier_id
-            .cmp(&right.cold_backing.cold_tier_id)
-    });
-    let mut groups = Vec::new();
-    let mut start = 0usize;
-    while start < pending.len() {
-        let mut end = start + 1;
-        while end < pending.len()
-            && pending[end].cold_backing.cold_tier_id == pending[start].cold_backing.cold_tier_id
-        {
-            end += 1;
-        }
-        groups.push(&pending[start..end]);
-        start = end;
-    }
-
-    let outcomes =
-        crate::client::parallel_map_ordered(groups, offload_target_parallelism(), |group| {
-            let mut first_error = None;
-            let result =
-                storage_owner.materialize_prepared_pending_offload_batch(group, &mut first_error);
-            (result, first_error)
-        });
-    let mut round_materialized = 0usize;
-    let mut first_error = None;
-    let mut first_batch_error = None;
-    for (result, group_error) in outcomes {
-        match result {
-            Ok(materialized) => {
-                round_materialized = round_materialized.saturating_add(materialized);
-            }
-            Err(error) => {
-                first_batch_error.get_or_insert(error);
-            }
-        }
-        if first_error.is_none() {
-            first_error = group_error;
-        }
-    }
-    if let Some(error) = first_batch_error {
-        return Err(error);
-    }
-    if round_materialized == 0 {
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-    }
-    Ok(round_materialized)
-}
-
 fn drain_pending_offload_round(
     storage_owner: &StorageOwnerState,
     max_tasks: usize,
@@ -504,51 +445,6 @@ pub(in super::super) fn prepare_pending_offload_entries(
 struct PendingOffloadPreparationBatch {
     pending: Vec<PendingOffloadMaterialization>,
     admission_deferred: Vec<(PendingOffloadEntry, Duration)>,
-}
-
-fn materialize_claimed_pending_offload_waves(
-    storage_owner: &StorageOwnerState,
-    mut entries: Vec<PendingOffloadEntry>,
-) -> Result<usize> {
-    let mut materialized = 0usize;
-    while !entries.is_empty() {
-        let prepare_tracker = OperationTracker::new("cold_offload_prepare_batch");
-        let prepared = prepare_pending_offload_entries_partitioned(storage_owner, entries);
-        prepare_tracker.finish(
-            &prepared,
-            prepared
-                .as_ref()
-                .map(|prepared| prepared.pending.len())
-                .unwrap_or_default() as u64,
-        );
-        let prepared = prepared?;
-        let mut pending = prepared.pending;
-        let deferred = prepared.admission_deferred;
-        if pending.is_empty() {
-            retry_admission_deferred(storage_owner, deferred);
-            break;
-        }
-        match materialize_ready_pending_offload_groups(storage_owner, &mut pending) {
-            Ok(round_materialized) => {
-                materialized = materialized.saturating_add(round_materialized);
-            }
-            Err(error) => {
-                retry_admission_deferred(storage_owner, deferred);
-                return Err(error);
-            }
-        }
-        entries = deferred.into_iter().map(|(entry, _)| entry).collect();
-    }
-    Ok(materialized)
-}
-
-fn retry_admission_deferred(
-    storage_owner: &StorageOwnerState,
-    deferred: Vec<(PendingOffloadEntry, Duration)>,
-) {
-    for (entry, delay) in deferred {
-        storage_owner.pending_offloads.retry_after(entry, delay);
-    }
 }
 
 fn prepare_pending_offload_entries_partitioned(
