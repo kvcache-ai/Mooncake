@@ -104,10 +104,10 @@ impl DeleteMarkerStore {
     }
 
     pub(crate) fn remove_if_older(&mut self, key: &ObjectKey, live_version: RouteVersion) -> bool {
-        if !self
+        if self
             .entries
             .get(key)
-            .is_some_and(|marker| marker.version < live_version)
+            .is_none_or(|marker| marker.version >= live_version)
         {
             return false;
         }
