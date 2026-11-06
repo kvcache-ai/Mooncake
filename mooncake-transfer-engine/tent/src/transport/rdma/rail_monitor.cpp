@@ -14,10 +14,46 @@
 
 #include "tent/transport/rdma/rail_monitor.h"
 
+#include "tent/runtime/segment.h"
+
 namespace mooncake {
 namespace tent {
 
 namespace {
+
+int hexDigit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Decodes the colon-separated 16-byte GID string published in DeviceDesc and
+// reports the embedded address of an IPv4-mapped (RoCE v2) GID. IB and native
+// IPv6 GIDs carry no IPv4 subnet, so they are rejected and left unknown.
+bool parseGidIpv4(const std::string& gid, uint32_t& ipv4) {
+    constexpr size_t kGidBytes = 16;
+    uint8_t raw[kGidBytes];
+    size_t pos = 0;
+    for (size_t i = 0; i < kGidBytes; ++i) {
+        if (i) {
+            if (pos >= gid.size() || gid[pos] != ':') return false;
+            ++pos;
+        }
+        if (pos + 2 > gid.size()) return false;
+        int hi = hexDigit(gid[pos]), lo = hexDigit(gid[pos + 1]);
+        if (hi < 0 || lo < 0) return false;
+        raw[i] = static_cast<uint8_t>(hi * 16 + lo);
+        pos += 2;
+    }
+    if (pos != gid.size()) return false;
+    for (size_t i = 0; i < 10; ++i)
+        if (raw[i]) return false;
+    if (raw[10] != 0xff || raw[11] != 0xff) return false;
+    ipv4 = (uint32_t(raw[12]) << 24) | (uint32_t(raw[13]) << 16) |
+           (uint32_t(raw[14]) << 8) | uint32_t(raw[15]);
+    return true;
+}
 
 bool sameNicLayout(const Topology::NicEntry& a, const Topology::NicEntry& b) {
     return a.name == b.name && a.pci_bus_id == b.pci_bus_id &&
@@ -62,16 +98,12 @@ bool sameRailLayout(const Topology* a, const Topology* b) {
 
 Status RailMonitor::load(std::shared_ptr<const Topology> local,
                          std::shared_ptr<const Topology> remote,
-                         const std::string& rail_topo_json,
-                         const Config* conf) {
+                         const std::string& rail_topo_json, const Config* conf,
+                         const std::vector<DeviceDesc>* local_devices,
+                         const std::vector<DeviceDesc>* remote_devices) {
     std::lock_guard<std::mutex> guard(mutex_);
     const bool first_load = !ready_;
-    const bool same_layout = ready_ &&
-                             sameRailLayout(local_.get(), local.get()) &&
-                             sameRailLayout(remote_.get(), remote.get());
-
-    local_ = std::move(local);
-    remote_ = std::move(remote);
+    const int previous_prefix_len = subnet_prefix_len_;
     if (conf) {
         error_threshold_ = conf->get(kCfgErrorThreshold, error_threshold_);
         error_window_ = std::chrono::seconds(
@@ -80,15 +112,35 @@ Status RailMonitor::load(std::shared_ptr<const Topology> local,
             conf->get(kCfgCooldownSecs, (int)cooldown_.count()));
         probe_interval_ = std::chrono::seconds(
             conf->get(kCfgProbeIntervalSecs, (int)probe_interval_.count()));
+        subnet_prefix_len_ = conf->get(kCfgSubnetPrefixLen, subnet_prefix_len_);
         // Config is identical on every COW snapshot refresh. Log once per
         // monitor so PD/e2e does not reprint the banner per slice/worker.
         if (first_load) {
             LOG(INFO) << "RailMonitor: error_threshold=" << error_threshold_
                       << " error_window=" << error_window_.count() << "s"
                       << " cooldown=" << cooldown_.count() << "s"
-                      << " probe_interval=" << probe_interval_.count() << "s";
+                      << " probe_interval=" << probe_interval_.count() << "s"
+                      << " subnet_prefix_len=" << subnet_prefix_len_;
         }
     }
+
+    // A NIC that re-reads its GID (address refresh) can move to another
+    // subnet, which changes the rail map even though the NIC/memory layout is
+    // untouched. Fold the published GIDs into the same-layout test so such a
+    // refresh still rebuilds.
+    auto local_gid_ipv4 = collectGidIpv4(*local, local_devices);
+    auto remote_gid_ipv4 = collectGidIpv4(*remote, remote_devices);
+    const bool same_layout = ready_ &&
+                             subnet_prefix_len_ == previous_prefix_len &&
+                             sameRailLayout(local_.get(), local.get()) &&
+                             sameRailLayout(remote_.get(), remote.get()) &&
+                             local_gid_ipv4 == local_gid_ipv4_ &&
+                             remote_gid_ipv4 == remote_gid_ipv4_;
+
+    local_ = std::move(local);
+    remote_ = std::move(remote);
+    local_gid_ipv4_ = std::move(local_gid_ipv4);
+    remote_gid_ipv4_ = std::move(remote_gid_ipv4);
     if (same_layout) return Status::OK();
     if (!rail_topo_json.empty()) {
         auto status = loadFromJson(rail_topo_json);
@@ -290,9 +342,13 @@ void RailMonitor::markFailed(int local_nic, int remote_nic,
                 st.cooldown *= 2;
                 if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
             }
-            LOG(INFO) << "Rail paused: local_nic=" << local_nic
-                      << " remote_nic=" << remote_nic
-                      << " (errors=" << st.error_count << " in "
+            // Name both NICs: an operator reading this line needs to know
+            // which link to look at, and a bare topology index does not say.
+            LOG(INFO) << "Rail paused: local_nic=" << local_nic << " ("
+                      << local_->getNicName(local_nic)
+                      << ") remote_nic=" << remote_nic << " ("
+                      << remote_->getNicName(remote_nic)
+                      << ") (errors=" << st.error_count << " in "
                       << error_window_.count()
                       << "s, cooldown=" << st.cooldown.count() << "s)";
             st.resume_time = now + st.cooldown;
@@ -464,16 +520,70 @@ static int matchRemoteNicId(const Topology* local, const Topology* remote,
     return -1;
 }
 
+RailMonitor::GidIpv4Map RailMonitor::collectGidIpv4(
+    const Topology& topo, const std::vector<DeviceDesc>* devices) {
+    GidIpv4Map gid_ipv4;
+    if (!devices) return gid_ipv4;
+    for (const auto& device : *devices) {
+        int nic_id = topo.getNicId(device.name);
+        if (nic_id < 0) continue;
+        uint32_t ipv4 = 0;
+        if (parseGidIpv4(device.gid, ipv4)) gid_ipv4[nic_id] = ipv4;
+    }
+    return gid_ipv4;
+}
+
+std::unordered_map<int, std::unordered_set<int>> RailMonitor::subnetPeers()
+    const {
+    std::unordered_map<int, std::unordered_set<int>> peers;
+    if (subnet_prefix_len_ <= 0 || subnet_prefix_len_ > 32) return peers;
+    const uint32_t mask = subnet_prefix_len_ == 32
+                              ? ~0u
+                              : ~((1u << (32 - subnet_prefix_len_)) - 1u);
+    for (const auto& [local_nic, local_ipv4] : local_gid_ipv4_) {
+        std::unordered_set<int> matched;
+        for (const auto& [remote_nic, remote_ipv4] : remote_gid_ipv4_)
+            if ((local_ipv4 & mask) == (remote_ipv4 & mask))
+                matched.insert(remote_nic);
+        // No peer NIC in this NIC's subnet means the prefix does not describe
+        // this fabric (a routed rail network, or a prefix length that does not
+        // match the deployment). Pruning on that basis would strand the NIC,
+        // so leave every one of its pairs in place and let rail health decide.
+        if (!matched.empty()) peers.emplace(local_nic, std::move(matched));
+    }
+    return peers;
+}
+
 Status RailMonitor::loadDefault() {
     rail_states_.clear();
     direct_rails_.clear();
     int local_nic_count = (int)local_->getNicCount();
     int remote_nic_count = (int)remote_->getNicCount();
     std::vector<int> remote_load(remote_nic_count, 0);
+    // A rail NIC and a peer front-end NIC on an unrelated subnet have no path
+    // to each other, yet nothing above this layer knows that: the pair is
+    // selected, posted, and only unwound after the RC retry counter expires
+    // (seconds), once per worker. Published RoCE v2 GIDs make the disjoint
+    // subnets visible up front, so those pairs never become rails.
+    auto subnet_peers = subnetPeers();
+    auto reachable = [&](int local_nic, int remote_nic) {
+        auto it = subnet_peers.find(local_nic);
+        return it == subnet_peers.end() || it->second.count(remote_nic) > 0;
+    };
+    size_t pruned = 0;
     for (int local_nic = 0; local_nic < local_nic_count; ++local_nic) {
         for (int remote_nic = 0; remote_nic < remote_nic_count; ++remote_nic) {
+            if (!reachable(local_nic, remote_nic)) {
+                ++pruned;
+                continue;
+            }
             rail_states_[{local_nic, remote_nic}] = RailState{};
         }
+    }
+    if (pruned) {
+        LOG(INFO) << "RailMonitor: dropped " << pruned
+                  << " NIC pairs whose RoCE v2 GIDs sit on different /"
+                  << subnet_prefix_len_ << " subnets";
     }
     for (int local_nic = 0; local_nic < local_nic_count; ++local_nic) {
         auto local_entry = local_->getNicEntry(local_nic);
@@ -486,7 +596,8 @@ Status RailMonitor::loadDefault() {
         for (int remote_nic = 0; remote_nic < remote_nic_count; ++remote_nic) {
             auto remote_entry = remote_->getNicEntry(remote_nic);
             if (remote_entry && remote_entry->type == Topology::NIC_RDMA &&
-                remote_entry->name == local_nic_name) {
+                remote_entry->name == local_nic_name &&
+                reachable(local_nic, remote_nic)) {
                 remote_load[remote_nic]++;
                 direct_rails_[local_nic] = remote_nic;
                 matched = true;
@@ -498,7 +609,7 @@ Status RailMonitor::loadDefault() {
         // Priority 2: CUDA memory topology matching (GPU-direct NIC)
         int remote_nic =
             matchRemoteNicId(local_.get(), remote_.get(), local_nic);
-        if (remote_nic >= 0) {
+        if (remote_nic >= 0 && reachable(local_nic, remote_nic)) {
             remote_load[remote_nic]++;
             direct_rails_[local_nic] = remote_nic;
             continue;
@@ -509,7 +620,7 @@ Status RailMonitor::loadDefault() {
         for (int cand = 0; cand < remote_nic_count; ++cand) {
             auto cand_entry = remote_->getNicEntry(cand);
             if (!cand_entry || cand_entry->type != Topology::NIC_RDMA ||
-                numa_id != cand_entry->numa_node)
+                numa_id != cand_entry->numa_node || !reachable(local_nic, cand))
                 continue;
             if (remote_load[cand] < best_nic_load) {
                 best_nic_load = remote_load[cand];
@@ -524,7 +635,9 @@ Status RailMonitor::loadDefault() {
 
         for (int cand = 0; cand < remote_nic_count; ++cand) {
             auto cand_entry = remote_->getNicEntry(cand);
-            if (!cand_entry || cand_entry->type != Topology::NIC_RDMA) continue;
+            if (!cand_entry || cand_entry->type != Topology::NIC_RDMA ||
+                !reachable(local_nic, cand))
+                continue;
             if (remote_load[cand] < best_nic_load) {
                 best_nic_load = remote_load[cand];
                 best_nic = cand;
