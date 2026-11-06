@@ -50,6 +50,8 @@ pub(crate) const REBALANCE_ROUTES_TOTAL: &str = "mooncake_store_rebalance_routes
 pub(crate) const REBALANCE_BYTES_TOTAL: &str = "mooncake_store_rebalance_bytes_total";
 pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecycle_total";
 pub(crate) const RECLAIM_RELEASE_TOTAL: &str = "mooncake_store_reclaim_release_total";
+pub(crate) const EVICTION_GUARD_EVENT_TOTAL: &str = "mooncake_store_eviction_guard_event_total";
+pub(crate) const EVICTION_GUARD_PENDING_TOTAL: &str = "mooncake_store_eviction_guard_pending_total";
 pub(crate) const EVICTION_TOTAL: &str = "mooncake_store_eviction_total";
 pub(crate) const EVICTION_DURATION: &str = "mooncake_store_eviction_duration_seconds";
 pub(crate) const EVICTED_REPLICAS_TOTAL: &str = "mooncake_store_evicted_replicas_total";
@@ -118,6 +120,8 @@ pub struct MetricsSnapshot {
     pub rebalance_bytes: Vec<CounterSample<PhaseKey>>,
     pub segment_lifecycle: Vec<CounterSample<ActionResultKey>>,
     pub reclaim_release: Vec<CounterSample<ActionResultKey>>,
+    pub eviction_guard_events: Vec<CounterSample<PhaseResultKey>>,
+    pub eviction_guard_pending: Vec<GaugeSample<PhaseKey>>,
     pub eviction: Vec<CounterSample<ResultKey>>,
     pub eviction_duration: Vec<HistogramSample<ResultKey>>,
     pub evicted_replicas: u64,
@@ -421,6 +425,23 @@ impl<K: Ord + Clone> GaugeFamily<K> {
             })
             .collect()
     }
+
+    fn snapshot_with_defaults<I>(&self, defaults: I) -> Vec<GaugeSample<K>>
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let mut inner = self.inner.clone();
+        for key in defaults {
+            inner.entry(key).or_default();
+        }
+        inner
+            .iter()
+            .map(|(key, value)| GaugeSample {
+                key: key.clone(),
+                value: *value,
+            })
+            .collect()
+    }
 }
 
 pub(crate) struct HistogramFamily<K> {
@@ -544,6 +565,8 @@ struct MetricsRegistry {
     rebalance_bytes: CounterFamily<PhaseKey>,
     segment_lifecycle: CounterFamily<ActionResultKey>,
     reclaim_release: CounterFamily<ActionResultKey>,
+    eviction_guard_events: CounterFamily<PhaseResultKey>,
+    eviction_guard_pending: GaugeFamily<PhaseKey>,
     eviction: CounterFamily<ResultKey>,
     eviction_duration: HistogramFamily<ResultKey>,
     evicted_replicas: u64,
@@ -625,6 +648,8 @@ impl Default for MetricsRegistry {
             rebalance_bytes: CounterFamily::default(),
             segment_lifecycle: CounterFamily::default(),
             reclaim_release: CounterFamily::default(),
+            eviction_guard_events: CounterFamily::default(),
+            eviction_guard_pending: GaugeFamily::default(),
             eviction: CounterFamily::default(),
             eviction_duration: HistogramFamily::default(),
             evicted_replicas: 0,
@@ -837,6 +862,12 @@ impl MetricsRegistry {
             reclaim_release: self
                 .reclaim_release
                 .snapshot_with_defaults(reclaim_release_keys()),
+            eviction_guard_events: self
+                .eviction_guard_events
+                .snapshot_with_defaults(eviction_guard_event_keys()),
+            eviction_guard_pending: self
+                .eviction_guard_pending
+                .snapshot_with_defaults(phase_keys(EVICTION_GUARD_PENDING_PHASES)),
             eviction: self.eviction.snapshot(),
             eviction_duration: self.eviction_duration.snapshot(),
             evicted_replicas: self.evicted_replicas,
@@ -983,6 +1014,31 @@ const RECLAIM_RELEASE_RESULTS: &[&str] = &[
     "skipped_missing_runtime_lease",
     "error",
 ];
+const EVICTION_GUARD_PENDING_PHASES: &[&str] = &[
+    "prepared",
+    "ready_to_commit",
+    "pending_confirmation",
+    "pending_allocation_confirmation",
+];
+const EVICTION_GUARD_EVENT_OUTCOMES: &[(&str, &str)] = &[
+    ("route_cas", "outcome_unknown"),
+    ("clock_candidate", "pending_confirmation"),
+    ("allocator_candidate", "pending_confirmation"),
+    ("pending_token", "aborted"),
+    ("local_commit", "release_deferred"),
+    ("local_commit", "released"),
+    ("local_commit", "identity_replaced"),
+    ("route_confirmation", "referenced"),
+    ("route_confirmation", "absent"),
+    ("route_confirmation", "indeterminate"),
+    ("allocation_confirmation", "absent"),
+    ("allocation_confirmation", "referenced"),
+    ("allocation_confirmation", "conflict"),
+    ("allocation_confirmation", "invalid_response"),
+    ("allocation_confirmation", "indeterminate"),
+    ("reservation_rollback", "queued"),
+    ("reservation_rollback", "released"),
+];
 
 fn result_keys(results: &'static [&'static str]) -> impl Iterator<Item = ResultKey> {
     results.iter().copied().map(|result| ResultKey { result })
@@ -1000,6 +1056,12 @@ fn phase_result_keys(
         .iter()
         .copied()
         .map(move |result| PhaseResultKey { phase, result })
+}
+
+fn eviction_guard_event_keys() -> impl Iterator<Item = PhaseResultKey> {
+    EVICTION_GUARD_EVENT_OUTCOMES
+        .iter()
+        .map(|(phase, result)| PhaseResultKey { phase, result })
 }
 
 fn preferred_segment_skip_keys() -> impl Iterator<Item = PreferredSegmentSkipKey> {
@@ -1415,6 +1477,23 @@ pub(crate) fn record_reclaim_release(action: &'static str, result: &'static str)
         .lock()
         .reclaim_release
         .add(ActionResultKey { action, result }, 1);
+}
+
+pub(crate) fn record_eviction_guard_event(source: &'static str, outcome: &'static str) {
+    global_metrics_registry().lock().eviction_guard_events.add(
+        PhaseResultKey {
+            phase: source,
+            result: outcome,
+        },
+        1,
+    );
+}
+
+pub(crate) fn set_eviction_guard_pending(phase: &'static str, count: usize) {
+    global_metrics_registry()
+        .lock()
+        .eviction_guard_pending
+        .set(PhaseKey { phase }, count as f64);
 }
 
 pub(crate) struct ColdTierDeviceMetrics<'a> {

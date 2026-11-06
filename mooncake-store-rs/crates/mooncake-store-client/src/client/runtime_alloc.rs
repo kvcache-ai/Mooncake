@@ -147,14 +147,32 @@ impl StoreClient {
         let failed = failed_indices.iter().copied().collect::<BTreeSet<_>>();
         for (index, release) in releases.iter().enumerate() {
             if failed.contains(&index) {
+                crate::observability::registry::record_eviction_guard_event(
+                    "reservation_rollback",
+                    "queued",
+                );
+                debug!(
+                    storage_runtime = %release.storage_runtime,
+                    segment = %release.segment_name.0,
+                    offset_bytes = release.offset_bytes,
+                    length_bytes = release.length_bytes,
+                    allocation_id = release.allocation_id,
+                    reason,
+                    "reservation rollback release is pending retry"
+                );
                 self.enqueue_unresolved_reservation_reclaim(release.clone());
                 continue;
             }
+            crate::observability::registry::record_eviction_guard_event(
+                "reservation_rollback",
+                "released",
+            );
             debug!(
                 storage_runtime = %release.storage_runtime,
                 segment = %release.segment_name.0,
                 offset_bytes = release.offset_bytes,
                 length_bytes = release.length_bytes,
+                allocation_id = release.allocation_id,
                 reason,
                 "released reserved allocation during rollback"
             );

@@ -61,6 +61,32 @@ fn test_route_write_gate() -> Arc<RouteWriteGate> {
     Arc::new(RouteWriteGate::default())
 }
 
+fn assert_eviction_guard_event_at_least(metrics: &str, source: &str, outcome: &str, minimum: u64) {
+    let source_label = format!("source=\"{source}\"");
+    let outcome_label = format!("outcome=\"{outcome}\"");
+    let observed = metrics
+        .lines()
+        .find_map(|line| {
+            if line.starts_with("mooncake_store_eviction_guard_event_total{")
+                && line.contains(&source_label)
+                && line.contains(&outcome_label)
+            {
+                line.rsplit_once(' ')?.1.parse::<u64>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing eviction guard metric source={source:?} outcome={outcome:?} in {metrics}"
+            )
+        });
+    assert!(
+        observed >= minimum,
+        "expected eviction guard metric source={source:?} outcome={outcome:?} >= {minimum}, got {observed}"
+    );
+}
+
 struct NoHotPathMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     deny_tenant_policy_list: bool,
@@ -15782,6 +15808,8 @@ fn flush_due_reclaims_skips_duplicate_remote_release() {
 
 #[test]
 fn reservation_target_metadata_failure_releases_all_reserve_paths() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
     let inner = Arc::new(InMemoryMetadataBackend::new());
     let metadata = Arc::new(RecoverableMetadataBackend::new(inner));
     let storage_transport = Arc::new(TestTransport::new("reservation-target-storage-segment"));
@@ -15899,6 +15927,8 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
         0,
         "local batch cleanup must release the reservation after target lookup fails"
     );
+    let metrics = render_prometheus_metrics();
+    assert_eviction_guard_event_at_least(&metrics, "reservation_rollback", "released", 5);
 }
 
 #[test]
@@ -19933,6 +19963,8 @@ fn batch_buffer_delete_reclaims_untracked_remote_allocations() {
 
 #[test]
 fn orphaned_pending_allocation_reclaims_after_publication_deadline() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("orphan-pending-owner-segment"));
     let client = StoreClientBuilder::new(metadata, "orphan-pending-owner")
@@ -20003,6 +20035,15 @@ fn orphaned_pending_allocation_reclaims_after_publication_deadline() {
             .is_empty(),
         "released orphan should leave no pending allocation"
     );
+    let metrics = render_prometheus_metrics();
+    assert_eviction_guard_event_at_least(
+        &metrics,
+        "allocator_candidate",
+        "pending_confirmation",
+        1,
+    );
+    assert_eviction_guard_event_at_least(&metrics, "allocation_confirmation", "absent", 1);
+    assert_eviction_guard_event_at_least(&metrics, "local_commit", "released", 1);
     assert_eq!(reservation.length_bytes, 16);
 }
 
@@ -20446,6 +20487,8 @@ fn eviction_rejects_stale_route_metadata_before_route_cas() {
 
 #[test]
 fn eviction_retains_token_when_applied_cas_reply_is_lost() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("eviction-applied-reply-loss-segment"));
     let client = StoreClientBuilder::new(metadata, "eviction-applied-reply-loss")
@@ -20490,6 +20533,8 @@ fn eviction_retains_token_when_applied_cas_reply_is_lost() {
         16,
         "the allocator allocation must remain non-reusable until confirmation"
     );
+    let metrics = render_prometheus_metrics();
+    assert_eviction_guard_event_at_least(&metrics, "route_cas", "outcome_unknown", 1);
 
     sleep(Duration::from_millis(120));
     assert_eq!(
@@ -20505,6 +20550,9 @@ fn eviction_retains_token_when_applied_cas_reply_is_lost() {
         0,
         "the confirmed absent allocation should become reusable"
     );
+    let metrics = render_prometheus_metrics();
+    assert_eviction_guard_event_at_least(&metrics, "route_confirmation", "absent", 1);
+    assert_eviction_guard_event_at_least(&metrics, "local_commit", "released", 1);
 }
 
 #[test]

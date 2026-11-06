@@ -4,7 +4,8 @@ use super::registry::{
     PreferredSegmentSkipKey, ReplicaDistributionKey, RequestBytesKey, RequestInflightKey,
     RequestKey, ResultKey, RuntimeKey, RuntimeStatusKey, TenantKey, TransportBytesKey,
     TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, COLD_TIER_IO_BUCKETS, EVICTED_BYTES_TOTAL,
-    EVICTED_REPLICAS_TOTAL, EVICTION_DURATION, EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES,
+    EVICTED_REPLICAS_TOTAL, EVICTION_DURATION, EVICTION_GUARD_EVENT_TOTAL,
+    EVICTION_GUARD_PENDING_TOTAL, EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES,
     HEARTBEAT_LAST_SUCCESS_MS, MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL,
     METADATA_OPERATION_DURATION, METADATA_OPERATION_INFLIGHT, METADATA_OPERATION_TOTAL,
     OBJECT_ROUTES, PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL, REBALANCE_ROUTES_TOTAL,
@@ -545,6 +546,39 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
             tenant,
             escape(action),
             escape(result),
+            value
+        ));
+    }
+
+    counter_family(
+        output,
+        EVICTION_GUARD_EVENT_TOTAL,
+        "Eviction guard lifecycle events by source and outcome.",
+    );
+    for CounterSample { key, value } in &snapshot.eviction_guard_events {
+        let PhaseResultKey { phase, result } = key;
+        output.push_str(&format!(
+            "{}{{tenant=\"{}\",source=\"{}\",outcome=\"{}\"}} {}\n",
+            EVICTION_GUARD_EVENT_TOTAL,
+            tenant,
+            escape(phase),
+            escape(result),
+            value
+        ));
+    }
+
+    gauge_family(
+        output,
+        EVICTION_GUARD_PENDING_TOTAL,
+        "Pending eviction guard tokens by phase.",
+    );
+    for GaugeSample { key, value } in &snapshot.eviction_guard_pending {
+        let PhaseKey { phase } = key;
+        output.push_str(&format!(
+            "{}{{tenant=\"{}\",phase=\"{}\"}} {}\n",
+            EVICTION_GUARD_PENDING_TOTAL,
+            tenant,
+            escape(phase),
             value
         ));
     }
