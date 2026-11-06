@@ -101,7 +101,11 @@ DEFINE_string(
     "and no I/O. Enable to split Avg Tx into submit vs completion wait.");
 DEFINE_uint64(request_interval_us, 0,
               "Per-thread delay before issuing each transfer batch, in "
-              "microseconds. 0 disables pacing.");
+              "microseconds. 0 disables pacing. Closed loop: the wait starts "
+              "after the previous transfer completes, so each thread issues "
+              "at most 1 / (interval + transfer latency) requests per "
+              "second. The wait busy-yields, keeping one core busy per "
+              "thread.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
               "tight worker threads (0 disables deadline tagging); cannot be "
