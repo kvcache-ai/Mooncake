@@ -1017,6 +1017,10 @@ impl ColdTierDeviceManager {
         self.admission.config.foreground_offload_kick_batch.max(1)
     }
 
+    pub(in super::super) fn offload_parallelism(&self) -> usize {
+        self.admission.config.offload_runtime_max_in_flight.max(1)
+    }
+
     pub(in super::super) fn offload_poll_interval(&self) -> Duration {
         Duration::from_millis(self.admission.config.offload_poll_interval_ms.max(1))
     }

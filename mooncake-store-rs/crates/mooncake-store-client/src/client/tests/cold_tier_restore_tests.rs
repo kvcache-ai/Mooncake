@@ -1548,6 +1548,11 @@ fn pending_offloads_balance_and_write_distinct_targets_concurrently() {
     client
         .register_local_memory()
         .expect("local memory should register");
+    assert_eq!(
+        client.storage_owner.cold_tier_devices.offload_parallelism(),
+        16,
+        "offload worker parallelism must follow the runtime admission limit"
+    );
 
     let payload_sizes = [512, 128, 128, 128, 128];
     for (index, payload_size) in payload_sizes.into_iter().enumerate() {

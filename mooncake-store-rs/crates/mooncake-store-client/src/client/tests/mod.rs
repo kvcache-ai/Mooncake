@@ -26,7 +26,7 @@ use super::{
     align_up_u64, backend_store_cold_payload_batch, bootstrap_route_policy,
     cached_live_client_snapshot, compatibility_matches, control_bind_host, copy_into_region,
     decode_backend_payload, effective_route_policy, encode_backend_component,
-    encode_backend_payload, encode_lifecycle_state, flatten_slices, now_ms, parallel_map_ordered, payload_checksum,
+    encode_backend_payload, encode_lifecycle_state, flatten_slices, now_ms, payload_checksum,
     record_success_metric, restore_payload_from_cold_backing, route_topk_from_tenant_spec,
     run_bounded_parallel_jobs, scatter_into_buffers, shared_cold_tier_device_cache,
     shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
@@ -22195,36 +22195,3 @@ fn background_watermark_batch_retains_all_tokens_when_complete_reply_is_lost() {
 }
 
 mod batch_put_status_tests;
-
-#[test]
-fn parallel_map_parallelizes_and_preserves_order() {
-    let inflight = Arc::new(AtomicUsize::new(0));
-    let max_inflight = Arc::new(AtomicUsize::new(0));
-    let jobs = vec![0usize, 1, 2, 3];
-    let results = parallel_map_ordered(jobs, 2, {
-        let inflight = inflight.clone();
-        let max_inflight = max_inflight.clone();
-        move |job| {
-            let current = inflight.fetch_add(1, Ordering::SeqCst) + 1;
-            max_inflight.fetch_max(current, Ordering::SeqCst);
-            sleep(Duration::from_millis(20));
-            inflight.fetch_sub(1, Ordering::SeqCst);
-            job * 10
-        }
-    });
-
-    assert_eq!(results, vec![0, 10, 20, 30]);
-    assert!(
-        max_inflight.load(Ordering::SeqCst) >= 2,
-        "jobs should overlap when parallelism is greater than one"
-    );
-}
-
-#[test]
-fn parallel_map_handles_empty_and_single_job_inputs() {
-    let empty_results = parallel_map_ordered::<usize, usize, _>(Vec::new(), 8, |job| job * 10);
-    assert!(empty_results.is_empty());
-
-    let single_results = parallel_map_ordered(vec![7usize], 8, |job| job * 10);
-    assert_eq!(single_results, vec![70]);
-}

@@ -114,60 +114,6 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn parallel_map_ordered<Input, Output, F>(
-    jobs: impl IntoIterator<Item = Input>,
-    max_parallelism: usize,
-    worker: F,
-) -> Vec<Output>
-where
-    Input: Send,
-    Output: Send,
-    F: Fn(Input) -> Output + Sync,
-{
-    let jobs = jobs.into_iter().collect::<Vec<_>>();
-    let workers = jobs.len().min(max_parallelism.max(1));
-    if workers <= 1 {
-        return jobs.into_iter().map(worker).collect();
-    }
-
-    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
-        jobs.into_iter().enumerate().collect::<Vec<_>>(),
-    ));
-    let results = std::sync::Mutex::new(Vec::<(usize, Output)>::new());
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let queue = &queue;
-            let results = &results;
-            let worker = &worker;
-            scope.spawn(move || {
-                let mut local_results = Vec::new();
-                loop {
-                    let next_job = queue
-                        .lock()
-                        .expect("parallel job queue lock should succeed")
-                        .pop_front();
-                    let Some((index, job)) = next_job else {
-                        break;
-                    };
-                    local_results.push((index, worker(job)));
-                }
-                if !local_results.is_empty() {
-                    results
-                        .lock()
-                        .expect("parallel job results lock should succeed")
-                        .extend(local_results);
-                }
-            });
-        }
-    });
-
-    let mut results = results
-        .into_inner()
-        .expect("parallel job results lock should succeed");
-    results.sort_by_key(|(index, _)| *index);
-    results.into_iter().map(|(_, output)| output).collect()
-}
-
 impl StoreClient {
     fn route_ops(&self) -> RouteOperations {
         RouteOperations::new(self.route_directory.clone(), self.lease.clone())
