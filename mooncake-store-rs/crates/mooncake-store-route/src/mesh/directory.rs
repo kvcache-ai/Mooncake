@@ -36,9 +36,11 @@ use crate::mesh::selection::{
     retained_authority_candidates, select_authorities_for_requests, RouteAuthoritySelection,
 };
 use crate::metrics::{record_cas_outcome, record_delete_marker_event};
+use crate::shim::{
+    RouteAuthorityClient, RouteAuthorityRecord, RouteAuthorityService, RouteMembershipProvider,
+};
 #[cfg(test)]
 use crate::table::DEFAULT_DELETE_MARKER_BUDGET_BYTES;
-use crate::shim::{RouteAuthorityClient, RouteAuthorityRecord, RouteAuthorityService, RouteMembershipProvider};
 use crate::util::{route_read_source, sampled_per_key_debug_log};
 use crate::DEFAULT_ROUTE_OWNER_PAGE_SIZE;
 
@@ -115,7 +117,9 @@ fn route_from_authority_record(
         }
         record_delete_marker_event("route_marker_conflict", 1);
     }
-    record.delete_version.map(|version| delete_marker_route(key, version))
+    record
+        .delete_version
+        .map(|version| delete_marker_route(key, version))
 }
 
 fn delete_marker_route(key: &ObjectKey, version: RouteVersion) -> ObjectRoute {
@@ -299,8 +303,8 @@ impl EmbeddedWrhRouteDirectory {
         current_candidates: &[ClientLease],
     ) -> Vec<ClientLease> {
         let limit = self.route_topk.saturating_mul(2);
-        let retained = retained_authority_candidates(self.membership.as_ref(), observer)
-            .unwrap_or_default();
+        let retained =
+            retained_authority_candidates(self.membership.as_ref(), observer).unwrap_or_default();
         let mut authorities = BTreeMap::<String, ClientLease>::new();
         for authority in ranked_top_authorities(&self.namespace, current_candidates, key, limit)
             .into_iter()
@@ -1878,20 +1882,17 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             };
             if result.as_ref().ok().is_some_and(|cas| cas.applied) {
                 if let Some(served) = attempt.resolved_authorities[index].as_ref() {
-                    let is_delete_marker = request.next.as_ref().is_none_or(|route| {
-                        route.state == RouteState::Tombstone
-                    });
+                    let is_delete_marker = request
+                        .next
+                        .as_ref()
+                        .is_none_or(|route| route.state == RouteState::Tombstone);
                     let delete_version = result
                         .as_ref()
                         .ok()
                         .and_then(|cas| cas.delete_version)
                         .or(request.expected);
                     let fanout = if is_delete_marker {
-                        self.delete_marker_fanout_authorities(
-                            observer,
-                            &request.key,
-                            &candidates,
-                        )
+                        self.delete_marker_fanout_authorities(observer, &request.key, &candidates)
                     } else {
                         selections[index].authorities.clone()
                     };
@@ -1900,8 +1901,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                             continue;
                         }
                         let next = if is_delete_marker {
-                            delete_version
-                                .map(|version| delete_marker_route(&request.key, version))
+                            delete_version.map(|version| delete_marker_route(&request.key, version))
                         } else {
                             request.next.clone()
                         };

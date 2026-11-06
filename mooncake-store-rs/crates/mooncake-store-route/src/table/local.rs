@@ -331,11 +331,7 @@ impl LocalRouteTable {
             if marker_blocked {
                 record_delete_marker_event("blocked_stale_route", 1);
             }
-            let delete_version = if current.is_none() {
-                marker
-            } else {
-                None
-            };
+            let delete_version = if current.is_none() { marker } else { None };
             let result = CasResult {
                 applied: false,
                 current,
@@ -348,7 +344,9 @@ impl LocalRouteTable {
         let applied_delete_version = self.apply_update(key, next, expected);
         CasResult {
             applied: true,
-            current: next.filter(|route| route.state != mooncake_store_core::RouteState::Tombstone).cloned(),
+            current: next
+                .filter(|route| route.state != mooncake_store_core::RouteState::Tombstone)
+                .cloned(),
             delete_version: applied_delete_version,
             version_floor: None,
         }
@@ -398,16 +396,20 @@ impl LocalRouteTable {
         match next {
             Some(route) => {
                 if route.state == mooncake_store_core::RouteState::Tombstone {
-                    return self.routes.get(&key.0).is_some_and(|current| {
-                        current.version > route.version
-                    }) || self
-                        .delete_marker(key)
-                        .is_some_and(|marker| marker >= route.version);
+                    return self
+                        .routes
+                        .get(&key.0)
+                        .is_some_and(|current| current.version > route.version)
+                        || self
+                            .delete_marker(key)
+                            .is_some_and(|marker| marker >= route.version);
                 }
                 self.routes
                     .get(&key.0)
                     .is_some_and(|current| route.version < current.version)
-                    || self.delete_marker(key).is_some_and(|marker| route.version <= marker)
+                    || self
+                        .delete_marker(key)
+                        .is_some_and(|marker| route.version <= marker)
             }
             None => expected.is_some_and(|version| {
                 self.routes
@@ -439,7 +441,8 @@ impl LocalRouteTable {
         delete_version: Option<RouteVersion>,
     ) -> Option<RouteVersion> {
         let old = self.routes.get(&key.0).cloned();
-        let next_live = next.filter(|route| route.state != mooncake_store_core::RouteState::Tombstone);
+        let next_live =
+            next.filter(|route| route.state != mooncake_store_core::RouteState::Tombstone);
         self.bump_owner_epochs(old.as_ref(), next_live);
         if let Some(route) = old.as_ref() {
             self.remove_indexes(key, route);

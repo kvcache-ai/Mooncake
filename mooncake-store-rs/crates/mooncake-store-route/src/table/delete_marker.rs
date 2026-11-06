@@ -92,9 +92,7 @@ impl DeleteMarkerStore {
             let Some((key, marker)) = self.entries.pop_front() else {
                 break;
             };
-            self.accounted_bytes = self
-                .accounted_bytes
-                .saturating_sub(marker.accounted_bytes);
+            self.accounted_bytes = self.accounted_bytes.saturating_sub(marker.accounted_bytes);
             evicted.push(EvictedDeleteMarker {
                 key,
                 version: marker.version,
@@ -105,11 +103,7 @@ impl DeleteMarkerStore {
         evicted
     }
 
-    pub(crate) fn remove_if_older(
-        &mut self,
-        key: &ObjectKey,
-        live_version: RouteVersion,
-    ) -> bool {
+    pub(crate) fn remove_if_older(&mut self, key: &ObjectKey, live_version: RouteVersion) -> bool {
         if !self
             .entries
             .get(key)
@@ -118,9 +112,7 @@ impl DeleteMarkerStore {
             return false;
         }
         if let Some(marker) = self.entries.remove(key) {
-            self.accounted_bytes = self
-                .accounted_bytes
-                .saturating_sub(marker.accounted_bytes);
+            self.accounted_bytes = self.accounted_bytes.saturating_sub(marker.accounted_bytes);
             return true;
         }
         false
@@ -145,8 +137,7 @@ fn accounted_entry_bytes(key: &ObjectKey) -> usize {
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
-    (value.saturating_add(alignment.saturating_sub(1)) / alignment)
-        .saturating_mul(alignment)
+    (value.saturating_add(alignment.saturating_sub(1)) / alignment).saturating_mul(alignment)
 }
 
 #[cfg(test)]
