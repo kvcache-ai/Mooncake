@@ -72,6 +72,7 @@ impl StorageOwnerState {
         let staging_slot_ttl =
             Duration::from_millis(cold_tier.rate_limits.staging_slot_ttl_ms.max(1));
         let restore_max_distinct_flights = cold_tier.rate_limits.restore_max_distinct_flights;
+        let hot_replicas = super::super::HotReplicaTracker::for_runtime(&runtime);
         Self {
             runtime,
             route_ops,
@@ -79,7 +80,7 @@ impl StorageOwnerState {
             allocator: allocator.clone(),
             state,
             cold_tier_devices: ColdTierDeviceManager::new(cold_tier),
-            hot_replicas: super::super::HotReplicaTracker::default(),
+            hot_replicas,
             nof_backings: super::super::HotReplicaTracker::default(),
             pending_offloads: super::super::ColdTierOffloadManager::new(offload_priority),
             cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),
