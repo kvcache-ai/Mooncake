@@ -33,7 +33,6 @@
 #include <sstream>
 
 #include "tent/common/status.h"
-#include "tent/runtime/platform.h"
 #include "tent/common/utils/ip.h"
 #include "tent/transport/rdma/buffers.h"
 #include "tent/transport/rdma/endpoint_store.h"

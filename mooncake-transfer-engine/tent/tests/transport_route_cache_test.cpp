@@ -184,303 +184,119 @@ std::vector<Request> stridedWrites(uint8_t* base, size_t count) {
     return reqs;
 }
 
-TEST(TransportRouteCache, SameMrReusesRoute) {
-    auto cfg = makeConfig(true);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+class TransportRouteCacheTest : public ::testing::TestWithParam<bool> {
+   protected:
+    void SetUp() override {
+        engine_ = std::make_unique<TransferEngineImpl>(makeConfig(GetParam()));
+        ASSERT_TRUE(engine_->available());
+        installFakeRdmaAndTcp(*engine_, rdma_, tcp_);
+    }
 
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+    void TearDown() override {
+        for (auto& buf : buffers_) {
+            if (!buf.empty())
+                engine_->unregisterLocalMemory(buf.data(), buf.size());
+        }
+    }
 
+    uint8_t* registerBytes(size_t bytes, uint8_t fill) {
+        buffers_.emplace_back(bytes, fill);
+        EXPECT_TRUE(engine_->registerLocalMemory(buffers_.back().data(), bytes)
+                        .ok());
+        return buffers_.back().data();
+    }
+
+    uint64_t submitAndCountResolves(const std::vector<Request>& reqs) {
+        engine_->resetTransportResolveCallsForTest();
+        BatchID batch_id = engine_->allocateBatch(reqs.size());
+        EXPECT_TRUE(engine_->submitTransfer(batch_id, reqs).ok());
+        const uint64_t calls = engine_->transportResolveCallsForTest();
+        EXPECT_TRUE(engine_->freeBatch(batch_id).ok());
+        return calls;
+    }
+
+    std::unique_ptr<TransferEngineImpl> engine_;
+    std::shared_ptr<FakeTransport> rdma_, tcp_;
+    std::vector<std::vector<uint8_t>> buffers_;
+};
+
+INSTANTIATE_TEST_SUITE_P(MergeOnOff, TransportRouteCacheTest,
+                         ::testing::Bool());
+
+TEST_P(TransportRouteCacheTest, SameMrReusesRoute) {
     constexpr size_t kCount = 8;
-    std::vector<uint8_t> buf(kCount * kStride, 0x11);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(kCount);
-    ASSERT_TRUE(
-        engine.submitTransfer(batch_id, stridedWrites(buf.data(), kCount))
-            .ok());
-
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 1u)
-        << "strided descriptors in one MR must share one SelectionResult";
-    EXPECT_EQ(fake_rdma->submit_calls.load() + fake_tcp->submit_calls.load(),
-              1);
-    EXPECT_EQ(
-        fake_rdma->submitted_tasks.load() + fake_tcp->submitted_tasks.load(),
-        static_cast<int>(kCount));
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+    uint8_t* base = registerBytes(kCount * kStride, 0x11);
+    EXPECT_EQ(submitAndCountResolves(stridedWrites(base, kCount)), 1u);
 }
 
-// A starts lower and is sorted first. B starts inside A and extends past it.
-// An address past A is B; an address in the overlap is still A, even though B
-// contains that address too. Merge sorts by target_offset and would run A
-// first, so keep the submitted B-then-A order.
-TEST(TransportRouteCache, OverlappingMrsDoNotReuseByContainment) {
-    auto cfg = makeConfig(false);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    std::vector<uint8_t> buf(32 * 1024, 0x41);
-    uint8_t* base = buf.data();
-    ASSERT_TRUE(engine.registerLocalMemory(base, 8192).ok());
-    ASSERT_TRUE(engine.registerLocalMemory(base + 4096, 16384).ok());
-
-    std::vector<Request> reqs;
-    reqs.push_back(makeLocalWrite(base + 8192, kChunk));
-    reqs.push_back(makeLocalWrite(base + 4096, kChunk));
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(reqs.size());
-    ASSERT_TRUE(engine.submitTransfer(batch_id, reqs).ok());
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 2u);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(base + 4096, 16384).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(base, 8192).ok());
-}
-
-TEST(TransportRouteCache, SameMrReusesRouteWithoutMerge) {
-    auto cfg = makeConfig(false);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    constexpr size_t kCount = 8;
-    std::vector<uint8_t> buf(kCount * kStride, 0x22);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(kCount);
-    ASSERT_TRUE(
-        engine.submitTransfer(batch_id, stridedWrites(buf.data(), kCount))
-            .ok());
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 1u);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
-}
-
-TEST(TransportRouteCache, DistinctMrsResolveOnceEach) {
-    auto cfg = makeConfig(true);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
+TEST_P(TransportRouteCacheTest, DistinctMrsResolveOnceEach) {
     constexpr size_t kCount = 4;
-    std::vector<uint8_t> a(kCount * kStride, 0x31);
-    std::vector<uint8_t> b(kCount * kStride, 0x32);
-    ASSERT_TRUE(engine.registerLocalMemory(a.data(), a.size()).ok());
-    ASSERT_TRUE(engine.registerLocalMemory(b.data(), b.size()).ok());
-
-    auto reqs = stridedWrites(a.data(), kCount);
-    auto more = stridedWrites(b.data(), kCount);
+    uint8_t* a = registerBytes(kCount * kStride, 0x31);
+    uint8_t* b = registerBytes(kCount * kStride, 0x32);
+    auto reqs = stridedWrites(a, kCount);
+    auto more = stridedWrites(b, kCount);
     reqs.insert(reqs.end(), more.begin(), more.end());
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(reqs.size());
-    ASSERT_TRUE(engine.submitTransfer(batch_id, reqs).ok());
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 2u);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(a.data(), a.size()).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(b.data(), b.size()).ok());
+    EXPECT_EQ(submitAndCountResolves(reqs), 2u);
 }
 
-TEST(TransportRouteCache, DistinctHintDoesNotReuse) {
-    auto cfg = makeConfig(true);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    std::vector<uint8_t> buf(2 * kStride, 0x41);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    Request rdma = makeLocalWrite(buf.data(), kChunk);
-    rdma.transport_hint = RDMA;
-    Request tcp = makeLocalWrite(buf.data() + kStride, kChunk);
-    tcp.transport_hint = TCP;
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {rdma, tcp}).ok());
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 2u);
-    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
-    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+TEST_P(TransportRouteCacheTest, DistinctKeyFieldDoesNotReuse) {
+    uint8_t* base = registerBytes(kStride + kChunk * 2, 0x41);
+    const std::pair<const char*, void (*)(Request&)> cases[] = {
+        {"hint", [](Request& req) { req.transport_hint = TCP; }},
+        {"intent",
+         [](Request& req) {
+             req.intent_type = IntentType::BACKGROUND_PREFETCH;
+         }},
+        {"length", [](Request& req) { req.length = kChunk * 2; }},
+        {"priority", [](Request& req) { req.priority = PRIO_LOW; }},
+    };
+    for (const auto& [name, mutate] : cases) {
+        SCOPED_TRACE(name);
+        Request first = makeLocalWrite(base, kChunk);
+        if (std::string(name) == "intent")
+            first.intent_type = IntentType::FOREGROUND_GET;
+        Request second = makeLocalWrite(base + kChunk + kGap, kChunk);
+        mutate(second);
+        EXPECT_EQ(submitAndCountResolves({first, second}), 2u);
+    }
 }
 
-TEST(TransportRouteCache, DistinctIntentDoesNotReuse) {
-    auto cfg = makeConfig(true);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    std::vector<uint8_t> buf(2 * kStride, 0x51);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    Request a = makeLocalWrite(buf.data(), kChunk);
-    a.intent_type = IntentType::FOREGROUND_GET;
-    Request b = makeLocalWrite(buf.data() + kStride, kChunk);
-    b.intent_type = IntentType::BACKGROUND_PREFETCH;
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {a, b}).ok());
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 2u);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
-}
-
-TEST(TransportRouteCache, DistinctLengthDoesNotReuse) {
-    auto cfg = makeConfig(true);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    std::vector<uint8_t> buf(kChunk + kGap + kChunk * 2, 0x61);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    Request a = makeLocalWrite(buf.data(), kChunk);
-    Request b = makeLocalWrite(buf.data() + kChunk + kGap, kChunk * 2);
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {a, b}).ok());
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 2u);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
-}
-
-TEST(TransportRouteCache, DistinctPriorityDoesNotReuse) {
-    auto cfg = makeConfig(true);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    std::vector<uint8_t> buf(2 * kStride, 0x71);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    Request a = makeLocalWrite(buf.data(), kChunk);
-    a.priority = PRIO_HIGH;
-    Request b = makeLocalWrite(buf.data() + kStride, kChunk);
-    b.priority = PRIO_LOW;
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {a, b}).ok());
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 2u);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
-}
-
-TEST(TransportRouteCache, PolicyNameNulloptDoesNotReuseEmptyString) {
-    auto cfg = makeConfig(false);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    std::vector<uint8_t> buf(2 * kStride, 0x81);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    Request unbound = makeLocalWrite(buf.data(), kChunk);
-    Request empty_name = makeLocalWrite(buf.data() + kStride, kChunk);
+TEST_P(TransportRouteCacheTest, PolicyNameNulloptDoesNotReuseEmptyString) {
+    uint8_t* base = registerBytes(2 * kStride, 0x81);
+    Request unbound = makeLocalWrite(base, kChunk);
+    Request empty_name = makeLocalWrite(base + kStride, kChunk);
     empty_name.policy_name = std::string{};
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {unbound, empty_name}).ok());
-    // Default policy hits once. "" is a different key and selects UNSPEC;
-    // resolveTransport retries getTransportType after invalidateRemote.
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 3u);
-    EXPECT_EQ(fake_rdma->submitted_tasks.load(), 1);
-    EXPECT_EQ(fake_tcp->submitted_tasks.load(), 0);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+    // Default policy resolves once. "" is a different key and selects UNSPEC,
+    // so resolveTransport calls getTransportType again after invalidateRemote.
+    EXPECT_EQ(submitAndCountResolves({unbound, empty_name}), 3u);
+    EXPECT_EQ(rdma_->submitted_tasks.load(), 1);
+    EXPECT_EQ(tcp_->submitted_tasks.load(), 0);
 }
 
-TEST(TransportRouteCache, UnspecMissIsNotCached) {
-    auto cfg = makeConfig(false);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    std::vector<uint8_t> buf(2 * kStride, 0x91);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    Request a = makeLocalWrite(buf.data(), kChunk);
+TEST_P(TransportRouteCacheTest, UnspecMissIsNotCached) {
+    uint8_t* base = registerBytes(2 * kStride, 0x91);
+    Request a = makeLocalWrite(base, kChunk);
     a.policy_name = std::string{};
-    Request b = makeLocalWrite(buf.data() + kStride, kChunk);
+    Request b = makeLocalWrite(base + kStride, kChunk);
     b.policy_name = std::string{};
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(2);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {a, b}).ok());
-    // Two identical UNSPEC owners; each miss calls getTransportType twice
-    // (resolveTransport invalidate retry). A cached UNSPEC would be 2.
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 4u);
-    EXPECT_EQ(
-        fake_rdma->submitted_tasks.load() + fake_tcp->submitted_tasks.load(),
-        0);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+    // Each UNSPEC miss calls getTransportType twice. The first miss also marks
+    // the peer refreshed, so the second owner cannot reuse a cached UNSPEC.
+    // Caching the miss would report 2.
+    EXPECT_EQ(submitAndCountResolves({a, b}), 4u);
+    EXPECT_EQ(rdma_->submitted_tasks.load() + tcp_->submitted_tasks.load(), 0);
 }
 
-TEST(TransportRouteCache, HashMapHitAfterInterleaving) {
-    auto cfg = makeConfig(false);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
-
-    std::shared_ptr<FakeTransport> fake_rdma, fake_tcp;
-    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
-
-    std::vector<uint8_t> buf(3 * kStride, 0xa1);
-    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
-
-    Request a = makeLocalWrite(buf.data(), kChunk);
+TEST_P(TransportRouteCacheTest, HashMapHitAfterInterleaving) {
+    uint8_t* base = registerBytes(3 * kStride, 0xa1);
+    Request a = makeLocalWrite(base, kChunk);
     a.transport_hint = RDMA;
-    Request mid = makeLocalWrite(buf.data() + kStride, kChunk);
+    Request mid = makeLocalWrite(base + kStride, kChunk);
     mid.transport_hint = TCP;
-    Request a_again = makeLocalWrite(buf.data() + 2 * kStride, kChunk);
-    a_again.transport_hint = RDMA;
-
-    engine.resetTransportResolveCallsForTest();
-    BatchID batch_id = engine.allocateBatch(3);
-    ASSERT_TRUE(engine.submitTransfer(batch_id, {a, mid, a_again}).ok());
-    EXPECT_EQ(engine.transportResolveCallsForTest(), 2u);
-    EXPECT_EQ(fake_rdma->submitted_tasks.load(), 2);
-    EXPECT_EQ(fake_tcp->submitted_tasks.load(), 1);
-
-    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+    Request again = makeLocalWrite(base + 2 * kStride, kChunk);
+    again.transport_hint = RDMA;
+    EXPECT_EQ(submitAndCountResolves({a, mid, again}), 2u);
+    EXPECT_EQ(rdma_->submitted_tasks.load(), 2);
+    EXPECT_EQ(tcp_->submitted_tasks.load(), 1);
 }
 
 }  // namespace

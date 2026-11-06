@@ -1555,9 +1555,7 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
-#ifdef TENT_TRANSPORT_RESOLVE_COUNTER
     transport_resolve_calls_.fetch_add(1, std::memory_order_relaxed);
-#endif
     bool device_direct = false;
     auto result =
         planTransport(request, transport_index, true, true, &device_direct);
@@ -1813,6 +1811,9 @@ struct MergeResult {
     // Original request index -> merged request index. Every input has one
     // entry.
     std::vector<size_t> task_lookup;
+    // merged index -> one original request. can_merge requires the same
+    // source and target BufferKey, so any member of the group is equivalent.
+    std::vector<size_t> first_public;
 };
 
 struct TransferEngineImpl::PreparedSubmit {
@@ -1854,6 +1855,7 @@ MergeResult makePassThroughMergeResult(const std::vector<Request>& requests) {
     for (size_t i = 0; i < requests.size(); ++i) {
         result.request_list.push_back(requests[i]);
         result.task_lookup[i] = i;
+        result.first_public.push_back(i);
     }
     return result;
 }
@@ -1889,25 +1891,10 @@ struct RouteCacheKeyHash {
         mix(std::hash<uint64_t>{}(k.source.length));
         mix(std::hash<uint64_t>{}(k.target.addr));
         mix(std::hash<uint64_t>{}(k.target.length));
-        mix(k.policy_name.has_value() ? 1u : 0u);
         if (k.policy_name) mix(std::hash<std::string>{}(*k.policy_name));
         return h;
     }
 };
-
-RouteCacheKey makeRouteCacheKey(const Request& req, const BufferKey& source,
-                                const BufferKey& target) {
-    RouteCacheKey key;
-    key.target_id = req.target_id;
-    key.hint = req.transport_hint;
-    key.intent = req.intent_type;
-    key.priority = req.priority;
-    key.length = req.length;
-    key.source = source;
-    key.target = target;
-    key.policy_name = req.policy_name;
-    return key;
-}
 
 }  // namespace
 
@@ -1996,6 +1983,7 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
     for (const auto& item : items) {
         if (merged_items.empty() || !can_merge(merged_items.back(), item)) {
             merged_items.push_back(item);
+            result.first_public.push_back(item.orig_idx);
         } else {
             merged_items.back().req.length += item.req.length;
         }
@@ -2301,11 +2289,13 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
 
 SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
                                                      int transport_index,
-                                                     bool invalidate_on_fail) {
+                                                     bool invalidate_on_fail,
+                                                     bool* refreshed) {
     auto result = getTransportType(req, transport_index);
     if (result.transport == UNSPEC && invalidate_on_fail) {
         metadata_->segmentManager().invalidateRemote(req.target_id);
         result = getTransportType(req, transport_index);
+        if (refreshed) *refreshed = true;
     }
     return result;
 }
@@ -2335,11 +2325,8 @@ Status TransferEngineImpl::prepareSubmit(
     }
     const size_t start_task_id = batch->task_list.size();
     prepared.submit_time = std::chrono::steady_clock::now();
-    auto merge_boundaries =
-        merge_requests_
-            ? resolveRequestBoundaries(metadata_.get(), request_list,
-                                       hp_tcp_transport_config_)
-            : std::vector<RequestBoundaryInfo>{};
+    auto merge_boundaries = resolveRequestBoundaries(
+        metadata_.get(), request_list, hp_tcp_transport_config_);
     auto merged =
         mergeRequests(request_list, merge_boundaries, merge_requests_);
 
@@ -2378,132 +2365,54 @@ Status TransferEngineImpl::prepareSubmit(
     }
 
     prepared.owners.reserve(merged.request_list.size());
-    std::vector<size_t> first_public(merged.request_list.size(),
-                                     std::numeric_limits<size_t>::max());
-    for (size_t pub = 0; pub < merged.task_lookup.size(); ++pub) {
-        const size_t owner_id = merged.task_lookup[pub];
-        if (first_public[owner_id] == std::numeric_limits<size_t>::max())
-            first_public[owner_id] = pub;
-    }
-    const bool have_boundaries = merge_boundaries.size() == request_list.size();
 
-    // One prepareSubmit only. Each lookup uses the snapshot findBuffer /
-    // resolve sees then; a mid-submit metadata refresh is not part of the
-    // key. Pinning one snapshot per target is follow-up.
+    // One prepareSubmit. Keys come from the precomputed findBuffer results.
+    // After a peer snapshot refresh, later owners of that peer skip the cache.
     std::unordered_map<RouteCacheKey, SelectionResult, RouteCacheKeyHash>
         route_cache;
-    RouteCacheKey last_key{};
+    std::unordered_set<SegmentID> refreshed_targets;
+    std::optional<RouteCacheKey> last_key;
     SelectionResult last_route{};
-    bool last_valid = false;
-
-    auto lookupSourceKey = [&](const Request& req) -> std::optional<BufferKey> {
-        auto local_desc = metadata_->segmentManager().getLocal();
-        if (!local_desc) return std::nullopt;
-        return toBufferKey(
-            local_desc->findBuffer(requestSourceAddr(req), req.length));
-    };
-    auto lookupTargetKey = [&](const Request& req) -> std::optional<BufferKey> {
-        std::optional<BufferKey> key;
-        metadata_->segmentManager().withCachedSegment(
-            req.target_id, [&](SegmentDesc* desc) {
-                key = toBufferKey(
-                    desc->findBuffer(req.target_offset, req.length));
-                return Status::OK();
-            });
-        return key;
-    };
 
     for (size_t owner_id = 0; owner_id < merged.request_list.size();
          ++owner_id) {
         PreparedSubmit::Owner owner;
         owner.request = merged.request_list[owner_id];
-        const size_t pub = first_public[owner_id];
-        std::optional<BufferKey> source_key;
-        std::optional<BufferKey> target_key;
-        if (have_boundaries && pub < merge_boundaries.size()) {
-            source_key = merge_boundaries[pub].source_key;
-            target_key = merge_boundaries[pub].target_key;
-        }
-
-        const uint64_t len = owner.request.length;
-        // Same findBuffer result, not geometric containment. Overlapping
-        // registrations are first-match: a later, larger MR can cover an
-        // address whose findBuffer buffer is an earlier one.
-        auto sameResolvedBuffers = [&]() {
-            return last_valid && source_key && target_key &&
-                   last_key.target_id == owner.request.target_id &&
-                   last_key.hint == owner.request.transport_hint &&
-                   last_key.intent == owner.request.intent_type &&
-                   last_key.priority == owner.request.priority &&
-                   last_key.length == len &&
-                   last_key.policy_name == owner.request.policy_name &&
-                   last_key.source == *source_key &&
-                   last_key.target == *target_key;
-        };
-        if (!sameResolvedBuffers()) {
-            if (!source_key) source_key = lookupSourceKey(owner.request);
-            if (!target_key) target_key = lookupTargetKey(owner.request);
-        }
-        if (sameResolvedBuffers()) {
-            owner.route = last_route;
-        } else if (source_key && target_key) {
-            auto key =
-                makeRouteCacheKey(owner.request, *source_key, *target_key);
-            bool remember = true;
-            if (auto it = route_cache.find(key); it != route_cache.end()) {
-                owner.route = it->second;
-            } else {
-                owner.route = resolveTransport(owner.request, 0);
-                // resolveTransport may drop a stale peer snapshot and select
-                // against the replacement. The key above still names the old
-                // findBuffer result, so a refreshed RDMA route must not be
-                // reused for a later owner whose new MR is different.
-                auto selected_source = lookupSourceKey(owner.request);
-                auto selected_target = lookupTargetKey(owner.request);
-                const bool buffers_changed =
-                    !selected_source || !selected_target ||
-                    *selected_source != key.source ||
-                    *selected_target != key.target;
-                if (buffers_changed) {
-                    const auto target_id = owner.request.target_id;
-                    std::erase_if(route_cache, [&](const auto& entry) {
-                        return entry.first.target_id == target_id;
-                    });
-                    if (last_valid && last_key.target_id == target_id)
-                        last_valid = false;
-                    if (have_boundaries) {
-                        for (size_t i = 0; i < request_list.size(); ++i) {
-                            if (request_list[i].target_id != target_id)
-                                continue;
-                            merge_boundaries[i].target_key =
-                                lookupTargetKey(request_list[i]);
-                        }
-                        if (selected_source && *selected_source != key.source) {
-                            for (size_t i = 0; i < request_list.size(); ++i) {
-                                merge_boundaries[i].source_key =
-                                    lookupSourceKey(request_list[i]);
-                            }
-                        }
-                    }
-                    if (selected_source && selected_target) {
-                        key = makeRouteCacheKey(owner.request, *selected_source,
-                                                *selected_target);
-                    }
-                }
-                remember = owner.route.transport != UNSPEC &&
-                           selected_source && selected_target;
-                if (remember) route_cache.emplace(key, owner.route);
-            }
-            if (remember) {
-                last_key = std::move(key);
-                last_route = owner.route;
-                last_valid = true;
-            } else {
-                last_valid = false;
-            }
+        const auto& req = owner.request;
+        const auto& boundary = merge_boundaries[merged.first_public[owner_id]];
+        const bool cacheable = boundary.source_key && boundary.target_key &&
+                               !refreshed_targets.contains(req.target_id);
+        if (!cacheable) {
+            bool refreshed = false;
+            owner.route = resolveTransport(req, 0, true, &refreshed);
+            if (refreshed) refreshed_targets.insert(req.target_id);
+            last_key.reset();
         } else {
-            owner.route = resolveTransport(owner.request, 0);
-            last_valid = false;
+            RouteCacheKey key{req.target_id,     req.transport_hint,
+                              req.intent_type,   req.priority,
+                              req.length,        *boundary.source_key,
+                              *boundary.target_key, req.policy_name};
+            if (last_key && key == *last_key) {
+                owner.route = last_route;
+            } else if (auto it = route_cache.find(key);
+                       it != route_cache.end()) {
+                owner.route = it->second;
+                last_key = key;
+                last_route = owner.route;
+            } else {
+                bool refreshed = false;
+                owner.route = resolveTransport(req, 0, true, &refreshed);
+                if (refreshed) {
+                    refreshed_targets.insert(req.target_id);
+                    last_key.reset();
+                } else if (owner.route.transport != UNSPEC) {
+                    route_cache.emplace(key, owner.route);
+                    last_key = std::move(key);
+                    last_route = owner.route;
+                } else {
+                    last_key.reset();
+                }
+            }
         }
         if (require_post_submit_cancellation) {
             const auto type = owner.route.transport;

@@ -1,12 +1,6 @@
 file(GLOB TENT_RUNTIME_SOURCES "*.cpp")
 add_library(tent_runtime OBJECT ${TENT_RUNTIME_SOURCES})
 
-if(BUILD_UNIT_TESTS)
-  # Resolve-call counter for tent_transport_route_cache_test. Production builds
-  # leave the field and fetch_add out of TransferEngineImpl.
-  target_compile_definitions(tent_runtime PUBLIC TENT_TRANSPORT_RESOLVE_COUNTER)
-endif()
-
 if(TARGET metastore_redis)
   add_definitions(-DUSE_REDIS)
   target_link_libraries(tent_runtime PUBLIC metastore_redis)
