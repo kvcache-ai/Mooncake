@@ -69,7 +69,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     explicit CentralizedCoordinatorStateMachine(
         int max_world_size,
         std::chrono::microseconds fault_reconciliation_window =
-            std::chrono::microseconds(50000));
+            std::chrono::microseconds(50000),
+        std::optional<DeviceAllReduceAlgorithm> all_reduce_algorithm =
+            std::nullopt);
 
     void setFaultReconciliationWindow(
         std::chrono::microseconds fault_reconciliation_window);
@@ -207,6 +209,9 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     };
     FaultReconciliationContext reconciliation_ctx_;
     std::chrono::microseconds fault_reconciliation_window_;
+
+    // Unset uses size-based selection.
+    const std::optional<DeviceAllReduceAlgorithm> all_reduce_algorithm_;
 
     // requestShutdown() freezes the ranks whose current Agent sessions must
     // end before the state machine asks the Host to stop serving RPCs. New

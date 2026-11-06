@@ -31,7 +31,6 @@ _CPP_EXPORTS = frozenset(
         "MooncakeHostMemAllocator",
         "MooncakeDistributedNoFRegister",
         "MooncakeDistributedStore",
-        "EngramStoreConfig",
         "EngramStore",
         "bind_to_numa_node",
         "get_alloc_func_addr",
@@ -64,7 +63,6 @@ _CPP_INTERNAL_EXPORTS = frozenset(
         "_serialize_tensor",
         "_tensor_metadata_size",
         "_deserialize_tensor",
-        "_get_pyclient_from_wrapper",
     }
 )
 
@@ -125,6 +123,10 @@ __all__ = sorted(_EXPORTS)
 
 
 def __getattr__(name: str):
+    if name == "EngramStore" and _BACKEND == "cpp":
+        from mooncake.engram import EngramStore
+
+        return EngramStore
     if name in _EXPORTS:
         return getattr(_IMPLEMENTATION, name)
     if _BACKEND == "cpp" and name in _CPP_INTERNAL_EXPORTS:

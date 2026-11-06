@@ -238,10 +238,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_SLICE_SIZE", "transports/rdma/workers/block_size");
     setConfig(config, "MC_RETRY_CNT",
               "transports/rdma/workers/max_retry_count");
-    setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
-              "transports/rdma/disable_gpu_direct_rdma");
-    setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
-              "transports/rdma/log_slice_affinity");
+    setBoolConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
+                  "transports/rdma/disable_gpu_direct_rdma");
+    setBoolConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
+                  "transports/rdma/log_slice_affinity");
     setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
                   "transports/rdma/strict_local_numa");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated

@@ -28,8 +28,8 @@ DeviceCollectiveWorkspace::create(DeviceTransferService& transfer_service,
     PG_VALIDATE_ARG(
         self_rank >= 0 && static_cast<uint32_t>(self_rank) < max_world_size,
         "device collective self rank is outside the world");
-    PG_TRY(auto buffer,
-           transfer_service.allocatePeerAccessible(buffer_size, 1));
+    PG_TRY(auto buffer, transfer_service.allocatePeerAccessible(
+                            buffer_size, alignof(uint64_t)));
     const DeviceCollectiveWorkspaceEndpoint local_endpoint{
         .buffer_offset = buffer.offset(),
         .buffer_size = buffer.size(),

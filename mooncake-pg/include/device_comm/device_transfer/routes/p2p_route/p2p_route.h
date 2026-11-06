@@ -31,6 +31,14 @@ class P2pRoute : public RouteProvider {
 
     [[nodiscard]] PGResult<void> initialize();
 
+    [[nodiscard]] const DeviceUUID& deviceUuid() const noexcept {
+        return device_uuid_;
+    }
+    [[nodiscard]] const std::vector<DeviceUUID>& nativeAtomicPeerUuids()
+        const noexcept {
+        return native_atomic_peer_uuids_;
+    }
+
     [[nodiscard]] std::string_view routeKey() const noexcept override;
     [[nodiscard]] uint32_t routeVersion() const noexcept override;
     PGResult<void> registerRegion(DeviceRegionKind kind, void* addr,
@@ -50,6 +58,8 @@ class P2pRoute : public RouteProvider {
     int device_index_ = -1;
     GlobalRank self_rank_ = kInvalidGlobalRank;
     uint32_t max_world_size_ = 0;
+    DeviceUUID device_uuid_{};
+    std::vector<DeviceUUID> native_atomic_peer_uuids_;
     std::optional<GpuStream> snapshot_stream_;
 };
 

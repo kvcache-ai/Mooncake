@@ -18,6 +18,8 @@ import os
 import sys
 import time
 
+INVALID_PARAMS = -600
+
 
 def _require_store():
     try:
@@ -142,6 +144,27 @@ def run() -> int:
     print(f"batch_put_session_revoke {revoke_rcs}", flush=True)
     if any(rc != 0 for rc in revoke_rcs):
         return 51
+
+    # DFS configs are rejected at start: the session path never writes DFS.
+    dfs_keys = [f"session_e2e_dfs_{int(time.time())}"]
+    for replica_num in (1, 0):
+        dfs_config = store.ReplicateConfig()
+        dfs_config.replica_num = replica_num
+        dfs_config.dfs_replica_num = 1
+        dfs_start = mc.batch_put_session_start(dfs_keys, [page_size], dfs_config)
+        print(
+            f"batch_put_session_start_dfs replica_num={replica_num} {dfs_start}",
+            flush=True,
+        )
+        if dfs_start != [INVALID_PARAMS]:
+            return 60
+    # Nothing was reserved, so a MEMORY-only session on the same key starts.
+    dfs_retry = mc.batch_put_session_start(dfs_keys, [page_size])
+    print(f"batch_put_session_start_after_dfs_reject {dfs_retry}", flush=True)
+    if any(rc != 0 for rc in dfs_retry):
+        return 61
+    if any(rc != 0 for rc in mc.batch_put_session_revoke(dfs_keys)):
+        return 62
 
     assert mc.unregister_buffer(_ptr(src)) == 0
     assert mc.unregister_buffer(_ptr(dst)) == 0

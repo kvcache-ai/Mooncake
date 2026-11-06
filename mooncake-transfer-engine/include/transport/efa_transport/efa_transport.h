@@ -79,6 +79,20 @@ class EfaTransport : public Transport {
     buildLocalNicMap(const TopologyMatrix& matrix,
                      const std::vector<std::string>& device_names);
 
+    // Writes to `indexed` a copy of `topology` that lists only `device_names`
+    // (the EFA devices the transport opened), numbered in the topology's own
+    // order. A topology index selects both the NIC in context_list_ and the
+    // buffer key in lkey/rkey, which hold one entry per opened device, so a
+    // topology that also lists other HCAs -- the two non-EFA InfiniBand HCAs
+    // on p6-b300, or an EFA device that failed to open -- shifts every
+    // selection to another NIC. Topology::disableDevice() cannot close the
+    // gap, because it keeps indices stable for the RDMA transport.
+    //
+    // Exposed for testing.
+    static int indexTopologyOverDevices(
+        const Topology& topology, const std::vector<std::string>& device_names,
+        Topology& indexed);
+
     // Eagerly populate the address vector with every (local_ctx, peer_nic)
     // handshake for `segment_name`.
     //

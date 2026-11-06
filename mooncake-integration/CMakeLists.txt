@@ -21,7 +21,6 @@ endif()
 if(WITH_STORE)
   include_directories("../mooncake-store/include")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
-  include_directories("../mooncake-store/include/engram")
 
   include_directories(
     "../mooncake-store/include/cachelib_memory_allocator/include")
@@ -93,7 +92,8 @@ if(WITH_TE)
                      tests/on_cuda_transport_guard_test.cpp)
       target_include_directories(
         on_cuda_transport_guard_test
-        PRIVATE "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/include")
+        PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>
+      )
       target_link_libraries(on_cuda_transport_guard_test
                             PRIVATE pybind11::headers Python3::Python)
       add_test(NAME on_cuda_transport_guard_test
@@ -108,7 +108,7 @@ if(WITH_TE)
         ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
         "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
         PYTHONPATH=$<TARGET_FILE_DIR:engine>
-        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>:$ENV{LD_LIBRARY_PATH}
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_send_probe.py)
     add_test(
@@ -117,7 +117,7 @@ if(WITH_TE)
         ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
         "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
         PYTHONPATH=$<TARGET_FILE_DIR:engine>
-        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>:$ENV{LD_LIBRARY_PATH}
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
@@ -162,14 +162,13 @@ if(USE_UBSHMEM)
 endif()
 
 if(WITH_STORE)
+  if(USE_CUDA)
+    add_subdirectory(../mooncake-store/src/engram
+                     ${CMAKE_BINARY_DIR}/mooncake-store/src/engram)
+  endif()
   pybind11_add_module(
-    store
-    ${SOURCES}
-    ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp
-    store/buffer_pool.cpp
-    store/engram_store_py.cpp
-    integration_utils.h)
+    store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
+    store/buffer_pool.cpp integration_utils.h)
   set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
                                                               "$ORIGIN")
   if(USE_TENT)
@@ -312,8 +311,8 @@ if(WITH_TE)
                                  COMPONENT python)
   # Co-locate libtent_metrics.so with the Python C extensions so engine.so and
   # _store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
-  # must be loadable wherever the extensions are installed; otherwise
-  # `import mooncake.engine` / `mooncake.store` fails with a missing library.
+  # must be loadable wherever the extensions are installed; otherwise `import
+  # mooncake.engine` / `mooncake.store` fails with a missing library.
   if(TARGET tent_metrics)
     install(TARGETS tent_metrics
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)

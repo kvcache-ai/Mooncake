@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -228,6 +229,22 @@ TEST(NvlinkHostNumaAllocationTest, DiscoversSortedGpuLocalNodes) {
     driver.fabric_supported = 0;
     EXPECT_TRUE(NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes)
                     .IsNotSupportedTransport());
+    EXPECT_TRUE(nodes.empty());
+}
+
+TEST(NvlinkHostNumaAllocationTest, NvlinkIpcZeroKeepsFabricAllocations) {
+    FakeCudaDriver driver;
+    std::vector<int> nodes;
+    setenv("MC_USE_NVLINK_IPC", "0", 1);
+    auto zero = NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes);
+    unsetenv("MC_USE_NVLINK_IPC");
+    ASSERT_TRUE(zero.ok());
+    EXPECT_EQ(nodes, (std::vector<int>{0, 2}));
+
+    setenv("MC_USE_NVLINK_IPC", "1", 1);
+    auto one = NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes);
+    unsetenv("MC_USE_NVLINK_IPC");
+    EXPECT_TRUE(one.IsNotSupportedTransport());
     EXPECT_TRUE(nodes.empty());
 }
 
