@@ -1933,7 +1933,7 @@ impl StorageOwnerState {
     fn rebuild_clock(&self) -> Result<()> {
         let tracker = OperationTracker::new("storage_owner_rebuild_clock");
         let result = (|| {
-            let mut clock = StorageClockState::default();
+            let mut clock = StorageClockState::for_runtime(&self.runtime);
             let mut route_count = 0usize;
             self.route_ops
                 .visit_routes_by_replica_owner(&self.runtime, &mut |route| {
@@ -1978,6 +1978,15 @@ pub(in crate::client) fn nof_backing_clock_segment(target_id: &str) -> SegmentNa
 
 impl StorageClockState {
     const READ_HOT_CLOCK_CREDIT: u8 = 2;
+
+    fn for_runtime(runtime: &ClientRuntimeId) -> Self {
+        let cursor = runtime_clock_cursor(runtime);
+        Self {
+            hand: cursor,
+            stale_reclaim_hand: cursor.rotate_right(13),
+            ..Self::default()
+        }
+    }
 
     fn eviction_budget(&self) -> usize {
         self.entries.len().saturating_mul(3)
@@ -2287,6 +2296,12 @@ impl StorageClockState {
 
 #[allow(dead_code)]
 impl HotReplicaTracker {
+    fn for_runtime(runtime: &ClientRuntimeId) -> Self {
+        Self {
+            clock: Mutex::new(StorageClockState::for_runtime(runtime)),
+        }
+    }
+
     fn eviction_budget(&self) -> usize {
         self.clock.lock().eviction_budget()
     }
@@ -2341,12 +2356,24 @@ impl HotReplicaTracker {
     }
 
     fn rebuild(&self, routes: &[ObjectRoute], runtime: &ClientRuntimeId) {
-        let mut clock = StorageClockState::default();
+        let mut clock = StorageClockState::for_runtime(runtime);
         for route in routes {
             clock.track_route(route, runtime);
         }
         *self.clock.lock() = clock;
     }
+}
+
+fn runtime_clock_cursor(runtime: &ClientRuntimeId) -> usize {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in runtime.storage_key().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    (hash & 0x7fff_ffff) as usize
 }
 
 #[allow(dead_code)]
