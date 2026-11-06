@@ -581,6 +581,13 @@ mod state_core_tests {
     }
 
     #[test]
+    fn pending_publication_default_capacity_keeps_byte_guard_independent() {
+        let lifecycle = AllocationLifecycleConfig::default();
+        assert_eq!(lifecycle.max_pending_publications, 8192);
+        assert_eq!(lifecycle.max_pending_publication_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
     fn pending_publication_backpressure_rejects_before_physical_reserve() {
         let owner = ClientRuntimeId::new("backpressure-owner", ClientEpoch(1));
         let segment_name = SegmentName::new("backpressure-segment");
