@@ -3279,6 +3279,195 @@ mod owner_page_contract_tests {
             AllocationRouteReference::conflict()
         );
     }
+
+    #[test]
+    fn allocation_reverse_lookup_tracks_public_cas_generation_changes() {
+        let observer = test_lease("allocation-cas-authority");
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![observer.clone()],
+            }),
+        );
+        let mut route = test_route("allocation-cas-generation", &observer.runtime);
+        route.replicas[0].allocation_id = Some(7);
+        let identity = AllocationRouteIdentity {
+            owner: observer.runtime.clone(),
+            segment_name: route.replicas[0].segment_name.clone(),
+            offset_bytes: route.replicas[0].segment_offset,
+            length_bytes: route.replicas[0].length,
+            allocation_id: 7,
+        };
+        assert!(
+            directory
+                .compare_and_swap_object_route(&observer, &route.key, None, Some(&route))
+                .unwrap()
+                .applied
+        );
+        assert_eq!(
+            directory
+                .get_allocation_route_reference_keys_consistent(
+                    &observer,
+                    std::slice::from_ref(&identity)
+                )
+                .unwrap(),
+            vec![AllocationRouteReference::exact(route.key.clone())]
+        );
+
+        let mut next = route.clone();
+        next.version = route.version.next();
+        next.replicas[0].allocation_id = Some(8);
+        assert!(
+            directory
+                .compare_and_swap_object_route(
+                    &observer,
+                    &route.key,
+                    Some(route.version),
+                    Some(&next)
+                )
+                .unwrap()
+                .applied
+        );
+        assert!(
+            !directory
+                .compare_and_swap_object_route(&observer, &route.key, Some(route.version), None)
+                .unwrap()
+                .applied
+        );
+        assert_eq!(
+            directory
+                .get_allocation_route_references_consistent(
+                    &observer,
+                    std::slice::from_ref(&identity)
+                )
+                .unwrap(),
+            vec![AllocationRouteReferenceState::Conflict]
+        );
+
+        let mut changed_length = next.clone();
+        changed_length.version = next.version.next();
+        changed_length.replicas[0].allocation_id = Some(7);
+        changed_length.replicas[0].length += 1;
+        assert!(
+            directory
+                .compare_and_swap_object_route(
+                    &observer,
+                    &route.key,
+                    Some(next.version),
+                    Some(&changed_length)
+                )
+                .unwrap()
+                .applied
+        );
+        assert_eq!(
+            directory
+                .get_allocation_route_reference_keys_consistent(
+                    &observer,
+                    std::slice::from_ref(&identity)
+                )
+                .unwrap(),
+            vec![AllocationRouteReference::conflict()]
+        );
+        assert!(
+            directory
+                .compare_and_swap_object_route(
+                    &observer,
+                    &route.key,
+                    Some(changed_length.version),
+                    None
+                )
+                .unwrap()
+                .applied
+        );
+        assert_eq!(
+            directory
+                .get_allocation_route_references_consistent(&observer, &[identity])
+                .unwrap(),
+            vec![AllocationRouteReferenceState::Absent]
+        );
+    }
+
+    #[test]
+    fn exact_replica_confirmation_rejects_partial_absence() {
+        let observer = test_lease("partial-absence-observer");
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut route = test_route("partial-absence-key", &owner);
+        route.replicas[0].allocation_id = Some(7);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::from([("authority-a".to_string(), None)]),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+        assert!(directory
+            .confirm_replica_reference(&observer, &route.key, &route.replicas[0])
+            .is_err());
+    }
+
+    #[test]
+    fn allocation_reference_key_query_accepts_sharded_positive_proof() {
+        for exact_authority in ["authority-a", "authority-b"] {
+            let observer = test_lease("sharded-proof-observer");
+            let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+            let mut route = test_route("sharded-proof-key", &owner);
+            route.replicas[0].allocation_id = Some(7);
+            let identity = AllocationRouteIdentity {
+                owner,
+                segment_name: route.replicas[0].segment_name.clone(),
+                offset_bytes: route.replicas[0].segment_offset,
+                length_bytes: route.replicas[0].length,
+                allocation_id: 7,
+            };
+            let absent_authority = if exact_authority == "authority-a" {
+                "authority-b"
+            } else {
+                "authority-a"
+            };
+            let directory = EmbeddedWrhRouteDirectory::new(
+                2,
+                Arc::new(InMemoryMetadataBackend::new()),
+                &observer,
+                Arc::new(ConfirmationClient {
+                    routes: BTreeMap::from([
+                        (exact_authority.to_string(), Some(route.clone())),
+                        (absent_authority.to_string(), None),
+                    ]),
+                    allocation_references: BTreeMap::from([
+                        (
+                            exact_authority.to_string(),
+                            vec![AllocationRouteReferenceState::Exact],
+                        ),
+                        (
+                            absent_authority.to_string(),
+                            vec![AllocationRouteReferenceState::Absent],
+                        ),
+                    ]),
+                }),
+                Arc::new(TestMembership {
+                    leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+                }),
+            );
+            assert_eq!(
+                directory
+                    .get_allocation_route_reference_keys_consistent(&observer, &[identity])
+                    .unwrap(),
+                vec![AllocationRouteReference::exact(route.key)]
+            );
+        }
+    }
+
 }
 
 #[cfg(test)]
