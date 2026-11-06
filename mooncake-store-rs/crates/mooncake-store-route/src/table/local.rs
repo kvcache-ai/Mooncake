@@ -629,6 +629,41 @@ mod tests {
         ClientEpoch, CompatibilityDescriptor, ReplicaRoute, ReplicaTier, RouteState, SegmentName,
     };
 
+    use std::sync::{Arc, Mutex};
+    use crate::metrics::record_cas_outcome;
+
+    use crate::{set_route_metrics_sink, RouteMetricsSink};
+
+    static METRICS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Default)]
+    struct RecordingRouteMetricsSink {
+        cas_outcomes: Mutex<Vec<&'static str>>,
+        routes: Mutex<HashMap<String, ObjectRoute>>,
+    }
+
+    impl RouteMetricsSink for RecordingRouteMetricsSink {
+        fn record_route_repair(&self, _operation: &'static str) {}
+
+        fn record_route_cas(&self, outcome: &'static str) {
+            self.cas_outcomes.lock().unwrap().push(outcome);
+        }
+
+        fn record_route(&self, route: &ObjectRoute) {
+            self.routes
+                .lock()
+                .unwrap()
+                .insert(route.key.0.clone(), route.clone());
+        }
+
+        fn remove_route(&self, key: &ObjectKey) {
+            self.routes.lock().unwrap().remove(&key.0);
+        }
+        fn record_delete_marker_state(&self, _entries: u64, _bytes: u64, _budget_bytes: u64) {}
+
+        fn record_delete_marker_event(&self, _event: &'static str, _count: u64) {}
+    }
+
     fn test_route(key: &ObjectKey, version: u64) -> ObjectRoute {
         ObjectRoute {
             key: key.clone(),
@@ -654,6 +689,45 @@ mod tests {
             cold_backing: None,
             nof_backing: None,
         }
+    }
+
+    #[test]
+    fn logical_cas_metrics_do_not_change_authoritative_route_gauges() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let sink = Arc::new(RecordingRouteMetricsSink::default());
+        set_route_metrics_sink(sink.clone());
+        let key = ObjectKey::new("observed-route".to_string());
+        let route = test_route(&key, 1);
+        let result = CasResult {
+            applied: true,
+            current: Some(route.clone()),
+            delete_version: None,
+            version_floor: None,
+        };
+
+        record_cas_outcome(&result);
+
+        assert_eq!(*sink.cas_outcomes.lock().unwrap(), vec!["ok"]);
+        assert!(
+            sink.routes.lock().unwrap().is_empty(),
+            "a logical CAS caller must not add observed routes to authority gauges"
+        );
+    }
+
+    #[test]
+    fn local_route_table_mutations_own_route_gauge_updates() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        let sink = Arc::new(RecordingRouteMetricsSink::default());
+        set_route_metrics_sink(sink.clone());
+        let key = ObjectKey::new("authority-route".to_string());
+        let route = test_route(&key, 1);
+        let mut table = LocalRouteTable::default();
+
+        table.replace(&key, Some(&route));
+        assert_eq!(sink.routes.lock().unwrap().get(&key.0), Some(&route));
+
+        table.replace(&key, None);
+        assert!(sink.routes.lock().unwrap().is_empty());
     }
 
     #[test]
