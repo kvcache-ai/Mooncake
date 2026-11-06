@@ -57,6 +57,46 @@ pub(crate) fn build_embedded_wrh_route_directory(
 
 const BASELINE_TTL: Duration = Duration::from_secs(300);
 
+/// Merges allocation observations from a sharded route directory. A route is
+/// present only on its ranked authorities, so `Exact` from those authorities
+/// naturally coexists with `Absent` from the remaining authorities. The exact
+/// key is then verified by `confirm_replica_reference` before lifecycle state
+/// is finalized.
+fn merge_allocation_route_reference(
+    previous: Option<&AllocationRouteReference>,
+    observed: AllocationRouteReference,
+) -> AllocationRouteReference {
+    let Some(previous) = previous else {
+        return observed;
+    };
+    if previous.state == AllocationRouteReferenceState::Conflict
+        || observed.state == AllocationRouteReferenceState::Conflict
+    {
+        return AllocationRouteReference::conflict();
+    }
+    match (previous.state, observed.state) {
+        (AllocationRouteReferenceState::Absent, AllocationRouteReferenceState::Absent) => {
+            AllocationRouteReference::absent()
+        }
+        (AllocationRouteReferenceState::Absent, AllocationRouteReferenceState::Exact)
+            if observed.route_key.is_some() =>
+        {
+            observed
+        }
+        (AllocationRouteReferenceState::Exact, AllocationRouteReferenceState::Absent)
+            if previous.route_key.is_some() =>
+        {
+            previous.clone()
+        }
+        (AllocationRouteReferenceState::Exact, AllocationRouteReferenceState::Exact)
+            if previous.route_key.is_some() && previous.route_key == observed.route_key =>
+        {
+            previous.clone()
+        }
+        _ => AllocationRouteReference::conflict(),
+    }
+}
+
 struct BaselineState {
     member_ids: HashSet<String>,
     candidates: Vec<ClientLease>,
@@ -1375,11 +1415,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 )));
             }
             for (slot, observed) in consensus.iter_mut().zip(references) {
-                *slot = Some(match slot.as_ref() {
-                    None => observed,
-                    Some(previous) if previous == &observed => previous.clone(),
-                    Some(_) => AllocationRouteReference::conflict(),
-                });
+                *slot = Some(merge_allocation_route_reference(slot.as_ref(), observed));
             }
         }
         let refreshed_members = self
@@ -2669,6 +2705,44 @@ mod owner_page_contract_tests {
                 .get_allocation_route_references_consistent(&observer, &[identity])
                 .expect("historical allocation confirmation must use cached membership"),
             vec![AllocationRouteReferenceState::Absent],
+        );
+    }
+
+    #[test]
+    fn allocation_reference_key_merge_accepts_sharded_exact_observation() {
+        let route_key = ObjectKey::new("route-key".to_string());
+        let exact = AllocationRouteReference::exact(route_key.clone());
+
+        assert_eq!(
+            merge_allocation_route_reference(
+                Some(&AllocationRouteReference::absent()),
+                exact.clone(),
+            ),
+            exact
+        );
+        assert_eq!(
+            merge_allocation_route_reference(
+                Some(&AllocationRouteReference::exact(route_key.clone())),
+                AllocationRouteReference::absent(),
+            ),
+            AllocationRouteReference::exact(route_key)
+        );
+    }
+
+    #[test]
+    fn allocation_reference_key_merge_rejects_ambiguous_observations() {
+        let exact = AllocationRouteReference::exact(ObjectKey::new("route-a".to_string()));
+
+        assert_eq!(
+            merge_allocation_route_reference(
+                Some(&exact),
+                AllocationRouteReference::exact(ObjectKey::new("route-b".to_string())),
+            ),
+            AllocationRouteReference::conflict()
+        );
+        assert_eq!(
+            merge_allocation_route_reference(Some(&exact), AllocationRouteReference::conflict(),),
+            AllocationRouteReference::conflict()
         );
     }
 }
