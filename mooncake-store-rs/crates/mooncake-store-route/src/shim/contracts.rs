@@ -225,8 +225,25 @@ pub trait RouteAuthorityService: Send + Sync {
         authority: &ClientStableId,
         keys: &[ObjectKey],
     ) -> Vec<Result<RouteAuthorityRecord>> {
+        self.batch_get_routes(namespace, authority, keys)
+            .into_iter()
+            .map(|result| {
+                result.map(|route| RouteAuthorityRecord {
+                    route,
+                    delete_version: None,
+                })
+            })
+            .collect()
+    }
+
+    fn batch_get_routes(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<Result<Option<ObjectRoute>>> {
         keys.iter()
-            .map(|key| self.get_route_record(namespace, authority, key))
+            .map(|key| self.get_route(namespace, authority, key))
             .collect()
     }
 
