@@ -13,6 +13,12 @@ const PENDING_DELETE_RETRY_MAX_MS: u64 = 60_000;
 const PENDING_DELETE_WARN_AFTER_ATTEMPTS: u32 = 10;
 const STALE_CANDIDATE_RECONCILE_MIN_INTERVAL_MS: u64 = 100;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(in super) struct EvictionAttempt {
+    pub(in super) made_progress: bool,
+    pub(in super) dropped_without_cold: bool,
+}
+
 struct StaleCandidateReconcileGuard<'a> {
     storage_owner: &'a StorageOwnerState,
 }
@@ -2224,13 +2230,28 @@ impl StorageOwnerState {
     }
 
     fn evict_one_blocking(&self, preferred_segment: Option<&SegmentName>) -> Result<bool> {
+        Ok(self
+            .evict_one_blocking_with_outcome(preferred_segment)?
+            .made_progress)
+    }
+
+    pub(in super) fn evict_one_blocking_with_outcome(
+        &self,
+        preferred_segment: Option<&SegmentName>,
+    ) -> Result<EvictionAttempt> {
         let tracker = OperationTracker::new("storage_owner_evict_one");
         let result = (|| {
             if self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)? > 0 {
-                return Ok(true);
+                return Ok(EvictionAttempt {
+                    made_progress: true,
+                    ..EvictionAttempt::default()
+                });
             }
             if self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)? > 0 {
-                return Ok(true);
+                return Ok(EvictionAttempt {
+                    made_progress: true,
+                    ..EvictionAttempt::default()
+                });
             }
             let budget = {
                 let clock = self.hot_replicas.clock.lock();
@@ -2248,17 +2269,21 @@ impl StorageOwnerState {
                 let Some(victim) = victim else {
                     break;
                 };
-                if self.evict_candidate(&victim)? {
-                    return Ok(true);
+                let outcome = self.evict_candidate_with_outcome(&victim)?;
+                if outcome.made_progress {
+                    return Ok(outcome);
                 }
             }
             // No CLOCK victim made progress. A bounded allocator-candidate pass
             // can recover a historical untracked allocation without listing an
             // owner's full route set.
             if self.reconcile_stale_clock_candidates(preferred_segment, false)? > 0 {
-                return Ok(true);
+                return Ok(EvictionAttempt {
+                    made_progress: true,
+                    ..EvictionAttempt::default()
+                });
             }
-            Ok(false)
+            Ok(EvictionAttempt::default())
         })();
         tracker.finish(&result, 0);
         result
@@ -2417,9 +2442,19 @@ impl StorageOwnerState {
     }
 
     fn evict_candidate(&self, victim: &ClockEntryId) -> Result<bool> {
+        Ok(self.evict_candidate_with_outcome(victim)?.made_progress)
+    }
+
+    fn evict_candidate_with_outcome(
+        &self,
+        victim: &ClockEntryId,
+    ) -> Result<EvictionAttempt> {
         let Some(route) = self.load_victim_route_bounded(&victim.route_key)? else {
             if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
-                return Ok(true);
+                return Ok(EvictionAttempt {
+                    made_progress: true,
+                    ..EvictionAttempt::default()
+                });
             }
             // A route miss starts exact confirmation, but does not itself prove
             // absence. Keep the CLOCK entry (or its pending token) meanwhile.
@@ -2427,21 +2462,24 @@ impl StorageOwnerState {
                 .clock
                 .lock()
                 .mark_hot_keys(std::slice::from_ref(&victim.route_key));
-            return Ok(false);
+            return Ok(EvictionAttempt::default());
         };
         if route.state != RouteState::Active {
             self.hot_replicas
                 .clock
                 .lock()
                 .mark_hot_keys(std::slice::from_ref(&victim.route_key));
-            return Ok(false);
+            return Ok(EvictionAttempt::default());
         }
         if self.replica_index_for_victim(&route, victim).is_none() {
             if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
-                return Ok(true);
+                return Ok(EvictionAttempt {
+                    made_progress: true,
+                    ..EvictionAttempt::default()
+                });
             }
             self.sync_route(&route);
-            return Ok(false);
+            return Ok(EvictionAttempt::default());
         }
         let has_usable_cold_tier_device = self.has_usable_cold_tier_device()?;
         let cold_backing_not_on_disk = route.cold_backing.is_none()
@@ -2453,18 +2491,26 @@ impl StorageOwnerState {
             route
         } else {
             let Some(route) = self.ensure_materialized_cold_backing_for_eviction(&route)? else {
-                return Ok(false);
+                return Ok(EvictionAttempt::default());
             };
             route
         };
         let Some(replica_index) = self.replica_index_for_victim(&route, victim) else {
             if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
-                return Ok(true);
+                return Ok(EvictionAttempt {
+                    made_progress: true,
+                    ..EvictionAttempt::default()
+                });
             }
             self.sync_route(&route);
-            return Ok(false);
+            return Ok(EvictionAttempt::default());
         };
-        self.evict_route_replica(victim, &route, replica_index, delete_empty_route)
+        let made_progress =
+            self.evict_route_replica(victim, &route, replica_index, delete_empty_route)?;
+        Ok(EvictionAttempt {
+            made_progress,
+            dropped_without_cold: made_progress && delete_empty_route,
+        })
     }
 
     pub(super) fn has_local_cold_tier_work(&self) -> bool {
@@ -3290,6 +3336,10 @@ impl StorageClockState {
 
     fn eviction_budget(&self) -> usize {
         self.entries.len().saturating_mul(3)
+    }
+
+    fn tracked_replica_count(&self) -> usize {
+        self.by_id.len()
     }
 
     fn entry_length(&self, id: &ClockEntryId) -> Option<u64> {
