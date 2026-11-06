@@ -66,10 +66,14 @@ impl AsyncRouteMirrorWorker {
                 Self::push_batch(&mut groups, first, &mut total_items);
                 let started = Instant::now();
                 while total_items < DRAIN_BUDGET && started.elapsed() < COALESCE_WINDOW {
-                    match receiver.try_recv() {
+                    let remaining = COALESCE_WINDOW.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match receiver.recv_timeout(remaining) {
                         Ok(batch) => Self::push_batch(&mut groups, batch, &mut total_items),
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 for (_, (secondary, requests)) in groups {
@@ -263,8 +267,8 @@ mod tests {
             })
         }
 
-        fn take_calls(&self) -> Vec<(String, Vec<RouteCasRequest>)> {
-            std::mem::take(&mut *self.calls.lock())
+        fn calls(&self) -> Vec<(String, Vec<RouteCasRequest>)> {
+            self.calls.lock().clone()
         }
     }
 
@@ -410,7 +414,46 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_coalesces_same_authority_batches() {
+    fn push_batch_coalesces_same_authority_batches() {
+        let secondary = test_lease("secondary-x");
+        let mut groups = BTreeMap::new();
+        let mut total_items = 0;
+
+        AsyncRouteMirrorWorker::push_batch(
+            &mut groups,
+            RouteMirrorBatch {
+                secondary: secondary.clone(),
+                requests: vec![test_cas_request("a")],
+            },
+            &mut total_items,
+        );
+        AsyncRouteMirrorWorker::push_batch(
+            &mut groups,
+            RouteMirrorBatch {
+                secondary: secondary.clone(),
+                requests: vec![test_cas_request("b")],
+            },
+            &mut total_items,
+        );
+        AsyncRouteMirrorWorker::push_batch(
+            &mut groups,
+            RouteMirrorBatch {
+                secondary,
+                requests: vec![test_cas_request("c")],
+            },
+            &mut total_items,
+        );
+
+        assert_eq!(total_items, 3);
+        assert_eq!(groups.len(), 1);
+        let (_, requests) = groups
+            .get("secondary-x")
+            .expect("same authority batches should share one group");
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[test]
+    fn enqueue_processes_same_authority_batches() {
         let client = RecordingAuthorityClient::new();
         let membership = Arc::new(NoopMembership);
         let worker = AsyncRouteMirrorWorker::spawn(
@@ -425,7 +468,7 @@ mod tests {
         worker.enqueue(secondary.clone(), vec![test_cas_request("c")]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let calls = client.take_calls();
+            let calls = client.calls();
             let total: usize = calls.iter().map(|(_, reqs)| reqs.len()).sum();
             if total == 3 {
                 for (id, _) in &calls {
