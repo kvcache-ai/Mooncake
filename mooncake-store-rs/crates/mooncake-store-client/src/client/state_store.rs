@@ -1641,9 +1641,6 @@ impl StorageOwnerState {
     fn evict_one_blocking(&self, preferred_segment: Option<&SegmentName>) -> Result<bool> {
         let tracker = OperationTracker::new("storage_owner_evict_one");
         let result = (|| {
-            if self.reclaim_stale_local_allocations_before_clock_eviction(preferred_segment)? > 0 {
-                return Ok(true);
-            }
             for rebuild in 0..=1usize {
                 let budget = {
                     let clock = self.hot_replicas.clock.lock();
@@ -1662,6 +1659,9 @@ impl StorageOwnerState {
                     }
                 }
                 if rebuild == 0 {
+                    if self.reclaim_stale_local_allocations_before_clock_eviction(preferred_segment)? > 0 {
+                        return Ok(true);
+                    }
                     self.rebuild_clock()?;
                 }
             }
