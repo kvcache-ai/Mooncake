@@ -773,10 +773,9 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
     let cas = match cas_result {
         Ok(cas) => cas,
         Err(error) => {
-            client.best_effort_release_reserved_allocations(
-                &targets,
+            client.release_only_legacy_reservations_after_unknown_route_publish(
                 &reservations,
-                "restore_promote_route_cas_error",
+                "restore_promote_route_cas_outcome_unknown",
             );
             return Err(error);
         }
