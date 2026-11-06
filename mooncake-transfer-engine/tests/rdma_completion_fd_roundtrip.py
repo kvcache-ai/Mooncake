@@ -36,7 +36,7 @@ def main():
         return 1
 
     payload = b"P" * length
-    source.write_bytes_to_buffer(local, payload)
+    source.write_bytes_to_buffer(local, payload.decode("ascii"), length)
     batch_id = source.batch_transfer_async(
         peer,
         [local],
