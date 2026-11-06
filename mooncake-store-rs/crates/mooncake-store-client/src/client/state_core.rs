@@ -6,6 +6,7 @@ include!("cold_tier_state.rs");
 pub(crate) struct LiveClientCache {
     refreshed_at: Option<Instant>,
     leases: Vec<ClientLease>,
+    retained_leases: Vec<ClientLease>,
     tenant_quota_policies: BTreeMap<String, TenantQuotaPolicyCacheEntry>,
 }
 
@@ -16,8 +17,21 @@ impl LiveClientCache {
     }
 
     pub(crate) fn store(&mut self, leases: Vec<ClientLease>) {
+        if self.refreshed_at.is_some() {
+            self.retained_leases = std::mem::take(&mut self.leases);
+        }
         self.refreshed_at = Some(Instant::now());
         self.leases = filter_live_client_leases(&leases);
+    }
+
+    pub(crate) fn retained_snapshot(&self) -> Option<Vec<ClientLease>> {
+        self.refreshed_at?;
+        let leases = if self.retained_leases.is_empty() {
+            &self.leases
+        } else {
+            &self.retained_leases
+        };
+        Some(filter_live_client_leases(leases))
     }
 
     pub(crate) fn tenant_quota_policy(
@@ -176,6 +190,17 @@ pub(crate) fn cached_live_client_snapshot(
     live_client_cache.lock().snapshot().ok_or_else(|| {
         StoreError::InvalidState(
             "live client snapshot is not initialized; build() must prewarm membership before serving requests"
+                .to_string(),
+        )
+    })
+}
+
+pub(crate) fn cached_retained_live_client_snapshot(
+    live_client_cache: &SharedLiveClientCache,
+) -> Result<Vec<ClientLease>> {
+    live_client_cache.lock().retained_snapshot().ok_or_else(|| {
+        StoreError::InvalidState(
+            "retained live client snapshot is not initialized; build() must prewarm membership before serving requests"
                 .to_string(),
         )
     })

@@ -230,6 +230,10 @@ pub trait RouteMembershipProvider: Send + Sync {
         operation: &'static str,
     ) -> Result<Vec<ClientLease>>;
 
+    fn retained_live_clients(&self, operation: &'static str) -> Result<Vec<ClientLease>> {
+        self.live_clients(false, operation)
+    }
+
     fn reconcile_suspects(&self, leases: &[ClientLease]);
 
     fn is_suspect(&self, runtime: &ClientRuntimeId) -> bool;
