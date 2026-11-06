@@ -1,21 +1,23 @@
-# The fault-injection targets require the Linux linker's --wrap support.
+# The fault-injection tests use linker wrapping.
 if(NOT USE_CUDA OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   return()
 endif()
 
-# Model the non-CUDA unknown-host contract without requiring HIP hardware.
+# Substitute a platform that resolves unknown host pointers by location.
 if(TARGET tent_transport_hint_test AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(cuda_pointer_platform_loader
       "_ZN8mooncake4tent8Platform9getLoaderESt10shared_ptrINS0_6ConfigEE")
   target_compile_definitions(
     tent_transport_hint_test
-    PRIVATE TENT_TEST_PLATFORM_LOADER="${cuda_pointer_platform_loader}")
-  target_link_options(tent_transport_hint_test PRIVATE
-                      "-Wl,--wrap=${cuda_pointer_platform_loader}")
+    PRIVATE TENT_TEST_PLATFORM_LOADER="${cuda_pointer_platform_loader}"
+            TENT_TEST_CUDA_POINTER_QUERY)
+  target_link_options(
+    tent_transport_hint_test PRIVATE
+    "-Wl,--wrap=${cuda_pointer_platform_loader}"
+    "-Wl,--wrap=cuPointerGetAttributes")
 endif()
 
-# Include platform base definitions directly: platform_cuda also references
-# them, so separate static archives can fail to link in optimized builds.
+# Link the platform base objects directly to avoid a static archive cycle.
 add_library(
   cuda_pointer_test_runtime OBJECT
   ${CMAKE_CURRENT_LIST_DIR}/../src/runtime/platform.cpp

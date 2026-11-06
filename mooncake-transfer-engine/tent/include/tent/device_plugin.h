@@ -20,8 +20,8 @@
 
 #define LOCATION_LEN 32
 
-// A recognized operation failed. Unlike legacy negative "not handled" return
-// codes, this stops dispatch and must never authorize a CPU fallback.
+// The plugin handled the operation and failed. Stop dispatch without falling
+// back to host memory handling.
 #define TENT_DEVICE_PLUGIN_ERROR (-3)
 
 #ifdef __cplusplus

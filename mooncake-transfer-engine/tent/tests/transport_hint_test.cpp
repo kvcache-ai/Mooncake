@@ -30,6 +30,7 @@
 #include <vector>
 
 #ifdef USE_CUDA
+#include <cuda.h>
 #include <cuda_runtime.h>
 #endif
 
@@ -38,6 +39,27 @@
 #include "tent/runtime/segment.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
+
+#ifdef TENT_TEST_CUDA_POINTER_QUERY
+namespace {
+thread_local CUdeviceptr watched_pointer = 0;
+thread_local int pointer_queries = 0;
+thread_local int queries_before_failure = 0;
+}  // namespace
+
+extern "C" CUresult __real_cuPointerGetAttributes(
+    unsigned int count, CUpointer_attribute* attributes, void** values,
+    CUdeviceptr ptr);
+
+extern "C" CUresult __wrap_cuPointerGetAttributes(
+    unsigned int count, CUpointer_attribute* attributes, void** values,
+    CUdeviceptr ptr) {
+    if (watched_pointer && ptr == watched_pointer &&
+        ++pointer_queries > queries_before_failure)
+        return CUDA_ERROR_INVALID_CONTEXT;
+    return __real_cuPointerGetAttributes(count, attributes, values, ptr);
+}
+#endif
 
 #ifdef TENT_TEST_PLATFORM_LOADER
 #include "tent/platform/cpu.h"
@@ -270,14 +292,43 @@ TEST(TransportRegistration, ManagedMemoryNeverReachesWarmupOrRegistration) {
     for (const char* location : {"*", "cpu:0", "cuda:0"}) {
         MemoryOptions options;
         options.location = location;
-        EXPECT_FALSE(engine.registerLocalMemory({ptr}, {4096}, options).ok());
+        auto status = engine.registerLocalMemory({ptr}, {4096}, options);
+        EXPECT_TRUE(status.IsInvalidArgument());
+        EXPECT_NE(status.message().find("CUDA Managed memory"),
+                  std::string_view::npos);
     }
+    auto status = engine.registerLocalMemory(nullptr, 4096);
+    EXPECT_TRUE(status.IsInvalidArgument());
+    EXPECT_NE(status.message().find("CUresult " +
+                                    std::to_string(CUDA_ERROR_INVALID_VALUE)),
+              std::string_view::npos);
+    std::vector<char> host(4096);
+#ifdef TENT_TEST_CUDA_POINTER_QUERY
+    watched_pointer = reinterpret_cast<CUdeviceptr>(host.data());
+    pointer_queries = queries_before_failure = 0;
+    status = engine.registerLocalMemory(host.data(), host.size());
+    watched_pointer = 0;
+    EXPECT_EQ(1, pointer_queries);
+    EXPECT_TRUE(status.IsInvalidArgument());
+    EXPECT_NE(status.message().find("CUresult " +
+                                    std::to_string(CUDA_ERROR_INVALID_CONTEXT)),
+              std::string_view::npos);
+#endif
     EXPECT_EQ(0, rdma->warmup_calls);
     EXPECT_EQ(0, tcp->warmup_calls);
     EXPECT_EQ(0, rdma->registration_calls);
     EXPECT_EQ(0, tcp->registration_calls);
-    std::vector<char> host(4096);
-    ASSERT_TRUE(engine.registerLocalMemory(host.data(), host.size()).ok());
+#ifdef TENT_TEST_CUDA_POINTER_QUERY
+    watched_pointer = reinterpret_cast<CUdeviceptr>(host.data());
+    pointer_queries = 0;
+    queries_before_failure = 1;
+#endif
+    status = engine.registerLocalMemory(host.data(), host.size());
+#ifdef TENT_TEST_CUDA_POINTER_QUERY
+    watched_pointer = 0;
+    EXPECT_EQ(1, pointer_queries);
+#endif
+    ASSERT_TRUE(status.ok()) << status;
     EXPECT_EQ(1, rdma->registration_calls);
     EXPECT_EQ(1, tcp->registration_calls);
     EXPECT_TRUE(engine.unregisterLocalMemory(host.data(), host.size()).ok());

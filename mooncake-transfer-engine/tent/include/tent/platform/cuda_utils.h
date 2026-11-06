@@ -42,18 +42,16 @@ struct CudaPointerInfo {
     int device = -1;
     bool registered_host = false;
 
-    // CUDA copy/free eligibility, not GPUDirect transport eligibility.
+    // Both device and managed allocations can be copied or freed through CUDA.
     bool isCuda() const {
         return kind == CudaMemoryKind::Device ||
                kind == CudaMemoryKind::Managed;
     }
 };
 
-// No runtime API calls: classification must not create or switch contexts.
-// Only a successful multi-attribute query can authorize host handling. Unlike
-// cuPointerGetAttribute(), cuPointerGetAttributes() returns success with
-// default attributes for ordinary, unregistered host pointers. This is
-// classification, not validation of a host address or allocation ownership.
+// Use the Driver API to avoid creating or switching contexts.
+// cuPointerGetAttributes() returns default attributes for unregistered host
+// pointers. These attributes do not establish address validity or ownership.
 inline CUresult getCudaPointerInfo(const void* ptr, CudaPointerInfo& info) {
     info = {};
     if (!ptr) return CUDA_ERROR_INVALID_VALUE;

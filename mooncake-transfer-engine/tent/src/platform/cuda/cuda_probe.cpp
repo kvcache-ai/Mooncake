@@ -267,7 +267,6 @@ namespace {
 bool cudaAbiMatches() {
     static const bool matches = [] {
         int runtime_version = 0;
-        // Preserve the platform's existing CUDA Runtime major-version guard.
         if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess &&
             runtime_version / 1000 != CUDART_VERSION / 1000) {
             LOG(ERROR) << "CUDA ABI mismatch: built against CUDART "
@@ -281,20 +280,51 @@ bool cudaAbiMatches() {
     }();
     return matches;
 }
-}  // namespace
 
-MemoryType CudaPlatform::getMemoryType(void* addr) {
+struct TransferPointerProbe {
+    CudaPointerInfo info;
+    CUresult result;
+    bool abi_matches;
+
+    bool supported() const {
+        return result == CUDA_SUCCESS && abi_matches &&
+               info.kind != CudaMemoryKind::Managed;
+    }
+};
+
+TransferPointerProbe probeTransferPointer(void* addr) {
     CudaPointerInfo info;
     const CUresult result = getCudaPointerInfo(addr, info);
     if (result == CUDA_ERROR_NO_DEVICE &&
-        cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE)
-        return MTYPE_CPU;
-    if (result != CUDA_SUCCESS) return MTYPE_UNKNOWN;
-    if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
-    // This type selects transfer backends. Managed memory is CUDA-addressable
-    // but is not supported by GPUDirect RDMA.
-    if (info.kind == CudaMemoryKind::Managed) return MTYPE_UNKNOWN;
-    return info.kind == CudaMemoryKind::Device ? MTYPE_CUDA : MTYPE_CPU;
+        cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE) {
+        info.kind = CudaMemoryKind::Host;
+        return {info, CUDA_SUCCESS, true};
+    }
+    return {info, result, result == CUDA_SUCCESS && cudaAbiMatches()};
+}
+}  // namespace
+
+MemoryType CudaPlatform::getMemoryType(void* addr) {
+    const auto probe = probeTransferPointer(addr);
+    if (!probe.supported()) return MTYPE_UNKNOWN;
+    return probe.info.kind == CudaMemoryKind::Device ? MTYPE_CUDA : MTYPE_CPU;
+}
+
+Status CudaPlatform::validateMemoryRegistration(void* addr,
+                                                CudaPointerInfo& info) {
+    const auto probe = probeTransferPointer(addr);
+    if (probe.result != CUDA_SUCCESS)
+        return Status::InvalidArgument(
+            "CUDA pointer classification failed (CUresult " +
+            std::to_string(probe.result) + ")" LOC_MARK);
+    if (!probe.abi_matches)
+        return Status::InvalidArgument("CUDA Runtime ABI mismatch" LOC_MARK);
+    if (probe.info.kind == CudaMemoryKind::Managed)
+        return Status::InvalidArgument(
+            "CUDA Managed memory is not supported for transfer "
+            "registration" LOC_MARK);
+    info = probe.info;
+    return Status::OK();
 }
 
 Status CudaPlatform::getPointerDeviceId(void* addr, int& device) {
@@ -327,21 +357,15 @@ static inline std::string genCudaNodeName(int node) {
 const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
                                                            size_t len,
                                                            bool skip_prefault) {
+    const auto probe = probeTransferPointer(start);
+    if (!probe.supported()) return {};
+    return getLocation(start, len, skip_prefault, probe.info);
+}
+
+std::vector<RangeLocation> CudaPlatform::getLocation(
+    void* start, size_t len, bool skip_prefault, const CudaPointerInfo& info) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
-
-    CudaPointerInfo info;
-    // The interface has no error channel. An empty result reports no known
-    // location without touching potentially inaccessible device memory.
-    const CUresult result = getCudaPointerInfo(start, info);
-    if (result != CUDA_SUCCESS &&
-        !(result == CUDA_ERROR_NO_DEVICE &&
-          cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE))
-        return entries;
-    if (result == CUDA_SUCCESS && !cudaAbiMatches()) return entries;
-    // Do not publish managed memory as ordinary cuda:N memory: registration
-    // would authorize transports without Unified Memory coherence support.
-    if (info.kind == CudaMemoryKind::Managed) return entries;
     if (info.kind == CudaMemoryKind::Device) {
         entries.push_back({(uint64_t)start, len, genCudaNodeName(info.device)});
         return entries;

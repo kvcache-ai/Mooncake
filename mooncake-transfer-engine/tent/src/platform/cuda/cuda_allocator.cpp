@@ -77,16 +77,14 @@ Status CudaPlatform::allocate(void** pptr, size_t size,
 Status CudaPlatform::free(void* ptr, size_t size) {
     CudaPointerInfo info;
     const CUresult result = getCudaPointerInfo(ptr, info);
-    // Preserve host-only deployments with no visible CUDA device. Other
-    // initialization/query failures do not establish host memory.
+    // Only an initialization result of CUDA_ERROR_NO_DEVICE permits fallback.
     if (!(result == CUDA_ERROR_NO_DEVICE &&
           cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE))
         CHECK_CU(result);
     if (info.isCuda()) {
         CHECK_CUDA(cudaFree(ptr));
     } else {
-        // Registered host memory may be CUDA-allocated or caller-registered;
-        // neither establishes ownership by this platform's NUMA allocator.
+        // CUDA host registration does not establish NUMA allocator ownership.
         if (info.registered_host)
             return Status::InvalidArgument(
                 "Cannot NUMA-free registered CUDA host memory");

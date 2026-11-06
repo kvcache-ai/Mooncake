@@ -105,7 +105,6 @@ static int cuda_free(void* ctx_, void* ptr, size_t size) {
 
 static int cuda_memcpy_sync(void* ctx_, void* dst, void* src, size_t length) {
     (void)ctx_;
-    // Pin the owning device so the runtime does not default to GPU 0.
     CudaPointerInfo src_info, dst_info;
     const CUresult src_result = getCudaPointerInfo(src, src_info);
     const CUresult dst_result = getCudaPointerInfo(dst, dst_info);
@@ -116,6 +115,7 @@ static int cuda_memcpy_sync(void* ctx_, void* dst, void* src, size_t length) {
     if (src_result != CUDA_SUCCESS || dst_result != CUDA_SUCCESS)
         return TENT_DEVICE_PLUGIN_ERROR;
     if (!src_info.isCuda() && !dst_info.isCuda()) return -1;
+    // Use the buffer's owning device so the runtime does not default to GPU 0.
     int dev = src_info.isCuda() ? src_info.device : dst_info.device;
 
     // Restore the exact caller state, as CudaPlatform::copy() does. An ordinal
@@ -170,8 +170,7 @@ static int cuda_query_location(void* ctx_, void* addr, size_t size,
         cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE)
         return 0;
     if (result != CUDA_SUCCESS) return TENT_DEVICE_PLUGIN_ERROR;
-    // Location queries authorize transfer registration/routing, unlike local
-    // CUDA copies and frees. Managed memory is not GPUDirect RDMA safe.
+    // Keep managed memory out of GPUDirect RDMA routing.
     if (info.kind == CudaMemoryKind::Managed) return TENT_DEVICE_PLUGIN_ERROR;
     if (!info.isCuda()) return 0;
     buf[0].start = addr;

@@ -1,9 +1,19 @@
 // Copyright 2026 KVCache.AI
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
 #include "tent/runtime/memory_prober.h"
 #ifdef TENT_TEST_SEGMENT_TRACKER
 #include "tent/runtime/segment_manager.h"
@@ -79,10 +89,8 @@ CUresult __wrap_cuPointerGetAttributes(unsigned int count,
                 return CUDA_ERROR_INVALID_VALUE;
         }
     }
-    // Also exercise errors after partially populated output.
     return a.error;
 }
-// Keeps the regression harness runnable against the original helper.
 CUresult __wrap_cuPointerGetAttribute(void* value, CUpointer_attribute attr,
                                       CUdeviceptr ptr) {
     auto a = pointers[ptr];
@@ -229,6 +237,12 @@ TEST_F(CudaPointerTest, QueryErrorsNeverAuthorizeHostHandling) {
             pointers.clear();
             pointers[(CUdeviceptr)bad] = {CU_MEMORYTYPE_DEVICE, 0, 2, error};
             EXPECT_EQ(MTYPE_UNKNOWN, platform.getMemoryType(bad));
+            CudaPointerInfo info;
+            auto status = platform.validateMemoryRegistration(bad, info);
+            EXPECT_TRUE(status.IsInvalidArgument());
+            EXPECT_NE(
+                status.message().find("CUresult " + std::to_string(error)),
+                std::string_view::npos);
             EXPECT_FALSE(platform.copy(dst, src, sizeof(src)).ok());
             EXPECT_EQ('\0', dst[0]);
             EXPECT_FALSE(platform.free(bad, sizeof(src)).ok());
@@ -377,7 +391,6 @@ TEST_F(CudaPointerTest, PluginRuntimeFailuresDoNotFallback) {
     fail_free = true;
     EXPECT_FALSE(prober.free(ptr, 64).ok());
     fail_free = false;
-    // The failed free must retain the allocation's registration for retry.
     EXPECT_TRUE(prober.free(ptr, 64).ok());
     EXPECT_EQ(2, frees);
     EXPECT_EQ(0, host_frees);
@@ -399,7 +412,7 @@ TEST_F(CudaPointerTest, ContextRestoreFailureIsReportedAfterCopy) {
     prober.unloadPlugins();
 }
 
-// Run separately: driver initialization is deliberately cached per process.
+// Use separate processes because the driver initialization result is cached.
 TEST(CudaPointerInitTest, AbiMismatchStopsPlatformProbeAndCopy) {
     if (!std::getenv("TENT_TEST_CUDA_ABI_MISMATCH")) GTEST_SKIP();
     CudaPlatform platform(nullptr);
@@ -408,6 +421,10 @@ TEST(CudaPointerInitTest, AbiMismatchStopsPlatformProbeAndCopy) {
                          Attributes{CU_MEMORYTYPE_DEVICE, 1, 2}}) {
         pointers[(CUdeviceptr)src] = a;
         EXPECT_EQ(MTYPE_UNKNOWN, platform.getMemoryType(src));
+        CudaPointerInfo info;
+        auto status = platform.validateMemoryRegistration(src, info);
+        EXPECT_NE(status.message().find("CUDA Runtime ABI mismatch"),
+                  std::string_view::npos);
         EXPECT_TRUE(platform.getLocation(src, sizeof(src)).empty());
         EXPECT_FALSE(platform.copy(dst, src, sizeof(src)).ok());
         EXPECT_EQ('\0', dst[0]);
@@ -421,6 +438,11 @@ TEST(CudaPointerInitTest, FailureIsNotHostMemory) {
     CudaPlatform platform(nullptr);
     char src[8] = {}, dst[8] = {};
     EXPECT_EQ(MTYPE_UNKNOWN, platform.getMemoryType(src));
+    CudaPointerInfo info;
+    auto status = platform.validateMemoryRegistration(src, info);
+    EXPECT_NE(
+        status.message().find("CUresult " + std::to_string(CUDA_ERROR_UNKNOWN)),
+        std::string_view::npos);
     EXPECT_FALSE(platform.copy(dst, src, sizeof(src)).ok());
     EXPECT_FALSE(platform.free(src, sizeof(src)).ok());
     EXPECT_TRUE(platform.getLocation(src, sizeof(src)).empty());
@@ -434,6 +456,9 @@ TEST(CudaPointerInitTest, NoVisibleDevicePreservesHostOnlyOperation) {
     CudaPlatform platform(nullptr);
     char src[] = "host", dst[sizeof(src)] = {};
     EXPECT_EQ(MTYPE_CPU, platform.getMemoryType(src));
+    CudaPointerInfo info;
+    EXPECT_TRUE(platform.validateMemoryRegistration(src, info).ok());
+    EXPECT_EQ(CudaMemoryKind::Host, info.kind);
     EXPECT_TRUE(platform.copy(dst, src, sizeof(src)).ok());
     EXPECT_STREQ(src, dst);
     EXPECT_TRUE(platform.free(src, sizeof(src)).ok());

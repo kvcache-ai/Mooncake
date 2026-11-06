@@ -44,6 +44,11 @@
 #include "tent/metrics/config_loader.h"
 #include "tent/transport/hp_tcp/hp_tcp_protocol.h"
 
+#ifdef USE_CUDA
+#include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -964,14 +969,15 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc.addr = (uint64_t)addr_list[i];
         desc.length = size_list[i];
 
-        // CUDA must reject unknown/managed memory before temporary
-        // registration. Other platforms may resolve unknown pointers through
-        // getLocation().
         auto& platform = Platform::getLoader();
-        if (platform.type() == "cuda" &&
-            platform.getMemoryType(addr_list[i]) == MTYPE_UNKNOWN)
-            return Status::InvalidArgument(
-                "Unsupported or unknown CUDA memory type" LOC_MARK);
+#ifdef USE_CUDA
+        // Warm-up can register memory temporarily, so validate it first.
+        auto* cuda = dynamic_cast<CudaPlatform*>(&platform);
+        CudaPointerInfo pointer_info;
+        if (cuda)
+            CHECK_STATUS(
+                cuda->validateMemoryRegistration(addr_list[i], pointer_info));
+#endif
 
         // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
         // subsequent RDMA registration and NUMA probing
@@ -985,8 +991,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         }
 
         // NUMA probe: skip prefault if warm-up already pinned pages
-        auto entries = Platform::getLoader().getLocation(
-            addr_list[i], size_list[i], pages_pinned);
+        std::vector<RangeLocation> entries;
+#ifdef USE_CUDA
+        if (cuda) {
+            entries = cuda->getLocation(addr_list[i], size_list[i],
+                                        pages_pinned, pointer_info);
+        } else
+#endif
+        {
+            entries =
+                platform.getLocation(addr_list[i], size_list[i], pages_pinned);
+        }
         if (entries.empty())
             return Status::InvalidArgument(
                 "Unable to locate registered memory range" LOC_MARK);
