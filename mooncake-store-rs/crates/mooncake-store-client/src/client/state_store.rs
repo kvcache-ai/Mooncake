@@ -1301,6 +1301,20 @@ impl StorageOwnerState {
         RouteTrafficReport::new(routes.len(), bytes)
     }
 
+    fn track_routes_with_initial_cold_backing(
+        &self,
+        routes: &[ObjectRoute],
+    ) -> Result<RouteTrafficReport> {
+        let mut tracked_routes = Vec::with_capacity(routes.len());
+        for route in routes {
+            tracked_routes.push(
+                cold_tier::publish_initial_write_cold_backing(self, route)?
+                    .unwrap_or_else(|| route.clone()),
+            );
+        }
+        Ok(self.track_routes(&tracked_routes))
+    }
+
     fn track_route(&self, route: &ObjectRoute) {
         let mut allocator = self.allocator.lock();
         let mut clock = self.hot_replicas.clock.lock();
@@ -2341,11 +2355,29 @@ impl StorageOwnerState {
                         .confirm_replica_reference(&route_key, &replica)
                     {
                         Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
-                            self.track_route(&route);
-                            registry::record_eviction_guard_event(
-                                "pending_publication",
-                                "finalized",
-                            );
+                            match self.track_routes_with_initial_cold_backing(
+                                std::slice::from_ref(&route),
+                            ) {
+                                Ok(_) => registry::record_eviction_guard_event(
+                                    "pending_publication",
+                                    "finalized",
+                                ),
+                                Err(error) => {
+                                    debug!(
+                                        runtime = %self.runtime,
+                                        key = %route.key.0,
+                                        allocation_id = publication.identity.allocation_id,
+                                        error = %error,
+                                        "pending publication cold backing preparation failed; retaining reservation"
+                                    );
+                                    self.retry_pending_publications(
+                                        std::slice::from_ref(publication),
+                                        now_ms.saturating_add(
+                                            PENDING_PUBLICATION_LOCAL_RETRY_DELAY_MS,
+                                        ),
+                                    );
+                                }
+                            }
                         }
                         Ok(mooncake_store_core::RouteReplicaReference::Absent) => {
                             self.retry_pending_publications(

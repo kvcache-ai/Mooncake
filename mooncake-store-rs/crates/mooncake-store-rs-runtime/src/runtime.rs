@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
-    http_transport_label, ClassicTeTransportFactory, HttpStoreTransportFactory,
+    http_transport_label, ClassicTeTransportFactory, ColdTierRateLimitConfig, HttpStoreTransportFactory,
     HttpTransportServerHandle, LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner,
     RouteControlMode, StoreClient, StoreClientBuilder, StoreTransportFactory, TentTransportFactory,
 };
@@ -46,6 +46,13 @@ pub struct CompatRuntimeArgs {
 
 impl CompatRuntimeArgs {
     pub fn build(self) -> Result<CompatRuntime> {
+        self.build_with_cold_tier_rate_limits(ColdTierRateLimitConfig::default())
+    }
+
+    pub fn build_with_cold_tier_rate_limits(
+        self,
+        cold_tier_rate_limits: ColdTierRateLimitConfig,
+    ) -> Result<CompatRuntime> {
         let plan = self.setup.build()?;
         let timeouts = plan.timeouts;
         let planner_metadata = plan.routed_writes.then(|| plan.metadata.clone());
@@ -114,7 +121,8 @@ impl CompatRuntimeArgs {
             .transfer_timeout(timeouts.transfer_stall_timeout)
             .request_timeout(timeouts.request_timeout)
             .route_control(self.route_control)
-            .route_topk(plan.route_topk);
+            .route_topk(plan.route_topk)
+            .cold_tier_rate_limits(cold_tier_rate_limits);
 
         if !plan.cold_tier_targets.is_empty() {
             builder = builder.cold_tier_targets(plan.cold_tier_targets);

@@ -1,6 +1,15 @@
 #[allow(unused_imports)]
 use super::*;
 
+fn prometheus_counter_value(metrics: &str, name: &str, labels: &[&str]) -> u64 {
+    metrics
+        .lines()
+        .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default()
+}
+
 #[test]
 fn embedded_client_restores_cold_only_route_without_configured_cold_tier_target() {
     let _cold_tier_env = enable_cold_tier_for_test();
@@ -298,16 +307,14 @@ fn allocator_pressure_batches_pending_cold_victims() {
     }
 
     let metrics = render_prometheus_metrics();
-    let backend_batches = metrics
-        .lines()
-        .find(|line| {
-            line.starts_with("mooncake_store_operation_total{")
-                && line.contains("operation=\"cold_offload_backend_write_batch\"")
-                && line.contains("status=\"ok\"")
-        })
-        .and_then(|line| line.split_whitespace().last())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_default();
+    let backend_batches = prometheus_counter_value(
+        &metrics,
+        "mooncake_store_operation_total{",
+        &[
+            "operation=\"cold_offload_backend_write_batch\"",
+            "status=\"ok\"",
+        ],
+    );
     assert_eq!(backend_batches, 1, "pending victims should share one backend write batch");
 
     let _ = std::fs::remove_dir_all(cold_root);
@@ -374,16 +381,14 @@ fn allocator_pressure_batches_hot_only_cold_victims() {
     }
 
     let metrics = render_prometheus_metrics();
-    let backend_batches = metrics
-        .lines()
-        .find(|line| {
-            line.starts_with("mooncake_store_operation_total{")
-                && line.contains("operation=\"cold_offload_backend_write_batch\"")
-                && line.contains("status=\"ok\"")
-        })
-        .and_then(|line| line.split_whitespace().last())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_default();
+    let backend_batches = prometheus_counter_value(
+        &metrics,
+        "mooncake_store_operation_total{",
+        &[
+            "operation=\"cold_offload_backend_write_batch\"",
+            "status=\"ok\"",
+        ],
+    );
     assert_eq!(
         backend_batches, 2,
         "hot-only victims should drain consecutive device-sized waves without admission backoff"
@@ -436,28 +441,24 @@ fn background_materializer_drains_single_target_admission_waves() {
     );
 
     let metrics = render_prometheus_metrics();
-    let backend_batches = metrics
-        .lines()
-        .find(|line| {
-            line.starts_with("mooncake_store_operation_total{")
-                && line.contains("operation=\"cold_offload_backend_write_batch\"")
-                && line.contains("status=\"ok\"")
-        })
-        .and_then(|line| line.split_whitespace().last())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_default();
+    let backend_batches = prometheus_counter_value(
+        &metrics,
+        "mooncake_store_operation_total{",
+        &[
+            "operation=\"cold_offload_backend_write_batch\"",
+            "status=\"ok\"",
+        ],
+    );
     assert_eq!(backend_batches, 2, "eight writes should use two four-entry waves");
-    let admission_retries = metrics
-        .lines()
-        .find(|line| {
-            line.starts_with("mooncake_store_cold_tier_operation_total{")
-                && line.contains("operation=\"offload\"")
-                && line.contains("result=\"retry\"")
-                && line.contains("error_kind=\"admission\"")
-        })
-        .and_then(|line| line.split_whitespace().last())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_default();
+    let admission_retries = prometheus_counter_value(
+        &metrics,
+        "mooncake_store_cold_tier_operation_total{",
+        &[
+            "operation=\"offload\"",
+            "result=\"retry\"",
+            "error_kind=\"admission\"",
+        ],
+    );
     assert_eq!(
         admission_retries, 1,
         "a full device window should defer the remaining entries as one wave"
@@ -545,16 +546,14 @@ fn stale_pending_entry_does_not_reoffload_materialized_route() {
     );
 
     let metrics = render_prometheus_metrics();
-    let backend_outputs = metrics
-        .lines()
-        .find(|line| {
-            line.starts_with("mooncake_store_operation_bytes_out_total{")
-                && line.contains("operation=\"cold_offload_backend_write_batch\"")
-                && line.contains("status=\"ok\"")
-        })
-        .and_then(|line| line.split_whitespace().last())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or_default();
+    let backend_outputs = prometheus_counter_value(
+        &metrics,
+        "mooncake_store_operation_bytes_out_total{",
+        &[
+            "operation=\"cold_offload_backend_write_batch\"",
+            "status=\"ok\"",
+        ],
+    );
     assert_eq!(backend_outputs, 1, "the stale entry must not write again");
 
     let _ = std::fs::remove_dir_all(cold_root);

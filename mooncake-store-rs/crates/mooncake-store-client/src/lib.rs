@@ -28,7 +28,7 @@ pub use client::cold_tier::nof::extent_store::{
     SpdkNofTransport,
 };
 pub use client::{
-    stable_phase_spread_ms, AllocationLifecycleConfig, BandwidthShaping, ColdTierKind, ColdTierOffloadMode,
+    stable_phase_spread_ms, AllocationLifecycleConfig, BandwidthShaping, ColdTierKind, ColdTierOffloadMode, ColdTierRateLimitConfig,
     ColdTierShutdownMode, ColdTierSsdEngine, ColdTierTarget, ColdTierTargetConfig,
     ColdTierTargetSpec, ColdTierWatermarkConfig, DebugEvictAllResult, ExecutionFairness,
     GetRequest, HealthChannel, HealthUpdate, HeartbeatLease, MooncakeCompatibilityFacade,

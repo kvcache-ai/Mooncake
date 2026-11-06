@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_store_client::{
     init_tracing, stable_phase_spread_ms, start_metrics_http_server, stop_metrics_http_server,
-    ColdTierKind, ColdTierSsdEngine, ColdTierTargetSpec, RouteControlMode,
+    ColdTierKind, ColdTierRateLimitConfig, ColdTierSsdEngine, ColdTierTargetSpec, RouteControlMode,
 };
 use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
@@ -232,6 +232,21 @@ struct RunArgs {
     cold_tier_tags: Vec<String>,
     #[arg(long, help = "Bootstrap cold tier device capacity override in bytes")]
     cold_tier_capacity_bytes: Option<u64>,
+    #[arg(long, help = "Maximum concurrent cold-tier offloads for this runtime")]
+    cold_tier_offload_runtime_max_in_flight: Option<usize>,
+    #[arg(long, help = "Maximum concurrent cold-tier offloads per device")]
+    cold_tier_offload_device_max_in_flight: Option<usize>,
+    #[arg(long, help = "Cold-tier offload rate limit for this runtime")]
+    cold_tier_offload_runtime_ops_per_sec: Option<u32>,
+    #[arg(long, help = "Cold-tier offload rate limit per device")]
+    cold_tier_offload_device_ops_per_sec: Option<u32>,
+    #[arg(long, help = "Pending offloads kicked by one foreground allocation")]
+    cold_tier_foreground_offload_kick_batch: Option<usize>,
+    #[arg(
+        long,
+        help = "Background cold-tier offload poll interval in milliseconds"
+    )]
+    cold_tier_offload_poll_interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -319,7 +334,8 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     let heartbeat_interval =
         effective_heartbeat_interval(args.heartbeat_interval_ms, args.lease_ttl_ms);
     let requested_initial_state = requested_initial_state(&args);
-    let runtime = build_runtime_args(&args, timeouts, metrics_addr.as_deref()).build()?;
+    let runtime = build_runtime_args(&args, timeouts, metrics_addr.as_deref())
+        .build_with_cold_tier_rate_limits(build_cold_tier_rate_limits(&args))?;
 
     let stable_id = runtime.stable_id.clone();
     let epoch = runtime.epoch;
@@ -890,6 +906,29 @@ fn build_runtime_args(
     }
 }
 
+fn build_cold_tier_rate_limits(args: &RunArgs) -> ColdTierRateLimitConfig {
+    let mut limits = ColdTierRateLimitConfig::default();
+    if let Some(value) = args.cold_tier_offload_runtime_max_in_flight {
+        limits = limits.offload_runtime_max_in_flight(value);
+    }
+    if let Some(value) = args.cold_tier_offload_device_max_in_flight {
+        limits = limits.offload_device_max_in_flight(value);
+    }
+    if let Some(value) = args.cold_tier_offload_runtime_ops_per_sec {
+        limits = limits.offload_runtime_ops_per_sec(value);
+    }
+    if let Some(value) = args.cold_tier_offload_device_ops_per_sec {
+        limits = limits.offload_device_ops_per_sec(value);
+    }
+    if let Some(value) = args.cold_tier_foreground_offload_kick_batch {
+        limits = limits.foreground_offload_kick_batch(value);
+    }
+    if let Some(value) = args.cold_tier_offload_poll_interval_ms {
+        limits = limits.offload_poll_interval_ms(value);
+    }
+    limits
+}
+
 /// Build cold tier target specs from CLI flags.
 ///
 /// Priority: `--cold-tier-targets-json` (full JSON) > individual `--cold-tier-*` flags.
@@ -1189,7 +1228,7 @@ mod tests {
     use mooncake_store_client::{ColdTierKind, ColdTierSsdEngine};
 
     use super::{
-        build_cold_tier_specs, build_runtime_args, compat_warnings, drained_message,
+        build_cold_tier_rate_limits, build_cold_tier_specs, build_runtime_args, compat_warnings, drained_message,
         dummy_worker_scope, effective_heartbeat_interval, emit_compat_warnings, fetch_http_body,
         heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, normalize_trace_filter, now_ms,
         parse_cli_from, parse_falsey_env_bool, parse_hugepage_size_arg, parse_label,
@@ -1258,6 +1297,12 @@ mod tests {
             cold_tier_ssd_engine: None,
             cold_tier_tags: vec![],
             cold_tier_capacity_bytes: None,
+            cold_tier_offload_runtime_max_in_flight: None,
+            cold_tier_offload_device_max_in_flight: None,
+            cold_tier_offload_runtime_ops_per_sec: None,
+            cold_tier_offload_device_ops_per_sec: None,
+            cold_tier_foreground_offload_kick_batch: None,
+            cold_tier_offload_poll_interval_ms: None,
         }
     }
 
@@ -2188,6 +2233,25 @@ mod tests {
         assert_eq!(targets[0].ssd_engine, Some(ColdTierSsdEngine::ExtentStore));
         assert_eq!(targets[0].capacity_override_bytes, Some(4096));
         assert_eq!(targets[0].tags, vec!["fast".to_string()]);
+    }
+
+    #[test]
+    fn build_runtime_args_maps_cold_tier_rate_limits() {
+        let mut args = sample_args();
+        args.cold_tier_offload_runtime_max_in_flight = Some(32);
+        args.cold_tier_offload_device_max_in_flight = Some(4);
+        args.cold_tier_offload_runtime_ops_per_sec = Some(4_096);
+        args.cold_tier_offload_device_ops_per_sec = Some(1_024);
+        args.cold_tier_foreground_offload_kick_batch = Some(64);
+        args.cold_tier_offload_poll_interval_ms = Some(1);
+
+        let limits = build_cold_tier_rate_limits(&args);
+        assert_eq!(limits.offload_runtime_max_in_flight, 32);
+        assert_eq!(limits.offload_device_max_in_flight, 4);
+        assert_eq!(limits.offload_runtime_ops_per_sec, 4_096);
+        assert_eq!(limits.offload_device_ops_per_sec, 1_024);
+        assert_eq!(limits.foreground_offload_kick_batch, 64);
+        assert_eq!(limits.offload_poll_interval_ms, 1);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use super::super::{
     ColdTierOffloadManager, ColdTierOffloadMode, ColdTierOffloadPriorityConfig,
     ColdTierOffloadRunGuard, ColdTierPendingOffloadPolicy, FreeSchedulerState, ObjectKey,
     ObjectRoute, OperationTracker, PendingOffloadCasContext, PendingOffloadCasOutcome,
-    PendingOffloadEntry, PendingOffloadKey, PendingOffloadMaterialization,
+    PendingOffloadEntry, PendingOffloadKey, PendingOffloadMaterialization, PendingOffloadPayload,
     PendingOffloadPrepareOutcome, PendingOffloadQueue, PendingOffloadQueueSnapshot,
     PendingOffloadReadyRoute, PersistentStorageBackend, Result, RouteCasRequest, RouteState,
     RouteVersion, StorageOwnerState, StoreError, DEFAULT_PENDING_OFFLOAD_RETRY_BASE_MS,
@@ -12,9 +12,9 @@ use super::super::{
 };
 use super::{
     backend_remove_cold_payload, backend_remove_pending_source, backend_store_cold_payload_batch,
-    backend_store_pending_source, local_hot_replica_checksum, materialized_cold_backing,
+    backend_store_pending_source, materialized_cold_backing, payload_checksum,
     pending_persistent_backing, persistent_backing_contains_target, persistent_backing_targets,
-    read_local_hot_replica_payload, same_cold_payload,
+    pin_local_hot_replica_payload, read_local_hot_replica_payload, same_cold_payload,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -122,7 +122,9 @@ fn publish_initial_write_backing(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(checksum) = checksum_for_cold_backing(storage_owner, route, replica)? else {
+    let Some((checksum, _source_pin)) =
+        pinned_checksum_for_cold_backing(storage_owner, route, replica)?
+    else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
@@ -233,7 +235,9 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    let Some(checksum) = checksum_for_cold_backing(storage_owner, route, replica)? else {
+    let Some((checksum, _source_pin)) =
+        pinned_checksum_for_cold_backing(storage_owner, route, replica)?
+    else {
         storage_owner.sync_route(route);
         return Ok(None);
     };
@@ -274,21 +278,18 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
     }
 }
 
-fn checksum_for_cold_backing(
+fn pinned_checksum_for_cold_backing(
     storage_owner: &StorageOwnerState,
     route: &ObjectRoute,
     replica: &mooncake_store_core::ReplicaRoute,
-) -> Result<Option<u64>> {
-    if let Some(checksum) = replica.checksum {
-        return Ok(Some(checksum));
-    }
-    match local_hot_replica_checksum(
-        &storage_owner.allocator,
-        &storage_owner.state,
-        route,
-        replica,
-    ) {
-        Ok(checksum) => Ok(Some(checksum)),
+) -> Result<Option<(u64, PendingOffloadPayload)>> {
+    match pin_local_hot_replica_payload(&storage_owner.allocator, &storage_owner.state, replica) {
+        Ok(payload) => {
+            let checksum = replica
+                .checksum
+                .unwrap_or_else(|| payload_checksum(payload.as_slice()));
+            Ok(Some((checksum, payload)))
+        }
         Err(error) => {
             tracing::warn!(
                 runtime = %storage_owner.runtime,
@@ -731,7 +732,9 @@ pub(in super::super) fn prepare_pending_offload_entry(
     let route = if route.nof_backing.as_ref().is_some_and(|backing| {
         backing.state == mooncake_store_core::ColdBackingState::PendingOffload
     }) {
-        let Some(checksum) = checksum_for_cold_backing(storage_owner, &route, &replica)? else {
+        let Some((checksum, _source_pin)) =
+            pinned_checksum_for_cold_backing(storage_owner, &route, &replica)?
+        else {
             return Ok(PendingOffloadPrepareOutcome::Retry(entry));
         };
         let Some(pending) = storage_owner
@@ -748,7 +751,9 @@ pub(in super::super) fn prepare_pending_offload_entry(
     let (cold_backing, transient_nof, route) = match pending_persistent_backing(&route) {
         Some(backing) => (backing, false, route.clone()),
         None => {
-            let Some(checksum) = checksum_for_cold_backing(storage_owner, &route, &replica)? else {
+            let Some((checksum, _source_pin)) =
+                pinned_checksum_for_cold_backing(storage_owner, &route, &replica)?
+            else {
                 storage_owner.sync_route(&route);
                 return Ok(PendingOffloadPrepareOutcome::Skipped);
             };

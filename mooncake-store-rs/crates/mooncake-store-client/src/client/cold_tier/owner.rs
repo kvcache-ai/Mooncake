@@ -71,7 +71,7 @@ impl ColdTierDeviceManager {
 
 pub(super) struct NofRuntimeTarget {
     pub(super) backend: Arc<dyn PersistentStorageBackend>,
-    pub(super) accumulated_writes: AtomicU64,
+    pub(super) accumulated_write_bytes: AtomicU64,
     recovery_required: AtomicBool,
     health: parking_lot::RwLock<NofTargetHealthState>,
 }
@@ -80,7 +80,7 @@ impl NofRuntimeTarget {
     pub(super) fn new(backend: Arc<dyn PersistentStorageBackend>) -> Self {
         Self {
             backend,
-            accumulated_writes: AtomicU64::new(0),
+            accumulated_write_bytes: AtomicU64::new(0),
             recovery_required: AtomicBool::new(false),
             health: parking_lot::RwLock::new(NofTargetHealthState::default()),
         }
