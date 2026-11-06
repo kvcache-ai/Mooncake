@@ -141,6 +141,7 @@ struct ColdTierDeviceManager {
     devices: SharedColdTierDeviceCache,
     watermarks: ColdTierWatermarkConfig,
     admission: Arc<ColdTierAdmission>,
+    accumulated_writes: Mutex<BTreeMap<String, u64>>,
     runtime: ClientRuntimeId,
 }
 

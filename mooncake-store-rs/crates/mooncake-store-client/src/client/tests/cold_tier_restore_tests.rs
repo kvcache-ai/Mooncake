@@ -1490,6 +1490,99 @@ fn pending_offload_materialization_owns_payload_snapshot_after_prepare() {
 }
 
 #[test]
+fn pending_offloads_balance_and_write_distinct_targets_concurrently() {
+    let _cold_guard = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root_a = cold_tier_test_root("parallel-offload-a");
+    let root_b = cold_tier_test_root("parallel-offload-b");
+    let probe = Arc::new(ConcurrentColdWriteProbe::default());
+    let mut rate_limits = ColdTierRateLimitConfig::default();
+    rate_limits.offload_runtime_max_in_flight = 16;
+    rate_limits.offload_device_max_in_flight = 8;
+    rate_limits.offload_runtime_ops_per_sec = 10_000;
+    rate_limits.offload_device_ops_per_sec = 10_000;
+    let client = StoreClientBuilder::new(metadata, "parallel-offload")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(Arc::new(TestTransport::new("parallel-offload-segment")))
+        .local_memory(storage_config_with_bytes(4096))
+        .cold_tier_targets([
+            ColdTierTargetConfig::directory(
+                "parallel-offload-a",
+                ColdTierKind::Ssd,
+                root_a.clone(),
+            )
+            .capacity_override_bytes(1 << 30),
+            ColdTierTargetConfig::directory(
+                "parallel-offload-b",
+                ColdTierKind::Ssd,
+                root_b.clone(),
+            )
+            .capacity_override_bytes(1 << 30),
+        ])
+        .cold_tier_backend_override(
+            "parallel-offload-a",
+            Arc::new(ProbedStorageBackend::new(probe.clone())),
+        )
+        .cold_tier_backend_override(
+            "parallel-offload-b",
+            Arc::new(ProbedStorageBackend::new(probe.clone())),
+        )
+        .cold_tier_rate_limits(rate_limits)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let payload = vec![0x5au8; 128];
+    for index in 0..16 {
+        client
+            .put(&format!("parallel-offload-{index}"), &payload)
+            .expect("put should publish pending cold backing");
+    }
+
+    let selected = client
+        .storage_owner
+        .cold_tier_devices
+        .accumulated_writes
+        .lock()
+        .clone();
+    let selected_a = selected
+        .get("parallel-offload-a")
+        .copied()
+        .unwrap_or_default();
+    let selected_b = selected
+        .get("parallel-offload-b")
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(selected_a + selected_b, 16);
+    assert!(
+        selected_a.abs_diff(selected_b) <= 1,
+        "equal targets should be balanced, got {selected_a} and {selected_b}"
+    );
+
+    for _ in 0..20 {
+        let _ = client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32);
+        if probe.max_active() >= 2 {
+            break;
+        }
+        sleep(Duration::from_millis(25));
+    }
+    assert!(
+        probe.max_active() >= 2,
+        "distinct cold targets should execute writes concurrently"
+    );
+
+    drop(client);
+    let _ = std::fs::remove_dir_all(root_a);
+    let _ = std::fs::remove_dir_all(root_b);
+}
+
+#[test]
 #[ignore = "too slow for default CI gate"]
 fn cold_restore_large_checkpoint_batch_rejects_corrupt_shard_without_partial_success() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());

@@ -359,6 +359,13 @@ fn ensure_pending_offload_work_available(storage_owner: &StorageOwnerState) -> R
     Ok(())
 }
 
+fn offload_target_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(32)
+}
+
 fn materialize_ready_pending_offload_groups(
     storage_owner: &StorageOwnerState,
     pending: &mut [PendingOffloadMaterialization],
@@ -368,22 +375,44 @@ fn materialize_ready_pending_offload_groups(
             .cold_tier_id
             .cmp(&right.cold_backing.cold_tier_id)
     });
-    let mut round_materialized = 0usize;
-    let mut first_error = None;
+    let mut groups = Vec::new();
     let mut start = 0usize;
     while start < pending.len() {
-        let cold_tier_id = pending[start].cold_backing.cold_tier_id.clone();
         let mut end = start + 1;
-        while end < pending.len() && pending[end].cold_backing.cold_tier_id == cold_tier_id {
+        while end < pending.len()
+            && pending[end].cold_backing.cold_tier_id == pending[start].cold_backing.cold_tier_id
+        {
             end += 1;
         }
-        round_materialized = round_materialized.saturating_add(
-            storage_owner.materialize_prepared_pending_offload_batch(
-                &pending[start..end],
-                &mut first_error,
-            )?,
-        );
+        groups.push(&pending[start..end]);
         start = end;
+    }
+
+    let outcomes =
+        crate::client::parallel_map_ordered(groups, offload_target_parallelism(), |group| {
+            let mut first_error = None;
+            let result =
+                storage_owner.materialize_prepared_pending_offload_batch(group, &mut first_error);
+            (result, first_error)
+        });
+    let mut round_materialized = 0usize;
+    let mut first_error = None;
+    let mut first_batch_error = None;
+    for (result, group_error) in outcomes {
+        match result {
+            Ok(materialized) => {
+                round_materialized = round_materialized.saturating_add(materialized);
+            }
+            Err(error) => {
+                first_batch_error.get_or_insert(error);
+            }
+        }
+        if first_error.is_none() {
+            first_error = group_error;
+        }
+    }
+    if let Some(error) = first_batch_error {
+        return Err(error);
     }
     if round_materialized == 0 {
         if let Some(error) = first_error {
