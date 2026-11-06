@@ -530,11 +530,48 @@ mod tests {
     }
 
     fn test_cas_request(key: &str) -> RouteCasRequest {
+        use mooncake_store_core::{CompatibilityDescriptor, ObjectRoute, RouteState, RouteVersion};
+
+        let key = ObjectKey::new(key.to_string());
+        RouteCasRequest {
+            key: key.clone(),
+            expected: None,
+            next: Some(ObjectRoute {
+                key,
+                namespace: None,
+                logical_key: None,
+                canonical_key: None,
+                sharing_scope: None,
+                qos_tier: None,
+                version: RouteVersion(1),
+                state: RouteState::Active,
+                compatibility: CompatibilityDescriptor::mooncake_v1(),
+                replicas: Vec::new(),
+                cold_backing: None,
+                nof_backing: None,
+            }),
+        }
+    }
+
+    fn test_delete_cas_request(key: &str) -> RouteCasRequest {
         RouteCasRequest {
             key: ObjectKey::new(key.to_string()),
-            expected: None,
+            expected: Some(mooncake_store_core::RouteVersion(1)),
             next: None,
         }
+    }
+
+    fn test_batch(key: &str) -> RouteMirrorBatch {
+        RouteMirrorBatch {
+            secondary: test_lease("secondary"),
+            requests: vec![test_cas_request(key)],
+        }
+    }
+
+    #[test]
+    fn request_classifier_distinguishes_live_routes_and_deletes() {
+        assert!(!is_delete_marker_request(&test_cas_request("live")));
+        assert!(is_delete_marker_request(&test_delete_cas_request("deleted")));
     }
 
     #[test]
@@ -545,21 +582,22 @@ mod tests {
 
     #[test]
     fn enqueue_overwrites_oldest_when_queue_is_full() {
-        let client = RecordingAuthorityClient::new();
-        let membership = Arc::new(NoopMembership);
-        let worker = AsyncRouteMirrorWorker::spawn(
-            "test-ns".to_string(),
-            ClientStableId::new("local".to_string()),
-            client.clone(),
-            membership,
+        let queue = MirrorQueue::new(2);
+        assert!(queue.push(test_batch("key-0")).is_none());
+        assert!(queue.push(test_batch("key-1")).is_none());
+
+        let evicted = queue
+            .push(test_batch("key-2"))
+            .expect("a full queue should evict its oldest batch");
+        assert_eq!(evicted.requests[0].key, ObjectKey::new("key-0"));
+        assert_eq!(
+            queue.try_pop().expect("key-1 should remain").requests[0].key,
+            ObjectKey::new("key-1")
         );
-        for i in 0..QUEUE_CAPACITY + 10 {
-            worker.enqueue(
-                test_lease("secondary"),
-                vec![test_cas_request(&format!("key-{i}"))],
-            );
-        }
-        drop(worker);
+        assert_eq!(
+            queue.try_pop().expect("key-2 should remain").requests[0].key,
+            ObjectKey::new("key-2")
+        );
     }
 
     #[test]
