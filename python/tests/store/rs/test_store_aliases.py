@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+import weakref
 
 import pytest
 
@@ -60,7 +61,6 @@ def test_put_batch_delegates_to_batch_put(store_module) -> None:
         return 0
 
     store._invoke = fake_invoke  # type: ignore[attr-defined]
-    store._track_keys = lambda keys, tenant=None: None  # type: ignore[attr-defined]
 
     result = store.put_batch(["alpha"], [b"one"], tenant="tenant-a")
 
@@ -186,3 +186,32 @@ def test_pending_publication_env_defaults_and_explicit_precedence(store_module, 
     })
     assert explicit["max_pending_publications"] == 3
     assert explicit["max_pending_publication_bytes"] == 512
+
+
+def test_batch_put_preserves_per_item_statuses(store_module):
+    store = object.__new__(store_module.MooncakeDistributedStore)
+    store._invoke = lambda *args, **kwargs: [0, -1, 0]
+    assert store.batch_put([("first", b"a"), ("duplicate", b"b"), ("third", b"c")]) == [0, -1, 0]
+
+
+def test_successful_writes_release_key_references(store_module):
+    class Key(str):
+        def __str__(self):
+            return self
+
+    store = store_module.MooncakeDistributedStore()
+    store._invoke = lambda name, *args, **kwargs: [0] if name.startswith("batch_") else 0
+    writes = [
+        lambda key: store.put(key, b"x"),
+        lambda key: store.put_from(key, 1, 1),
+        lambda key: store.batch_put([(key, b"x")]),
+        lambda key: store.batch_put_from([(key, 1, 1)]),
+        lambda key: store.batch_put_from([key], [1], [1]),
+    ]
+    for index, write in enumerate(writes):
+        key = Key(f"unique-{index}")
+        reference = weakref.ref(key)
+        write(key)
+        del key
+        assert reference() is None
+    assert "_tracked_keys" not in vars(store)
