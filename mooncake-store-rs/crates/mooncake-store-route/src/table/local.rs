@@ -465,15 +465,33 @@ impl LocalRouteTable {
         let evicted = self.delete_markers.record(key, version);
         if !evicted.is_empty() {
             record_delete_marker_event("capacity_evicted", evicted.len() as u64);
-            for marker in evicted {
-                tracing::warn!(
-                    key = %marker.key.0,
-                    delete_version = marker.version.0,
-                    age_ms = marker.age.as_millis() as u64,
-                    accounted_bytes = marker.accounted_bytes,
-                    "delete marker evicted at bounded FIFO capacity"
-                );
-            }
+            let evicted_count = evicted.len();
+            let evicted_bytes = evicted
+                .iter()
+                .map(|marker| marker.accounted_bytes)
+                .sum::<usize>();
+            let oldest_age_ms = evicted
+                .iter()
+                .map(|marker| marker.age.as_millis() as u64)
+                .max()
+                .unwrap_or_default();
+            let max_delete_version = evicted
+                .iter()
+                .map(|marker| marker.version.0)
+                .max()
+                .unwrap_or_default();
+            let sample_key = evicted
+                .first()
+                .map(|marker| marker.key.0.as_str())
+                .unwrap_or_default();
+            tracing::warn!(
+                evicted_count,
+                evicted_bytes,
+                oldest_age_ms,
+                max_delete_version,
+                sample_key,
+                "delete markers evicted at bounded FIFO capacity"
+            );
         }
         self.record_delete_marker_state();
     }
