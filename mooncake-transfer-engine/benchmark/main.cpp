@@ -369,7 +369,8 @@ int processBatchSizes(
         if (tent_runner) {
             const auto selection_report = calculateRdmaSelectionMetrics(
                 block_size, batch_size, num_threads, XferBenchConfig::backend,
-                XferBenchConfig::op_type, selection_start, selection_end);
+                mixed_opcode ? "mix" : XferBenchConfig::op_type,
+                selection_start, selection_end);
             if (!appendRdmaSelectionMetricsJsonl(
                     XferBenchConfig::result_output_jsonl, selection_report,
                     &error)) {
