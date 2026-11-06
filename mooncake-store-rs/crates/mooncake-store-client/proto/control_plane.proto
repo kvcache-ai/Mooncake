@@ -47,6 +47,7 @@ enum ErrorKind {
   ERROR_KIND_ALLOCATOR = 6;
   ERROR_KIND_METADATA = 7;
   ERROR_KIND_TRANSPORT = 8;
+  ERROR_KIND_BACKPRESSURE = 9;
 }
 
 message ErrorDetail {

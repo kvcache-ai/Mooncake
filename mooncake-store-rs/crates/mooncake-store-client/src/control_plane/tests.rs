@@ -2118,6 +2118,9 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let decoded = decode_error(Some(pb_error(StoreError::Conflict("boom".to_string()))))
         .expect_err("error detail should decode into store error");
     assert!(matches!(decoded, StoreError::Conflict(_)));
+    let backpressure = decode_error(Some(pb_error(StoreError::Backpressure("busy".to_string()))))
+        .expect_err("backpressure detail should decode into store error");
+    assert!(matches!(backpressure, StoreError::Backpressure(_)));
 
     ensure_batch_len("get", 2, 2).expect("matching lengths should pass");
     let error = ensure_batch_len("get", 2, 1).expect_err("mismatched lengths must fail");

@@ -56,7 +56,7 @@ pub(super) fn pb_error(error: StoreError) -> pb::ErrorDetail {
         StoreError::Allocator(message) => (pb::ErrorKind::Allocator, message),
         StoreError::Metadata(message) => (pb::ErrorKind::Metadata, message),
         StoreError::Transport(message) => (pb::ErrorKind::Transport, message),
-        StoreError::Backpressure(message) => (pb::ErrorKind::Transport, message),
+        StoreError::Backpressure(message) => (pb::ErrorKind::Backpressure, message),
     };
     pb::ErrorDetail {
         kind: kind as i32,
@@ -73,6 +73,7 @@ pub(super) fn store_error_from_pb(error: pb::ErrorDetail) -> StoreError {
         pb::ErrorKind::Unsupported => StoreError::Unsupported(error.message),
         pb::ErrorKind::Allocator => StoreError::Allocator(error.message),
         pb::ErrorKind::Metadata => StoreError::Metadata(error.message),
+        pb::ErrorKind::Backpressure => StoreError::Backpressure(error.message),
         pb::ErrorKind::Transport | pb::ErrorKind::Unspecified => {
             StoreError::Transport(error.message)
         }

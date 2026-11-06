@@ -2211,12 +2211,24 @@ impl StoreClient {
                 }
             }
         }
-        for runtime in failed_runtimes {
+        if failed_runtimes.len() == 1 {
+            let runtime = failed_runtimes
+                .into_iter()
+                .next()
+                .expect("single failed runtime checked above");
             eprintln!(
                 "[mooncake-store] marking remote write target suspect runtime={} context={} error={}",
                 runtime, context, error
             );
             self.mark_runtime_suspect(&runtime, context);
+        } else if !failed_runtimes.is_empty() {
+            debug!(
+                runtime = %self.lease.runtime,
+                targets = failed_runtimes.len(),
+                context,
+                error = %error,
+                "ambiguous remote write failure invalidated segment caches without quarantining every target"
+            );
         }
         let _ = refresh_live_client_cache(
             self.metadata.as_ref(),
