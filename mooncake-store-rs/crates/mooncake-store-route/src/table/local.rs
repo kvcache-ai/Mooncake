@@ -9,6 +9,7 @@ use mooncake_store_core::{
     RouteVersion, StoreError,
 };
 
+use crate::metrics::record_cas_outcome;
 use crate::metrics::{record_authoritative_route_update, record_delete_marker_event, record_delete_marker_state};
 use crate::table::{DeleteMarkerSnapshot, DeleteMarkerStore};
 use crate::RouteAuthorityRecord;
@@ -342,18 +343,21 @@ impl LocalRouteTable {
                 delete_version,
                 version_floor: None,
             };
+            record_cas_outcome(&result);
             return result;
         }
 
         let applied_delete_version = self.apply_update(key, next, expected);
-        CasResult {
+        let result = CasResult {
             applied: true,
             current: next
                 .filter(|route| route.state != mooncake_store_core::RouteState::Tombstone)
                 .cloned(),
             delete_version: applied_delete_version,
             version_floor: None,
-        }
+        };
+        record_cas_outcome(&result);
+        result
     }
 
     pub(crate) fn compare_and_swap_many(&mut self, requests: &[RouteCasRequest]) -> Vec<CasResult> {
