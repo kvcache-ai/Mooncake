@@ -2044,7 +2044,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             .iter()
             .map(|key| ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk))
             .collect::<Vec<_>>();
-        let mut delete_versions = vec![None; keys.len()];
+        let mut delete_versions: Vec<Option<RouteVersion>> = vec![None; keys.len()];
         for rank in 0..self.route_topk {
             let mut by_authority = BTreeMap::<ClientStableId, Vec<(usize, ObjectKey)>>::new();
             for (index, authorities) in ranked_authorities.iter().enumerate() {
