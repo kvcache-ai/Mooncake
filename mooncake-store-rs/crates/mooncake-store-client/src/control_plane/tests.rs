@@ -2996,3 +2996,179 @@ impl AllocatorService for LegacyOnlyAllocator {
     }
 
 }
+
+struct GatedRpcAllocator {
+    inner: TestAllocator,
+    entered: std::sync::mpsc::Sender<()>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl GatedRpcAllocator {
+    fn wait_for_release(&self) {
+        self.entered
+            .send(())
+            .expect("test should observe allocator entry");
+        let (lock, ready) = &*self.gate;
+        let mut released = lock.lock().expect("allocator gate should lock");
+        while !*released {
+            released = ready.wait(released).expect("allocator gate should wait");
+        }
+    }
+}
+
+impl AllocatorService for GatedRpcAllocator {
+    fn reserve_any(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<SegmentReservation> {
+        self.wait_for_release();
+        self.inner.reserve_any(owner, length_bytes)
+    }
+
+    fn reserve_specific(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<SegmentReservation> {
+        self.wait_for_release();
+        self.inner
+            .reserve_specific(owner, segment_name, length_bytes)
+    }
+
+    fn release(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+        allocation_id: u64,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.release(
+            owner,
+            segment_name,
+            offset_bytes,
+            length_bytes,
+            allocation_id,
+        )
+    }
+}
+
+#[test]
+fn allocator_reservation_rpcs_preserve_unrelated_route_rpc_progress() {
+    with_env_var(CONTROL_PLANE_SERVER_THREADS_ENV, Some("1"), || {
+        let mut observed = Vec::new();
+        for operation in 0..4 {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let allocator = Arc::new(GatedRpcAllocator {
+                inner: TestAllocator::default(),
+                entered: entered_tx,
+                gate: gate.clone(),
+            });
+            let authority = Arc::new(TestAuthority::default());
+            let owner = sample_owner();
+            authority.insert(sample_route("unrelated-route", 1, &owner));
+            let mut handle = ControlPlaneHandle::spawn(
+                "127.0.0.1",
+                authority,
+                allocator,
+                Arc::new(TestEviction::default()),
+            )
+            .expect("server should start");
+            let lease = sample_lease(handle.address());
+            let client = ControlPlaneClient::with_request_timeout(Duration::from_millis(300))
+                .expect("client should start");
+            let authority_id = ClientStableId::new("authority");
+            let keys = [ObjectKey::new("unrelated-route")];
+            client
+                .batch_get_routes(&lease, "ns-a", &authority_id, &keys)
+                .expect("route channel should warm before allocator blocks");
+            let endpoint = format!("http://{}", handle.address());
+            let reservation = thread::spawn(move || {
+                RuntimeBuilder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("RPC runtime should start")
+                    .block_on(async move {
+                        let channel = tonic::transport::Endpoint::from_shared(endpoint)
+                            .expect("endpoint should parse")
+                            .timeout(Duration::from_secs(5))
+                            .connect()
+                            .await
+                            .expect("RPC channel should connect");
+                        let mut rpc =
+                            pb::control_plane_service_client::ControlPlaneServiceClient::new(
+                                channel,
+                            );
+                        let owner = Some(pb_runtime_id(&owner));
+                        match operation {
+                            0 => rpc
+                                .reserve_any(pb::ReserveAnyRequest {
+                                    owner,
+                                    length_bytes: 16,
+                                    pending_publication: false,
+                                })
+                                .await
+                                .map(|_| ()),
+                            1 => rpc
+                                .batch_reserve_any(pb::BatchReserveAnyRequest {
+                                    owner,
+                                    length_bytes: vec![16],
+                                    pending_publication: false,
+                                })
+                                .await
+                                .map(|_| ()),
+                            2 => rpc
+                                .reserve_specific(pb::ReserveSpecificRequest {
+                                    owner,
+                                    segment_name: "segment-a".to_string(),
+                                    length_bytes: 16,
+                                    pending_publication: false,
+                                })
+                                .await
+                                .map(|_| ()),
+                            _ => rpc
+                                .batch_reserve_specific(pb::BatchReserveSpecificRequest {
+                                    owner,
+                                    entries: vec![pb::ReserveSpecificEntry {
+                                        segment_name: "segment-a".to_string(),
+                                        length_bytes: 16,
+                                    }],
+                                    pending_publication: false,
+                                })
+                                .await
+                                .map(|_| ()),
+                        }
+                    })
+            });
+            let entered = entered_rx.recv_timeout(Duration::from_secs(3));
+            let progress = client.batch_get_routes(&lease, "ns-a", &authority_id, &keys);
+            let (lock, ready) = &*gate;
+            *lock.lock().expect("gate should lock") = true;
+            ready.notify_all();
+            let reservation_result = reservation
+                .join()
+                .expect("reservation thread should finish");
+            handle.shutdown();
+            assert!(
+                entered.is_ok(),
+                "allocator operation {operation} must enter its synchronous service"
+            );
+            assert!(
+                reservation_result.is_ok(),
+                "reservation {operation} should finish after release: {reservation_result:?}"
+            );
+            eprintln!(
+                "allocator RPC {operation}: unrelated route progress = {}",
+                progress.is_ok()
+            );
+            observed.push((operation, progress));
+        }
+        assert!(
+            observed.iter().all(|(_, result)| result.is_ok()),
+            "allocator RPCs must not block unrelated real route RPCs: {observed:?}"
+        );
+    });
+}
