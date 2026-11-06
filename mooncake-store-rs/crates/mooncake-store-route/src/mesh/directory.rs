@@ -1857,6 +1857,10 @@ mod owner_page_contract_tests {
         force_refresh_calls: AtomicUsize,
     }
 
+    struct CachedOnlyMembership {
+        leases: Vec<ClientLease>,
+    }
+
     impl RouteMembershipProvider for ForceRefreshChangingMembership {
         fn live_clients(
             &self,
@@ -1868,6 +1872,35 @@ mod owner_page_contract_tests {
             } else {
                 Ok(self.first.clone())
             }
+        }
+
+        fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
+            false
+        }
+
+        fn mark_suspect(
+            &self,
+            _runtime: ClientRuntimeId,
+            _quarantine_until: Instant,
+            _observed: Option<&ClientLease>,
+        ) {
+        }
+    }
+
+    impl RouteMembershipProvider for CachedOnlyMembership {
+        fn live_clients(
+            &self,
+            force_refresh: bool,
+            _operation: &'static str,
+        ) -> Result<Vec<ClientLease>> {
+            if force_refresh {
+                return Err(StoreError::Metadata(
+                    "injected metadata refresh failure".to_string(),
+                ));
+            }
+            Ok(self.leases.clone())
         }
 
         fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
@@ -2140,6 +2173,82 @@ mod owner_page_contract_tests {
                     &expected_route.replicas[0],
                 )
                 .expect("consistent authorities should confirm absence"),
+            RouteReplicaReference::Absent
+        ));
+    }
+
+    #[test]
+    fn exact_replica_confirmation_uses_cached_membership() {
+        let observer = test_lease("observer");
+        let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut expected_route = test_route("confirmation-cached-membership", &replica_owner);
+        expected_route.replicas[0].allocation_id = Some(7);
+        let absent = ObjectRoute {
+            replicas: Vec::new(),
+            ..expected_route.clone()
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::from([
+                    ("authority-a".to_string(), Some(absent.clone())),
+                    ("authority-b".to_string(), Some(absent)),
+                ]),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(CachedOnlyMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        assert!(matches!(
+            directory
+                .confirm_replica_reference(
+                    &observer,
+                    &expected_route.key,
+                    &expected_route.replicas[0],
+                )
+                .expect("cached membership must be sufficient for confirmation"),
+            RouteReplicaReference::Absent
+        ));
+    }
+
+    #[test]
+    fn exact_replica_confirmation_treats_missing_and_unreferenced_as_absent() {
+        let observer = test_lease("observer");
+        let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut expected_route = test_route("confirmation-semantic-absence", &replica_owner);
+        expected_route.replicas[0].allocation_id = Some(7);
+        let absent = ObjectRoute {
+            replicas: Vec::new(),
+            ..expected_route.clone()
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::from([
+                    ("authority-a".to_string(), Some(absent)),
+                    ("authority-b".to_string(), None),
+                ]),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        assert!(matches!(
+            directory
+                .confirm_replica_reference(
+                    &observer,
+                    &expected_route.key,
+                    &expected_route.replicas[0],
+                )
+                .expect("semantic absence must not depend on complete route equality"),
             RouteReplicaReference::Absent
         ));
     }
