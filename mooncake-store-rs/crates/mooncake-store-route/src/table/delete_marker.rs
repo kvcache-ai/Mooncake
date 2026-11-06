@@ -1,5 +1,4 @@
 use std::mem::size_of;
-use std::time::{Duration, Instant};
 
 use hashlink::LinkedHashMap;
 use mooncake_store_core::{ObjectKey, RouteVersion};
@@ -11,7 +10,6 @@ const ACCOUNTING_ALIGNMENT: usize = 64;
 #[derive(Clone, Debug)]
 struct DeleteMarker {
     version: RouteVersion,
-    recorded_at: Instant,
     accounted_bytes: usize,
 }
 
@@ -20,14 +18,6 @@ pub(crate) struct DeleteMarkerSnapshot {
     pub(crate) entries: usize,
     pub(crate) accounted_bytes: usize,
     pub(crate) budget_bytes: usize,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct EvictedDeleteMarker {
-    pub(crate) key: ObjectKey,
-    pub(crate) version: RouteVersion,
-    pub(crate) age: Duration,
-    pub(crate) accounted_bytes: usize,
 }
 
 pub(crate) struct DeleteMarkerStore {
@@ -59,17 +49,13 @@ impl DeleteMarkerStore {
         keys.iter().map(|key| self.get(key)).collect()
     }
 
-    pub(crate) fn record(
-        &mut self,
-        key: &ObjectKey,
-        version: RouteVersion,
-    ) -> Vec<EvictedDeleteMarker> {
+    pub(crate) fn record(&mut self, key: &ObjectKey, version: RouteVersion) -> usize {
         if self
             .entries
             .get(key)
             .is_some_and(|current| current.version >= version)
         {
-            return Vec::new();
+            return 0;
         }
 
         let accounted_bytes = accounted_entry_bytes(key);
@@ -77,7 +63,6 @@ impl DeleteMarkerStore {
             key.clone(),
             DeleteMarker {
                 version,
-                recorded_at: Instant::now(),
                 accounted_bytes,
             },
         ) {
@@ -87,20 +72,15 @@ impl DeleteMarkerStore {
         }
         self.accounted_bytes = self.accounted_bytes.saturating_add(accounted_bytes);
 
-        let mut evicted = Vec::new();
+        let mut evicted_count = 0;
         while self.accounted_bytes > self.budget_bytes {
-            let Some((key, marker)) = self.entries.pop_front() else {
+            let Some((_, marker)) = self.entries.pop_front() else {
                 break;
             };
             self.accounted_bytes = self.accounted_bytes.saturating_sub(marker.accounted_bytes);
-            evicted.push(EvictedDeleteMarker {
-                key,
-                version: marker.version,
-                age: marker.recorded_at.elapsed(),
-                accounted_bytes: marker.accounted_bytes,
-            });
+            evicted_count += 1;
         }
-        evicted
+        evicted_count
     }
 
     pub(crate) fn remove_if_older(&mut self, key: &ObjectKey, live_version: RouteVersion) -> bool {
@@ -155,11 +135,12 @@ mod tests {
         store.record(&b, RouteVersion(1));
         store.record(&a, RouteVersion(3));
         store.record(&a, RouteVersion(2));
-        let evicted = store.record(&c, RouteVersion(1));
+        let evicted_count = store.record(&c, RouteVersion(1));
 
         assert_eq!(store.get(&a), Some(RouteVersion(3)));
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].key, b);
+        assert_eq!(evicted_count, 1);
+        assert_eq!(store.get(&b), None);
+        assert_eq!(store.get(&c), Some(RouteVersion(1)));
     }
 
     #[test]
@@ -171,10 +152,11 @@ mod tests {
 
         store.record(&a, RouteVersion(1));
         store.record(&b, RouteVersion(2));
-        let evicted = store.record(&c, RouteVersion(3));
+        let evicted_count = store.record(&c, RouteVersion(3));
 
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].key, a);
+        assert_eq!(evicted_count, 1);
+        assert_eq!(store.get(&a), None);
+        assert_eq!(store.get(&c), Some(RouteVersion(3)));
         assert!(store.snapshot().accounted_bytes <= 512);
         assert!(!store.remove_if_older(&b, RouteVersion(2)));
         assert!(store.remove_if_older(&b, RouteVersion(3)));
