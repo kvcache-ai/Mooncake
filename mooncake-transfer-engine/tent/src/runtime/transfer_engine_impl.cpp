@@ -2449,15 +2449,52 @@ Status TransferEngineImpl::prepareSubmit(
         } else if (source_key && target_key) {
             auto key =
                 makeRouteCacheKey(owner.request, *source_key, *target_key);
+            bool remember = true;
             if (auto it = route_cache.find(key); it != route_cache.end()) {
                 owner.route = it->second;
             } else {
                 owner.route = resolveTransport(owner.request, 0);
-                if (owner.route.transport != UNSPEC) {
-                    route_cache.emplace(key, owner.route);
+                // resolveTransport may drop a stale peer snapshot and select
+                // against the replacement. The key above still names the old
+                // findBuffer result, so a refreshed RDMA route must not be
+                // reused for a later owner whose new MR is different.
+                auto selected_source = lookupSourceKey(owner.request);
+                auto selected_target = lookupTargetKey(owner.request);
+                const bool buffers_changed =
+                    !selected_source || !selected_target ||
+                    *selected_source != key.source ||
+                    *selected_target != key.target;
+                if (buffers_changed) {
+                    const auto target_id = owner.request.target_id;
+                    std::erase_if(route_cache, [&](const auto& entry) {
+                        return entry.first.target_id == target_id;
+                    });
+                    if (last_valid && last_key.target_id == target_id)
+                        last_valid = false;
+                    if (have_boundaries) {
+                        for (size_t i = 0; i < request_list.size(); ++i) {
+                            if (request_list[i].target_id != target_id)
+                                continue;
+                            merge_boundaries[i].target_key =
+                                lookupTargetKey(request_list[i]);
+                        }
+                        if (selected_source && *selected_source != key.source) {
+                            for (size_t i = 0; i < request_list.size(); ++i) {
+                                merge_boundaries[i].source_key =
+                                    lookupSourceKey(request_list[i]);
+                            }
+                        }
+                    }
+                    if (selected_source && selected_target) {
+                        key = makeRouteCacheKey(owner.request, *selected_source,
+                                                *selected_target);
+                    }
                 }
+                remember = owner.route.transport != UNSPEC &&
+                           selected_source && selected_target;
+                if (remember) route_cache.emplace(key, owner.route);
             }
-            if (owner.route.transport != UNSPEC) {
+            if (remember) {
                 last_key = std::move(key);
                 last_route = owner.route;
                 last_valid = true;

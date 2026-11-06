@@ -216,9 +216,10 @@ TEST(TransportRouteCache, SameMrReusesRoute) {
 
 // A starts lower and is sorted first. B starts inside A and extends past it.
 // An address past A is B; an address in the overlap is still A, even though B
-// contains that address too.
+// contains that address too. Merge sorts by target_offset and would run A
+// first, so keep the submitted B-then-A order.
 TEST(TransportRouteCache, OverlappingMrsDoNotReuseByContainment) {
-    auto cfg = makeConfig(true);
+    auto cfg = makeConfig(false);
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
