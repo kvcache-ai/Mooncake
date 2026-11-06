@@ -52,6 +52,8 @@ pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecyc
 pub(crate) const RECLAIM_RELEASE_TOTAL: &str = "mooncake_store_reclaim_release_total";
 pub(crate) const EVICTION_TOTAL: &str = "mooncake_store_eviction_total";
 pub(crate) const EVICTION_DURATION: &str = "mooncake_store_eviction_duration_seconds";
+pub(crate) const EVICTED_REPLICAS_TOTAL: &str = "mooncake_store_evicted_replicas_total";
+pub(crate) const EVICTED_BYTES_TOTAL: &str = "mooncake_store_evicted_bytes_total";
 pub(crate) const TRANSPORT_OPERATION_TOTAL: &str = "mooncake_store_transport_operation_total";
 pub(crate) const TRANSPORT_BYTES_TOTAL: &str = "mooncake_store_transport_bytes_total";
 pub(crate) const METADATA_OPERATION_TOTAL: &str = "mooncake_store_metadata_operation_total";
@@ -118,6 +120,8 @@ pub struct MetricsSnapshot {
     pub reclaim_release: Vec<CounterSample<ActionResultKey>>,
     pub eviction: Vec<CounterSample<ResultKey>>,
     pub eviction_duration: Vec<HistogramSample<ResultKey>>,
+    pub evicted_replicas: u64,
+    pub evicted_bytes: u64,
     pub transport_operations: Vec<CounterSample<TransportOperationKey>>,
     pub transport_bytes: Vec<CounterSample<TransportBytesKey>>,
     pub metadata_operations: Vec<CounterSample<MetadataOperationKey>>,
@@ -542,6 +546,8 @@ struct MetricsRegistry {
     reclaim_release: CounterFamily<ActionResultKey>,
     eviction: CounterFamily<ResultKey>,
     eviction_duration: HistogramFamily<ResultKey>,
+    evicted_replicas: u64,
+    evicted_bytes: u64,
     transport_operations: CounterFamily<TransportOperationKey>,
     transport_bytes: CounterFamily<TransportBytesKey>,
     metadata_operations: CounterFamily<MetadataOperationKey>,
@@ -621,6 +627,8 @@ impl Default for MetricsRegistry {
             reclaim_release: CounterFamily::default(),
             eviction: CounterFamily::default(),
             eviction_duration: HistogramFamily::default(),
+            evicted_replicas: 0,
+            evicted_bytes: 0,
             transport_operations: CounterFamily::default(),
             transport_bytes: CounterFamily::default(),
             metadata_operations: CounterFamily::default(),
@@ -831,6 +839,8 @@ impl MetricsRegistry {
                 .snapshot_with_defaults(reclaim_release_keys()),
             eviction: self.eviction.snapshot(),
             eviction_duration: self.eviction_duration.snapshot(),
+            evicted_replicas: self.evicted_replicas,
+            evicted_bytes: self.evicted_bytes,
             transport_operations: self.transport_operations.snapshot(),
             transport_bytes: self.transport_bytes.snapshot(),
             metadata_operations: self.metadata_operations.snapshot(),
@@ -1443,6 +1453,12 @@ pub(crate) fn record_eviction(result: &'static str, duration: Duration) {
     registry
         .eviction_duration
         .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_evicted_replicas(replicas: usize, bytes: u64) {
+    let mut registry = global_metrics_registry().lock();
+    registry.evicted_replicas = registry.evicted_replicas.saturating_add(replicas as u64);
+    registry.evicted_bytes = registry.evicted_bytes.saturating_add(bytes);
 }
 
 pub(crate) fn record_cold_tier_device_metrics(metrics: ColdTierDeviceMetrics<'_>) {
