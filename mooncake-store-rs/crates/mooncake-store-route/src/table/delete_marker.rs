@@ -180,4 +180,26 @@ mod tests {
         assert!(store.remove_if_older(&b, RouteVersion(3)));
         assert_eq!(store.get(&b), None);
     }
+
+    #[test]
+    fn unique_delete_churn_plateaus_at_the_byte_budget() {
+        const BUDGET: usize = 256 * 64;
+        let mut store = DeleteMarkerStore::new(BUDGET);
+
+        for index in 0..10_000 {
+            store.record(
+                &ObjectKey::new(format!("churn-key-{index}")),
+                RouteVersion(1),
+            );
+        }
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.entries <= 64);
+        assert!(snapshot.accounted_bytes <= BUDGET);
+        assert_eq!(store.get(&ObjectKey::new("churn-key-0")), None);
+        assert_eq!(
+            store.get(&ObjectKey::new("churn-key-9999")),
+            Some(RouteVersion(1))
+        );
+    }
 }
