@@ -232,18 +232,39 @@ struct RunArgs {
     cold_tier_tags: Vec<String>,
     #[arg(long, help = "Bootstrap cold tier device capacity override in bytes")]
     cold_tier_capacity_bytes: Option<u64>,
-    #[arg(long, help = "Maximum concurrent cold-tier offloads for this runtime")]
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_MAX_IN_FLIGHT",
+        help = "Maximum concurrent cold-tier offloads for this runtime"
+    )]
     cold_tier_offload_runtime_max_in_flight: Option<usize>,
-    #[arg(long, help = "Maximum concurrent cold-tier offloads per device")]
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_MAX_IN_FLIGHT",
+        help = "Maximum concurrent cold-tier offloads per device"
+    )]
     cold_tier_offload_device_max_in_flight: Option<usize>,
-    #[arg(long, help = "Cold-tier offload rate limit for this runtime")]
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_OPS_PER_SEC",
+        help = "Cold-tier offload rate limit for this runtime"
+    )]
     cold_tier_offload_runtime_ops_per_sec: Option<u32>,
-    #[arg(long, help = "Cold-tier offload rate limit per device")]
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_OPS_PER_SEC",
+        help = "Cold-tier offload rate limit per device"
+    )]
     cold_tier_offload_device_ops_per_sec: Option<u32>,
-    #[arg(long, help = "Pending offloads kicked by one foreground allocation")]
+    #[arg(
+        long,
+        env = "MC_STORE_RS_COLD_TIER_FOREGROUND_OFFLOAD_KICK_BATCH",
+        help = "Pending offloads kicked by one foreground allocation"
+    )]
     cold_tier_foreground_offload_kick_batch: Option<usize>,
     #[arg(
         long,
+        env = "MC_STORE_RS_COLD_TIER_OFFLOAD_POLL_INTERVAL_MS",
         help = "Background cold-tier offload poll interval in milliseconds"
     )]
     cold_tier_offload_poll_interval_ms: Option<u64>,
@@ -2272,5 +2293,80 @@ mod tests {
 
         let error = validate_args(&args).expect_err("directory+uuid should conflict");
         assert!(error.to_string().contains("mutually exclusive"));
+    }
+    #[test]
+    fn cold_tier_rate_limit_flags_override_environment() {
+        with_env_vars(
+            [
+                (
+                    "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_MAX_IN_FLIGHT",
+                    Some("11"),
+                ),
+                (
+                    "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_MAX_IN_FLIGHT",
+                    Some("12"),
+                ),
+                (
+                    "MC_STORE_RS_COLD_TIER_OFFLOAD_RUNTIME_OPS_PER_SEC",
+                    Some("13"),
+                ),
+                (
+                    "MC_STORE_RS_COLD_TIER_OFFLOAD_DEVICE_OPS_PER_SEC",
+                    Some("14"),
+                ),
+                (
+                    "MC_STORE_RS_COLD_TIER_FOREGROUND_OFFLOAD_KICK_BATCH",
+                    Some("15"),
+                ),
+                ("MC_STORE_RS_COLD_TIER_OFFLOAD_POLL_INTERVAL_MS", Some("16")),
+            ],
+            || {
+                let base = [
+                    "mooncake-store-rs-client",
+                    "--local-hostname",
+                    "127.0.0.1",
+                    "--metadata-url",
+                    "redis://127.0.0.1:6379/0",
+                ];
+                let cli = parse_cli_from(base).expect("environment limits should parse");
+                let args = match cli.command {
+                    Command::Run(args) => args,
+                    _ => panic!("expected run command"),
+                };
+                let limits = build_cold_tier_rate_limits(&args);
+                assert_eq!(limits.offload_runtime_max_in_flight, 11);
+                assert_eq!(limits.offload_device_max_in_flight, 12);
+                assert_eq!(limits.offload_runtime_ops_per_sec, 13);
+                assert_eq!(limits.offload_device_ops_per_sec, 14);
+                assert_eq!(limits.foreground_offload_kick_batch, 15);
+                assert_eq!(limits.offload_poll_interval_ms, 16);
+                let cli = parse_cli_from(base.into_iter().chain([
+                    "--cold-tier-offload-runtime-max-in-flight",
+                    "31",
+                    "--cold-tier-offload-device-max-in-flight",
+                    "32",
+                    "--cold-tier-offload-runtime-ops-per-sec",
+                    "33",
+                    "--cold-tier-offload-device-ops-per-sec",
+                    "34",
+                    "--cold-tier-foreground-offload-kick-batch",
+                    "35",
+                    "--cold-tier-offload-poll-interval-ms",
+                    "36",
+                ]))
+                .expect("explicit limits should parse");
+                let args = match cli.command {
+                    Command::Run(args) => args,
+                    _ => panic!("expected run command"),
+                };
+                let limits = build_cold_tier_rate_limits(&args);
+                assert_eq!(limits.offload_runtime_max_in_flight, 31);
+                assert_eq!(limits.offload_device_max_in_flight, 32);
+                assert_eq!(limits.offload_runtime_ops_per_sec, 33);
+                assert_eq!(limits.offload_device_ops_per_sec, 34);
+                assert_eq!(limits.foreground_offload_kick_batch, 35);
+                assert_eq!(limits.offload_poll_interval_ms, 36);
+            },
+        );
     }
 }
