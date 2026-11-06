@@ -13,10 +13,24 @@
 
 namespace mooncake {
 
+// Environment variable that overrides the dummy/real client IPC socket name
+// when no explicit name is configured.
+inline constexpr const char *kIpcSocketPathEnv = "MOONCAKE_IPC_SOCKET_PATH";
+
+// Resolves the IPC socket name shared by a real client and its dummy clients.
+// Order: `configured`, then $MOONCAKE_IPC_SOCKET_PATH, then the default
+// abstract name "@mooncake_client_<port>.sock". Both sides must apply the same
+// rule so that they meet on the same socket.
+std::string resolveClientIpcSocketName(const std::string &configured, int port);
+
 // Lightweight Unix domain socket helper for one-shot, performance-insensitive
 // control-plane exchanges such as local fd passing. This opens short-lived
 // blocking sockets and handles one connection at a time; use asio-based
 // transport instead for latency-sensitive, high-throughput, or long-lived I/O.
+//
+// A socket name starting with '/' is a filesystem path, reachable by any
+// process that can see the path (e.g. pods sharing a hostPath). Any other name
+// is a Linux abstract socket, visible only inside the same network namespace.
 class UdsConnection {
    public:
     UdsConnection() = default;
@@ -71,8 +85,12 @@ class UdsAcceptor {
    private:
     void acceptLoop();
     void wakeAccept();
+    void unlinkBoundPath();
 
     std::string socket_name_;
+    // Filesystem path bound by this acceptor and removed on stop; empty for
+    // abstract sockets.
+    std::string bound_socket_path_;
     Handler handler_;
     int listen_fd_ = -1;
     std::atomic<int> active_client_fd_{-1};

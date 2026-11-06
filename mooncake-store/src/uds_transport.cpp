@@ -4,12 +4,15 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
 
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -36,14 +39,29 @@ int createCloexecUdsSocket() {
 #endif
 }
 
-tl::expected<void, std::string> makeAbstractAddress(
+bool isFilesystemSocketName(const std::string &socket_name) {
+    return !socket_name.empty() && socket_name[0] == '/';
+}
+
+tl::expected<void, std::string> makeSocketAddress(
     const std::string &socket_name, sockaddr_un &addr, socklen_t &addr_len) {
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+
+    if (isFilesystemSocketName(socket_name)) {
+        // Keep room for the terminating NUL that memset already provided.
+        if (socket_name.size() >= sizeof(addr.sun_path)) {
+            return tl::make_unexpected("UDS socket path too long: " +
+                                       socket_name);
+        }
+        memcpy(addr.sun_path, socket_name.c_str(), socket_name.size());
+        addr_len = offsetof(sockaddr_un, sun_path) + socket_name.size() + 1;
+        return {};
+    }
+
     if (socket_name.size() > sizeof(addr.sun_path) - 2) {
         return tl::make_unexpected("UDS socket name too long: " + socket_name);
     }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
     addr.sun_path[0] = '\0';
     strncpy(addr.sun_path + 1, socket_name.c_str(), sizeof(addr.sun_path) - 2);
     addr_len = sizeof(sa_family_t) + 1 + socket_name.length();
@@ -67,6 +85,62 @@ tl::expected<void, std::string> setSendTimeout(
     return {};
 }
 
+// A filesystem socket left behind by a crashed process makes bind() fail with
+// EADDRINUSE. Remove it only when connecting is refused (nobody listening), so
+// a live server, a socket we cannot probe, or an unrelated file is never
+// clobbered.
+tl::expected<void, std::string> removeStaleSocketFile(
+    const std::string &socket_path) {
+    struct stat st;
+    if (lstat(socket_path.c_str(), &st) < 0) {
+        if (errno == ENOENT) return {};
+        return tl::make_unexpected(errnoMessage(
+            "Failed to stat UDS socket path '" + socket_path + "'"));
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+        return tl::make_unexpected("UDS socket path '" + socket_path +
+                                   "' exists and is not a socket");
+    }
+
+    sockaddr_un addr;
+    socklen_t addr_len = 0;
+    auto addr_result = makeSocketAddress(socket_path, addr, addr_len);
+    if (!addr_result) return addr_result;
+
+    int probe_fd = createCloexecUdsSocket();
+    if (probe_fd < 0) {
+        return tl::make_unexpected(errnoMessage("Failed to create UDS socket"));
+    }
+    // Bound the probe in case a live owner's backlog is full.
+    auto timeout_result = setSendTimeout(probe_fd, std::chrono::seconds(1));
+    if (!timeout_result) {
+        ::close(probe_fd);
+        return tl::make_unexpected(timeout_result.error());
+    }
+    int connect_result =
+        ::connect(probe_fd, reinterpret_cast<sockaddr *>(&addr), addr_len);
+    int connect_errno = errno;
+    ::close(probe_fd);
+    if (connect_result == 0) {
+        return tl::make_unexpected("UDS socket path '" + socket_path +
+                                   "' is already in use by another process");
+    }
+    // The file disappeared after lstat(); nothing left to clean up.
+    if (connect_errno == ENOENT) return {};
+    if (connect_errno != ECONNREFUSED) {
+        errno = connect_errno;
+        return tl::make_unexpected(errnoMessage(
+            "Failed to probe existing UDS socket '" + socket_path + "'"));
+    }
+
+    if (unlink(socket_path.c_str()) < 0 && errno != ENOENT) {
+        return tl::make_unexpected(errnoMessage(
+            "Failed to remove stale UDS socket '" + socket_path + "'"));
+    }
+    LOG(INFO) << "Removed stale UDS socket file: " << socket_path;
+    return {};
+}
+
 tl::expected<int, std::string> createConnectedSocket(
     const std::string &socket_name, std::chrono::milliseconds connect_timeout) {
     if (connect_timeout.count() <= 0) {
@@ -80,7 +154,7 @@ tl::expected<int, std::string> createConnectedSocket(
 
     sockaddr_un addr;
     socklen_t addr_len = 0;
-    auto addr_result = makeAbstractAddress(socket_name, addr, addr_len);
+    auto addr_result = makeSocketAddress(socket_name, addr, addr_len);
     if (!addr_result) {
         close(sock_fd);
         return tl::make_unexpected(addr_result.error());
@@ -113,6 +187,14 @@ tl::expected<int, std::string> createConnectedSocket(
 }
 
 }  // namespace
+
+std::string resolveClientIpcSocketName(const std::string &configured,
+                                       int port) {
+    if (!configured.empty()) return configured;
+    const char *from_env = std::getenv(kIpcSocketPathEnv);
+    if (from_env != nullptr && from_env[0] != '\0') return from_env;
+    return "@mooncake_client_" + std::to_string(port) + ".sock";
+}
 
 UdsConnection::UdsConnection(int fd) : fd_(fd) {}
 
@@ -284,11 +366,21 @@ tl::expected<void, std::string> UdsAcceptor::start() {
 
     sockaddr_un addr;
     socklen_t addr_len = 0;
-    auto addr_result = makeAbstractAddress(socket_name_, addr, addr_len);
+    auto addr_result = makeSocketAddress(socket_name_, addr, addr_len);
     if (!addr_result) {
         ::close(listen_fd_);
         listen_fd_ = -1;
         return tl::make_unexpected(addr_result.error());
+    }
+
+    const bool is_filesystem = isFilesystemSocketName(socket_name_);
+    if (is_filesystem) {
+        auto cleanup_result = removeStaleSocketFile(socket_name_);
+        if (!cleanup_result) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            return tl::make_unexpected(cleanup_result.error());
+        }
     }
 
     if (bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), addr_len) < 0) {
@@ -299,11 +391,26 @@ tl::expected<void, std::string> UdsAcceptor::start() {
         return tl::make_unexpected(error);
     }
 
+    if (is_filesystem) {
+        bound_socket_path_ = socket_name_;
+        // Peers may run under a different uid (e.g. another pod). Access is
+        // meant to be controlled by the permissions of the parent directory.
+        if (chmod(socket_name_.c_str(), 0666) < 0) {
+            auto error = errnoMessage("Failed to chmod UDS socket '" +
+                                      socket_name_ + "'");
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            unlinkBoundPath();
+            return tl::make_unexpected(error);
+        }
+    }
+
     if (listen(listen_fd_, 5) < 0) {
         auto error = errnoMessage("Failed to listen on UDS socket '" +
                                   socket_name_ + "'");
         ::close(listen_fd_);
         listen_fd_ = -1;
+        unlinkBoundPath();
         return tl::make_unexpected(error);
     }
 
@@ -314,6 +421,10 @@ tl::expected<void, std::string> UdsAcceptor::start() {
 
 void UdsAcceptor::stop() {
     if (!running_.exchange(false)) return;
+    // Remove the path while still listening: once the listener closes, a
+    // successor could treat the file as stale and rebind it, and unlinking
+    // afterwards would delete the successor's socket.
+    unlinkBoundPath();
     wakeAccept();
     int active_client_fd = active_client_fd_.load();
     if (active_client_fd >= 0) {
@@ -352,6 +463,15 @@ void UdsAcceptor::wakeAccept() {
     if (listen_fd_ >= 0) {
         ::shutdown(listen_fd_, SHUT_RDWR);
     }
+}
+
+void UdsAcceptor::unlinkBoundPath() {
+    if (bound_socket_path_.empty()) return;
+    if (unlink(bound_socket_path_.c_str()) < 0 && errno != ENOENT) {
+        LOG(WARNING) << "Failed to remove UDS socket file "
+                     << bound_socket_path_ << ": " << strerror(errno);
+    }
+    bound_socket_path_.clear();
 }
 
 }  // namespace mooncake
