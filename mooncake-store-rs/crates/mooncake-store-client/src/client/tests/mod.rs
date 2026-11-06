@@ -15733,6 +15733,59 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
 }
 
 #[test]
+fn partial_replica_reservation_is_released_when_required_segment_lookup_fails() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("partial-reserve-storage-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("partial-reserve-writer-segment"));
+    let storage = StoreClientBuilder::new(metadata.clone(), "partial-reserve-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(storage_transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let writer = StoreClientBuilder::new(metadata, "partial-reserve-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&storage, &writer]);
+
+    let segment = storage
+        .segment_name()
+        .expect("storage segment should exist");
+    let policy = writer
+        .resolve_replication_policy(Some(
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .preferred_segments([segment.0.as_str(), "missing-required-segment"]),
+        ))
+        .expect("replication policy should resolve");
+    let result =
+        writer.reserve_replica_targets(&ObjectRef::new("partial-reserve-key"), 16, &policy);
+
+    assert!(matches!(result, Err(StoreError::NotFound(_))));
+    assert_eq!(
+        storage.allocator.lock().usage_bytes().0,
+        0,
+        "a later required-segment lookup failure must roll back earlier reservations"
+    );
+}
+
+#[test]
 fn bounded_parallel_jobs_parallelize_and_preserve_order() {
     let inflight = Arc::new(AtomicUsize::new(0));
     let max_inflight = Arc::new(AtomicUsize::new(0));
