@@ -67,6 +67,18 @@ static int GetNofInflightBytesLimit() {
     return value;
 }
 
+// SPDK reports "no request slot right now" as a submit failure rather than as
+// an I/O error: spdk_nvme_ns_cmd_read/write return -ENOMEM ("The request
+// cannot be allocated", spdk/nvme.h), and nvme_rdma_qpair_submit_request
+// returns -EAGAIN when the qpair's free request list is empty, with the
+// explicit note "Inform the upper layer to try again later". The transfer is
+// still valid, so these are backpressure to wait out, not reasons to abort a
+// whole page. Everything else -- -EINVAL (malformed) or -ENXIO (qpair failed
+// at the transport level) -- is permanent.
+static inline bool IsNofSubmitBackpressure(int ret) {
+    return ret == -ENOMEM || ret == -EAGAIN;
+}
+
 static int CountNofQueuedTasks(const mooncake::NofTask* head) {
     int count = 0;
     const mooncake::NofTask* cursor = head;
@@ -559,7 +571,13 @@ void NofWorkerPool::workerThread(int work_idx) {
             for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[i];
-                while (nof_qos->head[i] && avail_blocks > 0) {
+                // Set when SubmitIO refused a chunk because the qpair has no
+                // free request slot. The head task keeps its remaining bytes
+                // and stays queued; we stop submitting for this op so the
+                // worker drains completions below and retries on the next
+                // pass instead of aborting the transfer.
+                bool backpressure = false;
+                while (!backpressure && nof_qos->head[i] && avail_blocks > 0) {
                     NofTask* task = nof_qos->head[i];
                     NofSubTask* sub_task;
                     while (task->remaining_bytes > 0 && avail_blocks > 0) {
@@ -592,6 +610,28 @@ void NofWorkerPool::workerThread(int work_idx) {
                             task->seg_handle, submit_ptr, submit_off,
                             submit_bytes, task->op, &sub_task->adaptor);
                         if (ret != 0) {
+                            // Return the pool slot: a sub-task taken out
+                            // and then failing to submit must be returned,
+                            // or repeated failures would exhaust the 4096
+                            // slots and allocate new chunks unboundedly.
+                            sub_task->sub_task_pool->push(sub_task);
+                            // Retrying can only help while some I/O is still in
+                            // flight to hand request slots back. With nothing
+                            // outstanding the pool cannot drain, so a retry
+                            // would spin here forever without progress --
+                            // report that as a real failure instead.
+                            if (IsNofSubmitBackpressure(ret) &&
+                                total_outstanding_io->load(
+                                    std::memory_order_acquire) > 0) {
+                                VLOG(2) << "work " << work_idx << ", seg "
+                                        << task->seg_handle
+                                        << " submit backpressure ret=" << ret
+                                        << " outstanding="
+                                        << total_outstanding_io->load(
+                                               std::memory_order_acquire);
+                                backpressure = true;
+                                break;
+                            }
 #ifdef USE_NOF
                             if (task->metric) {
                                 if (task->op == NofIOOp::kWrite) {
@@ -602,12 +642,8 @@ void NofWorkerPool::workerThread(int work_idx) {
                             }
 #endif
                             LOG(ERROR) << "work " << work_idx << ", seg "
-                                       << task->seg_handle << " submit io fail";
-                            // Return the pool slot: a sub-task taken out
-                            // and then failing to submit must be returned,
-                            // or repeated failures would exhaust the 4096
-                            // slots and allocate new chunks unboundedly.
-                            sub_task->sub_task_pool->push(sub_task);
+                                       << task->seg_handle
+                                       << " submit io fail ret=" << ret;
                             task->failed = true;
                             task->remaining_bytes = 0;
                         } else {
