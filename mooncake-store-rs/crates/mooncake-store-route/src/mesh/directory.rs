@@ -534,7 +534,7 @@ impl EmbeddedWrhRouteDirectory {
             match self.contains_authority_batch(&authority, &batch_keys) {
                 Ok(results) => {
                     for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
-                        match result.map(|record| route_from_authority_record(&key, record)) {
+                        match result {
                             Ok(true) => {
                                 trace!(
                                     namespace = %self.namespace,
@@ -1400,6 +1400,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     continue;
                 }
             };
+            let response = route_from_authority_record(key, response);
             let references_replica = response.as_ref().is_some_and(|route| {
                 route.replicas.iter().any(|candidate| {
                     candidate.owner == replica.owner
