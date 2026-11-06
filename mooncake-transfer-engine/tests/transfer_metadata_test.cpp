@@ -1314,6 +1314,7 @@ class TestableTransferMetadata : public TransferMetadata {
 class RpcOwnershipStoragePlugin : public FakeMetadataStoragePlugin {
    public:
     bool reject = true;
+    bool reject_remove = false;
     int puts = 0, deletes = 0;
     bool set(const std::string &key, const Json::Value &value) override {
         ++puts;
@@ -1321,7 +1322,7 @@ class RpcOwnershipStoragePlugin : public FakeMetadataStoragePlugin {
     }
     bool remove(const std::string &key) override {
         ++deletes;
-        return FakeMetadataStoragePlugin::remove(key);
+        return !reject_remove && FakeMetadataStoragePlugin::remove(key);
     }
 };
 
@@ -1470,6 +1471,31 @@ TEST_F(TransferMetadataRpcOwnershipTest,
     EXPECT_EQ(metadata.addRpcMetaEntry("127.0.0.1", desc), ERR_METADATA);
     EXPECT_EQ(metadata.removeRpcMetaEntry("127.0.0.1"), 0);
     EXPECT_EQ(storage->deletes, 1);
+
+    // One metadata instance may acknowledge more than one RPC key. Removing
+    // an earlier key must not lose eligibility for the current publication.
+    storage->reject = false;
+    ASSERT_EQ(metadata.addRpcMetaEntry("first", desc), 0);
+    ASSERT_EQ(metadata.addRpcMetaEntry("second", desc), 0);
+    storage->reject = true;
+    EXPECT_EQ(metadata.addRpcMetaEntry("unpublished", desc), ERR_METADATA);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("unpublished"), 0);
+    EXPECT_EQ(storage->deletes, 1);
+    EXPECT_EQ(metadata.rePublishRpcMetaEntry("first"), ERR_METADATA);
+    storage->reject_remove = true;
+    EXPECT_EQ(metadata.removeRpcMetaEntry("first"), ERR_METADATA);
+    storage->reject_remove = false;
+    EXPECT_EQ(metadata.removeRpcMetaEntry("first"), 0);
+    EXPECT_FALSE(storage->get("mooncake/rpc_meta/first", value));
+    EXPECT_TRUE(storage->get("mooncake/rpc_meta/second", value));
+    storage->drop("mooncake/rpc_meta/second");
+    storage->reject = false;
+    EXPECT_EQ(metadata.rePublishRpcMetaEntry("second"), 0);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("second"), 0);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("first"), 0);
+    EXPECT_EQ(metadata.removeRpcMetaEntry("second"), 0);
+    EXPECT_EQ(metadata.rePublishRpcMetaEntry("second"), ERR_METADATA);
+    EXPECT_EQ(storage->deletes, 4);
 }
 
 TEST_F(TransferMetadataRpcOwnershipTest, FailedHandshakeConsumesFdOnce) {

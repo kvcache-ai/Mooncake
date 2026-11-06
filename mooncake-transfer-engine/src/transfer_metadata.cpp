@@ -1942,6 +1942,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
         return ERR_METADATA;
     }
     published_rpc_meta_key_ = key;
+    published_rpc_meta_keys_.insert(key);
     if (local_rpc_meta_.sockfd >= 0 && local_rpc_meta_.sockfd != desc.sockfd) {
         close(std::exchange(local_rpc_meta_.sockfd, -1));
     }
@@ -1952,14 +1953,15 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
 
 int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
     const std::string key = rpc_meta_prefix_ + server_name;
-    if (p2p_handshake_mode_ || published_rpc_meta_key_ != key) {
+    if (p2p_handshake_mode_ || !published_rpc_meta_keys_.count(key)) {
         return 0;
     }
     if (!storage_plugin_->remove(key)) {
         LOG(ERROR) << "Failed to remove location of " << server_name;
         return ERR_METADATA;
     }
-    published_rpc_meta_key_.clear();
+    published_rpc_meta_keys_.erase(key);
+    if (published_rpc_meta_key_ == key) published_rpc_meta_key_.clear();
     return 0;
 }
 

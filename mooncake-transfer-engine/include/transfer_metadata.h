@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "buffer_range_index.h"
 #include "common.h"
@@ -380,6 +381,8 @@ class TransferMetadata {
     // Nonempty only for an acknowledged publication not yet removed.
     // This is local cleanup eligibility, not a fence against another writer.
     std::string published_rpc_meta_key_;
+    // Keep cleanup eligibility for earlier acknowledged keys as well.
+    std::unordered_set<std::string> published_rpc_meta_keys_;
 
     std::atomic<SegmentID> next_segment_id_;
 
