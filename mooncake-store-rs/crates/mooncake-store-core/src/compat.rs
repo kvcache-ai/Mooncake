@@ -2,6 +2,9 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+pub const ROUTE_OWNER_LIST_PAGINATION_CAPABILITY: &str = "route-owner-list-pagination-v1";
+pub const ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY: &str = "route-owner-list-pagination-snapshot-v1";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompatibilityDescriptor {
     pub store_api_version: u32,
@@ -20,6 +23,8 @@ impl CompatibilityDescriptor {
             "hot-standby".to_string(),
             "hot-upgrade".to_string(),
             "masterless-routing".to_string(),
+            ROUTE_OWNER_LIST_PAGINATION_CAPABILITY.to_string(),
+            ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY.to_string(),
         ]);
         Self {
             store_api_version: 1,
@@ -62,7 +67,10 @@ impl Default for CompatibilityDescriptor {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::CompatibilityDescriptor;
+    use super::{
+        CompatibilityDescriptor, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY,
+        ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
+    };
 
     #[test]
     fn default_descriptor_matches_mooncake_v1_contract() {
@@ -73,6 +81,8 @@ mod tests {
         assert_eq!(descriptor.metadata_schema_version, 1);
         assert_eq!(descriptor.transport_api_version, 1);
         assert!(descriptor.supports("masterless-routing"));
+        assert!(descriptor.supports(ROUTE_OWNER_LIST_PAGINATION_CAPABILITY));
+        assert!(descriptor.supports(ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY));
         assert!(!descriptor.supports("imaginary-capability"));
     }
 

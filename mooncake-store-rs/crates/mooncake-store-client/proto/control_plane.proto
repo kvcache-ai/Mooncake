@@ -355,12 +355,14 @@ message ListRoutesByReplicaOwnerRequest {
   ClientRuntimeId owner = 3;
   optional string cursor = 4;
   uint32 limit = 5;
+  optional uint64 snapshot_epoch = 6;
 }
 
 message ListRoutesByReplicaOwnerReply {
   repeated ObjectRoute routes = 1;
   ErrorDetail error = 2;
   optional string next_cursor = 3;
+  optional uint64 snapshot_epoch = 4;
 }
 
 message AllocationRouteIdentity {

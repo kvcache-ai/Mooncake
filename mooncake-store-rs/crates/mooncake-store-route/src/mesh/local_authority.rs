@@ -67,6 +67,7 @@ impl LocalRouteAuthority {
         &self,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> Result<RouteOwnerPage> {
         authority_list_routes_by_replica_owner_page(
@@ -74,6 +75,7 @@ impl LocalRouteAuthority {
             &self.authority,
             owner,
             cursor,
+            snapshot_epoch,
             limit,
         )
     }

@@ -16,7 +16,10 @@ pub use cold_tier::{
     ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierDeviceUpdate,
     ColdTierPutDeviceResult, ColdTierTarget, ColdTierTargetSpec, ColdTierUsageDelta,
 };
-pub use compat::CompatibilityDescriptor;
+pub use compat::{
+    CompatibilityDescriptor, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY,
+    ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
+};
 pub use error::{Result, StoreError};
 pub use hugepage::{parse_hugepage_size, HugePageConfig};
 pub use identity::{

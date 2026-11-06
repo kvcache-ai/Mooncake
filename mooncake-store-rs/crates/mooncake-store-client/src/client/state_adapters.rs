@@ -63,10 +63,16 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         authority: &ClientStableId,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> Result<mooncake_store_route::RouteOwnerPage> {
         crate::route_directory::authority_list_routes_by_replica_owner_page(
-            namespace, authority, owner, cursor, limit,
+            namespace,
+            authority,
+            owner,
+            cursor,
+            snapshot_epoch,
+            limit,
         )
     }
 

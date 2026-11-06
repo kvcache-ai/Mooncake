@@ -15,6 +15,8 @@ pub struct RouteOwnerPage {
     pub routes: Vec<ObjectRoute>,
     /// The final route key returned by this page. Callers resume strictly after it.
     pub next_cursor: Option<String>,
+    /// The owner-local route epoch used to validate the complete paged scan.
+    pub snapshot_epoch: Option<u64>,
 }
 
 impl RouteOwnerPage {
@@ -22,6 +24,7 @@ impl RouteOwnerPage {
         Self {
             routes: Vec::new(),
             next_cursor: None,
+            snapshot_epoch: None,
         }
     }
 }
@@ -66,6 +69,7 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         authority: &ClientStableId,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> Result<RouteOwnerPage>;
 
@@ -103,11 +107,17 @@ pub trait RouteAuthorityService: Send + Sync {
         authority: &ClientStableId,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> Result<RouteOwnerPage> {
-        // Legacy service implementations remain source-compatible. Bounded callers fail closed
-        // until the service supplies an indexed pagination implementation.
-        let _ = (namespace, authority, owner, cursor, limit);
+        let _ = (
+            namespace,
+            authority,
+            owner,
+            cursor,
+            snapshot_epoch,
+            limit,
+        );
         Err(StoreError::Unsupported(
             "route authority does not implement bounded owner-route pagination".to_string(),
         ))

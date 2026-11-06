@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
+use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -36,11 +37,13 @@ use tonic::{Request, Response, Status};
 #[derive(Default)]
 struct TestAuthority {
     routes: Mutex<BTreeMap<String, ObjectRoute>>,
+    route_epoch: AtomicU64,
 }
 
 impl TestAuthority {
     fn insert(&self, route: ObjectRoute) {
         self.routes.lock().insert(route.key.0.clone(), route);
+        self.route_epoch.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -75,27 +78,42 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
         _authority: &ClientStableId,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> mooncake_store_core::Result<mooncake_store_route::RouteOwnerPage> {
-        let routes = self.routes.lock();
-        let mut matching = routes
-            .iter()
-            .filter(|(key, route)| {
-                cursor.map_or(true, |cursor| key.as_str() > cursor)
-                    && route.replicas.iter().any(|replica| &replica.owner == owner)
+        let route_table = self.routes.lock();
+        let current_epoch = self.route_epoch.load(Ordering::SeqCst);
+        if let Some(snapshot_epoch) = snapshot_epoch.filter(|epoch| *epoch != current_epoch) {
+            return Err(StoreError::StaleEpoch(format!(
+                "test authority snapshot changed: expected epoch {snapshot_epoch}, current epoch {current_epoch}"
+            )));
+        }
+        let limit = limit.max(1);
+        let start = cursor.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut routes = Vec::with_capacity(limit);
+        for route in route_table
+            .range::<str, _>((start, Bound::Unbounded))
+            .filter_map(|(_, route)| {
+                route
+                    .replicas
+                    .iter()
+                    .any(|replica| &replica.owner == owner)
+                    .then(|| route.clone())
             })
-            .map(|(_, route)| route.clone())
-            .take(limit.max(1).saturating_add(1))
-            .collect::<Vec<_>>();
-        let next_cursor = if matching.len() > limit.max(1) {
-            matching.pop();
-            matching.last().map(|route| route.key.0.clone())
-        } else {
-            None
-        };
+        {
+            if routes.len() == limit {
+                return Ok(mooncake_store_route::RouteOwnerPage {
+                    next_cursor: routes.last().map(|route: &ObjectRoute| route.key.0.clone()),
+                    routes,
+                    snapshot_epoch: Some(current_epoch),
+                });
+            }
+            routes.push(route);
+        }
         Ok(mooncake_store_route::RouteOwnerPage {
-            routes: matching,
-            next_cursor,
+            routes,
+            next_cursor: None,
+            snapshot_epoch: Some(current_epoch),
         })
     }
 
@@ -120,6 +138,7 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
                     routes.remove(&key.0);
                 }
             }
+            self.route_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(CasResult {
             applied,
@@ -144,6 +163,7 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
                 routes.remove(&key.0);
             }
         }
+        self.route_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -1450,6 +1470,125 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
 }
 
 #[test]
+fn control_plane_owner_route_pages_bound_large_control_replies() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    // 256 routes must exceed the server's 1 MiB response budget so this
+    // exercises byte-bounded pagination rather than only the 256-route cap.
+    let padding = "x".repeat(8 * 1024);
+    for index in 0..2048 {
+        let key = format!("route-{index:04}-{padding}");
+        authority.insert(sample_route(&key, 1, &owner));
+    }
+
+    let mut handle = ControlPlaneHandle::spawn("127.0.0.1", authority, allocator, eviction)
+        .expect("control plane server should start");
+    let lease = sample_lease(handle.address());
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+    let authority_id = ClientStableId::new("authority");
+    let mut cursor = None;
+    let mut snapshot_epoch = None;
+    let mut keys = Vec::new();
+    let mut page_count = 0usize;
+
+    loop {
+        let page = client
+            .list_routes_by_replica_owner_page(
+                &lease,
+                "ns-a",
+                &authority_id,
+                &owner,
+                cursor.as_deref(),
+                snapshot_epoch,
+                4096,
+            )
+            .expect("paged owner listing should succeed");
+        assert!(
+            page.routes.len() <= 256,
+            "server must clamp a caller page size to the bounded reply limit"
+        );
+        if page.next_cursor.is_some() {
+            assert!(
+                page.routes.len() < 256,
+                "the byte budget must split a non-terminal oversized owner page"
+            );
+        }
+        assert!(
+            page.routes
+                .windows(2)
+                .all(|routes| routes[0].key.0 < routes[1].key.0),
+            "routes within a page must be ordered by cursor key"
+        );
+        keys.extend(page.routes.into_iter().map(|route| route.key.0));
+        page_count = page_count.saturating_add(1);
+        snapshot_epoch = page.snapshot_epoch;
+        assert!(
+            snapshot_epoch.is_some(),
+            "every owner-route page must carry a snapshot epoch"
+        );
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        assert_ne!(cursor.as_deref(), Some(next_cursor.as_str()));
+        cursor = Some(next_cursor);
+    }
+
+    assert!(page_count > 1, "large listings must require multiple pages");
+    assert_eq!(keys.len(), 2048);
+    assert!(keys.windows(2).all(|keys| keys[0] < keys[1]));
+    assert!(keys
+        .first()
+        .is_some_and(|key| key.starts_with("route-0000-")));
+    assert!(client.active_stream_sessions() >= 1);
+    handle.shutdown();
+}
+
+#[test]
+fn control_plane_owner_route_snapshot_rejects_mutation_between_pages() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("route-a", 1, &owner));
+    authority.insert(sample_route("route-b", 1, &owner));
+
+    let mut handle = ControlPlaneHandle::spawn("127.0.0.1", authority.clone(), allocator, eviction)
+        .expect("control plane server should start");
+    let lease = sample_lease(handle.address());
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+    let authority_id = ClientStableId::new("authority");
+
+    let first = client
+        .list_routes_by_replica_owner_page(&lease, "ns-a", &authority_id, &owner, None, None, 1)
+        .expect("first page should establish an owner-route snapshot");
+    let cursor = first
+        .next_cursor
+        .as_deref()
+        .expect("two routes should require a continuation page");
+    let snapshot_epoch = first
+        .snapshot_epoch
+        .expect("first page must carry a snapshot epoch");
+
+    authority.insert(sample_route("route-b", 2, &owner));
+
+    let error = client
+        .list_routes_by_replica_owner_page(
+            &lease,
+            "ns-a",
+            &authority_id,
+            &owner,
+            Some(cursor),
+            Some(snapshot_epoch),
+            1,
+        )
+        .expect_err("a changed owner route set must invalidate its continuation page");
+    assert!(matches!(error, StoreError::StaleEpoch(_)));
+    handle.shutdown();
+}
+
+#[test]
 fn control_plane_client_can_be_called_from_tokio_runtime_thread() {
     let authority = Arc::new(TestAuthority::default());
     let allocator = Arc::new(TestAllocator::default());
@@ -2116,6 +2255,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: Some(pb_runtime_id(&owner)),
                 cursor: None,
                 limit: 1,
+                snapshot_epoch: None,
             }))
             .await
             .expect("first owner route page should reply")
@@ -2131,6 +2271,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: Some(pb_runtime_id(&owner)),
                 cursor: first_page.next_cursor,
                 limit: 1,
+                snapshot_epoch: None,
             }))
             .await
             .expect("second owner route page should reply")
@@ -2146,6 +2287,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: None,
                 cursor: None,
                 limit: 0,
+                snapshot_epoch: None,
             }))
             .await
             .expect_err("missing owner should be rejected");
@@ -2415,6 +2557,7 @@ fn owner_route_rpc_defaults_and_clamps_page_limit() {
                     owner: Some(pb_runtime_id(&owner)),
                     cursor: None,
                     limit,
+                snapshot_epoch: None,
                 }))
                 .await
                 .expect("bounded owner route request should reply")

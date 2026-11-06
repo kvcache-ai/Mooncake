@@ -8,7 +8,7 @@ use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
     ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute,
     ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory, RouteReplicaReference,
-    RouteVersion, StoreError,
+    RouteVersion, StoreError, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 use tracing::{debug, trace, warn};
 
@@ -86,6 +86,7 @@ struct OwnerRoutePageScan {
     authority: ClientLease,
     routes: VecDeque<ObjectRoute>,
     next_cursor: Option<String>,
+    snapshot_epoch: Option<u64>,
     seen_cursors: HashSet<String>,
 }
 
@@ -422,6 +423,8 @@ impl EmbeddedWrhRouteDirectory {
         authority: &ClientLease,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
+        require_snapshot: bool,
     ) -> Result<crate::RouteOwnerPage> {
         if self.authority_is_local(authority) {
             if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
@@ -430,6 +433,7 @@ impl EmbeddedWrhRouteDirectory {
                     &authority.runtime.stable_id,
                     owner,
                     cursor,
+                    snapshot_epoch,
                     DEFAULT_ROUTE_OWNER_PAGE_SIZE,
                 );
             }
@@ -438,8 +442,20 @@ impl EmbeddedWrhRouteDirectory {
                 &authority.runtime.stable_id,
                 owner,
                 cursor,
+                snapshot_epoch,
                 DEFAULT_ROUTE_OWNER_PAGE_SIZE,
             );
+        }
+        let capability = if require_snapshot {
+            ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY
+        } else {
+            ROUTE_OWNER_LIST_PAGINATION_CAPABILITY
+        };
+        if !authority.compatibility.supports(capability) {
+            return Err(StoreError::Unsupported(format!(
+                "route authority {} does not support required owner-route pagination capability {capability}",
+                authority.runtime
+            )));
         }
         self.authority_client.list_routes_by_replica_owner_page(
             authority,
@@ -447,6 +463,7 @@ impl EmbeddedWrhRouteDirectory {
             &authority.runtime.stable_id,
             owner,
             cursor,
+            snapshot_epoch,
             DEFAULT_ROUTE_OWNER_PAGE_SIZE,
         )
     }
@@ -456,29 +473,71 @@ impl EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+        require_snapshot: bool,
     ) -> Result<()> {
         let mut scans = Vec::new();
-        for authority in self.authority_candidates(observer)? {
-            match self.list_routes_by_replica_owner_page_from_authority(&authority, owner, None) {
+        let authorities = self.authority_candidates(observer)?;
+        if authorities.is_empty() {
+            return Err(StoreError::InvalidState(format!(
+                "owner-route scan for {owner} has no route authorities"
+            )));
+        }
+        let mut last_error = None;
+        for authority in authorities {
+            match self.list_routes_by_replica_owner_page_from_authority(
+                &authority,
+                owner,
+                None,
+                None,
+                require_snapshot,
+            ) {
                 Ok(page) => {
                     let mut seen_cursors = HashSet::new();
                     validate_owner_route_page(None, &page, &mut seen_cursors)?;
+                    if require_snapshot && page.snapshot_epoch.is_none() {
+                        return Err(StoreError::Unsupported(format!(
+                            "route authority {} returned owner-route pages without a snapshot epoch",
+                            authority.runtime
+                        )));
+                    }
                     scans.push(OwnerRoutePageScan {
                         authority,
                         routes: VecDeque::from(page.routes),
                         next_cursor: page.next_cursor,
+                        snapshot_epoch: page.snapshot_epoch,
                         seen_cursors,
                     });
                 }
                 Err(error) => {
-                    self.maybe_mark_authority_suspect(
-                        &authority,
-                        &error,
-                        "route_list_by_replica_owner_failed",
+                    if !matches!(
+                        error,
+                        StoreError::Unsupported(_) | StoreError::StaleEpoch(_)
+                    ) {
+                        self.maybe_mark_authority_suspect(
+                            &authority,
+                            &error,
+                            "route_list_by_replica_owner_failed",
+                        );
+                    }
+                    warn!(
+                        authority = %authority.runtime,
+                        owner = %owner,
+                        error = %error,
+                        "route-owner scan is incomplete after authority page-list failure"
                     );
-                    return Err(error);
+                    if require_snapshot {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
                 }
             }
+        }
+        if scans.is_empty() {
+            return Err(last_error.unwrap_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "owner-route scan for {owner} has no reachable route authorities"
+                ))
+            }));
         }
 
         loop {
@@ -490,14 +549,67 @@ impl EmbeddedWrhRouteDirectory {
                     .next_cursor
                     .take()
                     .expect("checked that the owner route page cursor exists");
-                let page = self.list_routes_by_replica_owner_page_from_authority(
-                    &scan.authority,
+                let authority = scan.authority.clone();
+                let expected_epoch = require_snapshot.then(|| {
+                    scan.snapshot_epoch
+                        .expect("strict owner-route scan must establish a snapshot epoch")
+                });
+                match self.list_routes_by_replica_owner_page_from_authority(
+                    &authority,
                     owner,
                     Some(&cursor),
-                )?;
-                validate_owner_route_page(Some(&cursor), &page, &mut scan.seen_cursors)?;
-                scan.routes = VecDeque::from(page.routes);
-                scan.next_cursor = page.next_cursor;
+                    expected_epoch,
+                    require_snapshot,
+                ) {
+                    Ok(page) => {
+                        if require_snapshot && page.snapshot_epoch != expected_epoch {
+                            return Err(StoreError::StaleEpoch(format!(
+                                "route authority {} changed owner-route snapshot while scanning {owner}",
+                                authority.runtime
+                            )));
+                        }
+                        if page.routes.is_empty() && page.next_cursor.is_some() {
+                            let error = StoreError::Transport(format!(
+                                "route owner page returned an empty non-terminal page for authority {}",
+                                authority.runtime
+                            ));
+                            self.maybe_mark_authority_suspect(
+                                &authority,
+                                &error,
+                                "route_list_by_replica_owner_page_invalid",
+                            );
+                            warn!(
+                                authority = %authority.runtime,
+                                owner = %owner,
+                                error = %error,
+                                "route-owner page listing stopped after invalid page"
+                            );
+                            return Err(error);
+                        }
+                        validate_owner_route_page(Some(&cursor), &page, &mut scan.seen_cursors)?;
+                        scan.routes = VecDeque::from(page.routes);
+                        scan.next_cursor = page.next_cursor;
+                    }
+                    Err(error) => {
+                        if !matches!(
+                            error,
+                            StoreError::Unsupported(_) | StoreError::StaleEpoch(_)
+                        ) {
+                            self.maybe_mark_authority_suspect(
+                                &authority,
+                                &error,
+                                "route_list_by_replica_owner_page_failed",
+                            );
+                        }
+                        warn!(
+                            authority = %authority.runtime,
+                            owner = %owner,
+                            error = %error,
+                            "route-owner scan is incomplete after continuation page failure"
+                        );
+                        return Err(error);
+                    }
+                }
             }
 
             let Some(next_key) = scans
@@ -506,6 +618,9 @@ impl EmbeddedWrhRouteDirectory {
                 .min()
                 .map(ToOwned::to_owned)
             else {
+                if require_snapshot {
+                    self.validate_owner_route_scan_snapshot(observer, owner, &scans)?;
+                }
                 return Ok(());
             };
             let mut merged = BTreeMap::new();
@@ -526,6 +641,56 @@ impl EmbeddedWrhRouteDirectory {
                     .expect("a route matched the selected page key"),
             )?;
         }
+    }
+
+    fn validate_owner_route_scan_snapshot(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        scans: &[OwnerRoutePageScan],
+    ) -> Result<()> {
+        // Re-read one bounded page per authority. This catches a mutation after a
+        // terminal first/last page, where no continuation request would exist to
+        // validate the epoch.
+        for scan in scans {
+            let snapshot_epoch = scan
+                .snapshot_epoch
+                .expect("strict owner-route scan must establish a snapshot epoch");
+            let page = self.list_routes_by_replica_owner_page_from_authority(
+                &scan.authority,
+                owner,
+                None,
+                Some(snapshot_epoch),
+                true,
+            )?;
+            if page.snapshot_epoch != Some(snapshot_epoch) {
+                return Err(StoreError::StaleEpoch(format!(
+                    "route authority {} changed owner-route snapshot while validating {owner}",
+                    scan.authority.runtime
+                )));
+            }
+        }
+
+        let initial_authorities = scans
+            .iter()
+            .map(|scan| {
+                (
+                    scan.authority.runtime.stable_id.clone(),
+                    scan.authority.runtime.epoch,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let refreshed_authorities = self
+            .authority_candidates_force_refresh(observer)?
+            .into_iter()
+            .map(|authority| (authority.runtime.stable_id, authority.runtime.epoch))
+            .collect::<BTreeSet<_>>();
+        if initial_authorities != refreshed_authorities {
+            return Err(StoreError::StaleEpoch(format!(
+                "route authority membership changed while scanning owner routes for {owner}"
+            )));
+        }
+        Ok(())
     }
 
     fn list_routes_in_scope_from_authority(
@@ -1423,7 +1588,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             }
             routes.push(route);
             Ok(())
-        })?;
+        }, false)?;
         Ok(routes)
     }
 
@@ -1433,7 +1598,16 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         owner: &ClientRuntimeId,
         visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
     ) -> Result<()> {
-        self.visit_routes_by_replica_owner_pages(observer, owner, visitor)
+        self.visit_routes_by_replica_owner_pages(observer, owner, visitor, false)
+    }
+
+    fn visit_routes_by_replica_owner_consistent(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_routes_by_replica_owner_pages(observer, owner, visitor, true)
     }
 
     fn list_routes_in_scope(
@@ -1816,6 +1990,7 @@ mod owner_page_contract_tests {
             validate_owner_route_page(
                 cursor,
                 &crate::RouteOwnerPage {
+                snapshot_epoch: None,
                     routes: vec![route(key)],
                     next_cursor: Some(key.to_string()),
                 },
@@ -1827,6 +2002,7 @@ mod owner_page_contract_tests {
         let error = validate_owner_route_page(
             Some("route-b"),
             &crate::RouteOwnerPage {
+                snapshot_epoch: None,
                 routes: vec![route("route-a")],
                 next_cursor: Some("route-a".to_string()),
             },
@@ -1844,6 +2020,7 @@ mod owner_page_contract_tests {
         let error = validate_owner_route_page(
             None,
             &crate::RouteOwnerPage {
+                snapshot_epoch: None,
                 routes,
                 next_cursor: None,
             },
@@ -2036,3 +2213,400 @@ mod owner_page_contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
+    use crate::RouteOwnerPage;
+    use mooncake_store_core::{
+        ClientEndpointSet, ClientEpoch, ClientLifecycleState, CompatibilityDescriptor,
+        ReplicaRoute, ReplicaTier, RouteState, SegmentName,
+    };
+
+    struct TestMembership {
+        leases: Vec<ClientLease>,
+    }
+
+    impl RouteMembershipProvider for TestMembership {
+        fn live_clients(
+            &self,
+            _force_refresh: bool,
+            _operation: &'static str,
+        ) -> Result<Vec<ClientLease>> {
+            Ok(self.leases.clone())
+        }
+
+        fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
+            false
+        }
+
+        fn mark_suspect(
+            &self,
+            _runtime: ClientRuntimeId,
+            _quarantine_until: Instant,
+            _observed: Option<&ClientLease>,
+        ) {
+        }
+    }
+
+    struct ChangingMembership {
+        initial: Vec<ClientLease>,
+        refreshed: Vec<ClientLease>,
+    }
+
+    impl RouteMembershipProvider for ChangingMembership {
+        fn live_clients(
+            &self,
+            force_refresh: bool,
+            _operation: &'static str,
+        ) -> Result<Vec<ClientLease>> {
+            Ok(if force_refresh {
+                self.refreshed.clone()
+            } else {
+                self.initial.clone()
+            })
+        }
+
+        fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
+            false
+        }
+
+        fn mark_suspect(
+            &self,
+            _runtime: ClientRuntimeId,
+            _quarantine_until: Instant,
+            _observed: Option<&ClientLease>,
+        ) {
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ContinuationPageBehavior {
+        Error,
+        InvalidEmptyPage,
+        Terminal,
+        ChangedEpochOnFinalValidation,
+    }
+
+    struct ContinuationPageClient {
+        page_calls: AtomicUsize,
+        behavior: ContinuationPageBehavior,
+        fail_initial_page_after: Option<usize>,
+    }
+
+    impl ContinuationPageClient {
+        fn new(behavior: ContinuationPageBehavior) -> Arc<Self> {
+            Arc::new(Self {
+                page_calls: AtomicUsize::new(0),
+                behavior,
+                fail_initial_page_after: None,
+            })
+        }
+
+        fn with_second_initial_page_failure(behavior: ContinuationPageBehavior) -> Arc<Self> {
+            Arc::new(Self {
+                page_calls: AtomicUsize::new(0),
+                behavior,
+                fail_initial_page_after: Some(1),
+            })
+        }
+    }
+
+    impl RouteAuthorityClient for ContinuationPageClient {
+        fn batch_get_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _keys: &[ObjectKey],
+        ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn batch_contains_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _keys: &[ObjectKey],
+        ) -> Result<Vec<Result<bool>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn batch_compare_and_swap_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _requests: &[RouteCasRequest],
+        ) -> Result<Vec<Result<CasResult>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn batch_replace_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _requests: &[RouteCasRequest],
+        ) -> Result<Vec<Result<()>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn list_routes_by_replica_owner_page(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            owner: &ClientRuntimeId,
+            cursor: Option<&str>,
+            snapshot_epoch: Option<u64>,
+            _limit: usize,
+        ) -> Result<crate::RouteOwnerPage> {
+            let call = self.page_calls.fetch_add(1, Ordering::SeqCst);
+            if cursor.is_none() && self.fail_initial_page_after == Some(call) {
+                return Err(StoreError::Transport(
+                    "injected initial page failure".to_string(),
+                ));
+            }
+            if call == 0 {
+                assert!(cursor.is_none());
+                assert!(snapshot_epoch.is_none());
+                let next_cursor = match self.behavior {
+                    ContinuationPageBehavior::Terminal
+                    | ContinuationPageBehavior::ChangedEpochOnFinalValidation => None,
+                    ContinuationPageBehavior::Error
+                    | ContinuationPageBehavior::InvalidEmptyPage => Some("route-a".to_string()),
+                };
+                return Ok(RouteOwnerPage {
+                    routes: vec![test_route("route-a", owner)],
+                    next_cursor,
+                    snapshot_epoch: Some(1),
+                });
+            }
+            if cursor.is_none() {
+                assert_eq!(snapshot_epoch, Some(1));
+                let snapshot_epoch = match self.behavior {
+                    ContinuationPageBehavior::ChangedEpochOnFinalValidation => Some(2),
+                    _ => Some(1),
+                };
+                return Ok(RouteOwnerPage {
+                    routes: vec![test_route("route-a", owner)],
+                    next_cursor: None,
+                    snapshot_epoch,
+                });
+            }
+            assert_eq!(cursor, Some("route-a"));
+            assert_eq!(snapshot_epoch, Some(1));
+            match self.behavior {
+                ContinuationPageBehavior::Error => Err(StoreError::Transport(
+                    "injected continuation page failure".to_string(),
+                )),
+                ContinuationPageBehavior::InvalidEmptyPage => Ok(RouteOwnerPage {
+                    routes: Vec::new(),
+                    next_cursor: Some("route-a".to_string()),
+                    snapshot_epoch: Some(1),
+                }),
+                ContinuationPageBehavior::Terminal => {
+                    unreachable!("terminal first page must not request a continuation")
+                }
+                ContinuationPageBehavior::ChangedEpochOnFinalValidation => Ok(RouteOwnerPage {
+                    routes: Vec::new(),
+                    next_cursor: None,
+                    snapshot_epoch: Some(1),
+                }),
+            }
+        }
+    }
+
+    fn test_lease(stable_id: &str) -> ClientLease {
+        let mut labels = BTreeMap::new();
+        labels.insert("route".to_string(), "true".to_string());
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            expires_at_ms: u64::MAX,
+            compatibility: CompatibilityDescriptor::mooncake_v1(),
+            endpoints: ClientEndpointSet {
+                labels,
+                ..ClientEndpointSet::default()
+            },
+        }
+    }
+
+    fn test_route(key: &str, owner: &ClientRuntimeId) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(key.to_string()),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::mooncake_v1(),
+            replicas: vec![ReplicaRoute {
+                owner: owner.clone(),
+                segment_name: SegmentName::new("segment-a".to_string()),
+                allocation_id: None,
+                segment_offset: 0,
+                length: 1,
+                checksum: None,
+                offset: Some(0),
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: None,
+            nof_backing: None,
+        }
+    }
+
+    #[test]
+    fn owner_route_scan_fails_when_a_continuation_page_fails() {
+        let observer = test_lease("observer");
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let authority_client = ContinuationPageClient::new(ContinuationPageBehavior::Error);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            authority_client.clone(),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority")],
+            }),
+        );
+        let mut visited = Vec::new();
+
+        let error = directory
+            .visit_routes_by_replica_owner_consistent(&observer, &owner, &mut |route| {
+                visited.push(route.key.0);
+                Ok(())
+            })
+            .expect_err("a failed continuation page must fail the owner scan");
+
+        assert!(
+            matches!(error, StoreError::Transport(message) if message == "injected continuation page failure")
+        );
+        assert_eq!(visited, vec!["route-a"]);
+        assert_eq!(authority_client.page_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn owner_route_scan_fails_when_a_continuation_page_is_invalid() {
+        let observer = test_lease("observer");
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let authority_client =
+            ContinuationPageClient::new(ContinuationPageBehavior::InvalidEmptyPage);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            authority_client.clone(),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority")],
+            }),
+        );
+
+        let error = directory
+            .visit_routes_by_replica_owner_consistent(&observer, &owner, &mut |_| Ok(()))
+            .expect_err("an empty continuation page with a cursor must fail the owner scan");
+
+        assert!(
+            matches!(error, StoreError::Transport(message) if message.contains("empty non-terminal page"))
+        );
+        assert_eq!(authority_client.page_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn owner_route_scan_fails_closed_when_an_authority_initial_page_fails() {
+        let observer = test_lease("observer");
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let authority_client = ContinuationPageClient::with_second_initial_page_failure(
+            ContinuationPageBehavior::Terminal,
+        );
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            authority_client.clone(),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+        let mut visited = Vec::new();
+
+        let error = directory
+            .visit_routes_by_replica_owner_consistent(&observer, &owner, &mut |route| {
+                visited.push(route.key.0);
+                Ok(())
+            })
+            .expect_err("a partial owner-route listing must be incomplete");
+
+        assert!(matches!(
+            error,
+            StoreError::Transport(message) if message == "injected initial page failure"
+        ));
+        assert!(
+            visited.is_empty(),
+            "an incomplete scan must not expose a partial route set to a destructive caller"
+        );
+        assert_eq!(authority_client.page_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn owner_route_scan_rejects_a_changed_final_snapshot_epoch() {
+        let observer = test_lease("observer");
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let authority_client =
+            ContinuationPageClient::new(ContinuationPageBehavior::ChangedEpochOnFinalValidation);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            authority_client.clone(),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority")],
+            }),
+        );
+
+        let error = directory
+            .visit_routes_by_replica_owner_consistent(&observer, &owner, &mut |_| Ok(()))
+            .expect_err("a changed terminal epoch must invalidate the owner scan");
+
+        assert!(matches!(error, StoreError::StaleEpoch(_)));
+        assert_eq!(authority_client.page_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn owner_route_scan_rejects_changed_authority_membership() {
+        let observer = test_lease("observer");
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let authority_client = ContinuationPageClient::new(ContinuationPageBehavior::Terminal);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            1,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            authority_client.clone(),
+            Arc::new(ChangingMembership {
+                initial: vec![test_lease("authority-a")],
+                refreshed: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        let error = directory
+            .visit_routes_by_replica_owner_consistent(&observer, &owner, &mut |_| Ok(()))
+            .expect_err("changed authority membership must invalidate the owner scan");
+
+        assert!(matches!(error, StoreError::StaleEpoch(_)));
+        assert_eq!(authority_client.page_calls.load(Ordering::SeqCst), 2);
+    }
+}
+

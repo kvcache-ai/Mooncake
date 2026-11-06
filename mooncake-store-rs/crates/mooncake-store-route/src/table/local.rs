@@ -23,6 +23,7 @@ pub(crate) struct LocalRouteTable {
     routes: HashMap<String, ObjectRoute>,
     owner_index: HashMap<ClientRuntimeId, BTreeSet<String>>,
     allocation_start_index: HashMap<AllocationRouteStart, BTreeSet<String>>,
+    owner_epochs: HashMap<ClientRuntimeId, u64>,
     scope_index: HashMap<NamespaceScope, HashSet<String>>,
     reuse_index: HashMap<ReuseIdentity, HashSet<String>>,
     version_floors: HashMap<String, RouteVersion>,
@@ -166,14 +167,29 @@ impl LocalRouteTable {
             .collect()
     }
 
-    pub(crate) fn list_by_replica_owner_page(
+    pub(crate) fn list_by_replica_owner_page(&self, owner: &ClientRuntimeId, cursor: Option<&str>, limit: usize) -> RouteOwnerPage {
+        self.list_by_replica_owner_page_at_epoch(owner, cursor, limit, None).expect("unconditional owner page must succeed")
+    }
+
+    pub(crate) fn list_by_replica_owner_page_at_epoch(
         &self,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
         limit: usize,
-    ) -> RouteOwnerPage {
+        expected_epoch: Option<u64>,
+    ) -> Result<RouteOwnerPage> {
+        let snapshot_epoch = self.owner_epochs.get(owner).copied().unwrap_or_default();
+        if let Some(expected_epoch) = expected_epoch.filter(|epoch| *epoch != snapshot_epoch) {
+            return Err(StoreError::StaleEpoch(format!(
+                "owner-route snapshot changed for {owner}: expected epoch {expected_epoch}, current epoch {snapshot_epoch}"
+            )));
+        }
         let Some(keys) = self.owner_index.get(owner) else {
-            return RouteOwnerPage::empty();
+            return Ok(RouteOwnerPage {
+                routes: Vec::new(),
+                next_cursor: None,
+                snapshot_epoch: Some(snapshot_epoch),
+            });
         };
         let start = cursor.map_or(Bound::Unbounded, Bound::Excluded);
         let limit = if limit == 0 {
@@ -181,23 +197,26 @@ impl LocalRouteTable {
         } else {
             limit.clamp(1, DEFAULT_ROUTE_OWNER_PAGE_SIZE)
         };
-        let mut routes = Vec::with_capacity(limit);
+        let mut routes: Vec<ObjectRoute> = Vec::with_capacity(limit);
         for key in keys.range::<str, _>((start, Bound::Unbounded)) {
             let Some(route) = self.routes.get(key) else {
                 continue;
             };
-            if routes.len() == limit {
-                return RouteOwnerPage {
-                    next_cursor: routes.last().map(|route: &ObjectRoute| route.key.0.clone()),
+            if routes.len() == limit.max(1) {
+                let next_cursor = routes.last().map(|route| route.key.0.clone());
+                return Ok(RouteOwnerPage {
                     routes,
-                };
+                    next_cursor,
+                    snapshot_epoch: Some(snapshot_epoch),
+                });
             }
             routes.push(route.clone());
         }
-        RouteOwnerPage {
+        Ok(RouteOwnerPage {
             routes,
             next_cursor: None,
-        }
+            snapshot_epoch: Some(snapshot_epoch),
+        })
     }
 
     pub(crate) fn list_in_scope(&self, scope: &NamespaceScope) -> Vec<ObjectRoute> {
@@ -297,6 +316,7 @@ impl LocalRouteTable {
 
     fn apply_update(&mut self, key: &ObjectKey, next: Option<&ObjectRoute>) {
         let old = self.routes.get(&key.0).cloned();
+        self.bump_owner_epochs(old.as_ref(), next);
         if let Some(route) = old.as_ref() {
             self.remove_indexes(key, route);
         }
@@ -312,6 +332,18 @@ impl LocalRouteTable {
                     self.version_floors.insert(key.0.clone(), old.version);
                 }
             }
+        }
+    }
+
+    fn bump_owner_epochs(&mut self, old: Option<&ObjectRoute>, next: Option<&ObjectRoute>) {
+        let owners = old
+            .into_iter()
+            .chain(next)
+            .flat_map(|route| route.replicas.iter().map(|replica| replica.owner.clone()))
+            .collect::<BTreeSet<_>>();
+        for owner in owners {
+            let epoch = self.owner_epochs.entry(owner).or_default();
+            *epoch = epoch.wrapping_add(1);
         }
     }
 
@@ -484,7 +516,9 @@ mod tests {
             table.replace(&key, Some(&test_route(&key, 1)));
         }
 
-        let first = table.list_by_replica_owner_page(&owner, None, 2);
+        let first = table
+            .list_by_replica_owner_page_at_epoch(&owner, None, 2, None)
+            .expect("first page should establish a snapshot epoch");
         assert_eq!(
             first
                 .routes
@@ -495,7 +529,9 @@ mod tests {
         );
         assert_eq!(first.next_cursor.as_deref(), Some("route-b"));
 
-        let second = table.list_by_replica_owner_page(&owner, first.next_cursor.as_deref(), 2);
+        let second = table
+            .list_by_replica_owner_page_at_epoch(&owner, first.next_cursor.as_deref(), 2, None)
+            .expect("second page should establish a snapshot epoch");
         assert_eq!(
             second
                 .routes
@@ -505,6 +541,37 @@ mod tests {
             vec!["route-c"]
         );
         assert_eq!(second.next_cursor, None);
+    }
+
+    #[test]
+    fn owner_route_page_snapshot_rejects_owner_mutation_between_pages() {
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut table = LocalRouteTable::default();
+        for key in ["route-a", "route-b"] {
+            let key = ObjectKey::new(key.to_string());
+            table.replace(&key, Some(&test_route(&key, 1)));
+        }
+
+        let first = table
+            .list_by_replica_owner_page_at_epoch(&owner, None, 1, None)
+            .expect("first page should establish a snapshot epoch");
+        let epoch = first
+            .snapshot_epoch
+            .expect("snapshot page must return an epoch");
+        assert_eq!(first.next_cursor.as_deref(), Some("route-a"));
+
+        let replacement_key = ObjectKey::new("route-b".to_string());
+        table.replace(&replacement_key, Some(&test_route(&replacement_key, 2)));
+
+        assert!(matches!(
+            table.list_by_replica_owner_page_at_epoch(
+                &owner,
+                first.next_cursor.as_deref(),
+                1,
+                Some(epoch),
+            ),
+            Err(StoreError::StaleEpoch(_))
+        ));
     }
 
     #[test]

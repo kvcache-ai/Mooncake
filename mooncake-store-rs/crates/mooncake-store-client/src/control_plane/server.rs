@@ -13,6 +13,120 @@ use mooncake_store_route::{
     DEFAULT_ROUTE_OWNER_PAGE_SIZE,
 };
 use std::time::{Duration, Instant};
+use mooncake_store_route::RouteOwnerPage;
+use prost::Message;
+
+const MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES: usize = 1024 * 1024;
+
+fn pb_route_owner_page(page: RouteOwnerPage) -> Result<pb::ListRoutesByReplicaOwnerReply> {
+    let RouteOwnerPage {
+        routes: page_routes,
+        next_cursor: page_next_cursor,
+        snapshot_epoch,
+    } = page;
+    let mut routes: Vec<pb::ObjectRoute> = Vec::with_capacity(page_routes.len());
+    let mut encoded_len: usize = 0;
+    let mut next_cursor = page_next_cursor;
+    let snapshot_epoch_field_len = optional_u64_field_len(snapshot_epoch);
+    for route in page_routes {
+        let route = pb_object_route(&route);
+        let route_len = route.encoded_len();
+        let route_field_len = 1 + prost_varint_len(route_len) + route_len;
+        if encoded_len
+            .saturating_add(route_field_len)
+            .saturating_add(snapshot_epoch_field_len)
+            > MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+        {
+            if routes.is_empty() {
+                return Err(StoreError::InvalidState(format!(
+                    "route {} exceeds the {} byte owner-list page limit",
+                    route.key, MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+                )));
+            }
+            next_cursor = routes.last().map(|last| last.key.clone());
+            while encoded_len
+                .saturating_add(snapshot_epoch_field_len)
+                .saturating_add(optional_string_field_len(next_cursor.as_deref()))
+                > MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            {
+                let Some(last) = routes.pop() else {
+                    return Err(StoreError::InvalidState(format!(
+                        "route {} exceeds the {} byte owner-list page limit",
+                        route.key, MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+                    )));
+                };
+                let last_len = last.encoded_len();
+                encoded_len = encoded_len.saturating_sub(1 + prost_varint_len(last_len) + last_len);
+                next_cursor = routes.last().map(|last| last.key.clone());
+                if routes.is_empty() {
+                    return Err(StoreError::InvalidState(format!(
+                        "route owner cursor exceeds the {} byte page limit",
+                        MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+                    )));
+                }
+            }
+            return Ok(pb::ListRoutesByReplicaOwnerReply {
+                routes,
+                next_cursor,
+                error: None,
+                snapshot_epoch,
+            });
+        }
+        encoded_len = encoded_len.saturating_add(route_field_len);
+        routes.push(route);
+    }
+    while encoded_len
+        .saturating_add(snapshot_epoch_field_len)
+        .saturating_add(optional_string_field_len(next_cursor.as_deref()))
+        > MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+    {
+        let Some(route) = routes.pop() else {
+            return Err(StoreError::InvalidState(format!(
+                "route owner cursor exceeds the {} byte page limit",
+                MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            )));
+        };
+        let route_len = route.encoded_len();
+        encoded_len = encoded_len.saturating_sub(1 + prost_varint_len(route_len) + route_len);
+        next_cursor = routes.last().map(|route| route.key.clone());
+        if routes.is_empty() {
+            return Err(StoreError::InvalidState(format!(
+                "route owner cursor exceeds the {} byte page limit",
+                MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            )));
+        }
+    }
+    Ok(pb::ListRoutesByReplicaOwnerReply {
+        routes,
+        next_cursor,
+        error: None,
+        snapshot_epoch,
+    })
+}
+
+fn optional_string_field_len(value: Option<&str>) -> usize {
+    value.map_or(0, |value| 1 + prost_varint_len(value.len()) + value.len())
+}
+
+fn optional_u64_field_len(value: Option<u64>) -> usize {
+    value.map_or(0, |mut value| {
+        let mut len = 1usize;
+        while value >= 0x80 {
+            value >>= 7;
+            len = len.saturating_add(1);
+        }
+        1 + len
+    })
+}
+
+fn prost_varint_len(mut value: usize) -> usize {
+    let mut len: usize = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len = len.saturating_add(1);
+    }
+    len
+}
 
 const SLOW_CONTROL_REQUEST_LOG_THRESHOLD: Duration = Duration::from_millis(1000);
 const MAX_ALLOCATION_REFERENCE_QUERY_BATCH: usize = 64;
@@ -596,6 +710,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             authority: ClientStableId::new(request.authority),
             owner,
             cursor: request.cursor,
+            snapshot_epoch: request.snapshot_epoch,
             limit: if request.limit == 0 {
                 DEFAULT_ROUTE_OWNER_PAGE_SIZE
             } else {
@@ -605,13 +720,10 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             },
         };
         let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
-            Ok(RouteControlResponse::ListByReplicaOwner(page)) => {
-                pb::ListRoutesByReplicaOwnerReply {
-                    routes: page.routes.iter().map(pb_object_route).collect(),
-                    error: None,
-                    next_cursor: page.next_cursor,
-                }
-            }
+            Ok(RouteControlResponse::ListByReplicaOwner(page)) => match pb_route_owner_page(page) {
+                Ok(reply) => reply,
+                Err(error) => pb::ListRoutesByReplicaOwnerReply { routes: Vec::new(), error: Some(pb_error(error)), next_cursor: None, snapshot_epoch: None },
+            },
             Ok(_) => pb::ListRoutesByReplicaOwnerReply {
                 routes: Vec::new(),
                 error: Some(pb_error(StoreError::Transport(
@@ -619,11 +731,13 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         .to_string(),
                 ))),
                 next_cursor: None,
+                snapshot_epoch: None,
             },
             Err(error) => pb::ListRoutesByReplicaOwnerReply {
                 routes: Vec::new(),
                 error: Some(pb_error(error)),
                 next_cursor: None,
+                snapshot_epoch: None,
             },
         };
         Ok(Response::new(reply))
@@ -1410,5 +1524,119 @@ pub(super) async fn handle_control_stream_request(
             body: None,
             error: Some(pb_error(status_to_store_error(status))),
         },
+    }
+}
+
+#[cfg(test)]
+mod owner_page_tests {
+    use super::*;
+    use mooncake_store_core::{
+        ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, ObjectKey, ObjectRoute,
+        ReplicaRoute, ReplicaTier, RouteState, RouteVersion, SegmentName,
+    };
+
+    fn route(index: usize, padding_len: usize) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(format!("route-{index:03}-{}", "x".repeat(padding_len))),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
+                segment_name: SegmentName::new("segment-a"),
+                allocation_id: None,
+                offset: Some(0),
+                segment_offset: 0,
+                length: 1,
+                checksum: None,
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: None,
+            nof_backing: None,
+        }
+    }
+
+    fn route_fields_len(routes: &[ObjectRoute]) -> usize {
+        routes.iter().fold(0usize, |encoded_len, route| {
+            let route = pb_object_route(route);
+            let route_len = route.encoded_len();
+            encoded_len.saturating_add(1 + prost_varint_len(route_len) + route_len)
+        })
+    }
+
+    fn page_with_padding(padding_len: usize) -> RouteOwnerPage {
+        let routes = (0..DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+            .map(|index| route(index, padding_len))
+            .collect::<Vec<_>>();
+        let next_cursor = routes.last().map(|route| route.key.0.clone());
+        RouteOwnerPage {
+            routes,
+            next_cursor,
+            snapshot_epoch: Some(1),
+        }
+    }
+
+    #[test]
+    fn byte_trimming_rewinds_cursor_to_last_returned_route() {
+        let mut low = 0usize;
+        let mut high = MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES / DEFAULT_ROUTE_OWNER_PAGE_SIZE;
+        while low < high {
+            let middle = low.saturating_add((high - low + 1) / 2);
+            if route_fields_len(&page_with_padding(middle).routes)
+                <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            {
+                low = middle;
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+
+        let page = page_with_padding(low);
+        let route_fields_len = route_fields_len(&page.routes);
+        let next_cursor = page
+            .next_cursor
+            .as_ref()
+            .expect("non-terminal source page must have a cursor");
+        let cursor_field_len = 1 + prost_varint_len(next_cursor.len()) + next_cursor.len();
+        assert!(route_fields_len <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES);
+        assert!(
+            route_fields_len.saturating_add(cursor_field_len) > MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+        );
+
+        let reply = pb_route_owner_page(page).expect("byte-trimmed page should encode");
+        assert!(reply.encoded_len() <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES);
+        assert_eq!(reply.routes.len(), DEFAULT_ROUTE_OWNER_PAGE_SIZE - 1);
+        assert_eq!(
+            reply.next_cursor.as_deref(),
+            reply.routes.last().map(|route| route.key.as_str())
+        );
+    }
+
+    #[test]
+    fn byte_trimming_counts_snapshot_epoch() {
+        let mut low = 0usize;
+        let mut high = MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES / DEFAULT_ROUTE_OWNER_PAGE_SIZE;
+        while low < high {
+            let middle = low.saturating_add((high - low + 1) / 2);
+            if route_fields_len(&page_with_padding(middle).routes)
+                .saturating_add(optional_u64_field_len(Some(u64::MAX)))
+                <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES
+            {
+                low = middle;
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+
+        let mut page = page_with_padding(low);
+        page.snapshot_epoch = Some(u64::MAX);
+        let reply = pb_route_owner_page(page).expect("page should trim for the snapshot epoch");
+        assert!(reply.encoded_len() <= MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES);
     }
 }

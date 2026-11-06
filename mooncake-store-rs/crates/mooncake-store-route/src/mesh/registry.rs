@@ -166,6 +166,7 @@ pub(crate) fn authority_list_routes_by_replica_owner_page(
     authority: &ClientStableId,
     owner: &ClientRuntimeId,
     cursor: Option<&str>,
+    snapshot_epoch: Option<u64>,
     limit: usize,
 ) -> Result<RouteOwnerPage> {
     let mesh = route_mesh(namespace);
@@ -176,7 +177,9 @@ pub(crate) fn authority_list_routes_by_replica_owner_page(
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
     }
-    Ok(slot.table.list_by_replica_owner_page(owner, cursor, limit))
+    Ok(slot
+        .table
+        .list_by_replica_owner_page_at_epoch(owner, cursor, limit, snapshot_epoch)?)
 }
 
 pub(crate) fn authority_list_routes(
