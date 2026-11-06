@@ -171,3 +171,18 @@ def test_remove_all_preserves_direct_negative_status(store_module, caplog) -> No
     store._native = Native()
     store._worker = None
     assert store.remove_all() == -1
+
+
+
+def test_pending_publication_env_defaults_and_explicit_precedence(store_module, monkeypatch):
+    monkeypatch.setenv("MC_STORE_RS_MAX_PENDING_PUBLICATIONS", "17")
+    monkeypatch.setenv("MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES", "4096")
+    defaults = store_module._apply_setup_env_defaults({})
+    assert defaults["max_pending_publications"] == 17
+    assert defaults["max_pending_publication_bytes"] == 4096
+    explicit = store_module._apply_setup_env_defaults({
+        "max_pending_publications": 3,
+        "max_pending_publication_bytes": 512,
+    })
+    assert explicit["max_pending_publications"] == 3
+    assert explicit["max_pending_publication_bytes"] == 512

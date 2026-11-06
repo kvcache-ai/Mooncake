@@ -1239,6 +1239,12 @@ class MooncakeDistributedStore:
             eviction_low_watermark_percent=_coerce_optional_int(
                 config.get("eviction_low_watermark_percent")
             ),
+            max_pending_publications=_coerce_optional_int(
+                config.get("max_pending_publications")
+            ),
+            max_pending_publication_bytes=_coerce_optional_int(
+                config.get("max_pending_publication_bytes")
+            ),
             route_control=str(config.get("route_control", "embedded_wrh")),
         )
         global_segment_size = _coerce_int(
@@ -1507,6 +1513,14 @@ _SETUP_ENV_DEFAULTS = {
     ),
     "eviction_low_watermark_percent": (
         "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT",
+        _coerce_optional_int,
+    ),
+    "max_pending_publications": (
+        "MC_STORE_RS_MAX_PENDING_PUBLICATIONS",
+        _coerce_optional_int,
+    ),
+    "max_pending_publication_bytes": (
+        "MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES",
         _coerce_optional_int,
     ),
     "route_control": ("MC_STORE_RS_ROUTE_CONTROL", _coerce_optional_str),

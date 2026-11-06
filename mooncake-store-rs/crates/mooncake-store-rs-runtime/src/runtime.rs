@@ -107,6 +107,7 @@ impl CompatRuntimeArgs {
             .compatibility(CompatibilityDescriptor::default())
             .tenant(plan.tenant)
             .segment_name(segment_name.clone())
+            .allocation_lifecycle(plan.allocation_lifecycle)
             .local_memory(local_memory)
             .transport(transport)
             .transport_factory(factory)
@@ -262,6 +263,8 @@ mod tests {
                 local_buffer_size: 1024,
                 eviction_high_watermark_percent: None,
                 eviction_low_watermark_percent: None,
+                max_pending_publications: None,
+                max_pending_publication_bytes: None,
                 protocol: protocol.to_string(),
                 _rdma_devices: String::new(),
                 transport_rpc_port: None,
@@ -513,6 +516,28 @@ mod tests {
             route_a.replicas[0].owner.stable_id.0,
             route_b.replicas[0].owner.stable_id.0
         );
+    }
+
+    #[test]
+    fn runtime_enforces_pending_publication_byte_limit() {
+        let _guard = env_test_lock().lock();
+        let server =
+            RedisTestServer::start().expect("redis-server is required for runtime validation");
+        let mut args = sample_args("http", server.url());
+        args.setup.transport_backend = Some("http".to_string());
+        args.setup.max_pending_publications = Some(7);
+        args.setup.max_pending_publication_bytes = Some(32);
+        let runtime = args.build().expect("http runtime should build");
+        let error = runtime
+            .client
+            .put("too-large", &[1; 64])
+            .expect_err("configured publication budget must reject oversized writes");
+        assert!(matches!(error, StoreError::Backpressure(_)), "{error:?}");
+        runtime
+            .client
+            .put("fits", &[2; 16])
+            .expect("write within publication budget should succeed");
+        assert_eq!(runtime.client.get("fits").unwrap(), vec![2; 16]);
     }
 
     #[test]

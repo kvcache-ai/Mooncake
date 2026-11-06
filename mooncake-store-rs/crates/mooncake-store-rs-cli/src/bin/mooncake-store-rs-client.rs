@@ -107,6 +107,10 @@ struct RunArgs {
     eviction_high_watermark_percent: Option<u8>,
     #[arg(long, env = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT")]
     eviction_low_watermark_percent: Option<u8>,
+    #[arg(long, env = "MC_STORE_RS_MAX_PENDING_PUBLICATIONS")]
+    max_pending_publications: Option<usize>,
+    #[arg(long, env = "MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES")]
+    max_pending_publication_bytes: Option<u64>,
     #[arg(long, default_value = "tcp", env = "MOONCAKE_PROTOCOL")]
     protocol: String,
     #[arg(long, default_value = "", env = "MC_STORE_RS_RDMA_DEVICES")]
@@ -857,6 +861,8 @@ fn build_runtime_args(
             local_buffer_size: args.scratch_bytes,
             eviction_high_watermark_percent: args.eviction_high_watermark_percent,
             eviction_low_watermark_percent: args.eviction_low_watermark_percent,
+            max_pending_publications: args.max_pending_publications,
+            max_pending_publication_bytes: args.max_pending_publication_bytes,
             protocol: args.protocol.clone(),
             _rdma_devices: args.rdma_devices.clone(),
             transport_rpc_port: args.transport_rpc_port,
@@ -1214,6 +1220,8 @@ mod tests {
             scratch_bytes: 512,
             eviction_high_watermark_percent: None,
             eviction_low_watermark_percent: None,
+            max_pending_publications: None,
+            max_pending_publication_bytes: None,
             protocol: "tcp".to_string(),
             rdma_devices: String::new(),
             transport_rpc_port: None,
@@ -1552,6 +1560,49 @@ mod tests {
                 assert_eq!(args.trace_filter.as_deref(), Some("debug"));
                 assert_eq!(args.route_control, RouteControlArg::MetadataOnly);
                 assert!(args.drain_on_exit);
+            },
+        );
+    }
+
+    #[test]
+    fn pending_publication_cli_env_precedence_and_runtime_forwarding() {
+        with_env_vars(
+            [
+                ("MC_STORE_RS_MAX_PENDING_PUBLICATIONS", Some("17")),
+                ("MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES", Some("4096")),
+            ],
+            || {
+                for explicit in [false, true] {
+                    let mut argv = vec![
+                        "mooncake-store-rs-client",
+                        "run",
+                        "--local-hostname",
+                        "127.0.0.1",
+                        "--metadata-url",
+                        "redis://127.0.0.1:6379/0",
+                    ];
+                    if explicit {
+                        argv.extend([
+                            "--max-pending-publications",
+                            "3",
+                            "--max-pending-publication-bytes",
+                            "512",
+                        ]);
+                    }
+                    let cli = parse_cli_from(argv).unwrap();
+                    let Command::Run(args) = cli.command else {
+                        panic!("expected run");
+                    };
+                    let runtime_args = build_runtime_args(&args, sample_timeouts(), None);
+                    assert_eq!(
+                        runtime_args.setup.max_pending_publications,
+                        Some(if explicit { 3 } else { 17 })
+                    );
+                    assert_eq!(
+                        runtime_args.setup.max_pending_publication_bytes,
+                        Some(if explicit { 512 } else { 4096 })
+                    );
+                }
             },
         );
     }
