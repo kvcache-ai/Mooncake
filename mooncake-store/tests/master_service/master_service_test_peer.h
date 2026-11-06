@@ -67,6 +67,12 @@ class MasterServiceTestPeer {
 
     void RunDfsEvictionForTesting();
 
+    void ConfigureKvcsCapacityForTesting(
+        std::unique_ptr<KvcsCapacityProvider> provider, bool eviction_enabled,
+        double high_watermark, double low_watermark);
+
+    void RefreshKvcsDfsUsageForTesting();
+
     // Queue one segment through the private HTTP metadata cleanup path, as the
     // client monitor does when a client times out.
     void CleanupHttpMetadataForTesting(const std::string& segment_name);
@@ -172,6 +178,17 @@ class MasterServiceTestPeer {
     }
     static const auto& EnableDfs(const MasterService& service) {
         return service.enable_dfs_;
+    }
+
+    static auto& DfsAllocator(MasterService& service) {
+        return service.dfs_allocator_;
+    }
+    static const auto& DfsAllocator(const MasterService& service) {
+        return service.dfs_allocator_;
+    }
+
+    static bool UsesKvcs(const MasterService& service) {
+        return service.use_kvcs_;
     }
 
     static auto& EnableOplog(MasterService& service) {
