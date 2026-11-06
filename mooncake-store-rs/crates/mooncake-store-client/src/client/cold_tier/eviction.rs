@@ -1,7 +1,7 @@
 use super::super::{
-    is_missing_live_allocation_error, refresh_cold_tier_device_cache, ClockEntryId,
-    DebugEvictAllResult, ObjectRoute, OperationTracker, PendingOffloadPrepareOutcome,
-    RestorePromotionQueue, Result, RouteState, SegmentName, StorageOwnerState,
+    refresh_cold_tier_device_cache, ClockEntryId, DebugEvictAllResult, ObjectRoute,
+    OperationTracker, PendingOffloadPrepareOutcome, RestorePromotionQueue, Result, RouteState,
+    SegmentName, StorageOwnerState,
 };
 use super::{
     local_hot_replica_checksum, pending_persistent_backing, read_local_hot_replica_payload,
@@ -137,7 +137,7 @@ impl StorageOwnerState {
     ) -> Result<DebugEvictOneResult> {
         let tracker = OperationTracker::new("storage_owner_debug_evict_one_force_drop");
         let result = (|| {
-            if self.reclaim_stale_local_allocations_before_clock_eviction(preferred_segment)? > 0 {
+            if self.reconcile_stale_clock_candidates(preferred_segment, false)? > 0 {
                 return Ok(DebugEvictOneResult {
                     evicted: true,
                     dropped_without_cold: false,
@@ -257,67 +257,15 @@ impl StorageOwnerState {
         route: &ObjectRoute,
         replica_index: usize,
     ) -> Result<DebugEvictOneResult> {
-        let evicted_replica = route.replicas[replica_index].clone();
         let (next, dropped_without_cold) = debug_route_after_replica_eviction(route, replica_index);
-        let cas = match next.as_ref() {
-            Some(next_route) => {
-                self.route_ops
-                    .prune_route(&route.key, Some(route.version), next_route)?
-            }
-            None => self
-                .route_ops
-                .delete_route(&route.key, Some(route.version))?,
-        };
-        if !cas.applied {
-            match cas.current.as_ref() {
-                Some(current) => self.sync_route(current),
-                None => self.hot_replicas.clock.lock().remove_id(victim),
-            }
-            return Ok(DebugEvictOneResult::default());
-        }
-
-        if dropped_without_cold {
+        let evicted = self.evict_route_replica_with_next(victim, route, replica_index, next)?;
+        if evicted && dropped_without_cold {
             self.pending_offloads
                 .discard_for_debug_evict_all(&route.key);
         }
-        self.hot_replicas.clock.lock().remove_id(victim);
-        if let Err(error) = self.allocator.lock().release(
-            &self.runtime,
-            &evicted_replica.segment_name,
-            evicted_replica.segment_offset,
-            evicted_replica.length,
-            evicted_replica.allocation_id.unwrap_or(0),
-        ) {
-            if is_missing_live_allocation_error(&error) {
-                warn!(
-                    runtime = %self.runtime,
-                    key = %route.key.0,
-                    segment = %evicted_replica.segment_name.0,
-                    offset_bytes = evicted_replica.segment_offset,
-                    length_bytes = evicted_replica.length,
-                    error = %error,
-                    "debug_dram_eviction_allocator_release_already_absent"
-                );
-            } else {
-                return Err(error);
-            }
-        }
-        if let Some(next_route) = &next {
-            self.sync_route(next_route);
-        }
-        info!(
-            runtime = %self.runtime,
-            key = %route.key.0,
-            segment = %evicted_replica.segment_name.0,
-            offset_bytes = evicted_replica.segment_offset,
-            length_bytes = evicted_replica.length,
-            dropped_without_cold,
-            route_deleted = next.is_none(),
-            "debug_dram_eviction_complete"
-        );
         Ok(DebugEvictOneResult {
-            evicted: true,
-            dropped_without_cold,
+            evicted,
+            dropped_without_cold: evicted && dropped_without_cold,
         })
     }
 

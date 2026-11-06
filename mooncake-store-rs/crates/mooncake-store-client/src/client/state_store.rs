@@ -1,7 +1,24 @@
 include!("cold_tier_restore_state.rs");
 
-const STALE_RECLAIM_SCAN_INTERVAL_MS: u64 = 100;
 const BACKGROUND_EVICTION_BATCH_SIZE: usize = 256;
+
+const PENDING_EVICTION_CONFIRMATION_BATCH: usize = 32;
+const PENDING_EVICTION_MAX_ENTRIES: usize = 1024;
+const PENDING_EVICTION_RETRY_BASE_MS: u64 = 100;
+const PENDING_EVICTION_RETRY_MAX_MS: u64 = 10_000;
+const STALE_CANDIDATE_RECONCILE_MIN_INTERVAL_MS: u64 = 100;
+
+struct StaleCandidateReconcileGuard<'a> {
+    storage_owner: &'a StorageOwnerState,
+}
+
+impl Drop for StaleCandidateReconcileGuard<'_> {
+    fn drop(&mut self) {
+        self.storage_owner
+            .stale_candidate_reconcile_in_progress
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 
 impl RouteWriteGate {
     fn lock(&self) -> RouteWritePermit<'_> {
@@ -1263,16 +1280,16 @@ impl StorageOwnerState {
         let started = Instant::now();
         let used_before = self.allocator.lock().usage_bytes().0;
         let result = (|| {
+            let mut evicted = self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)?;
             let (used_bytes, capacity_bytes) = self.allocator.lock().usage_bytes();
             if capacity_bytes == 0 {
-                return Ok(0);
+                return Ok(evicted);
             }
             let high_watermark = watermark_bytes(capacity_bytes, high_percent);
             if used_bytes < high_watermark {
-                return Ok(0);
+                return Ok(evicted);
             }
             let low_watermark = watermark_bytes(capacity_bytes, low_percent);
-            let mut evicted = 0usize;
             loop {
                 let (used_bytes, _) = self.allocator.lock().usage_bytes();
                 if used_bytes <= low_watermark {
@@ -1391,10 +1408,13 @@ impl StorageOwnerState {
                 continue;
             }
 
-            let evicted_replica = route.replicas[replica_index].clone();
             let next = cold_tier::route_after_replica_eviction(&route, replica_index, true);
-            planned_bytes = planned_bytes.saturating_add(evicted_replica.length);
-            prepared.push((victim, route, evicted_replica, next));
+            let Some(token) = self.begin_eviction(&victim, &route, replica_index, next.clone())?
+            else {
+                continue;
+            };
+            planned_bytes = planned_bytes.saturating_add(token.identity.length_bytes);
+            prepared.push((route, token, next));
             if planned_bytes >= bytes_to_reclaim {
                 break;
             }
@@ -1405,14 +1425,43 @@ impl StorageOwnerState {
 
         let requests = prepared
             .iter()
-            .map(|(_, route, _, next)| RouteCasRequest {
+            .map(|(route, _, next)| RouteCasRequest {
                 key: route.key.clone(),
                 expected: Some(route.version),
                 next: next.clone(),
             })
             .collect::<Vec<_>>();
-        let results = self.route_ops.publish_routes(&requests)?;
+        let results = match self.route_ops.publish_routes(&requests) {
+            Ok(results) => results,
+            Err(error) => {
+                for (_, token, _) in &prepared {
+                    self.defer_pending_eviction(
+                        &token.identity,
+                        PendingEvictionPhase::PendingConfirmation,
+                    );
+                    registry::record_eviction_guard_event("route_cas", "outcome_unknown");
+                    debug!(
+                        runtime = %self.runtime,
+                        key = ?token.route_key,
+                        segment = %token.identity.segment_name.0,
+                        offset_bytes = token.identity.offset_bytes,
+                        length_bytes = token.identity.length_bytes,
+                        allocation_id = token.identity.allocation_id,
+                        error = %error,
+                        "batched route eviction CAS outcome is unknown; retaining pending token"
+                    );
+                }
+                return Ok(reclaimed);
+            }
+        };
         if results.len() != prepared.len() {
+            for (_, token, _) in &prepared {
+                self.defer_pending_eviction(
+                    &token.identity,
+                    PendingEvictionPhase::PendingConfirmation,
+                );
+                registry::record_eviction_guard_event("route_cas", "outcome_unknown");
+            }
             return Err(StoreError::InvalidState(format!(
                 "background eviction route CAS returned {} results for {} requests",
                 results.len(),
@@ -1423,35 +1472,39 @@ impl StorageOwnerState {
         let mut first_error = None;
         let mut evicted_replicas = 0usize;
         let mut evicted_bytes = 0u64;
-        for ((victim, route, evicted_replica, next), result) in
-            prepared.into_iter().zip(results)
-        {
+        for ((_, token, _), result) in prepared.into_iter().zip(results) {
             match result {
                 Ok(cas) if cas.applied => {
-                    let finish = self.finish_evicted_replica(
-                        &victim,
-                        &route,
-                        &evicted_replica,
-                        next.as_ref(),
-                        true,
-                    );
-                    match finish {
-                        Ok(()) => {
+                    match self.commit_eviction(&token) {
+                        Ok(true) => {
                             reclaimed = reclaimed.saturating_add(1);
                             evicted_replicas = evicted_replicas.saturating_add(1);
-                            evicted_bytes = evicted_bytes.saturating_add(evicted_replica.length);
+                            evicted_bytes =
+                                evicted_bytes.saturating_add(token.identity.length_bytes);
                         }
+                        Ok(false) => {}
                         Err(error) => {
                             first_error.get_or_insert(error);
                         }
                     }
                 }
-                Ok(cas) => match cas.current.as_ref() {
-                    Some(current) => self.sync_route(current),
-                    None => self.hot_replicas.clock.lock().remove_id(&victim),
-                },
+                Ok(cas) => self.abort_eviction(&token, cas.current.as_ref()),
                 Err(error) => {
-                    first_error.get_or_insert(error);
+                    self.defer_pending_eviction(
+                        &token.identity,
+                        PendingEvictionPhase::PendingConfirmation,
+                    );
+                    registry::record_eviction_guard_event("route_cas", "outcome_unknown");
+                    debug!(
+                        runtime = %self.runtime,
+                        key = ?token.route_key,
+                        segment = %token.identity.segment_name.0,
+                        offset_bytes = token.identity.offset_bytes,
+                        length_bytes = token.identity.length_bytes,
+                        allocation_id = token.identity.allocation_id,
+                        error = %error,
+                        "batched route eviction CAS outcome is unknown; retaining pending token"
+                    );
                 }
             }
         }
@@ -1464,13 +1517,23 @@ impl StorageOwnerState {
         }
     }
 
-    fn evict_one(self: &Arc<Self>, preferred_segment: Option<&SegmentName>) -> Result<bool> {
+    fn evict_one_for_reservation(
+        self: &Arc<Self>,
+        preferred_segment: Option<&SegmentName>,
+    ) -> Result<bool> {
         let preferred_segment = preferred_segment.cloned();
         if tokio::runtime::Handle::try_current().is_ok() {
             let storage_owner = Arc::clone(self);
             let thread = std::thread::Builder::new()
-                .name(format!("mooncake-storage-owner-evict-{}", self.runtime.stable_id.0))
-                .spawn(move || storage_owner.evict_one_blocking(preferred_segment.as_ref()))
+                .name(format!(
+                    "mooncake-storage-owner-reserve-evict-{}",
+                    self.runtime.stable_id.0
+                ))
+                .spawn(move || {
+                    storage_owner.evict_one_for_reservation_blocking(
+                        preferred_segment.as_ref(),
+                    )
+                })
                 .map_err(|error| {
                     StoreError::Transport(format!(
                         "failed to spawn storage-owner eviction worker: {error}"
@@ -1480,7 +1543,7 @@ impl StorageOwnerState {
                 StoreError::Transport("storage-owner eviction worker panicked".to_string())
             })?;
         }
-        self.evict_one_blocking(preferred_segment.as_ref())
+        self.evict_one_for_reservation_blocking(preferred_segment.as_ref())
     }
 
     pub(in super) fn evict_one_clean_and_reserve_bounded(
@@ -1488,10 +1551,8 @@ impl StorageOwnerState {
         length_bytes: u64,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
-        if self.reclaim_stale_local_allocations_before_clock_eviction(preferred_segment)? > 0 {
-            if let Some(reservation) =
-                self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment)?
-            {
+        if self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)? > 0 {
+            if let Some(reservation) = self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment)? {
                 return Ok(Some(reservation));
             }
         }
@@ -1521,9 +1582,19 @@ impl StorageOwnerState {
     ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
         let reservation = {
             let mut allocator = self.allocator.lock();
+            let deadline_ms = pending_publish_deadline_ms(
+                length_bytes,
+                DEFAULT_TRANSFER_STALL_TIMEOUT,
+                None,
+            );
             match preferred_segment {
-                Some(segment) => allocator.reserve_specific(&self.runtime, segment, length_bytes),
-                None => allocator.reserve_any(&self.runtime, length_bytes),
+                Some(segment) => allocator.reserve_specific_with_pending(
+                    &self.runtime,
+                    segment,
+                    length_bytes,
+                    deadline_ms,
+                ),
+                None => allocator.reserve_any_with_pending(&self.runtime, length_bytes, deadline_ms),
             }
         };
         match reservation {
@@ -1539,131 +1610,60 @@ impl StorageOwnerState {
         length_bytes: u64,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
-        let Some(route) = self.load_victim_route_bounded(&victim.route_key)? else {
-            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
-                return self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment);
-            }
-            self.hot_replicas.remove_id(victim);
-            return Ok(None);
-        };
-        if route.state != RouteState::Active {
-            self.hot_replicas
-                .clock
-                .lock()
-                .mark_hot_keys(std::slice::from_ref(&victim.route_key));
-            return Ok(None);
+        if self.evict_candidate(victim)? {
+            return self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment);
         }
-        if self.replica_index_for_victim(&route, victim).is_none() {
-            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
-                return self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment);
-            }
-            self.sync_route(&route);
-            return Ok(None);
-        }
-        match route.cold_backing.as_ref().map(|backing| backing.state) {
-            Some(mooncake_store_core::ColdBackingState::Materialized) => {}
-            _ => return Ok(None),
-        }
-        let Some(replica_index) = self.replica_index_for_victim(&route, victim) else {
-            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
-                return self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment);
-            }
-            self.sync_route(&route);
-            return Ok(None);
-        };
-        let evicted_replica = &route.replicas[replica_index];
-        if evicted_replica.length < length_bytes {
-            return Ok(None);
-        }
-        if self.read_pin_registry.is_pinned(
-            &evicted_replica.segment_name,
-            evicted_replica.segment_offset,
-        ) {
-            return Ok(None);
-        }
-        self.evict_route_replica_and_reserve(victim, &route, replica_index, length_bytes)
+        Ok(None)
     }
 
-    fn evict_route_replica_and_reserve(
+    fn evict_one_for_reservation_blocking(
         &self,
-        victim: &ClockEntryId,
-        route: &ObjectRoute,
-        replica_index: usize,
-        length_bytes: u64,
-    ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
-        let evicted_replica = route.replicas[replica_index].clone();
-        let next = cold_tier::route_after_replica_eviction(route, replica_index, false);
-        let cas = self.route_ops.compare_and_swap_route(
-            &route.key,
-            Some(route.version),
-            next.as_ref(),
-        )?;
-        if !cas.applied {
-            match cas.current.as_ref() {
-                Some(current) => self.sync_route(current),
-                None => self.hot_replicas.remove_id(victim),
-            }
-            return Ok(None);
+        preferred_segment: Option<&SegmentName>,
+    ) -> Result<bool> {
+        if self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)? > 0 {
+            return Ok(true);
         }
-
-        self.hot_replicas.remove_id(victim);
-        let excess = evicted_replica.length - length_bytes;
-        if excess > 0 {
-            self.allocator.lock().release(
-                &self.runtime,
-                &evicted_replica.segment_name,
-                evicted_replica.segment_offset + length_bytes,
-                excess,
-                0,
-            )?;
+        if self.evict_one_blocking(preferred_segment)? {
+            return Ok(true);
         }
-        if let Some(next) = &next {
-            self.sync_route(next);
-        }
-        info!(
-            runtime = %self.runtime,
-            key = %route.key.0,
-            segment = %evicted_replica.segment_name.0,
-            offset_bytes = evicted_replica.segment_offset,
-            length_bytes = evicted_replica.length,
-            reuse_length = length_bytes,
-            "dram_eviction_and_reuse"
-        );
-        Ok(Some(mooncake_store_core::SegmentReservation {
-            owner: self.runtime.clone(),
-            segment_name: evicted_replica.segment_name,
-            offset_bytes: evicted_replica.segment_offset,
-            length_bytes,
-            allocation_id: evicted_replica.allocation_id.unwrap_or(0),
-        }))
+        // A reserve miss that cannot make progress through normal CLOCK
+        // eviction is a real capacity-pressure signal. It may bypass the
+        // successful-pass interval, but the candidate reconciler still
+        // enforces its 100ms singleflight cadence and all safety fences.
+        Ok(self.reconcile_stale_clock_candidates(preferred_segment, true)? > 0)
     }
 
     fn evict_one_blocking(&self, preferred_segment: Option<&SegmentName>) -> Result<bool> {
         let tracker = OperationTracker::new("storage_owner_evict_one");
         let result = (|| {
-            for rebuild in 0..=1usize {
-                let budget = {
-                    let clock = self.hot_replicas.clock.lock();
-                    clock.eviction_budget()
+            if self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)? > 0 {
+                return Ok(true);
+            }
+            let budget = {
+                let clock = self.hot_replicas.clock.lock();
+                clock.eviction_budget()
+            };
+            for _ in 0..budget.max(1) {
+                let victim = {
+                    let mut clock = self.hot_replicas.clock.lock();
+                    clock.pick_victim(
+                        preferred_segment,
+                        self.offload_priority.eviction_policy,
+                        self.offload_priority.eviction_scan_limit,
+                    )
                 };
-                for _ in 0..budget.max(1) {
-                    let victim = {
-                        let mut clock = self.hot_replicas.clock.lock();
-                        clock.pick_victim(preferred_segment, self.offload_priority.eviction_policy, self.offload_priority.eviction_scan_limit)
-                    };
-                    let Some(victim) = victim else {
-                        break;
-                    };
-                    if self.evict_candidate(&victim)? {
-                        return Ok(true);
-                    }
+                let Some(victim) = victim else {
+                    break;
+                };
+                if self.evict_candidate(&victim)? {
+                    return Ok(true);
                 }
-                if rebuild == 0 {
-                    if self.reclaim_stale_local_allocations_before_clock_eviction(preferred_segment)? > 0 {
-                        return Ok(true);
-                    }
-                    self.rebuild_clock()?;
-                }
+            }
+            // No CLOCK victim made progress. A bounded allocator-candidate pass
+            // can recover a historical untracked allocation without listing an
+            // owner's full route set.
+            if self.reconcile_stale_clock_candidates(preferred_segment, false)? > 0 {
+                return Ok(true);
             }
             Ok(false)
         })();
@@ -1671,62 +1671,122 @@ impl StorageOwnerState {
         result
     }
 
-    fn reclaim_stale_local_allocations_before_clock_eviction(
+    fn reconcile_stale_clock_candidates(
         &self,
         preferred_segment: Option<&SegmentName>,
+        force_scan: bool,
     ) -> Result<usize> {
-        let now_ms = now_ms();
+        let requested_at_ms = now_ms();
         let last_completed = self
-            .stale_reclaim_scan_completed_at_ms
+            .stale_candidate_reconcile_completed_at_ms
             .load(std::sync::atomic::Ordering::Relaxed);
-        if last_completed != 0
-            && now_ms.saturating_sub(last_completed) < STALE_RECLAIM_SCAN_INTERVAL_MS
+        if !force_scan
+            && last_completed != 0
+            && requested_at_ms.saturating_sub(last_completed)
+                < self.offload_priority.stale_candidate_reconcile_interval_ms
         {
             return Ok(0);
         }
 
         if self
-            .stale_reclaim_scan_completed_at_ms
+            .stale_candidate_reconcile_in_progress
             .compare_exchange(
-                last_completed,
-                now_ms,
-                std::sync::atomic::Ordering::Relaxed,
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
                 std::sync::atomic::Ordering::Relaxed,
             )
             .is_err()
         {
             return Ok(0);
         }
-
-        let candidate_keys = {
-            let mut clock = self.hot_replicas.clock.lock();
-            clock.reclaim_candidate_keys(
-                preferred_segment,
-                self.offload_priority.eviction_scan_limit,
-            )
+        let _scan_guard = StaleCandidateReconcileGuard {
+            storage_owner: self,
         };
-        if candidate_keys.is_empty() {
+
+        let scan_started_at_ms = now_ms();
+        let last_completed = self
+            .stale_candidate_reconcile_completed_at_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !force_scan
+            && last_completed != 0
+            && scan_started_at_ms.saturating_sub(last_completed)
+                < self.offload_priority.stale_candidate_reconcile_interval_ms
+        {
             return Ok(0);
         }
+        // force_scan bypasses the successful-pass interval, not the minimum
+        // cadence. This prevents repeated mismatch signals from becoming a
+        // tight bounded-query loop while an earlier pass is still settling.
+        let last_started = self
+            .stale_candidate_reconcile_started_at_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last_completed != 0
+            && scan_started_at_ms.saturating_sub(last_started)
+                < STALE_CANDIDATE_RECONCILE_MIN_INTERVAL_MS
+        {
+            return Ok(0);
+        }
+        self.stale_candidate_reconcile_started_at_ms.store(
+            scan_started_at_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
-        let current_routes = match self.route_ops.load_routes_bounded(&candidate_keys) {
-            Ok(routes) => routes,
-            Err(error) => {
-                warn!(
-                    runtime = %self.runtime,
-                    keys = candidate_keys.len(),
-                    error = %error,
-                    "stale/orphan reclaim pre-pass skipped after route lookup failure"
-                );
-                return Ok(0);
-            }
+        let (candidate_keys, tracked_identities, legacy_tracked_spans) = {
+            let mut clock = self.hot_replicas.clock.lock();
+            (
+                clock.reclaim_candidate_keys(
+                    preferred_segment,
+                    self.offload_priority.eviction_scan_limit,
+                ),
+                clock.tracked_allocation_identities(),
+                clock.tracked_allocation_spans(),
+            )
         };
         let mut released = 0usize;
-        for (key, current) in candidate_keys.iter().zip(current_routes) {
-            released = released.saturating_add(
-                self.reclaim_stale_local_allocations_for_key(key, current.as_ref())?,
-            );
+        if !candidate_keys.is_empty() {
+            let current_routes = match self.route_ops.load_routes_bounded(&candidate_keys) {
+                Ok(routes) => routes,
+                Err(error) => {
+                    warn!(
+                        runtime = %self.runtime,
+                        keys = candidate_keys.len(),
+                        error = %error,
+                        "stale/orphan reclaim pre-pass skipped after route lookup failure"
+                    );
+                    return Ok(0);
+                }
+            };
+            for (key, current) in candidate_keys.iter().zip(current_routes.into_iter()) {
+                released = released.saturating_add(
+                    self.reclaim_stale_local_allocations_for_key(key, current.as_ref())?,
+                );
+            }
         }
+        let pending_evictions = self
+            .pending_evictions
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let candidates = self.allocator.lock().untracked_reconcile_candidates(
+            &tracked_identities,
+            &legacy_tracked_spans,
+            &pending_evictions,
+            scan_started_at_ms,
+            preferred_segment,
+            PENDING_EVICTION_CONFIRMATION_BATCH,
+        );
+        for identity in candidates {
+            self.begin_untracked_candidate_confirmation(&identity);
+        }
+        released = released.saturating_add(
+            self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)?,
+        );
+        self.stale_candidate_reconcile_completed_at_ms.store(
+            now_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(released)
     }
 
@@ -1735,77 +1795,20 @@ impl StorageOwnerState {
         key: &ObjectKey,
         current: Option<&ObjectRoute>,
     ) -> Result<usize> {
-        let active_current = match current {
-            Some(route) if route.state == RouteState::Active => Some(route),
-            Some(_) => return Ok(0),
-            None => None,
-        };
-        let live_allocations = active_current
-            .map(|route| self.local_allocation_spans_for_route(route))
-            .unwrap_or_default();
-        let candidate_allocations = {
+        let candidates = {
             let clock = self.hot_replicas.clock.lock();
-            clock.allocation_spans_for_key(key)
+            clock.entry_ids_for_key(key)
         };
-        if candidate_allocations.is_empty() {
+        if candidates.is_empty() {
             return Ok(0);
         }
-        let releasable = {
-            let mut allocator = self.allocator.lock();
-            let releasable = allocator.releasable_stale_candidates(
-                &candidate_allocations,
-                &live_allocations,
-                now_ms(),
-            );
-            for allocation in &releasable {
-                allocator.release(
-                    &self.runtime,
-                    &allocation.segment_name,
-                    allocation.offset_bytes,
-                    allocation.length_bytes,
-                    0,
-                )?;
+        for candidate in candidates {
+            if current.is_some_and(|route| route_references_clock_entry(route, &self.runtime, &candidate)) {
+                continue;
             }
-            releasable
-        };
-        if releasable.is_empty() {
-            return Ok(0);
+            self.begin_historical_candidate_confirmation(&candidate);
         }
-        self.reconcile_after_stale_release(key, active_current, &releasable);
-        Ok(releasable.len())
-    }
-
-    fn reconcile_after_stale_release(
-        &self,
-        key: &ObjectKey,
-        current: Option<&ObjectRoute>,
-        released: &[AllocationSpan],
-    ) {
-        if let Some(current) = current {
-            self.allocator
-                .lock()
-                .clear_pending_route(current, &self.runtime);
-        }
-        let mut clock = self.hot_replicas.clock.lock();
-        for allocation in released {
-            clock.remove_allocation_for_key(key, allocation);
-        }
-        if let Some(current) = current {
-            clock.track_route(current, &self.runtime);
-        }
-    }
-
-    fn local_allocation_spans_for_route(&self, route: &ObjectRoute) -> BTreeSet<AllocationSpan> {
-        route
-            .replicas
-            .iter()
-            .filter(|replica| replica.owner == self.runtime)
-            .map(|replica| AllocationSpan {
-                segment_name: replica.segment_name.clone(),
-                offset_bytes: replica.segment_offset,
-                length_bytes: replica.length,
-            })
-            .collect()
+        self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)
     }
 
     fn evict_candidate(&self, victim: &ClockEntryId) -> Result<bool> {
@@ -1813,13 +1816,15 @@ impl StorageOwnerState {
             if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
                 return Ok(true);
             }
-            self.hot_replicas.clock.lock().remove_id(victim);
+            // A route miss starts exact confirmation, but does not itself prove
+            // absence. Keep the CLOCK entry (or its pending token) meanwhile.
+            self.hot_replicas
+                .clock
+                .lock()
+                .mark_hot_keys(std::slice::from_ref(&victim.route_key));
             return Ok(false);
         };
         if route.state != RouteState::Active {
-            if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))? > 0 {
-                return Ok(true);
-            }
             self.hot_replicas
                 .clock
                 .lock()
@@ -1883,7 +1888,17 @@ impl StorageOwnerState {
             replica.owner == self.runtime
                 && replica.segment_name == victim.segment_name
                 && replica.segment_offset == victim.segment_offset
+                && replica.length == self.clock_entry_length(victim)
+                && replica.allocation_id == victim.allocation_id
         })
+    }
+
+    fn clock_entry_length(&self, victim: &ClockEntryId) -> u64 {
+        self.hot_replicas
+            .clock
+            .lock()
+            .entry_length(victim)
+            .unwrap_or_default()
     }
 
     fn evict_route_replica(
@@ -1893,91 +1908,470 @@ impl StorageOwnerState {
         replica_index: usize,
         delete_empty_route: bool,
     ) -> Result<bool> {
-        let evicted_replica = route.replicas[replica_index].clone();
         let next = cold_tier::route_after_replica_eviction(route, replica_index, delete_empty_route);
-        let cas = match next.as_ref() {
-            Some(next_route) => self
-                .route_ops
-                .prune_route(&route.key, Some(route.version), next_route)?,
-            None => self.route_ops.delete_route(&route.key, Some(route.version))?,
-        };
-        if !cas.applied {
-            match cas.current.as_ref() {
-                Some(current) => self.sync_route(current),
-                None => self.hot_replicas.clock.lock().remove_id(victim),
-            }
-            return Ok(false);
-        }
-
-        self.finish_evicted_replica(
-            victim,
-            route,
-            &evicted_replica,
-            next.as_ref(),
-            delete_empty_route,
-        )?;
-        registry::record_evicted_replicas(1, evicted_replica.length);
-        Ok(true)
+        self.evict_route_replica_with_next(victim, route, replica_index, next)
     }
 
-    fn finish_evicted_replica(
+    fn evict_route_replica_with_next(
         &self,
         victim: &ClockEntryId,
         route: &ObjectRoute,
-        evicted_replica: &ReplicaRoute,
-        next: Option<&ObjectRoute>,
-        delete_empty_route: bool,
-    ) -> Result<()> {
-        self.hot_replicas.clock.lock().remove_id(victim);
-        if let Err(error) = self.allocator.lock().release(
-            &self.runtime,
-            &evicted_replica.segment_name,
-            evicted_replica.segment_offset,
-            evicted_replica.length,
-            evicted_replica.allocation_id.unwrap_or(0),
-        ) {
-            if is_missing_live_allocation_error(&error) {
-                warn!(
+        replica_index: usize,
+        next: Option<ObjectRoute>,
+    ) -> Result<bool> {
+        let Some(token) = self.begin_eviction(victim, route, replica_index, next.clone())? else {
+            return Ok(false);
+        };
+        let cas = match next.as_ref() {
+            Some(next_route) => self
+                .route_ops
+                .prune_route(&route.key, Some(route.version), next_route),
+            None => self.route_ops.delete_route(&route.key, Some(route.version)),
+        };
+        match cas {
+            Ok(cas) if cas.applied => self.commit_eviction(&token),
+            Ok(cas) => {
+                self.abort_eviction(&token, cas.current.as_ref());
+                Ok(false)
+            }
+            Err(error) => {
+                self.defer_pending_eviction(&token.identity, PendingEvictionPhase::PendingConfirmation);
+                debug!(
                     runtime = %self.runtime,
                     key = %route.key.0,
-                    segment = %evicted_replica.segment_name.0,
-                    offset_bytes = evicted_replica.segment_offset,
-                    length_bytes = evicted_replica.length,
                     error = %error,
-                    "dram_eviction_allocator_release_already_absent"
+                    "route eviction CAS outcome is unknown; retaining pending token"
                 );
-            } else {
-                return Err(error);
+                Ok(false)
             }
         }
-        if let Some(next_route) = next {
-            self.sync_route(next_route);
+    }
+
+    fn begin_eviction(
+        &self,
+        victim: &ClockEntryId,
+        route: &ObjectRoute,
+        replica_index: usize,
+        next_route: Option<ObjectRoute>,
+    ) -> Result<Option<EvictionToken>> {
+        let evicted_replica = route.replicas[replica_index].clone();
+        let Some(allocation_id) = evicted_replica.allocation_id.filter(|id| *id != 0) else {
+            return Ok(None);
+        };
+        if victim.allocation_id != Some(allocation_id)
+            || self.read_pin_registry.is_pinned(
+                &evicted_replica.segment_name,
+                evicted_replica.segment_offset,
+            )
+        {
+            return Ok(None);
         }
-        info!(
-            runtime = %self.runtime,
-            key = %route.key.0,
-            segment = %evicted_replica.segment_name.0,
-            offset_bytes = evicted_replica.segment_offset,
-            length_bytes = evicted_replica.length,
-            delete_empty_route,
-            cold_backing_state = ?route.cold_backing.as_ref().map(|backing| backing.state),
-            route_deleted = next.is_none(),
-            "dram_eviction_complete"
-        );
-        if stable_debug_log_sample(&[
-            "storage_owner_evicted_replica",
-            &route.key.0,
-            &evicted_replica.segment_name.0,
-        ]) {
+        let allocation = AllocationSpan {
+            segment_name: evicted_replica.segment_name.clone(),
+            offset_bytes: evicted_replica.segment_offset,
+            length_bytes: evicted_replica.length,
+        };
+        let Some(identity) = self.allocator.lock().allocation_identity(&allocation) else {
+            self.hot_replicas
+                .clock
+                .lock()
+                .mark_hot_keys(std::slice::from_ref(&route.key));
+            return Ok(None);
+        };
+        if identity.allocation_id != allocation_id {
+            self.hot_replicas
+                .clock
+                .lock()
+                .mark_hot_keys(std::slice::from_ref(&route.key));
+            return Ok(None);
+        }
+        let token = EvictionToken {
+            identity: identity.clone(),
+            kind: PendingEvictionKind::RouteCas,
+            route_key: Some(route.key.clone()),
+            expected_version: route.version,
+            evicted_replica: Some(evicted_replica),
+            clock_id: Some(victim.clone()),
+            next_route,
+        };
+        let mut pending = self.pending_evictions.lock();
+        if pending.contains_key(&identity) {
+            return Ok(None);
+        }
+        if pending.len() >= PENDING_EVICTION_MAX_ENTRIES {
             debug!(
                 runtime = %self.runtime,
-                key = %route.key.0,
-                segment = %evicted_replica.segment_name.0,
-                length_bytes = evicted_replica.length,
-                "sampled storage-owner replica eviction"
+                limit = PENDING_EVICTION_MAX_ENTRIES,
+                "eviction prepare deferred because the pending token queue is full"
             );
+            return Ok(None);
         }
-        Ok(())
+        pending.insert(
+            identity,
+            PendingEviction {
+                token: token.clone(),
+                phase: PendingEvictionPhase::Prepared,
+                confirmation_attempts: 0,
+                next_attempt_at_ms: now_ms(),
+                confirmation_in_progress: false,
+            },
+        );
+        Ok(Some(token))
+    }
+
+    fn begin_historical_candidate_confirmation(&self, victim: &ClockEntryId) {
+        let Some(allocation_id) = victim.allocation_id.filter(|id| *id != 0) else {
+            return;
+        };
+        let Some(length_bytes) = self.hot_replicas.clock.lock().entry_length(victim) else {
+            return;
+        };
+        let allocation = AllocationSpan {
+            segment_name: victim.segment_name.clone(),
+            offset_bytes: victim.segment_offset,
+            length_bytes,
+        };
+        let identity = {
+            let allocator = self.allocator.lock();
+            let Some(identity) = allocator.allocation_identity(&allocation) else {
+                return;
+            };
+            if allocator.is_pending_allocation(&allocation, now_ms()) {
+                return;
+            }
+            identity
+        };
+        if identity.allocation_id != allocation_id {
+            return;
+        }
+        let mut pending = self.pending_evictions.lock();
+        if pending.contains_key(&identity) {
+            return;
+        }
+        if pending.len() >= PENDING_EVICTION_MAX_ENTRIES {
+            return;
+        }
+        let token = EvictionToken {
+            identity: identity.clone(),
+            kind: PendingEvictionKind::RouteCas,
+            route_key: Some(victim.route_key.clone()),
+            expected_version: RouteVersion(0),
+            evicted_replica: Some(ReplicaRoute {
+                owner: self.runtime.clone(),
+                segment_name: victim.segment_name.clone(),
+                allocation_id: Some(allocation_id),
+                offset: None,
+                segment_offset: victim.segment_offset,
+                length: length_bytes,
+                checksum: None,
+                tier: mooncake_store_core::ReplicaTier::Unknown,
+                priority: u16::MAX,
+            }),
+            clock_id: Some(victim.clone()),
+            next_route: None,
+        };
+        pending.insert(
+            identity,
+            PendingEviction {
+                token,
+                phase: PendingEvictionPhase::PendingConfirmation,
+                confirmation_attempts: 0,
+                next_attempt_at_ms: now_ms(),
+                confirmation_in_progress: false,
+            },
+        );
+    }
+
+    fn begin_untracked_candidate_confirmation(&self, identity: &AllocationIdentity) {
+        if identity.allocation_id == 0
+            || self
+                .read_pin_registry
+                .is_pinned(&identity.segment_name, identity.offset_bytes)
+        {
+            return;
+        }
+        let allocation = AllocationSpan {
+            segment_name: identity.segment_name.clone(),
+            offset_bytes: identity.offset_bytes,
+            length_bytes: identity.length_bytes,
+        };
+        {
+            let allocator = self.allocator.lock();
+            if allocator.allocation_identity(&allocation).as_ref() != Some(identity)
+                || allocator.is_pending_allocation(&allocation, now_ms())
+            {
+                return;
+            }
+        }
+        let mut pending = self.pending_evictions.lock();
+        if pending.contains_key(identity) {
+            return;
+        }
+        if pending.len() >= PENDING_EVICTION_MAX_ENTRIES {
+            return;
+        }
+        pending.insert(
+            identity.clone(),
+            PendingEviction {
+                token: EvictionToken {
+                    identity: identity.clone(),
+                    kind: PendingEvictionKind::AllocationCandidate,
+                    route_key: None,
+                    expected_version: RouteVersion(0),
+                    evicted_replica: None,
+                    clock_id: None,
+                    next_route: None,
+                },
+                phase: PendingEvictionPhase::PendingAllocationConfirmation,
+                confirmation_attempts: 0,
+                next_attempt_at_ms: now_ms(),
+                confirmation_in_progress: false,
+            },
+        );
+    }
+
+    fn abort_eviction(&self, token: &EvictionToken, current: Option<&ObjectRoute>) {
+        self.pending_evictions.lock().remove(&token.identity);
+        if let Some(current) = current {
+            self.sync_route(current);
+        } else if let Some(route_key) = token.route_key.as_ref() {
+            self.hot_replicas
+                .clock
+                .lock()
+                .mark_hot_keys(std::slice::from_ref(route_key));
+        }
+    }
+
+    fn commit_eviction(&self, token: &EvictionToken) -> Result<bool> {
+        if self
+            .read_pin_registry
+            .is_pinned(&token.identity.segment_name, token.identity.offset_bytes)
+        {
+            self.defer_pending_eviction(&token.identity, PendingEvictionPhase::ReadyToCommit);
+            return Ok(false);
+        }
+        let release_result = {
+            let mut allocator = self.allocator.lock();
+            match allocator.allocation_identity(&AllocationSpan {
+                segment_name: token.identity.segment_name.clone(),
+                offset_bytes: token.identity.offset_bytes,
+                length_bytes: token.identity.length_bytes,
+            }) {
+                Some(current) if current == token.identity => allocator.release(
+                    &self.runtime,
+                    &token.identity.segment_name,
+                    token.identity.offset_bytes,
+                    token.identity.length_bytes,
+                    token.identity.allocation_id,
+                ),
+                Some(_) | None => Ok(()),
+            }
+        };
+        if let Err(error) = release_result {
+            self.defer_pending_eviction(&token.identity, PendingEvictionPhase::ReadyToCommit);
+            debug!(
+                runtime = %self.runtime,
+                key = ?token.route_key,
+                error = %error,
+                "eviction local commit deferred; retaining pending token"
+            );
+            return Ok(false);
+        }
+        if let Some(clock_id) = token.clock_id.as_ref() {
+            self.hot_replicas.clock.lock().remove_id(clock_id);
+        }
+        self.pending_evictions.lock().remove(&token.identity);
+        trace!(
+            runtime = %self.runtime,
+            key = ?token.route_key,
+            segment = %token.identity.segment_name.0,
+            offset_bytes = token.identity.offset_bytes,
+            length_bytes = token.identity.length_bytes,
+            expected_version = token.expected_version.0,
+            route_deleted = token.kind == PendingEvictionKind::RouteCas && token.next_route.is_none(),
+            "dram_eviction_complete"
+        );
+        Ok(true)
+    }
+
+    fn defer_pending_eviction(&self, identity: &AllocationIdentity, phase: PendingEvictionPhase) {
+        let mut pending = self.pending_evictions.lock();
+        let Some(entry) = pending.get_mut(identity) else {
+            return;
+        };
+        entry.phase = phase;
+        entry.confirmation_in_progress = false;
+        entry.confirmation_attempts = entry.confirmation_attempts.saturating_add(1);
+        let retry_limit = self.offload_priority.pending_eviction_retry_limit.max(1);
+        let delay_ms = if entry.confirmation_attempts >= retry_limit {
+            // Keep the token after transient retries are exhausted, but do not
+            // turn a persistent authority disagreement into a hot RPC loop.
+            PENDING_EVICTION_RETRY_MAX_MS
+        } else {
+            let exponent = entry.confirmation_attempts.saturating_sub(1).min(7);
+            PENDING_EVICTION_RETRY_BASE_MS
+                .saturating_mul(1u64 << exponent)
+                .min(PENDING_EVICTION_RETRY_MAX_MS)
+        };
+        entry.next_attempt_at_ms = now_ms().saturating_add(delay_ms);
+    }
+
+    fn process_pending_evictions(&self, limit: usize) -> Result<usize> {
+        let now = now_ms();
+        let work = {
+            let mut pending = self.pending_evictions.lock();
+            pending
+                .values_mut()
+                .filter(|entry| {
+                    entry.phase != PendingEvictionPhase::Prepared
+                        && !entry.confirmation_in_progress
+                        && entry.next_attempt_at_ms <= now
+                })
+                .take(limit.max(1))
+                .map(|entry| {
+                    entry.confirmation_in_progress = true;
+                    (entry.token.clone(), entry.phase)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut committed = 0usize;
+        for (token, phase) in work {
+            match phase {
+                PendingEvictionPhase::Prepared => unreachable!("prepared tokens are not worker work"),
+                PendingEvictionPhase::ReadyToCommit => {
+                    if self.commit_eviction(&token)? {
+                        committed = committed.saturating_add(1);
+                    }
+                }
+                PendingEvictionPhase::PendingConfirmation => {
+                    let Some(route_key) = token.route_key.as_ref() else {
+                        self.defer_pending_eviction(
+                            &token.identity,
+                            PendingEvictionPhase::PendingConfirmation,
+                        );
+                        continue;
+                    };
+                    let Some(evicted_replica) = token.evicted_replica.as_ref() else {
+                        self.defer_pending_eviction(
+                            &token.identity,
+                            PendingEvictionPhase::PendingConfirmation,
+                        );
+                        continue;
+                    };
+                    match self
+                        .route_ops
+                        .confirm_replica_reference(route_key, evicted_replica)
+                    {
+                        Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
+                            self.abort_eviction(&token, Some(&route));
+                        }
+                        Ok(mooncake_store_core::RouteReplicaReference::Absent) => {
+                            {
+                                let mut pending = self.pending_evictions.lock();
+                                if let Some(entry) = pending.get_mut(&token.identity) {
+                                    entry.phase = PendingEvictionPhase::ReadyToCommit;
+                                    entry.confirmation_in_progress = false;
+                                    entry.next_attempt_at_ms = now_ms();
+                                }
+                            }
+                            if self.commit_eviction(&token)? {
+                                committed = committed.saturating_add(1);
+                            }
+                        }
+                        Err(error) => {
+                            self.defer_pending_eviction(
+                                &token.identity,
+                                PendingEvictionPhase::PendingConfirmation,
+                            );
+                            debug!(
+                                runtime = %self.runtime,
+                                key = ?token.route_key,
+                                error = %error,
+                                "exact eviction confirmation is indeterminate; retaining token"
+                            );
+                        }
+                    }
+                }
+                PendingEvictionPhase::PendingAllocationConfirmation => {
+                    let identity = mooncake_store_core::AllocationRouteIdentity {
+                        owner: self.runtime.clone(),
+                        segment_name: token.identity.segment_name.clone(),
+                        offset_bytes: token.identity.offset_bytes,
+                        length_bytes: token.identity.length_bytes,
+                        allocation_id: token.identity.allocation_id,
+                    };
+                    match self
+                        .route_ops
+                        .get_allocation_route_references_consistent(&[identity])
+                    {
+                        Ok(references)
+                            if matches!(
+                                references.as_slice(),
+                                [mooncake_store_core::AllocationRouteReferenceState::Absent]
+                            ) =>
+                        {
+                            {
+                                let mut pending = self.pending_evictions.lock();
+                                if let Some(entry) = pending.get_mut(&token.identity) {
+                                    entry.phase = PendingEvictionPhase::ReadyToCommit;
+                                    entry.confirmation_in_progress = false;
+                                    entry.next_attempt_at_ms = now_ms();
+                                }
+                            }
+                            if self.commit_eviction(&token)? {
+                                committed = committed.saturating_add(1);
+                            }
+                        }
+                        Ok(references)
+                            if matches!(
+                                references.as_slice(),
+                                [mooncake_store_core::AllocationRouteReferenceState::Exact]
+                                    | [mooncake_store_core::AllocationRouteReferenceState::Conflict]
+                            ) =>
+                        {
+                            self.defer_pending_eviction(
+                                &token.identity,
+                                PendingEvictionPhase::PendingAllocationConfirmation,
+                            );
+                            trace!(
+                                runtime = %self.runtime,
+                                segment = %token.identity.segment_name.0,
+                                offset_bytes = token.identity.offset_bytes,
+                                allocation_id = token.identity.allocation_id,
+                                references = ?references,
+                                "allocator candidate remains route-referenced or conflicted; retaining token"
+                            );
+                        }
+                        Ok(references) => {
+                            self.defer_pending_eviction(
+                                &token.identity,
+                                PendingEvictionPhase::PendingAllocationConfirmation,
+                            );
+                            debug!(
+                                runtime = %self.runtime,
+                                references = ?references,
+                                "allocation reference response length was indeterminate; retaining token"
+                            );
+                        }
+                        Err(error) => {
+                            self.defer_pending_eviction(
+                                &token.identity,
+                                PendingEvictionPhase::PendingAllocationConfirmation,
+                            );
+                            debug!(
+                                runtime = %self.runtime,
+                                segment = %token.identity.segment_name.0,
+                                offset_bytes = token.identity.offset_bytes,
+                                allocation_id = token.identity.allocation_id,
+                                error = %error,
+                                "allocation reference confirmation is indeterminate; retaining token"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(committed)
     }
 
     pub(in super) fn current_materialized_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
@@ -2026,13 +2420,17 @@ fn route_storage_bytes(route: &ObjectRoute, runtime: &ClientRuntimeId) -> u64 {
         .sum()
 }
 
-fn is_missing_live_allocation_error(error: &StoreError) -> bool {
-    matches!(
-        error,
-        StoreError::Allocator(message)
-            if message.contains("segment release missing live allocation")
-                || message.contains("segment release stale allocation generation")
-    )
+fn route_references_clock_entry(
+    route: &ObjectRoute,
+    runtime: &ClientRuntimeId,
+    entry: &ClockEntryId,
+) -> bool {
+    route.replicas.iter().any(|replica| {
+        replica.owner == *runtime
+            && replica.segment_name == entry.segment_name
+            && replica.segment_offset == entry.segment_offset
+            && replica.allocation_id == entry.allocation_id
+    })
 }
 
 pub(in crate::client) fn nof_backing_clock_segment(target_id: &str) -> SegmentName {
@@ -2052,6 +2450,24 @@ impl StorageClockState {
 
     fn eviction_budget(&self) -> usize {
         self.entries.len().saturating_mul(3)
+    }
+
+    fn entry_length(&self, id: &ClockEntryId) -> Option<u64> {
+        self.by_id
+            .get(id)
+            .and_then(|index| self.entries.get(*index))
+            .and_then(Option::as_ref)
+            .map(|entry| entry.length_bytes)
+    }
+
+    fn entry_ids_for_key(&self, key: &ObjectKey) -> Vec<ClockEntryId> {
+        self.by_key
+            .get(key)
+            .into_iter()
+            .flat_map(|indices| indices.iter())
+            .filter_map(|index| self.entries.get(*index).and_then(Option::as_ref))
+            .map(|entry| entry.id.clone())
+            .collect()
     }
 
     fn reclaim_candidate_keys(
@@ -2081,6 +2497,7 @@ impl StorageClockState {
         keys
     }
 
+    #[cfg(test)]
     fn allocation_spans_for_key(&self, key: &ObjectKey) -> BTreeSet<AllocationSpan> {
         self.by_key
             .get(key)
@@ -2129,6 +2546,7 @@ impl StorageClockState {
                 route_key: route.key.clone(),
                 segment_name: replica.segment_name.clone(),
                 segment_offset: replica.segment_offset,
+                allocation_id: replica.allocation_id,
             });
         }
     }
@@ -2272,6 +2690,7 @@ impl StorageClockState {
             route_key: route.key.clone(),
             segment_name: replica.segment_name.clone(),
             segment_offset: replica.segment_offset,
+            allocation_id: replica.allocation_id,
         };
         if let Some(index) = self.by_id.get(&id).copied() {
             if let Some(entry) = self.entries.get_mut(index).and_then(Option::as_mut) {
@@ -2334,12 +2753,33 @@ impl StorageClockState {
         }
     }
 
-    fn remove_allocation_for_key(&mut self, key: &ObjectKey, allocation: &AllocationSpan) {
-        self.remove_id(&ClockEntryId {
-            route_key: key.clone(),
-            segment_name: allocation.segment_name.clone(),
-            segment_offset: allocation.offset_bytes,
-        });
+    fn tracked_allocation_spans(&self) -> BTreeSet<AllocationSpan> {
+        self.entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|entry| AllocationSpan {
+                segment_name: entry.id.segment_name.clone(),
+                offset_bytes: entry.id.segment_offset,
+                length_bytes: entry.length_bytes,
+            })
+            .collect()
+    }
+
+    fn tracked_allocation_identities(&self) -> BTreeSet<AllocationIdentity> {
+        self.entries
+            .iter()
+            .filter_map(Option::as_ref)
+            .filter_map(|entry| {
+                entry.id.allocation_id.filter(|allocation_id| *allocation_id != 0).map(
+                    |allocation_id| AllocationIdentity {
+                        segment_name: entry.id.segment_name.clone(),
+                        offset_bytes: entry.id.segment_offset,
+                        length_bytes: entry.length_bytes,
+                        allocation_id,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn pick_victim_coldest_largest_first(

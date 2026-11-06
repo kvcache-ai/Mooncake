@@ -235,6 +235,10 @@ pub struct ColdTierOffloadPriorityConfig {
     pub pending_aging_ms: u64,
     pub pending_scan_limit: usize,
     pub eviction_scan_limit: usize,
+    /// Minimum interval between bounded allocator-candidate reconciliation passes.
+    pub stale_candidate_reconcile_interval_ms: u64,
+    /// Number of exponential-backoff steps before pending confirmation retries cap out.
+    pub pending_eviction_retry_limit: u32,
 }
 
 impl Default for ColdTierOffloadPriorityConfig {
@@ -245,6 +249,8 @@ impl Default for ColdTierOffloadPriorityConfig {
             pending_aging_ms: 30_000,
             pending_scan_limit: 64,
             eviction_scan_limit: 64,
+            stale_candidate_reconcile_interval_ms: 60_000,
+            pending_eviction_retry_limit: 3,
         }
     }
 }
@@ -272,6 +278,19 @@ impl ColdTierOffloadPriorityConfig {
 
     pub fn eviction_scan_limit(mut self, eviction_scan_limit: usize) -> Self {
         self.eviction_scan_limit = eviction_scan_limit.max(1);
+        self
+    }
+
+    pub fn stale_candidate_reconcile_interval_ms(
+        mut self,
+        stale_candidate_reconcile_interval_ms: u64,
+    ) -> Self {
+        self.stale_candidate_reconcile_interval_ms = stale_candidate_reconcile_interval_ms;
+        self
+    }
+
+    pub fn pending_eviction_retry_limit(mut self, pending_eviction_retry_limit: u32) -> Self {
+        self.pending_eviction_retry_limit = pending_eviction_retry_limit.max(1);
         self
     }
 }
