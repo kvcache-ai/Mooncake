@@ -46,9 +46,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       client_(client),
       ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
-      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      client_buffer_allocator_(AlignedClientBufferAllocator::create(
-          config.local_buffer_size, client ? client->GetProtocol() : "")) {
+      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()) {
     if (!config_.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -83,14 +81,19 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     }
 
     storage_backend_ = create_storage_backend_result.value();
-    if (auto distributed_backend =
-            std::dynamic_pointer_cast<DistributedStorageBackend>(
-                storage_backend_)) {
-        config_.enable_dfs = !distributed_backend->UsesObjectStorage() ||
-                             distributed_backend->UsesKvcs();
-        if (config_.enable_dfs && client_) {
-            client_->SetDfsStorageBackend(distributed_backend);
-        }
+    auto distributed_backend =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_);
+    config_.enable_dfs =
+        distributed_backend && (!distributed_backend->UsesObjectStorage() ||
+                                distributed_backend->UsesKvcs());
+    if (config_.enable_dfs && client_) {
+        client_->SetDfsStorageBackend(distributed_backend);
+    }
+
+    // Descriptor-based DFS does not use the LOCAL_DISK restore arena.
+    if (!config_.enable_dfs) {
+        client_buffer_allocator_ = AlignedClientBufferAllocator::create(
+            config.local_buffer_size, client ? client->GetProtocol() : "");
     }
 
     // Register the client buffer with the process-wide io_uring fixed-buffer
@@ -242,6 +245,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::LoadBatch(const std::vector<std::string>& keys,
                        const std::vector<int64_t>& sizes, bool prefer_pinned) {
+    if (config_.enable_dfs) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     const bool use_pinned = prefer_pinned && pinned_restore_arena_allocator_;
     auto& allocator = use_pinned ? *pinned_restore_arena_allocator_
                                  : *client_buffer_allocator_;
@@ -286,6 +292,9 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
         keys.size() != object_sizes.size()) {
         LOG(ERROR) << "Mismatched range load arguments";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config_.enable_dfs) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     for (size_t i = 0; i < keys.size(); ++i) {
         if (offsets[i] < 0 || lengths[i] < 0 || object_sizes[i] < 0 ||
@@ -1412,6 +1421,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 }
 
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
+    if (config_.enable_dfs) {
+        return {};
+    }
     // The buffer pool backs SSD-offload read results that are fetched by
     // remote peers via RDMA READ.  It must therefore be registered with
     // remote_accessible=true so its BufferDesc publishes an rkey; otherwise
