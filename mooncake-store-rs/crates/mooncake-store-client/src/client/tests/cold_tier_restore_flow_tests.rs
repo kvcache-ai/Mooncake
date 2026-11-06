@@ -310,7 +310,7 @@ fn put_and_batch_put_survive_cold_offload_and_memory_eviction() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let cold_root = cold_tier_test_root("put-batch-evict-restore");
     let transport = Arc::new(TestTransport::new("put-batch-evict-restore-segment"));
-    let client = StoreClientBuilder::new(metadata, "put-batch-evict-restore")
+    let mut client = StoreClientBuilder::new(metadata, "put-batch-evict-restore")
         .state(ClientLifecycleState::Active)
         .label("storage", "true")
         .transport(transport)
@@ -325,6 +325,12 @@ fn put_and_batch_put_survive_cold_offload_and_memory_eviction() {
     client
         .register_local_memory()
         .expect("local memory should register");
+    // This test explicitly drives the existing offload path after stopping
+    // the periodic worker. Background scheduling remains covered by the
+    // Other cold-tier integration tests retain background-worker coverage,
+    // while this flow stays independent of polling
+    // and queue-claim races.
+    client.cold_tier.shutdown();
 
     let single_payload = vec![1u8; 24];
     let batch_payload_a = vec![2u8; 24];
@@ -345,11 +351,27 @@ fn put_and_batch_put_survive_cold_offload_and_memory_eviction() {
         "evict-restore-batch-a",
         "evict-restore-batch-b",
     ];
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads()
+            .expect("synchronous cold offload should succeed"),
+        initial_keys.len()
+    );
     for key in initial_keys {
-        let cold_backing = wait_for_materialized_cold_backing(&client, key);
+        let route = client
+            .query_route(key)
+            .expect("route query should succeed")
+            .expect("route should exist");
+        let cold_backing = route.cold_backing.as_ref().unwrap_or_else(|| {
+            panic!(
+                "route should have a cold backing after synchronous offload: key={key} route={route:?}"
+            )
+        });
         assert_eq!(
             cold_backing.state,
-            mooncake_store_core::ColdBackingState::Materialized
+            mooncake_store_core::ColdBackingState::Materialized,
+            "cold backing did not materialize: key={key} backing={cold_backing:?} route={route:?}"
         );
     }
     let deadline = Instant::now() + Duration::from_secs(2);
