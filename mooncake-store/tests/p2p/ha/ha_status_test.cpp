@@ -423,7 +423,8 @@ TEST_F(HAStatusTest, DoctorFlagsMasterViewLeaseExpiredForStuckPrimary) {
     // /ha/status reports a lease remaining time and therefore clamps an
     // expired estimate to zero; doctor retains the signed diagnostic detail.
     EXPECT_EQ(status.Snapshot().master_view_expires_in_ms, 0);
-    const auto* issue = FindIssue(doctor(), "MASTER_VIEW_LEASE_EXPIRED");
+    auto report = doctor();
+    const auto* issue = FindIssue(report, "MASTER_VIEW_LEASE_EXPIRED");
     ASSERT_NE(issue, nullptr);
     EXPECT_NE(issue->message.find("expires_in_ms=-"), std::string::npos);
     EXPECT_NE(issue->message.find("view_epoch=7"), std::string::npos);
