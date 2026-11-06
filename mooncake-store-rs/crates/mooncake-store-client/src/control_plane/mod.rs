@@ -139,10 +139,25 @@ impl RouteTrafficReport {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct DeletePendingEntry {
     pub route_key: ObjectKey,
-    pub identity: AllocationRouteIdentity,
+    pub identity: Option<AllocationRouteIdentity>,
+    pub cold_backing: Option<ColdDeleteTarget>,
     pub reclaim_grace_ms: u64,
     pub prepare_only: bool,
     pub expected_route_version: Option<mooncake_store_core::RouteVersion>,
+}
+
+/// Physical cold-backing target carried by a unified delete-pending entry.
+///
+/// Only Ord-friendly fields are kept so the entry stays usable in the shutdown
+/// retention BTreeSet and as a ReclaimQueue identity. The route authority is
+/// the source of truth for eligibility; this identifies what to delete.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct ColdDeleteTarget {
+    pub owner: ClientRuntimeId,
+    pub cold_tier_id: String,
+    pub object_locator: String,
+    pub length: u64,
+    pub checksum: Option<u64>,
 }
 
 pub(crate) trait EvictionService: Send + Sync {

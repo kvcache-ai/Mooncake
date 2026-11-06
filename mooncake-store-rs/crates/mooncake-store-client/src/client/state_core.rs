@@ -797,6 +797,7 @@ struct StorageOwnerState {
     initial_cold_backing_repair_at_ms: AtomicU64,
     pending_evictions: Mutex<BTreeMap<AllocationIdentity, PendingEviction>>,
     pending_deletes: Mutex<PendingDeleteQueue>,
+    pending_cold_deletes: Mutex<PendingColdDeleteQueue>,
     pending_delete_next_due_at_ms: AtomicU64,
     pending_publication_authority_retry: Mutex<PendingPublicationAuthorityRetry>,
     // Bounded candidate reconciliation is independent from owner-wide audit.
@@ -895,6 +896,13 @@ struct PendingEviction {
 
 type PendingDelete = ReclaimToken<AllocationIdentity>;
 type PendingDeleteQueue = ReclaimQueue<AllocationIdentity>;
+
+/// Cold-backing instantiation of the same generic owner-local reclaim queue
+/// used for DRAM allocation deletes. The queue carries only protocol state;
+/// the physical cold payload deletion and used_bytes release reuse the
+/// existing pending-delete GC reclaim path.
+type PendingColdDelete = ReclaimToken<crate::control_plane::ColdDeleteTarget>;
+type PendingColdDeleteQueue = ReclaimQueue<crate::control_plane::ColdDeleteTarget>;
 
 #[derive(Default)]
 struct RouteWriteGate {

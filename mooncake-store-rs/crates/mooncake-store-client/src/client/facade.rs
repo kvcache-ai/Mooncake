@@ -383,13 +383,14 @@ impl StoreClient {
             };
             let entry = DeletePendingEntry {
                 route_key: route.key.clone(),
-                identity: mooncake_store_core::AllocationRouteIdentity {
+                identity: Some(mooncake_store_core::AllocationRouteIdentity {
                     owner: replica.owner.clone(),
                     segment_name: replica.segment_name.clone(),
                     offset_bytes: replica.segment_offset,
                     length_bytes: replica.length,
                     allocation_id,
-                },
+                }),
+                cold_backing: None,
                 reclaim_grace_ms: self.local_memory.reclaim_grace_ms,
                 prepare_only: true,
                 expected_route_version: Some(route.version),
@@ -477,6 +478,13 @@ impl StoreClient {
             }
             if !has_nof && has_cold_backing {
                 if route.state == RouteState::Deleting {
+                    // A re-delete of an already-Deleting cold route re-arms the
+                    // owner-local reclaim token (idempotent: the queue dedups by
+                    // cold target and the drain is a version-fenced point lookup).
+                    // This recovers the window where a prior delete was killed
+                    // between the route CAS and the enqueue, which under
+                    // EmbeddedWrh has no index-scan fallback.
+                    self.dispatch_cold_backing_delete(&route);
                     return Ok(());
                 }
                 let mut deleting = route.clone();
@@ -495,6 +503,7 @@ impl StoreClient {
                 if cas.applied {
                     self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
                     self.storage_owner.sync_route(&deleting);
+                    self.dispatch_cold_backing_delete(&deleting);
                     return Ok(());
                 }
                 let _ = self.abort_tenant_quota_reservation(
@@ -946,13 +955,14 @@ impl StoreClient {
             };
             let entry = DeletePendingEntry {
                 route_key: route.key.clone(),
-                identity: mooncake_store_core::AllocationRouteIdentity {
+                identity: Some(mooncake_store_core::AllocationRouteIdentity {
                     owner: replica.owner.clone(),
                     segment_name: replica.segment_name.clone(),
                     offset_bytes: replica.segment_offset,
                     length_bytes: replica.length,
                     allocation_id,
-                },
+                }),
+                cold_backing: None,
                 reclaim_grace_ms,
                 prepare_only: false,
                 expected_route_version: Some(route.version),
@@ -1005,17 +1015,52 @@ impl StoreClient {
                 );
             }
         }
-        if route.cold_backing.is_some() {
-            let mut cold_backing_route = route.clone();
-            cold_backing_route.replicas.clear();
-            if let Err(error) = self.schedule_route_reclaim(&cold_backing_route) {
+        self.dispatch_cold_backing_delete(route);
+    }
+
+    /// Dispatch the cold backing delete for `route` through the same durable
+    /// owner-local pending-delete queue used for DRAM allocations. Called from
+    /// both the cold-backed authoritative delete path and the post-delete
+    /// storage reclaim scheduler, so a short-lived writer that shuts down
+    /// before draining cannot leak the cold backing's used_bytes. A remote
+    /// owner receives it via the shutdown-retained delete-pending notification.
+    fn dispatch_cold_backing_delete(&self, route: &ObjectRoute) {
+        let Some(cold_backing) = route.cold_backing.as_ref() else {
+            return;
+        };
+        // Preserve the prior local untrack of the cold-only route view.
+        let mut cold_backing_route = route.clone();
+        cold_backing_route.replicas.clear();
+        self.storage_owner.untrack_route(&cold_backing_route);
+        let cold_entry = DeletePendingEntry {
+            route_key: route.key.clone(),
+            identity: None,
+            cold_backing: Some(crate::control_plane::ColdDeleteTarget {
+                owner: cold_backing.owner.clone(),
+                cold_tier_id: cold_backing.cold_tier_id.clone(),
+                object_locator: cold_backing.object_locator.clone(),
+                length: cold_backing.length,
+                checksum: cold_backing.checksum,
+            }),
+            reclaim_grace_ms: self.local_memory.reclaim_grace_ms,
+            prepare_only: false,
+            expected_route_version: Some(route.version),
+        };
+        if cold_backing.owner == self.lease.runtime {
+            if let Err(error) = self
+                .storage_owner
+                .enqueue_delete_pending(std::slice::from_ref(&cold_entry))
+            {
                 warn!(
                     runtime = %self.lease.runtime,
                     key = %route.key.0,
                     error = %error,
-                    "cold backing reclaim scheduling failed after authoritative delete"
+                    "local cold delete pending enqueue failed after authoritative delete"
                 );
             }
+        } else {
+            self.retain_remote_delete_pending_for_shutdown(std::slice::from_ref(&cold_entry));
+            self.async_delete_pending.enqueue(std::slice::from_ref(&cold_entry));
         }
     }
 

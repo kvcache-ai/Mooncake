@@ -80,6 +80,16 @@ impl ColdTierHandle {
     }
 
     pub(in super::super) fn background_tick(storage_owner: &StorageOwnerState) {
+        // Always drain the owner-local cold delete queue first. It is a cheap
+        // point lookup per due token and must not be gated behind cold-tier
+        // enablement or local-device presence: a node that owns cold routes can
+        // otherwise accumulate reclaim tokens it never drains, and under
+        // EmbeddedWrh there is no index-scan fallback.
+        if let Err(error) = storage_owner
+            .process_cold_pending_deletes(super::super::PENDING_DELETE_CONFIRMATION_BATCH)
+        {
+            tracing::warn!(error = %error, "background owner-local cold delete reclaim failed");
+        }
         if super::cold_tier_disabled() {
             storage_owner.record_cold_tier_observability_snapshots();
             return;

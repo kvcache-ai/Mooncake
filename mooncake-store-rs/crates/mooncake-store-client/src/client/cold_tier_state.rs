@@ -396,6 +396,21 @@ struct PendingDeleteGcResult {
     used_bytes_released: u64,
 }
 
+/// Outcome of one owner-side pending-delete cold reclaim attempt. Shared by the
+/// Redis cold-backing index GC and the owner-local cold reclaim queue so both
+/// delete the payload and release used_bytes identically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColdReclaimDisposition {
+    /// Payload deleted, used_bytes released, route CAS advanced or removed.
+    Reclaimed,
+    /// Route not deletable yet (still Active, backing changed, or claim lost).
+    NotEligible,
+    /// Route CAS conflicted with a concurrent writer; retry later.
+    Conflict,
+    /// Route already gone; nothing left to reclaim.
+    Gone,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ColdTierMaintenanceStats {
     pub(crate) devices: BTreeMap<String, BackendMaintenanceStats>,

@@ -20736,13 +20736,14 @@ fn delete_pending_releases_absent_exact_identity() {
         .expect("reservation should succeed");
     let entry = DeletePendingEntry {
         route_key: ObjectKey::new("default::delete-pending-absent"),
-        identity: AllocationRouteIdentity {
+        identity: Some(AllocationRouteIdentity {
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
             offset_bytes: reservation.offset_bytes,
             length_bytes: reservation.length_bytes,
             allocation_id: reservation.allocation_id,
-        },
+        }),
+        cold_backing: None,
         reclaim_grace_ms: 0,
         prepare_only: false,
         expected_route_version: None,
@@ -20808,13 +20809,14 @@ fn delete_pending_queue_backpressure_preserves_pending_publication_recovery() {
     };
     let entry = DeletePendingEntry {
         route_key: ObjectKey::new("default::delete-pending-queue-full"),
-        identity: AllocationRouteIdentity {
+        identity: Some(AllocationRouteIdentity {
             owner: client.runtime_id().clone(),
             segment_name: identity.segment_name.clone(),
             offset_bytes: identity.offset_bytes,
             length_bytes: identity.length_bytes,
             allocation_id: identity.allocation_id,
-        },
+        }),
+        cold_backing: None,
         reclaim_grace_ms: 0,
         prepare_only: false,
         expected_route_version: None,
@@ -20901,13 +20903,14 @@ fn delete_pending_force_notification_overrides_grace_without_blind_release() {
         .expect("reservation should succeed");
     let entry = DeletePendingEntry {
         route_key: ObjectKey::new("default::delete-pending-force"),
-        identity: AllocationRouteIdentity {
+        identity: Some(AllocationRouteIdentity {
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
             offset_bytes: reservation.offset_bytes,
             length_bytes: reservation.length_bytes,
             allocation_id: reservation.allocation_id,
-        },
+        }),
+        cold_backing: None,
         reclaim_grace_ms: 60_000,
         prepare_only: false,
         expected_route_version: None,
@@ -21003,13 +21006,14 @@ fn delete_pending_retains_republished_exact_identity() {
     );
     let entry = DeletePendingEntry {
         route_key: route.key.clone(),
-        identity: AllocationRouteIdentity {
+        identity: Some(AllocationRouteIdentity {
             owner: client.runtime_id().clone(),
             segment_name: reservation.segment_name.clone(),
             offset_bytes: reservation.offset_bytes,
             length_bytes: reservation.length_bytes,
             allocation_id: reservation.allocation_id,
-        },
+        }),
+        cold_backing: None,
         reclaim_grace_ms: 0,
         prepare_only: false,
         expected_route_version: None,

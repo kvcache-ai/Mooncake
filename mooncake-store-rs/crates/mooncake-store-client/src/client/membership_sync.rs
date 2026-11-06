@@ -702,11 +702,13 @@ fn flush_async_delete_pending(
 ) {
     let mut grouped = BTreeMap::<ClientRuntimeId, BTreeSet<DeletePendingEntry>>::new();
     for entry in entries {
-        if entry.identity.owner != *local_runtime {
-            grouped
-                .entry(entry.identity.owner.clone())
-                .or_default()
-                .insert(entry.clone());
+        let owner = match (&entry.identity, &entry.cold_backing) {
+            (Some(identity), _) => identity.owner.clone(),
+            (None, Some(cold)) => cold.owner.clone(),
+            (None, None) => continue,
+        };
+        if owner != *local_runtime {
+            grouped.entry(owner).or_default().insert(entry.clone());
         }
     }
     if grouped.is_empty() {
