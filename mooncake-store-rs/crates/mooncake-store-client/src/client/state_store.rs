@@ -1341,17 +1341,25 @@ impl StorageOwnerState {
         let now_ms = now_ms();
         let mut accepted = 0usize;
         for entry in entries {
-            if entry.identity.owner != self.runtime {
+            if let Some(cold) = entry.cold_backing.as_ref() {
+                accepted = accepted
+                    .saturating_add(self.enqueue_cold_delete_pending(entry, cold, now_ms)?);
+                continue;
+            }
+            let Some(route_identity) = entry.identity.as_ref() else {
+                continue;
+            };
+            if route_identity.owner != self.runtime {
                 return Err(StoreError::InvalidState(format!(
                     "delete pending identity owner {} does not match allocator owner {}",
-                    entry.identity.owner, self.runtime
+                    route_identity.owner, self.runtime
                 )));
             }
             let identity = AllocationIdentity {
-                segment_name: entry.identity.segment_name.clone(),
-                offset_bytes: entry.identity.offset_bytes,
-                length_bytes: entry.identity.length_bytes,
-                allocation_id: entry.identity.allocation_id,
+                segment_name: route_identity.segment_name.clone(),
+                offset_bytes: route_identity.offset_bytes,
+                length_bytes: route_identity.length_bytes,
+                allocation_id: route_identity.allocation_id,
             };
             let allocation = AllocationSpan {
                 segment_name: identity.segment_name.clone(),
@@ -1486,6 +1494,125 @@ impl StorageOwnerState {
                 "delete pending retry scheduled"
             );
         }
+    }
+
+    fn enqueue_cold_delete_pending(
+        &self,
+        entry: &DeletePendingEntry,
+        cold: &crate::control_plane::ColdDeleteTarget,
+        now_ms: u64,
+    ) -> Result<usize> {
+        if cold.owner != self.runtime {
+            return Err(StoreError::InvalidState(format!(
+                "cold delete pending owner {} does not match storage owner {}",
+                cold.owner, self.runtime
+            )));
+        }
+        let identity = cold.clone();
+        let mut pending = self.pending_cold_deletes.lock();
+        if !pending.entries.contains_key(&identity)
+            && pending.entries.len() >= PENDING_DELETE_MAX_ENTRIES
+        {
+            // Unlike DRAM (which has the allocator PendingPublish fence as a
+            // backstop), a dropped cold token under EmbeddedWrh has no fallback
+            // index scan, so surface the drop.
+            warn!(
+                runtime = %self.runtime,
+                limit = PENDING_DELETE_MAX_ENTRIES,
+                cold_tier_id = %identity.cold_tier_id,
+                "dropping best-effort cold delete pending notification because owner queue is full"
+            );
+            return Ok(0);
+        }
+        let inserted = pending.insert(PendingColdDelete {
+            route_key: entry.route_key.clone(),
+            expected_route_version: entry.expected_route_version,
+            prepare_only: entry.prepare_only,
+            identity: identity.clone(),
+            grace_ms: entry.reclaim_grace_ms,
+            prepared_at_ms: now_ms,
+            confirmed_absent_at_ms: None,
+            confirmation_attempts: 0,
+            next_attempt_at_ms: now_ms.saturating_add(entry.reclaim_grace_ms),
+            confirmation_in_progress: false,
+            deferred: false,
+        });
+        Ok(usize::from(inserted))
+    }
+
+    fn claim_due_cold_deletes(&self, now_ms: u64, limit: usize) -> Vec<PendingColdDelete> {
+        self.pending_cold_deletes.lock().claim_due(now_ms, limit)
+    }
+
+    fn complete_cold_delete(&self, identity: &crate::control_plane::ColdDeleteTarget) {
+        self.pending_cold_deletes.lock().complete(identity);
+    }
+
+    fn defer_cold_delete(
+        &self,
+        identity: &crate::control_plane::ColdDeleteTarget,
+        reason: &str,
+    ) {
+        let now_ms = now_ms();
+        let (attempts, became_deferred) = {
+            let mut pending = self.pending_cold_deletes.lock();
+            let Some((_, attempts, became_deferred)) = pending.defer(
+                identity,
+                now_ms,
+                PENDING_DELETE_RETRY_BASE_MS,
+                PENDING_DELETE_RETRY_MAX_MS,
+                PENDING_DELETE_WARN_AFTER_ATTEMPTS,
+            ) else {
+                return;
+            };
+            (attempts, became_deferred)
+        };
+        if became_deferred {
+            warn!(
+                runtime = %self.runtime,
+                cold_tier_id = %identity.cold_tier_id,
+                object_locator = %identity.object_locator,
+                attempts,
+                reason,
+                "cold delete pending remains deferred after bounded retries"
+            );
+        } else {
+            debug!(
+                runtime = %self.runtime,
+                cold_tier_id = %identity.cold_tier_id,
+                attempts,
+                reason,
+                "cold delete pending retry scheduled"
+            );
+        }
+    }
+
+    fn process_cold_pending_deletes(&self, limit: usize) -> Result<usize> {
+        let pending = self.claim_due_cold_deletes(now_ms(), limit);
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut reclaimed = 0usize;
+        for token in &pending {
+            match self.reclaim_queued_cold_delete(&token.route_key, &token.identity) {
+                Ok(true) => {
+                    self.complete_cold_delete(&token.identity);
+                    reclaimed = reclaimed.saturating_add(1);
+                }
+                Ok(false) => {
+                    self.defer_cold_delete(&token.identity, "cold route not deletable yet");
+                }
+                Err(error) => {
+                    self.defer_cold_delete(&token.identity, "cold delete reclaim failed");
+                    debug!(
+                        runtime = %self.runtime,
+                        error = %error,
+                        "cold delete pending reclaim is indeterminate"
+                    );
+                }
+            }
+        }
+        Ok(reclaimed)
     }
 
     fn process_pending_deletes(&self, limit: usize) -> Result<usize> {

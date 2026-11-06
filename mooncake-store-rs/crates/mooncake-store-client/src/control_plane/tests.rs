@@ -1517,7 +1517,7 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
         .expect("sample route should have one replica");
     let delete_entry = super::DeletePendingEntry {
         route_key: delete_route.key.clone(),
-        identity: AllocationRouteIdentity {
+        identity: Some(AllocationRouteIdentity {
             owner: owner.clone(),
             segment_name: delete_replica.segment_name.clone(),
             offset_bytes: delete_replica.segment_offset,
@@ -1525,7 +1525,8 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
             allocation_id: delete_replica
                 .allocation_id
                 .expect("sample route should carry allocation generation"),
-        },
+        }),
+        cold_backing: None,
         reclaim_grace_ms: 0,
         prepare_only: false,
         expected_route_version: Some(delete_route.version),
@@ -2934,7 +2935,7 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
         .expect("sample route should have one replica");
     let delete_entry = super::DeletePendingEntry {
         route_key: delete_route.key.clone(),
-        identity: AllocationRouteIdentity {
+        identity: Some(AllocationRouteIdentity {
             owner: owner.clone(),
             segment_name: delete_replica.segment_name.clone(),
             offset_bytes: delete_replica.segment_offset,
@@ -2942,7 +2943,8 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
             allocation_id: delete_replica
                 .allocation_id
                 .expect("sample route should carry allocation generation"),
-        },
+        }),
+        cold_backing: None,
         reclaim_grace_ms: 0,
         prepare_only: false,
         expected_route_version: Some(delete_route.version),

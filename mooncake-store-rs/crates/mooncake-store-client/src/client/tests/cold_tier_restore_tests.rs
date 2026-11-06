@@ -2680,3 +2680,103 @@ fn cold_tier_data_readable_after_restart_new_epoch() {
     // Cleanup
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn cold_delete_reclaims_used_bytes_via_owner_pending_queue() {
+    // Regression for https://project.aone.alibaba-inc.com/issue/87337500:
+    // deleting a cold-backed object must release the cold device used_bytes.
+    // The cold backing delete now rides the same durable owner-local
+    // pending-delete queue used for DRAM allocations; the owner-side drain is a
+    // point lookup by route key (no metadata scan, no Redis pending-delete
+    // index), so it works under EmbeddedWrh and for short-lived writers.
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root = cold_tier_test_root("cold-delete-owner-queue");
+    let device_id = "cold-delete-owner-queue";
+    let client = StoreClientBuilder::new(metadata.clone(), device_id)
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "cold-delete-owner-queue-segment",
+        )))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(512)
+                .scratch_bytes(4096)
+                .alignment(1)
+                // grace 0 keeps the queued cold reclaim immediately due.
+                .reclaim_grace_ms(0)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .cold_tier_target(ColdTierTargetConfig::directory(
+            device_id,
+            ColdTierKind::Ssd,
+            root.clone(),
+        ))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let payload = b"cold-delete-payload";
+    let route = client
+        .put("cold-delete-key", payload)
+        .expect("put should succeed");
+    wait_for_storage_clock_route(&client, &route, false);
+    let backing = wait_for_materialized_cold_backing(&client, "cold-delete-key");
+
+    let scoped = metadata
+        .for_tenant("default")
+        .expect("for_tenant should return Some");
+    let device_before = scoped
+        .get_cold_tier_device(device_id)
+        .expect("device lookup should succeed")
+        .expect("cold device should exist");
+    assert!(
+        device_before.used_bytes >= backing.length,
+        "cold used_bytes should include the materialized backing: used={} length={}",
+        device_before.used_bytes,
+        backing.length
+    );
+
+    client
+        .remove("cold-delete-key", true)
+        .expect("remove should publish the logical delete");
+
+    // Drive the owner-local cold reclaim queue until used_bytes is released.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let device_after = loop {
+        let _ = client.storage_owner.process_cold_pending_deletes(64);
+        let device = scoped
+            .get_cold_tier_device(device_id)
+            .expect("device lookup should succeed")
+            .expect("cold device should exist");
+        if device.used_bytes + backing.length <= device_before.used_bytes {
+            break device;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cold used_bytes was not released after delete: used={}",
+            device.used_bytes
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        device_after.used_bytes + backing.length,
+        device_before.used_bytes,
+        "cold used_bytes must be released after reclaim (this was the leak)"
+    );
+    assert!(
+        client
+            .storage_owner
+            .pending_cold_deletes
+            .lock()
+            .entries
+            .is_empty(),
+        "cold pending queue should be drained after reclaim"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}

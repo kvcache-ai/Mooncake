@@ -135,6 +135,9 @@ impl StorageOwnerState {
             initial_cold_backing_repair_at_ms: AtomicU64::new(0),
             pending_evictions: parking_lot::Mutex::new(BTreeMap::new()),
             pending_deletes: parking_lot::Mutex::new(super::super::PendingDeleteQueue::default()),
+            pending_cold_deletes: parking_lot::Mutex::new(
+                super::super::PendingColdDeleteQueue::default(),
+            ),
             pending_delete_next_due_at_ms: AtomicU64::new(u64::MAX),
             pending_publication_authority_retry: parking_lot::Mutex::new(
                 super::super::PendingPublicationAuthorityRetry::default(),

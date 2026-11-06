@@ -426,6 +426,7 @@ message DeletePendingEntry {
   uint64 reclaim_grace_ms = 3;
   bool prepare_only = 4;
   optional uint64 expected_route_version = 5;
+  ColdBackingRoute cold_backing = 6;
 }
 
 message BatchNotifyDeletePendingRequest {

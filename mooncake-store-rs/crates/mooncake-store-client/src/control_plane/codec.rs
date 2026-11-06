@@ -135,7 +135,18 @@ pub(super) fn try_allocation_route_identity(
 pub(super) fn pb_delete_pending_entry(entry: &DeletePendingEntry) -> pb::DeletePendingEntry {
     pb::DeletePendingEntry {
         route_key: entry.route_key.0.clone(),
-        identity: Some(pb_allocation_route_identity(&entry.identity)),
+        identity: entry.identity.as_ref().map(pb_allocation_route_identity),
+        cold_backing: entry.cold_backing.as_ref().map(|target| {
+            pb_cold_backing_route(&mooncake_store_core::ColdBackingRoute {
+                owner: target.owner.clone(),
+                cold_tier_id: target.cold_tier_id.clone(),
+                object_locator: target.object_locator.clone(),
+                length: target.length,
+                checksum: target.checksum,
+                state: mooncake_store_core::ColdBackingState::PendingDelete,
+                replicas: Vec::new(),
+            })
+        }),
         reclaim_grace_ms: entry.reclaim_grace_ms,
         prepare_only: entry.prepare_only,
         expected_route_version: entry.expected_route_version.map(|version| version.0),
@@ -153,13 +164,27 @@ pub(super) fn try_delete_pending_entry(
     let identity = entry
         .identity
         .map(try_allocation_route_identity)
+        .transpose()?;
+    let cold_backing = entry
+        .cold_backing
+        .map(try_cold_backing_route)
         .transpose()?
-        .ok_or_else(|| {
-            StoreError::Transport("delete pending entry is missing identity".to_string())
-        })?;
+        .map(|route| ColdDeleteTarget {
+            owner: route.owner,
+            cold_tier_id: route.cold_tier_id,
+            object_locator: route.object_locator,
+            length: route.length,
+            checksum: route.checksum,
+        });
+    if identity.is_none() && cold_backing.is_none() {
+        return Err(StoreError::Transport(
+            "delete pending entry is missing identity and cold backing".to_string(),
+        ));
+    }
     Ok(DeletePendingEntry {
         route_key: ObjectKey::new(entry.route_key),
         identity,
+        cold_backing,
         reclaim_grace_ms: entry.reclaim_grace_ms,
         prepare_only: entry.prepare_only,
         expected_route_version: entry
