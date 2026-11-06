@@ -1217,10 +1217,9 @@ impl StoreClient {
             {
                 Ok(cas) => cas,
                 Err(error) => {
-                    self.best_effort_release_reserved_allocations(
-                        &targets,
+                    self.release_only_legacy_reservations_after_unknown_route_publish(
                         &reservations,
-                        "explicit_migration_route_cas_error",
+                        "explicit_migration_route_cas_outcome_unknown",
                     );
                     return Err(error);
                 }
