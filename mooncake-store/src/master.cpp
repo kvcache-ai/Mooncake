@@ -812,20 +812,15 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     }
 
     // Determine RPC server port with compatibility warnings
-    int rpc_port;
-    if (FLAGS_rpc_port > 0) {
-        rpc_port = FLAGS_rpc_port;
-        if (FLAGS_port != 50051) {  // 50051 is the default value
-            LOG(WARNING) << "Both rpc_port and port are set. "
-                         << "Using rpc_port=" << FLAGS_rpc_port
-                         << ". Please migrate to use rpc_port only.";
-        }
-        master_config.rpc_port = rpc_port;
-    } else {
-        if (!conf_set) {
-            master_config.rpc_port = FLAGS_port;
-        }
+    if (FLAGS_rpc_port > 0 && FLAGS_port != 50051) {  // 50051 is the default
+        LOG(WARNING) << "Both rpc_port and port are set. "
+                     << "Using rpc_port=" << FLAGS_rpc_port
+                     << ". Please migrate to use rpc_port only.";
     }
+    // A config file without rpc_port leaves it at the flag's 0, which must
+    // fall back to --port like the command line does.
+    master_config.rpc_port = mooncake::ResolveMasterRpcPort(
+        FLAGS_rpc_port, conf_set ? master_config.rpc_port : 0, FLAGS_port);
 
     google::CommandLineFlagInfo info;
     if ((google::GetCommandLineFlagInfo("enable_cxl", &info) &&
