@@ -27,7 +27,6 @@
 #include <sys/mman.h>
 
 #if defined(USE_CUDA)
-#include <bits/stdint-uintn.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "cuda_alike.h"
@@ -93,20 +92,6 @@ static mooncake::Status releaseFinishedBatch(mooncake::TransferEngine& engine,
     mooncake::Status status = engine.freeBatchID(batch_id);
     if (status.IsBatchCleanupDeferred()) return mooncake::Status::OK();
     return status;
-}
-
-volatile bool g_te_running = true;
-volatile bool g_te_triggered_sig = false;
-
-void signalHandlerV0(int signum) {
-    if (g_te_triggered_sig) {
-        LOG(ERROR) << "Received signal " << signum
-                   << " again, forcefully terminating...";
-        std::exit(EXIT_FAILURE);
-    }
-    LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_te_running = false;
-    g_te_triggered_sig = true;
 }
 
 #ifdef __linux__
@@ -609,8 +594,6 @@ int TEBenchRunner::freeBuffers() {
 }
 
 TEBenchRunner::TEBenchRunner() {
-    signal(SIGINT, signalHandlerV0);
-    signal(SIGTERM, signalHandlerV0);
     // Disable auto-discovery when an explicit non-RDMA xport is requested
     // (e.g. flagcx, shm) so we can installTransport() ourselves below.
     bool auto_disc = XferBenchConfig::xport_type != "flagcx" &&
@@ -667,26 +650,8 @@ int TEBenchRunner::runTarget() {
         LOG(ERROR) << "Target cannot start: initialization failed";
         return -1;
     }
-    while (g_te_running) sleep(1);
+    while (!stopRequested()) sleep(1);
     return 0;
-}
-
-size_t TEBenchRunner::targetIndex(int thread_id) const {
-    LOG_ASSERT(!target_handles_.empty());
-    return static_cast<size_t>(thread_id) % target_handles_.size();
-}
-
-int TEBenchRunner::localTargetThreadId(int thread_id) const {
-    LOG_ASSERT(!target_handles_.empty());
-    return thread_id / static_cast<int>(target_handles_.size());
-}
-
-uint64_t TEBenchRunner::getTargetSegmentId(int thread_id) const {
-    return target_handles_[targetIndex(thread_id)];
-}
-
-size_t TEBenchRunner::getTargetCount() const {
-    return std::max<size_t>(target_handles_.size(), 1);
 }
 
 int TEBenchRunner::startInitiator(int num_threads) {
@@ -712,24 +677,7 @@ int TEBenchRunner::startInitiator(int num_threads) {
         target_handles_.push_back(handle);
         target_infos_.push_back(std::move(info));
     }
-    threads_.resize(num_threads);
-    g_te_running = true;
-    current_task_.resize(threads_.size());
-    for (size_t i = 0; i < threads_.size(); ++i)
-        threads_[i] = std::thread(&TEBenchRunner::runner, this, i);
-    return 0;
-}
-
-int TEBenchRunner::stopInitiator() {
-    {
-        std::unique_lock<std::mutex> lk(mtx_);
-        g_te_running = false;
-        cv_task_.notify_all();
-        cv_done_.notify_all();
-    }
-    for (auto& thread : threads_) {
-        thread.join();
-    }
+    startWorkers(num_threads);
     return 0;
 }
 
@@ -767,43 +715,6 @@ void TEBenchRunner::pinThread(int thread_id) {
     }
 }
 
-int TEBenchRunner::runner(int thread_id) {
-    while (g_te_running) {
-        std::function<int(int)> task;
-        {
-            std::unique_lock<std::mutex> lk(mtx_);
-            cv_task_.wait(
-                lk, [&] { return !g_te_running || current_task_[thread_id]; });
-            if (!g_te_running) break;
-            std::swap(task, current_task_[thread_id]);
-        }
-        if (task) task(thread_id);
-        {
-            std::unique_lock<std::mutex> lk(mtx_);
-            if (--pending_ == 0) cv_done_.notify_all();
-        }
-    }
-    return 0;
-}
-
-int TEBenchRunner::runInitiatorTasks(
-    const std::function<int(int /* thread_id */)>& func) {
-    std::unique_lock<std::mutex> lk(mtx_);
-    for (size_t id = 0; id < current_task_.size(); ++id)
-        current_task_[id] = func;
-    pending_ = (int)threads_.size();
-    cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return !g_te_running || pending_ == 0; });
-    return g_te_running ? 0 : -1;
-}
-
-void TEBenchRunner::noteTransferFailed() {
-    std::lock_guard<std::mutex> lk(mtx_);
-    g_te_running = false;
-    cv_task_.notify_all();
-    cv_done_.notify_all();
-}
-
 // How long a stopped run keeps waiting for a batch already handed to the
 // transports before abandoning it. A second SIGINT still exits immediately.
 static constexpr uint64_t kStopDrainTimeoutUs = 5ull * 1000 * 1000;
@@ -825,7 +736,7 @@ mooncake::Status TEBenchRunner::waitForBatch(BatchID batch_id,
             status.s != TransferStatusEnum::PENDING) {
             return mooncake::Status::OK();
         }
-        if (g_te_running) continue;
+        if (running()) continue;
         if (!stop_seen) {
             stop_seen = true;
             since_stop.reset();
@@ -845,7 +756,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
                                         IntentType intent_type) {
     (void)deadline_ns;
     (void)intent_type;
-    if (!g_te_running) return -1.0;
+    if (!running()) return -1.0;
     auto batch_id = engine_->allocateBatchID(batch_size);
     std::vector<TransferRequest> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
