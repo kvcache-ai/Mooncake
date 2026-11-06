@@ -78,18 +78,43 @@ AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                                  const AllocatedBuffer::Descriptor& descriptor)
     : allocator_(std::move(allocator)),
       buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
-      size_(descriptor.size_),
-      protocol(descriptor.protocol_) {
-    if (protocol == "cxl") {
-        segment_name_ = descriptor.transport_endpoint_;
+      size_(descriptor.size_) {
+    if (descriptor.protocol_ == "cxl") {
+        protocol_ = std::make_unique<ProtocolState>();
+        protocol_->kind = BufferProtocol::kCxl;
+        protocol_->value = descriptor.transport_endpoint_;
+    } else if (descriptor.protocol_ != "tcp") {
+        // Keep a protocol this build does not know so the descriptor still
+        // round-trips through restore unchanged.
+        protocol_ = std::make_unique<ProtocolState>();
+        protocol_->kind = BufferProtocol::kOther;
+        protocol_->value = descriptor.protocol_;
     }
 }
 
+std::string_view AllocatedBuffer::protocolName() const noexcept {
+    if (!protocol_) return "tcp";
+    switch (protocol_->kind) {
+        case BufferProtocol::kCxl:
+            return "cxl";
+        case BufferProtocol::kOther:
+            return protocol_->value;
+        case BufferProtocol::kTcp:
+            break;
+    }
+    return "tcp";
+}
+
 bool AllocatedBuffer::copyTransferProtocolFrom(const AllocatedBuffer& source) {
-    if (protocol == "cxl" || source.protocol == "cxl") {
+    if (protocolKind() == BufferProtocol::kCxl ||
+        source.protocolKind() == BufferProtocol::kCxl) {
         return false;
     }
-    protocol = source.protocol;
+    if (!source.protocol_) {
+        protocol_.reset();
+        return true;
+    }
+    protocol_ = std::make_unique<ProtocolState>(*source.protocol_);
     return true;
 }
 
@@ -104,8 +129,8 @@ std::string AllocatedBuffer::getTransportEndpoint(
         LOG(ERROR) << "allocator=expired_or_null in getTransportEndpoint";
     }
 
-    if (this->protocol == "cxl") {
-        endpoint = this->segment_name_;
+    if (protocolKind() == BufferProtocol::kCxl) {
+        endpoint = protocol_->value;
     }
     return endpoint;
 }
@@ -114,15 +139,22 @@ std::string AllocatedBuffer::getTransportEndpoint(
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
     std::optional<SegmentLocality>* locality) const {
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol,
-            getTransportEndpoint(locality)};
+            reinterpret_cast<uintptr_t>(buffer_ptr_),
+            std::string(protocolName()), getTransportEndpoint(locality)};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
+    // Build the state first. It is the only step that can throw, and a buffer
+    // whose address is already an offset but whose protocol is still TCP would
+    // be freed at the wrong address during unwinding (see
+    // CachelibBufferAllocator::deallocate).
+    auto state = std::make_unique<ProtocolState>();
+    state->kind = BufferProtocol::kCxl;
+    state->value = std::move(client_segment_name);
+
     uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
     buffer_ptr_ = reinterpret_cast<void*>(offset_raw - DEFAULT_CXL_BASE);
-    protocol = "cxl";
-    segment_name_ = client_segment_name;
+    protocol_ = std::move(state);
 }
 
 void* AllocatedBuffer::get_vaddr_from_cxl() {
