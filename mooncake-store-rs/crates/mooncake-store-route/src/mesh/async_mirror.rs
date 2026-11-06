@@ -22,6 +22,7 @@ fn mirror_queue_capacity() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+        .map(|value| value.min(65_536))
         .unwrap_or(QUEUE_CAPACITY)
 }
 
@@ -36,6 +37,7 @@ fn mirror_retry_attempts() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+        .map(|value| value.min(8))
         .unwrap_or(3)
 }
 
@@ -43,6 +45,7 @@ fn mirror_retry_base_delay() -> Duration {
     let millis = std::env::var("MC_STORE_RS_DELETE_MARKER_RETRY_BASE_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.min(1_000))
         .unwrap_or(50);
     Duration::from_millis(millis)
 }
@@ -317,7 +320,11 @@ pub(crate) fn mirror_secondary_batch(
                 record_delete_marker_event("propagation_retry", 1);
             }
             let shift = attempt.min(10) as u32;
-            std::thread::sleep(base_delay.saturating_mul(1u32 << shift));
+            std::thread::sleep(
+                base_delay
+                    .saturating_mul(1u32 << shift)
+                    .min(Duration::from_secs(2)),
+            );
             continue;
         }
         if is_delete_marker {
@@ -529,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_drops_when_queue_full() {
+    fn enqueue_overwrites_oldest_when_queue_is_full() {
         let client = RecordingAuthorityClient::new();
         let membership = Arc::new(NoopMembership);
         let worker = AsyncRouteMirrorWorker::spawn(

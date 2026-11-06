@@ -2851,6 +2851,50 @@ mod owner_page_contract_tests {
     }
 
     #[test]
+    fn delete_marker_fanout_uses_current_and_retained_top_2k_union() {
+        let observer = test_lease("observer-delete-fanout");
+        let current = (0..6)
+            .map(|index| test_lease(&format!("current-{index}")))
+            .collect::<Vec<_>>();
+        let retained = (0..6)
+            .map(|index| test_lease(&format!("retained-{index}")))
+            .collect::<Vec<_>>();
+        let key = ObjectKey::new("delete-fanout-key".to_string());
+        let membership = Arc::new(RetainedMembership {
+            current: current.clone(),
+            retained: retained.clone(),
+        });
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::new(),
+            }),
+            membership,
+        );
+
+        let actual = directory
+            .delete_marker_fanout_authorities(&observer, &key, &current)
+            .into_iter()
+            .map(|lease| lease.runtime.stable_id.0)
+            .collect::<BTreeSet<_>>();
+        let expected = ranked_top_authorities(&directory.namespace, &current, &key, 4)
+            .into_iter()
+            .chain(ranked_top_authorities(
+                &directory.namespace,
+                &retained,
+                &key,
+                4,
+            ))
+            .map(|lease| lease.runtime.stable_id.0)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn exact_replica_confirmation_rejects_changed_authority_membership() {
         let observer = test_lease("observer");
         let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));

@@ -61,14 +61,6 @@ pub(crate) fn authority_get(
     LocalRouteAuthority::new(namespace, authority.clone()).get_route(key)
 }
 
-pub(crate) fn authority_get_many(
-    namespace: &str,
-    authority: &ClientStableId,
-    keys: &[ObjectKey],
-) -> Result<Vec<Option<ObjectRoute>>> {
-    LocalRouteAuthority::new(namespace, authority.clone()).get_routes(keys)
-}
-
 pub(crate) fn authority_get_record(
     namespace: &str,
     authority: &ClientStableId,
