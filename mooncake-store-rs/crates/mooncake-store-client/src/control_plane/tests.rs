@@ -120,13 +120,13 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
         let mut routes = Vec::with_capacity(limit);
         for route in route_table
             .range::<str, _>((start, Bound::Unbounded))
-            .filter_map(|(_, route)| {
+            .filter(|(_, route)| {
                 route
                     .replicas
                     .iter()
                     .any(|replica| &replica.owner == owner)
-                    .then(|| route.clone())
             })
+            .map(|(_, route)| route.clone())
         {
             if routes.len() == limit {
                 return Ok(mooncake_store_route::RouteOwnerPage {

@@ -1509,11 +1509,13 @@ fn pending_offloads_balance_and_write_distinct_targets_concurrently() {
     let root_a = cold_tier_test_root("parallel-offload-a");
     let root_b = cold_tier_test_root("parallel-offload-b");
     let probe = Arc::new(ConcurrentColdWriteProbe::default());
-    let mut rate_limits = ColdTierRateLimitConfig::default();
-    rate_limits.offload_runtime_max_in_flight = 16;
-    rate_limits.offload_device_max_in_flight = 8;
-    rate_limits.offload_runtime_ops_per_sec = 10_000;
-    rate_limits.offload_device_ops_per_sec = 10_000;
+    let rate_limits = ColdTierRateLimitConfig {
+        offload_runtime_max_in_flight: 16,
+        offload_device_max_in_flight: 8,
+        offload_runtime_ops_per_sec: 10_000,
+        offload_device_ops_per_sec: 10_000,
+        ..ColdTierRateLimitConfig::default()
+    };
     let client = StoreClientBuilder::new(metadata, "parallel-offload")
         .state(ClientLifecycleState::Active)
         .label("storage", "true")

@@ -131,26 +131,6 @@ fn decode_allocation_route_references_reply(
     ))
 }
 
-#[cfg(test)]
-mod owner_page_decode_tests {
-    use super::*;
-
-    #[test]
-    fn owner_route_reply_rejects_oversized_pages_before_decoding() {
-        let routes = (0..=mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE)
-            .map(|_| pb::ObjectRoute::default())
-            .collect();
-        let error = decode_route_list_by_replica_owner_reply(pb::ListRoutesByReplicaOwnerReply {
-            routes,
-            error: None,
-            next_cursor: None,
-            snapshot_epoch: None,
-        })
-        .expect_err("an oversized transport page must fail closed");
-        assert!(matches!(error, StoreError::Transport(_)));
-    }
-}
-
 impl ControlPlaneClient {
     pub(crate) fn new() -> Result<Self> {
         Self::with_request_timeout(control_request_timeout_from_env())
@@ -1650,4 +1630,24 @@ impl ControlPlaneClient {
         }
     }
 
+}
+
+#[cfg(test)]
+mod owner_page_decode_tests {
+    use super::*;
+
+    #[test]
+    fn owner_route_reply_rejects_oversized_pages_before_decoding() {
+        let routes = (0..=mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+            .map(|_| pb::ObjectRoute::default())
+            .collect();
+        let error = decode_route_list_by_replica_owner_reply(pb::ListRoutesByReplicaOwnerReply {
+            routes,
+            error: None,
+            next_cursor: None,
+            snapshot_epoch: None,
+        })
+        .expect_err("an oversized transport page must fail closed");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
 }

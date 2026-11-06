@@ -6,7 +6,7 @@ fn routed_status_writer(
 ) -> (StoreClient, StoreClient, Arc<TestTransport>) {
     let storage_transport = Arc::new(TestTransport::new(&format!("{name}-storage-segment")));
     let writer_transport = Arc::new(storage_transport.peer(&format!("{name}-writer-segment")));
-    let storage = StoreClientBuilder::new(metadata.clone(), &format!("{name}-storage"))
+    let storage = StoreClientBuilder::new(metadata.clone(), format!("{name}-storage"))
         .state(ClientLifecycleState::Active)
         .label("storage", "true")
         .live_client_sync_interval(fast_live_client_sync_interval())
