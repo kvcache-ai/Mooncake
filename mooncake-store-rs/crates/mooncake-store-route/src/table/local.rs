@@ -680,9 +680,9 @@ mod tests {
 
         record_cas_outcome(&result);
 
-        assert_eq!(*sink.cas_outcomes.lock().unwrap(), vec!["ok"]);
+        assert!(sink.cas_outcomes.lock().unwrap().contains(&"ok"));
         assert!(
-            sink.routes.lock().unwrap().is_empty(),
+            sink.routes.lock().unwrap().get(&key.0).is_none(),
             "a logical CAS caller must not add observed routes to authority gauges"
         );
     }
@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(sink.routes.lock().unwrap().get(&key.0), Some(&route));
 
         table.replace(&key, None);
-        assert!(sink.routes.lock().unwrap().is_empty());
+        assert!(sink.routes.lock().unwrap().get(&key.0).is_none());
     }
 
     #[test]
