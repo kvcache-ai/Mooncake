@@ -22,7 +22,8 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use mooncake_store_client::{
-    LocalMemoryConfig, MooncakeCompatibilityFacade, PutRequest, StoreClient, StoreClientBuilder,
+    LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner, PutRequest,
+    ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
 use mooncake_store_core::{
     ClientLifecycleState, CompatibilityDescriptor, MetadataBackend, TenantPolicy,
@@ -40,6 +41,15 @@ fn bench_storage_config() -> LocalMemoryConfig {
     LocalMemoryConfig::new()
         .numa_aware(false)
         .storage_bytes(64 * 1024)
+        .scratch_bytes(4 * 1024)
+        .alignment(1)
+        .reclaim_grace_ms(0)
+}
+
+fn remote_bench_storage_config() -> LocalMemoryConfig {
+    LocalMemoryConfig::new()
+        .numa_aware(false)
+        .storage_bytes(16 * 1024 * 1024)
         .scratch_bytes(4 * 1024)
         .alignment(1)
         .reclaim_grace_ms(0)
@@ -82,6 +92,55 @@ fn build_active_client_with_lifecycle(
         .register_local_memory()
         .expect("bench local memory registration should succeed");
     client
+}
+
+fn build_remote_lifecycle_pair(lifecycle_enabled: bool) -> (StoreClient, StoreClient) {
+    let metadata: Arc<InMemoryMetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+    let owner_transport = Arc::new(TestTransport::new("allocation-lifecycle-remote-owner"));
+    let writer_transport = Arc::new(owner_transport.peer("allocation-lifecycle-remote-writer"));
+    let mut owner_compatibility = CompatibilityDescriptor::mooncake_v1();
+    if !lifecycle_enabled {
+        owner_compatibility
+            .capabilities
+            .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    }
+    let owner = StoreClientBuilder::new(
+        metadata.clone() as Arc<dyn MetadataBackend>,
+        "allocation-lifecycle-remote-owner",
+    )
+    .state(ClientLifecycleState::Active)
+    .tenant("tenant-allocation-lifecycle-remote")
+    .label("pool", "bench-pool")
+    .label("storage", "true")
+    .segment_name("allocation-lifecycle-remote-owner-segment")
+    .transport(owner_transport)
+    .local_memory(remote_bench_storage_config())
+    .compatibility(owner_compatibility)
+    .build(test_future_expiry_ms())
+    .expect("remote lifecycle owner should build");
+    owner
+        .register_local_memory()
+        .expect("remote lifecycle owner should register memory");
+
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+    let writer = StoreClientBuilder::new(
+        metadata as Arc<dyn MetadataBackend>,
+        "allocation-lifecycle-remote-writer",
+    )
+    .state(ClientLifecycleState::Active)
+    .tenant("tenant-allocation-lifecycle-remote")
+    .label("pool", "bench-pool")
+    .label("storage", "false")
+    .segment_name("allocation-lifecycle-remote-writer-segment")
+    .transport(writer_transport)
+    .local_memory(remote_bench_storage_config())
+    .routed_writes(planner, 1)
+    .build(test_future_expiry_ms())
+    .expect("remote lifecycle writer should build");
+    writer
+        .register_local_memory()
+        .expect("remote lifecycle writer should register memory");
+    (owner, writer)
 }
 
 fn install_generous_quota_policy(metadata: &Arc<InMemoryMetadataBackend>, tenant: &str) {
@@ -186,6 +245,34 @@ fn bench_allocation_lifecycle_single_put(c: &mut Criterion) {
                 client
                     .put_in_tenant("tenant-allocation-lifecycle", &key, &value)
                     .expect("allocation lifecycle put should succeed");
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_allocation_lifecycle_remote_put(c: &mut Criterion) {
+    let value = small_payload(64);
+    let policy = ReplicationPolicy::new().prefer_local(false);
+    let mut group = c.benchmark_group("put_allocation_lifecycle_remote");
+    group.throughput(Throughput::Bytes(value.len() as u64));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(50);
+
+    for (name, lifecycle_enabled) in [("legacy", false), ("lifecycle", true)] {
+        let (_owner, client) = build_remote_lifecycle_pair(lifecycle_enabled);
+        client
+            .put_with_policy("__bench_remote_warmup__", b"warm", &policy)
+            .expect("remote lifecycle warmup should succeed");
+
+        let mut counter = 0u64;
+        group.bench_with_input(BenchmarkId::new("put_64B", name), &client, |b, client| {
+            b.iter(|| {
+                counter = counter.wrapping_add(1);
+                let key = format!("remote-k-{counter}");
+                client
+                    .put_with_policy(&key, &value, &policy)
+                    .expect("remote allocation lifecycle put should succeed");
             });
         });
     }
@@ -385,6 +472,7 @@ criterion_group!(
     multi_tenant_perf,
     bench_put_baseline_single_tenant_default_scope,
     bench_allocation_lifecycle_single_put,
+    bench_allocation_lifecycle_remote_put,
     bench_put_single_tenant_non_default_scope,
     bench_put_multi_tenant_strict_quota_hot_cache,
     bench_batch_put_multi_tenant,
