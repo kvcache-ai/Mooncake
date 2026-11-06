@@ -3026,9 +3026,11 @@ fn test_storage_owner_state(
         expires_at_ms: test_future_expiry_ms(),
     };
     let route_directory = build_route_directory(
-        RouteControlMode::MetadataOnly,
-        2,
-        128 * 1024 * 1024,
+        crate::route_directory::RouteDirectoryBuildConfig {
+            mode: RouteControlMode::MetadataOnly,
+            route_topk: 2,
+            delete_marker_budget_bytes: 64 * 1024 * 1024,
+        },
         metadata.clone(),
         &lease,
         control_client.clone(),
