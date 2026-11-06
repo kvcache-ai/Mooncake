@@ -175,9 +175,13 @@ constexpr int kNoSlot = 0xffff;
 // (num_topk <= kWarpSize). Each destination rank gets the token once in its
 // token list, and each pick goes under its expert with that list position, so
 // the receiver pulls the token once whichever of its experts picked it.
+// Returns in `first_dst` the lane's destination rank if the lane is the first
+// to name it (else -1), and in `first_pos` the token's position in that
+// rank's list.
 XPU_EP_INLINE void list_picks(const DispatchArgs& a, sycl::sub_group sg,
                               int lane, int t, int T, int num_local, int* lists,
-                              int* rank_lists, int32_t* rank_picks) {
+                              int* rank_lists, int32_t* rank_picks,
+                              int& first_dst, int& first_pos) {
     const bool live = lane < a.num_topk;
     const size_t k = static_cast<size_t>(t) * a.num_topk + lane;
     const int e = live ? static_cast<int>(a.topk_idx[k]) : -1;
@@ -189,6 +193,8 @@ XPU_EP_INLINE void list_picks(const DispatchArgs& a, sycl::sub_group sg,
     if (dst >= 0 && first == lane)
         pos = device_atomic<int>(a.counter_per_rank[dst]).fetch_add(1);
     pos = sycl::select_from_group(sg, pos, first);
+    first_dst = first == lane ? dst : -1;
+    first_pos = pos;
 
     int slot = -1;
     if (e >= 0) {
@@ -228,6 +234,9 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                              a.num_experts, a.num_ranks);
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int, 1> s_last(1, h);
+        // Hybrid: the remote ranks the current token goes to, as
+        // rank | position in its list << 16, and their number.
+        sycl::local_accessor<int, 1> s_out(kWarpSize + 1, h);
         h.parallel_for(
             sycl::nd_range<1>(static_cast<size_t>(num_wgs) * kWGSize, kWGSize),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarpSize)]] {
@@ -239,6 +248,7 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                 const int T = a.num_max_dispatch_tokens_per_rank;
                 const int num_local = a.num_experts / a.num_ranks;
                 const int hidden = a.hidden;
+                const int* remote = a.peers.remote;
                 const int n_vec = hidden / 8;  // 16-byte BF16 chunks
                 auto* counts = reinterpret_cast<int*>(a.staging + st.counts);
                 auto* lists = reinterpret_cast<int*>(a.staging + st.lists);
@@ -258,9 +268,19 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                 }
 
                 for (int t = wg; t < a.num_tokens; t += num_wgs) {
-                    if (warp == 0)
+                    if (warp == 0) {
+                        int dst, pos;
                         list_picks(a, sg, lane, t, T, num_local, lists,
-                                   rank_lists, rank_picks);
+                                   rank_lists, rank_picks, dst, pos);
+                        if (remote) {
+                            const int out = dst >= 0 && remote[dst];
+                            const int i = sycl::exclusive_scan_over_group(
+                                sg, out, sycl::plus<int>());
+                            if (out) s_out[i] = dst | (pos << 16);
+                            if (lane == kWarpSize - 1)
+                                s_out[kWarpSize] = i + out;
+                        }
+                    }
 
                     uint8_t* msg = a.staging + t * msg_bytes;
                     const auto* xv = reinterpret_cast<const vec4*>(
@@ -304,6 +324,19 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                             }
                         }
                     }
+                    if (remote) {
+                        // Copy the message to the outbox of each remote rank
+                        // it goes to; the proxy writes these out.
+                        sycl::group_barrier(it.get_group());
+                        for (int i = 0; i < s_out[kWarpSize]; ++i) {
+                            const size_t dst = s_out[i] & 0xffff;
+                            const size_t pos = s_out[i] >> 16;
+                            coop_copy(a.staging + st.outbox +
+                                          (dst * T + pos) * msg_bytes,
+                                      msg, msg_bytes, tid, kWGSize);
+                        }
+                        sycl::group_barrier(it.get_group());
+                    }
                 }
 
                 if (!arrive_last(it, a.done_counter, &s_last[0])) return;
@@ -318,6 +351,7 @@ sycl::event dispatch_send_impl(sycl::queue& q, const DispatchArgs a) {
                     rank_counts[r] =
                         device_atomic<int>(a.counter_per_rank[r]).load();
                     a.counter_per_rank[r] = 0;
+                    if (a.host_counts) a.host_counts[r] = rank_counts[r];
                 }
                 sycl::group_barrier(it.get_group());
                 // Each rank's flag carries how many tokens this rank sends it.
@@ -349,7 +383,6 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
     // it pulls, and the source's flag carries the token count.
     const int num_local = a.num_experts / a.num_ranks;
     const size_t msg_bytes = dispatch_msg_bytes(a.hidden, kUseFP8);
-    const size_t stage_bytes = dispatch_msg_bytes(a.hidden, false);
     const size_t hidden_bytes =
         kUseFP8 ? a.hidden : static_cast<size_t>(a.hidden) * kBf16Size;
     const DispatchStaging st(a.hidden, a.num_max_dispatch_tokens_per_rank,
@@ -368,12 +401,17 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                 const int slots = a.num_ranks * T;
                 const int src_rank = static_cast<int>(it.get_group(0));
                 const uint8_t* src = rebase(a.peers, a.staging, src_rank);
+                // A rank on another node has written what this rank would
+                // have read from its staging into landing[src_rank], and its
+                // messages into the local stage.
+                const bool pushed =
+                    !src && a.peers.remote && a.peers.remote[src_rank];
 
                 // An unmapped peer (inactive at connect) never posts a flag;
                 // an inactive rank contributes no tokens.
                 if (tid == 0)
                     s_flag[0] =
-                        src == nullptr
+                        src == nullptr && !pushed
                             ? 0
                             : wait_flag(a.ready + src_rank * kReadyStride,
                                         a.active_ranks, src_rank,
@@ -382,38 +420,54 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                 const bool ok = s_flag[0] != 0;
                 const int n = ok ? s_flag[0] - 1 : 0;
                 if (a.recv.count && tid == 0) a.recv.count[src_rank] = n;
-                if (!ok) src = nullptr;
+
+                // This rank's counts, lists, token list and picks from the
+                // source, in its staging or in the landing zone.
+                const int *counts = nullptr, *lists = nullptr,
+                          *rank_list = nullptr;
+                const int32_t* rank_picks = nullptr;
+                if (ok && pushed) {
+                    const uint8_t* land =
+                        a.staging + st.landing +
+                        static_cast<size_t>(src_rank) * st.land.bytes;
+                    counts =
+                        reinterpret_cast<const int*>(land + st.land.counts);
+                    lists = reinterpret_cast<const int*>(land + st.land.lists);
+                    rank_list =
+                        reinterpret_cast<const int*>(land + st.land.rank_list);
+                    rank_picks =
+                        reinterpret_cast<const int32_t*>(land + st.land.picks);
+                } else if (ok) {
+                    counts = reinterpret_cast<const int*>(src + st.counts) +
+                             a.rank * num_local;
+                    lists = reinterpret_cast<const int*>(src + st.lists) +
+                            static_cast<size_t>(a.rank) * num_local * T;
+                    rank_list =
+                        reinterpret_cast<const int*>(src + st.rank_lists) +
+                        static_cast<size_t>(a.rank) * T;
+                    rank_picks =
+                        reinterpret_cast<const int32_t*>(src + st.rank_picks) +
+                        static_cast<size_t>(a.rank) * T * kTopkShadowMaxTopk *
+                            2;
+                }
 
                 // Prefetch: lane i holds this warp's i-th token entry, and
                 // the count and list head of the warp's first local expert.
-                const int* rank_list =
-                    src ? reinterpret_cast<const int*>(src + st.rank_lists) +
-                              static_cast<size_t>(a.rank) * T
-                        : nullptr;
                 const int p_lane = warp + lane * kNumWarps;
                 const int ent_lane =
                     rank_list && p_lane < n ? rank_list[p_lane] : 0;
                 const int le0 = warp;
-                const int* list0 =
-                    src && le0 < num_local
-                        ? reinterpret_cast<const int*>(src + st.lists) +
-                              static_cast<size_t>(a.rank * num_local + le0) * T
-                        : nullptr;
+                const int* list0 = lists && le0 < num_local
+                                       ? lists + static_cast<size_t>(le0) * T
+                                       : nullptr;
                 const int cnt0 = sycl::group_broadcast(
-                    sg,
-                    list0 && lane == 0
-                        ? reinterpret_cast<const int*>(
-                              src + st.counts)[a.rank * num_local + le0]
-                        : 0,
-                    0);
+                    sg, list0 && lane == 0 ? counts[le0] : 0, 0);
                 const int list0_lane = lane < cnt0 ? list0[lane] : 0;
 
-                uint8_t* stage =
-                    a.staging + st.local_stage +
-                    static_cast<size_t>(src_rank) * T * stage_bytes;
+                uint8_t* stage = a.staging + st.local_stage +
+                                 static_cast<size_t>(src_rank) * T * msg_bytes;
                 const int pick_ints = 2 * a.num_topk;
                 for (int i = 0, p = warp; p < n; ++i, p += kNumWarps) {
-                    const size_t entry = static_cast<size_t>(a.rank) * T + p;
                     const int tok =
                         i < kWarpSize
                             ? sycl::select_from_group(sg, ent_lane, i)
@@ -423,16 +477,16 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                     int pick_a = 0, pick_b = 0;
                     const int32_t* picks = nullptr;
                     if (a.recv.count) {
-                        picks = reinterpret_cast<const int32_t*>(
-                                    src + st.rank_picks) +
-                                entry * kTopkShadowMaxTopk * 2;
+                        picks = rank_picks +
+                                static_cast<size_t>(p) * kTopkShadowMaxTopk * 2;
                         if (lane < pick_ints) pick_a = picks[lane];
                         if (lane + kWarpSize < pick_ints)
                             pick_b = picks[lane + kWarpSize];
                     }
-                    coop_pull(stage + p * stage_bytes,
-                              src + (tok & 0xffff) * msg_bytes, msg_bytes, lane,
-                              kWarpSize);
+                    if (!pushed)
+                        coop_pull(stage + p * msg_bytes,
+                                  src + (tok & 0xffff) * msg_bytes, msg_bytes,
+                                  lane, kWarpSize);
                     if (a.recv.count) {
                         const int np = tok >> 16;
                         const size_t idx = static_cast<size_t>(src_rank) *
@@ -451,17 +505,11 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                 const int num_scales = a.hidden / kNumPerChannels;
                 for (int le = warp; le < num_local; le += kNumWarps) {
                     const bool first = le == le0;
-                    const int expert = a.rank * num_local + le;
                     const int* list =
-                        src ? reinterpret_cast<const int*>(src + st.lists) +
-                                  static_cast<size_t>(expert) * T
-                            : nullptr;
+                        lists ? lists + static_cast<size_t>(le) * T : nullptr;
                     int cnt = 0, begin = 0;
                     if (lane == 0) {
-                        if (src)
-                            cnt = first ? cnt0
-                                        : reinterpret_cast<const int*>(
-                                              src + st.counts)[expert];
+                        if (list) cnt = first ? cnt0 : counts[le];
                         begin = device_atomic<int>(a.packed_recv_count[le])
                                     .fetch_add(cnt);
                         a.packed_recv_layout_range[le * a.num_ranks +
@@ -478,7 +526,7 @@ sycl::event dispatch_recv_impl(sycl::queue& q, const DispatchArgs a) {
                             lane_e = j + lane < cnt ? list[j + lane] : 0;
                         const int e =
                             sycl::select_from_group(sg, lane_e, j % kWarpSize);
-                        const uint8_t* msg = stage + (e >> 16) * stage_bytes;
+                        const uint8_t* msg = stage + (e >> 16) * msg_bytes;
                         const size_t row =
                             static_cast<size_t>(le) * slots + begin + j;
                         if (lane == 0) a.packed_recv_src_info[row] = e & 0xffff;
@@ -528,6 +576,8 @@ sycl::event combine_send_reduced(sycl::queue& q, const CombineArgs a) {
                 if (wg == 0) clean_ready(tid, a.next_ready, a.num_ranks);
 
                 const int n = a.recv.count[src_rank];
+                if (a.host_counts && wg % groups == 0 && tid == 0)
+                    a.host_counts[src_rank] = n;
                 for (int p = wg % groups; p < n; p += groups) {
                     const size_t idx =
                         static_cast<size_t>(src_rank) * kTopkShadowMaxTokens +
@@ -597,6 +647,9 @@ sycl::event combine_send_reduced(sycl::queue& q, const CombineArgs a) {
 // s_row[k] and s_w[k] (row 0: nothing to add). Run by one sub-group with lane
 // k on pick k. Pre-reduced rows already carry the weights and hold every pick
 // of one rank, so each rank is read once, at the token's first pick of it.
+// A rank on another node has written the rows into this rank's inbox, at
+// what would have been their offset within its staging relative to this
+// rank's first row there.
 XPU_EP_INLINE void locate_rows(const CombineArgs& a, sycl::sub_group sg,
                                int lane, int t, int T, int num_local,
                                size_t row_bytes, uint64_t* s_row, float* s_w) {
@@ -606,32 +659,47 @@ XPU_EP_INLINE void locate_rows(const CombineArgs& a, sycl::sub_group sg,
     const int packed = live ? a.slot_shadow[k] : 0;
     const int dst = e >= 0 ? e / num_local : -1;
     bool add = e >= 0;
-    size_t offset;
+    size_t offset, inbox_offset;
     if (a.recv.count) {
         for (int j = 0; j < a.num_topk; ++j)
             if (sycl::select_from_group(sg, dst, j) == dst && j < lane)
                 add = false;
-        offset = (static_cast<size_t>(a.rank) * T +
-                  (static_cast<uint32_t>(packed) >> 16)) *
-                 row_bytes;
+        inbox_offset = (static_cast<uint32_t>(packed) >> 16) * row_bytes;
+        offset = static_cast<size_t>(a.rank) * T * row_bytes + inbox_offset;
     } else {
         const int slot = packed & 0xffff;
         add = add && slot != kNoSlot;
-        offset =
-            ((static_cast<size_t>(e % num_local) * a.num_ranks + a.rank) * T +
-             slot) *
-            row_bytes;
+        const size_t le = e % num_local;
+        inbox_offset = (le * T + slot) * row_bytes;
+        offset = ((le * a.num_ranks + a.rank) * T + slot) * row_bytes;
     }
     uint64_t row = 0;
     if (add) {
-        const uint8_t* base = rebase(a.peers, a.staging, dst);
+        const bool pushed = a.peers.remote && a.peers.remote[dst];
+        const uint8_t* base = pushed ? a.inbox + static_cast<size_t>(dst) *
+                                                     num_local * T * row_bytes
+                                     : rebase(a.peers, a.staging, dst);
         if (base && device_atomic<int32_t>(a.active_ranks[dst]).load())
-            row = reinterpret_cast<uint64_t>(base + offset);
+            row = reinterpret_cast<uint64_t>(base +
+                                             (pushed ? inbox_offset : offset));
     }
     if (live) {
         s_row[lane] = row;
         s_w[lane] = a.recv.count ? 1.0f : a.topk_weights[k];
     }
+}
+
+// Waits for every reachable peer's combine flag, for the hybrid combine_recv.
+sycl::event combine_wait(sycl::queue& q, const CombineArgs a) {
+    return q.parallel_for(
+        sycl::nd_range<1>(kWGSize, kWGSize), [=](sycl::nd_item<1> it) {
+            const int tid = static_cast<int>(it.get_local_id(0));
+            for (int r = tid; r < a.num_ranks; r += kWGSize)
+                if (a.peers.peer_bases[r] ||
+                    (a.peers.remote && a.peers.remote[r]))
+                    wait_flag(a.ready + r * kReadyStride, a.active_ranks, r,
+                              a.timeout_ticks);
+        });
 }
 
 }  // namespace
@@ -673,6 +741,9 @@ sycl::event combine_send(sycl::queue& q, const CombineArgs& args) {
                 int cnt, begin;
                 unpack_range(a.layout_range[le * a.num_ranks + src_rank], cnt,
                              begin);
+                if (a.host_counts && tid == 0)
+                    a.host_counts[kHostCellsOffset + le * a.num_ranks +
+                                  src_rank] = cnt;
                 uint8_t* rows =
                     a.staging +
                     (static_cast<size_t>(le) * a.num_ranks + src_rank) * T *
@@ -692,6 +763,7 @@ sycl::event combine_send(sycl::queue& q, const CombineArgs& args) {
 
 sycl::event combine_recv(sycl::queue& q, const CombineArgs& args) {
     const CombineArgs a = args;
+    if (a.peers.remote) combine_wait(q, a);
     const int num_wgs = std::max(1, std::min(a.num_combined_tokens, a.max_wgs));
     const size_t row_bytes = static_cast<size_t>(a.hidden) * kBf16Size;
     return q.submit([&](sycl::handler& h) {
@@ -711,10 +783,11 @@ sycl::event combine_recv(sycl::queue& q, const CombineArgs& args) {
 
                 // Wait for every rank's rows (a timed-out rank is dropped
                 // from active_ranks and skipped below).
-                for (int r = tid; r < a.num_ranks; r += kWGSize)
-                    if (a.peers.peer_bases[r])
-                        wait_flag(a.ready + r * kReadyStride, a.active_ranks, r,
-                                  a.timeout_ticks);
+                if (!a.peers.remote)
+                    for (int r = tid; r < a.num_ranks; r += kWGSize)
+                        if (a.peers.peer_bases[r])
+                            wait_flag(a.ready + r * kReadyStride,
+                                      a.active_ranks, r, a.timeout_ticks);
                 group_acquire(it);
 
                 for (int t = wg; t < a.num_combined_tokens; t += num_wgs) {
@@ -769,6 +842,77 @@ sycl::event combine_recv(sycl::queue& q, const CombineArgs& args) {
                 }
             });
     });
+}
+
+std::vector<ProxyPut> dispatch_puts(const DispatchArgs& a, const void* base,
+                                    const std::vector<int>& ranks) {
+    // Into rank b's local stage for this rank go the messages of its outbox
+    // here, and into its landing zone for this rank the counts, lists, token
+    // list and picks dispatch_recv would have read from this staging.
+    const DispatchStaging st(a.hidden, a.num_max_dispatch_tokens_per_rank,
+                             a.num_experts, a.num_ranks);
+    const uint64_t msg_bytes = dispatch_msg_bytes(a.hidden, a.use_fp8);
+    const uint64_t t = a.num_max_dispatch_tokens_per_rank;
+    const uint64_t local = a.num_experts / a.num_ranks;
+    const uint64_t pick_bytes = kTopkShadowMaxTopk * 2 * sizeof(int32_t);
+    const auto* b0 = static_cast<const uint8_t*>(base);
+    const uint64_t staging = a.staging - b0;
+    const uint64_t flag =
+        reinterpret_cast<const uint8_t*>(a.ready + a.rank * kReadyStride) - b0;
+    const uint64_t land = staging + st.landing + a.rank * st.land.bytes;
+    std::vector<ProxyPut> puts;
+    for (int b : ranks) {
+        const uint64_t n = a.host_counts[b];
+        auto put = [&](uint64_t from, uint64_t to, uint64_t bytes) {
+            if (bytes)
+                puts.push_back({b, from, to, static_cast<uint32_t>(bytes), 0});
+        };
+        put(staging + st.outbox + b * t * msg_bytes,
+            staging + st.local_stage + a.rank * t * msg_bytes, n * msg_bytes);
+        put(staging + st.counts + b * local * sizeof(int),
+            land + st.land.counts, local * sizeof(int));
+        put(staging + st.lists + b * local * t * sizeof(int),
+            land + st.land.lists, local * t * sizeof(int));
+        put(staging + st.rank_lists + b * t * sizeof(int),
+            land + st.land.rank_list, n * sizeof(int));
+        if (a.recv.count)
+            put(staging + st.rank_picks + b * t * pick_bytes,
+                land + st.land.picks, n * pick_bytes);
+        puts.push_back({b, 0, flag, 0, static_cast<uint32_t>(n + 1)});
+    }
+    return puts;
+}
+
+std::vector<ProxyPut> combine_puts(const CombineArgs& a, const void* base,
+                                   const std::vector<int>& ranks) {
+    // Rank b's rows go to its inbox at this rank's slice, at their offset in
+    // this staging relative to b's first row (see locate_rows).
+    const uint64_t t = a.num_max_dispatch_tokens_per_rank;
+    const uint64_t local = a.num_experts / a.num_ranks;
+    const uint64_t row_bytes = static_cast<uint64_t>(a.hidden) * kBf16Size;
+    const auto* b0 = static_cast<const uint8_t*>(base);
+    const uint64_t staging = a.staging - b0;
+    const uint64_t to = a.inbox - b0 + a.rank * local * t * row_bytes;
+    const uint64_t flag =
+        reinterpret_cast<const uint8_t*>(a.ready + a.rank * kReadyStride) - b0;
+    std::vector<ProxyPut> puts;
+    for (int b : ranks) {
+        auto put = [&](uint64_t from, uint64_t dst, uint64_t rows) {
+            if (rows)
+                puts.push_back(
+                    {b, from, dst, static_cast<uint32_t>(rows * row_bytes), 0});
+        };
+        if (a.recv.count) {
+            put(staging + b * t * row_bytes, to, a.host_counts[b]);
+        } else {
+            for (uint64_t le = 0; le < local; ++le)
+                put(staging + (le * a.num_ranks + b) * t * row_bytes,
+                    to + le * t * row_bytes,
+                    a.host_counts[kHostCellsOffset + le * a.num_ranks + b]);
+        }
+        puts.push_back({b, 0, flag, 0, 1});
+    }
+    return puts;
 }
 
 }  // namespace xpu_ep
