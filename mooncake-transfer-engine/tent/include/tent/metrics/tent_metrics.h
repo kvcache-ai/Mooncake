@@ -154,6 +154,38 @@ class TentMetrics {
     // the only failure metric that records TIMEOUT/CANCELED outcomes.
     void recordTaskFailure(TransportType tp, TaskFailureReason reason);
 
+    enum class StreamEvent {
+        ConnectStarted,
+        ConnectSuccess,
+        RetryIssued,
+        RetryExhausted,
+    };
+
+    // Stream metrics cover TCP and HP-TCP. Events are limited to connection
+    // establishment and software retries; physical attempt completions are
+    // represented once by the latency histogram count.
+    void recordStreamEvent(TransportType transport, Request::OpCode operation,
+                           StreamEvent event, int64_t count = 1) noexcept;
+    void recordStreamAttempt(TransportType transport, Request::OpCode operation,
+                             double latency_us) noexcept;
+    void recordStreamQueueWait(TransportType transport,
+                               Request::OpCode operation,
+                               double latency_us) noexcept;
+    enum class StreamConnectionRole { Client, Server };
+    enum class ProtocolErrorKind { Frame, Correlation };
+    // Paired stream state gauges. These updates remain active when runtime
+    // sampling is disabled so current state cannot drift.
+    void recordStreamAdmission(TransportType transport, int64_t task_delta,
+                               int64_t byte_delta) noexcept;
+    void recordStreamConnection(TransportType transport,
+                                StreamConnectionRole role,
+                                int64_t delta) noexcept;
+    void recordProtocolError(TransportType transport,
+                             ProtocolErrorKind kind) noexcept;
+    void recordTcpSocketSample(TransportType transport,
+                               StreamConnectionRole role,
+                               uint32_t retransmit_delta) noexcept;
+
     // In-flight transport attempts (gauge): incremented when an attempt is
     // submitted, decremented when it finishes. Reflects how much work is
     // sitting in the engine right now — a persistently high or stuck value
@@ -290,6 +322,12 @@ class TentMetrics {
         "transport", "operation", "outcome"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 3> kStreamEventLabels{
+        "transport", "operation", "event"};
+    static inline const std::array<std::string, 2> kStreamConnectionLabels{
+        "transport", "role"};
+    static inline const std::array<std::string, 2> kProtocolErrorLabels{
+        "transport", "kind"};
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -305,15 +343,23 @@ class TentMetrics {
     static constexpr size_t kAttemptOutcomeDomain =
         kAttemptDomain * kOutcomeValueDomain;
     static constexpr size_t kTaskFailureDomain = kTransportDomain * 4;
+    static constexpr size_t kStreamEventValueDomain = 4;
+    static constexpr size_t kStreamOperationDomain = kTransportDomain * 2;
+    static constexpr size_t kStreamEventDomain =
+        kStreamOperationDomain * kStreamEventValueDomain;
+    static constexpr size_t kStreamConnectionDomain = kTransportDomain * 2;
+    static constexpr size_t kProtocolErrorKindDomain = 2;
+    static constexpr size_t kProtocolErrorDomain =
+        kTransportDomain * kProtocolErrorKindDomain;
 
     // Stable slot indices into the cached-cell label domain.
-    static size_t transportSlot(TransportType tp) {
+    static size_t transportSlot(TransportType tp) noexcept {
         return static_cast<size_t>(tp);
     }
-    static size_t attemptSlot(TransportType tp, Request::OpCode op) {
+    static size_t attemptSlot(TransportType tp, Request::OpCode op) noexcept {
         return static_cast<size_t>(tp) * 2 + (op == Request::READ ? 0u : 1u);
     }
-    static size_t operationSlot(Request::OpCode operation) {
+    static size_t operationSlot(Request::OpCode operation) noexcept {
         return operation == Request::READ ? 0u : 1u;
     }
     static size_t outcomeIndex(TransferStatusEnum status) noexcept;
@@ -328,8 +374,29 @@ class TentMetrics {
         return attemptSlot(tp, operation) * kOutcomeValueDomain +
                outcomeIndex(status);
     }
-    static size_t taskFailureSlot(TransportType tp, TaskFailureReason reason) {
+    static size_t taskFailureSlot(TransportType tp,
+                                  TaskFailureReason reason) noexcept {
         return static_cast<size_t>(tp) * 4 + static_cast<size_t>(reason);
+    }
+    static size_t streamOperationSlot(TransportType transport,
+                                      Request::OpCode operation) noexcept {
+        return attemptSlot(transport, operation);
+    }
+    static size_t streamEventSlot(TransportType transport,
+                                  Request::OpCode operation,
+                                  StreamEvent event) noexcept {
+        return streamOperationSlot(transport, operation) *
+                   kStreamEventValueDomain +
+               static_cast<size_t>(event);
+    }
+    static size_t streamConnectionSlot(TransportType transport,
+                                       StreamConnectionRole role) noexcept {
+        return transportSlot(transport) * 2 + static_cast<size_t>(role);
+    }
+    static size_t protocolErrorSlot(TransportType transport,
+                                    ProtocolErrorKind kind) noexcept {
+        return transportSlot(transport) * kProtocolErrorKindDomain +
+               static_cast<size_t>(kind);
     }
 
     // Per-transport counters (label: transport). Values are int64_t.
@@ -393,6 +460,18 @@ class TentMetrics {
         "tent_quarantined_batches_total",
         "Batches abandoned by lazyFreeBatch after repeated failed reclaim "
         "attempts; reclaimed only at engine teardown"};
+    metrics::CachedDynamicCounter<3> stream_events_total_{
+        "tent_stream_events_total",
+        "TCP software retry and HP-TCP connection-establishment events",
+        kStreamEventLabels, kStreamEventDomain};
+    metrics::CachedDynamicCounter<2> protocol_errors_total_{
+        "tent_protocol_errors_total",
+        "Rejected or inconsistent transport protocol frames",
+        kProtocolErrorLabels, kProtocolErrorDomain};
+    metrics::CachedDynamicCounter<2> tcp_retransmissions_total_{
+        "tent_tcp_retransmissions_total",
+        "Kernel TCP retransmissions observed through TCP_INFO deltas",
+        kStreamConnectionLabels, kStreamConnectionDomain};
 
     // Gauges, backed by cached cells and updated with add/sub. Serialized as
     // Prometheus gauges (current value per label), NOT via the counters_
@@ -405,6 +484,17 @@ class TentMetrics {
         "tent_logical_requests_inflight",
         "Accepted logical requests without a terminal outcome", kOperationLabel,
         kOperationDomain};
+    metrics::CachedDynamicCounter<1> stream_admitted_tasks_{
+        "tent_stream_admitted_tasks",
+        "HP-TCP tasks holding bounded admission capacity", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<1> stream_admitted_bytes_{
+        "tent_stream_admitted_bytes",
+        "HP-TCP bytes holding bounded admission capacity", kTransportLabel,
+        kTransportDomain};
+    metrics::CachedDynamicCounter<2> stream_connections_{
+        "tent_stream_connections", "Open stream connections by endpoint role",
+        kStreamConnectionLabels, kStreamConnectionDomain};
     metrics::CachedDynamicCounter<1> registered_buffer_bytes_{
         "tent_registered_buffer_bytes", "Registered local buffer bytes",
         kTransportLabel, kTransportDomain};
@@ -430,7 +520,6 @@ class TentMetrics {
     // Buckets span 10us to 500ms to capture both fast RDMA and slower TCP.
     static inline const std::vector<double> kStageBuckets{
         10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000};
-
     // Histograms are composed of cached-cell counters: one counter per bucket
     // plus a sum counter. The sum is part of the histogram itself, so no
     // parallel standalone sum counter is needed.
@@ -466,6 +555,14 @@ class TentMetrics {
         "tent_transport_attempt_latency_us",
         "Observed physical transport attempt latency in microseconds",
         kLatencyBuckets, kAttemptLabels, kAttemptDomain};
+    metrics::CachedDynamicHistogram<2> stream_attempt_latency_{
+        "tent_stream_attempt_latency_us",
+        "Physical TCP and HP-TCP attempt latency in microseconds",
+        kLatencyBuckets, kAttemptLabels, kStreamOperationDomain};
+    metrics::CachedDynamicHistogram<2> stream_queue_wait_{
+        "tent_stream_queue_wait_us",
+        "TCP logical-task and HP-TCP physical-slice queue wait in microseconds",
+        kLatencyBuckets, kAttemptLabels, kStreamOperationDomain};
 
     // Per-transport (N=1) histograms for unified serialization; the N=2
     // transport_attempt_latency_ histogram is serialized separately (see
@@ -474,7 +571,8 @@ class TentMetrics {
 
     // Serialize a gauge backed by a cached-cell counter: emits the current
     // value per label with # TYPE ... gauge.
-    void serializeGaugePrometheus(metrics::CachedDynamicCounter<1>& gauge,
+    template <uint8_t N>
+    void serializeGaugePrometheus(metrics::CachedDynamicCounter<N>& gauge,
                                   std::string& out) const;
 
     // Append the fixed single-series metrics-pipeline state plus the

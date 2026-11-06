@@ -7,7 +7,17 @@
 
 #include <glog/logging.h>
 
+#include "tent/metrics/tent_metrics.h"
+
 namespace mooncake::tent {
+
+#if TENT_METRICS_ENABLED
+namespace {
+void StampCommandQueue(HighPerformanceTcpWorkers::Command& command) {
+    command.enqueue_time = std::chrono::steady_clock::now();
+}
+}  // namespace
+#endif
 
 Status HighPerformanceTcpAdmissionController::tryReserve(uint64_t tasks,
                                                          uint64_t bytes) {
@@ -30,6 +40,10 @@ Status HighPerformanceTcpAdmissionController::tryReserve(uint64_t tasks,
     }
     tasks_ += tasks;
     bytes_ += bytes;
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordStreamAdmission(TransportType::HP_TCP, tasks,
+                                                  bytes);
+#endif
     return Status::OK();
 }
 
@@ -48,6 +62,11 @@ void HighPerformanceTcpAdmissionController::release(uint64_t tasks,
         } else {
             tasks_ -= tasks;
             bytes_ -= bytes;
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordStreamAdmission(
+                TransportType::HP_TCP, -static_cast<int64_t>(tasks),
+                -static_cast<int64_t>(bytes));
+#endif
             notify_waiters = tasks_ == 0 && bytes_ == 0;
         }
     }
@@ -226,6 +245,10 @@ Status HighPerformanceTcpWorkers::tryCommitBatch(
         return Status::InternalError("HP TCP ownership commit failed" LOC_MARK);
     }
 
+#if TENT_METRICS_ENABLED
+    for (auto& command : commands) StampCommandQueue(command);
+#endif
+
     for (size_t i = 0; i < commands.size(); ++i) {
         Command command = std::move(commands[i]);
         const size_t owner = command.worker_id;
@@ -251,9 +274,13 @@ void HighPerformanceTcpWorkers::runCommand(Command command) {
     const size_t owner = command.worker_id;
     try {
         if (running()) {
-            command.run(owner);
-        } else if (command.cancel) {
-            command.cancel();
+#if TENT_METRICS_ENABLED
+            command.run(owner, command.enqueue_time);
+#else
+            command.run(owner, QueueTime{});
+#endif
+        } else {
+            if (command.cancel) command.cancel();
         }
     } catch (const std::exception& error) {
         LOG(ERROR) << "HP TCP worker command failed: " << error.what();
