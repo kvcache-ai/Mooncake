@@ -101,6 +101,19 @@ fn decode_route_list_by_replica_owner_reply(
     ))
 }
 
+fn decode_allocation_route_references_reply(
+    reply: pb::GetAllocationRouteReferencesReply,
+) -> Result<RouteControlResponse> {
+    decode_error(reply.error)?;
+    Ok(RouteControlResponse::AllocationReferences(
+        reply
+            .references
+            .into_iter()
+            .map(try_allocation_reference_state)
+            .collect::<Result<Vec<_>>>()?,
+    ))
+}
+
 #[cfg(test)]
 mod owner_page_decode_tests {
     use super::*;
@@ -213,6 +226,11 @@ impl ControlPlaneClient {
             } => self.send_route_list_by_replica_owner(
                 lease, namespace, authority, owner, cursor, limit,
             ),
+            RouteControlRequest::GetAllocationReferences {
+                namespace,
+                authority,
+                identities,
+            } => self.send_route_allocation_references(lease, namespace, authority, identities),
         }
     }
 
@@ -422,6 +440,29 @@ impl ControlPlaneClient {
                 .await
         })?;
         decode_route_list_by_replica_owner_reply(reply)
+    }
+
+    fn send_route_allocation_references(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        identities: Vec<AllocationRouteIdentity>,
+    ) -> Result<RouteControlResponse> {
+        let request = pb::GetAllocationRouteReferencesRequest {
+            namespace,
+            authority: authority.0.clone(),
+            identities: identities
+                .iter()
+                .map(pb_allocation_route_identity)
+                .collect(),
+        };
+        let reply = self.rpc_for_lease(lease, move |mut client| async move {
+            client
+                .get_allocation_route_references(Request::new(request))
+                .await
+        })?;
+        decode_allocation_route_references_reply(reply)
     }
 
     fn send_route_batch_replace(

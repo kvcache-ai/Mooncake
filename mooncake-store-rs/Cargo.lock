@@ -1313,6 +1313,7 @@ version = "0.1.0"
 dependencies = [
  "dashmap",
  "mooncake-store-core",
+ "mooncake-store-rs-metadata",
  "parking_lot",
  "tracing",
 ]

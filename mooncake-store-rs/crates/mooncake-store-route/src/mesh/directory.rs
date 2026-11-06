@@ -1,13 +1,14 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope,
-    ObjectKey, ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory, RouteVersion,
-    StoreError,
+    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
+    ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute,
+    ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory, RouteReplicaReference,
+    RouteVersion, StoreError,
 };
 use tracing::{debug, trace, warn};
 
@@ -21,10 +22,10 @@ use crate::mesh::read_repair::{
 };
 use crate::mesh::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
-    authority_get_many, authority_get_version_floor, authority_get_version_floors,
-    authority_is_local, authority_list_reuse_candidates, authority_list_routes,
-    authority_list_routes_by_replica_owner_page, authority_list_routes_in_scope,
-    local_authority_service, register_local_authority, unregister_local_authority,
+    authority_get_allocation_route_references, authority_get_many, authority_get_version_floor,
+    authority_get_version_floors, authority_is_local, authority_list_reuse_candidates,
+    authority_list_routes, authority_list_routes_in_scope, local_authority_service,
+    authority_list_routes_by_replica_owner_page, register_local_authority, unregister_local_authority,
 };
 use crate::mesh::selection::{
     authority_candidates, ranked_authorities, ranked_top_authorities,
@@ -223,6 +224,33 @@ impl EmbeddedWrhRouteDirectory {
             &self.namespace,
             &authority.runtime.stable_id,
             keys,
+        )
+    }
+
+    fn get_allocation_route_references_from_authority(
+        &self,
+        authority: &ClientLease,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        if self.authority_is_local(authority) {
+            if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
+                return service.get_allocation_route_references(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    identities,
+                );
+            }
+            return authority_get_allocation_route_references(
+                &self.namespace,
+                &authority.runtime.stable_id,
+                identities,
+            );
+        }
+        self.authority_client.get_allocation_route_references(
+            authority,
+            &self.namespace,
+            &authority.runtime.stable_id,
+            identities,
         )
     }
 
@@ -946,6 +974,127 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         Ok(routes.pop().unwrap_or(None))
     }
 
+    fn confirm_replica_reference(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        replica: &ReplicaRoute,
+    ) -> Result<RouteReplicaReference> {
+        let candidates = self.authority_candidates_force_refresh(observer)?;
+        if candidates.is_empty() {
+            return Err(StoreError::Transport(
+                "exact replica confirmation has no live route authorities".to_string(),
+            ));
+        }
+        let expected_members = candidates
+            .iter()
+            .map(|authority| authority.runtime.clone())
+            .collect::<BTreeSet<_>>();
+
+        let mut observed: Option<Option<ObjectRoute>> = None;
+        let mut referenced: Option<ObjectRoute> = None;
+        for authority in candidates {
+            let mut responses = self.read_authority_batch(&authority, std::slice::from_ref(key))?;
+            let response = responses.pop().ok_or_else(|| {
+                StoreError::InvalidState(
+                    "route authority returned no result for exact replica confirmation".to_string(),
+                )
+            })??;
+            let references_replica = response.as_ref().is_some_and(|route| {
+                route.replicas.iter().any(|candidate| {
+                    candidate.owner == replica.owner
+                        && candidate.segment_name == replica.segment_name
+                        && candidate.segment_offset == replica.segment_offset
+                        && candidate.allocation_id == replica.allocation_id
+                        && replica
+                            .allocation_id
+                            .is_some_and(|allocation_id| allocation_id != 0)
+                })
+            });
+            if let Some(previous) = observed.as_ref() {
+                if previous != &response {
+                    return Err(StoreError::Transport(format!(
+                        "route authorities diverged while confirming exact replica for {}",
+                        key.0
+                    )));
+                }
+            } else {
+                observed = Some(response.clone());
+            }
+            if references_replica {
+                referenced = response;
+            }
+        }
+        let refreshed_members = self
+            .authority_candidates_force_refresh(observer)?
+            .into_iter()
+            .map(|authority| authority.runtime)
+            .collect::<BTreeSet<_>>();
+        if refreshed_members != expected_members {
+            return Err(StoreError::StaleEpoch(
+                "route authority membership changed during exact replica confirmation".to_string(),
+            ));
+        }
+        if let Some(route) = referenced {
+            return Ok(RouteReplicaReference::Referenced(Box::new(route)));
+        }
+        Ok(RouteReplicaReference::Absent)
+    }
+
+    fn get_allocation_route_references_consistent(
+        &self,
+        observer: &ClientLease,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = self.authority_candidates_force_refresh(observer)?;
+        if candidates.is_empty() {
+            return Err(StoreError::Transport(
+                "allocation reference query has no live route authorities".to_string(),
+            ));
+        }
+        let expected_members = candidates
+            .iter()
+            .map(|authority| authority.runtime.clone())
+            .collect::<BTreeSet<_>>();
+        let mut consensus = vec![None; identities.len()];
+        for authority in &candidates {
+            let references =
+                self.get_allocation_route_references_from_authority(authority, identities)?;
+            if references.len() != identities.len() {
+                return Err(StoreError::Transport(format!(
+                    "route authority {} returned {} allocation references for {} identities",
+                    authority.runtime,
+                    references.len(),
+                    identities.len()
+                )));
+            }
+            for (slot, observed) in consensus.iter_mut().zip(references) {
+                *slot = Some(match *slot {
+                    None => observed,
+                    Some(previous) if previous == observed => previous,
+                    Some(_) => AllocationRouteReferenceState::Conflict,
+                });
+            }
+        }
+        let refreshed_members = self
+            .authority_candidates_force_refresh(observer)?
+            .into_iter()
+            .map(|authority| authority.runtime)
+            .collect::<BTreeSet<_>>();
+        if refreshed_members != expected_members {
+            return Err(StoreError::StaleEpoch(
+                "route authority membership changed during allocation reference query".to_string(),
+            ));
+        }
+        Ok(consensus
+            .into_iter()
+            .map(|state| state.expect("nonempty authorities populate every allocation reference"))
+            .collect())
+    }
+
     fn get_object_routes(
         &self,
         observer: &ClientLease,
@@ -1472,10 +1621,176 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
     }
 }
 
+fn observer_start_rank(observer: &ClientLease, topk: usize) -> usize {
+    if topk <= 1 {
+        return 0;
+    }
+    let id = &observer.runtime.stable_id.0;
+    let hash = id
+        .bytes()
+        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    (hash as usize) % topk
+}
+
 #[cfg(test)]
 mod owner_page_contract_tests {
     use super::*;
-    use mooncake_store_core::{CompatibilityDescriptor, RouteState};
+    use crate::RouteOwnerPage;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
+    use mooncake_store_core::{
+        ClientEndpointSet, ClientEpoch, ClientLifecycleState, CompatibilityDescriptor,
+        ReplicaRoute, ReplicaTier, RouteState, SegmentName,
+    };
+
+    struct TestMembership {
+        leases: Vec<ClientLease>,
+    }
+
+    impl RouteMembershipProvider for TestMembership {
+        fn live_clients(
+            &self,
+            _force_refresh: bool,
+            _operation: &'static str,
+        ) -> Result<Vec<ClientLease>> {
+            Ok(self.leases.clone())
+        }
+
+        fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
+            false
+        }
+
+        fn mark_suspect(
+            &self,
+            _runtime: ClientRuntimeId,
+            _quarantine_until: Instant,
+            _observed: Option<&ClientLease>,
+        ) {
+        }
+    }
+
+    struct ForceRefreshChangingMembership {
+        first: Vec<ClientLease>,
+        refreshed: Vec<ClientLease>,
+        force_refresh_calls: AtomicUsize,
+    }
+
+    impl RouteMembershipProvider for ForceRefreshChangingMembership {
+        fn live_clients(
+            &self,
+            force_refresh: bool,
+            _operation: &'static str,
+        ) -> Result<Vec<ClientLease>> {
+            if force_refresh && self.force_refresh_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                Ok(self.refreshed.clone())
+            } else {
+                Ok(self.first.clone())
+            }
+        }
+
+        fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
+            false
+        }
+
+        fn mark_suspect(
+            &self,
+            _runtime: ClientRuntimeId,
+            _quarantine_until: Instant,
+            _observed: Option<&ClientLease>,
+        ) {
+        }
+    }
+
+    struct ConfirmationClient {
+        routes: BTreeMap<String, Option<ObjectRoute>>,
+        allocation_references: BTreeMap<String, Vec<AllocationRouteReferenceState>>,
+    }
+
+    impl RouteAuthorityClient for ConfirmationClient {
+        fn batch_get_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            authority: &ClientStableId,
+            keys: &[ObjectKey],
+        ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+            let route = self.routes.get(&authority.0).cloned().unwrap_or(None);
+            Ok(keys.iter().map(|_| Ok(route.clone())).collect())
+        }
+
+        fn batch_contains_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _keys: &[ObjectKey],
+        ) -> Result<Vec<Result<bool>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn batch_compare_and_swap_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _requests: &[RouteCasRequest],
+        ) -> Result<Vec<Result<CasResult>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn batch_replace_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _requests: &[RouteCasRequest],
+        ) -> Result<Vec<Result<()>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn list_routes_by_replica_owner_page(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _owner: &ClientRuntimeId,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<RouteOwnerPage> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn get_allocation_route_references(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            authority: &ClientStableId,
+            identities: &[AllocationRouteIdentity],
+        ) -> Result<Vec<AllocationRouteReferenceState>> {
+            let references = self
+                .allocation_references
+                .get(&authority.0)
+                .cloned()
+                .ok_or_else(|| {
+                    StoreError::Unsupported(
+                        "missing allocation-reference test response".to_string(),
+                    )
+                })?;
+            if references.len() != identities.len() {
+                return Err(StoreError::InvalidState(
+                    "allocation-reference test response length mismatch".to_string(),
+                ));
+            }
+            Ok(references)
+        }
+    }
+
 
     fn route(key: &str) -> ObjectRoute {
         ObjectRoute {
@@ -1537,15 +1852,187 @@ mod owner_page_contract_tests {
         .expect_err("an oversized route page must fail closed");
         assert!(matches!(error, StoreError::Transport(_)));
     }
-}
 
-fn observer_start_rank(observer: &ClientLease, topk: usize) -> usize {
-    if topk <= 1 {
-        return 0;
+    fn test_lease(stable_id: &str) -> ClientLease {
+        let mut labels = BTreeMap::new();
+        labels.insert("route".to_string(), "true".to_string());
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(1)),
+            state: ClientLifecycleState::Active,
+            expires_at_ms: u64::MAX,
+            compatibility: CompatibilityDescriptor::mooncake_v1(),
+            endpoints: ClientEndpointSet {
+                labels,
+                ..ClientEndpointSet::default()
+            },
+        }
     }
-    let id = &observer.runtime.stable_id.0;
-    let hash = id
-        .bytes()
-        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
-    (hash as usize) % topk
+
+    fn test_route(key: &str, owner: &ClientRuntimeId) -> ObjectRoute {
+        ObjectRoute {
+            nof_backing: None,
+            key: ObjectKey::new(key.to_string()),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::mooncake_v1(),
+            replicas: vec![ReplicaRoute {
+                owner: owner.clone(),
+                segment_name: SegmentName::new("segment-a".to_string()),
+                allocation_id: None,
+                segment_offset: 0,
+                length: 1,
+                checksum: None,
+                offset: Some(0),
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+            cold_backing: None,
+        }
+    }
+
+    #[test]
+    fn exact_replica_confirmation_requires_all_authorities_to_agree() {
+        let observer = test_lease("observer");
+        let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut referenced = test_route("confirmation-key", &replica_owner);
+        referenced.replicas[0].allocation_id = Some(7);
+        let absent = ObjectRoute {
+            replicas: Vec::new(),
+            ..referenced.clone()
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::from([
+                    ("authority-a".to_string(), Some(referenced.clone())),
+                    ("authority-b".to_string(), Some(absent)),
+                ]),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        let error = directory
+            .confirm_replica_reference(&observer, &referenced.key, &referenced.replicas[0])
+            .expect_err("authority divergence must not prove replica absence or reference");
+        assert!(matches!(error, StoreError::Transport(message) if message.contains("diverged")));
+    }
+
+    #[test]
+    fn exact_replica_confirmation_accepts_consistent_absence() {
+        let observer = test_lease("observer");
+        let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut expected_route = test_route("confirmation-absent-key", &replica_owner);
+        expected_route.replicas[0].allocation_id = Some(7);
+        let absent = ObjectRoute {
+            replicas: Vec::new(),
+            ..expected_route.clone()
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::from([
+                    ("authority-a".to_string(), Some(absent.clone())),
+                    ("authority-b".to_string(), Some(absent)),
+                ]),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        assert!(matches!(
+            directory
+                .confirm_replica_reference(
+                    &observer,
+                    &expected_route.key,
+                    &expected_route.replicas[0],
+                )
+                .expect("consistent authorities should confirm absence"),
+            RouteReplicaReference::Absent
+        ));
+    }
+
+    #[test]
+    fn exact_replica_confirmation_rejects_changed_authority_membership() {
+        let observer = test_lease("observer");
+        let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut expected_route = test_route("confirmation-membership-key", &replica_owner);
+        expected_route.replicas[0].allocation_id = Some(7);
+        let absent = ObjectRoute {
+            replicas: Vec::new(),
+            ..expected_route.clone()
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::from([("authority-a".to_string(), Some(absent))]),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(ForceRefreshChangingMembership {
+                first: vec![test_lease("authority-a")],
+                refreshed: vec![test_lease("authority-a"), test_lease("authority-b")],
+                force_refresh_calls: AtomicUsize::new(0),
+            }),
+        );
+
+        let error = directory
+            .confirm_replica_reference(&observer, &expected_route.key, &expected_route.replicas[0])
+            .expect_err("membership churn must not prove replica absence");
+        assert!(matches!(error, StoreError::StaleEpoch(_)));
+    }
+
+    #[test]
+    fn allocation_reference_confirmation_fails_closed_on_authority_divergence() {
+        let observer = test_lease("observer");
+        let identity = AllocationRouteIdentity {
+            owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
+            segment_name: SegmentName::new("segment-a".to_string()),
+            offset_bytes: 64,
+            length_bytes: 16,
+            allocation_id: 7,
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::from([
+                    (
+                        "authority-a".to_string(),
+                        vec![AllocationRouteReferenceState::Absent],
+                    ),
+                    (
+                        "authority-b".to_string(),
+                        vec![AllocationRouteReferenceState::Exact],
+                    ),
+                ]),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        assert_eq!(
+            directory
+                .get_allocation_route_references_consistent(&observer, &[identity])
+                .expect("divergent observations should resolve fail-closed"),
+            vec![AllocationRouteReferenceState::Conflict],
+        );
+    }
 }

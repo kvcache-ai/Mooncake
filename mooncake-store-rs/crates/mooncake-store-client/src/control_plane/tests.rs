@@ -278,6 +278,13 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         self.inner.list_routes_by_replica_owner(request).await
     }
 
+    async fn get_allocation_route_references(
+        &self,
+        request: Request<pb::GetAllocationRouteReferencesRequest>,
+    ) -> std::result::Result<Response<pb::GetAllocationRouteReferencesReply>, Status> {
+        self.inner.get_allocation_route_references(request).await
+    }
+
     async fn batch_compare_and_swap_routes(
         &self,
         request: Request<pb::BatchCompareAndSwapRoutesRequest>,
@@ -582,6 +589,13 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
         request: Request<pb::ListRoutesByReplicaOwnerRequest>,
     ) -> std::result::Result<Response<pb::ListRoutesByReplicaOwnerReply>, Status> {
         self.inner.list_routes_by_replica_owner(request).await
+    }
+
+    async fn get_allocation_route_references(
+        &self,
+        request: Request<pb::GetAllocationRouteReferencesRequest>,
+    ) -> std::result::Result<Response<pb::GetAllocationRouteReferencesReply>, Status> {
+        self.inner.get_allocation_route_references(request).await
     }
 
     async fn batch_compare_and_swap_routes(
@@ -889,6 +903,13 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
         request: Request<pb::ListRoutesByReplicaOwnerRequest>,
     ) -> std::result::Result<Response<pb::ListRoutesByReplicaOwnerReply>, Status> {
         self.inner.list_routes_by_replica_owner(request).await
+    }
+
+    async fn get_allocation_route_references(
+        &self,
+        request: Request<pb::GetAllocationRouteReferencesRequest>,
+    ) -> std::result::Result<Response<pb::GetAllocationRouteReferencesReply>, Status> {
+        self.inner.get_allocation_route_references(request).await
     }
 
     async fn batch_compare_and_swap_routes(

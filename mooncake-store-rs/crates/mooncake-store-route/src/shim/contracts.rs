@@ -3,8 +3,9 @@
 use std::time::Instant;
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result,
-    RouteCasRequest, RouteVersion, StoreError,
+    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
+    ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest, RouteVersion,
+    StoreError,
 };
 
 pub const DEFAULT_ROUTE_OWNER_PAGE_SIZE: usize = 256;
@@ -67,6 +68,18 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<RouteOwnerPage>;
+
+    fn get_allocation_route_references(
+        &self,
+        _lease: &ClientLease,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        _identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        Err(StoreError::Unsupported(
+            "route authority client does not support allocation reference queries".to_string(),
+        ))
+    }
 }
 
 pub trait RouteAuthorityService: Send + Sync {
@@ -97,6 +110,17 @@ pub trait RouteAuthorityService: Send + Sync {
         let _ = (namespace, authority, owner, cursor, limit);
         Err(StoreError::Unsupported(
             "route authority does not implement bounded owner-route pagination".to_string(),
+        ))
+    }
+
+    fn get_allocation_route_references(
+        &self,
+        _namespace: &str,
+        _authority: &ClientStableId,
+        _identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        Err(StoreError::Unsupported(
+            "route authority does not implement allocation reference queries".to_string(),
         ))
     }
 
