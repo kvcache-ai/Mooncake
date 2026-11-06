@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mooncake_store_client::{AllocationLifecycleConfig, ColdTierTargetConfig, ColdTierTargetSpec};
 #[cfg(test)]
 use mooncake_store_client::{ColdTierKind, ColdTierSsdEngine};
-use mooncake_store_client::{AllocationLifecycleConfig, ColdTierTargetConfig, ColdTierTargetSpec};
 use mooncake_store_core::{MetadataBackend, Result, StoreError};
 use mooncake_store_rs_metadata::{
     build_store_metadata_backend, resolve_redis_auth, MetadataKeyspace,

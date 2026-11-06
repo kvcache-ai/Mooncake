@@ -68,15 +68,21 @@ fn routed_batch_statuses_preserve_mixed_publish_results_without_replay() {
             let reads_before = directory.full_reads() + directory.bounded_reads();
             let transfers_before = transport.submitted_batch_bytes().len();
             let statuses = writer.batch_put_from_statuses(
-                &ordered_keys.iter().map(|key| {
-                    PutFromRequest::new(key, batch_value.as_ptr().cast(), batch_value.len())
-                }).collect::<Vec<_>>(),
+                &ordered_keys
+                    .iter()
+                    .map(|key| {
+                        PutFromRequest::new(key, batch_value.as_ptr().cast(), batch_value.len())
+                    })
+                    .collect::<Vec<_>>(),
             );
             assert_eq!(statuses.len(), 6);
             for (index, status) in statuses.iter().enumerate() {
                 let existing = (index < 3) != fresh_first;
                 if existing {
-                    assert!(status.is_ok(), "existing routes should remain accepted: {statuses:?}");
+                    assert!(
+                        status.is_ok(),
+                        "existing routes should remain accepted: {statuses:?}"
+                    );
                 } else {
                     assert!(status.is_ok(), "{statuses:?}");
                 }
@@ -237,10 +243,13 @@ fn routed_batch_statuses_preserve_success_when_another_publish_reply_is_lost() {
             calls: AtomicUsize::new(0),
         });
         writer.route_directory = directory.clone();
-        let statuses = registered_batch_statuses(&writer, &[
-            PutRequest::new("success", b"first"),
-            PutRequest::new("unknown", b"second"),
-        ]);
+        let statuses = registered_batch_statuses(
+            &writer,
+            &[
+                PutRequest::new("success", b"first"),
+                PutRequest::new("unknown", b"second"),
+            ],
+        );
         assert_eq!(statuses.len(), 2);
         assert!(statuses[0].is_ok(), "{statuses:?}");
         assert!(
@@ -280,10 +289,13 @@ fn routed_batch_statuses_retain_unknown_batch_outcomes_without_replay() {
         inner: counter.clone(),
         fail_once: AtomicBool::new(true),
     });
-    let statuses = registered_batch_statuses(&writer, &[
-        PutRequest::new("first", b"first"),
-        PutRequest::new("second", b"second"),
-    ]);
+    let statuses = registered_batch_statuses(
+        &writer,
+        &[
+            PutRequest::new("first", b"first"),
+            PutRequest::new("second", b"second"),
+        ],
+    );
     assert_eq!(statuses.len(), 2);
     assert!(
         statuses
@@ -343,10 +355,13 @@ fn routed_batch_statuses_preserve_pending_quota_after_finalize_failure() {
     let (_storage, mut writer, _) = routed_status_writer(metadata, "quota-status");
     let directory = Arc::new(CountingRouteDirectory::new(writer.route_directory.clone()));
     writer.route_directory = directory.clone();
-    let statuses = registered_batch_statuses(&writer, &[
-        PutRequest::new("a-failed", b"1234"),
-        PutRequest::new("b-success", b"5678"),
-    ]);
+    let statuses = registered_batch_statuses(
+        &writer,
+        &[
+            PutRequest::new("a-failed", b"1234"),
+            PutRequest::new("b-success", b"5678"),
+        ],
+    );
     assert_eq!(statuses.len(), 2);
     assert!(
         matches!(&statuses[0], Err(StoreError::InvalidState(message)) if message.contains("injected finalize failure")),
@@ -375,24 +390,37 @@ fn routed_batch_statuses_preserve_pending_quota_after_finalize_failure() {
 }
 
 // The community status API consumes registered buffers.
-fn registered_batch_statuses(writer: &StoreClient, requests: &[PutRequest<'_>]) -> Vec<Result<ObjectRoute>> {
-    let regions = requests.iter().map(|request| (request.value.as_ptr() as usize, request.value.len())).collect::<BTreeSet<_>>();
+fn registered_batch_statuses(
+    writer: &StoreClient,
+    requests: &[PutRequest<'_>],
+) -> Vec<Result<ObjectRoute>> {
+    let regions = requests
+        .iter()
+        .map(|request| (request.value.as_ptr() as usize, request.value.len()))
+        .collect::<BTreeSet<_>>();
     for (address, length) in &regions {
-        writer.register_buffer(*address as *mut std::ffi::c_void, *length).expect("status source should register");
+        writer
+            .register_buffer(*address as *mut std::ffi::c_void, *length)
+            .expect("status source should register");
     }
-    let from = requests.iter().map(|request| PutFromRequest {
-        tenant: request.tenant,
-        domain: request.domain,
-        object_set: request.object_set,
-        qos_tier: request.qos_tier,
-        key: request.key,
-        buffer: request.value.as_ptr().cast(),
-        size: request.value.len(),
-        policy: request.policy.clone(),
-    }).collect::<Vec<_>>();
+    let from = requests
+        .iter()
+        .map(|request| PutFromRequest {
+            tenant: request.tenant,
+            domain: request.domain,
+            object_set: request.object_set,
+            qos_tier: request.qos_tier,
+            key: request.key,
+            buffer: request.value.as_ptr().cast(),
+            size: request.value.len(),
+            policy: request.policy.clone(),
+        })
+        .collect::<Vec<_>>();
     let statuses = writer.batch_put_from_statuses(&from);
     for (address, length) in regions {
-        writer.unregister_buffer(address as *mut std::ffi::c_void, length).expect("status source should unregister");
+        writer
+            .unregister_buffer(address as *mut std::ffi::c_void, length)
+            .expect("status source should unregister");
     }
     statuses
 }

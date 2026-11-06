@@ -1,6 +1,7 @@
 use super::super::{
-    refresh_cold_tier_device_cache, ClockEntryId, DebugEvictAllResult, ObjectRoute, OperationTracker,
-    PendingOffloadPrepareOutcome, RestorePromotionQueue, Result, StorageOwnerState,
+    refresh_cold_tier_device_cache, ClockEntryId, DebugEvictAllResult, ObjectRoute,
+    OperationTracker, PendingOffloadPrepareOutcome, RestorePromotionQueue, Result,
+    StorageOwnerState,
 };
 use super::{payload_checksum, pin_local_hot_replica_payload};
 use std::collections::{BTreeMap, BTreeSet};

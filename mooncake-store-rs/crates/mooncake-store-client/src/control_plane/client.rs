@@ -103,7 +103,7 @@ fn decode_route_list_by_replica_owner_reply(
         mooncake_store_route::RouteOwnerPage {
             routes,
             next_cursor: reply.next_cursor,
-        snapshot_epoch: reply.snapshot_epoch,
+            snapshot_epoch: reply.snapshot_epoch,
         },
     ))
 }
@@ -223,7 +223,15 @@ impl ControlPlaneClient {
                 snapshot_epoch,
                 limit,
             } => self.send_route_list_by_replica_owner(
-                lease, namespace, authority, RouteOwnerPageQuery { owner, cursor, snapshot_epoch, limit },
+                lease,
+                namespace,
+                authority,
+                RouteOwnerPageQuery {
+                    owner,
+                    cursor,
+                    snapshot_epoch,
+                    limit,
+                },
             ),
             RouteControlRequest::GetAllocationReferences {
                 namespace,
@@ -1629,7 +1637,6 @@ impl ControlPlaneClient {
             )),
         }
     }
-
 }
 
 #[cfg(test)]

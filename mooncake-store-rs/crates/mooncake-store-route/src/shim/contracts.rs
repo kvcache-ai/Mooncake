@@ -154,14 +154,7 @@ pub trait RouteAuthorityService: Send + Sync {
         snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> Result<RouteOwnerPage> {
-        let _ = (
-            namespace,
-            authority,
-            owner,
-            cursor,
-            snapshot_epoch,
-            limit,
-        );
+        let _ = (namespace, authority, owner, cursor, snapshot_epoch, limit);
         Err(StoreError::Unsupported(
             "route authority does not implement bounded owner-route pagination".to_string(),
         ))

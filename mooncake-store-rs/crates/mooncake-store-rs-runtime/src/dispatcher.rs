@@ -2138,5 +2138,4 @@ mod tests {
         assert_eq!(remove_all_result_status(true, 7), (0, 7));
         assert_eq!(remove_all_result_status(false, 3), (-1, 3));
     }
-
 }
