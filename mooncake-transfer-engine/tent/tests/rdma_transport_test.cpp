@@ -5989,8 +5989,7 @@ TEST(RdmaQuiesceTest, IdleWorkersDrainStaySuspendedAndRejectSubmit) {
     bool worker_suspended = false;
     while (!worker_suspended &&
            std::chrono::steady_clock::now() < suspend_deadline) {
-        worker_suspended =
-            RdmaTransportTestPeer::workerInSuspend(*workers, 0);
+        worker_suspended = RdmaTransportTestPeer::workerInSuspend(*workers, 0);
         if (!worker_suspended) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }

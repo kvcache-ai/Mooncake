@@ -1578,7 +1578,7 @@ void Workers::workerThread(int thread_id) {
             } else {
                 worker.cv.wait(lock, [&]() -> bool {
                     return !running_ || worker.inflight_slices.load(
-                               std::memory_order_acquire) > 0;
+                                            std::memory_order_acquire) > 0;
                 });
             }
             worker.in_suspend = false;
