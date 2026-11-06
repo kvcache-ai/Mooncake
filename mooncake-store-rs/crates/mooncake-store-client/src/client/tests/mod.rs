@@ -22187,3 +22187,70 @@ fn background_watermark_batch_retains_all_tokens_when_complete_reply_is_lost() {
 }
 
 mod batch_put_status_tests;
+
+struct AppliedMigrationReplyLossDirectory {
+    inner: Arc<dyn RouteDirectory>,
+    key: ObjectKey,
+    fail_once: AtomicBool,
+}
+impl RouteDirectory for AppliedMigrationReplyLossDirectory {
+    fn get_object_route(&self, observer: &ClientLease, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
+        self.inner.get_object_route(observer, key)
+    }
+    fn confirm_replica_reference(&self, observer: &ClientLease, key: &ObjectKey, replica: &ReplicaRoute) -> Result<RouteReplicaReference> {
+        self.inner.confirm_replica_reference(observer, key, replica)
+    }
+    fn compare_and_swap_object_route(&self, observer: &ClientLease, key: &ObjectKey, expected: Option<RouteVersion>, next: Option<&ObjectRoute>) -> Result<mooncake_store_core::CasResult> {
+        let result = self.inner.compare_and_swap_object_route(observer, key, expected, next)?;
+        if key == &self.key && result.applied && self.fail_once.swap(false, Ordering::SeqCst) {
+            return Err(StoreError::Transport("injected migration reply loss after apply".to_string()));
+        }
+        Ok(result)
+    }
+    fn metadata(&self) -> &dyn MetadataBackend { self.inner.metadata() }
+}
+
+#[test]
+fn migration_applied_reply_loss_keeps_publicly_readable_generation() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let ta = Arc::new(TestTransport::new("migration-unknown-a"));
+    let tb = Arc::new(ta.peer("migration-unknown-b"));
+    let tr = Arc::new(ta.peer("migration-unknown-reader"));
+    let a = StoreClientBuilder::new(metadata.clone(), "migration-unknown-a")
+        .state(ClientLifecycleState::Active).label("storage", "true").label("route", "true")
+        .route_control(RouteControlMode::EmbeddedWrh).transport(ta)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .local_memory(storage_config()).build(test_future_expiry_ms()).unwrap();
+    let mut b = StoreClientBuilder::new(metadata.clone(), "migration-unknown-b")
+        .state(ClientLifecycleState::Active).label("storage", "true").label("route", "true")
+        .route_control(RouteControlMode::EmbeddedWrh).transport(tb)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .local_memory(storage_config()).build(test_future_expiry_ms()).unwrap();
+    let reader = StoreClientBuilder::new(metadata, "migration-unknown-reader")
+        .state(ClientLifecycleState::Active).label("storage", "false").label("route", "false")
+        .route_control(RouteControlMode::EmbeddedWrh).transport(tr)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .local_memory(rw_only_config()).build(test_future_expiry_ms()).unwrap();
+    a.register_local_memory().unwrap(); b.register_local_memory().unwrap(); reader.register_local_memory().unwrap();
+    wait_for_membership_convergence(&[&a, &b, &reader]);
+    let key = "migration-unknown";
+    let payload = vec![0x41; 4096];
+    let seeded = a.put(key, &payload).unwrap();
+    assert_eq!(seeded.replicas[0].owner, *a.runtime_id());
+    let target = b.segment_name().unwrap();
+    b.route_directory = Arc::new(AppliedMigrationReplyLossDirectory {
+        inner: b.route_directory.clone(), key: seeded.key.clone(), fail_once: AtomicBool::new(true),
+    });
+    let object_id = LogicalObjectId::new(NamespaceScope::with_defaults(Some("default"), None, None), key);
+    let error = b.execute_explicit_route_migration(&object_id, &ExplicitMigrationPlan {
+        mode: ExplicitMigrationMode::Move,
+        source: ReplicaReadSelector::Segment(seeded.replicas[0].segment_name.clone()),
+        target_segments: vec![target], all_or_nothing: true,
+    }).expect_err("applied migration should lose its reply");
+    assert!(error.to_string().contains("injected migration reply loss after apply"));
+    let published = reader.query_route(key).unwrap().unwrap();
+    assert_eq!(published.replicas.len(), 1);
+    assert_eq!(published.replicas[0].owner, *b.runtime_id());
+    b.put("migration-reuse-probe", &vec![0x5a; payload.len()]).unwrap();
+    assert_eq!(reader.get(key).unwrap(), payload, "an applied route must keep its generation after the CAS reply is lost");
+}
