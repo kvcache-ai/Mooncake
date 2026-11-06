@@ -340,7 +340,7 @@ impl LocalRouteTable {
     }
 
     pub(crate) fn replace(&mut self, key: &ObjectKey, next: Option<&ObjectRoute>) {
-        if self.version_floor_blocks_insert(key, None, next) {
+        if self.replace_is_stale(key, None, next) {
             return;
         }
         self.apply_update(key, next);
@@ -348,7 +348,36 @@ impl LocalRouteTable {
 
     pub(crate) fn replace_many(&mut self, requests: &[RouteCasRequest]) {
         for request in requests {
-            self.replace(&request.key, request.next.as_ref());
+            if self.replace_is_stale(&request.key, request.expected, request.next.as_ref()) {
+                continue;
+            }
+            self.apply_update(&request.key, request.next.as_ref());
+        }
+    }
+
+    // Secondary mirrors are asynchronous, so an older publish or delete can arrive
+    // after a newer route is already visible on the authority.
+    fn replace_is_stale(
+        &self,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> bool {
+        match next {
+            Some(route) => {
+                self.routes
+                    .get(&key.0)
+                    .is_some_and(|current| route.version < current.version)
+                    || self
+                        .version_floors
+                        .get(&key.0)
+                        .is_some_and(|floor| route.version <= *floor)
+            }
+            None => expected.is_some_and(|version| {
+                self.routes
+                    .get(&key.0)
+                    .is_some_and(|current| current.version > version)
+            }),
         }
     }
 
@@ -560,6 +589,46 @@ mod tests {
             Some(RouteVersion(4))
         );
         assert_eq!(table.version_floor(&key), None);
+    }
+
+    #[test]
+    fn replace_ignores_delayed_older_route_when_newer_route_is_present() {
+        let key = ObjectKey::new("key-a".to_string());
+        let old = test_route(&key, 3);
+        let new = test_route(&key, 4);
+        let mut table = LocalRouteTable::default();
+
+        table.replace(&key, Some(&old));
+        table.replace(&key, Some(&new));
+        table.replace(&key, Some(&old));
+
+        assert_eq!(
+            table.get(&key).as_ref().map(|route| route.version),
+            Some(RouteVersion(4)),
+            "a delayed mirror must not roll a live route back to an older version"
+        );
+    }
+
+    #[test]
+    fn replace_many_ignores_delayed_delete_when_newer_route_is_present() {
+        let key = ObjectKey::new("key-a".to_string());
+        let old = test_route(&key, 3);
+        let new = test_route(&key, 4);
+        let mut table = LocalRouteTable::default();
+
+        table.replace(&key, Some(&old));
+        table.replace(&key, Some(&new));
+        table.replace_many(&[RouteCasRequest {
+            key: key.clone(),
+            expected: Some(old.version),
+            next: None,
+        }]);
+
+        assert_eq!(
+            table.get(&key).as_ref().map(|route| route.version),
+            Some(RouteVersion(4)),
+            "a delayed mirror delete must not remove a newer route"
+        );
     }
 
     #[test]

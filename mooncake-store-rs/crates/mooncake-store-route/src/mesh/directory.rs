@@ -1796,7 +1796,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                             .1
                             .push(RouteCasRequest {
                                 key: request.key.clone(),
-                                expected: None,
+                                expected: request.expected,
                                 next: request.next.clone(),
                             });
                     }
