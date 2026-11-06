@@ -1861,6 +1861,11 @@ mod owner_page_contract_tests {
         leases: Vec<ClientLease>,
     }
 
+    struct RetainedMembership {
+        current: Vec<ClientLease>,
+        retained: Vec<ClientLease>,
+    }
+
     impl RouteMembershipProvider for ForceRefreshChangingMembership {
         fn live_clients(
             &self,
@@ -1918,9 +1923,101 @@ mod owner_page_contract_tests {
         }
     }
 
+    impl RouteMembershipProvider for RetainedMembership {
+        fn live_clients(
+            &self,
+            force_refresh: bool,
+            _operation: &'static str,
+        ) -> Result<Vec<ClientLease>> {
+            if force_refresh {
+                return Err(StoreError::Metadata(
+                    "injected metadata refresh failure".to_string(),
+                ));
+            }
+            Ok(self.current.clone())
+        }
+
+        fn retained_live_clients(&self, _operation: &'static str) -> Result<Vec<ClientLease>> {
+            Ok(self.retained.clone())
+        }
+
+        fn reconcile_suspects(&self, _leases: &[ClientLease]) {}
+
+        fn is_suspect(&self, _runtime: &ClientRuntimeId) -> bool {
+            false
+        }
+
+        fn mark_suspect(
+            &self,
+            _runtime: ClientRuntimeId,
+            _quarantine_until: Instant,
+            _observed: Option<&ClientLease>,
+        ) {
+        }
+    }
+
     struct ConfirmationClient {
         routes: BTreeMap<String, Option<ObjectRoute>>,
         allocation_references: BTreeMap<String, Vec<AllocationRouteReferenceState>>,
+    }
+
+    struct RecordingConfirmationClient {
+        routes: BTreeMap<String, Option<ObjectRoute>>,
+        queried_authorities: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RouteAuthorityClient for RecordingConfirmationClient {
+        fn batch_get_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            authority: &ClientStableId,
+            keys: &[ObjectKey],
+        ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+            self.queried_authorities.lock().push(authority.0.clone());
+            let route = self.routes.get(&authority.0).cloned().unwrap_or(None);
+            Ok(keys.iter().map(|_| Ok(route.clone())).collect())
+        }
+
+        fn batch_contains_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _keys: &[ObjectKey],
+        ) -> Result<Vec<Result<bool>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn batch_compare_and_swap_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _requests: &[RouteCasRequest],
+        ) -> Result<Vec<Result<CasResult>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn batch_replace_routes(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _requests: &[RouteCasRequest],
+        ) -> Result<Vec<Result<()>>> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
+
+        fn list_routes_by_replica_owner_page(
+            &self,
+            _lease: &ClientLease,
+            _namespace: &str,
+            _authority: &ClientStableId,
+            _query: &RouteOwnerPageQuery,
+        ) -> Result<RouteOwnerPage> {
+            Err(StoreError::Unsupported("unused test operation".to_string()))
+        }
     }
 
     impl RouteAuthorityClient for ConfirmationClient {
@@ -2251,6 +2348,82 @@ mod owner_page_contract_tests {
                 .expect("semantic absence must not depend on complete route equality"),
             RouteReplicaReference::Absent
         ));
+    }
+
+    #[test]
+    fn exact_replica_confirmation_checks_bounded_current_and_retained_topk_union() {
+        let observer = test_lease("observer");
+        let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut referenced = test_route("confirmation-retained-authority", &replica_owner);
+        referenced.replicas[0].allocation_id = Some(7);
+        let absent = ObjectRoute {
+            replicas: Vec::new(),
+            ..referenced.clone()
+        };
+        let current = vec![
+            test_lease("current-a"),
+            test_lease("current-b"),
+            test_lease("current-c"),
+        ];
+        let retained = vec![
+            test_lease("retained-a"),
+            test_lease("retained-b"),
+            test_lease("retained-c"),
+        ];
+        let metadata = Arc::new(InMemoryMetadataBackend::new());
+        let namespace = metadata.route_namespace();
+        let current_topk = ranked_top_authorities(&namespace, &current, &referenced.key, 2);
+        let retained_topk = ranked_top_authorities(&namespace, &retained, &referenced.key, 2);
+        let retained_reference = retained_topk[0].runtime.stable_id.0.clone();
+        let expected_authorities = current_topk
+            .iter()
+            .chain(&retained_topk)
+            .map(|lease| lease.runtime.stable_id.0.clone())
+            .collect::<BTreeSet<_>>();
+        let queried_authorities = Arc::new(Mutex::new(Vec::new()));
+        let routes = expected_authorities
+            .iter()
+            .map(|authority| {
+                (
+                    authority.clone(),
+                    Some(if *authority == retained_reference {
+                        referenced.clone()
+                    } else {
+                        absent.clone()
+                    }),
+                )
+            })
+            .collect();
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            metadata,
+            &observer,
+            Arc::new(RecordingConfirmationClient {
+                routes,
+                queried_authorities: queried_authorities.clone(),
+            }),
+            Arc::new(RetainedMembership { current, retained }),
+        );
+
+        assert!(matches!(
+            directory
+                .confirm_replica_reference(
+                    &observer,
+                    &referenced.key,
+                    &referenced.replicas[0],
+                )
+                .expect("a retained exact reference must keep the allocation"),
+            RouteReplicaReference::Referenced(_)
+        ));
+        assert_eq!(
+            queried_authorities
+                .lock()
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_authorities
+        );
+        assert!(queried_authorities.lock().len() <= 4);
     }
 
     #[test]
