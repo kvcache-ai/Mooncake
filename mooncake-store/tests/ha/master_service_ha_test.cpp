@@ -45,6 +45,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
     ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         auto it = kvs_.find(std::string(key));
         if (it == kvs_.end()) {
             return ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -54,12 +55,14 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
     ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         kvs_[std::string(key)] = std::string(value);
         return ErrorCode::OK;
     }
 
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         kvs.clear();
         for (auto it = kvs_.lower_bound(std::string(begin_key));
              it != kvs_.end() && it->first < end_key; ++it) {
@@ -74,6 +77,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     bool SupportsTxn() const override { return true; }
 
     ErrorCode Txn(const KvTxn& txn) override {
+        std::lock_guard<std::mutex> lock(kvs_mutex_);
         for (const auto& compare : txn.compares) {
             auto it = kvs_.find(compare.key);
             if (compare.kind == KvCompareKind::kKeyNotExists) {
@@ -92,6 +96,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
    private:
+    std::mutex kvs_mutex_;
     std::map<std::string, std::string> kvs_;
 };
 
@@ -6078,6 +6083,90 @@ TEST_F(MasterServiceHATest,
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+}
+
+TEST_F(MasterServiceHATest, FullWriterMustNotLeaveRetiredOwnerInStandby) {
+    // This is not an allocator-overlap test. It reproduces a control-plane
+    // disagreement: the primary retires an owner, but a full writer drops its
+    // SEGMENT_UNMOUNT event. Reusing the logical name then leaves two endpoints
+    // with that name in standby replay, making promotion fail INVALID_PARAMS.
+    const std::string cluster_id = "retired_owner_full_writer";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    // ASSERT failures must not strand the writer in the fake transaction and
+    // hang service destruction. Declare this after service so it releases
+    // first.
+    struct ReleaseBlockedBackend {
+        std::shared_ptr<BlockingBatchHaKvBackend> backend;
+        ~ReleaseBlockedBackend() { backend->AllowTxn(); }
+    } release{backend};
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    const UUID old_client = generate_uuid();
+    Segment old_owner = MakeSegment("owner-with-stable-name");
+    old_owner.te_endpoint = "old-owner-endpoint";
+    ASSERT_TRUE(service.MountSegment(old_owner, old_client));
+    ReadBatchEventually(storage, 1, batch);
+
+    // Hold batch 2 in flight, then occupy the only waiting slot with batch 3.
+    // The unmount below cannot reserve another slot until we release the
+    // backend.
+    backend->BlockTxn();
+    ASSERT_TRUE(service.MountSegment(
+        MakeSegment("inflight-owner",
+                    kDefaultSegmentBase + kDefaultSegmentSize),
+        generate_uuid()));
+    ASSERT_TRUE(backend->WaitForBlockedTxn());
+    ASSERT_TRUE(service.MountSegment(
+        MakeSegment("waiting-owner",
+                    kDefaultSegmentBase + 2 * kDefaultSegmentSize),
+        generate_uuid()));
+
+    const auto retired = service.UnmountSegment(old_owner.id, old_client);
+    // Backpressure may reject an operation before changing primary state.
+    // Success, however, must never mean the corresponding replay event was
+    // lost.
+    if (!retired) {
+        EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, retired.error());
+    }
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 3, batch);
+    if (!retired) {
+        ASSERT_TRUE(service.UnmountSegment(old_owner.id, old_client));
+        ReadBatchEventually(storage, 4, batch);
+    }
+
+    // Model a new owner incarnation: same name, different endpoint and UUID.
+    Segment replacement = MakeSegment(old_owner.name);
+    replacement.te_endpoint = "replacement-owner-endpoint";
+    ASSERT_TRUE(service.MountSegment(replacement, generate_uuid()));
+    ReadBatchEventually(storage, retired ? 4 : 5, batch);
+
+    StandbyMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    ASSERT_EQ(ErrorCode::OK, reader.PollOnce(10).error);
+    const auto& registry = applier.GetSegmentRegistry();
+    EXPECT_FALSE(registry.HasSegment(old_owner.te_endpoint))
+        << "Primary retired the old endpoint, but standby still owns it";
+    EXPECT_TRUE(registry.HasSegment(replacement.te_endpoint));
+
+    // The stale entry is observable as an actual restore failure, not merely a
+    // missing log record: two endpoint-keyed entries compete for one name
+    // alias.
+    MasterService promoted(MasterServiceConfig::builder().build());
+    EXPECT_TRUE(promoted.RestoreFromStandbySnapshot({}, batch.last_seq,
+                                                    registry.GetAllSegments()))
+        << "A successful retirement must not poison standby promotion";
 }
 
 TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
