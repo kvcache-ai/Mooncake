@@ -1851,10 +1851,10 @@ mod owner_page_contract_tests {
         }
     }
 
-    struct ForceRefreshChangingMembership {
+    struct SnapshotChangingMembership {
         first: Vec<ClientLease>,
         refreshed: Vec<ClientLease>,
-        force_refresh_calls: AtomicUsize,
+        snapshot_calls: AtomicUsize,
     }
 
     struct CachedOnlyMembership {
@@ -1866,13 +1866,13 @@ mod owner_page_contract_tests {
         retained: Vec<ClientLease>,
     }
 
-    impl RouteMembershipProvider for ForceRefreshChangingMembership {
+    impl RouteMembershipProvider for SnapshotChangingMembership {
         fn live_clients(
             &self,
-            force_refresh: bool,
+            _force_refresh: bool,
             _operation: &'static str,
         ) -> Result<Vec<ClientLease>> {
-            if force_refresh && self.force_refresh_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+            if self.snapshot_calls.fetch_add(1, Ordering::SeqCst) > 1 {
                 Ok(self.refreshed.clone())
             } else {
                 Ok(self.first.clone())
@@ -2205,7 +2205,7 @@ mod owner_page_contract_tests {
     }
 
     #[test]
-    fn exact_replica_confirmation_requires_all_authorities_to_agree() {
+    fn exact_replica_confirmation_keeps_allocation_when_any_authority_references_it() {
         let observer = test_lease("observer");
         let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
         let mut referenced = test_route("confirmation-key", &replica_owner);
@@ -2230,10 +2230,12 @@ mod owner_page_contract_tests {
             }),
         );
 
-        let error = directory
+        assert!(matches!(
+            directory
             .confirm_replica_reference(&observer, &referenced.key, &referenced.replicas[0])
-            .expect_err("authority divergence must not prove replica absence or reference");
-        assert!(matches!(error, StoreError::Transport(message) if message.contains("diverged")));
+            .expect("an exact reference on any proof authority must retain the allocation"),
+            RouteReplicaReference::Referenced(_)
+        ));
     }
 
     #[test]
@@ -2444,10 +2446,10 @@ mod owner_page_contract_tests {
                 routes: BTreeMap::from([("authority-a".to_string(), Some(absent))]),
                 allocation_references: BTreeMap::new(),
             }),
-            Arc::new(ForceRefreshChangingMembership {
+            Arc::new(SnapshotChangingMembership {
                 first: vec![test_lease("authority-a")],
                 refreshed: vec![test_lease("authority-a"), test_lease("authority-b")],
-                force_refresh_calls: AtomicUsize::new(0),
+                snapshot_calls: AtomicUsize::new(0),
             }),
         );
 
