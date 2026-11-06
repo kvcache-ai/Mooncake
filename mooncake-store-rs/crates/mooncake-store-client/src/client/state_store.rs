@@ -1987,10 +1987,9 @@ impl StorageClockState {
     const READ_HOT_CLOCK_CREDIT: u8 = 2;
 
     fn for_runtime(runtime: &ClientRuntimeId) -> Self {
-        let cursor = runtime_clock_cursor(runtime);
         Self {
-            hand: cursor,
-            stale_reclaim_hand: cursor.rotate_right(13),
+            hand: runtime_clock_cursor(runtime, 0x6576_6963_7469_6f6e),
+            stale_reclaim_hand: runtime_clock_cursor(runtime, 0x7374_616c_655f_6763),
             ..Self::default()
         }
     }
@@ -2371,16 +2370,25 @@ impl HotReplicaTracker {
     }
 }
 
-fn runtime_clock_cursor(runtime: &ClientRuntimeId) -> usize {
+fn runtime_clock_cursor(runtime: &ClientRuntimeId, salt: u64) -> usize {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
     let mut hash = FNV_OFFSET_BASIS;
-    for byte in runtime.storage_key().bytes() {
+    for byte in salt
+        .to_le_bytes()
+        .into_iter()
+        .chain(runtime.storage_key().bytes())
+    {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    (hash & 0x7fff_ffff) as usize
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    (hash as usize) & (usize::MAX >> 1)
 }
 
 #[allow(dead_code)]
