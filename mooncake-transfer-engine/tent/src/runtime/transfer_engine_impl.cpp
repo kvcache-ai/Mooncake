@@ -274,13 +274,15 @@ void restoreExplicitTransferEngineConfig(
         ConfigHelper::forceTcp(config);
     }
     if (preserved.force_fabric) {
-        ConfigHelper::forceFabric(config,
-                                  preserved.fabric_provider.value_or("auto"));
+        const std::string provider = preserved.fabric_provider.value_or(
+            config.get("transports/fabric/provider", std::string("auto")));
+        ConfigHelper::forceFabric(config, provider);
+        restoreExplicitConfigValue(config, "transports/fabric/devices",
+                                   preserved.fabric_devices);
     }
-    restoreExplicitConfigValue(config, "transports/fabric/provider",
-                               preserved.fabric_provider);
-    restoreExplicitConfigValue(config, "transports/fabric/devices",
-                               preserved.fabric_devices);
+    if (std::getenv("MC_FORCE_TCP")) {
+        ConfigHelper::forceTcp(config);
+    }
     restoreExplicitConfigValue(config, "topology/rdma_whitelist",
                                preserved.rdma_whitelist);
     restoreExplicitConfigValue(config, "transports/ascend_direct/agent_mode",
@@ -1077,11 +1079,72 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 options.type == HP_TCP ||
                 (options.type == UNSPEC && transports.size() == 1 &&
                  transports.front() == HP_TCP);
+            const bool fabric_required =
+                options.type == FABRIC ||
+                (options.type == UNSPEC &&
+                 conf_->get("transports/force_fabric", false));
             std::vector<TransportType> registered_transports;
+            auto rollbackRegisteredTransports = [&]() -> Status {
+                Status first_error;
+                for (auto registered : registered_transports) {
+                    for (auto& desc : descs) {
+                        auto cleanup =
+                            transport_list_[registered]->removeMemoryBuffer(
+                                desc);
+                        if (!cleanup.ok()) {
+                            LOG(WARNING) << cleanup.ToString();
+                            if (first_error.ok()) first_error = cleanup;
+                            continue;
+                        }
+                        desc.transport_attrs.erase(registered);
+                        desc.transports.erase(
+                            std::remove(desc.transports.begin(),
+                                        desc.transports.end(), registered),
+                            desc.transports.end());
+                    }
+                }
+                if (first_error.ok()) return first_error;
+
+                std::vector<BufferDesc> retained;
+                for (auto& desc : descs) {
+                    bool needs_cleanup = !desc.transports.empty();
+                    for (auto registered : registered_transports) {
+                        if (needs_cleanup) break;
+                        needs_cleanup =
+                            transport_list_[registered]->tracksLocalBuffer(
+                                desc);
+                    }
+                    if (!needs_cleanup) continue;
+                    // Hide rollback remnants but keep them reachable for retry.
+                    desc.internal = true;
+                    retained.push_back(desc);
+                }
+                if (!retained.empty()) {
+                    auto retained_status = local_segment_tracker_->addInBatch(
+                        retained,
+                        [](std::vector<BufferDesc>&) { return Status::OK(); });
+                    if (!retained_status.ok()) {
+                        LOG(ERROR) << "Failed to retain registrations after "
+                                      "rollback failure: "
+                                   << retained_status.ToString();
+                    } else {
+                        LOG(WARNING)
+                            << "Retained " << retained.size()
+                            << " buffer registrations after rollback failure; "
+                               "unregisterLocalMemory is required before retry";
+                    }
+                }
+                return first_error;
+            };
             Status first_error = Status::OK();
             for (auto type : transports) {
                 auto s = transport_list_[type]->addMemoryBuffer(descs, options);
                 if (!s.ok()) {
+                    if (type == FABRIC && fabric_required) {
+                        registered_transports.push_back(type);
+                        auto cleanup = rollbackRegisteredTransports();
+                        return cleanup.ok() ? s : cleanup;
+                    }
                     // addMemoryBuffer implementations are required to be
                     // transactional, but invoke remove on the failing
                     // transport as defensive cleanup for a partially
@@ -1105,6 +1168,23 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             }
             if (registered_transports.empty() && !first_error.ok()) {
                 return first_error;
+            }
+            if (fabric_required) {
+                for (const auto& desc : descs) {
+                    const bool advertised =
+                        std::find(desc.transports.begin(),
+                                  desc.transports.end(),
+                                  FABRIC) != desc.transports.end();
+                    if (transport_list_[FABRIC]->tracksLocalBuffer(desc) &&
+                        (options.perm == kLocalReadWrite || advertised)) {
+                        continue;
+                    }
+                    auto cleanup = rollbackRegisteredTransports();
+                    if (!cleanup.ok()) return cleanup;
+                    return Status::InternalError(
+                        "Required Fabric transport did not register "
+                        "memory" LOC_MARK);
+                }
             }
             // desc.transports lists the transports that actually registered
             // the buffer (each transport appends itself on success).

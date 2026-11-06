@@ -172,6 +172,7 @@ void ConfigHelper::forceTcp(Config& config) {
 }
 
 void ConfigHelper::forceFabric(Config& config, const std::string& provider) {
+    // Memory routing is pinned separately; leave file/platform paths available.
     config.set("transports/force_tcp", false);
     config.set("transports/force_fabric", true);
     config.set("transports/tcp/enable", false);

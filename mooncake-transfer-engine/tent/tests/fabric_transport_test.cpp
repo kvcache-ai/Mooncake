@@ -320,6 +320,18 @@ class FabricTransportTest : public ::testing::Test {
     uint64_t remote_base_ = 0;
 };
 
+TEST_F(FabricTransportTest, SameAddressDifferentLengthPreservesRegistration) {
+    connect(0, 0);
+    auto status =
+        client_->registerLocalMemory(buffer_.data(), kBufferLength / 2);
+    EXPECT_FALSE(status.ok()) << status.ToString();
+    SegmentInfo info;
+    ASSERT_TRUE(client_->getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    ASSERT_EQ(info.buffers.size(), 1u);
+    EXPECT_EQ(info.buffers.front().length, kBufferLength);
+    roundTrip(0, 0, 4096, 1, 4096);
+}
+
 TEST_F(FabricTransportTest, WriteThenRead) {
     connect(0, 0);
     roundTrip(0, 0, 4 * 1024 * 1024, 8, 4 * 1024 * 1024);
