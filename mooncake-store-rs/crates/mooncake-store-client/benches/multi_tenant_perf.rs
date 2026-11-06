@@ -25,8 +25,8 @@ use mooncake_store_client::{
     LocalMemoryConfig, MooncakeCompatibilityFacade, PutRequest, StoreClient, StoreClientBuilder,
 };
 use mooncake_store_core::{
-    ClientLifecycleState, MetadataBackend, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
-    TenantQuotaPolicy,
+    ClientLifecycleState, CompatibilityDescriptor, MetadataBackend, TenantPolicy,
+    TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy, ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY,
 };
 use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::fixtures::test_future_expiry_ms;
@@ -51,6 +51,22 @@ fn build_active_client(
     stable_id: &str,
     tenant: &str,
 ) -> StoreClient {
+    build_active_client_with_lifecycle(metadata, transport, stable_id, tenant, true)
+}
+
+fn build_active_client_with_lifecycle(
+    metadata: Arc<dyn MetadataBackend>,
+    transport: Arc<TestTransport>,
+    stable_id: &str,
+    tenant: &str,
+    lifecycle_enabled: bool,
+) -> StoreClient {
+    let mut compatibility = CompatibilityDescriptor::mooncake_v1();
+    if !lifecycle_enabled {
+        compatibility
+            .capabilities
+            .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    }
     let client = StoreClientBuilder::new(metadata, stable_id)
         .state(ClientLifecycleState::Active)
         .tenant(tenant)
@@ -59,6 +75,7 @@ fn build_active_client(
         .segment_name(format!("{stable_id}-segment"))
         .transport(transport)
         .local_memory(bench_storage_config())
+        .compatibility(compatibility)
         .build(test_future_expiry_ms())
         .expect("bench client build should succeed");
     client
@@ -134,6 +151,44 @@ fn bench_put_baseline_single_tenant_default_scope(c: &mut Criterion) {
                 .expect("baseline put should succeed");
         });
     });
+    group.finish();
+}
+
+fn bench_allocation_lifecycle_single_put(c: &mut Criterion) {
+    let value = small_payload(64);
+    let mut group = c.benchmark_group("put_allocation_lifecycle");
+    group.throughput(Throughput::Bytes(value.len() as u64));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(50);
+
+    for (name, lifecycle_enabled) in [("lifecycle", true), ("legacy", false)] {
+        let transport_name = if lifecycle_enabled {
+            "allocation-lifecycle-enabled"
+        } else {
+            "allocation-lifecycle-disabled"
+        };
+        let metadata: Arc<InMemoryMetadataBackend> = Arc::new(InMemoryMetadataBackend::new());
+        let transport = Arc::new(TestTransport::new(transport_name));
+        let client = build_active_client_with_lifecycle(
+            metadata as Arc<dyn MetadataBackend>,
+            transport,
+            transport_name,
+            "tenant-allocation-lifecycle",
+            lifecycle_enabled,
+        );
+        warm_up_client(&client, "tenant-allocation-lifecycle");
+
+        let mut counter = 0u64;
+        group.bench_with_input(BenchmarkId::new("put_64B", name), &client, |b, client| {
+            b.iter(|| {
+                counter = counter.wrapping_add(1);
+                let key = format!("k-{counter}");
+                client
+                    .put_in_tenant("tenant-allocation-lifecycle", &key, &value)
+                    .expect("allocation lifecycle put should succeed");
+            });
+        });
+    }
     group.finish();
 }
 
@@ -329,6 +384,7 @@ fn bench_get_multi_tenant_with_policy(c: &mut Criterion) {
 criterion_group!(
     multi_tenant_perf,
     bench_put_baseline_single_tenant_default_scope,
+    bench_allocation_lifecycle_single_put,
     bench_put_single_tenant_non_default_scope,
     bench_put_multi_tenant_strict_quota_hot_cache,
     bench_batch_put_multi_tenant,
