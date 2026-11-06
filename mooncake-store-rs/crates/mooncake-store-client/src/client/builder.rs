@@ -549,6 +549,7 @@ impl StoreClientBuilder {
         let route_directory = build_route_directory(
             effective_route_control,
             effective_route_topk,
+            delete_marker_budget_bytes(self.local_memory.storage_bytes),
             runtime_metadata.clone(),
             &provisional_lease,
             control_client.clone(),
@@ -887,6 +888,17 @@ impl StoreClientBuilder {
             deferred_cold_tier_reconciles: Mutex::new(deferred_reconciles),
         })
     }
+}
+
+fn delete_marker_budget_bytes(storage_bytes: usize) -> usize {
+    const MIN_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    const DEFAULT_RATIO: f64 = 0.01;
+    let ratio = std::env::var("MC_STORE_RS_DELETE_MARKER_MEMORY_RATIO")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+        .unwrap_or(DEFAULT_RATIO);
+    ((storage_bytes as f64 * ratio) as usize).max(MIN_BUDGET_BYTES)
 }
 
 fn bootstrap_route_policy(

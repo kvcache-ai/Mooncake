@@ -610,9 +610,13 @@ impl StoreClient {
                 }
             };
             if !cas.applied && expected_version.is_none() && cas.current.is_none() {
+                if cas.delete_version.is_none() && cas.version_floor.is_some() {
+                    registry::record_delete_marker_event("legacy_floor_retry", 1);
+                }
                 let retry_version = cas
-                    .version_floor
-                    .map(|floor| floor.next())
+                    .delete_version
+                    .or(cas.version_floor)
+                    .map(|version| version.next())
                     .unwrap_or_else(|| next_route_version(None, &self.route_ops(), &scoped_key));
                 if retry_version > route.version {
                     route.version = retry_version;

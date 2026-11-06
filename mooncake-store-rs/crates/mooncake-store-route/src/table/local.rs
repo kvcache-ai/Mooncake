@@ -9,7 +9,9 @@ use mooncake_store_core::{
     RouteVersion, StoreError,
 };
 
-use crate::metrics::record_authoritative_route_update;
+use crate::metrics::{record_authoritative_route_update, record_delete_marker_event, record_delete_marker_state};
+use crate::table::{DeleteMarkerSnapshot, DeleteMarkerStore};
+use crate::RouteAuthorityRecord;
 use crate::{RouteOwnerPage, DEFAULT_ROUTE_OWNER_PAGE_SIZE};
 
 fn route_has_materialized_cold_backing(route: &ObjectRoute) -> bool {
@@ -27,7 +29,7 @@ pub(crate) struct LocalRouteTable {
     owner_epochs: HashMap<ClientRuntimeId, u64>,
     scope_index: HashMap<NamespaceScope, HashSet<String>>,
     reuse_index: HashMap<ReuseIdentity, HashSet<String>>,
-    version_floors: HashMap<String, RouteVersion>,
+    delete_markers: DeleteMarkerStore,
 }
 
 /// The reverse index intentionally omits length and generation. Any route at
@@ -60,12 +62,30 @@ impl From<&ReplicaRoute> for AllocationRouteStart {
 }
 
 impl LocalRouteTable {
+    pub(crate) fn with_delete_marker_budget(budget_bytes: usize) -> Self {
+        Self {
+            delete_markers: DeleteMarkerStore::new(budget_bytes),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn get(&self, key: &ObjectKey) -> Option<ObjectRoute> {
         self.routes.get(&key.0).cloned()
     }
 
+    pub(crate) fn get_record(&self, key: &ObjectKey) -> RouteAuthorityRecord {
+        RouteAuthorityRecord {
+            route: self.get(key),
+            delete_version: self.delete_marker(key),
+        }
+    }
+
     pub(crate) fn get_many(&self, keys: &[ObjectKey]) -> Vec<Option<ObjectRoute>> {
         keys.iter().map(|key| self.get(key)).collect()
+    }
+
+    pub(crate) fn get_records(&self, keys: &[ObjectKey]) -> Vec<RouteAuthorityRecord> {
+        keys.iter().map(|key| self.get_record(key)).collect()
     }
 
     pub(crate) fn contains_many(&self, keys: &[ObjectKey]) -> Vec<bool> {
@@ -101,17 +121,21 @@ impl LocalRouteTable {
                     && !route_has_materialized_cold_backing(route)
             });
             if dominated {
-                self.apply_update(key, None);
+                self.apply_update(key, None, None);
             }
         }
     }
 
-    pub(crate) fn version_floor(&self, key: &ObjectKey) -> Option<RouteVersion> {
-        self.version_floors.get(&key.0).copied()
+    pub(crate) fn delete_marker(&self, key: &ObjectKey) -> Option<RouteVersion> {
+        self.delete_markers.get(key)
     }
 
-    pub(crate) fn version_floors(&self, keys: &[ObjectKey]) -> Vec<Option<RouteVersion>> {
-        keys.iter().map(|key| self.version_floor(key)).collect()
+    pub(crate) fn delete_markers(&self, keys: &[ObjectKey]) -> Vec<Option<RouteVersion>> {
+        self.delete_markers.get_many(keys)
+    }
+
+    pub(crate) fn delete_marker_snapshot(&self) -> DeleteMarkerSnapshot {
+        self.delete_markers.snapshot()
     }
 
     pub(crate) fn list_routes(&self) -> Vec<ObjectRoute> {
@@ -299,33 +323,36 @@ impl LocalRouteTable {
         next: Option<&ObjectRoute>,
     ) -> CasResult {
         let current = self.get(key);
-        let matches = match (expected, current.as_ref()) {
-            (None, None) => true,
-            (Some(version), Some(route)) => route.version == version,
+        let marker = self.delete_marker(key);
+        let matches = match (expected, current.as_ref(), marker) {
+            (None, None, None) => true,
+            (Some(version), Some(route), _) => route.version == version,
+            (Some(version), None, Some(marker)) => marker == version,
             _ => false,
         };
-        let floor_blocked = self.version_floor_blocks_insert(key, expected, next);
-        if !matches || floor_blocked {
-            let version_floor = if floor_blocked && current.is_none() {
-                self.version_floors.get(&key.0).copied()
+        let marker_blocked = self.delete_marker_blocks_insert(key, expected, next);
+        if !matches || marker_blocked {
+            let delete_version = if current.is_none() {
+                marker
             } else {
                 None
             };
             let result = CasResult {
                 applied: false,
                 current,
-                version_floor,
+                delete_version,
+                version_floor: None,
             };
             return result;
         }
 
-        self.apply_update(key, next);
-        let result = CasResult {
+        let applied_delete_version = self.apply_update(key, next, expected);
+        CasResult {
             applied: true,
-            current: next.cloned(),
+            current: next.filter(|route| route.state != mooncake_store_core::RouteState::Tombstone).cloned(),
+            delete_version: applied_delete_version,
             version_floor: None,
-        };
-        result
+        }
     }
 
     pub(crate) fn compare_and_swap_many(&mut self, requests: &[RouteCasRequest]) -> Vec<CasResult> {
@@ -341,7 +368,7 @@ impl LocalRouteTable {
         if self.replace_is_stale(key, None, next) {
             return;
         }
-        self.apply_update(key, next);
+        self.apply_update(key, next, None);
     }
 
     pub(crate) fn replace_many(&mut self, requests: &[RouteCasRequest]) {
@@ -349,7 +376,7 @@ impl LocalRouteTable {
             if self.replace_is_stale(&request.key, request.expected, request.next.as_ref()) {
                 continue;
             }
-            self.apply_update(&request.key, request.next.as_ref());
+            self.apply_update(&request.key, request.next.as_ref(), request.expected);
         }
     }
 
@@ -363,13 +390,17 @@ impl LocalRouteTable {
     ) -> bool {
         match next {
             Some(route) => {
+                if route.state == mooncake_store_core::RouteState::Tombstone {
+                    return self.routes.get(&key.0).is_some_and(|current| {
+                        current.version > route.version
+                    }) || self
+                        .delete_marker(key)
+                        .is_some_and(|marker| marker >= route.version);
+                }
                 self.routes
                     .get(&key.0)
                     .is_some_and(|current| route.version < current.version)
-                    || self
-                        .version_floors
-                        .get(&key.0)
-                        .is_some_and(|floor| route.version <= *floor)
+                    || self.delete_marker(key).is_some_and(|marker| route.version <= marker)
             }
             None => expected.is_some_and(|version| {
                 self.routes
@@ -379,43 +410,85 @@ impl LocalRouteTable {
         }
     }
 
-    fn version_floor_blocks_insert(
+    fn delete_marker_blocks_insert(
         &self,
         key: &ObjectKey,
-        expected: Option<RouteVersion>,
+        _expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> bool {
-        if expected.is_some() {
-            return false;
-        }
         let Some(route) = next else {
             return false;
         };
-        self.version_floors
-            .get(&key.0)
-            .is_some_and(|floor| route.version <= *floor)
+        route.state != mooncake_store_core::RouteState::Tombstone
+            && self
+                .delete_marker(key)
+                .is_some_and(|marker| route.version <= marker)
     }
 
-    fn apply_update(&mut self, key: &ObjectKey, next: Option<&ObjectRoute>) {
+    fn apply_update(
+        &mut self,
+        key: &ObjectKey,
+        next: Option<&ObjectRoute>,
+        delete_version: Option<RouteVersion>,
+    ) -> Option<RouteVersion> {
         let old = self.routes.get(&key.0).cloned();
-        self.bump_owner_epochs(old.as_ref(), next);
+        let next_live = next.filter(|route| route.state != mooncake_store_core::RouteState::Tombstone);
+        self.bump_owner_epochs(old.as_ref(), next_live);
         if let Some(route) = old.as_ref() {
             self.remove_indexes(key, route);
         }
         match next {
+            Some(route) if route.state == mooncake_store_core::RouteState::Tombstone => {
+                self.routes.remove(&key.0);
+                self.record_delete_marker(key, route.version);
+                record_authoritative_route_update(None, key);
+                return Some(route.version);
+            }
             Some(route) => {
                 self.routes.insert(key.0.clone(), route.clone());
-                self.version_floors.remove(&key.0);
+                if self.delete_markers.remove_if_older(key, route.version) {
+                    record_delete_marker_event("superseded", 1);
+                    self.record_delete_marker_state();
+                }
                 self.insert_indexes(key, route);
             }
             None => {
                 self.routes.remove(&key.0);
-                if let Some(old) = old.as_ref() {
-                    self.version_floors.insert(key.0.clone(), old.version);
+                if let Some(version) = old.as_ref().map(|route| route.version).or(delete_version) {
+                    self.record_delete_marker(key, version);
+                    record_authoritative_route_update(None, key);
+                    return Some(version);
                 }
             }
         }
-        record_authoritative_route_update(next, key);
+        record_authoritative_route_update(next_live, key);
+        None
+    }
+
+    fn record_delete_marker(&mut self, key: &ObjectKey, version: RouteVersion) {
+        let evicted = self.delete_markers.record(key, version);
+        if !evicted.is_empty() {
+            record_delete_marker_event("capacity_evicted", evicted.len() as u64);
+            for marker in evicted {
+                tracing::warn!(
+                    key = %marker.key.0,
+                    delete_version = marker.version.0,
+                    age_ms = marker.age.as_millis() as u64,
+                    accounted_bytes = marker.accounted_bytes,
+                    "delete marker evicted at bounded FIFO capacity"
+                );
+            }
+        }
+        self.record_delete_marker_state();
+    }
+
+    fn record_delete_marker_state(&self) {
+        let snapshot = self.delete_markers.snapshot();
+        record_delete_marker_state(
+            snapshot.entries as u64,
+            snapshot.accounted_bytes as u64,
+            snapshot.budget_bytes as u64,
+        );
     }
 
     fn bump_owner_epochs(&mut self, old: Option<&ObjectRoute>, next: Option<&ObjectRoute>) {
@@ -556,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_ignores_stale_route_at_version_floor() {
+    fn replace_ignores_stale_route_at_delete_marker() {
         let key = ObjectKey::new("key-a".to_string());
         let old = test_route(&key, 3);
         let mut table = LocalRouteTable::default();
@@ -569,11 +642,11 @@ mod tests {
             table.get(&key).is_none(),
             "delayed mirror replace must not resurrect an evicted route"
         );
-        assert_eq!(table.version_floor(&key), Some(RouteVersion(3)));
+        assert_eq!(table.delete_marker(&key), Some(RouteVersion(3)));
     }
 
     #[test]
-    fn replace_accepts_newer_route_above_version_floor() {
+    fn replace_accepts_newer_route_above_delete_marker() {
         let key = ObjectKey::new("key-a".to_string());
         let old = test_route(&key, 3);
         let new = test_route(&key, 4);
@@ -587,7 +660,7 @@ mod tests {
             table.get(&key).as_ref().map(|route| route.version),
             Some(RouteVersion(4))
         );
-        assert_eq!(table.version_floor(&key), None);
+        assert_eq!(table.delete_marker(&key), None);
     }
 
     #[test]
@@ -628,6 +701,43 @@ mod tests {
             Some(RouteVersion(4)),
             "a delayed mirror delete must not remove a newer route"
         );
+    }
+
+    #[test]
+    fn replace_many_installs_delete_marker_when_route_is_missing() {
+        let key = ObjectKey::new("missing-delete-marker".to_string());
+        let mut table = LocalRouteTable::default();
+
+        table.replace_many(&[RouteCasRequest {
+            key: key.clone(),
+            expected: Some(RouteVersion(9)),
+            next: None,
+        }]);
+
+        assert_eq!(table.get(&key), None);
+        assert_eq!(table.delete_marker(&key), Some(RouteVersion(9)));
+        let stale = test_route(&key, 9);
+        table.replace(&key, Some(&stale));
+        assert_eq!(table.get(&key), None);
+
+        let newer = test_route(&key, 10);
+        table.replace(&key, Some(&newer));
+        assert_eq!(table.get(&key), Some(newer));
+        assert_eq!(table.delete_marker(&key), None);
+    }
+
+    #[test]
+    fn tombstone_route_is_stored_as_delete_marker() {
+        let key = ObjectKey::new("tombstone-marker".to_string());
+        let mut table = LocalRouteTable::default();
+        let mut tombstone = test_route(&key, 4);
+        tombstone.state = RouteState::Tombstone;
+        tombstone.replicas.clear();
+
+        table.replace(&key, Some(&tombstone));
+
+        assert_eq!(table.get(&key), None);
+        assert_eq!(table.delete_marker(&key), Some(RouteVersion(4)));
     }
 
     #[test]

@@ -10,6 +10,12 @@ use mooncake_store_core::{
 
 pub const DEFAULT_ROUTE_OWNER_PAGE_SIZE: usize = 256;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RouteAuthorityRecord {
+    pub route: Option<ObjectRoute>,
+    pub delete_version: Option<RouteVersion>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteOwnerPage {
     pub routes: Vec<ObjectRoute>,
@@ -45,7 +51,7 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         namespace: &str,
         authority: &ClientStableId,
         keys: &[ObjectKey],
-    ) -> Result<Vec<Result<Option<ObjectRoute>>>>;
+    ) -> Result<Vec<Result<RouteAuthorityRecord>>>;
 
     fn batch_contains_routes(
         &self,
@@ -111,6 +117,19 @@ pub trait RouteAuthorityService: Send + Sync {
         authority: &ClientStableId,
         key: &ObjectKey,
     ) -> Result<Option<ObjectRoute>>;
+
+    fn get_route_record(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> Result<RouteAuthorityRecord> {
+        self.get_route(namespace, authority, key)
+            .map(|route| RouteAuthorityRecord {
+                route,
+                delete_version: None,
+            })
+    }
 
     fn list_routes_by_replica_owner(
         &self,
@@ -200,14 +219,14 @@ pub trait RouteAuthorityService: Send + Sync {
             .collect()
     }
 
-    fn batch_get_routes(
+    fn batch_get_route_records(
         &self,
         namespace: &str,
         authority: &ClientStableId,
         keys: &[ObjectKey],
-    ) -> Vec<Result<Option<ObjectRoute>>> {
+    ) -> Vec<Result<RouteAuthorityRecord>> {
         keys.iter()
-            .map(|key| self.get_route(namespace, authority, key))
+            .map(|key| self.get_route_record(namespace, authority, key))
             .collect()
     }
 

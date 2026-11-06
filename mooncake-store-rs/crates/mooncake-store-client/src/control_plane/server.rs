@@ -504,20 +504,23 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             keys: vec![ObjectKey::new(request.key)],
         };
         let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
-            Ok(RouteControlResponse::BatchGet(mut routes)) => match routes.pop() {
-                Some(Ok(route)) => pb::GetRouteReply {
-                    route: route.as_ref().map(pb_object_route),
+            Ok(RouteControlResponse::BatchGet(mut records)) => match records.pop() {
+                Some(Ok(record)) => pb::GetRouteReply {
+                    route: record.route.as_ref().map(pb_object_route),
                     error: None,
+                    delete_version: record.delete_version.map(|version| version.0),
                 },
                 Some(Err(error)) => pb::GetRouteReply {
                     route: None,
                     error: Some(pb_error(error)),
+                    delete_version: None,
                 },
                 None => pb::GetRouteReply {
                     route: None,
                     error: Some(pb_error(StoreError::Transport(
                         "control plane get_route reply is missing batch item".to_string(),
                     ))),
+                    delete_version: None,
                 },
             },
             Ok(_) => pb::GetRouteReply {
@@ -525,10 +528,12 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 error: Some(pb_error(StoreError::Transport(
                     "control plane get_route returned non-get route response".to_string(),
                 ))),
+                delete_version: None,
             },
             Err(error) => pb::GetRouteReply {
                 route: None,
                 error: Some(pb_error(error)),
+                delete_version: None,
             },
         };
         Ok(Response::new(reply))
@@ -551,16 +556,18 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             keys,
         };
         let replies = match serve_route_control_request(self.authority.as_ref(), route_request) {
-            Ok(RouteControlResponse::BatchGet(routes)) => routes
+            Ok(RouteControlResponse::BatchGet(records)) => records
                 .into_iter()
                 .map(|result| match result {
-                    Ok(route) => pb::GetRouteReply {
-                        route: route.as_ref().map(pb_object_route),
+                    Ok(record) => pb::GetRouteReply {
+                        route: record.route.as_ref().map(pb_object_route),
                         error: None,
+                        delete_version: record.delete_version.map(|version| version.0),
                     },
                     Err(error) => pb::GetRouteReply {
                         route: None,
                         error: Some(pb_error(error)),
+                        delete_version: None,
                     },
                 })
                 .collect(),
@@ -572,6 +579,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     .map(|_| pb::GetRouteReply {
                         route: None,
                         error: Some(detail.clone()),
+                        delete_version: None,
                     })
                     .collect()
             }
@@ -581,6 +589,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     .map(|_| pb::GetRouteReply {
                         route: None,
                         error: Some(detail.clone()),
+                        delete_version: None,
                     })
                     .collect()
             }

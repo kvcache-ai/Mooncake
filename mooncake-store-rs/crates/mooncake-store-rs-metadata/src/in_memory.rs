@@ -592,6 +592,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             return Ok(CasResult {
                 applied: false,
                 current,
+                delete_version: None,
                 version_floor: None,
             });
         }
@@ -608,6 +609,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         Ok(CasResult {
             applied: true,
             current: next.cloned(),
+            delete_version: None,
             version_floor: None,
         })
     }

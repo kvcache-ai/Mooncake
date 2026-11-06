@@ -1,7 +1,8 @@
 use super::codec::*;
 use super::*;
 use mooncake_store_route::{
-    RouteControlRequest, RouteControlResponse, RouteControlTransport, RouteOwnerPageQuery,
+    RouteAuthorityRecord, RouteControlRequest, RouteControlResponse, RouteControlTransport,
+    RouteOwnerPageQuery,
 };
 
 impl RouteControlTransport for ControlPlaneClient {
@@ -28,7 +29,10 @@ fn decode_route_batch_get_reply(reply: pb::BatchGetRoutesReply) -> Result<RouteC
             .into_iter()
             .map(|entry| {
                 decode_error(entry.error)?;
-                entry.route.map(try_object_route).transpose()
+                Ok(RouteAuthorityRecord {
+                    route: entry.route.map(try_object_route).transpose()?,
+                    delete_version: entry.delete_version.map(RouteVersion),
+                })
             })
             .collect(),
     ))
@@ -559,7 +563,10 @@ impl ControlPlaneClient {
             },
         )?;
         match response {
-            RouteControlResponse::BatchGet(replies) => Ok(replies),
+            RouteControlResponse::BatchGet(replies) => Ok(replies
+                .into_iter()
+                .map(|reply| reply.map(|record| record.route))
+                .collect()),
             _ => Err(StoreError::Transport(
                 "test batch_get_routes returned non-get route response".to_string(),
             )),
@@ -897,9 +904,10 @@ impl ControlPlaneClient {
                 "control plane get_route transport returned non-route reply".to_string(),
             ));
         };
-        replies.pop().ok_or_else(|| {
+        let record = replies.pop().ok_or_else(|| {
             StoreError::Transport("control plane get_route reply is missing batch item".to_string())
-        })?
+        })??;
+        Ok(record.route)
     }
 
     #[allow(dead_code)]

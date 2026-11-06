@@ -3,7 +3,9 @@ use super::registry::{
     MetadataInflightKey, MetadataOperationKey, MetricsSnapshot, PhaseKey, PhaseResultKey,
     PreferredSegmentSkipKey, ReplicaDistributionKey, RequestBytesKey, RequestInflightKey,
     RequestKey, ResultKey, RuntimeKey, RuntimeStatusKey, TenantKey, TransportBytesKey,
-    TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, COLD_TIER_IO_BUCKETS, EVICTED_BYTES_TOTAL,
+    TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, COLD_TIER_IO_BUCKETS,
+    DELETE_MARKER_BUDGET_BYTES, DELETE_MARKER_BYTES, DELETE_MARKER_ENTRIES,
+    DELETE_MARKER_EVENT_TOTAL, EVICTED_BYTES_TOTAL,
     EVICTED_REPLICAS_TOTAL, EVICTION_DURATION, EVICTION_GUARD_EVENT_TOTAL,
     EVICTION_GUARD_PENDING_TOTAL, EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES,
     HEARTBEAT_LAST_SUCCESS_MS, MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL,
@@ -379,6 +381,45 @@ fn render_request_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
 
 fn render_consistency_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     let tenant = escape(&snapshot.tenant);
+    gauge_family(
+        output,
+        DELETE_MARKER_ENTRIES,
+        "Retained delete markers in the local route authority.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        DELETE_MARKER_ENTRIES, tenant, snapshot.delete_marker_entries
+    ));
+    gauge_family(
+        output,
+        DELETE_MARKER_BYTES,
+        "Accounted bytes retained by the bounded delete marker FIFO.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        DELETE_MARKER_BYTES, tenant, snapshot.delete_marker_bytes
+    ));
+    gauge_family(
+        output,
+        DELETE_MARKER_BUDGET_BYTES,
+        "Configured delete marker FIFO byte budget.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        DELETE_MARKER_BUDGET_BYTES, tenant, snapshot.delete_marker_budget_bytes
+    ));
+    counter_family(
+        output,
+        DELETE_MARKER_EVENT_TOTAL,
+        "Delete marker lifecycle and propagation events.",
+    );
+    for_result_counter(
+        output,
+        DELETE_MARKER_EVENT_TOTAL,
+        &tenant,
+        &snapshot.delete_marker_events,
+    );
+
     counter_family(output, ROUTE_CAS_TOTAL, "Route CAS outcomes.");
     for_result_counter(output, ROUTE_CAS_TOTAL, &tenant, &snapshot.route_cas);
 

@@ -423,6 +423,7 @@ pub(super) fn pb_cas_result(result: &CasResult) -> pb::CasResult {
         applied: result.applied,
         current: result.current.as_ref().map(pb_object_route),
         version_floor: result.version_floor.map(|v| v.0),
+        delete_version: result.delete_version.map(|v| v.0),
     }
 }
 
@@ -430,6 +431,7 @@ pub(super) fn try_cas_result(result: pb::CasResult) -> Result<CasResult> {
     Ok(CasResult {
         applied: result.applied,
         current: result.current.map(try_object_route).transpose()?,
+        delete_version: result.delete_version.map(RouteVersion),
         version_floor: result.version_floor.map(RouteVersion),
     })
 }

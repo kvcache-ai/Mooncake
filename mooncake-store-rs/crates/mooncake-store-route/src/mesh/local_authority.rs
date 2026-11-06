@@ -8,12 +8,13 @@ use mooncake_store_core::{
 use super::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
     authority_get, authority_get_allocation_route_reference_keys,
-    authority_get_allocation_route_references, authority_get_many, authority_list_routes,
-    authority_list_routes_by_replica_owner, authority_list_routes_by_replica_owner_page,
-    authority_replace, authority_replace_many, bind_local_authority_service,
+    authority_get_allocation_route_references, authority_get_many, authority_get_record,
+    authority_get_records, authority_list_routes, authority_list_routes_by_replica_owner,
+    authority_list_routes_by_replica_owner_page, authority_replace, authority_replace_many,
+    bind_local_authority_service,
 };
 use crate::shim::RouteAuthorityService;
-use crate::RouteOwnerPage;
+use crate::{RouteAuthorityRecord, RouteOwnerPage};
 
 #[derive(Clone, Debug)]
 pub struct LocalRouteAuthority {
@@ -39,6 +40,14 @@ impl LocalRouteAuthority {
 
     pub fn get_routes(&self, keys: &[ObjectKey]) -> Result<Vec<Option<ObjectRoute>>> {
         authority_get_many(&self.namespace, &self.authority, keys)
+    }
+
+    pub fn get_route_record(&self, key: &ObjectKey) -> Result<RouteAuthorityRecord> {
+        authority_get_record(&self.namespace, &self.authority, key)
+    }
+
+    pub fn get_route_records(&self, keys: &[ObjectKey]) -> Result<Vec<RouteAuthorityRecord>> {
+        authority_get_records(&self.namespace, &self.authority, keys)
     }
 
     pub fn contains_routes(&self, keys: &[ObjectKey]) -> Result<Vec<bool>> {

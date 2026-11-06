@@ -7,8 +7,8 @@ use mooncake_store_core::{
     RouteCasRequest, RouteControlMode, RouteDirectory, RouteVersion,
 };
 use mooncake_store_route::{
-    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityService, RouteMembershipProvider,
-    RouteMetricsSink, RouteOwnerPage,
+    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityRecord, RouteAuthorityService,
+    RouteMembershipProvider, RouteMetricsSink, RouteOwnerPage,
 };
 
 use crate::client::{
@@ -21,6 +21,7 @@ use crate::observability::{registry, OperationTracker};
 pub(crate) fn build_route_directory(
     mode: RouteControlMode,
     route_topk: usize,
+    delete_marker_budget_bytes: usize,
     metadata: Arc<dyn MetadataBackend>,
     lease: &ClientLease,
     control_plane: Arc<ControlPlaneClient>,
@@ -36,6 +37,7 @@ pub(crate) fn build_route_directory(
     mooncake_store_route::build_route_directory(
         mode,
         route_topk,
+        delete_marker_budget_bytes,
         metadata,
         lease,
         control_plane,
@@ -65,6 +67,22 @@ pub(crate) fn authority_get_many(
     keys: &[ObjectKey],
 ) -> Result<Vec<Option<ObjectRoute>>> {
     LocalRouteAuthority::new(namespace, authority.clone()).get_routes(keys)
+}
+
+pub(crate) fn authority_get_record(
+    namespace: &str,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+) -> Result<RouteAuthorityRecord> {
+    LocalRouteAuthority::new(namespace, authority.clone()).get_route_record(key)
+}
+
+pub(crate) fn authority_get_records(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<RouteAuthorityRecord>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).get_route_records(keys)
 }
 
 pub(crate) fn authority_get_allocation_route_references(
@@ -219,5 +237,13 @@ impl RouteMetricsSink for ClientRouteMetricsSink {
 
     fn remove_route(&self, key: &ObjectKey) {
         registry::remove_route(key);
+    }
+
+    fn record_delete_marker_state(&self, entries: u64, bytes: u64, budget_bytes: u64) {
+        registry::record_delete_marker_state(entries, bytes, budget_bytes);
+    }
+
+    fn record_delete_marker_event(&self, event: &'static str, count: u64) {
+        registry::record_delete_marker_event(event, count);
     }
 }

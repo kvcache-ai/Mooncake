@@ -35,6 +35,15 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         authority_get(namespace, authority, key)
     }
 
+    fn get_route_record(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> Result<mooncake_store_route::RouteAuthorityRecord> {
+        crate::route_directory::authority_get_record(namespace, authority, key)
+    }
+
     fn list_routes_by_replica_owner(
         &self,
         namespace: &str,
@@ -112,14 +121,14 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         authority_replace(namespace, authority, key, next)
     }
 
-    fn batch_get_routes(
+    fn batch_get_route_records(
         &self,
         namespace: &str,
         authority: &ClientStableId,
         keys: &[ObjectKey],
-    ) -> Vec<Result<Option<ObjectRoute>>> {
-        match authority_get_many(namespace, authority, keys) {
-            Ok(routes) => routes.into_iter().map(Ok).collect(),
+    ) -> Vec<Result<mooncake_store_route::RouteAuthorityRecord>> {
+        match crate::route_directory::authority_get_records(namespace, authority, keys) {
+            Ok(records) => records.into_iter().map(Ok).collect(),
             Err(error) => keys
                 .iter()
                 .map(|_| Err(StoreError::NotFound(error.to_string())))

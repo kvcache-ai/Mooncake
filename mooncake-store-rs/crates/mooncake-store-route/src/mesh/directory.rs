@@ -7,9 +7,10 @@ use parking_lot::Mutex;
 
 use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
-    ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey,
-    ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
-    RouteReplicaReference, RouteVersion, StoreError, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY,
+    ClientLease, ClientRuntimeId, ClientStableId, CompatibilityDescriptor, MetadataBackend,
+    NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest,
+    RouteDirectory, RouteReplicaReference, RouteState, RouteVersion, StoreError,
+    ROUTE_OWNER_LIST_PAGINATION_CAPABILITY,
     ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 use tracing::{debug, trace, warn};
@@ -25,7 +26,7 @@ use crate::mesh::read_repair::{
 use crate::mesh::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
     authority_get_allocation_route_reference_keys, authority_get_allocation_route_references,
-    authority_list_routes_by_replica_owner_page, authority_get_many, authority_get_version_floor, authority_get_version_floors,
+    authority_list_routes_by_replica_owner_page, authority_get_delete_marker, authority_get_delete_markers, authority_get_records,
     authority_is_local, authority_list_reuse_candidates, authority_list_routes,
     authority_list_routes_in_scope, local_authority_service, register_local_authority,
     unregister_local_authority,
@@ -35,19 +36,22 @@ use crate::mesh::selection::{
     retained_authority_candidates, select_authorities_for_requests, RouteAuthoritySelection,
 };
 use crate::metrics::record_cas_outcome;
-use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
+use crate::table::DEFAULT_DELETE_MARKER_BUDGET_BYTES;
+use crate::shim::{RouteAuthorityClient, RouteAuthorityRecord, RouteAuthorityService, RouteMembershipProvider};
 use crate::util::{route_read_source, sampled_per_key_debug_log};
 use crate::DEFAULT_ROUTE_OWNER_PAGE_SIZE;
 
 pub(crate) fn build_embedded_wrh_route_directory(
     route_topk: usize,
+    delete_marker_budget_bytes: usize,
     metadata: Arc<dyn MetadataBackend>,
     lease: &ClientLease,
     control_transport: Arc<dyn RouteControlTransport>,
     membership: Arc<dyn RouteMembershipProvider>,
 ) -> Arc<dyn RouteDirectory> {
-    Arc::new(EmbeddedWrhRouteDirectory::new(
+    Arc::new(EmbeddedWrhRouteDirectory::new_with_delete_marker_budget(
         route_topk,
+        delete_marker_budget_bytes,
         metadata,
         lease,
         Arc::new(RouteControlAuthorityClient::new(control_transport)),
@@ -94,6 +98,38 @@ fn merge_allocation_route_reference(
             previous.clone()
         }
         _ => AllocationRouteReference::conflict(),
+    }
+}
+
+fn route_from_authority_record(
+    key: &ObjectKey,
+    record: RouteAuthorityRecord,
+) -> Option<ObjectRoute> {
+    if let Some(route) = record.route {
+        if record
+            .delete_version
+            .is_none_or(|delete_version| route.version > delete_version)
+        {
+            return Some(route);
+        }
+    }
+    record.delete_version.map(|version| delete_marker_route(key, version))
+}
+
+fn delete_marker_route(key: &ObjectKey, version: RouteVersion) -> ObjectRoute {
+    ObjectRoute {
+        key: key.clone(),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: None,
+        version,
+        state: RouteState::Tombstone,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: Vec::new(),
+        cold_backing: None,
+        nof_backing: None,
     }
 }
 
@@ -175,8 +211,30 @@ impl EmbeddedWrhRouteDirectory {
         authority_client: Arc<dyn RouteAuthorityClient>,
         membership: Arc<dyn RouteMembershipProvider>,
     ) -> Self {
+        Self::new_with_delete_marker_budget(
+            route_topk,
+            DEFAULT_DELETE_MARKER_BUDGET_BYTES,
+            metadata,
+            lease,
+            authority_client,
+            membership,
+        )
+    }
+
+    fn new_with_delete_marker_budget(
+        route_topk: usize,
+        delete_marker_budget_bytes: usize,
+        metadata: Arc<dyn MetadataBackend>,
+        lease: &ClientLease,
+        authority_client: Arc<dyn RouteAuthorityClient>,
+        membership: Arc<dyn RouteMembershipProvider>,
+    ) -> Self {
         let namespace = metadata.route_namespace();
-        register_local_authority(&namespace, &lease.runtime.stable_id);
+        register_local_authority(
+            &namespace,
+            &lease.runtime.stable_id,
+            delete_marker_budget_bytes,
+        );
         let async_mirror = AsyncRouteMirrorWorker::spawn(
             namespace.clone(),
             lease.runtime.stable_id.clone(),
@@ -229,6 +287,36 @@ impl EmbeddedWrhRouteDirectory {
         observer: &ClientLease,
     ) -> Result<Vec<ClientLease>> {
         authority_candidates(self.membership.as_ref(), observer, true)
+    }
+
+    fn delete_marker_fanout_authorities(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        current_candidates: &[ClientLease],
+    ) -> Vec<ClientLease> {
+        let limit = self.route_topk.saturating_mul(2);
+        let retained = retained_authority_candidates(self.membership.as_ref(), observer)
+            .unwrap_or_default();
+        let mut authorities = BTreeMap::<String, ClientLease>::new();
+        for authority in ranked_top_authorities(&self.namespace, current_candidates, key, limit)
+            .into_iter()
+            .chain(ranked_top_authorities(
+                &self.namespace,
+                &retained,
+                key,
+                limit,
+            ))
+        {
+            let stable_id = authority.runtime.stable_id.0.clone();
+            match authorities.get(&stable_id) {
+                Some(current) if current.runtime.epoch >= authority.runtime.epoch => {}
+                _ => {
+                    authorities.insert(stable_id, authority);
+                }
+            }
+        }
+        authorities.into_values().collect()
     }
 
     fn eviction_confirmation_authorities(
@@ -292,18 +380,18 @@ impl EmbeddedWrhRouteDirectory {
         &self,
         authority: &ClientStableId,
         keys: &[ObjectKey],
-    ) -> Result<Vec<Option<ObjectRoute>>> {
-        authority_get_many(&self.namespace, authority, keys)
+    ) -> Result<Vec<RouteAuthorityRecord>> {
+        authority_get_records(&self.namespace, authority, keys)
     }
 
     fn read_authority_batch(
         &self,
         authority: &ClientLease,
         keys: &[ObjectKey],
-    ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+    ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
         if self.authority_is_local(authority) {
             if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
-                return Ok(service.batch_get_routes(
+                return Ok(service.batch_get_route_records(
                     &self.namespace,
                     &authority.runtime.stable_id,
                     keys,
@@ -446,7 +534,7 @@ impl EmbeddedWrhRouteDirectory {
             match self.contains_authority_batch(&authority, &batch_keys) {
                 Ok(results) => {
                     for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
-                        match result {
+                        match result.map(|record| route_from_authority_record(&key, record)) {
                             Ok(true) => {
                                 trace!(
                                     namespace = %self.namespace,
@@ -888,7 +976,7 @@ impl EmbeddedWrhRouteDirectory {
             match self.read_authority_batch(&authority, &batch_keys) {
                 Ok(results) => {
                     for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
-                        match result {
+                        match result.map(|record| route_from_authority_record(&key, record)) {
                             Ok(Some(route)) => {
                                 trace!(
                                     namespace = %self.namespace,
@@ -1786,10 +1874,33 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             };
             if result.as_ref().ok().is_some_and(|cas| cas.applied) {
                 if let Some(served) = attempt.resolved_authorities[index].as_ref() {
-                    for secondary in &selections[index].authorities {
+                    let is_delete_marker = request.next.as_ref().is_none_or(|route| {
+                        route.state == RouteState::Tombstone
+                    });
+                    let delete_version = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|cas| cas.delete_version)
+                        .or(request.expected);
+                    let fanout = if is_delete_marker {
+                        self.delete_marker_fanout_authorities(
+                            observer,
+                            &request.key,
+                            &candidates,
+                        )
+                    } else {
+                        selections[index].authorities.clone()
+                    };
+                    for secondary in &fanout {
                         if secondary.runtime.stable_id == served.runtime.stable_id {
                             continue;
                         }
+                        let next = if is_delete_marker {
+                            delete_version
+                                .map(|version| delete_marker_route(&request.key, version))
+                        } else {
+                            request.next.clone()
+                        };
                         mirrors
                             .entry(secondary.runtime.stable_id.0.clone())
                             .or_insert_with(|| (secondary.clone(), Vec::new()))
@@ -1797,7 +1908,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                             .push(RouteCasRequest {
                                 key: request.key.clone(),
                                 expected: request.expected,
-                                next: request.next.clone(),
+                                next,
                             });
                     }
                 }
@@ -1896,12 +2007,12 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         )
     }
 
-    fn get_version_floor(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
+    fn get_delete_marker(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
         let candidates = self.authority_candidates(observer).ok()?;
         let ranked = ranked_authorities(&self.namespace, &candidates, key);
         for authority in ranked.iter().take(self.route_topk) {
             if let Some(floor) =
-                authority_get_version_floor(&self.namespace, &authority.runtime.stable_id, key)
+                authority_get_delete_marker(&self.namespace, &authority.runtime.stable_id, key)
             {
                 return Some(floor);
             }
@@ -1909,7 +2020,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         None
     }
 
-    fn get_version_floors(
+    fn get_delete_markers(
         &self,
         observer: &ClientLease,
         keys: &[ObjectKey],
@@ -1947,7 +2058,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     .iter()
                     .map(|(_, key)| key.clone())
                     .collect::<Vec<_>>();
-                for ((index, _), floor) in entries.into_iter().zip(authority_get_version_floors(
+                for ((index, _), floor) in entries.into_iter().zip(authority_get_delete_markers(
                     &self.namespace,
                     &authority,
                     &lookup_keys,
@@ -2210,10 +2321,18 @@ mod owner_page_contract_tests {
             _namespace: &str,
             authority: &ClientStableId,
             keys: &[ObjectKey],
-        ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+        ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
             self.queried_authorities.lock().push(authority.0.clone());
             let route = self.routes.get(&authority.0).cloned().unwrap_or(None);
-            Ok(keys.iter().map(|_| Ok(route.clone())).collect())
+            Ok(keys
+                .iter()
+                .map(|_| {
+                    Ok(RouteAuthorityRecord {
+                        route: route.clone(),
+                        delete_version: None,
+                    })
+                })
+                .collect())
         }
 
         fn batch_contains_routes(
@@ -2264,14 +2383,22 @@ mod owner_page_contract_tests {
             _namespace: &str,
             authority: &ClientStableId,
             keys: &[ObjectKey],
-        ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+        ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
             let route = self.routes.get(&authority.0).cloned().ok_or_else(|| {
                 StoreError::Transport(format!(
                     "injected route authority failure for {}",
                     authority.0
                 ))
             })?;
-            Ok(keys.iter().map(|_| Ok(route.clone())).collect())
+            Ok(keys
+                .iter()
+                .map(|_| {
+                    Ok(RouteAuthorityRecord {
+                        route: route.clone(),
+                        delete_version: None,
+                    })
+                })
+                .collect())
         }
 
         fn batch_contains_routes(
@@ -3057,7 +3184,7 @@ mod snapshot_tests {
             _namespace: &str,
             _authority: &ClientStableId,
             _keys: &[ObjectKey],
-        ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+        ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
             Err(StoreError::Unsupported("unused test operation".to_string()))
         }
 

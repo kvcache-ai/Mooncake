@@ -35,6 +35,10 @@ pub(crate) const MEMBERSHIP_REFRESH_TOTAL: &str = "mooncake_store_membership_ref
 pub(crate) const MEMBERSHIP_REFRESH_DURATION: &str =
     "mooncake_store_membership_refresh_duration_seconds";
 pub(crate) const ROUTE_CAS_TOTAL: &str = "mooncake_store_route_cas_total";
+pub(crate) const DELETE_MARKER_ENTRIES: &str = "mooncake_store_delete_marker_entries";
+pub(crate) const DELETE_MARKER_BYTES: &str = "mooncake_store_delete_marker_bytes";
+pub(crate) const DELETE_MARKER_BUDGET_BYTES: &str = "mooncake_store_delete_marker_budget_bytes";
+pub(crate) const DELETE_MARKER_EVENT_TOTAL: &str = "mooncake_store_delete_marker_event_total";
 pub(crate) const REPLICATION_PUBLISH_TOTAL: &str = "mooncake_store_replication_publish_total";
 pub(crate) const REPLICATION_PUBLISH_DURATION: &str =
     "mooncake_store_replication_publish_duration_seconds";
@@ -107,6 +111,10 @@ pub struct MetricsSnapshot {
     pub membership_refresh: Vec<CounterSample<ResultKey>>,
     pub membership_refresh_duration: Vec<HistogramSample<ResultKey>>,
     pub route_cas: Vec<CounterSample<ResultKey>>,
+    pub delete_marker_entries: u64,
+    pub delete_marker_bytes: u64,
+    pub delete_marker_budget_bytes: u64,
+    pub delete_marker_events: Vec<CounterSample<ResultKey>>,
     pub replication_publish: Vec<CounterSample<ResultKey>>,
     pub replication_publish_duration: Vec<HistogramSample<ResultKey>>,
     pub checksum_validation: Vec<CounterSample<ResultKey>>,
@@ -552,6 +560,10 @@ struct MetricsRegistry {
     membership_refresh: CounterFamily<ResultKey>,
     membership_refresh_duration: HistogramFamily<ResultKey>,
     route_cas: CounterFamily<ResultKey>,
+    delete_marker_entries: u64,
+    delete_marker_bytes: u64,
+    delete_marker_budget_bytes: u64,
+    delete_marker_events: CounterFamily<ResultKey>,
     replication_publish: CounterFamily<ResultKey>,
     replication_publish_duration: HistogramFamily<ResultKey>,
     checksum_validation: CounterFamily<ResultKey>,
@@ -635,6 +647,10 @@ impl Default for MetricsRegistry {
             membership_refresh: CounterFamily::default(),
             membership_refresh_duration: HistogramFamily::default(),
             route_cas: CounterFamily::default(),
+            delete_marker_entries: 0,
+            delete_marker_bytes: 0,
+            delete_marker_budget_bytes: 0,
+            delete_marker_events: CounterFamily::default(),
             replication_publish: CounterFamily::default(),
             replication_publish_duration: HistogramFamily::default(),
             checksum_validation: CounterFamily::default(),
@@ -829,6 +845,10 @@ impl MetricsRegistry {
             membership_refresh: self.membership_refresh.snapshot(),
             membership_refresh_duration: self.membership_refresh_duration.snapshot(),
             route_cas: self.route_cas.snapshot(),
+            delete_marker_entries: self.delete_marker_entries,
+            delete_marker_bytes: self.delete_marker_bytes,
+            delete_marker_budget_bytes: self.delete_marker_budget_bytes,
+            delete_marker_events: self.delete_marker_events.snapshot(),
             replication_publish: self.replication_publish.snapshot(),
             replication_publish_duration: self.replication_publish_duration.snapshot(),
             checksum_validation: self.checksum_validation.snapshot(),
@@ -1204,6 +1224,23 @@ pub(crate) fn record_route_cas(result: &'static str) {
         .lock()
         .route_cas
         .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_delete_marker_state(entries: u64, bytes: u64, budget_bytes: u64) {
+    let mut registry = global_metrics_registry().lock();
+    registry.delete_marker_entries = entries;
+    registry.delete_marker_bytes = bytes;
+    registry.delete_marker_budget_bytes = budget_bytes;
+}
+
+pub(crate) fn record_delete_marker_event(event: &'static str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    global_metrics_registry()
+        .lock()
+        .delete_marker_events
+        .add(ResultKey { result: event }, count);
 }
 
 pub(crate) fn record_replication_publish(result: &'static str, duration: Duration) {
