@@ -2128,6 +2128,12 @@ class MasterService {
             for (auto& replica : replicas_) {
                 if (replica.is_memory_replica()) {
                     mem_size_ += replica.get_memory_buffer_size();
+                    // An abandoned put is staging memory now, reported by
+                    // master_put_start_discarded_staging_size, not a put
+                    // in flight.
+                    if (replica.is_processing()) {
+                        replica.mark_removed();
+                    }
                 }
             }
             MasterMetricManager::instance().inc_put_start_discard_cnt(

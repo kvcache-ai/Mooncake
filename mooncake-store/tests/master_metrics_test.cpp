@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -301,6 +302,71 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+}
+
+TEST_F(MasterMetricsTest, ProcessingMemGaugeTracksPutLifecycle) {
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 1000;
+    auto service = std::make_unique<WrappedMasterService>(service_config);
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "processing_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    UUID writer = generate_uuid();
+    UUID upserter = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, writer).has_value());
+
+    const uint64_t value_length = 4096;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const int64_t processing0 = metrics.get_mem_processing_bytes();
+    const int64_t staging0 = metrics.get_put_start_discarded_staging_size();
+
+    // A put is in flight from PutStart until PutEnd.
+    ASSERT_TRUE(
+        service->PutStart(writer, "done", value_length, config).has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0 + value_length);
+    ASSERT_TRUE(service
+                    ->PutEnd(writer, ObjectMeta{"done", std::nullopt},
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0);
+
+    // A revoked put is no longer in flight.
+    ASSERT_TRUE(
+        service->PutStart(writer, "revoked", value_length, config).has_value());
+    ASSERT_TRUE(service->PutRevoke(writer, "revoked").has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0);
+
+    // A preempted put moves to discarded staging, so the two gauges never
+    // count the same bytes.
+    ASSERT_TRUE(service->PutStart(writer, "upserted", value_length, config)
+                    .has_value());
+    ASSERT_TRUE(service->UpsertStart(upserter, "upserted", value_length, config)
+                    .has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0 + value_length);
+    EXPECT_EQ(metrics.get_put_start_discarded_staging_size(),
+              staging0 + value_length);
+    ASSERT_TRUE(service
+                    ->UpsertEnd(upserter, ObjectMeta{"upserted", std::nullopt},
+                                ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0);
+
+    // A master that stops serving releases its in-flight puts.
+    ASSERT_TRUE(service->PutStart(writer, "inflight", value_length, config)
+                    .has_value());
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0 + value_length);
+    service.reset();
+    EXPECT_EQ(metrics.get_mem_processing_bytes(), processing0);
+    EXPECT_EQ(metrics.get_put_start_discarded_staging_size(), staging0);
+
+    std::string serialized = metrics.serialize_metrics();
+    EXPECT_NE(serialized.find("master_mem_processing_bytes"),
+              std::string::npos);
 }
 
 TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {

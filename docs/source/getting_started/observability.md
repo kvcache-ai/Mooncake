@@ -170,6 +170,27 @@ The admin HTTP server is configured in the master config file (`master.json` or 
 
 Set `enable_metric_reporting` to `false` to disable the periodic metrics log. HTTP endpoints (`/metrics`, `/health`, etc.) remain available regardless of this setting.
 
+### In-Flight Write Metrics
+
+`master_allocated_bytes` counts all allocated memory, including data that
+eviction can reclaim, so it cannot tell a full-but-evictable store from one
+pinned by puts that have not finished.
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `master_mem_processing_bytes` | gauge | Memory held by `PROCESSING` replicas: puts that have started but not ended |
+| `master_put_start_discarded_staging_size` | gauge | Memory of replicas displaced by an overwrite, a preempted put or a timed-out put, until deferred release |
+
+Each replica updates `master_mem_processing_bytes` when its status changes, so
+the gauge is always current and costs no metadata walk or lock. A put that is
+preempted or times out moves from the first gauge to the second, so the two
+never count the same bytes. Divided by `master_total_capacity_bytes`, their sum
+is the memory that eviction cannot reclaim because of unfinished or displaced
+writes.
+
+Memory pinned by read leases is not exported: a lease is only an expiry time on
+the object, so counting it would need a walk over all objects.
+
 ### Process and Allocator Memory Metrics
 
 Both `/metrics` endpoints export the resident set size of the serving process,

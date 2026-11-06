@@ -419,6 +419,7 @@ class Replica {
 
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
+        AddProcessingMemBytes(-processing_mem_bytes());
         if (is_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
                 std::get<DiskReplicaData>(data_).object_size);
@@ -451,6 +452,7 @@ class Replica {
 
         // Decrement metric for the current object before overwriting.
         if (status_ != ReplicaStatus::UNDEFINED) {
+            AddProcessingMemBytes(-processing_mem_bytes());
             if (is_disk_replica()) {
                 MasterMetricManager::instance().dec_allocated_file_size(
                     std::get<DiskReplicaData>(data_).object_size);
@@ -698,7 +700,7 @@ class Replica {
 
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
-            status_ = ReplicaStatus::COMPLETE;
+            set_status(ReplicaStatus::COMPLETE);
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
         } else {
@@ -708,7 +710,7 @@ class Replica {
 
     void mark_processing() {
         if (status_ == ReplicaStatus::COMPLETE) {
-            status_ = ReplicaStatus::PROCESSING;
+            set_status(ReplicaStatus::PROCESSING);
         } else {
             LOG(ERROR) << "Cannot mark_processing from status: " << status_;
         }
@@ -717,7 +719,7 @@ class Replica {
     void mark_removed() {
         if (status_ == ReplicaStatus::COMPLETE ||
             status_ == ReplicaStatus::PROCESSING) {
-            status_ = ReplicaStatus::REMOVED;
+            set_status(ReplicaStatus::REMOVED);
         } else if (status_ == ReplicaStatus::REMOVED) {
             LOG(WARNING) << "Replica already marked as removed";
         } else {
@@ -727,7 +729,7 @@ class Replica {
 
     void cancel_remove() {
         if (status_ == ReplicaStatus::REMOVED) {
-            status_ = ReplicaStatus::COMPLETE;
+            set_status(ReplicaStatus::COMPLETE);
         } else {
             LOG(ERROR) << "Cannot cancel_remove from status: " << status_;
         }
@@ -896,7 +898,9 @@ class Replica {
         : id_(id),
           data_(MemoryReplicaData{std::move(buffer)}),
           status_(status),
-          refcnt_(0) {}
+          refcnt_(0) {
+        AddProcessingMemBytes(processing_mem_bytes());
+    }
 
     Replica(ReplicaID id, std::unique_ptr<AllocatedBuffer> buffer,
             ReplicaStatus status, ReplicaType replica_type)
@@ -908,6 +912,7 @@ class Replica {
         } else {
             LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
         }
+        AddProcessingMemBytes(processing_mem_bytes());
     }
 
     Replica(ReplicaID id, std::string file_path, uint64_t object_size,
@@ -937,6 +942,28 @@ class Replica {
           data_(DfsReplicaData{std::move(descriptor)}),
           status_(status),
           refcnt_(0) {}
+
+    // Memory this replica holds while PROCESSING, i.e. a put in flight; it
+    // is what the replica contributes to master_mem_processing_bytes.
+    [[nodiscard]] int64_t processing_mem_bytes() const {
+        if (status_ != ReplicaStatus::PROCESSING || !is_memory_replica()) {
+            return 0;
+        }
+        const auto& buffer = std::get<MemoryReplicaData>(data_).buffer;
+        return buffer ? static_cast<int64_t>(buffer->size()) : 0;
+    }
+
+    static void AddProcessingMemBytes(int64_t delta) {
+        if (delta != 0) {
+            MasterMetricManager::instance().add_mem_processing_bytes(delta);
+        }
+    }
+
+    void set_status(ReplicaStatus status) {
+        const int64_t before = processing_mem_bytes();
+        status_ = status;
+        AddProcessingMemBytes(processing_mem_bytes() - before);
+    }
 
     // Process-wide and monotonic. Standby restores bump it past the max
     // restored id and never roll back: a failed restore keeps the counter

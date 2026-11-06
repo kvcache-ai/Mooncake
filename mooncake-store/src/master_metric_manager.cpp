@@ -68,6 +68,9 @@ MasterMetricManager::MasterMetricManager()
       soft_pin_key_count_(
           "master_soft_pin_key_count",
           "Total number of soft-pinned keys managed by the master"),
+      mem_processing_bytes_(
+          "master_mem_processing_bytes",
+          "Memory bytes held by PROCESSING replicas (puts not yet ended)"),
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_(
           "master_value_size_bytes", "Distribution of object value sizes",
@@ -585,6 +588,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     dfs_file_count_.update(0);
     key_count_.update(0);
     soft_pin_key_count_.update(0);
+    mem_processing_bytes_.update(0);
     active_clients_.update(0);
     client_liveness_active_clients_.update(0);
     client_liveness_suspected_clients_.update(0);
@@ -996,6 +1000,17 @@ int64_t MasterMetricManager::get_key_count() { return key_count_.value(); }
 
 int64_t MasterMetricManager::get_soft_pin_key_count() {
     return soft_pin_key_count_.value();
+}
+
+void MasterMetricManager::add_mem_processing_bytes(int64_t delta) {
+    if (delta >= 0) {
+        mem_processing_bytes_.inc(delta);
+    } else {
+        mem_processing_bytes_.dec(-delta);
+    }
+}
+int64_t MasterMetricManager::get_mem_processing_bytes() {
+    return mem_processing_bytes_.value();
 }
 
 // Cluster Metrics
@@ -2158,6 +2173,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(dfs_file_count_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
+    serialize_metric(mem_processing_bytes_);
     serialize_metric(active_clients_);
     serialize_metric(client_liveness_active_clients_);
     serialize_metric(client_liveness_suspected_clients_);
