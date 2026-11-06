@@ -1915,8 +1915,7 @@ void WorkerPool::monitorWorker() {
         if (timeout.report) {
             LOG(ERROR)
                 << "CQ completion timeout diagnostic: context="
-                << context_.deviceName()
-                << ", outstanding=" << cq_outstanding
+                << context_.deviceName() << ", outstanding=" << cq_outstanding
                 << ", cq_nonzero_age_ms=" << timeout.cq_nonzero_age_ms
                 << ", no_progress_age_ms=" << timeout.no_progress_age_ms
                 << ", poll_gap_ms=" << timeout.poll_gap_ms
@@ -1963,8 +1962,7 @@ void WorkerPool::monitorWorker() {
                             : 0;
                     LOG(ERROR)
                         << "CQ stuck transfer group: context="
-                        << context_.deviceName()
-                        << ", peer_nic=" << entry.first
+                        << context_.deviceName() << ", peer_nic=" << entry.first
                         << ", slices=" << group.slice_count
                         << ", bytes=" << group.total_bytes
                         << ", oldest_post_age_ms=" << oldest_age_ms

@@ -183,8 +183,7 @@ TEST(CqTimeoutDiagnostic, PeriodicTinyTransfersWithIdleGapsDoNotReport) {
     for (int cycle = 0; cycle < 200; ++cycle) {
         for (int i = 0; i < 100; ++i) {  // 10 s idle, poller parked
             now += kTick;
-            if (diag.observe(now, 0, processed, last_poll_ts).report)
-                ++reports;
+            if (diag.observe(now, 0, processed, last_poll_ts).report) ++reports;
         }
         now += kTick;  // 2 slices posted, monitor samples first
         if (diag.observe(now, 2, processed, last_poll_ts).report) ++reports;

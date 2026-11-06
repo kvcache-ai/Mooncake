@@ -73,15 +73,13 @@ class CqTimeoutDiagnostic {
         verdict.no_progress_age_ms = no_progress_age_ns / 1000000ull;
         verdict.poll_gap_ms = poll_gap_ns / 1000000ull;
 
-        const bool poll_stalled =
-            cq_nonzero_age_ns >= kStallWindowNs &&
-            poll_gap_ns >= kStallWindowNs;
+        const bool poll_stalled = cq_nonzero_age_ns >= kStallWindowNs &&
+                                  poll_gap_ns >= kStallWindowNs;
         const bool transfer_timed_out =
             no_progress_age_ns >= kNoProgressWindowNs;
         if (!poll_stalled && !transfer_timed_out) return verdict;
 
-        if (have_report_ &&
-            now_ns - last_report_ns_ < kMinReportIntervalNs)
+        if (have_report_ && now_ns - last_report_ns_ < kMinReportIntervalNs)
             return verdict;
 
         last_report_ns_ = now_ns;
