@@ -5631,6 +5631,105 @@ TEST_F(StorageBackendTest, BucketBatchLoadUsesUringAcrossQueueDepth) {
     }
 }
 
+// One BatchLoad spanning several buckets: the reads of all buckets go through
+// a single sliding-window io_uring batch.
+static void RunUringLoadAcrossBuckets(const std::string& storage_filepath) {
+    constexpr int kBuckets = 5;
+    constexpr int kKeysPerBucket = 8;
+    constexpr size_t kValueSize = 5000;  // not 4 KiB aligned
+    constexpr size_t kReadBufferSize = 16384;
+
+    FileStorageConfig config;
+    config.storage_filepath = storage_filepath;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = kKeysPerBucket;
+    bucket_config.bucket_size_limit = 1024 * 1024;
+    bucket_config.max_total_size = 16 * 1024 * 1024;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    std::vector<std::string> keys, values;
+    for (int i = 0; i < kBuckets * kKeysPerBucket; ++i) {
+        keys.push_back("multi_bucket_key_" + std::to_string(i));
+        std::string value(kValueSize, '\0');
+        for (size_t j = 0; j < kValueSize; ++j) {
+            value[j] = static_cast<char>('a' + (i * 7 + j) % 26);
+        }
+        values.push_back(std::move(value));
+    }
+    for (int b = 0; b < kBuckets; ++b) {
+        std::unordered_map<std::string, std::vector<Slice>> offload_batch;
+        for (int k = 0; k < kKeysPerBucket; ++k) {
+            int i = b * kKeysPerBucket + k;
+            offload_batch.emplace(
+                keys[i],
+                std::vector<Slice>{Slice{values[i].data(), values[i].size()}});
+        }
+        auto offload_result = storage_backend.BatchOffload(
+            offload_batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+    }
+
+    using AlignedBuffer = std::unique_ptr<void, decltype(&std::free)>;
+    std::vector<AlignedBuffer> read_buffers;
+    std::unordered_map<std::string, Slice> load_batch;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        void* buffer = nullptr;
+        ASSERT_EQ(posix_memalign(&buffer, 4096, kReadBufferSize), 0);
+        read_buffers.emplace_back(buffer, &std::free);
+        load_batch.emplace(keys[i], Slice{buffer, kValueSize});
+    }
+    auto load_result = storage_backend.BatchLoad(load_batch);
+    ASSERT_TRUE(load_result.has_value()) << load_result.error();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& loaded = load_batch.at(keys[i]);
+        EXPECT_EQ(std::string_view(static_cast<char*>(loaded.ptr), loaded.size),
+                  values[i])
+            << keys[i];
+    }
+
+    // Span reads (a window inside each value) take the same path.
+    constexpr uint64_t kSpanOffset = 777;
+    constexpr size_t kSpanLength = 1000;
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        spans.emplace(keys[i], StorageValueSpan{
+                                   kSpanOffset, kValueSize,
+                                   Slice{read_buffers[i].get(), kSpanLength}});
+    }
+    auto span_result = storage_backend.BatchLoadSpans(spans);
+    ASSERT_TRUE(span_result.has_value()) << span_result.error();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& loaded = spans.at(keys[i]).slice;
+        EXPECT_EQ(std::string_view(static_cast<char*>(loaded.ptr), kSpanLength),
+                  std::string_view(values[i]).substr(kSpanOffset, kSpanLength))
+            << keys[i];
+    }
+}
+
+TEST_F(StorageBackendTest, BucketBatchLoadUringAcrossBuckets) {
+    RunUringLoadAcrossBuckets(data_path);
+}
+
+// Same, with the buckets spread over two offload disks: one batch reads from
+// both disks at once.
+TEST_F(StorageBackendTest, BucketBatchLoadUringAcrossDisks) {
+    fs::create_directories(data_path + "/disk0");
+    fs::create_directories(data_path + "/disk1");
+    RunUringLoadAcrossBuckets(data_path + "/disk0," + data_path + "/disk1");
+    for (const char* disk : {"/disk0", "/disk1"}) {
+        int buckets = 0;
+        for (const auto& entry :
+             fs::recursive_directory_iterator(data_path + disk)) {
+            if (entry.path().extension() == ".bucket") ++buckets;
+        }
+        EXPECT_GT(buckets, 0) << disk << " holds no bucket";
+    }
+}
+
 TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
     constexpr int kKeyCount = 2;
     constexpr size_t kValueSize = 4096;
