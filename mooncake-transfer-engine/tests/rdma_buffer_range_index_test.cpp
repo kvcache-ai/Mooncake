@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -359,6 +360,54 @@ TEST(BufferRangeIndex, KeyedDeviceFoundFromAnyRetry) {
                 << c.topology << " retry " << retry;
         }
     }
+}
+
+// Duplicate HCAs in an entry must not hide the keyed one.
+TEST(BufferRangeIndex, DuplicateHcaInLocationStillFindsKeyedDevice) {
+    auto desc = MakeSparseSegment(R"({"cpu:0":[["a","a","a"],["b"]]})", {"a"});
+    for (int retry = 0; retry < 8; ++retry) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                              device_id, retry),
+                  0)
+            << retry;
+        EXPECT_EQ(device_id, DeviceIndex(desc, "b")) << retry;
+    }
+}
+
+// The wildcard entry lists every HCA, so it is consulted only when the
+// buffer's location has no entry; an entry without keyed HCAs fails instead.
+TEST(BufferRangeIndex, ExistingLocationWithoutKeysDoesNotUseWildcard) {
+    const char *topology = R"({"cpu:0":[["a"],[]],"cpu:1":[["b"],[]]})";
+    auto desc = MakeSparseSegment(topology, {"a"});
+    auto unlisted = MakeSparseSegment(topology, {"a"}, "cpu:7");
+    for (int retry : {0, 1, 2, 3}) {
+        int buffer_id = -1, device_id = -1;
+        EXPECT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                              device_id, retry),
+                  ERR_ADDRESS_NOT_REGISTERED)
+            << retry;
+        ASSERT_EQ(RdmaTransport::selectDevice(&unlisted, 0x1080, 16, buffer_id,
+                                              device_id, retry),
+                  0)
+            << retry;
+        EXPECT_EQ(device_id, DeviceIndex(unlisted, "b")) << retry;
+    }
+}
+
+// A first attempt still spreads over the keyed preferred HCAs.
+TEST(BufferRangeIndex, RandomPickStaysOnKeyedPreferred) {
+    auto desc = MakeSparseSegment(R"({"cpu:0":[["a","b","c"],[]]})", {"b"});
+    std::set<int> seen;
+    for (int i = 0; i < 200; ++i) {
+        int buffer_id = -1, device_id = -1;
+        ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x1080, 16, buffer_id,
+                                              device_id, 0),
+                  0);
+        seen.insert(device_id);
+    }
+    EXPECT_EQ(seen,
+              (std::set<int>{DeviceIndex(desc, "a"), DeviceIndex(desc, "c")}));
 }
 
 TEST(BufferRangeIndex, BufferWithoutAnyKeyIsNotSelectable) {

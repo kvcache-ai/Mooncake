@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <set>
 #include <thread>
@@ -1669,13 +1670,20 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
                        uint64_t offset, std::string_view hint,
                        std::string_view local_hca, int retry_count,
                        bool by_local_hca) {
+    // Drop topology candidates without valid keys for this buffer before the
+    // selection rule applies. An entry that exists but has no such candidate
+    // fails rather than falling back to the wildcard entry, which would leave
+    // the buffer's location or the peer-affinity mapping.
+    const std::function<bool(int)> device_filter = [desc, &buffer](int id) {
+        return RdmaTransport::hasValidKeys(desc, buffer, id);
+    };
     if (by_local_hca) {
         const auto location = resolveBufferLocation(buffer, offset);
         int device_id = desc->topology.selectDeviceByLocalHca(
-            location, local_hca, retry_count);
-        if (device_id >= 0) return device_id;
-        return desc->topology.selectDeviceByLocalHca(kWildcardLocation,
-                                                     local_hca, retry_count);
+            location, local_hca, retry_count, device_filter);
+        if (device_id != ERR_DEVICE_NOT_FOUND) return device_id;
+        return desc->topology.selectDeviceByLocalHca(
+            kWildcardLocation, local_hca, retry_count, device_filter);
     }
 
     std::string location = buffer.name;
@@ -1698,9 +1706,11 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
             return device_id;
     }
 
-    int device_id = desc->topology.selectDevice(location, retry_count);
-    if (device_id >= 0) return device_id;
-    return desc->topology.selectDevice(kWildcardLocation, retry_count);
+    int device_id =
+        desc->topology.selectDevice(location, retry_count, device_filter);
+    if (device_id != ERR_DEVICE_NOT_FOUND) return device_id;
+    return desc->topology.selectDevice(kWildcardLocation, retry_count,
+                                       device_filter);
 }
 
 int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
@@ -1736,20 +1746,7 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
                                           retry_count, by_local_hca);
         }
-        // Skip topology candidates without valid MR keys within this selection
-        // call. Additional attempts only advance the topology walk; they do not
-        // update the slice's retry counter. Preserve the existing location and
-        // peer-affinity policy. This bound assumes no duplicate HCAs within a
-        // location entry.
-        const int max_attempts =
-            static_cast<int>(desc->topology.getHcaList().size());
-        for (int i = 1; i <= max_attempts &&
-                        !RdmaTransport::hasValidKeys(desc, buffer, selected);
-             ++i) {
-            selected = pickTopologyDevice(desc, buffer, offset, hint, local_hca,
-                                          retry_count + i, by_local_hca);
-        }
-        if (!RdmaTransport::hasValidKeys(desc, buffer, selected)) return false;
+        if (selected < 0) return false;
         buffer_id = candidate;
         device_id = selected;
         return true;
