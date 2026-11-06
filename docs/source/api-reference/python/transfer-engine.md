@@ -185,6 +185,10 @@ submission only; it is advisory rather than a hard pin for an in-flight slice.
 For example: `engine.batch_transfer_sync_read(..., nic_hint="mlx5_3")`.
 ```
 
+Synchronous transfers, including the batch variants, return `-1` when the
+engine reports a terminal `CANCELED` status. They release the batch and return
+without waiting for `MC_TRANSFER_TIMEOUT` or resubmitting the canceled work.
+
 #### transfer_sync_write()
 
 ```python
