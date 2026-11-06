@@ -470,7 +470,7 @@ impl StoreClient {
                 .attribute_u64("mooncake.item_count", 1)
                 .attribute_u64("mooncake.replica_count", policy.replica_count as u64)
                 .input_bytes(value.len() as u64);
-            let reserve_result = self.reserve_replica_targets(&object_ref, &scoped_key, value.len(), &policy);
+            let reserve_result = self.reserve_replica_targets(&object_ref, value.len(), &policy);
             reserve_tracker.finish(&reserve_result, 0);
             let (targets, reservations) = match reserve_result {
                 Ok(reserved) => reserved,
@@ -595,7 +595,20 @@ impl StoreClient {
                 "route_publish_cas_complete"
             );
             cas_tracker.finish(&cas_result, 0);
-            let mut cas = cas_result?;
+            let mut cas = match cas_result {
+                Ok(cas) => cas,
+                Err(error) => {
+                    self.release_only_legacy_reservations_after_unknown_route_publish(
+                        &reservations,
+                        "put_stage_route_compare_and_swap_outcome_unknown",
+                    );
+                    let _ = self.abort_tenant_quota_reservation(
+                        quota_reservation.as_ref(),
+                        "put_stage_route_compare_and_swap_outcome_unknown",
+                    );
+                    return Err(error);
+                }
+            };
             if !cas.applied && expected_version.is_none() && cas.current.is_none() {
                 let retry_version = cas
                     .version_floor
@@ -616,7 +629,20 @@ impl StoreClient {
                         },
                         retry_started.elapsed(),
                     );
-                    cas = retry_result?;
+                    cas = match retry_result {
+                        Ok(cas) => cas,
+                        Err(error) => {
+                            self.release_only_legacy_reservations_after_unknown_route_publish(
+                                &reservations,
+                                "put_stage_route_floor_retry_outcome_unknown",
+                            );
+                            let _ = self.abort_tenant_quota_reservation(
+                                quota_reservation.as_ref(),
+                                "put_stage_route_floor_retry_outcome_unknown",
+                            );
+                            return Err(error);
+                        }
+                    };
                 }
             }
             if !cas.applied {
@@ -1243,10 +1269,6 @@ impl StoreClient {
     )> {
         let tenant = object.tenant.unwrap_or(self.default_tenant());
         let key = object.key;
-        let route_key = ObjectKey::from_logical_id(&LogicalObjectId::new(
-            NamespaceScope::with_defaults(object.tenant, object.domain, object.object_set),
-            object.key,
-        ));
         let allow_partial_copy =
             !plan.all_or_nothing && matches!(plan.mode, ExplicitMigrationMode::Copy);
         let mut targets = Vec::with_capacity(plan.target_segments.len());
@@ -1309,12 +1331,11 @@ impl StoreClient {
                 return Err(error);
             }
             let is_local = preferred.owner == self.lease.runtime;
-            let (target, reservation) = match self.reserve_specific_segment_for_route(
+            let (target, reservation) = match self.reserve_specific_segment(
                 &preferred.owner,
                 &preferred.segment_name,
                 length_bytes,
                 is_local,
-                Some(&route_key),
             ) {
                 Ok(result) => result,
                 Err(error) if allow_partial_copy => {
@@ -1790,12 +1811,14 @@ impl StoreClient {
         &self,
         live_allocations: &BTreeSet<AllocationSpan>,
     ) -> Result<usize> {
+        let recovered_pending_publications =
+            self.storage_owner.recover_due_pending_publications()?;
         let stale = self
             .allocator
             .lock()
             .stale_allocations(live_allocations, now_ms());
         if stale.is_empty() {
-            return Ok(0);
+            return Ok(recovered_pending_publications);
         }
         let releases = stale
             .iter()
@@ -1808,7 +1831,7 @@ impl StoreClient {
             })
             .collect::<Vec<_>>();
         self.release_segment_allocations_batch(&releases)?;
-        Ok(stale.len())
+        Ok(recovered_pending_publications.saturating_add(stale.len()))
     }
 
     fn retire_empty_draining_segments(&self) -> Result<()> {

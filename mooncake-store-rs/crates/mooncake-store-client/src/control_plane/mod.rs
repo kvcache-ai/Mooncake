@@ -67,16 +67,17 @@ pub(crate) trait AllocatorService: Send + Sync {
 
     fn batch_reserve_any_with_pending_publication(
         &self,
-        owner: &ClientRuntimeId,
-        requests: &[ReserveAnyOp],
+        _owner: &ClientRuntimeId,
+        length_bytes: &[u64],
     ) -> Vec<Result<SegmentReservation>> {
-        self.batch_reserve_any(
-            owner,
-            &requests
-                .iter()
-                .map(|request| request.length_bytes)
-                .collect::<Vec<_>>(),
-        )
+        length_bytes
+            .iter()
+            .map(|_| {
+                Err(StoreError::Unsupported(
+                    "allocator does not support pending-publication reservations".to_string(),
+                ))
+            })
+            .collect()
     }
 
     fn batch_reserve_specific(
@@ -94,10 +95,17 @@ pub(crate) trait AllocatorService: Send + Sync {
 
     fn batch_reserve_specific_with_pending_publication(
         &self,
-        owner: &ClientRuntimeId,
+        _owner: &ClientRuntimeId,
         requests: &[ReserveSpecificOp],
     ) -> Vec<Result<SegmentReservation>> {
-        self.batch_reserve_specific(owner, requests)
+        requests
+            .iter()
+            .map(|_| {
+                Err(StoreError::Unsupported(
+                    "allocator does not support pending-publication reservations".to_string(),
+                ))
+            })
+            .collect()
     }
 
     fn batch_release(&self, owner: &ClientRuntimeId, requests: &[ReleaseOp]) -> Vec<Result<()>> {
@@ -116,12 +124,6 @@ pub(crate) trait AllocatorService: Send + Sync {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ReserveAnyOp {
-    pub(crate) length_bytes: u64,
-    pub(crate) route_key: Option<ObjectKey>,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RouteTrafficReport {
     pub accepted: usize,
@@ -134,10 +136,19 @@ impl RouteTrafficReport {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct DeletePendingEntry {
+    pub route_key: ObjectKey,
+    pub identity: AllocationRouteIdentity,
+    pub reclaim_grace_ms: u64,
+}
+
 pub(crate) trait EvictionService: Send + Sync {
     fn batch_report_route_hits(&self, keys: &[ObjectKey]) -> Result<RouteTrafficReport>;
 
     fn batch_track_routes(&self, routes: &[ObjectRoute]) -> Result<RouteTrafficReport>;
+
+    fn batch_notify_delete_pending(&self, entries: &[DeletePendingEntry]) -> Result<usize>;
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +184,6 @@ impl MigrationService for UnsupportedMigrationService {
 pub(crate) struct ReserveSpecificOp {
     pub segment_name: SegmentName,
     pub length_bytes: u64,
-    pub route_key: Option<ObjectKey>,
 }
 
 #[derive(Clone, Debug)]

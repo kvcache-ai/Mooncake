@@ -1,13 +1,13 @@
 use super::super::{
-    cold_tier_device_id, compatibility_matches, registry, AsyncEvictionHandle,
-    AsyncReplicaTrackHandle, AsyncRouteHitReportHandle, ColdObjectRead, ColdRestoreFlightLeader,
-    ColdRestoreFlightRegistration, ColdTierAdmissionPermit, ColdTierHandle,
-    ColdTierRateLimitConfig, ControlPlaneHandle, DebugEvictAllResult, LocalAllocatorState,
-    MembershipSyncHandle, ObjectKey, ObjectRef, ObjectRoute, OperationTracker, ReplicaRoute,
-    ReplicaTier, ReplicationPolicy, RequestDeadline, ResolvedObject, RestorePromotionKey,
-    RestorePromotionPayload, RestorePromotionPushOutcome, RestorePromotionQueue,
-    RestorePromotionTask, Result, RouteState, StorageOwnerState, StoreClient, StoreError,
-    DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
+    cold_tier_device_id, compatibility_matches, registry, AsyncDeletePendingHandle,
+    AsyncEvictionHandle, AsyncReplicaTrackHandle, AsyncRouteHitReportHandle, ColdObjectRead,
+    ColdRestoreFlightLeader, ColdRestoreFlightRegistration, ColdTierAdmissionPermit,
+    ColdTierHandle, ColdTierRateLimitConfig, ControlPlaneHandle, DebugEvictAllResult,
+    LocalAllocatorState, MembershipSyncHandle, ObjectKey, ObjectRef, ObjectRoute, OperationTracker,
+    ReplicaRoute, ReplicaTier, ReplicationPolicy, RequestDeadline, ResolvedObject,
+    RestorePromotionKey, RestorePromotionPayload, RestorePromotionPushOutcome,
+    RestorePromotionQueue, RestorePromotionTask, Result, RouteState, StorageOwnerState,
+    StoreClient, StoreError, DEFAULT_REMOTE_COLD_RESTORE_RECHECK_DELAY,
 };
 use super::target_selection::promote_cold_backing_target;
 use super::{
@@ -652,6 +652,7 @@ fn clone_restore_promotion_client(client: &StoreClient) -> StoreClient {
         membership_sync: MembershipSyncHandle::disabled(),
         _async_eviction: AsyncEvictionHandle::disabled(),
         async_replica_tracking: AsyncReplicaTrackHandle::disabled(),
+        async_delete_pending: AsyncDeletePendingHandle::disabled(),
         async_route_hit_reporting: AsyncRouteHitReportHandle::disabled(),
         cold_tier: ColdTierHandle::disabled(queue.clone()),
         cold_restore_flights: client.cold_restore_flights.clone(),
@@ -672,6 +673,8 @@ fn clone_restore_promotion_client(client: &StoreClient) -> StoreClient {
         namespace_quota: client.namespace_quota.clone(),
         execution_fairness: client.execution_fairness.clone(),
         bandwidth_shaping: client.bandwidth_shaping.clone(),
+        allocation_lifecycle: client.allocation_lifecycle,
+        allocation_lifecycle_enabled: client.allocation_lifecycle_enabled,
         placement_policy: client.placement_policy.clone(),
         state: client.state.clone(),
         owns_local_state_lifecycle: false,
@@ -701,7 +704,6 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
     }
 
     let policy = client.resolve_replication_policy(Some(&task.policy))?;
-    let route_key = ObjectKey::from_logical_id(&task.object_id);
     let reserve_tracker =
         OperationTracker::new("restore_promote_reserve").input_bytes(task.payload.len() as u64);
     let reserve_result = if let (Some(target_runtime), Some(target_segment)) =
@@ -714,11 +716,10 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
                     segment_name: target_segment.clone(),
                 },
                 task.payload.len(),
-                &route_key,
             )
             .map(|(target, reservation)| (vec![target], vec![reservation]))
     } else {
-        client.reserve_replica_targets(&object_ref, &route_key, task.payload.len(), &policy)
+        client.reserve_replica_targets(&object_ref, task.payload.len(), &policy)
     };
     reserve_tracker.finish(&reserve_result, 0);
     let (targets, reservations) = reserve_result?;

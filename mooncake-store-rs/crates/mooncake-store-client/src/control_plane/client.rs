@@ -759,6 +759,63 @@ impl ControlPlaneClient {
         result
     }
 
+    pub(crate) fn batch_notify_delete_pending(
+        &self,
+        lease: &ClientLease,
+        entries: &[DeletePendingEntry],
+    ) -> Result<usize> {
+        let tracker = OperationTracker::new("control_eviction_batch_notify_delete_pending");
+        let result = (|| {
+            if entries.is_empty() {
+                return Ok(0);
+            }
+            let request = pb::BatchNotifyDeletePendingRequest {
+                entries: entries.iter().map(pb_delete_pending_entry).collect(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(
+                    pb::control_stream_request::Body::EvictionNotifyDeletePending(request.clone()),
+                ),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::EvictionNotifyDeletePending(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_notify_delete_pending reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_notify_delete_pending reply type mismatch"
+                                .to_string(),
+                        ));
+                    };
+                    decode_error(reply.error)?;
+                    return Ok(reply.accepted as usize);
+                }
+                Err(error) => {
+                    warn!(
+                        items = entries.len(),
+                        error = %error,
+                        "control stream batch_notify_delete_pending failed; falling back to unary rpc"
+                    );
+                }
+            }
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client
+                    .batch_notify_delete_pending(Request::new(request))
+                    .await
+            })?;
+            decode_error(reply.error)?;
+            Ok(reply.accepted as usize)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
     pub(crate) fn submit_migration_task(
         &self,
         lease: &ClientLease,
@@ -872,16 +929,9 @@ impl ControlPlaneClient {
         lease: &ClientLease,
         owner: &ClientRuntimeId,
         length_bytes: u64,
-        route_key: Option<ObjectKey>,
     ) -> Result<SegmentReservation> {
-        let mut replies = self.batch_reserve_any_with_pending_publication(
-            lease,
-            owner,
-            &[ReserveAnyOp {
-                length_bytes,
-                route_key,
-            }],
-        )?;
+        let mut replies =
+            self.batch_reserve_any_with_pending_publication(lease, owner, &[length_bytes])?;
         replies.pop().ok_or_else(|| {
             StoreError::Transport(
                 "control plane reserve_any publication reply is missing batch item".to_string(),
@@ -895,34 +945,34 @@ impl ControlPlaneClient {
         owner: &ClientRuntimeId,
         length_bytes: &[u64],
     ) -> Result<Vec<Result<SegmentReservation>>> {
-        let requests = length_bytes
-            .iter()
-            .map(|length_bytes| ReserveAnyOp {
-                length_bytes: *length_bytes,
-                route_key: None,
-            })
-            .collect::<Vec<_>>();
-        self.batch_reserve_any_with_pending_publication(lease, owner, &requests)
+        self.batch_reserve_any_inner(lease, owner, length_bytes, false)
     }
 
     pub(crate) fn batch_reserve_any_with_pending_publication(
         &self,
         lease: &ClientLease,
         owner: &ClientRuntimeId,
-        requests: &[ReserveAnyOp],
+        length_bytes: &[u64],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        self.batch_reserve_any_inner(lease, owner, length_bytes, true)
+    }
+
+    fn batch_reserve_any_inner(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+        pending_publication: bool,
     ) -> Result<Vec<Result<SegmentReservation>>> {
         let tracker = OperationTracker::new("control_allocator_batch_reserve_any");
         let result = (|| {
-            if requests.is_empty() {
+            if length_bytes.is_empty() {
                 return Ok(Vec::new());
             }
             let request = pb::BatchReserveAnyRequest {
                 owner: Some(pb_runtime_id(owner)),
-                length_bytes: requests
-                    .iter()
-                    .map(|request| request.length_bytes)
-                    .collect(),
-                route_keys: Vec::new(),
+                length_bytes: length_bytes.to_vec(),
+                pending_publication,
             };
             match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
                 request_id,
@@ -944,7 +994,7 @@ impl ControlPlaneClient {
                             "control stream batch_reserve_any reply type mismatch".to_string(),
                         ));
                     };
-                    ensure_batch_len("batch_reserve_any", requests.len(), reply.replies.len())?;
+                    ensure_batch_len("batch_reserve_any", length_bytes.len(), reply.replies.len())?;
                     return Ok(reply
                         .replies
                         .into_iter()
@@ -963,7 +1013,7 @@ impl ControlPlaneClient {
                 Err(error) => {
                     warn!(
                         owner = %owner,
-                        items = requests.len(),
+                        items = length_bytes.len(),
                         error = %error,
                         "control stream batch_reserve_any failed; falling back to unary batch rpc"
                     );
@@ -972,7 +1022,7 @@ impl ControlPlaneClient {
             let reply = self.rpc_for_lease(lease, move |mut client| async move {
                 client.batch_reserve_any(Request::new(request)).await
             })?;
-            ensure_batch_len("batch_reserve_any", requests.len(), reply.replies.len())?;
+            ensure_batch_len("batch_reserve_any", length_bytes.len(), reply.replies.len())?;
             Ok(reply
                 .replies
                 .into_iter()
@@ -1005,7 +1055,6 @@ impl ControlPlaneClient {
             &[ReserveSpecificOp {
                 segment_name: segment_name.clone(),
                 length_bytes,
-                route_key: None,
             }],
         )?;
         results.pop().ok_or_else(|| {
@@ -1021,16 +1070,14 @@ impl ControlPlaneClient {
         owner: &ClientRuntimeId,
         segment_name: &SegmentName,
         length_bytes: u64,
-        route_key: Option<ObjectKey>,
     ) -> Result<SegmentReservation> {
-        let mut results = self.batch_reserve_specific(
+        let mut results = self.batch_reserve_specific_with_pending_publication(
             lease,
             owner,
             &[ReserveSpecificOp {
                 segment_name: segment_name.clone(),
                 length_bytes,
-                route_key,
-}],
+            }],
         )?;
         results.pop().ok_or_else(|| {
             StoreError::Transport(
@@ -1046,6 +1093,25 @@ impl ControlPlaneClient {
         owner: &ClientRuntimeId,
         requests: &[ReserveSpecificOp],
     ) -> Result<Vec<Result<SegmentReservation>>> {
+        self.batch_reserve_specific_inner(lease, owner, requests, false)
+    }
+
+    pub(crate) fn batch_reserve_specific_with_pending_publication(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        self.batch_reserve_specific_inner(lease, owner, requests, true)
+    }
+
+    fn batch_reserve_specific_inner(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+        pending_publication: bool,
+    ) -> Result<Vec<Result<SegmentReservation>>> {
         let tracker = OperationTracker::new("control_allocator_batch_reserve_specific");
         let result = (|| {
             if requests.is_empty() {
@@ -1058,9 +1124,9 @@ impl ControlPlaneClient {
                     .map(|request| pb::ReserveSpecificEntry {
                         segment_name: request.segment_name.0.clone(),
                         length_bytes: request.length_bytes,
-                        route_key: String::new(),
                     })
                     .collect(),
+                pending_publication,
             };
             match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
                 request_id,

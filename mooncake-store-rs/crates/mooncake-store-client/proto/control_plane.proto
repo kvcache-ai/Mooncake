@@ -20,6 +20,7 @@ service ControlPlaneService {
   rpc GetAllocationRouteReferences(GetAllocationRouteReferencesRequest) returns (GetAllocationRouteReferencesReply);
   rpc BatchReportRouteHits(BatchReportRouteHitsRequest) returns (BatchReportRouteHitsReply);
   rpc BatchTrackReplicaRoutes(BatchTrackReplicaRoutesRequest) returns (BatchTrackReplicaRoutesReply);
+  rpc BatchNotifyDeletePending(BatchNotifyDeletePendingRequest) returns (BatchNotifyDeletePendingReply);
   rpc SubmitMigrationTask(SubmitMigrationTaskRequest) returns (SubmitMigrationTaskReply);
   rpc GetMigrationExecutionStatus(GetMigrationExecutionStatusRequest) returns (GetMigrationExecutionStatusReply);
   rpc TriggerColdTierOffload(TriggerColdTierOffloadRequest) returns (TriggerColdTierOffloadReply);
@@ -280,7 +281,7 @@ message BatchReplaceRoutesReply {
 message ReserveAnyRequest {
   ClientRuntimeId owner = 1;
   uint64 length_bytes = 2;
-  string route_key = 3;
+  bool pending_publication = 3;
 }
 
 message ReserveAnyReply {
@@ -291,7 +292,7 @@ message ReserveAnyReply {
 message BatchReserveAnyRequest {
   ClientRuntimeId owner = 1;
   repeated uint64 length_bytes = 2;
-  repeated string route_keys = 3;
+  bool pending_publication = 3;
 }
 
 message BatchReserveAnyReply {
@@ -302,7 +303,7 @@ message ReserveSpecificRequest {
   ClientRuntimeId owner = 1;
   string segment_name = 2;
   uint64 length_bytes = 3;
-  string route_key = 4;
+  bool pending_publication = 4;
 }
 
 message ReserveSpecificReply {
@@ -313,12 +314,12 @@ message ReserveSpecificReply {
 message ReserveSpecificEntry {
   string segment_name = 1;
   uint64 length_bytes = 2;
-  string route_key = 3;
 }
 
 message BatchReserveSpecificRequest {
   ClientRuntimeId owner = 1;
   repeated ReserveSpecificEntry entries = 2;
+  bool pending_publication = 3;
 }
 
 message BatchReserveSpecificReply {
@@ -412,6 +413,21 @@ message BatchTrackReplicaRoutesRequest {
 }
 
 message BatchTrackReplicaRoutesReply {
+  uint64 accepted = 1;
+  ErrorDetail error = 2;
+}
+
+message DeletePendingEntry {
+  string route_key = 1;
+  AllocationRouteIdentity identity = 2;
+  uint64 reclaim_grace_ms = 3;
+}
+
+message BatchNotifyDeletePendingRequest {
+  repeated DeletePendingEntry entries = 1;
+}
+
+message BatchNotifyDeletePendingReply {
   uint64 accepted = 1;
   ErrorDetail error = 2;
 }
@@ -622,6 +638,8 @@ message PinForReadReply {
 message ControlStreamRequest {
   uint64 request_id = 1;
   oneof body {
+    BatchNotifyDeletePendingRequest eviction_notify_delete_pending = 14;
+
     BatchGetRoutesRequest route_get = 2;
     BatchCompareAndSwapRoutesRequest route_cas = 3;
     BatchReplaceRoutesRequest route_replace = 4;
@@ -638,6 +656,8 @@ message ControlStreamRequest {
 message ControlStreamReply {
   uint64 request_id = 1;
   oneof body {
+    BatchNotifyDeletePendingReply eviction_notify_delete_pending = 14;
+
     BatchGetRoutesReply route_get = 2;
     BatchCompareAndSwapRoutesReply route_cas = 3;
     BatchReplaceRoutesReply route_replace = 4;

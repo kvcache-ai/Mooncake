@@ -35,7 +35,7 @@ use tracing::{debug, info, info_span, trace, warn};
 use crate::control_plane::pb;
 use crate::control_plane::{
     control_address_label, AllocatorService, ControlPlaneClient, ControlPlaneHandle,
-    EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp, ReserveAnyOp,
+    DeletePendingEntry, EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp,
     ReserveSpecificOp, RouteTrafficReport, UnsupportedColdTierControlService,
 };
 use crate::memory::{
@@ -87,6 +87,7 @@ const DEFAULT_COLD_TIER_CLEANUP_DEVICE_BATCH: usize = 1;
 const DEFAULT_COLD_TIER_CLEANUP_VICTIM_BATCH: usize = 32;
 #[allow(dead_code)]
 const DEFAULT_PENDING_DELETE_GC_BATCH: usize = 64;
+const PENDING_DELETE_SHUTDOWN_FLUSH_CAPACITY: usize = 4096;
 #[allow(dead_code)]
 const DEFAULT_OFFLOAD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
@@ -157,6 +158,7 @@ pub struct StoreClient {
     membership_sync: MembershipSyncHandle,
     _async_eviction: AsyncEvictionHandle,
     async_replica_tracking: AsyncReplicaTrackHandle,
+    async_delete_pending: AsyncDeletePendingHandle,
     async_route_hit_reporting: AsyncRouteHitReportHandle,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
@@ -175,6 +177,8 @@ pub struct StoreClient {
     namespace_quota: Option<NamespaceQuota>,
     execution_fairness: Option<ExecutionFairness>,
     bandwidth_shaping: Option<BandwidthShaping>,
+    allocation_lifecycle: AllocationLifecycleConfig,
+    allocation_lifecycle_enabled: bool,
     placement_policy: Option<TenantPlacementPolicy>,
     state: Arc<Mutex<StoreState>>,
     /// True if this client owns shared local runtime state cleanup.
