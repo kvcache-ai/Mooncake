@@ -1,7 +1,7 @@
 if(USE_XPU)
-  # Intel XPU: a SYCL implementation of the same _ep module for ranks on one
-  # node (peers over Level Zero IPC; no RDMA path). common.cmake has already
-  # required the DPC++ compiler.
+  # Intel XPU: a SYCL implementation of the same _ep module (peers on the node
+  # over Level Zero IPC, ranks on other nodes over RDMA when rdma-core allows
+  # it, see below). common.cmake has already required the DPC++ compiler.
   set(MOONCAKE_EP_XPU_AOT_DEVICES
       "bmg"
       CACHE
@@ -35,6 +35,50 @@ if(USE_XPU)
   target_link_libraries(_ep PRIVATE glog::glog ${MOONCAKE_EP_ZE_LOADER})
   set_target_properties(_ep PROPERTIES POSITION_INDEPENDENT_CODE ON
                                        INSTALL_RPATH "$ORIGIN")
+
+  # The hybrid path's buffer layout and RDMA writes, on one GPU with no NIC:
+  # the writes are replayed as device copies (not built by default).
+  add_executable(xpu_ep_hybrid_test EXCLUDE_FROM_ALL
+                 ../tests/xpu_ep_hybrid_test.cpp xpu/xpu_ep_kernels.cpp)
+  target_include_directories(
+    xpu_ep_hybrid_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/xpu
+                               ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_options(xpu_ep_hybrid_test PRIVATE ${_ep_xpu_sycl_flags})
+  target_link_options(xpu_ep_hybrid_test PRIVATE ${_ep_xpu_sycl_flags})
+
+  # The verbs path to ranks on other nodes needs an rdma-core with
+  # ibv_reg_dmabuf_mr. Without it _ep reaches only ranks on its node. The
+  # xpu_rdma_test target (not built by default) checks the verbs module on
+  # hardware.
+  find_path(MOONCAKE_EP_IBVERBS_INCLUDE_DIR infiniband/verbs.h)
+  find_library(MOONCAKE_EP_IBVERBS_LIBRARY ibverbs)
+  if(MOONCAKE_EP_IBVERBS_INCLUDE_DIR AND MOONCAKE_EP_IBVERBS_LIBRARY)
+    include(CheckCXXSymbolExists)
+    set(CMAKE_REQUIRED_INCLUDES ${MOONCAKE_EP_IBVERBS_INCLUDE_DIR})
+    set(CMAKE_REQUIRED_LIBRARIES ${MOONCAKE_EP_IBVERBS_LIBRARY})
+    check_cxx_symbol_exists(ibv_reg_dmabuf_mr infiniband/verbs.h
+                            MOONCAKE_EP_HAVE_IBV_REG_DMABUF_MR)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+  endif()
+  if(MOONCAKE_EP_HAVE_IBV_REG_DMABUF_MR)
+    target_sources(_ep PRIVATE xpu/xpu_rdma.cpp xpu/xpu_ep_proxy.cpp)
+    target_compile_definitions(_ep PRIVATE MOONCAKE_EP_XPU_RDMA=1)
+    target_include_directories(_ep PRIVATE ${MOONCAKE_EP_IBVERBS_INCLUDE_DIR})
+    target_link_libraries(_ep PRIVATE ${MOONCAKE_EP_IBVERBS_LIBRARY})
+    add_executable(xpu_rdma_test EXCLUDE_FROM_ALL ../tests/xpu_rdma_test.cpp
+                                                  xpu/xpu_rdma.cpp)
+    target_include_directories(
+      xpu_rdma_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/xpu
+                            ${MOONCAKE_EP_IBVERBS_INCLUDE_DIR})
+    target_compile_options(xpu_rdma_test PRIVATE ${_ep_xpu_sycl_flags})
+    target_link_options(xpu_rdma_test PRIVATE ${_ep_xpu_sycl_flags})
+    target_link_libraries(xpu_rdma_test PRIVATE ${MOONCAKE_EP_IBVERBS_LIBRARY}
+                                                ${MOONCAKE_EP_ZE_LOADER})
+  else()
+    message(STATUS "Mooncake EP (XPU): no rdma-core with ibv_reg_dmabuf_mr; "
+                   "the inter-node verbs path is not built")
+  endif()
   return()
 endif()
 

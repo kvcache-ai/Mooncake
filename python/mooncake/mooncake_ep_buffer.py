@@ -652,7 +652,8 @@ class Buffer:
                 # A failed update on any rank invalidates the IBGDA exchange
                 # for the whole group. Keep every rank on the same path.
                 self._use_fallback = True
-        # XPU has no RDMA path: peers are reached over Level Zero IPC only.
+        # XPU has no IBGDA: peers on the node are reached over Level Zero IPC,
+        # others over the proxy's RDMA writes (_connect_xpu_rdma).
         if (
             self.device_type != "xpu"
             and ibgda_ready
@@ -762,6 +763,8 @@ class Buffer:
                 dist.all_gather(handles, local_handle_tensor, self.group)
                 remote_handles = [h.tolist() for h in handles]
                 active_ranks_mask = self._active_ranks_list(device)
+                if self.device_type == "xpu":
+                    self._connect_xpu_rdma(remote_handles, active_ranks_mask, device)
                 self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
             except Exception as e:
                 import warnings
@@ -788,6 +791,70 @@ class Buffer:
         dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
         use_fast_path = bool(agreed.item())
         self._use_fallback = not use_fast_path
+
+    def _connect_xpu_rdma(
+        self,
+        handles: List[List[int]],
+        active_ranks_mask: List[int],
+        device: torch.device,
+    ) -> None:
+        """Connect the ranks on other nodes over RDMA (XPU only).
+
+        A rank is on another node if its IPC handle comes from another host
+        or pid namespace (words 3 and 4 of the handle), or, with
+        MC_EP_RANKS_PER_NODE=n, if rank // n differs: n=4 on one 8-GPU host
+        runs two virtual nodes. If any rank cannot set up RDMA, none does, and
+        the group stays on the fallback path unless every rank shares a node.
+        """
+        import warnings
+
+        per_node = int(os.environ.get("MC_EP_RANKS_PER_NODE", "0") or 0)
+        if per_node > 0:
+            nodes = [r // per_node for r in range(self.group_size)]
+        else:
+            nodes = [tuple(h[3:5]) for h in handles]
+        remote = [int(node != nodes[self.rank]) for node in nodes]
+        if not any(remote):
+            return
+        # Every rank with a peer on another node takes part in the agreement,
+        # whether or not it can set up RDMA itself.
+        info: List[int] = []
+        if not self.runtime.rdma_available():
+            warnings.warn(
+                f"[Rank {self.rank}] ranks on other nodes need the XPU verbs "
+                "path, which this build lacks (rdma-core with "
+                "ibv_reg_dmabuf_mr)",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        else:
+            try:
+                info = list(self.runtime.init_rdma(remote))
+            except Exception as e:
+                warnings.warn(
+                    f"[Rank {self.rank}] XPU RDMA setup failed: {e}",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+        info_len = 4 + 8 * self.group_size
+        ok = torch.tensor(
+            [int(len(info) == info_len)], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=self.group)
+        if not ok.item():
+            return
+        local = torch.tensor(info, dtype=torch.int32, device=device)
+        infos = [torch.empty_like(local) for _ in range(self.group_size)]
+        dist.all_gather(infos, local, self.group)
+        try:
+            self.runtime.connect_rdma([t.tolist() for t in infos], active_ranks_mask)
+        except Exception as e:
+            # use_fast_path() then reports false, and every rank falls back.
+            warnings.warn(
+                f"[Rank {self.rank}] XPU RDMA connect failed: {e}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     def update_ep_member(self):
         self.connect(True)
