@@ -81,6 +81,7 @@ std::shared_ptr<Config> config(Params params = {}) {
     c->set("transports/shm/enable", false);
     c->set("transports/io_uring/enable", false);
     c->set("transports/mlu/enable", true);
+    c->set("transports/mlu/disable_ipc", true);
     return c;
 }
 

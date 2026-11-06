@@ -16,8 +16,12 @@
 
 #include <glog/logging.h>
 #include <cnrt.h>
+#include <time.h>
 
 #include <algorithm>
+#include <charconv>
+#include <sstream>
+#include <tuple>
 #include <utility>
 
 #include "tent/common/status.h"
@@ -27,6 +31,52 @@
 namespace mooncake {
 namespace tent {
 namespace {
+struct IpcAttr {
+    uint64_t base = 0;
+    uint64_t size = 0;
+    uintptr_t handle = 0;
+    int device = -1;
+    uint64_t generation = 0;
+};
+
+std::string formatIpcAttr(const IpcAttr &attr) {
+    return std::to_string(attr.base) + ':' + std::to_string(attr.size) + ':' +
+           std::to_string(attr.handle) + ':' + std::to_string(attr.device) +
+           ':' + std::to_string(attr.generation);
+}
+
+bool parseIpcAttr(const std::string &text, IpcAttr &attr) {
+    std::array<std::string_view, 5> fields;
+    size_t start = 0;
+    for (size_t i = 0; i < fields.size(); ++i) {
+        const size_t end = text.find(':', start);
+        if (i + 1 < fields.size() && end == std::string::npos) return false;
+        if (i + 1 == fields.size() && end != std::string::npos) return false;
+        fields[i] = std::string_view(text).substr(start, end - start);
+        start = end + 1;
+    }
+    auto number = [](std::string_view field, auto &value) {
+        auto [end, ec] =
+            std::from_chars(field.data(), field.data() + field.size(), value);
+        return ec == std::errc() && end == field.data() + field.size();
+    };
+    return number(fields[0], attr.base) && number(fields[1], attr.size) &&
+           number(fields[2], attr.handle) && number(fields[3], attr.device) &&
+           number(fields[4], attr.generation) && attr.size && attr.handle &&
+           attr.device >= 0;
+}
+
+bool rangeWithin(uint64_t addr, uint64_t length, uint64_t base, uint64_t size) {
+    return addr >= base && addr - base <= size &&
+           length <= size - (addr - base);
+}
+
+uint64_t bootTimeNs() {
+    timespec ts{};
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return 0;
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
+}
+
 Status driverStatus(CNresult result) {
     if (result == CN_SUCCESS) return Status::OK();
     const char *message = nullptr;
@@ -83,6 +133,7 @@ MluTask::MluTask(MluTask &&other) noexcept
       status_word(other.status_word.load()),
       transferred_bytes(other.transferred_bytes.load()),
       queue(std::move(other.queue)),
+      imported_target(std::move(other.imported_target)),
       completion(std::exchange(other.completion, nullptr)),
       drain_on_error(other.drain_on_error) {}
 
@@ -108,7 +159,7 @@ MluTransport::~MluTransport() { logError(uninstall()); }
 Status MluTransport::install(std::string & /*local_segment_name*/,
                              std::shared_ptr<ControlService> metadata,
                              std::shared_ptr<Topology> /*local_topology*/,
-                             std::shared_ptr<Config> /*conf*/) {
+                             std::shared_ptr<Config> conf) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (installed_) {
         return Status::InvalidArgument(
@@ -120,19 +171,28 @@ Status MluTransport::install(std::string & /*local_segment_name*/,
             "MLU transport requires the MluPlatform to be active" LOC_MARK);
     }
     metadata_ = std::move(metadata);
+    ipc_enabled_ = !(conf && conf->get("transports/mlu/disable_ipc", false));
+    if (metadata_) {
+        auto local = metadata_->segmentManager().getLocal();
+        if (local) machine_id_ = local->machine_id;
+    }
+    ipc_generation_ = bootTimeNs();
     installed_ = true;
     caps.gpu_to_dram = true;
     caps.dram_to_gpu = true;
+    caps.gpu_to_gpu = true;
     return Status::OK();
 }
 
 Status MluTransport::uninstall() {
     std::lock_guard<std::mutex> lock(mutex_);
     CHECK_STATUS(quiesceLocked());
+    imports_.clear();
     queues_.clear();
     metadata_.reset();
     platform_ = nullptr;
     installed_ = false;
+    machine_id_.clear();
     return Status::OK();
 }
 
@@ -228,9 +288,28 @@ Status MluTransport::submitTransferTasks(
         return Status::InvalidArgument("Invalid MLU sub-batch" LOC_MARK);
     if (request_list.size() > mlu_batch->max_size - mlu_batch->task_list.size())
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
-    for (auto &request : request_list) {
+    std::vector<std::shared_ptr<void>> mappings;
+    std::vector<uint64_t> targets;
+    mappings.reserve(request_list.size());
+    targets.reserve(request_list.size());
+    for (const auto &request : request_list) {
+        uint64_t target = request.target_offset;
+        std::shared_ptr<void> mapping;
+        if (request.target_id != LOCAL_SEGMENT_ID) {
+            mapping = relocate(request.target_id, target, request.length);
+            if (!mapping)
+                return Status::InvalidArgument(
+                    "MLU IPC target is not mapped into this process");
+        }
+        targets.push_back(target);
+        mappings.push_back(std::move(mapping));
+    }
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        const auto &request = request_list[i];
         auto &task = mlu_batch->task_list.emplace_back();
         task.request = request;
+        task.request.target_offset = targets[i];
+        task.imported_target = std::move(mappings[i]);
         task.status_word = TransferStatusEnum::PENDING;
         task.transferred_bytes = 0;
         startTransfer(&task);
@@ -242,12 +321,13 @@ Status MluTransport::submitTransferTasks(
 
 void MluTransport::startTransfer(MluTask *task) {
     ContextGuard caller_context;
-    if (task->request.target_id != LOCAL_SEGMENT_ID ||
+    if ((task->request.target_id != LOCAL_SEGMENT_ID &&
+         !task->imported_target) ||
         (task->request.opcode != Request::READ &&
          task->request.opcode != Request::WRITE)) {
-        LOG(ERROR) << "MluTransport: unexpected non-local target "
+        LOG(ERROR) << "MluTransport: inaccessible target "
                    << task->request.target_id
-                   << "; MLU only supports local staging copies";
+                   << "; MLU requires a local or imported buffer";
         task->status_word = TransferStatusEnum::FAILED;
         task->transferred_bytes = 0;
         return;
@@ -259,8 +339,9 @@ void MluTransport::startTransfer(MluTask *task) {
         const auto local = metadata_->segmentManager().getLocal();
         if (!local->findBuffer(reinterpret_cast<uint64_t>(task->request.source),
                                task->request.length) ||
-            !local->findBuffer(task->request.target_offset,
-                               task->request.length)) {
+            (task->request.target_id == LOCAL_SEGMENT_ID &&
+             !local->findBuffer(task->request.target_offset,
+                                task->request.length))) {
             task->status_word = FAILED;
             return;
         }
@@ -272,8 +353,8 @@ void MluTransport::startTransfer(MluTask *task) {
         platform_->getMemoryType(task->request.source) == MTYPE_MLU;
     const bool staging_is_device =
         platform_->getMemoryType(staging) == MTYPE_MLU;
-    if (source_is_device == staging_is_device) {
-        LOG(ERROR) << "MluTransport: a staging copy must have exactly one MLU "
+    if (!source_is_device && !staging_is_device) {
+        LOG(ERROR) << "MluTransport: a copy must have an MLU "
                       "device side, but source="
                    << task->request.source << " (device=" << source_is_device
                    << ") and target=" << staging
@@ -282,6 +363,19 @@ void MluTransport::startTransfer(MluTask *task) {
                       "external device pointer.";
         task->status_word = TransferStatusEnum::FAILED;
         task->transferred_bytes = 0;
+        return;
+    }
+
+    if (source_is_device && staging_is_device) {
+        auto status = submitPeerCopy(*task);
+        if (status.ok() && !task->completion) {
+            task->transferred_bytes = task->request.length;
+            task->status_word = COMPLETED;
+        } else if (!status.ok() && !task->drain_on_error) {
+            LOG(WARNING) << "MluTransport: peer copy failed: "
+                         << status.ToString();
+            task->status_word = FAILED;
+        }
         return;
     }
 
@@ -298,6 +392,112 @@ void MluTransport::startTransfer(MluTask *task) {
         if (!task->drain_on_error)
             task->status_word = TransferStatusEnum::FAILED;
     }
+}
+
+Status MluTransport::submitPeerCopy(MluTask &task) {
+    void *src = task.request.source;
+    void *dst = reinterpret_cast<void *>(task.request.target_offset);
+    if (task.request.opcode == Request::READ) std::swap(src, dst);
+    const auto length = task.request.length;
+    if (!length) return Status::OK();
+
+    CNcontext src_context = nullptr, dst_context = nullptr;
+    int src_device = -1, dst_device = -1;
+    for (auto [ptr, context, device] :
+         {std::tuple<CNaddr, CNcontext *, int *>{reinterpret_cast<CNaddr>(src),
+                                                 &src_context, &src_device},
+          {reinterpret_cast<CNaddr>(dst), &dst_context, &dst_device}}) {
+        CHECK_STATUS(driverStatus(
+            cnGetMemAttribute(context, CN_MEM_ATTRIBUTE_CONTEXT, ptr)));
+        CHECK_STATUS(driverStatus(
+            cnGetMemAttribute(device, CN_MEM_ATTRIBUTE_DEVICE_ORDINAL, ptr)));
+        CNaddr base = 0;
+        cn_uint64_t size = 0;
+        CHECK_STATUS(driverStatus(cnMemGetAddressRange(&base, &size, ptr)));
+        if (ptr < base || ptr - base > size || length > size - (ptr - base))
+            return Status::InvalidArgument(
+                "MLU peer memory range exceeds its allocation");
+    }
+    bool accessible = src_context == dst_context;
+    if (src_device != dst_device) {
+        unsigned int peer_accessible = 0;
+        auto result =
+            cnrtGetPeerAccessibility(&peer_accessible, src_device, dst_device);
+        if (result != cnrtSuccess)
+            return Status::InternalError(cnrtGetErrorStr(result));
+        accessible = peer_accessible != 0;
+    }
+    if (!accessible) {
+        // Preserve the old host-staging behavior on systems without a direct
+        // device link or with two contexts on one device.
+        CHECK_STATUS(quiesceLocked());
+        void *host = nullptr;
+        auto allocated = cnrtHostMalloc(&host, length);
+        if (allocated != cnrtSuccess)
+            return Status::InternalError(cnrtGetErrorStr(allocated));
+        auto copied = platform_->copy(host, src, length);
+        if (copied.ok()) copied = platform_->copy(dst, host, length);
+        auto freed = cnrtFreeHost(host);
+        if (!copied.ok()) return copied;
+        if (freed != cnrtSuccess)
+            return Status::InternalError(cnrtGetErrorStr(freed));
+        return Status::OK();
+    }
+
+    ContextGuard guard;
+    CHECK_STATUS(guard.use(src_context));
+    auto &queue = queues_[src_context][2];
+    if (queue) {
+        auto previous = queue;
+        std::lock_guard<std::mutex> lock(previous->mutex);
+        if (!previous->error.ok()) {
+            auto ready = cnQueryQueue(previous->handle);
+            if (ready != CN_SUCCESS)
+                return ready == CN_ERROR_NOT_READY ? previous->error
+                                                   : driverStatus(ready);
+            queue.reset();
+        }
+    }
+    if (!queue) {
+        auto created = std::make_shared<MluCopyQueue>();
+        created->context = src_context;
+        CHECK_STATUS(driverStatus(cnCreateQueue(&created->handle, 0)));
+        queue = std::move(created);
+    }
+    task.queue = queue;
+    CHECK_STATUS(driverStatus(
+        cnCreateNotifier(&task.completion, CN_NOTIFIER_DISABLE_TIMING)));
+    std::lock_guard<std::mutex> lock(queue->mutex);
+    CHECK_STATUS(queue->error);
+    auto result =
+        src_context == dst_context
+            ? cnMemcpyAsync_V3(reinterpret_cast<CNaddr>(dst),
+                               reinterpret_cast<CNaddr>(src), length,
+                               queue->handle)
+            : cnMemcpyPeerAsync(reinterpret_cast<CNaddr>(dst), dst_context,
+                                reinterpret_cast<CNaddr>(src), src_context,
+                                length, queue->handle);
+    auto status = driverStatus(result);
+    if (status.ok()) {
+        status = driverStatus(cnPlaceNotifier(task.completion, queue->handle));
+        task.drain_on_error = !status.ok();
+        if (!status.ok()) queue->error = status;
+    } else {
+        switch (result) {
+            case CN_ERROR_INVALID_VALUE:
+            case CN_ERROR_INVALID_ADDRESS:
+            case CN_MEMORY_ERROR_INVALID_ADDRESS:
+            case CN_CONTEXT_ERROR_INVALID:
+            case CN_QUEUE_ERROR_INVALID:
+            case CN_ERROR_NOT_INITIALIZED:
+            case CN_ERROR_DEINITIALIZED:
+                break;
+            default:
+                task.drain_on_error = true;
+                queue->error = status;
+        }
+    }
+    return status;
 }
 
 Status MluTransport::submitCopy(MluTask &task, bool to_device) {
@@ -504,7 +704,7 @@ Status MluTransport::freeLocalMemory(void *addr, size_t size) {
 }
 
 Status MluTransport::addMemoryBuffer(BufferDesc &desc,
-                                     const MemoryOptions & /*options*/) {
+                                     const MemoryOptions &options) {
     LocationParser location(desc.location);
     if (location.type() != "mlu" && location.type() != "cpu" &&
         location.type() != kWildcardLocation) {
@@ -513,6 +713,48 @@ Status MluTransport::addMemoryBuffer(BufferDesc &desc,
     if (std::find(desc.transports.begin(), desc.transports.end(),
                   TransportType::MLU) == desc.transports.end()) {
         desc.transports.push_back(TransportType::MLU);
+    }
+    desc.transport_attrs.erase(MLU);
+    if (ipc_enabled_ && options.perm == kGlobalReadWrite &&
+        location.type() == "mlu" && desc.length) {
+        const auto address = static_cast<CNaddr>(desc.addr);
+        CNcontext context = nullptr;
+        int device = -1;
+        CNaddr base = 0;
+        cn_uint64_t size = 0;
+        auto status = driverStatus(
+            cnGetMemAttribute(&context, CN_MEM_ATTRIBUTE_CONTEXT, address));
+        if (status.ok())
+            status = driverStatus(cnGetMemAttribute(
+                &device, CN_MEM_ATTRIBUTE_DEVICE_ORDINAL, address));
+        if (status.ok())
+            status = driverStatus(cnMemGetAddressRange(&base, &size, address));
+        if (status.ok() && !rangeWithin(desc.addr, desc.length, base, size))
+            status =
+                Status::InvalidArgument("MLU IPC buffer exceeds allocation");
+        if (status.ok()) {
+            ContextGuard guard;
+            status = guard.use(context);
+            cnrtIpcMemHandle handle = nullptr;
+            if (status.ok()) {
+                auto result = cnrtAcquireMemHandle(
+                    &handle, reinterpret_cast<void *>(base));
+                if (result != cnrtSuccess)
+                    status = Status::InternalError(cnrtGetErrorStr(result));
+            }
+            if (status.ok() && handle) {
+                desc.transport_attrs[MLU] = formatIpcAttr(
+                    {base, size, reinterpret_cast<uintptr_t>(handle), device,
+                     ++ipc_generation_});
+            }
+        }
+        if (!status.ok()) {
+            // An unexportable allocation remains usable for local copies and
+            // the existing host-staged remote route.
+            LOG(INFO) << "MLU buffer " << (void *)desc.addr
+                      << " has no IPC handle: " << status.ToString();
+            desc.transport_attrs.erase(MLU);
+        }
     }
     return Status::OK();
 }
@@ -527,7 +769,124 @@ Status MluTransport::removeMemoryBuffer(BufferDesc &desc) {
         std::remove(desc.transports.begin(), desc.transports.end(),
                     TransportType::MLU),
         desc.transports.end());
+    desc.transport_attrs.erase(MLU);
     return Status::OK();
+}
+
+bool MluTransport::mayMapRemoteBuffer(SegmentID target_id,
+                                      const SegmentDesc &segment,
+                                      const BufferDesc &entry) const {
+    if (!installed_ || !ipc_enabled_ || target_id == LOCAL_SEGMENT_ID ||
+        machine_id_.empty() || segment.machine_id != machine_id_)
+        return false;
+    auto it = entry.transport_attrs.find(MLU);
+    return it != entry.transport_attrs.end() && !it->second.empty();
+}
+
+bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
+                                       const SegmentDesc &segment,
+                                       const BufferDesc &entry,
+                                       void *local_source) {
+    if (!mayMapRemoteBuffer(target_id, segment, entry)) return false;
+    const auto &attr_text = entry.transport_attrs.at(MLU);
+    IpcAttr attr;
+    if (!parseIpcAttr(attr_text, attr) ||
+        !rangeWithin(entry.addr, entry.length, attr.base, attr.size))
+        return false;
+
+    cnrtPointerAttributes_t source{};
+    auto queried = cnrtPointerGetAttributes(&source, local_source);
+    if (queried != cnrtSuccess) return false;
+    if (source.type == cnrtMemTypeDevice && source.device != attr.device) {
+        unsigned int accessible = 0;
+        auto result =
+            cnrtGetPeerAccessibility(&accessible, source.device, attr.device);
+        if (result != cnrtSuccess || !accessible) return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto &entries = imports_[target_id];
+    uint64_t newest_generation = 0;
+    for (const auto &buffer : segment.getMemory().buffers) {
+        auto it = buffer.transport_attrs.find(MLU);
+        if (it == buffer.transport_attrs.end()) continue;
+        IpcAttr published;
+        if (parseIpcAttr(it->second, published))
+            newest_generation =
+                std::max(newest_generation, published.generation);
+    }
+    // An older snapshot cannot retire a mapping published after it.
+    // In-flight tasks retain their own shared reference until the copy drains.
+    entries.erase(
+        std::remove_if(entries.begin(), entries.end(),
+                       [&](const ImportEntry &imported) {
+                           if (imported.generation > newest_generation)
+                               return false;
+                           for (const auto &buffer :
+                                segment.getMemory().buffers) {
+                               auto it = buffer.transport_attrs.find(MLU);
+                               if (it != buffer.transport_attrs.end() &&
+                                   it->second == imported.attr)
+                                   return false;
+                           }
+                           return true;
+                       }),
+        entries.end());
+    for (const auto &imported : entries)
+        if (imported.attr == attr_text) return true;
+
+    ContextGuard guard;
+    if (!guard.use(nullptr).ok()) return false;
+    auto selected = cnrtSetDevice(attr.device);
+    if (selected != cnrtSuccess) return false;
+    void *mapped = nullptr;
+    auto result = cnrtMapMemHandle(
+        &mapped, reinterpret_cast<cnrtIpcMemHandle>(attr.handle), 0);
+    if (result != cnrtSuccess) {
+        LOG(WARNING) << "MLU IPC map failed for segment " << segment.name
+                     << ": " << cnrtGetErrorStr(result);
+        return false;
+    }
+    CNcontext context = nullptr;
+    auto context_status = driverStatus(cnGetMemAttribute(
+        &context, CN_MEM_ATTRIBUTE_CONTEXT, reinterpret_cast<CNaddr>(mapped)));
+    if (!context_status.ok()) {
+        cnrtUnMapMemHandle(mapped);
+        return false;
+    }
+    std::shared_ptr<void> mapping(mapped, [context](void *ptr) {
+        ContextGuard guard;
+        auto status = guard.use(context);
+        if (status.ok()) {
+            auto result = cnrtUnMapMemHandle(ptr);
+            if (result != cnrtSuccess)
+                status = Status::InternalError(cnrtGetErrorStr(result));
+        }
+        logError(status);
+    });
+    entries.push_back(
+        {attr_text, attr.base, attr.size, attr.generation, std::move(mapping)});
+    LOG(INFO) << "MLU IPC mapped peer buffer " << (void *)attr.base << " of "
+              << segment.name << " at " << mapped << " on mlu:" << attr.device;
+    return true;
+}
+
+std::shared_ptr<void> MluTransport::relocate(SegmentID target_id,
+                                             uint64_t &addr, size_t length) {
+    auto it = imports_.find(target_id);
+    if (it == imports_.end()) return nullptr;
+    for (const auto &entry : it->second) {
+        if (!rangeWithin(addr, length, entry.base, entry.size)) continue;
+        addr =
+            addr - entry.base + reinterpret_cast<uint64_t>(entry.mapping.get());
+        return entry.mapping;
+    }
+    return nullptr;
+}
+
+void MluTransport::closeRemoteSegment(SegmentID target_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    imports_.erase(target_id);
 }
 
 }  // namespace tent
