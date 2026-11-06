@@ -17,16 +17,17 @@ def main():
         return 1
 
     device = os.environ.get("MC_TEST_DEVICE_NAME", "")
+    host = os.environ.get("MC_TEST_LOCAL_IP") or "127.0.0.1"
     source = engine.TransferEngine()
     target = engine.TransferEngine()
-    if source.initialize("127.0.0.1:0", "P2PHANDSHAKE", "rdma", device) != 0:
+    if source.initialize("%s:0" % host, "P2PHANDSHAKE", "rdma", device) != 0:
         print("source initialize failed")
         return 1
-    if target.initialize("127.0.0.1:0", "P2PHANDSHAKE", "rdma", device) != 0:
+    if target.initialize("%s:0" % host, "P2PHANDSHAKE", "rdma", device) != 0:
         print("target initialize failed")
         return 1
 
-    peer = "127.0.0.1:%d" % target.get_rpc_port()
+    peer = "%s:%d" % (host, target.get_rpc_port())
     length = 4096
     local = source.allocate_managed_buffer(length)
     remote = target.allocate_managed_buffer(length)
