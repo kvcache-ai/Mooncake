@@ -96,12 +96,12 @@ class RdmaCompletionFdTest : public ::testing::Test {
         device_ = pickRdmaDevice();
         if (device_.empty()) GTEST_SKIP() << "no usable RDMA device";
         const char* previous = std::getenv("MC_TEST_DEVICE_NAME");
-        saved_device_ = previous ? std::optional<std::string>(previous)
-                                 : std::nullopt;
+        saved_device_ =
+            previous ? std::optional<std::string>(previous) : std::nullopt;
         setenv("MC_TEST_DEVICE_NAME", device_.c_str(), 1);
         previous = std::getenv("MC_TE_FILTERS");
-        saved_filters_ = previous ? std::optional<std::string>(previous)
-                                  : std::nullopt;
+        saved_filters_ =
+            previous ? std::optional<std::string>(previous) : std::nullopt;
         setenv("MC_TE_FILTERS", device_.c_str(), 1);
         loadGlobalConfig(globalConfig());
         sender_ = makeEngine();
@@ -143,8 +143,7 @@ class RdmaCompletionFdTest : public ::testing::Test {
         BatchID batch = sender_->allocateBatchID(capacity);
         EXPECT_NE(batch, static_cast<BatchID>(0));
         if (notify) {
-            EXPECT_TRUE(
-                sender_->enableBatchCompletionNotification(batch).ok());
+            EXPECT_TRUE(sender_->enableBatchCompletionNotification(batch).ok());
         }
         EXPECT_TRUE(sender_->submitTransfer(batch, requests).ok());
         return batch;
@@ -229,8 +228,7 @@ TEST_F(RdmaCompletionFdTest, UnregisteredRemoteFailsAfterEveryTaskSettles) {
         requests[i].length = kLen;
     }
     requests[0].target_offset = reinterpret_cast<uint64_t>(target_.data());
-    requests[1].target_offset =
-        reinterpret_cast<uint64_t>(unregistered.data());
+    requests[1].target_offset = reinterpret_cast<uint64_t>(unregistered.data());
     BatchID batch = submit(requests, /*capacity=*/4, /*notify=*/true);
     ASSERT_TRUE(waitFd(sender_->completionFd(), 10000));
     std::vector<BatchCompletion> done;
