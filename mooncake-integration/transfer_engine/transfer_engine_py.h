@@ -338,6 +338,7 @@ class TransferEnginePy {
     std::vector<std::stack<char *>> free_list_;
     std::vector<char *> buffer_list_;
     std::unordered_set<char *> large_buffer_list_;
+    std::unordered_set<uintptr_t> external_registered_buffers_;
     std::unordered_map<std::string, Transport::SegmentHandle> handle_map_;
     bool auto_discovery_;
 

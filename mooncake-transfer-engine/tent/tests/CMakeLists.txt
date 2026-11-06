@@ -220,7 +220,13 @@ add_test(NAME tent_notification_fallback_test
 add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
-                      PRIVATE gtest gtest_main transfer_engine tent_link_group)
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET transfer_engine)
+  target_link_libraries(transfer_engine_config_override_test
+                        PRIVATE transfer_engine)
+  target_compile_definitions(transfer_engine_config_override_test
+                             PRIVATE MOONCAKE_TEST_TENT_COMPAT)
+endif()
 if(TARGET asio_shared)
   target_link_libraries(transfer_engine_config_override_test
                         PRIVATE asio_shared)

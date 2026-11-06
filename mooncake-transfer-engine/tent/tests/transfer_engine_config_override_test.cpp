@@ -14,7 +14,9 @@
 
 #include <gtest/gtest.h>
 
+#ifdef MOONCAKE_TEST_TENT_COMPAT
 #include "transfer_engine.h"
+#endif
 
 #include <chrono>
 #include <csignal>
@@ -171,6 +173,11 @@ class TestHttpMetadataServer {
             return std::nullopt;
         }
         return it->second;
+    }
+
+    void seed(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lock(store_mutex_);
+        store_[key] = value;
     }
 
     size_t deleteRequests() const {
@@ -724,6 +731,7 @@ TEST(TransferEngineConfigOverrideTest,
     }
 }
 
+#ifdef MOONCAKE_TEST_TENT_COMPAT
 TEST(TransferEngineConfigOverrideTest,
      SameNameReinitializationKeepsReplacementMetadata) {
 #ifdef _WIN32
@@ -798,6 +806,32 @@ TEST(TransferEngineConfigOverrideTest,
 }
 
 TEST(TransferEngineConfigOverrideTest,
+     MalformedReplacementDoesNotTerminateCleanup) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    EnvVarGuard force_tcp("MC_FORCE_TCP", "1");
+    EnvVarGuard tent_guard("MC_USE_TENT", "1");
+    EnvVarGuard tev1_guard("MC_USE_TEV1", "0");
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"rpc_server_hostname":"127.0.0.1","rpc_server_port":0})");
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    const auto endpoint = buildHttpMetadataEndpoint(port);
+    const auto key = buildMetadataKey(kSegmentName);
+
+    mooncake::TransferEngine engine(false);
+    ASSERT_EQ(engine.init(endpoint, kSegmentName, "", 0, "tcp"), 0);
+    server.seed(key, "{malformed");
+    EXPECT_NO_THROW(engine.freeEngine());
+    EXPECT_EQ(server.getStoredValue(key), "{malformed");
+    EXPECT_EQ(server.deleteRequests(), 0);
+#endif
+}
+
+TEST(TransferEngineConfigOverrideTest,
      DifferentNameReinitializationDeletesOnlyRetiredMetadata) {
 #ifdef _WIN32
     GTEST_SKIP() << "Requires local HTTP metadata server support";
@@ -825,6 +859,37 @@ TEST(TransferEngineConfigOverrideTest,
     engine.freeEngine();
     EXPECT_FALSE(server.getStoredValue(second_key).has_value());
     EXPECT_EQ(server.deleteRequests(), 2);
+#endif
+}
+#endif
+
+TEST(TransferEngineConfigOverrideTest,
+     OwnershipCheckedDeleteRejectsMalformedMetadata) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    CentralSegmentRegistry registry("http", buildHttpMetadataEndpoint(port));
+    auto expected = std::make_shared<SegmentDesc>();
+    expected->name = kSegmentName;
+    expected->type = SegmentType::Memory;
+    expected->machine_id = "machine";
+    expected->rpc_server_addr = "127.0.0.1:12345";
+    expected->owner_id = "owner";
+    const auto key = buildMetadataKey(kSegmentName);
+    server.seed(key, "{malformed");
+
+    SegmentDescRef current;
+    auto read_status = registry.getSegmentDesc(current, kSegmentName);
+    EXPECT_FALSE(read_status.ok());
+    EXPECT_EQ(current, nullptr);
+    auto delete_status =
+        registry.deleteSegmentDescIfOwned(kSegmentName, expected);
+    EXPECT_FALSE(delete_status.ok());
+    EXPECT_EQ(server.getStoredValue(key), "{malformed");
+    EXPECT_EQ(server.deleteRequests(), 0);
 #endif
 }
 

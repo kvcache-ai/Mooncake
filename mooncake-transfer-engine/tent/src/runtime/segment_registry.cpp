@@ -55,7 +55,14 @@ Status CentralSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
     auto status = plugin_->get(getFullMetadataKey(segment_name), jstr);
     if (!status.ok()) return status;
     desc = std::make_shared<SegmentDesc>();
-    *desc = json::parse(jstr).get<SegmentDesc>();
+    try {
+        *desc = json::parse(jstr).get<SegmentDesc>();
+    } catch (const json::exception &error) {
+        desc = nullptr;
+        return Status::MetadataError(
+            "Failed to parse segment descriptor " + segment_name + ": " +
+            error.what() + LOC_MARK);
+    }
     return Status::OK();
 }
 
@@ -118,7 +125,14 @@ Status PeerSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
                                     "not found" + LOC_MARK);
     }
     desc = std::make_shared<SegmentDesc>();
-    *desc = json::parse(response).get<SegmentDesc>();
+    try {
+        *desc = json::parse(response).get<SegmentDesc>();
+    } catch (const json::exception &error) {
+        desc = nullptr;
+        return Status::MetadataError(
+            "Failed to parse segment descriptor " + segment_name + ": " +
+            error.what() + LOC_MARK);
+    }
     return Status::OK();
 }
 

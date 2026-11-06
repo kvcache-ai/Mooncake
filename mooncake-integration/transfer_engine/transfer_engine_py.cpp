@@ -383,6 +383,14 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (engine_ && (!handle_map_.empty() || !buffer_list_.empty() ||
+                    !large_buffer_list_.empty() ||
+                    !external_registered_buffers_.empty())) {
+        LOG(ERROR) << "Cannot replace a transfer engine with registered "
+                      "buffers or cached segment handles; release them first";
+        return -1;
+    }
     if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
@@ -528,7 +536,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     return 0;
 }
 
-int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
+int TransferEnginePy::getRpcPort() { return engine_ ? engine_->getRpcPort() : 0; }
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     if (allocateMemory == nullptr || freeMemory == nullptr) {
@@ -1415,39 +1423,58 @@ int TransferEnginePy::batchRegisterMemory(
     std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
     const std::string& location) {
     pybind11::gil_scoped_release release;
+    std::lock_guard<std::mutex> guard(mutex_);
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
     for (size_t i = 0; i < batch_size; i++) {
         buffers.push_back(
             BufferEntry{(void*)buffer_addresses[i], capacities[i]});
     }
-    return engine_->registerLocalMemoryBatch(buffers, location);
+    int result = engine_->registerLocalMemoryBatch(buffers, location);
+    if (result == 0) {
+        external_registered_buffers_.insert(buffer_addresses.begin(),
+                                            buffer_addresses.end());
+    }
+    return result;
 }
 
 int TransferEnginePy::batchUnregisterMemory(
     std::vector<uintptr_t> buffer_addresses) {
     pybind11::gil_scoped_release release;
+    std::lock_guard<std::mutex> guard(mutex_);
     auto batch_size = buffer_addresses.size();
     std::vector<void*> buffers;
     for (size_t i = 0; i < batch_size; i++) {
         buffers.push_back(reinterpret_cast<char*>(buffer_addresses[i]));
     }
-    return engine_->unregisterLocalMemoryBatch(buffers);
+    int result = engine_->unregisterLocalMemoryBatch(buffers);
+    if (result == 0) {
+        for (auto address : buffer_addresses) {
+            external_registered_buffers_.erase(address);
+        }
+    }
+    return result;
 }
 
 int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      const std::string& location,
                                      bool remote_accessible) {
     pybind11::gil_scoped_release release;
+    std::lock_guard<std::mutex> guard(mutex_);
     char* buffer = reinterpret_cast<char*>(buffer_addr);
-    return engine_->registerLocalMemory(buffer, capacity, location,
-                                        remote_accessible);
+    int result = engine_->registerLocalMemory(buffer, capacity, location,
+                                              remote_accessible);
+    if (result == 0) external_registered_buffers_.insert(buffer_addr);
+    return result;
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
     pybind11::gil_scoped_release release;
+    std::lock_guard<std::mutex> guard(mutex_);
     char* buffer = reinterpret_cast<char*>(buffer_addr);
-    return engine_->unregisterLocalMemory(buffer);
+    int result = engine_->unregisterLocalMemory(buffer);
+    if (result == 0) external_registered_buffers_.erase(buffer_addr);
+    return result;
 }
 
 #ifdef USE_CUDA

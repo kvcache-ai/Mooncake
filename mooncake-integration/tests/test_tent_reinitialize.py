@@ -41,22 +41,54 @@ class Handler(BaseHTTPRequestHandler):
 
 
 client = r"""
+import ctypes
 import socket
 import sys
 import urllib.request
 import engine
 
+failed = engine.TransferEngine()
+assert failed.initialize("127.0.0.1", "http://127.0.0.1:1/metadata", "tcp", "") == -1
+assert failed.get_rpc_port() == 0
+del failed
+
 engine = engine.TransferEngine()
 assert engine.initialize("127.0.0.1", sys.argv[1], "tcp", "") == 0
+identity = engine.get_engine_ptr()
 port = engine.get_rpc_port()
+assert port > 0
 with socket.create_connection(("127.0.0.1", port), timeout=2):
     pass
+assert engine.send_probe("127.0.0.1") == 0
+
 assert engine.initialize("127.0.0.1", "http://127.0.0.1:1/metadata", "tcp", "") == -1
+assert engine.get_engine_ptr() == identity
+assert engine.get_rpc_port() == port
 with socket.create_connection(("127.0.0.1", port), timeout=2):
     pass
+assert engine.send_probe("127.0.0.1") == 0
 with urllib.request.urlopen(sys.argv[1] + "?key=mooncake/tent/127.0.0.1", timeout=2) as response:
     assert response.status == 200
     assert response.read()
+
+registered = ctypes.create_string_buffer(4096)
+address = ctypes.addressof(registered)
+assert engine.register_memory(address, len(registered)) == 0
+assert engine.initialize("127.0.0.1", sys.argv[1], "tcp", "") == -1
+assert engine.get_engine_ptr() == identity
+assert engine.send_probe("127.0.0.1") == 0
+assert engine.unregister_memory(address) == 0
+
+assert engine.initialize("127.0.0.1", sys.argv[1], "tcp", "") == 0
+second_identity = engine.get_engine_ptr()
+assert second_identity != identity
+assert engine.send_probe("127.0.0.1") == 0
+managed = engine.allocate_managed_buffer(4096)
+assert managed != 0
+assert engine.initialize("127.0.0.1", sys.argv[1], "tcp", "") == -1
+assert engine.get_engine_ptr() == second_identity
+assert engine.send_probe("127.0.0.1") == 0
+assert engine.free_managed_buffer(managed, 4096) == 0
 del engine
 """
 

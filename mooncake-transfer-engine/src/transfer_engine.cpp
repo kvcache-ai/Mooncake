@@ -784,7 +784,7 @@ std::string TransferEngine::getLocalIpAndPort() {
 
 int TransferEngine::getRpcPort() {
     if (use_tent_) {
-        return impl_tent_->getRpcServerPort();
+        return impl_tent_ ? impl_tent_->getRpcServerPort() : 0;
     } else
         return impl_->getRpcPort();
 }
