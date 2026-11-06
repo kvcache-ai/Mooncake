@@ -1,11 +1,11 @@
 use super::super::{
-    refresh_cold_tier_device_cache, DebugEvictAllResult, ObjectRoute, OperationTracker,
+    refresh_cold_tier_device_cache, ClockEntryId, DebugEvictAllResult, ObjectRoute, OperationTracker,
     PendingOffloadPrepareOutcome, RestorePromotionQueue, Result, StorageOwnerState,
 };
 use super::{
     local_hot_replica_checksum, pending_persistent_backing, read_local_hot_replica_payload,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ impl StorageOwnerState {
                     error_retries = 0;
                     no_progress_retries = 0;
                 }
-                Ok(_) if self.tracked_hot_replica_count() == 0 => break,
+                Ok(_) if self.evictable_hot_replica_count() == 0 => break,
                 Ok(_) if no_progress_retries < MAX_NO_PROGRESS_RETRIES => {
                     no_progress_retries += 1;
                     restore_promotions.wait_for_worker_idle();
@@ -78,7 +78,7 @@ impl StorageOwnerState {
                 }
             }
         }
-        result.remaining_hot_replicas = self.tracked_hot_replica_count();
+        result.remaining_hot_replicas = self.evictable_hot_replica_count();
         result.completed = result.remaining_hot_replicas == 0;
         if result.completed {
             result.stopped_reason = None;
@@ -95,8 +95,23 @@ impl StorageOwnerState {
         Ok(result)
     }
 
-    fn tracked_hot_replica_count(&self) -> usize {
-        self.hot_replicas.clock.lock().tracked_replica_count()
+    fn evictable_hot_replica_count(&self) -> usize {
+        let pending_delete_ids = self
+            .pending_deletes
+            .lock()
+            .entries
+            .values()
+            .map(|entry| ClockEntryId {
+                route_key: entry.route_key.clone(),
+                segment_name: entry.identity.segment_name.clone(),
+                segment_offset: entry.identity.offset_bytes,
+                allocation_id: Some(entry.identity.allocation_id),
+            })
+            .collect::<BTreeSet<_>>();
+        self.hot_replicas
+            .clock
+            .lock()
+            .tracked_replica_count_excluding(&pending_delete_ids)
     }
 }
 

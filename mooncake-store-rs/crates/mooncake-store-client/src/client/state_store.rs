@@ -3338,8 +3338,11 @@ impl StorageClockState {
         self.entries.len().saturating_mul(3)
     }
 
-    fn tracked_replica_count(&self) -> usize {
-        self.by_id.len()
+    fn tracked_replica_count_excluding(&self, excluded: &BTreeSet<ClockEntryId>) -> usize {
+        self.by_id
+            .keys()
+            .filter(|id| !excluded.contains(*id))
+            .count()
     }
 
     fn entry_length(&self, id: &ClockEntryId) -> Option<u64> {
