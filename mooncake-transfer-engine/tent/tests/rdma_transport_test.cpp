@@ -297,6 +297,10 @@ class RdmaTransportTestPeer {
         return workers.worker_context_[i];
     }
 
+    static void stopAcceptingSubmits(Workers& workers) {
+        workers.accepting_submits_.store(false, std::memory_order_release);
+    }
+
     static const Topology* railLocalTopology(Workers& workers,
                                              const std::string& machine_id) {
         auto it = workers.worker_context_[0].rails.find(machine_id);
@@ -840,6 +844,126 @@ TEST_F(RdmaSliceMetadataLifetimeTest,
     EXPECT_EQ(task->transferred_bytes, 0u);
     EXPECT_EQ(task->ref_count.load(), 1);
     ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       AcceptedPrefixIsNotReplayedWhenLaterChunkIsRejected) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    auto& params = RdmaTransportTestPeer::params(transport_);
+    params->workers.block_size = 256;
+    params->endpoint.max_qp_wr = 4;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 2).ok());
+    batch_->device_mask = 1ULL << 0;
+    auto* batch = static_cast<RdmaSubBatch*>(batch_);
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    auto* selector = workers_->getDeviceSelector();
+    // The fixture defaults to round-robin mode, which skips byte accounting.
+    selector->setSmartSelection(true);
+
+    // The first submit publishes its chunk before taking the wakeup mutex.
+    // Hold it there so the second request cannot be submitted yet.
+    std::unique_lock<std::mutex> gate(worker.mutex);
+    Status submit_status;
+    std::thread caller([&] {
+        submit_status =
+            transport_.submitTransferTasks(batch_, {request_, request_});
+    });
+    RdmaSliceList accepted;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!accepted.first && std::chrono::steady_clock::now() < deadline) {
+        accepted = worker.queues[PRIO_HIGH].pop();
+        if (!accepted.first) std::this_thread::yield();
+    }
+    // This is the accepting-state transition in quiesce(); calling quiesce
+    // while holding the wakeup mutex would deadlock.
+    RdmaTransportTestPeer::stopAcceptingSubmits(*workers_);
+    gate.unlock();
+    caller.join();
+
+    // Keep cleanup outside the assertions so a failed check cannot leave
+    // resolved slices for the fixture's pending-slice teardown.
+    [&] {
+        ASSERT_NE(accepted.first, nullptr) << "first chunk was never published";
+        EXPECT_TRUE(submit_status.ok())
+            << "A group failure would make runtime replay the accepted prefix";
+        ASSERT_EQ(batch->task_list.size(), 2u);
+        ASSERT_EQ(batch->slice_chain.size(), 2u);
+        EXPECT_EQ(batch->slice_chain[0], accepted.first);
+        EXPECT_EQ(accepted.num_slices, 16);
+        EXPECT_EQ(worker.queues[PRIO_HIGH].pop().num_slices, 0)
+            << "Only the accepted prefix may be published, exactly once";
+        EXPECT_EQ(worker.inflight_slices.load(), 16);
+        EXPECT_EQ(selector->getInflightBytes(0), request_.length);
+
+        auto* prefix = batch->task_list[0];
+        auto* rejected = batch->task_list[1];
+        EXPECT_EQ(prefix->num_slices, 16);
+        EXPECT_EQ(prefix->status_word, PENDING);
+        EXPECT_EQ(prefix->resolved_slices.load(), 0);
+        EXPECT_EQ(prefix->ref_count.load(), 17);
+        EXPECT_EQ(rejected->num_slices, 16);
+        EXPECT_EQ(rejected->status_word, FAILED);
+        EXPECT_EQ(rejected->resolved_slices.load(), 16);
+        EXPECT_EQ(rejected->transferred_bytes, 0u);
+        EXPECT_EQ(rejected->ref_count.load(), 1);
+
+        std::unordered_set<RdmaSlice*> seen;
+        auto* slice = batch->slice_chain[1];
+        for (int i = 0; i < 16; ++i) {
+            ASSERT_NE(slice, nullptr);
+            ASSERT_TRUE(seen.insert(slice).second);
+            EXPECT_EQ(slice->task, rejected);
+            EXPECT_EQ(slice->word, FAILED);
+            // source_dev_id proves allocation happened before rejection;
+            // charged_dev proves that the rejected charge was returned.
+            EXPECT_EQ(slice->source_dev_id, 0);
+            EXPECT_EQ(slice->charged_dev.load(), -1);
+            EXPECT_EQ(slice->counted_lane.load(), -1);
+            slice = slice->next;
+        }
+        EXPECT_EQ(slice, nullptr);
+
+        slice = accepted.first;
+        for (int i = 0; i < 16; ++i) {
+            ASSERT_NE(slice, nullptr);
+            ASSERT_TRUE(seen.insert(slice).second)
+                << "An accepted slice must be consumed only once";
+            EXPECT_EQ(slice->task, prefix);
+            EXPECT_EQ(slice->word, PENDING);
+            EXPECT_EQ(slice->charged_dev.load(), 0);
+            EXPECT_EQ(slice->counted_lane.load(), 0);
+            RdmaTransportTestPeer::discountFromOwner(*workers_, worker, slice);
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+            updateSliceStatus(slice, COMPLETED);
+            slice = slice->next;
+        }
+        EXPECT_EQ(slice, nullptr);
+        EXPECT_EQ(seen.size(), 32u);
+        EXPECT_EQ(prefix->status_word, COMPLETED);
+        EXPECT_EQ(prefix->transferred_bytes, request_.length);
+        EXPECT_EQ(prefix->resolved_slices.load(), 16);
+        EXPECT_EQ(prefix->ref_count.load(), 1);
+        EXPECT_EQ(worker.inflight_slices.load(), 0);
+        EXPECT_EQ(selector->getInflightBytes(0), 0u);
+        EXPECT_EQ(worker.queues[PRIO_HIGH].pop().num_slices, 0);
+    }();
+
+    // Resolve any pending slices after a failed assertion before freeing.
+    for (auto* first : batch->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next) {
+            RdmaTransportTestPeer::discountFromOwner(*workers_, worker, slice);
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+            updateSliceStatus(slice, CANCELED);
+        }
+    }
+    for (auto* task : batch->task_list) EXPECT_EQ(task->ref_count.load(), 1);
+    EXPECT_EQ(worker.inflight_slices.load(), 0);
+    std::vector<NicLoadStats> stats;
+    EXPECT_TRUE(selector->getNicLoadStats(stats).ok());
+    for (const auto& nic : stats) EXPECT_EQ(nic.inflight_bytes, 0u);
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    EXPECT_EQ(batch_, nullptr);
 }
 
 TEST_F(RdmaSliceMetadataLifetimeTest,
