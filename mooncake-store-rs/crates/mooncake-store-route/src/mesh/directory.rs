@@ -32,8 +32,9 @@ use crate::mesh::registry::{
     unregister_local_authority,
 };
 use crate::mesh::selection::{
-    authority_candidates, ranked_authorities, ranked_top_authorities,
-    retained_authority_candidates, select_authorities_for_requests, RouteAuthoritySelection,
+    authority_candidates, merge_authority_candidates, ranked_authorities,
+    ranked_merged_authorities, ranked_top_authorities, retained_authority_candidates,
+    select_authorities_for_requests, RouteAuthoritySelection,
 };
 use crate::metrics::{record_cas_outcome, record_delete_marker_event};
 use crate::shim::{
@@ -306,30 +307,16 @@ impl EmbeddedWrhRouteDirectory {
         key: &ObjectKey,
         current_candidates: &[ClientLease],
     ) -> Vec<ClientLease> {
-        // Deletes fan out to the deduplicated current/retained Top-2K union.
-        // When both snapshots contain one stable ID, the newer epoch wins.
         let limit = self.route_topk.saturating_mul(2);
         let retained =
             retained_authority_candidates(self.membership.as_ref(), observer).unwrap_or_default();
-        let mut authorities = BTreeMap::<String, ClientLease>::new();
-        for authority in ranked_top_authorities(&self.namespace, current_candidates, key, limit)
-            .into_iter()
-            .chain(ranked_top_authorities(
-                &self.namespace,
-                &retained,
-                key,
-                limit,
-            ))
-        {
-            let stable_id = authority.runtime.stable_id.0.clone();
-            match authorities.get(&stable_id) {
-                Some(current) if current.runtime.epoch >= authority.runtime.epoch => {}
-                _ => {
-                    authorities.insert(stable_id, authority);
-                }
-            }
-        }
-        authorities.into_values().collect()
+        ranked_merged_authorities(
+            &self.namespace,
+            current_candidates,
+            &retained,
+            key,
+            limit,
+        )
     }
 
     fn eviction_confirmation_authorities(
@@ -340,26 +327,13 @@ impl EmbeddedWrhRouteDirectory {
     ) -> Result<Vec<ClientLease>> {
         let retained_candidates =
             retained_authority_candidates(self.membership.as_ref(), observer)?;
-        let mut authorities = BTreeMap::<String, ClientLease>::new();
-        for authority in
-            ranked_top_authorities(&self.namespace, current_candidates, key, self.route_topk)
-                .into_iter()
-                .chain(ranked_top_authorities(
-                    &self.namespace,
-                    &retained_candidates,
-                    key,
-                    self.route_topk,
-                ))
-        {
-            let stable_id = authority.runtime.stable_id.0.clone();
-            match authorities.get(&stable_id) {
-                Some(current) if current.runtime.epoch >= authority.runtime.epoch => {}
-                _ => {
-                    authorities.insert(stable_id, authority);
-                }
-            }
-        }
-        Ok(authorities.into_values().collect())
+        Ok(ranked_merged_authorities(
+            &self.namespace,
+            current_candidates,
+            &retained_candidates,
+            key,
+            self.route_topk,
+        ))
     }
 
     fn allocation_confirmation_authorities(
@@ -369,17 +343,10 @@ impl EmbeddedWrhRouteDirectory {
     ) -> Result<Vec<ClientLease>> {
         let retained_candidates =
             retained_authority_candidates(self.membership.as_ref(), observer)?;
-        let mut authorities = BTreeMap::<String, ClientLease>::new();
-        for authority in current_candidates.iter().chain(&retained_candidates) {
-            let stable_id = authority.runtime.stable_id.0.clone();
-            match authorities.get(&stable_id) {
-                Some(current) if current.runtime.epoch >= authority.runtime.epoch => {}
-                _ => {
-                    authorities.insert(stable_id, authority.clone());
-                }
-            }
-        }
-        Ok(authorities.into_values().collect())
+        Ok(merge_authority_candidates(
+            current_candidates,
+            &retained_candidates,
+        ))
     }
 
     fn local_authority_service(
@@ -2786,7 +2753,7 @@ mod owner_page_contract_tests {
     }
 
     #[test]
-    fn exact_replica_confirmation_checks_bounded_current_and_retained_topk_union() {
+    fn exact_replica_confirmation_ranks_the_merged_membership_once() {
         let observer = test_lease("observer");
         let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
         let mut referenced = test_route("confirmation-retained-authority", &replica_owner);
@@ -2807,12 +2774,11 @@ mod owner_page_contract_tests {
         ];
         let metadata = Arc::new(InMemoryMetadataBackend::new());
         let namespace = metadata.route_namespace();
-        let current_topk = ranked_top_authorities(&namespace, &current, &referenced.key, 2);
-        let retained_topk = ranked_top_authorities(&namespace, &retained, &referenced.key, 2);
-        let retained_reference = retained_topk[0].runtime.stable_id.0.clone();
-        let expected_authorities = current_topk
+        let expected_ranked =
+            ranked_merged_authorities(&namespace, &current, &retained, &referenced.key, 2);
+        let referenced_authority = expected_ranked[0].runtime.stable_id.0.clone();
+        let expected_authorities = expected_ranked
             .iter()
-            .chain(&retained_topk)
             .map(|lease| lease.runtime.stable_id.0.clone())
             .collect::<BTreeSet<_>>();
         let queried_authorities = Arc::new(Mutex::new(Vec::new()));
@@ -2821,7 +2787,7 @@ mod owner_page_contract_tests {
             .map(|authority| {
                 (
                     authority.clone(),
-                    Some(if *authority == retained_reference {
+                    Some(if *authority == referenced_authority {
                         referenced.clone()
                     } else {
                         absent.clone()
@@ -2843,7 +2809,7 @@ mod owner_page_contract_tests {
         assert!(matches!(
             directory
                 .confirm_replica_reference(&observer, &referenced.key, &referenced.replicas[0],)
-                .expect("a retained exact reference must keep the allocation"),
+                .expect("a merged-membership reference must keep the allocation"),
             RouteReplicaReference::Referenced(_)
         ));
         assert_eq!(
@@ -2854,11 +2820,11 @@ mod owner_page_contract_tests {
                 .collect::<BTreeSet<_>>(),
             expected_authorities
         );
-        assert!(queried_authorities.lock().len() <= 4);
+        assert!(queried_authorities.lock().len() <= 2);
     }
 
     #[test]
-    fn delete_marker_fanout_uses_current_and_retained_top_2k_union() {
+    fn delete_marker_fanout_ranks_the_merged_membership_once() {
         let observer = test_lease("observer-delete-fanout");
         let current = (0..6)
             .map(|index| test_lease(&format!("current-{index}")))
@@ -2887,18 +2853,19 @@ mod owner_page_contract_tests {
             .into_iter()
             .map(|lease| lease.runtime.stable_id.0)
             .collect::<BTreeSet<_>>();
-        let expected = ranked_top_authorities(&directory.namespace, &current, &key, 4)
+        let expected = ranked_merged_authorities(
+            &directory.namespace,
+            &current,
+            &retained,
+            &key,
+            4,
+        )
             .into_iter()
-            .chain(ranked_top_authorities(
-                &directory.namespace,
-                &retained,
-                &key,
-                4,
-            ))
             .map(|lease| lease.runtime.stable_id.0)
             .collect::<BTreeSet<_>>();
 
         assert_eq!(actual, expected);
+        assert!(actual.len() <= 4);
     }
 
     #[test]
