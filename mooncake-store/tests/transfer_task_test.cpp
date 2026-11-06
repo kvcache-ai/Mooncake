@@ -194,6 +194,59 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
     }
 }
 
+// MemcpyOperationsOverlap decides whether a task's accelerator copies may be
+// batched. Addresses are synthetic and never dereferenced.
+static MemcpyOperation SyntheticOp(uintptr_t dest, uintptr_t src, size_t size) {
+    return MemcpyOperation(reinterpret_cast<void*>(dest),
+                           reinterpret_cast<const void*>(src), size);
+}
+
+TEST(MemcpyOperationsOverlapTest, DisjointOpsMayBatch) {
+    EXPECT_FALSE(MemcpyOperationsOverlap({}));
+    EXPECT_FALSE(MemcpyOperationsOverlap({SyntheticOp(0x1000, 0x9000, 0x100)}));
+    // Adjacent ranges share no byte.
+    EXPECT_FALSE(MemcpyOperationsOverlap({SyntheticOp(0x1000, 0x9000, 0x100),
+                                          SyntheticOp(0x1100, 0x9100, 0x100)}));
+    // Two ops may read the same source (one slice put to two replicas).
+    EXPECT_FALSE(MemcpyOperationsOverlap({SyntheticOp(0x1000, 0x9000, 0x100),
+                                          SyntheticOp(0x5000, 0x9000, 0x100)}));
+    // Zero-length ops touch nothing.
+    EXPECT_FALSE(MemcpyOperationsOverlap(
+        {SyntheticOp(0x1000, 0x9000, 0x100), SyntheticOp(0x1000, 0x1000, 0)}));
+}
+
+TEST(MemcpyOperationsOverlapTest, SharedWrittenBytesPreventBatching) {
+    // Write after write.
+    EXPECT_TRUE(MemcpyOperationsOverlap({SyntheticOp(0x1000, 0x9000, 0x100),
+                                         SyntheticOp(0x10ff, 0xa000, 0x100)}));
+    // Read after write, in either op order.
+    EXPECT_TRUE(MemcpyOperationsOverlap({SyntheticOp(0x1000, 0x9000, 0x100),
+                                         SyntheticOp(0x5000, 0x1080, 0x10)}));
+    EXPECT_TRUE(MemcpyOperationsOverlap({SyntheticOp(0x5000, 0x1080, 0x10),
+                                         SyntheticOp(0x1000, 0x9000, 0x100)}));
+    // A write inside a long read that starts earlier.
+    EXPECT_TRUE(MemcpyOperationsOverlap({SyntheticOp(0x5000, 0x1000, 0x1000),
+                                         SyntheticOp(0x1800, 0x9000, 0x10)}));
+    // An op whose own source and destination overlap.
+    EXPECT_TRUE(MemcpyOperationsOverlap({SyntheticOp(0x1000, 0x1080, 0x100),
+                                         SyntheticOp(0x5000, 0x9000, 0x10)}));
+}
+
+TEST(MemcpyOperationsOverlapTest, WrappingRangePreventsBatching) {
+    constexpr uintptr_t kTop = std::numeric_limits<uintptr_t>::max();
+    // Without the guard the wrapped end (0x100) would sort below its begin
+    // and the overlap with the low write would be missed.
+    EXPECT_TRUE(
+        MemcpyOperationsOverlap({SyntheticOp(kTop - 0xff, 0x9000, 0x200),
+                                 SyntheticOp(0x50, 0xa000, 0x10)}));
+    EXPECT_TRUE(MemcpyOperationsOverlap(
+        {SyntheticOp(0x1000, kTop, 2), SyntheticOp(0x5000, 0x9000, 0x10)}));
+    // Ending exactly at the top of the address space does not wrap.
+    EXPECT_FALSE(
+        MemcpyOperationsOverlap({SyntheticOp(kTop - 0xff, 0x9000, 0xff),
+                                 SyntheticOp(0x50, 0xa000, 0x10)}));
+}
+
 TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
     constexpr size_t kBufferSize = 512;
     constexpr size_t kFragmentCount = 128;
