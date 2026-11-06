@@ -36,6 +36,7 @@ use crate::mesh::selection::{
     retained_authority_candidates, select_authorities_for_requests, RouteAuthoritySelection,
 };
 use crate::metrics::record_cas_outcome;
+#[cfg(test)]
 use crate::table::DEFAULT_DELETE_MARKER_BUDGET_BYTES;
 use crate::shim::{RouteAuthorityClient, RouteAuthorityRecord, RouteAuthorityService, RouteMembershipProvider};
 use crate::util::{route_read_source, sampled_per_key_debug_log};
