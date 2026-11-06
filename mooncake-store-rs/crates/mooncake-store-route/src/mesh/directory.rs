@@ -2527,6 +2527,46 @@ mod owner_page_contract_tests {
             vec![AllocationRouteReferenceState::Conflict],
         );
     }
+
+    #[test]
+    fn allocation_reference_confirmation_uses_cached_membership() {
+        let observer = test_lease("observer");
+        let identity = AllocationRouteIdentity {
+            owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
+            segment_name: SegmentName::new("segment-a".to_string()),
+            offset_bytes: 64,
+            length_bytes: 16,
+            allocation_id: 7,
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::from([
+                    (
+                        "authority-a".to_string(),
+                        vec![AllocationRouteReferenceState::Absent],
+                    ),
+                    (
+                        "authority-b".to_string(),
+                        vec![AllocationRouteReferenceState::Absent],
+                    ),
+                ]),
+            }),
+            Arc::new(CachedOnlyMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        assert_eq!(
+            directory
+                .get_allocation_route_references_consistent(&observer, &[identity])
+                .expect("historical allocation confirmation must use cached membership"),
+            vec![AllocationRouteReferenceState::Absent],
+        );
+    }
 }
 
 #[cfg(test)]
