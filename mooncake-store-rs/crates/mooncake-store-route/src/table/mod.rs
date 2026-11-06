@@ -3,7 +3,7 @@
 mod delete_marker;
 mod local;
 
-pub(crate) use delete_marker::{
-    DeleteMarkerSnapshot, DeleteMarkerStore, DEFAULT_DELETE_MARKER_BUDGET_BYTES,
-};
+#[cfg(test)]
+pub(crate) use delete_marker::DEFAULT_DELETE_MARKER_BUDGET_BYTES;
+pub(crate) use delete_marker::{DeleteMarkerSnapshot, DeleteMarkerStore};
 pub(crate) use local::LocalRouteTable;
