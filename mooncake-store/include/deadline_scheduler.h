@@ -59,7 +59,10 @@ class DeadlineScheduler {
             timer_running_.store(false);
         }
         timer_cv_.notify_all();
-        if (timer_thread_.joinable()) {
+        // A callback may stop its owner. The timer can request its own stop;
+        // the owning thread joins it on a later Stop() or destruction.
+        if (timer_thread_.joinable() &&
+            timer_thread_.get_id() != std::this_thread::get_id()) {
             timer_thread_.join();
         }
     }

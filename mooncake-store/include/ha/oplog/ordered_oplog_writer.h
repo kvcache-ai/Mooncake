@@ -105,7 +105,13 @@ class OrderedOpLogWriter {
     // Stop() completes it with UNAVAILABLE_IN_CURRENT_STATUS. Promises are
     // fulfilled outside the writer mutex. Callers can co_await the future and
     // use via(executor) to select the continuation's execution context.
-    async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
+    // A finite timeout ends only this wait, returning the last write error or
+    // PERSISTENT_FAIL. The mutation may still commit: timeout is not proof of
+    // rejection, and must not trigger an unconditional replay of the mutation.
+    // Zero polls the current prefix; max() retains the unbounded wait.
+    async_simple::Future<ErrorCode> AwaitDurable(
+        uint64_t sequence,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
 
     bool IsAccepting() const;
     ErrorCode LastError() const;

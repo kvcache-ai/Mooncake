@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -213,6 +214,19 @@ TEST(DeadlineSchedulerTest, RunsExpiredBeforePendingRecord) {
     ASSERT_EQ(records.size(), 2);
     EXPECT_EQ(records[0], past_item);
     EXPECT_EQ(records[1], future_item);
+}
+
+TEST(DeadlineSchedulerTest, CallbackCanRequestStopBeforeOwnerJoins) {
+    std::promise<void> stopped;
+    auto completion = stopped.get_future();
+    Scheduler scheduler([&](const UUID&) {
+        scheduler.Stop();
+        stopped.set_value();
+    });
+    scheduler.Schedule(MakeUuid(100), Clock::now());
+    ASSERT_EQ(completion.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    scheduler.Stop();
 }
 
 }  // namespace mooncake::test
