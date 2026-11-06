@@ -70,6 +70,42 @@ impl StoreClient {
         ))
     }
 
+    fn resolve_reserved_replica_write_target(
+        &self,
+        storage_runtime: &ClientRuntimeId,
+        reservation: mooncake_store_core::SegmentReservation,
+    ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
+        match self.replica_write_target(storage_runtime, &reservation.segment_name) {
+            Ok(target) => Ok((target, reservation)),
+            Err(error) => {
+                self.release_unresolved_reservation(&reservation);
+                Err(error)
+            }
+        }
+    }
+
+    fn release_unresolved_reservation(
+        &self,
+        reservation: &mooncake_store_core::SegmentReservation,
+    ) {
+        let release = AllocationReleaseRequest {
+            storage_runtime: reservation.owner.clone(),
+            segment_name: reservation.segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+        };
+        if let Err(error) = self.release_segment_allocations_batch(&[release]) {
+            warn!(
+                storage_runtime = %reservation.owner,
+                segment = %reservation.segment_name.0,
+                offset_bytes = reservation.offset_bytes,
+                length_bytes = reservation.length_bytes,
+                error = %error,
+                "failed to release reservation after target metadata lookup"
+            );
+        }
+    }
+
     fn reserve_specific_segment(
         &self,
         storage_runtime: &ClientRuntimeId,
@@ -83,8 +119,7 @@ impl StoreClient {
             length_bytes as u64,
             require_local_memory,
         )?;
-        let target = self.replica_write_target(storage_runtime, &reservation.segment_name)?;
-        Ok((target, reservation))
+        self.resolve_reserved_replica_write_target(storage_runtime, reservation)
     }
 
     fn reserve_storage_runtime_segments_batch(
@@ -148,11 +183,10 @@ impl StoreClient {
                         request.require_local_memory,
                     )
                     .and_then(|reservation| {
-                        let target = self.replica_write_target(
+                        self.resolve_reserved_replica_write_target(
                             &request.storage_runtime,
-                            &reservation.segment_name,
-                        )?;
-                        Ok((target, reservation))
+                            reservation,
+                        )
                     }),
                 );
                 continue;
@@ -261,13 +295,10 @@ impl StoreClient {
                                     continue;
                                 }
                             };
-                            resolved[index] = Some(
-                                self.replica_write_target(
-                                    &job.storage_runtime,
-                                    &reservation.segment_name,
-                                )
-                                .map(|target| (target, reservation)),
-                            );
+                            resolved[index] = Some(self.resolve_reserved_replica_write_target(
+                                &job.storage_runtime,
+                                reservation,
+                            ));
                         }
                     }
                     Err(error) => {
@@ -301,13 +332,10 @@ impl StoreClient {
                                     continue;
                                 }
                             };
-                            resolved[index] = Some(
-                                self.replica_write_target(
-                                    &job.storage_runtime,
-                                    &reservation.segment_name,
-                                )
-                                .map(|target| (target, reservation)),
-                            );
+                            resolved[index] = Some(self.resolve_reserved_replica_write_target(
+                                &job.storage_runtime,
+                                reservation,
+                            ));
                         }
                     }
                     Err(error) => {
@@ -1224,8 +1252,7 @@ impl StoreClient {
             length_bytes = reservation.length_bytes,
             "reserved segment space"
         );
-        let target = self.replica_write_target(storage_runtime, &reservation.segment_name)?;
-        Ok((target, reservation))
+        self.resolve_reserved_replica_write_target(storage_runtime, reservation)
     }
 
     fn release_route_allocations(&self, route: &ObjectRoute) -> Result<()> {

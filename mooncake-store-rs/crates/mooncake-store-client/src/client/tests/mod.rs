@@ -15612,6 +15612,127 @@ fn flush_due_reclaims_skips_duplicate_remote_release() {
 }
 
 #[test]
+fn reservation_target_metadata_failure_releases_all_reserve_paths() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let metadata = Arc::new(RecoverableMetadataBackend::new(inner));
+    let storage_transport = Arc::new(TestTransport::new("reservation-target-storage-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("reservation-target-writer-segment"));
+    let storage = StoreClientBuilder::new(metadata.clone(), "reservation-target-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(storage_transport)
+        .local_memory(storage_config_with_bytes(256))
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "reservation-target-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&storage, &writer]);
+
+    let segment = storage
+        .segment_name()
+        .expect("storage segment should exist");
+    metadata
+        .unpublish_segment(storage.runtime_id(), &segment)
+        .expect("segment metadata should be removed after the storage allocator is live");
+
+    let assert_released = |result: Result<ReplicaWriteTarget>| {
+        assert!(matches!(result, Err(StoreError::NotFound(_))));
+        assert_eq!(
+            storage.allocator.lock().usage_bytes().0,
+            0,
+            "a reservation whose target metadata cannot be resolved must be released"
+        );
+    };
+
+    assert_released(
+        writer
+            .reserve_storage_runtime_segment(storage.runtime_id(), 16, false)
+            .map(|(target, _)| target),
+    );
+    assert_released(
+        writer
+            .reserve_specific_segment(storage.runtime_id(), &segment, 16, false)
+            .map(|(target, _)| target),
+    );
+    let any_batch = writer
+        .reserve_storage_runtime_segments_batch(&[StorageRuntimeReservationRequest {
+            storage_runtime: storage.runtime_id().clone(),
+            segment_name: None,
+            length_bytes: 16,
+            require_local_memory: false,
+        }])
+        .expect("remote reserve_any batch should return per-item results");
+    assert_released(
+        any_batch
+            .into_iter()
+            .next()
+            .expect("one any batch result")
+            .map(|(target, _)| target),
+    );
+    let specific_batch = writer
+        .reserve_storage_runtime_segments_batch(&[StorageRuntimeReservationRequest {
+            storage_runtime: storage.runtime_id().clone(),
+            segment_name: Some(segment.clone()),
+            length_bytes: 16,
+            require_local_memory: false,
+        }])
+        .expect("remote reserve_specific batch should return per-item results");
+    assert_released(
+        specific_batch
+            .into_iter()
+            .next()
+            .expect("one specific batch result")
+            .map(|(target, _)| target),
+    );
+
+    {
+        let mut allocator = storage.allocator.lock();
+        allocator
+            .segments
+            .get_mut(&segment)
+            .expect("local segment allocator should exist")
+            .announcement
+            .owner = ClientRuntimeId::new("stale-target-owner", ClientEpoch(1));
+    }
+    let local_batch = storage
+        .reserve_storage_runtime_segments_batch(&[StorageRuntimeReservationRequest {
+            storage_runtime: storage.runtime_id().clone(),
+            segment_name: None,
+            length_bytes: 16,
+            require_local_memory: true,
+        }])
+        .expect("local reserve batch should return a per-item result");
+    assert!(matches!(
+        local_batch
+            .into_iter()
+            .next()
+            .expect("one local batch result"),
+        Err(StoreError::NotFound(_))
+    ));
+    assert_eq!(
+        storage.allocator.lock().usage_bytes().0,
+        0,
+        "local batch cleanup must release the reservation after target lookup fails"
+    );
+}
+
+#[test]
 fn bounded_parallel_jobs_parallelize_and_preserve_order() {
     let inflight = Arc::new(AtomicUsize::new(0));
     let max_inflight = Arc::new(AtomicUsize::new(0));
