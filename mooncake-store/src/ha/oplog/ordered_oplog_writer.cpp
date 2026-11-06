@@ -15,12 +15,16 @@
 
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha_metric_manager.h"
+#include "deadline_scheduler.h"
 
 namespace mooncake {
 
 struct OrderedOpLogWriter::Impl {
     using DurableWaiters =
-        std::multimap<uint64_t, async_simple::Promise<ErrorCode>>;
+        std::multimap<uint64_t,
+                      std::shared_ptr<async_simple::Promise<ErrorCode>>>;
+    using WaitDeadline =
+        std::pair<uint64_t, std::weak_ptr<async_simple::Promise<ErrorCode>>>;
 
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     using Clock = std::chrono::steady_clock;
@@ -42,7 +46,28 @@ struct OrderedOpLogWriter::Impl {
                   TerminalCallback terminal_callback)
         : config(std::move(config)),
           write_batch(std::move(write_batch)),
-          terminal_callback(std::move(terminal_callback)) {
+          terminal_callback(std::move(terminal_callback)),
+          waiter_deadlines([this](const WaitDeadline& expired) {
+              DurableWaiters timed_out;
+              ErrorCode error;
+              {
+                  std::lock_guard<std::mutex> lock(mutex);
+                  auto promise = expired.second.lock();
+                  if (!promise) return;
+                  auto [begin, end] =
+                      durable_waiters.equal_range(expired.first);
+                  for (auto it = begin; it != end; ++it) {
+                      if (it->second == promise) {
+                          timed_out.insert(durable_waiters.extract(it));
+                          break;
+                      }
+                  }
+                  error = last_error == ErrorCode::OK
+                              ? ErrorCode::PERSISTENT_FAIL
+                              : last_error;
+              }
+              CompleteWaiters(std::move(timed_out), error);
+          }) {
         if (this->config.max_entries_per_batch == 0) {
             this->config.max_entries_per_batch = 1;
         }
@@ -116,6 +141,11 @@ struct OrderedOpLogWriter::Impl {
             auto current = it++;
             covered.insert(durable_waiters.extract(current));
         }
+        if (!covered.empty()) {
+            waiter_deadlines.RemoveIf([this](const WaitDeadline& deadline) {
+                return deadline.first <= durable_prefix.last_seq;
+            });
+        }
         return covered;
     }
 
@@ -123,7 +153,7 @@ struct OrderedOpLogWriter::Impl {
     // this while holding mutex.
     static void CompleteWaiters(DurableWaiters waiters, ErrorCode error) {
         for (auto& waiter : waiters) {
-            waiter.second.setValue(ErrorCode{error});
+            waiter.second->setValue(ErrorCode{error});
         }
     }
 
@@ -158,6 +188,7 @@ struct OrderedOpLogWriter::Impl {
             callback = terminal_callback;
             state = terminal_state;
             waiters.swap(durable_waiters);
+            waiter_deadlines.RemoveIf([](const WaitDeadline&) { return true; });
         }
         cv.notify_all();
         CompleteWaiters(std::move(waiters), error);
@@ -187,6 +218,7 @@ struct OrderedOpLogWriter::Impl {
     uint64_t next_group_id{1};
     DurablePrefix durable_prefix{config.initial_durable_prefix};
     DurableWaiters durable_waiters;
+    DeadlineScheduler<WaitDeadline> waiter_deadlines;
     size_t open_waiting_slots{0};
     std::unordered_set<uint64_t> active_reservations;
     std::deque<PendingEntry> committed_entries;
@@ -420,7 +452,7 @@ void OrderedOpLogWriter::Abort(Reservation&& reservation) {
 }
 
 async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
-    uint64_t sequence) {
+    uint64_t sequence, std::chrono::milliseconds timeout) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->durable_prefix.last_seq >= sequence) {
         return async_simple::makeReadyFuture<ErrorCode>(ErrorCode::OK);
@@ -433,9 +465,28 @@ async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
         return async_simple::makeReadyFuture<ErrorCode>(
             ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    async_simple::Promise<ErrorCode> promise;
-    auto future = promise.getFuture();
-    impl_->durable_waiters.emplace(sequence, std::move(promise));
+    if (timeout < std::chrono::milliseconds::zero()) {
+        return async_simple::makeReadyFuture<ErrorCode>(
+            ErrorCode::INVALID_PARAMS);
+    }
+    if (timeout == std::chrono::milliseconds::zero()) {
+        return async_simple::makeReadyFuture<ErrorCode>(
+            impl_->last_error == ErrorCode::OK ? ErrorCode::PERSISTENT_FAIL
+                                               : impl_->last_error);
+    }
+    auto promise = std::make_shared<async_simple::Promise<ErrorCode>>();
+    auto future = promise->getFuture();
+    impl_->durable_waiters.emplace(sequence, promise);
+    if (timeout != std::chrono::milliseconds::max()) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::time_point::max() - now);
+        const auto deadline = timeout >= remaining
+                                  ? std::chrono::steady_clock::time_point::max()
+                                  : now + timeout;
+        impl_->waiter_deadlines.Schedule({sequence, promise}, deadline);
+    }
     return future;
 }
 
@@ -700,6 +751,7 @@ void OrderedOpLogWriter::Stop() {
     }
     impl_->cv.notify_all();
     Impl::CompleteWaiters(std::move(waiters), waiter_error);
+    impl_->waiter_deadlines.Stop();
     if (!running) {
         return;
     }

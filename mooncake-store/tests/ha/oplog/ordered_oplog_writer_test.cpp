@@ -332,6 +332,42 @@ TEST_F(OrderedOpLogWriterAwaitTest,
     ExpectReadyResult(Await(11), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
+TEST_F(OrderedOpLogWriterAwaitTest, TimedWaitDoesNotCancelOtherWaitersOrWrite) {
+    storage_.BlockWrites();
+    CreateWriter();
+    writer_->Start();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    auto timed = writer_->AwaitDurable(pending->sequence_id(),
+                                       std::chrono::milliseconds(10));
+    auto untimed = writer_->AwaitDurable(pending->sequence_id());
+    ReenterFromContinuation(timed);
+    ExpectResult(timed, ErrorCode::PERSISTENT_FAIL);
+    EXPECT_FALSE(untimed.hasResult());
+    EXPECT_TRUE(writer_->IsAccepting());
+    storage_.UnblockWrites();
+    ExpectResult(untimed, ErrorCode::OK);
+    auto retry = writer_->AwaitDurable(pending->sequence_id(),
+                                       std::chrono::milliseconds::zero());
+    ExpectReadyResult(retry, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, StopDrainsTimedWaitersExactlyOnce) {
+    CreateWriter();
+    auto timed = writer_->AwaitDurable(1, std::chrono::hours(1));
+    std::atomic<int> completions{0};
+    auto completed = std::move(timed).thenValue([&](ErrorCode error) {
+        ++completions;
+        return error;
+    });
+    writer_->Stop();
+    ExpectResult(completed, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(completions.load(), 1);
+}
+
 TEST_F(OrderedOpLogWriterAwaitTest, CommittedSequenceWaitsForStorageSuccess) {
     storage_.BlockWrites();
     CreateWriter();
@@ -1851,6 +1887,59 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitBatchRejectsSlotMismatch) {
     auto next = writer.ReserveBatch(2);
     ASSERT_TRUE(next.has_value());
     writer.Abort(std::move(*next));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ZeroAndNegativeWaitsDoNotAffectAdmission) {
+    CreateWriter();
+    auto poll = writer_->AwaitDurable(1, std::chrono::milliseconds::zero());
+    ExpectReadyResult(poll, ErrorCode::PERSISTENT_FAIL);
+    auto invalid = writer_->AwaitDurable(1, std::chrono::milliseconds(-1));
+    ExpectReadyResult(invalid, ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(writer_->IsAccepting());
+    auto covered = writer_->AwaitDurable(0, std::chrono::milliseconds::zero());
+    ExpectReadyResult(covered, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, VeryLargeTimeoutDoesNotOverflow) {
+    CreateWriter();
+    auto waiter = writer_->AwaitDurable(
+        1, std::chrono::milliseconds::max() - std::chrono::milliseconds(1));
+    // Let the same timer process a real deadline. An overflowing "huge" wait
+    // would have expired before this probe, rather than merely racing our poll.
+    auto probe = writer_->AwaitDurable(2, std::chrono::milliseconds(1));
+    ExpectResult(probe, ErrorCode::PERSISTENT_FAIL);
+    ExpectPending(waiter);
+    writer_->Stop();
+    ExpectResult(waiter, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, TimedAndUntimedWaitsCompleteOnceOnSuccess) {
+    storage_.BlockWrites();
+    CreateWriter();
+    writer_->Start();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    auto timed =
+        writer_->AwaitDurable(pending->sequence_id(), std::chrono::hours(1));
+    auto untimed = writer_->AwaitDurable(pending->sequence_id());
+    ReenterFromContinuation(timed);
+    storage_.UnblockWrites();
+    ExpectResult(timed, ErrorCode::OK);
+    ExpectResult(untimed, ErrorCode::OK);
+    writer_->Stop();
+}
+TEST_F(OrderedOpLogWriterAwaitTest, TimedContinuationCanStopWriter) {
+    CreateWriter();
+    auto timed = writer_->AwaitDurable(1, std::chrono::milliseconds(1));
+    auto stopped = std::move(timed).thenValue([this](ErrorCode result) {
+        writer_->Stop();
+        return result;
+    });
+    ExpectResult(stopped, ErrorCode::PERSISTENT_FAIL);
+    writer_->Stop();
 }
 
 }  // namespace mooncake::test
