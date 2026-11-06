@@ -108,9 +108,11 @@ class OrderedOpLogWriter {
     // A finite timeout ends only this wait, returning the last write error or
     // PERSISTENT_FAIL. The mutation may still commit: timeout is not proof of
     // rejection, and must not trigger an unconditional replay of the mutation.
-    // Expired waits are notified on independent threads. Their continuations
-    // may outlive Stop(); use via(executor) to choose another execution
-    // context. Zero polls the current prefix; max() retains the unbounded wait.
+    // Finite waits use a shared four-thread executor for continuations. Their
+    // results become ready even if its workers are busy. Use via(executor) for
+    // blocking continuations; queued continuations may outlive Stop(). Thread
+    // initialization failure returns INTERNAL_ERROR without registering a wait.
+    // Zero polls the current prefix; max() retains the unbounded wait.
     async_simple::Future<ErrorCode> AwaitDurable(
         uint64_t sequence,
         std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
@@ -123,6 +125,8 @@ class OrderedOpLogWriter {
     // can no longer publish runtime metrics after this handoff.
     void ActivateRuntimeMetrics();
     void Start();
+    // Concurrent callers share one join. Calls on writer-owned threads only
+    // request shutdown; the owner must call Stop() from another thread.
     virtual void Stop();
 
    private:

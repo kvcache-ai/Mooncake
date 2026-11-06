@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <future>
 #include <mutex>
@@ -181,7 +182,7 @@ async_simple::coro::Lazy<ErrorCode> AwaitOnExecutor(
     OrderedOpLogWriter& writer, uint64_t sequence,
     std::promise<std::thread::id>& registered,
     std::promise<std::thread::id>& resumed) {
-    auto future = writer.AwaitDurable(sequence);
+    auto future = writer.AwaitDurable(sequence, std::chrono::hours(1));
     registered.set_value(std::this_thread::get_id());
     auto error = co_await std::move(future);
     resumed.set_value(std::this_thread::get_id());
@@ -1953,19 +1954,25 @@ TEST_F(OrderedOpLogWriterAwaitTest,
     writer_->Start();
     ASSERT_TRUE(storage_.WaitForBlockedWrite());
 
-    auto first =
-        writer_
-            ->AwaitDurable(pending->sequence_id(), std::chrono::milliseconds(1))
-            .thenValue([this](ErrorCode error) {
-                BlockCallback();
-                return error;
-            });
+    std::atomic<int> active{0};
+    std::vector<async_simple::Future<ErrorCode>> first;
+    for (int i = 0; i < 32; ++i) {
+        first.push_back(writer_
+                            ->AwaitDurable(pending->sequence_id(),
+                                           std::chrono::milliseconds(100))
+                            .thenValue([&](ErrorCode error) {
+                                ++active;
+                                BlockCallback();
+                                return error;
+                            }));
+    }
     ASSERT_TRUE(WaitForCallback());
     auto second = writer_->AwaitDurable(pending->sequence_id(),
                                         std::chrono::milliseconds(1));
     ExpectResult(second, ErrorCode::PERSISTENT_FAIL);
+    EXPECT_LE(active.load(), 4);
     ReleaseCallback();
-    ExpectResult(first, ErrorCode::PERSISTENT_FAIL);
+    for (auto& waiter : first) ExpectResult(waiter, ErrorCode::PERSISTENT_FAIL);
 }
 
 TEST_F(OrderedOpLogWriterAwaitTest,
@@ -2047,6 +2054,82 @@ TEST(OrderedOpLogWriterTimeoutTest, ContinuationCanReleaseLastWriterOwner) {
         EXPECT_TRUE(owner.expired());
         EXPECT_EQ(std::move(completed).get(), ErrorCode::PERSISTENT_FAIL);
     }
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, ShutdownContinuationCanReenterStop) {
+    CreateWriter();
+    auto waiter = writer_->AwaitDurable(1).thenValue([this](ErrorCode error) {
+        writer_->Stop();
+        return error;
+    });
+    writer_->Stop();
+    ExpectResult(waiter, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, DurableContinuationCanRequestStop) {
+    storage_.BlockWrites();
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation);
+    auto pending = writer_->Commit(std::move(*reservation), MakeEntry(), {});
+    ASSERT_TRUE(pending);
+    auto waiter = writer_->AwaitDurable(pending->sequence_id())
+                      .thenValue([this](ErrorCode error) {
+                          writer_->Stop();
+                          return error;
+                      });
+    auto later = writer_->AwaitDurable(pending->sequence_id() + 1);
+    writer_->Start();
+    storage_.UnblockWrites();
+    ExpectResult(waiter, ErrorCode::OK);
+    ExpectResult(later, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    writer_->Stop();
+}
+
+TEST(OrderedOpLogWriterTimeoutTest, ConcurrentContinuationsCanStopWriter) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        ([] {
+            FakeBatchWriter storage;
+            storage.BlockWrites();
+            OrderedOpLogWriter writer(
+                {}, [&](const auto& batch, const auto& prefix) {
+                    return storage.Write(batch, prefix);
+                });
+            auto reservation = writer.Reserve();
+            auto pending =
+                writer.Commit(std::move(*reservation), MakeEntry(), {});
+            writer.Start();
+            std::promise<void> release;
+            auto gate = release.get_future().share();
+            std::atomic<int> entered{0}, finished{0};
+            auto stop = [&](ErrorCode error) {
+                ++entered;
+                gate.wait();
+                writer.Stop();
+                ++finished;
+                return error;
+            };
+            auto first = writer
+                             .AwaitDurable(pending->sequence_id(),
+                                           std::chrono::milliseconds(1))
+                             .thenValue(stop);
+            auto second = writer
+                              .AwaitDurable(pending->sequence_id(),
+                                            std::chrono::milliseconds(1))
+                              .thenValue(stop);
+            auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (entered != 2 && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            release.set_value();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            storage.UnblockWrites();
+            while (finished != 2 && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            std::_Exit(finished == 2 ? 0 : 1);
+        }()),
+        ::testing::ExitedWithCode(0), "");
 }
 
 }  // namespace mooncake::test

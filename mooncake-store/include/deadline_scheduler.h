@@ -29,11 +29,17 @@ class DeadlineScheduler {
             if (stopping_) {
                 return;
             }
-            PushRecord(Record{std::move(id), deadline});
             if (!timer_running_.load()) {
                 timer_running_.store(true);
-                timer_thread_ = std::thread([this]() { this->TimerLoop(); });
+                try {
+                    timer_thread_ =
+                        std::thread([this]() { this->TimerLoop(); });
+                } catch (...) {
+                    timer_running_.store(false);
+                    throw;
+                }
             }
+            PushRecord(Record{std::move(id), deadline});
         }
         timer_cv_.notify_one();
     }
