@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicUsize;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,10 +27,11 @@ use crate::control_plane::pb;
 use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
 use crate::observability::{metrics_test_lock, render_prometheus_metrics, reset_metrics};
 use mooncake_store_core::{
-    CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, ColdBackingReplica, ColdBackingRoute, ColdBackingState,
-    CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
-    RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation, StoreError,
+    AllocationRouteIdentity, CasResult, ClientEndpointSet, ClientEpoch, ClientLease,
+    ClientLifecycleState, ClientRuntimeId, ClientStableId, ColdBackingReplica, ColdBackingRoute,
+    ColdBackingState, CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute,
+    ReplicaRoute, ReplicaTier, RouteCasRequest, RouteState, RouteVersion, SegmentName,
+    SegmentReservation, StoreError,
 };
 use mooncake_store_route::RouteOwnerPageQuery;
 use tonic::transport::Server;
@@ -173,6 +175,7 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
 struct TestAllocator {
     next_offset: Mutex<u64>,
     released: Mutex<Vec<ReleaseOp>>,
+    pending_publication_reserves: AtomicUsize,
 }
 
 impl AllocatorService for TestAllocator {
@@ -224,11 +227,32 @@ impl AllocatorService for TestAllocator {
         });
         Ok(())
     }
+    fn batch_reserve_any_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+    ) -> Vec<mooncake_store_core::Result<SegmentReservation>> {
+        self.pending_publication_reserves
+            .fetch_add(length_bytes.len(), Ordering::Relaxed);
+        self.batch_reserve_any(owner, length_bytes)
+    }
+
+    fn batch_reserve_specific_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Vec<mooncake_store_core::Result<SegmentReservation>> {
+        self.pending_publication_reserves
+            .fetch_add(requests.len(), Ordering::Relaxed);
+        self.batch_reserve_specific(owner, requests)
+    }
+
 }
 
 #[derive(Default)]
 struct TestEviction {
     reported: Mutex<Vec<ObjectKey>>,
+    delete_pending: Mutex<Vec<super::DeletePendingEntry>>,
 }
 
 impl EvictionService for TestEviction {
@@ -253,6 +277,14 @@ impl EvictionService for TestEviction {
             .map(|replica| replica.length)
             .sum();
         Ok(RouteTrafficReport::new(routes.len(), bytes))
+    }
+
+    fn batch_notify_delete_pending(
+        &self,
+        entries: &[super::DeletePendingEntry],
+    ) -> mooncake_store_core::Result<usize> {
+        self.delete_pending.lock().extend_from_slice(entries);
+        Ok(entries.len())
     }
 }
 
@@ -480,6 +512,14 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
     ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
         Err(Status::unavailable("stream disabled"))
     }
+    async fn batch_notify_delete_pending(
+        &self,
+        request: Request<pb::BatchNotifyDeletePendingRequest>,
+    ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
+        self.inner.batch_notify_delete_pending(request).await
+    }
+
+
 }
 
 struct ClosingStreamHandle {
@@ -793,6 +833,14 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
     ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
         Err(Status::unavailable("stream disabled"))
     }
+    async fn batch_notify_delete_pending(
+        &self,
+        request: Request<pb::BatchNotifyDeletePendingRequest>,
+    ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
+        self.inner.batch_notify_delete_pending(request).await
+    }
+
+
 }
 
 struct DelayedUnaryHandle {
@@ -1114,6 +1162,14 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
     ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
         Err(Status::unavailable("stream disabled"))
     }
+    async fn batch_notify_delete_pending(
+        &self,
+        request: Request<pb::BatchNotifyDeletePendingRequest>,
+    ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
+        self.inner.batch_notify_delete_pending(request).await
+    }
+
+
 }
 
 struct InvalidMigrationStatusHandle {
@@ -1267,6 +1323,32 @@ fn sample_lease(address: &str) -> ClientLease {
     }
 }
 
+#[test]
+fn pending_publication_reservation_requires_explicit_allocator_support() {
+    let allocator = LegacyOnlyAllocator;
+    let owner = sample_owner();
+
+    let any = allocator.batch_reserve_any_with_pending_publication(&owner, &[64, 128]);
+    assert_eq!(any.len(), 2);
+    assert!(
+        any.iter()
+            .all(|result| matches!(result, Err(StoreError::Unsupported(_)))),
+        "a legacy allocator must not silently reserve without recording PendingPublish"
+    );
+
+    let specific = allocator.batch_reserve_specific_with_pending_publication(
+        &owner,
+        &[ReserveSpecificOp {
+            segment_name: SegmentName::new("segment-a"),
+            length_bytes: 64,
+        }],
+    );
+    assert!(
+        matches!(specific.as_slice(), [Err(StoreError::Unsupported(_))]),
+        "a legacy allocator must reject lifecycle-specific reservations"
+    );
+}
+
 fn prometheus_sample_value(metrics: &str, sample: &str) -> u64 {
     metrics
         .lines()
@@ -1403,11 +1485,48 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
         1
     );
     assert_eq!(eviction.reported.lock().len(), 3);
+    let delete_route = sample_route("delete-pending", 1, &owner);
+    let delete_replica = delete_route
+        .replicas
+        .first()
+        .expect("sample route should have one replica");
+    let delete_entry = super::DeletePendingEntry {
+        route_key: delete_route.key.clone(),
+        identity: AllocationRouteIdentity {
+            owner: owner.clone(),
+            segment_name: delete_replica.segment_name.clone(),
+            offset_bytes: delete_replica.segment_offset,
+            length_bytes: delete_replica.length,
+            allocation_id: delete_replica
+                .allocation_id
+                .expect("sample route should carry allocation generation"),
+        },
+        reclaim_grace_ms: 0,
+    };
+    assert_eq!(
+        client
+            .batch_notify_delete_pending(&lease, std::slice::from_ref(&delete_entry))
+            .expect("delete notification should succeed"),
+        1
+    );
+    assert_eq!(eviction.delete_pending.lock().as_slice(), &[delete_entry]);
 
     let single_reservation = client
         .reserve_any(&lease, &owner, 32)
         .expect("single reserve_any should succeed");
     assert_eq!(single_reservation.length_bytes, 32);
+    assert_eq!(
+        allocator
+            .pending_publication_reserves
+            .load(Ordering::Relaxed),
+        0,
+        "legacy reserve must not opt a mixed-version owner into the lifecycle ledger"
+    );
+
+    let publication_reservation = client
+        .reserve_any_with_pending_publication(&lease, &owner, 20)
+        .expect("publication reserve_any should succeed");
+    assert_eq!(publication_reservation.length_bytes, 20);
 
     let batch_any = client
         .batch_reserve_any(&lease, &owner, &[8, 16])
@@ -1433,7 +1552,6 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
             &[ReserveSpecificOp {
                 segment_name: SegmentName::new("segment-c"),
                 length_bytes: 48,
-                route_key: None,
             }],
         )
         .expect("batch reserve_specific should succeed");
@@ -1444,6 +1562,25 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
             .segment_name
             .0,
         "segment-c"
+    );
+
+    let publication_specific = client
+        .batch_reserve_specific_with_pending_publication(
+            &lease,
+            &owner,
+            &[ReserveSpecificOp {
+                segment_name: SegmentName::new("segment-publication"),
+                length_bytes: 12,
+            }],
+        )
+        .expect("publication batch reserve_specific should succeed");
+    assert!(publication_specific[0].is_ok());
+    assert_eq!(
+        allocator
+            .pending_publication_reserves
+            .load(Ordering::Relaxed),
+        2,
+        "only explicit publication reserves may create lifecycle pending state"
     );
 
     let release_results = client
@@ -2356,7 +2493,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .reserve_any(Request::new(pb::ReserveAnyRequest {
                 owner: None,
                 length_bytes: 64,
-                route_key: String::new(),
+                pending_publication: false,
             }))
             .await
             .expect("reserve_any should reply")
@@ -2367,7 +2504,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .batch_reserve_any(Request::new(pb::BatchReserveAnyRequest {
                 owner: None,
                 length_bytes: vec![8, 16],
-                route_keys: Vec::new(),
+                pending_publication: false,
             }))
             .await
             .expect_err("batch reserve_any requires owner");
@@ -2378,7 +2515,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: None,
                 segment_name: "segment-a".to_string(),
                 length_bytes: 32,
-                route_key: String::new(),
+                pending_publication: false,
             }))
             .await
             .expect("reserve_specific should reply")
@@ -2391,8 +2528,8 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 entries: vec![pb::ReserveSpecificEntry {
                     segment_name: "segment-a".to_string(),
                     length_bytes: 32,
-                    route_key: String::new(),
                 }],
+                pending_publication: false,
             }))
             .await
             .expect_err("batch reserve_specific requires owner");
@@ -2666,7 +2803,6 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
             &[ReserveSpecificOp {
                 segment_name: SegmentName::new("segment-z"),
                 length_bytes: 24,
-                route_key: None,
             }],
         )
         .expect("fallback reserve_specific should succeed");
@@ -2705,9 +2841,68 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
         1
     );
     assert_eq!(eviction.reported.lock().len(), 2);
+    let delete_route = sample_route("delete-fallback", 1, &owner);
+    let delete_replica = delete_route
+        .replicas
+        .first()
+        .expect("sample route should have one replica");
+    let delete_entry = super::DeletePendingEntry {
+        route_key: delete_route.key.clone(),
+        identity: AllocationRouteIdentity {
+            owner: owner.clone(),
+            segment_name: delete_replica.segment_name.clone(),
+            offset_bytes: delete_replica.segment_offset,
+            length_bytes: delete_replica.length,
+            allocation_id: delete_replica
+                .allocation_id
+                .expect("sample route should carry allocation generation"),
+        },
+        reclaim_grace_ms: 0,
+    };
+    assert_eq!(
+        client
+            .batch_notify_delete_pending(&lease, std::slice::from_ref(&delete_entry))
+            .expect("fallback delete notification should succeed"),
+        1
+    );
+    assert_eq!(eviction.delete_pending.lock().as_slice(), &[delete_entry]);
 
     client.clear_channels();
     assert_eq!(client.active_stream_sessions(), 0);
     drop(client);
     handle.shutdown();
+}
+
+
+struct LegacyOnlyAllocator;
+
+impl AllocatorService for LegacyOnlyAllocator {
+    fn reserve_any(
+        &self,
+        _owner: &ClientRuntimeId,
+        _length_bytes: u64,
+    ) -> mooncake_store_core::Result<SegmentReservation> {
+        Err(StoreError::Unsupported("test allocator".to_string()))
+    }
+
+    fn reserve_specific(
+        &self,
+        _owner: &ClientRuntimeId,
+        _segment_name: &SegmentName,
+        _length_bytes: u64,
+    ) -> mooncake_store_core::Result<SegmentReservation> {
+        Err(StoreError::Unsupported("test allocator".to_string()))
+    }
+
+    fn release(
+        &self,
+        _owner: &ClientRuntimeId,
+        _segment_name: &SegmentName,
+        _offset_bytes: u64,
+        _length_bytes: u64,
+        _allocation_id: u64,
+    ) -> mooncake_store_core::Result<()> {
+        Err(StoreError::Unsupported("test allocator".to_string()))
+    }
+
 }

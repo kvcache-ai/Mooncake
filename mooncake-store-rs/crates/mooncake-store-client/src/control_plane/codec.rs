@@ -116,9 +116,7 @@ pub(super) fn try_allocation_route_identity(
         .ok_or_else(|| {
             StoreError::Transport("allocation reference identity is missing owner".to_string())
         })?;
-    if identity.segment_name.trim().is_empty()
-        || identity.length_bytes == 0
-        || identity.allocation_id == 0
+    if identity.segment_name.is_empty() || identity.length_bytes == 0 || identity.allocation_id == 0
     {
         return Err(StoreError::Transport(
             "allocation reference identity is invalid".to_string(),
@@ -130,6 +128,36 @@ pub(super) fn try_allocation_route_identity(
         offset_bytes: identity.offset_bytes,
         length_bytes: identity.length_bytes,
         allocation_id: identity.allocation_id,
+    })
+}
+
+pub(super) fn pb_delete_pending_entry(entry: &DeletePendingEntry) -> pb::DeletePendingEntry {
+    pb::DeletePendingEntry {
+        route_key: entry.route_key.0.clone(),
+        identity: Some(pb_allocation_route_identity(&entry.identity)),
+        reclaim_grace_ms: entry.reclaim_grace_ms,
+    }
+}
+
+pub(super) fn try_delete_pending_entry(
+    entry: pb::DeletePendingEntry,
+) -> Result<DeletePendingEntry> {
+    if entry.route_key.is_empty() {
+        return Err(StoreError::Transport(
+            "delete pending entry is missing route key".to_string(),
+        ));
+    }
+    let identity = entry
+        .identity
+        .map(try_allocation_route_identity)
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::Transport("delete pending entry is missing identity".to_string())
+        })?;
+    Ok(DeletePendingEntry {
+        route_key: ObjectKey::new(entry.route_key),
+        identity,
+        reclaim_grace_ms: entry.reclaim_grace_ms,
     })
 }
 

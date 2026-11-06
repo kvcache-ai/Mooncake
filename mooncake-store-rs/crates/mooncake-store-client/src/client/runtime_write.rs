@@ -488,6 +488,19 @@ impl StoreClient {
                     self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
             }
         };
+        let retain_prepared_after_unknown_route_publish =
+            |entries: &[PreparedObjectWrite<'_>], context: &str| {
+                for entry in entries {
+                    self.release_only_legacy_reservations_after_unknown_route_publish(
+                        &entry.reservations,
+                        context,
+                    );
+                    let _ = self.abort_tenant_quota_reservation(
+                        entry.quota_reservation.as_ref(),
+                        context,
+                    );
+                }
+            };
         let (routes, prepared) = loop {
             write_attempt = write_attempt.saturating_add(1);
             self.flush_due_reclaims_best_effort();
@@ -798,7 +811,6 @@ impl StoreClient {
                         storage_runtime,
                         segment_name,
                         length_bytes: entry.value_len as u64,
-                        route_key: Some(entry.scoped_key.clone()),
                     });
                 }
                 if let Some(key) = exhausted_key {
@@ -1414,7 +1426,10 @@ impl StoreClient {
         let mut cas_results = match cas_results_result {
             Ok(results) => results,
             Err(error) => {
-                release_prepared(&prepared, "batch_put_failed_before_publish");
+                retain_prepared_after_unknown_route_publish(
+                    &prepared,
+                    "batch_put_route_compare_and_swap_outcome_unknown",
+                );
                 return Err(error);
             }
         };
@@ -1457,7 +1472,10 @@ impl StoreClient {
             let retry_results = match retry_result {
                 Ok(results) => results,
                 Err(error) => {
-                    release_prepared(&prepared, "batch_put_floor_retry_failed");
+                    retain_prepared_after_unknown_route_publish(
+                        &prepared,
+                        "batch_put_floor_retry_outcome_unknown",
+                    );
                     return Err(error);
                 }
             };
@@ -1565,9 +1583,9 @@ impl StoreClient {
                                 }
                             }
                             Err(error) => {
-                                release_prepared(
+                                retain_prepared_after_unknown_route_publish(
                                     &prepared,
-                                    "batch_put_stale_overwrite_fallback_failed",
+                                    "batch_put_stale_overwrite_fallback_outcome_unknown",
                                 );
                                 return Err(error);
                             }
@@ -1575,7 +1593,10 @@ impl StoreClient {
                     }
                 }
                 Err(error) => {
-                    release_prepared(&prepared, "batch_put_stale_overwrite_failed");
+                    retain_prepared_after_unknown_route_publish(
+                        &prepared,
+                        "batch_put_stale_overwrite_outcome_unknown",
+                    );
                     return Err(error);
                 }
             }
@@ -1603,14 +1624,7 @@ impl StoreClient {
                     };
                     self.storage_owner.track_route(&route);
                     if let Some(previous) = pending.previous.as_ref() {
-                        if let Err(error) = self.schedule_route_reclaim(previous) {
-                            warn!(
-                                runtime = %self.lease.runtime,
-                                key = %pending.key.0,
-                                error = %error,
-                                "batch route overwrite reclaim scheduling failed after authoritative publish"
-                            );
-                        }
+                        self.schedule_reclaim_after_logical_remove(previous);
                     }
                     published.push(route);
                 }
@@ -1679,13 +1693,13 @@ impl StoreClient {
                     }
                 }
                 Err(error) => {
-                    self.release_reservations_or_enqueue(
+                    self.release_only_legacy_reservations_after_unknown_route_publish(
                         &prepared[index].reservations,
-                        "batch_put_route_compare_and_swap_error",
+                        "batch_put_route_compare_and_swap_outcome_unknown",
                     );
                     let _ = self.abort_tenant_quota_reservation(
                         prepared[index].quota_reservation.as_ref(),
-                        "batch_put_route_compare_and_swap_error",
+                        "batch_put_route_compare_and_swap_outcome_unknown",
                     );
                     first_error.get_or_insert(error);
                 }

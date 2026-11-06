@@ -8,7 +8,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use mooncake_store_core::{
-    ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
+    AllocationRouteIdentity, AllocationRouteReference, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
     MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest,
     RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteReplicaReference, RouteVersion, SegmentAnnouncement,
@@ -32,7 +32,7 @@ use super::{
     shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
     ColdObjectRead, ColdObjectWrite, ColdTierBackendResolver, ColdTierKind, ColdTierOffloadMode,
     ColdTierOffloadPriorityConfig, ColdTierRateLimitConfig, ColdTierTargetConfig,
-    ColdTierWatermarkConfig, LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState,
+    ColdTierWatermarkConfig, DeletePendingEntry, LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState,
     LocalAuthorityAdapter, LocalDirPersistentStorageBackend, PendingEvictionPhase, PendingReclaim,
     PersistentStorageBackend, ReplicaWriteTarget, ResolvedObject, RouteWriteGate, SegmentAllocator,
     StorageOwnerColdTierConfig, StorageOwnerState, StoreState, SuspectRuntimeCache, PENDING_EVICTION_RETRY_MAX_MS,
@@ -44,7 +44,7 @@ use crate::{
     memory::{with_test_numa_locations, RegionAllocation},
     metrics_test_lock, render_prometheus_metrics, reset_metrics,
     route_directory::{authority_get, authority_replace, build_route_directory},
-    snapshot_metrics, BandwidthShaping, ExecutionFairness, GetRequest, LocalMemoryConfig,
+    snapshot_metrics, AllocationLifecycleConfig, BandwidthShaping, ExecutionFairness, GetRequest, LocalMemoryConfig,
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, NamespaceQuota,
     ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy, RouteControlMode,
     StoreClient, StoreClientBuilder,
@@ -160,6 +160,8 @@ struct CountingRouteDirectory {
     batch_cas_calls: AtomicUsize,
     max_cas_batch_size: AtomicUsize,
     owner_list_scans: AtomicUsize,
+    allocation_reference_key_queries: AtomicUsize,
+    fail_allocation_reference_key_queries: AtomicBool,
 }
 
 struct EmptyConflictRouteDirectory {
@@ -254,6 +256,13 @@ impl crate::control_plane::EvictionService for NoopEvictionService {
             routes.len(),
             0,
         ))
+    }
+
+    fn batch_notify_delete_pending(
+        &self,
+        entries: &[crate::control_plane::DeletePendingEntry],
+    ) -> mooncake_store_core::Result<usize> {
+        Ok(entries.len())
     }
 }
 
@@ -451,6 +460,8 @@ impl CountingRouteDirectory {
             batch_cas_calls: AtomicUsize::new(0),
             max_cas_batch_size: AtomicUsize::new(0),
             owner_list_scans: AtomicUsize::new(0),
+            allocation_reference_key_queries: AtomicUsize::new(0),
+            fail_allocation_reference_key_queries: AtomicBool::new(false),
         }
     }
 
@@ -479,6 +490,11 @@ impl CountingRouteDirectory {
     }
     fn owner_list_scans(&self) -> usize {
         self.owner_list_scans.load(Ordering::Relaxed)
+    }
+
+    fn allocation_reference_key_queries(&self) -> usize {
+        self.allocation_reference_key_queries
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -1968,6 +1984,25 @@ impl RouteDirectory for CountingRouteDirectory {
         keys: &[ObjectKey],
     ) -> Vec<Option<RouteVersion>> {
         self.inner.get_version_floors(observer, keys)
+    }
+
+    fn get_allocation_route_reference_keys_consistent(
+        &self,
+        observer: &ClientLease,
+        identities: &[AllocationRouteIdentity],
+    ) -> mooncake_store_core::Result<Vec<AllocationRouteReference>> {
+        self.allocation_reference_key_queries
+            .fetch_add(1, Ordering::Relaxed);
+        if self
+            .fail_allocation_reference_key_queries
+            .load(Ordering::Relaxed)
+        {
+            return Err(StoreError::Transport(
+                "injected allocation reference key query failure".to_string(),
+            ));
+        }
+        self.inner
+            .get_allocation_route_reference_keys_consistent(observer, identities)
     }
 
     fn metadata(&self) -> &dyn MetadataBackend {
@@ -12563,6 +12598,12 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         Arc::new(NoopEvictionService),
     )
     .expect("static storage control plane should spawn");
+    // Advertise the legacy allocator API implemented by this fixture
+    // so writers exercise the mixed-version fallback.
+    let mut remote_compatibility = CompatibilityDescriptor::default();
+    remote_compatibility
+        .capabilities
+        .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
     let mut endpoints = ClientEndpointSet {
         rpc_address: "127.0.0.1:0".to_string(),
         segment_name: Some(SegmentName::new("seg-prefer")),
@@ -12585,7 +12626,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         .upsert_client_lease(&ClientLease {
             runtime: remote_owner.clone(),
             state: ClientLifecycleState::Active,
-            compatibility: CompatibilityDescriptor::default(),
+            compatibility: remote_compatibility,
             endpoints,
             expires_at_ms: test_future_expiry_ms(),
         })
@@ -12949,7 +12990,11 @@ fn helper_primitives_and_request_builders_cover_contracts() {
         .transport(builder_transport)
         .build(test_future_expiry_ms())
         .expect("builder with compatibility and route_control should succeed");
-    assert_eq!(built.lease().compatibility, custom_compat);
+    let mut expected_compat = custom_compat;
+    expected_compat
+        .capabilities
+        .remove(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+    assert_eq!(built.lease().compatibility, expected_compat);
 }
 
 #[test]
@@ -15238,6 +15283,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         lifecycle_state: test_lifecycle_state(ClientLifecycleState::Active),
         transfer_stall_timeout: Duration::from_secs(1),
         request_timeout_override: None,
+        allocation_lifecycle: AllocationLifecycleConfig::default(),
     };
     let primary = client.segment_name().expect("primary segment should exist");
     let single_reservation = local_allocator
@@ -15307,6 +15353,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
         lifecycle_state: test_lifecycle_state(ClientLifecycleState::Draining),
         transfer_stall_timeout: Duration::from_secs(1),
         request_timeout_override: None,
+        allocation_lifecycle: AllocationLifecycleConfig::default(),
     };
     assert!(matches!(
         draining_allocator.reserve_any(client.runtime_id(), 8),
@@ -15379,7 +15426,6 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
             &[crate::control_plane::ReserveSpecificOp {
                 segment_name: primary.clone(),
                 length_bytes: 8,
-                route_key: None,
             }],
         )
         .expect("rpc reserve_specific should succeed");
@@ -15855,7 +15901,6 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
             segment_name: None,
             length_bytes: 16,
             require_local_memory: false,
-            route_key: None,
         }])
         .expect("remote reserve_any batch should return per-item results");
     assert_released(
@@ -15871,7 +15916,6 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
             segment_name: Some(segment.clone()),
             length_bytes: 16,
             require_local_memory: false,
-            route_key: None,
         }])
         .expect("remote reserve_specific batch should return per-item results");
     assert_released(
@@ -15897,7 +15941,6 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
             segment_name: None,
             length_bytes: 16,
             require_local_memory: true,
-            route_key: None,
         }])
         .expect("local reserve batch should return a per-item result");
     assert!(matches!(
@@ -15958,13 +16001,8 @@ fn partial_replica_reservation_is_released_when_required_segment_lookup_fails() 
                 .preferred_segments([segment.0.as_str(), "missing-required-segment"]),
         ))
         .expect("replication policy should resolve");
-    let route_key = ObjectKey::new("default::partial-reserve-key");
-    let result = writer.reserve_replica_targets(
-        &ObjectRef::new("partial-reserve-key"),
-        &route_key,
-        16,
-        &policy,
-    );
+    let result =
+        writer.reserve_replica_targets(&ObjectRef::new("partial-reserve-key"), 16, &policy);
 
     assert!(matches!(result, Err(StoreError::NotFound(_))));
     assert_eq!(
@@ -18602,6 +18640,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         lifecycle_state: test_lifecycle_state(ClientLifecycleState::Active),
         transfer_stall_timeout: Duration::from_secs(1),
         request_timeout_override: None,
+        allocation_lifecycle: AllocationLifecycleConfig::default(),
     };
     let wrong_owner = ClientRuntimeId::new("other", ClientEpoch(9));
     assert!(matches!(
@@ -18620,7 +18659,6 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         &[crate::control_plane::ReserveSpecificOp {
             segment_name: primary.segment_name.clone(),
             length_bytes: 8,
-            route_key: None,
         }],
     );
     assert!(specific[0].is_ok());
@@ -20058,11 +20096,10 @@ fn pending_publication_recovery_releases_absent_identity_without_candidate_scan(
         .register_local_memory()
         .expect("local memory should register");
 
-    let route_key = ObjectKey::new("default::pending-publication-absent");
     let reservation = client
         .allocator
         .lock()
-        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0, Some(route_key))
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
         .expect("reservation should create a tracked pending publication");
 
     assert_eq!(
@@ -20087,6 +20124,69 @@ fn pending_publication_recovery_releases_absent_identity_without_candidate_scan(
             "mooncake_store_eviction_guard_event_total{tenant=\"default\",source=\"allocator_candidate\",outcome=\"pending_confirmation\"}",
         ) && !line.ends_with(" 0")
     }));
+}
+
+#[test]
+fn pending_publication_authority_failures_are_shared_backed_off() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("pending-publication-backoff-segment"));
+    let client = StoreClientBuilder::new(metadata, "pending-publication-backoff")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    client
+        .allocator
+        .lock()
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
+        .expect("reservation should create a due pending publication");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    directory
+        .fail_allocation_reference_key_queries
+        .store(true, Ordering::Relaxed);
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+
+    assert_eq!(
+        owner
+            .recover_due_pending_publications()
+            .expect("an indeterminate authority result must retain the publication"),
+        0
+    );
+    assert_eq!(directory.allocation_reference_key_queries(), 1);
+    assert_eq!(
+        owner
+            .recover_due_pending_publications()
+            .expect("the shared backoff must skip an immediate retry"),
+        0
+    );
+    assert_eq!(
+        directory.allocation_reference_key_queries(),
+        1,
+        "one authority failure must back off all due publications for this owner"
+    );
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        16,
+        "backoff must retain bytes until an authority can prove the allocation is absent"
+    );
 }
 
 #[test]
@@ -20118,7 +20218,7 @@ fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan(
     let reservation = client
         .allocator
         .lock()
-        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0, Some(route_key.clone()))
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
         .expect("reservation should create a tracked pending publication");
     let route = ObjectRoute {
         key: route_key,
@@ -20172,6 +20272,580 @@ fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan(
             "mooncake_store_eviction_guard_event_total{tenant=\"default\",source=\"allocator_candidate\",outcome=\"pending_confirmation\"}",
         ) && !line.ends_with(" 0")
     }));
+}
+
+#[test]
+fn delete_pending_releases_absent_exact_identity() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("delete-pending-absent-segment"));
+    let client = StoreClientBuilder::new(metadata, "delete-pending-absent")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let reservation = client
+        .allocator
+        .lock()
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
+        .expect("reservation should succeed");
+    let entry = DeletePendingEntry {
+        route_key: ObjectKey::new("default::delete-pending-absent"),
+        identity: AllocationRouteIdentity {
+            owner: client.runtime_id().clone(),
+            segment_name: reservation.segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+            allocation_id: reservation.allocation_id,
+        },
+        reclaim_grace_ms: 0,
+    };
+
+    assert_eq!(
+        client
+            .storage_owner
+            .enqueue_delete_pending(std::slice::from_ref(&entry))
+            .expect("delete pending should be accepted"),
+        1
+    );
+    assert_eq!(client.storage_owner.pending_deletes.lock().entries.len(), 1);
+    assert_eq!(
+        client
+            .storage_owner
+            .process_pending_deletes(1)
+            .expect("absent delete pending should release"),
+        1
+    );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 0);
+    assert!(client
+        .storage_owner
+        .pending_deletes
+        .lock()
+        .entries
+        .is_empty());
+}
+
+#[test]
+fn delete_pending_queue_backpressure_preserves_pending_publication_recovery() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("delete-pending-queue-full-segment"));
+    let client = StoreClientBuilder::new(metadata, "delete-pending-queue-full")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let reservation = client
+        .allocator
+        .lock()
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
+        .expect("reservation should create a pending publication");
+    let identity = AllocationIdentity {
+        segment_name: reservation.segment_name.clone(),
+        offset_bytes: reservation.offset_bytes,
+        length_bytes: reservation.length_bytes,
+        allocation_id: reservation.allocation_id,
+    };
+    let entry = DeletePendingEntry {
+        route_key: ObjectKey::new("default::delete-pending-queue-full"),
+        identity: AllocationRouteIdentity {
+            owner: client.runtime_id().clone(),
+            segment_name: identity.segment_name.clone(),
+            offset_bytes: identity.offset_bytes,
+            length_bytes: identity.length_bytes,
+            allocation_id: identity.allocation_id,
+        },
+        reclaim_grace_ms: 0,
+    };
+
+    {
+        let mut pending = client.storage_owner.pending_deletes.lock();
+        for index in 0..PENDING_DELETE_MAX_ENTRIES {
+            let queued_identity = AllocationIdentity {
+                segment_name: SegmentName::new(format!("queue-fill-{index}")),
+                offset_bytes: 0,
+                length_bytes: 1,
+                allocation_id: index as u64 + 1,
+            };
+            pending.entries.insert(
+                queued_identity.clone(),
+                PendingDelete {
+                    route_key: ObjectKey::new(format!("default::queue-fill-{index}")),
+                    identity: queued_identity,
+                    confirmation_attempts: 0,
+                    next_attempt_at_ms: u64::MAX,
+                    confirmation_in_progress: false,
+                    deferred: false,
+                },
+            );
+        }
+    }
+
+    assert_eq!(
+        client
+            .storage_owner
+            .enqueue_delete_pending(std::slice::from_ref(&entry))
+            .expect("queue-full notification should be handled"),
+        0,
+        "backpressure deliberately drops the best-effort delete notification"
+    );
+    let allocation = AllocationSpan {
+        segment_name: identity.segment_name.clone(),
+        offset_bytes: identity.offset_bytes,
+        length_bytes: identity.length_bytes,
+    };
+    assert!(
+        matches!(
+            client.allocator.lock().pending_allocations.get(&allocation),
+            Some(PendingAllocation::Publication { allocation_id, .. })
+                if *allocation_id == identity.allocation_id
+        ),
+        "a dropped notification must retain PendingPublish as the exact recovery fence"
+    );
+}
+
+#[test]
+fn delete_pending_force_notification_overrides_grace_without_blind_release() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("delete-pending-force-segment"));
+    let client = StoreClientBuilder::new(metadata, "delete-pending-force")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let reservation = client
+        .allocator
+        .lock()
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
+        .expect("reservation should succeed");
+    let entry = DeletePendingEntry {
+        route_key: ObjectKey::new("default::delete-pending-force"),
+        identity: AllocationRouteIdentity {
+            owner: client.runtime_id().clone(),
+            segment_name: reservation.segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+            allocation_id: reservation.allocation_id,
+        },
+        reclaim_grace_ms: 60_000,
+    };
+
+    client
+        .storage_owner
+        .enqueue_delete_pending(std::slice::from_ref(&entry))
+        .expect("graceful delete notification should be accepted");
+    assert_eq!(
+        client
+            .storage_owner
+            .process_due_delete_pending_for_reserve()
+            .expect("future delete notification should not be queried"),
+        0
+    );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 16);
+
+    let mut forced = entry;
+    forced.reclaim_grace_ms = 0;
+    client
+        .storage_owner
+        .enqueue_delete_pending(std::slice::from_ref(&forced))
+        .expect("shutdown force notification should be accepted");
+    assert_eq!(
+        client
+            .storage_owner
+            .process_due_delete_pending_for_reserve()
+            .expect("force notification should confirm an absent identity"),
+        1
+    );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 0);
+}
+
+#[test]
+fn delete_pending_retains_republished_exact_identity() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("delete-pending-referenced-segment"));
+    let client = StoreClientBuilder::new(metadata, "delete-pending-referenced")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let reservation = client
+        .allocator
+        .lock()
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
+        .expect("reservation should succeed");
+    let route = ObjectRoute {
+        key: ObjectKey::new("default::delete-pending-referenced"),
+        namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
+        logical_key: Some("delete-pending-referenced".to_string()),
+        canonical_key: None,
+        sharing_scope: Some("default".to_string()),
+        qos_tier: Some("default".to_string()),
+        version: RouteVersion(1),
+        state: RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: client.runtime_id().clone(),
+            segment_name: reservation.segment_name.clone(),
+            allocation_id: Some(reservation.allocation_id),
+            offset: Some(reservation.offset_bytes),
+            segment_offset: reservation.offset_bytes,
+            length: reservation.length_bytes,
+            checksum: None,
+            tier: ReplicaTier::Dram,
+            priority: 0,
+        }],
+        cold_backing: None,
+        nof_backing: None,
+    };
+    assert!(
+        client
+            .route_ops()
+            .publish_route(&route.key, None, &route)
+            .expect("route publication should succeed")
+            .applied
+    );
+    let entry = DeletePendingEntry {
+        route_key: route.key.clone(),
+        identity: AllocationRouteIdentity {
+            owner: client.runtime_id().clone(),
+            segment_name: reservation.segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+            allocation_id: reservation.allocation_id,
+        },
+        reclaim_grace_ms: 0,
+    };
+
+    client
+        .storage_owner
+        .enqueue_delete_pending(std::slice::from_ref(&entry))
+        .expect("delete pending should be accepted");
+    assert_eq!(
+        client
+            .storage_owner
+            .process_pending_deletes(1)
+            .expect("referenced identity must be retained"),
+        0
+    );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 16);
+    assert!(client
+        .storage_owner
+        .pending_deletes
+        .lock()
+        .entries
+        .is_empty());
+    wait_for_storage_clock_route(&client, &route, false);
+}
+
+#[test]
+fn delete_reclaim_does_not_downgrade_unknown_owner_to_legacy_release() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("delete-unknown-owner-segment"));
+    let client = StoreClientBuilder::new(metadata, "delete-unknown-owner")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("client should build");
+    let owner = ClientRuntimeId::new("delete-unknown-remote-owner", ClientEpoch(1));
+    let route = ObjectRoute {
+        key: ObjectKey::new("default::delete-unknown-owner"),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: None,
+        version: RouteVersion(1),
+        state: RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: owner.clone(),
+            segment_name: SegmentName::new("delete-unknown-owner-segment"),
+            allocation_id: Some(7),
+            offset: None,
+            segment_offset: 0,
+            length: 16,
+            checksum: None,
+            tier: ReplicaTier::Dram,
+            priority: 0,
+        }],
+        cold_backing: None,
+        nof_backing: None,
+    };
+
+    client.live_client_cache.lock().store(Vec::new());
+    assert_eq!(
+        client.allocation_lifecycle_owner_mode(&owner),
+        AllocationLifecycleOwnerMode::Unknown
+    );
+
+    client.schedule_reclaim_after_logical_remove(&route);
+
+    assert!(
+        client.state.lock().pending_reclaims.is_empty(),
+        "unknown owner capability must not use the destructive legacy reclaim path"
+    );
+}
+
+#[test]
+fn metadata_only_client_does_not_advertise_allocation_lifecycle_capability() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("metadata-only-lifecycle-segment"));
+    let client = StoreClientBuilder::new(metadata, "metadata-only-lifecycle")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(10_000)
+        .expect("metadata-only client should build");
+
+    assert!(
+        !client
+            .lease()
+            .compatibility
+            .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY),
+        "metadata-only route control cannot safely recover exact pending publications"
+    );
+}
+
+#[test]
+fn put_retains_lifecycle_reservation_when_route_cas_reply_is_lost() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("put-cas-reply-loss-segment"));
+    let mut client = StoreClientBuilder::new(metadata, "put-cas-reply-loss")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(storage_config_with_bytes(64))
+        .build(test_future_expiry_ms())
+        .expect("client should build");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+    client.route_directory = Arc::new(ApplyThenFailRouteDirectory {
+        inner: client.route_directory.clone(),
+        fail_once: AtomicBool::new(true),
+        confirmation_fails: AtomicBool::new(false),
+    });
+
+    let error = client
+        .put("put-cas-reply-loss", b"0123456789abcdef")
+        .expect_err("applied route CAS reply loss must reach the caller as an unknown outcome");
+    assert!(matches!(error, StoreError::Transport(_)));
+
+    let route = client
+        .query_route("put-cas-reply-loss")
+        .expect("route lookup should succeed after reply loss")
+        .expect("route CAS should have applied before the injected reply loss");
+    let replica = route
+        .replicas
+        .first()
+        .expect("published route should retain its replica");
+    let identity = AllocationIdentity {
+        segment_name: replica.segment_name.clone(),
+        offset_bytes: replica.segment_offset,
+        length_bytes: replica.length,
+        allocation_id: replica
+            .allocation_id
+            .expect("lifecycle route needs allocation id"),
+    };
+    let allocation = AllocationSpan {
+        segment_name: identity.segment_name.clone(),
+        offset_bytes: identity.offset_bytes,
+        length_bytes: identity.length_bytes,
+    };
+    assert_eq!(
+        client.allocator.lock().allocation_identity(&allocation),
+        Some(identity.clone()),
+        "unknown route CAS outcome must retain the exact allocation until owner recovery"
+    );
+
+    let pending = PendingPublication {
+        identity: identity.clone(),
+    };
+    let references = client
+        .storage_owner
+        .route_ops
+        .get_allocation_route_reference_keys_consistent(&[
+            mooncake_store_core::AllocationRouteIdentity {
+                owner: client.runtime_id().clone(),
+                segment_name: identity.segment_name.clone(),
+                offset_bytes: identity.offset_bytes,
+                length_bytes: identity.length_bytes,
+                allocation_id: identity.allocation_id,
+            },
+        ])
+        .expect("exact route reference query should succeed after the applied CAS");
+    assert_eq!(
+        references[0].state,
+        mooncake_store_core::AllocationRouteReferenceState::Exact,
+        "owner recovery must observe the exact route published before the reply was lost"
+    );
+    {
+        let mut allocator = client.allocator.lock();
+        let pending_allocation = allocator
+            .pending_allocations
+            .get_mut(&allocation)
+            .expect("retained allocation must keep its pending publication token");
+        let PendingAllocation::Publication { deadline_ms, .. } = pending_allocation else {
+            panic!("lifecycle reserve must create a publication token");
+        };
+        *deadline_ms = 0;
+        allocator.retry_pending_publication(&pending, 0);
+    }
+    assert_eq!(
+        client
+            .storage_owner
+            .recover_due_pending_publications()
+            .expect("owner recovery should confirm the applied route"),
+        0,
+        "an exact route reference finalizes tracking instead of releasing"
+    );
+    assert_eq!(
+        client.allocator.lock().allocation_identity(&allocation),
+        Some(identity),
+        "recovery must retain the allocation referenced by the applied route"
+    );
+    wait_for_storage_clock_route(&client, &route, false);
+}
+
+#[test]
+fn overwrite_uses_delete_pending_before_releasing_replaced_allocation() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("overwrite-delete-pending-segment"));
+    let mut local_memory = storage_config_with_bytes(64);
+    local_memory.eviction_poll_interval = Duration::ZERO;
+    let client = StoreClientBuilder::new(metadata, "overwrite-delete-pending")
+        .state(ClientLifecycleState::Active)
+        .transport(transport)
+        .local_memory(local_memory)
+        .build(test_future_expiry_ms())
+        .expect("client should build");
+    client
+        .register_local_memory()
+        .expect("client memory should register");
+
+    let original = client
+        .put("overwrite-delete-pending", b"0123456789abcdef")
+        .expect("original put should succeed");
+    let original_replica = original
+        .replicas
+        .first()
+        .expect("original route should contain one replica");
+    let original_identity = AllocationIdentity {
+        segment_name: original_replica.segment_name.clone(),
+        offset_bytes: original_replica.segment_offset,
+        length_bytes: original_replica.length,
+        allocation_id: original_replica
+            .allocation_id
+            .expect("lifecycle route needs allocation id"),
+    };
+    let original_allocation = AllocationSpan {
+        segment_name: original_identity.segment_name.clone(),
+        offset_bytes: original_identity.offset_bytes,
+        length_bytes: original_identity.length_bytes,
+    };
+
+    let replacement = client
+        .put("overwrite-delete-pending", b"fedcba9876543210")
+        .expect("replacement put should succeed");
+    let replacement_replica = replacement
+        .replicas
+        .first()
+        .expect("replacement route should contain one replica");
+    assert_ne!(
+        replacement_replica.allocation_id,
+        Some(original_identity.allocation_id),
+        "a same-key rewrite must use a new allocation generation"
+    );
+    assert!(
+        client
+            .storage_owner
+            .pending_deletes
+            .lock()
+            .entries
+            .contains_key(&original_identity),
+        "authoritative overwrite must hand the replaced allocation to DeletePending"
+    );
+    assert_eq!(
+        client
+            .allocator
+            .lock()
+            .allocation_identity(&original_allocation),
+        Some(original_identity.clone()),
+        "old allocation must remain live until exact confirmation observes replacement"
+    );
+
+    assert_eq!(
+        client
+            .storage_owner
+            .process_pending_deletes(1)
+            .expect("replaced allocation should confirm absent and release"),
+        1
+    );
+    assert!(
+        client
+            .allocator
+            .lock()
+            .allocation_identity(&original_allocation)
+            .is_none(),
+        "old allocation should release only after exact confirmation"
+    );
 }
 
 #[test]
@@ -20841,15 +21515,16 @@ fn pending_eviction_retries_settle_to_low_frequency_after_default_limit() {
     );
     let before = now_ms();
     owner.defer_pending_eviction(&identity, PendingEvictionPhase::PendingConfirmation);
-    let scheduled = owner
-        .pending_evictions
-        .lock()
-        .get(&identity)
-        .expect("token should remain pending after retry budget")
-        .next_attempt_at_ms;
+    let pending = owner.pending_evictions.lock();
+    let pending = pending.get(&identity).expect("token should remain pending after retry budget");
+    let scheduled = pending.next_attempt_at_ms;
     assert!(
         scheduled >= before.saturating_add(PENDING_EVICTION_RETRY_MAX_MS),
         "the retained token must stop issuing confirmation RPCs at a hot cadence"
+    );
+    assert!(
+        pending.deferred,
+        "the retained reclaim token must be surfaced as deferred once its retry budget is exhausted"
     );
 }
 

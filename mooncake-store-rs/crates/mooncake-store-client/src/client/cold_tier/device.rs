@@ -87,6 +87,11 @@ impl StorageOwnerState {
             cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),
             initial_cold_backing_repair_at_ms: AtomicU64::new(0),
             pending_evictions: parking_lot::Mutex::new(BTreeMap::new()),
+            pending_deletes: parking_lot::Mutex::new(super::super::PendingDeleteQueue::default()),
+            pending_delete_next_due_at_ms: AtomicU64::new(u64::MAX),
+            pending_publication_authority_retry: parking_lot::Mutex::new(
+                super::super::PendingPublicationAuthorityRetry::default(),
+            ),
             // Treat startup as the last successful baseline so an idle owner
             // does not immediately spend an eviction on reconciliation.
             stale_candidate_reconcile_completed_at_ms: AtomicU64::new(

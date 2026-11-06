@@ -430,6 +430,8 @@ fn batch_is_readable_uses_bounded_lookup_for_evicted_cold_only_entry() {
         batch_cas_calls: AtomicUsize::new(0),
         max_cas_batch_size: AtomicUsize::new(0),
         owner_list_scans: AtomicUsize::new(0),
+        allocation_reference_key_queries: AtomicUsize::new(0),
+        fail_allocation_reference_key_queries: AtomicBool::new(false),
     });
 
     let payload = vec![7u8; 24];

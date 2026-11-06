@@ -872,6 +872,30 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         Ok(Response::new(reply))
     }
 
+    async fn batch_notify_delete_pending(
+        &self,
+        request: Request<pb::BatchNotifyDeletePendingRequest>,
+    ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
+        let entries = request
+            .into_inner()
+            .entries
+            .into_iter()
+            .map(try_delete_pending_entry)
+            .collect::<Result<Vec<_>>>();
+        let reply =
+            match entries.and_then(|entries| self.eviction.batch_notify_delete_pending(&entries)) {
+                Ok(accepted) => pb::BatchNotifyDeletePendingReply {
+                    accepted: accepted as u64,
+                    error: None,
+                },
+                Err(error) => pb::BatchNotifyDeletePendingReply {
+                    accepted: 0,
+                    error: Some(pb_error(error)),
+                },
+            };
+        Ok(Response::new(reply))
+    }
+
     async fn batch_compare_and_swap_routes(
         &self,
         request: Request<pb::BatchCompareAndSwapRoutesRequest>,
@@ -1072,19 +1096,34 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::ReserveAnyRequest>,
     ) -> std::result::Result<Response<pb::ReserveAnyReply>, Status> {
         let request = request.into_inner();
-        let reply = match request
-            .owner
-            .as_ref()
-            .map(try_runtime_id)
-            .transpose()
-            .and_then(|owner| {
-                let owner = owner.ok_or_else(|| {
-                    StoreError::InvalidState(
-                        "control plane reserve_any request is missing owner".to_string(),
-                    )
-                })?;
-                self.allocator.batch_reserve_any_with_pending_publication(&owner, &[ReserveAnyOp { length_bytes: request.length_bytes, route_key: None }]).into_iter().next().expect("single reserve request must produce one result")
-            }) {
+        let allocator = self.allocator.clone();
+        let result = (move || {
+            request
+                .owner
+                .as_ref()
+                .map(try_runtime_id)
+                .transpose()
+                .and_then(|owner| {
+                    let owner = owner.ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "control plane reserve_any request is missing owner".to_string(),
+                        )
+                    })?;
+                    if request.pending_publication {
+                        allocator
+                            .batch_reserve_any_with_pending_publication(
+                                &owner,
+                                &[request.length_bytes],
+                            )
+                            .into_iter()
+                            .next()
+                            .expect("single reserve request should produce one allocator result")
+                    } else {
+                        allocator.reserve_any(&owner, request.length_bytes)
+                    }
+                })
+        })();
+        let reply = match result {
             Ok(reservation) => pb::ReserveAnyReply {
                 reservation: Some(pb_segment_reservation(&reservation)),
                 error: None,
@@ -1111,9 +1150,17 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         let owner = owner.ok_or_else(|| {
             Status::invalid_argument("control plane batch reserve_any request is missing owner")
         })?;
-        let replies = self
-            .allocator
-            .batch_reserve_any_with_pending_publication(&owner, &request.length_bytes.iter().map(|length_bytes| ReserveAnyOp { length_bytes: *length_bytes, route_key: None }).collect::<Vec<_>>())
+        let length_bytes = request.length_bytes;
+        let pending_publication = request.pending_publication;
+        let allocator = self.allocator.clone();
+        let results = (move || {
+            if pending_publication {
+                allocator.batch_reserve_any_with_pending_publication(&owner, &length_bytes)
+            } else {
+                allocator.batch_reserve_any(&owner, &length_bytes)
+            }
+        })();
+        let replies = results
             .into_iter()
             .map(|result| match result {
                 Ok(reservation) => pb::ReserveAnyReply {
@@ -1134,19 +1181,41 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::ReserveSpecificRequest>,
     ) -> std::result::Result<Response<pb::ReserveSpecificReply>, Status> {
         let request = request.into_inner();
-        let reply = match request
-            .owner
-            .as_ref()
-            .map(try_runtime_id)
-            .transpose()
-            .and_then(|owner| {
-                let owner = owner.ok_or_else(|| {
-                    StoreError::InvalidState(
-                        "control plane reserve_specific request is missing owner".to_string(),
-                    )
-                })?;
-                self.allocator.batch_reserve_specific_with_pending_publication(&owner, &[ReserveSpecificOp { segment_name: SegmentName::new(request.segment_name), length_bytes: request.length_bytes, route_key: None }]).into_iter().next().expect("single reserve request must produce one result")
-            }) {
+        let allocator = self.allocator.clone();
+        let result = (move || {
+            request
+                .owner
+                .as_ref()
+                .map(try_runtime_id)
+                .transpose()
+                .and_then(|owner| {
+                    let owner = owner.ok_or_else(|| {
+                        StoreError::InvalidState(
+                            "control plane reserve_specific request is missing owner".to_string(),
+                        )
+                    })?;
+                    if request.pending_publication {
+                        allocator
+                            .batch_reserve_specific_with_pending_publication(
+                                &owner,
+                                &[ReserveSpecificOp {
+                                    segment_name: SegmentName::new(request.segment_name),
+                                    length_bytes: request.length_bytes,
+                                }],
+                            )
+                            .into_iter()
+                            .next()
+                            .expect("single reserve request should produce one allocator result")
+                    } else {
+                        allocator.reserve_specific(
+                            &owner,
+                            &SegmentName::new(request.segment_name),
+                            request.length_bytes,
+                        )
+                    }
+                })
+        })();
+        let reply = match result {
             Ok(reservation) => pb::ReserveSpecificReply {
                 reservation: Some(pb_segment_reservation(&reservation)),
                 error: None,
@@ -1181,12 +1250,18 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             .map(|entry| ReserveSpecificOp {
                 segment_name: SegmentName::new(entry.segment_name),
                 length_bytes: entry.length_bytes,
-                route_key: None,
             })
             .collect::<Vec<_>>();
-        let replies = self
-            .allocator
-            .batch_reserve_specific_with_pending_publication(&owner, &entries)
+        let pending_publication = request.pending_publication;
+        let allocator = self.allocator.clone();
+        let results = (move || {
+            if pending_publication {
+                allocator.batch_reserve_specific_with_pending_publication(&owner, &entries)
+            } else {
+                allocator.batch_reserve_specific(&owner, &entries)
+            }
+        })();
+        let replies = results
             .into_iter()
             .map(|result| match result {
                 Ok(reservation) => pb::ReserveSpecificReply {
@@ -1343,6 +1418,9 @@ fn control_stream_request_operation(request: &pb::ControlStreamRequest) -> &'sta
         Some(pb::control_stream_request::Body::EvictionTrackReplicaRoutes(_)) => {
             "batch_track_replica_routes"
         }
+        Some(pb::control_stream_request::Body::EvictionNotifyDeletePending(_)) => {
+            "batch_notify_delete_pending"
+        }
         Some(pb::control_stream_request::Body::RouteReplace(_)) => "batch_replace_routes",
         Some(pb::control_stream_request::Body::AllocatorReserveAny(_)) => "batch_reserve_any",
         Some(pb::control_stream_request::Body::AllocatorReserveSpecific(_)) => {
@@ -1496,6 +1574,11 @@ pub(super) async fn handle_control_stream_request(
             .await
             .map(Response::into_inner)
             .map(pb::control_stream_reply::Body::EvictionTrackReplicaRoutes),
+        Some(pb::control_stream_request::Body::EvictionNotifyDeletePending(batch)) => service
+            .batch_notify_delete_pending(Request::new(batch))
+            .await
+            .map(Response::into_inner)
+            .map(pb::control_stream_reply::Body::EvictionNotifyDeletePending),
         Some(pb::control_stream_request::Body::RouteReplace(batch)) => service
             .batch_replace_routes(Request::new(batch))
             .await

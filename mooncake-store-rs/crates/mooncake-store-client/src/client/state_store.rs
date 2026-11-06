@@ -6,6 +6,11 @@ const PENDING_EVICTION_CONFIRMATION_BATCH: usize = 32;
 const PENDING_EVICTION_MAX_ENTRIES: usize = 1024;
 const PENDING_EVICTION_RETRY_BASE_MS: u64 = 100;
 const PENDING_EVICTION_RETRY_MAX_MS: u64 = 10_000;
+const PENDING_DELETE_CONFIRMATION_BATCH: usize = 64;
+const PENDING_DELETE_MAX_ENTRIES: usize = 4096;
+const PENDING_DELETE_RETRY_BASE_MS: u64 = 100;
+const PENDING_DELETE_RETRY_MAX_MS: u64 = 60_000;
+const PENDING_DELETE_WARN_AFTER_ATTEMPTS: u32 = 10;
 const STALE_CANDIDATE_RECONCILE_MIN_INTERVAL_MS: u64 = 100;
 
 struct StaleCandidateReconcileGuard<'a> {
@@ -259,7 +264,9 @@ impl StoreState {
         self.registered_buffers
             .get(&(buffer as usize))
             .copied()
-            .ok_or_else(|| StoreError::NotFound(format!("registered buffer {:p} not found", buffer)))
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("registered buffer {:p} not found", buffer))
+            })
     }
 
     fn buffer_is_registered(&self, buffer: *mut c_void, size: usize) -> bool {
@@ -545,10 +552,7 @@ mod state_store_tests {
 
         assert_eq!(
             transport.cached_descriptors(),
-            vec![(
-                "10.0.0.8:12002".to_string(),
-                "extra-descriptor".to_string()
-            )]
+            vec![("10.0.0.8:12002".to_string(), "extra-descriptor".to_string())]
         );
     }
 
@@ -883,7 +887,9 @@ mod state_store_tests {
             routes.push(route);
         }
         for index in 0..8 {
-            clock.pending_hot_keys.insert(ObjectKey(format!("k-{index}")));
+            clock
+                .pending_hot_keys
+                .insert(ObjectKey(format!("k-{index}")));
         }
         assert_eq!(clock.pending_hot_keys.len(), 8);
 
@@ -955,7 +961,9 @@ mod state_store_tests {
         );
 
         // pick_victim should return a cold entry, never the hot k-0.
-        let victim = rebuilt.pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0).expect("should find a cold victim");
+        let victim = rebuilt
+            .pick_victim(None, ColdTierEvictionPriorityPolicy::Clock, 0)
+            .expect("should find a cold victim");
         assert_ne!(
             victim.route_key,
             ObjectKey("k-0".to_string()),
@@ -1258,7 +1266,10 @@ impl StorageOwnerState {
     }
 
     fn untrack_route(&self, route: &ObjectRoute) {
-        self.hot_replicas.clock.lock().untrack_route(route, &self.runtime);
+        self.hot_replicas
+            .clock
+            .lock()
+            .untrack_route(route, &self.runtime);
         self.nof_backings.clock.lock().remove_key(&route.key);
     }
 
@@ -1271,13 +1282,408 @@ impl StorageOwnerState {
         nof_clock.sync_nof_route(route, &self.runtime, false);
     }
 
+    fn enqueue_delete_pending(&self, entries: &[DeletePendingEntry]) -> Result<usize> {
+        let now_ms = now_ms();
+        let mut accepted = 0usize;
+        for entry in entries {
+            if entry.identity.owner != self.runtime {
+                return Err(StoreError::InvalidState(format!(
+                    "delete pending identity owner {} does not match allocator owner {}",
+                    entry.identity.owner, self.runtime
+                )));
+            }
+            let identity = AllocationIdentity {
+                segment_name: entry.identity.segment_name.clone(),
+                offset_bytes: entry.identity.offset_bytes,
+                length_bytes: entry.identity.length_bytes,
+                allocation_id: entry.identity.allocation_id,
+            };
+            let allocation = AllocationSpan {
+                segment_name: identity.segment_name.clone(),
+                offset_bytes: identity.offset_bytes,
+                length_bytes: identity.length_bytes,
+            };
+            let is_live = {
+                let allocator = self.allocator.lock();
+                allocator.allocation_identity(&allocation).as_ref() == Some(&identity)
+            };
+            if !is_live {
+                // A duplicate notification may arrive after the local allocator has
+                // already released this generation. Treat it as idempotently accepted.
+                accepted = accepted.saturating_add(1);
+                continue;
+            }
+
+            let accepted_delete_pending = {
+                let mut pending = self.pending_deletes.lock();
+                let next_attempt_at_ms = now_ms.saturating_add(entry.reclaim_grace_ms);
+                if let Some(existing_next_attempt_at_ms) = pending
+                    .entries
+                    .get(&identity)
+                    .map(|existing| existing.next_attempt_at_ms)
+                {
+                    if next_attempt_at_ms < existing_next_attempt_at_ms {
+                        pending.ready.remove(&PendingDeleteReady {
+                            next_attempt_at_ms: existing_next_attempt_at_ms,
+                            identity: identity.clone(),
+                        });
+                        pending
+                            .entries
+                            .get_mut(&identity)
+                            .expect("pending delete entry must remain present while locked")
+                            .next_attempt_at_ms = next_attempt_at_ms;
+                        pending.ready.insert(PendingDeleteReady {
+                            next_attempt_at_ms,
+                            identity: identity.clone(),
+                        });
+                        self.refresh_pending_delete_next_due_at_ms(&pending);
+                    }
+                    true
+                } else if pending.entries.len() >= PENDING_DELETE_MAX_ENTRIES {
+                    debug!(
+                        runtime = %self.runtime,
+                        limit = PENDING_DELETE_MAX_ENTRIES,
+                        "dropping best-effort delete pending notification because owner queue is full"
+                    );
+                    false
+                } else {
+                    pending.ready.insert(PendingDeleteReady {
+                        next_attempt_at_ms,
+                        identity: identity.clone(),
+                    });
+                    pending.entries.insert(
+                        identity.clone(),
+                        PendingDelete {
+                            route_key: entry.route_key.clone(),
+                            identity: identity.clone(),
+                            confirmation_attempts: 0,
+                            next_attempt_at_ms,
+                            confirmation_in_progress: false,
+                            deferred: false,
+                        },
+                    );
+                    self.refresh_pending_delete_next_due_at_ms(&pending);
+                    true
+                }
+            };
+            if !accepted_delete_pending {
+                continue;
+            }
+
+            // Retain the PendingPublish fence if a best-effort notification is dropped.
+            // Clear it only after DeletePending owns the exact generation. Release
+            // the queue lock before reacquiring the allocator to preserve lock order.
+            let mut allocator = self.allocator.lock();
+            if allocator.allocation_identity(&allocation).as_ref() == Some(&identity) {
+                allocator.clear_pending_identity(&identity);
+            }
+            accepted = accepted.saturating_add(1);
+        }
+        Ok(accepted)
+    }
+
+    fn refresh_pending_delete_next_due_at_ms(&self, pending: &PendingDeleteQueue) {
+        let next_due_at_ms = pending
+            .ready
+            .first()
+            .map_or(u64::MAX, |entry| entry.next_attempt_at_ms);
+        self.pending_delete_next_due_at_ms
+            .store(next_due_at_ms, Ordering::Release);
+    }
+
+    pub(super) fn process_due_delete_pending_for_reserve(&self) -> Result<usize> {
+        let next_due_at_ms = self.pending_delete_next_due_at_ms.load(Ordering::Acquire);
+        if next_due_at_ms == u64::MAX || next_due_at_ms > now_ms() {
+            return Ok(0);
+        }
+        self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)
+    }
+
+    fn delete_pending_contains(&self, identity: &AllocationIdentity) -> bool {
+        self.pending_deletes.lock().entries.contains_key(identity)
+    }
+
+    fn claim_due_pending_deletes(&self, now_ms: u64, limit: usize) -> Vec<PendingDelete> {
+        let mut pending = self.pending_deletes.lock();
+        let mut claimed = Vec::with_capacity(limit);
+        while claimed.len() < limit.max(1) {
+            let Some(ready) = pending.ready.first().cloned() else {
+                break;
+            };
+            if ready.next_attempt_at_ms > now_ms {
+                break;
+            }
+            pending.ready.pop_first();
+            if let Some(entry) = pending.entries.get_mut(&ready.identity) {
+                if entry.next_attempt_at_ms == ready.next_attempt_at_ms
+                    && !entry.confirmation_in_progress
+                {
+                    entry.confirmation_in_progress = true;
+                    claimed.push(entry.clone());
+                }
+            }
+        }
+        self.refresh_pending_delete_next_due_at_ms(&pending);
+        claimed
+    }
+
+    fn complete_pending_delete(&self, identity: &AllocationIdentity) {
+        let mut pending = self.pending_deletes.lock();
+        if let Some(entry) = pending.entries.remove(identity) {
+            pending.ready.remove(&PendingDeleteReady {
+                next_attempt_at_ms: entry.next_attempt_at_ms,
+                identity: identity.clone(),
+            });
+        }
+        self.refresh_pending_delete_next_due_at_ms(&pending);
+    }
+
+    fn defer_pending_delete(&self, identity: &AllocationIdentity, reason: &str) {
+        let now_ms = now_ms();
+        let (_next_attempt_at_ms, attempts, became_deferred) = {
+            let mut pending = self.pending_deletes.lock();
+            let Some(previous_next_attempt_at_ms) = pending
+                .entries
+                .get(identity)
+                .map(|entry| entry.next_attempt_at_ms)
+            else {
+                return;
+            };
+            pending.ready.remove(&PendingDeleteReady {
+                next_attempt_at_ms: previous_next_attempt_at_ms,
+                identity: identity.clone(),
+            });
+            let (next_attempt_at_ms, attempts, became_deferred) = {
+                let entry = pending
+                    .entries
+                    .get_mut(identity)
+                    .expect("pending delete entry must remain present while locked");
+                entry.confirmation_in_progress = false;
+                entry.confirmation_attempts = entry.confirmation_attempts.saturating_add(1);
+                let exponent = entry.confirmation_attempts.saturating_sub(1).min(9);
+                let delay_ms = PENDING_DELETE_RETRY_BASE_MS
+                    .saturating_mul(1u64 << exponent)
+                    .min(PENDING_DELETE_RETRY_MAX_MS);
+                entry.next_attempt_at_ms = now_ms.saturating_add(delay_ms);
+                let became_deferred = entry.confirmation_attempts
+                    >= PENDING_DELETE_WARN_AFTER_ATTEMPTS
+                    && !entry.deferred;
+                if became_deferred {
+                    entry.deferred = true;
+                }
+                (
+                    entry.next_attempt_at_ms,
+                    entry.confirmation_attempts,
+                    became_deferred,
+                )
+            };
+            pending.ready.insert(PendingDeleteReady {
+                next_attempt_at_ms,
+                identity: identity.clone(),
+            });
+            self.refresh_pending_delete_next_due_at_ms(&pending);
+            (next_attempt_at_ms, attempts, became_deferred)
+        };
+        if became_deferred {
+            warn!(
+                runtime = %self.runtime,
+                segment = %identity.segment_name.0,
+                offset_bytes = identity.offset_bytes,
+                length_bytes = identity.length_bytes,
+                allocation_id = identity.allocation_id,
+                attempts,
+                reason,
+                "delete pending remains deferred after bounded retries"
+            );
+        } else {
+            debug!(
+                runtime = %self.runtime,
+                segment = %identity.segment_name.0,
+                offset_bytes = identity.offset_bytes,
+                allocation_id = identity.allocation_id,
+                attempts,
+                reason,
+                "delete pending retry scheduled"
+            );
+        }
+    }
+
+    fn process_pending_deletes(&self, limit: usize) -> Result<usize> {
+        let pending = self.claim_due_pending_deletes(now_ms(), limit);
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let identities = pending
+            .iter()
+            .map(|entry| mooncake_store_core::AllocationRouteIdentity {
+                owner: self.runtime.clone(),
+                segment_name: entry.identity.segment_name.clone(),
+                offset_bytes: entry.identity.offset_bytes,
+                length_bytes: entry.identity.length_bytes,
+                allocation_id: entry.identity.allocation_id,
+            })
+            .collect::<Vec<_>>();
+        let references = match self
+            .route_ops
+            .get_allocation_route_reference_keys_consistent(&identities)
+        {
+            Ok(references) if references.len() == pending.len() => references,
+            Ok(references) => {
+                for entry in &pending {
+                    self.defer_pending_delete(
+                        &entry.identity,
+                        "incomplete exact delete reference reply",
+                    );
+                }
+                debug!(
+                    runtime = %self.runtime,
+                    expected = pending.len(),
+                    actual = references.len(),
+                    "delete pending exact reference query returned an incomplete result"
+                );
+                return Ok(0);
+            }
+            Err(error) => {
+                for entry in &pending {
+                    self.defer_pending_delete(&entry.identity, "delete reference query failed");
+                }
+                debug!(
+                    runtime = %self.runtime,
+                    error = %error,
+                    entries = pending.len(),
+                    "delete pending exact reference query is indeterminate"
+                );
+                return Ok(0);
+            }
+        };
+
+        let mut released = 0usize;
+        for (entry, reference) in pending.iter().zip(references) {
+            match reference.state {
+                mooncake_store_core::AllocationRouteReferenceState::Absent => {
+                    if self
+                        .read_pin_registry
+                        .is_pinned(&entry.identity.segment_name, entry.identity.offset_bytes)
+                    {
+                        self.defer_pending_delete(
+                            &entry.identity,
+                            "allocation still has read pins",
+                        );
+                        continue;
+                    }
+                    let allocation = AllocationSpan {
+                        segment_name: entry.identity.segment_name.clone(),
+                        offset_bytes: entry.identity.offset_bytes,
+                        length_bytes: entry.identity.length_bytes,
+                    };
+                    let release = {
+                        let mut allocator = self.allocator.lock();
+                        match allocator.allocation_identity(&allocation) {
+                            Some(current) if current == entry.identity => allocator.release(
+                                &self.runtime,
+                                &entry.identity.segment_name,
+                                entry.identity.offset_bytes,
+                                entry.identity.length_bytes,
+                                entry.identity.allocation_id,
+                            ),
+                            Some(_) | None => Ok(()),
+                        }
+                    };
+                    match release {
+                        Ok(()) => {
+                            self.hot_replicas.clock.lock().remove_id(&ClockEntryId {
+                                route_key: entry.route_key.clone(),
+                                segment_name: entry.identity.segment_name.clone(),
+                                segment_offset: entry.identity.offset_bytes,
+                                allocation_id: Some(entry.identity.allocation_id),
+                            });
+                            self.complete_pending_delete(&entry.identity);
+                            released = released.saturating_add(1);
+                            registry::record_eviction_guard_event("delete_pending", "released");
+                        }
+                        Err(error) => {
+                            self.defer_pending_delete(
+                                &entry.identity,
+                                "local allocator release failed",
+                            );
+                            debug!(
+                                runtime = %self.runtime,
+                                allocation_id = entry.identity.allocation_id,
+                                error = %error,
+                                "delete pending local release failed"
+                            );
+                        }
+                    }
+                }
+                mooncake_store_core::AllocationRouteReferenceState::Exact => {
+                    let Some(route_key) = reference.route_key else {
+                        self.defer_pending_delete(
+                            &entry.identity,
+                            "exact delete reference omitted route key",
+                        );
+                        continue;
+                    };
+                    let replica = ReplicaRoute {
+                        owner: self.runtime.clone(),
+                        segment_name: entry.identity.segment_name.clone(),
+                        allocation_id: Some(entry.identity.allocation_id),
+                        offset: None,
+                        segment_offset: entry.identity.offset_bytes,
+                        length: entry.identity.length_bytes,
+                        checksum: None,
+                        tier: ReplicaTier::Dram,
+                        priority: 0,
+                    };
+                    match self
+                        .route_ops
+                        .confirm_replica_reference(&route_key, &replica)
+                    {
+                        Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
+                            self.track_route(&route);
+                            self.complete_pending_delete(&entry.identity);
+                            registry::record_eviction_guard_event("delete_pending", "retained");
+                        }
+                        Ok(mooncake_store_core::RouteReplicaReference::Absent) => {
+                            self.defer_pending_delete(
+                                &entry.identity,
+                                "delete reference changed during confirmation",
+                            );
+                        }
+                        Err(error) => {
+                            self.defer_pending_delete(
+                                &entry.identity,
+                                "delete reference confirmation failed",
+                            );
+                            debug!(
+                                runtime = %self.runtime,
+                                allocation_id = entry.identity.allocation_id,
+                                error = %error,
+                                "delete pending exact reference confirmation is indeterminate"
+                            );
+                        }
+                    }
+                }
+                mooncake_store_core::AllocationRouteReferenceState::Conflict => {
+                    self.defer_pending_delete(
+                        &entry.identity,
+                        "delete reference authorities disagree",
+                    );
+                }
+            }
+        }
+        Ok(released)
+    }
+
     fn evict_until_low_watermark(&self, high_percent: u8, low_percent: u8) -> Result<usize> {
         let tracker = OperationTracker::new("storage_owner_background_eviction");
         let started = Instant::now();
         let used_before = self.allocator.lock().usage_bytes().0;
         let result = (|| {
+            let mut evicted = self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)?;
             let _ = self.recover_due_pending_publications()?;
-            let mut evicted = self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)?;
+            evicted = evicted.saturating_add(
+                self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)?,
+            );
             let (used_bytes, capacity_bytes) = self.allocator.lock().usage_bytes();
             if capacity_bytes == 0 {
                 return Ok(evicted);
@@ -1325,11 +1731,7 @@ impl StorageOwnerState {
         result
     }
 
-    fn evict_background_batch(
-        &self,
-        bytes_to_reclaim: u64,
-        batch_size: usize,
-    ) -> Result<usize> {
+    fn evict_background_batch(&self, bytes_to_reclaim: u64, batch_size: usize) -> Result<usize> {
         if batch_size <= 1 || self.has_usable_cold_tier_device()? {
             return Ok(usize::from(self.evict_one_blocking(None)?));
         }
@@ -1383,10 +1785,8 @@ impl StorageOwnerState {
                 continue;
             };
             let Some(replica_index) = self.replica_index_for_victim(&route, &victim) else {
-                if self.reclaim_stale_local_allocations_for_key(
-                    &victim.route_key,
-                    Some(&route),
-                )? > 0
+                if self.reclaim_stale_local_allocations_for_key(&victim.route_key, Some(&route))?
+                    > 0
                 {
                     reclaimed = reclaimed.saturating_add(1);
                 } else {
@@ -1471,20 +1871,17 @@ impl StorageOwnerState {
         let mut evicted_bytes = 0u64;
         for ((_, token, _), result) in prepared.into_iter().zip(results) {
             match result {
-                Ok(cas) if cas.applied => {
-                    match self.commit_eviction(&token) {
-                        Ok(true) => {
-                            reclaimed = reclaimed.saturating_add(1);
-                            evicted_replicas = evicted_replicas.saturating_add(1);
-                            evicted_bytes =
-                                evicted_bytes.saturating_add(token.identity.length_bytes);
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            first_error.get_or_insert(error);
-                        }
+                Ok(cas) if cas.applied => match self.commit_eviction(&token) {
+                    Ok(true) => {
+                        reclaimed = reclaimed.saturating_add(1);
+                        evicted_replicas = evicted_replicas.saturating_add(1);
+                        evicted_bytes = evicted_bytes.saturating_add(token.identity.length_bytes);
                     }
-                }
+                    Ok(false) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                },
                 Ok(cas) => self.abort_eviction(&token, cas.current.as_ref()),
                 Err(error) => {
                     self.defer_pending_eviction(
@@ -1527,9 +1924,7 @@ impl StorageOwnerState {
                     self.runtime.stable_id.0
                 ))
                 .spawn(move || {
-                    storage_owner.evict_one_for_reservation_blocking(
-                        preferred_segment.as_ref(),
-                    )
+                    storage_owner.evict_one_for_reservation_blocking(preferred_segment.as_ref())
                 })
                 .map_err(|error| {
                     StoreError::Transport(format!(
@@ -1543,13 +1938,22 @@ impl StorageOwnerState {
         self.evict_one_for_reservation_blocking(preferred_segment.as_ref())
     }
 
-    pub(in super) fn evict_one_clean_and_reserve_bounded(
+    pub(super) fn evict_one_clean_and_reserve_bounded(
         &self,
         length_bytes: u64,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
+        if self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)? > 0 {
+            if let Some(reservation) =
+                self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment)?
+            {
+                return Ok(Some(reservation));
+            }
+        }
         if self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)? > 0 {
-            if let Some(reservation) = self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment)? {
+            if let Some(reservation) =
+                self.reserve_local_after_stale_reclaim(length_bytes, preferred_segment)?
+            {
                 return Ok(Some(reservation));
             }
         }
@@ -1579,11 +1983,8 @@ impl StorageOwnerState {
     ) -> Result<Option<mooncake_store_core::SegmentReservation>> {
         let reservation = {
             let mut allocator = self.allocator.lock();
-            let deadline_ms = pending_publish_deadline_ms(
-                length_bytes,
-                DEFAULT_TRANSFER_STALL_TIMEOUT,
-                None,
-            );
+            let deadline_ms =
+                pending_publish_deadline_ms(length_bytes, DEFAULT_TRANSFER_STALL_TIMEOUT, None);
             match preferred_segment {
                 Some(segment) => allocator.reserve_specific_with_pending(
                     &self.runtime,
@@ -1591,7 +1992,9 @@ impl StorageOwnerState {
                     length_bytes,
                     deadline_ms,
                 ),
-                None => allocator.reserve_any_with_pending(&self.runtime, length_bytes, deadline_ms),
+                None => {
+                    allocator.reserve_any_with_pending(&self.runtime, length_bytes, deadline_ms)
+                }
             }
         };
         match reservation {
@@ -1617,6 +2020,9 @@ impl StorageOwnerState {
         &self,
         preferred_segment: Option<&SegmentName>,
     ) -> Result<bool> {
+        if self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)? > 0 {
+            return Ok(true);
+        }
         if self.recover_due_pending_publications()? > 0 {
             return Ok(true);
         }
@@ -1633,14 +2039,45 @@ impl StorageOwnerState {
         Ok(self.reconcile_stale_clock_candidates(preferred_segment, true)? > 0)
     }
 
-    fn recover_due_pending_publications(&self) -> Result<usize> {
+    fn pending_publication_authority_retry_ready(&self, now_ms: u64) -> bool {
+        self.pending_publication_authority_retry
+            .lock()
+            .is_ready(now_ms)
+    }
+
+    fn defer_pending_publications_after_authority_failure(
+        &self,
+        publications: &[PendingPublication],
+        now_ms: u64,
+    ) {
+        if publications.is_empty() {
+            return;
+        }
+        let next_attempt_at_ms = {
+            let mut retry = self.pending_publication_authority_retry.lock();
+            retry.defer(&self.runtime, now_ms)
+        };
+        self.retry_pending_publications(publications, next_attempt_at_ms);
+    }
+
+    fn reset_pending_publication_authority_retry(&self) {
+        let mut retry = self.pending_publication_authority_retry.lock();
+        retry.reset();
+    }
+
+    pub(super) fn recover_due_pending_publications(&self) -> Result<usize> {
         const PENDING_PUBLICATION_CONFIRMATION_BATCH: usize = 64;
-        const PENDING_PUBLICATION_RETRY_DELAY_MS: u64 = 1_000;
+        const PENDING_PUBLICATION_LOCAL_RETRY_DELAY_MS: u64 = 1_000;
+
+        let now_ms = now_ms();
+        if !self.pending_publication_authority_retry_ready(now_ms) {
+            return Ok(0);
+        }
 
         let publications = self
             .allocator
             .lock()
-            .claim_due_pending_publications(now_ms(), PENDING_PUBLICATION_CONFIRMATION_BATCH);
+            .claim_due_pending_publications(now_ms, PENDING_PUBLICATION_CONFIRMATION_BATCH);
         if publications.is_empty() {
             return Ok(0);
         }
@@ -1666,10 +2103,7 @@ impl StorageOwnerState {
                     actual = references.len(),
                     "pending publication confirmation returned an incomplete result"
                 );
-                self.retry_pending_publications(
-                    &publications,
-                    now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
-                );
+                self.defer_pending_publications_after_authority_failure(&publications, now_ms);
                 return Ok(0);
             }
             Err(error) => {
@@ -1679,15 +2113,14 @@ impl StorageOwnerState {
                     error = %error,
                     "pending publication confirmation is indeterminate; retaining reservations"
                 );
-                self.retry_pending_publications(
-                    &publications,
-                    now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
-                );
+                self.defer_pending_publications_after_authority_failure(&publications, now_ms);
                 return Ok(0);
             }
         };
 
+        self.reset_pending_publication_authority_retry();
         let mut recovered = 0usize;
+        let mut authority_retries = Vec::new();
         for (publication, reference) in publications.iter().zip(references) {
             match reference.state {
                 mooncake_store_core::AllocationRouteReferenceState::Exact => {
@@ -1697,10 +2130,7 @@ impl StorageOwnerState {
                             allocation_id = publication.identity.allocation_id,
                             "exact pending publication reference is missing its route key"
                         );
-                        self.retry_pending_publications(
-                            std::slice::from_ref(publication),
-                            now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
-                        );
+                        authority_retries.push(publication.clone());
                         continue;
                     };
                     let replica = ReplicaRoute {
@@ -1728,7 +2158,7 @@ impl StorageOwnerState {
                         Ok(mooncake_store_core::RouteReplicaReference::Absent) => {
                             self.retry_pending_publications(
                                 std::slice::from_ref(publication),
-                                now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                                now_ms.saturating_add(PENDING_PUBLICATION_LOCAL_RETRY_DELAY_MS),
                             );
                         }
                         Err(error) => {
@@ -1739,10 +2169,7 @@ impl StorageOwnerState {
                                 error = %error,
                                 "pending publication route confirmation is indeterminate"
                             );
-                            self.retry_pending_publications(
-                                std::slice::from_ref(publication),
-                                now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
-                            );
+                            authority_retries.push(publication.clone());
                         }
                     }
                 }
@@ -1771,19 +2198,17 @@ impl StorageOwnerState {
                             );
                             self.retry_pending_publications(
                                 std::slice::from_ref(publication),
-                                now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
+                                now_ms.saturating_add(PENDING_PUBLICATION_LOCAL_RETRY_DELAY_MS),
                             );
                         }
                     }
                 }
                 mooncake_store_core::AllocationRouteReferenceState::Conflict => {
-                    self.retry_pending_publications(
-                        std::slice::from_ref(publication),
-                        now_ms().saturating_add(PENDING_PUBLICATION_RETRY_DELAY_MS),
-                    );
+                    authority_retries.push(publication.clone());
                 }
             }
         }
+        self.defer_pending_publications_after_authority_failure(&authority_retries, now_ms);
         Ok(recovered)
     }
 
@@ -1801,6 +2226,9 @@ impl StorageOwnerState {
     fn evict_one_blocking(&self, preferred_segment: Option<&SegmentName>) -> Result<bool> {
         let tracker = OperationTracker::new("storage_owner_evict_one");
         let result = (|| {
+            if self.process_pending_deletes(PENDING_DELETE_CONFIRMATION_BATCH)? > 0 {
+                return Ok(true);
+            }
             if self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)? > 0 {
                 return Ok(true);
             }
@@ -1892,10 +2320,8 @@ impl StorageOwnerState {
         {
             return Ok(0);
         }
-        self.stale_candidate_reconcile_started_at_ms.store(
-            scan_started_at_ms,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.stale_candidate_reconcile_started_at_ms
+            .store(scan_started_at_ms, std::sync::atomic::Ordering::Relaxed);
 
         let (candidate_keys, tracked_identities, legacy_tracked_spans) = {
             let mut clock = self.hot_replicas.clock.lock();
@@ -1947,9 +2373,8 @@ impl StorageOwnerState {
         for identity in candidates {
             self.begin_untracked_candidate_confirmation(&identity);
         }
-        released = released.saturating_add(
-            self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)?,
-        );
+        released = released
+            .saturating_add(self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)?);
         let pending_after = self.pending_evictions.lock().len();
         if allocator_candidate_count != 0 || released != 0 || pending_before != pending_after {
             debug!(
@@ -1963,10 +2388,8 @@ impl StorageOwnerState {
                 "bounded eviction guard reconciliation completed"
             );
         }
-        self.stale_candidate_reconcile_completed_at_ms.store(
-            now_ms(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.stale_candidate_reconcile_completed_at_ms
+            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         Ok(released)
     }
 
@@ -1983,7 +2406,9 @@ impl StorageOwnerState {
             return Ok(0);
         }
         for candidate in candidates {
-            if current.is_some_and(|route| route_references_clock_entry(route, &self.runtime, &candidate)) {
+            if current
+                .is_some_and(|route| route_references_clock_entry(route, &self.runtime, &candidate))
+            {
                 continue;
             }
             self.begin_historical_candidate_confirmation(&candidate);
@@ -2042,7 +2467,7 @@ impl StorageOwnerState {
         self.evict_route_replica(victim, &route, replica_index, delete_empty_route)
     }
 
-    pub(in super) fn has_local_cold_tier_work(&self) -> bool {
+    pub(super) fn has_local_cold_tier_work(&self) -> bool {
         cold_tier::cold_tier_enabled() && self.cold_tier_devices.has_any_local_backend()
     }
 
@@ -2063,7 +2488,11 @@ impl StorageOwnerState {
             .has_usable_device(self.metadata.as_ref())
     }
 
-    fn replica_index_for_victim(&self, route: &ObjectRoute, victim: &ClockEntryId) -> Option<usize> {
+    fn replica_index_for_victim(
+        &self,
+        route: &ObjectRoute,
+        victim: &ClockEntryId,
+    ) -> Option<usize> {
         route.replicas.iter().position(|replica| {
             replica.owner == self.runtime
                 && replica.segment_name == victim.segment_name
@@ -2088,7 +2517,8 @@ impl StorageOwnerState {
         replica_index: usize,
         delete_empty_route: bool,
     ) -> Result<bool> {
-        let next = cold_tier::route_after_replica_eviction(route, replica_index, delete_empty_route);
+        let next =
+            cold_tier::route_after_replica_eviction(route, replica_index, delete_empty_route);
         self.evict_route_replica_with_next(victim, route, replica_index, next)
     }
 
@@ -2103,9 +2533,10 @@ impl StorageOwnerState {
             return Ok(false);
         };
         let cas = match next.as_ref() {
-            Some(next_route) => self
-                .route_ops
-                .prune_route(&route.key, Some(route.version), next_route),
+            Some(next_route) => {
+                self.route_ops
+                    .prune_route(&route.key, Some(route.version), next_route)
+            }
             None => self.route_ops.delete_route(&route.key, Some(route.version)),
         };
         match cas {
@@ -2115,7 +2546,10 @@ impl StorageOwnerState {
                 Ok(false)
             }
             Err(error) => {
-                self.defer_pending_eviction(&token.identity, PendingEvictionPhase::PendingConfirmation);
+                self.defer_pending_eviction(
+                    &token.identity,
+                    PendingEvictionPhase::PendingConfirmation,
+                );
                 registry::record_eviction_guard_event("route_cas", "outcome_unknown");
                 debug!(
                     runtime = %self.runtime,
@@ -2170,6 +2604,9 @@ impl StorageOwnerState {
                 .mark_hot_keys(std::slice::from_ref(&route.key));
             return Ok(None);
         }
+        if self.delete_pending_contains(&identity) {
+            return Ok(None);
+        }
         let token = EvictionToken {
             identity: identity.clone(),
             kind: PendingEvictionKind::RouteCas,
@@ -2199,6 +2636,7 @@ impl StorageOwnerState {
                 confirmation_attempts: 0,
                 next_attempt_at_ms: now_ms(),
                 confirmation_in_progress: false,
+                deferred: false,
             },
         );
         drop(pending);
@@ -2229,6 +2667,9 @@ impl StorageOwnerState {
             identity
         };
         if identity.allocation_id != allocation_id {
+            return;
+        }
+        if self.delete_pending_contains(&identity) {
             return;
         }
         let mut pending = self.pending_evictions.lock();
@@ -2265,6 +2706,7 @@ impl StorageOwnerState {
                 confirmation_attempts: 0,
                 next_attempt_at_ms: now_ms(),
                 confirmation_in_progress: false,
+                deferred: false,
             },
         );
         drop(pending);
@@ -2302,6 +2744,9 @@ impl StorageOwnerState {
                 return;
             }
         }
+        if self.delete_pending_contains(identity) {
+            return;
+        }
         let mut pending = self.pending_evictions.lock();
         if pending.contains_key(identity) {
             return;
@@ -2325,6 +2770,7 @@ impl StorageOwnerState {
                 confirmation_attempts: 0,
                 next_attempt_at_ms: now_ms(),
                 confirmation_in_progress: false,
+                deferred: false,
             },
         );
         drop(pending);
@@ -2474,7 +2920,7 @@ impl StorageOwnerState {
     }
 
     fn defer_pending_eviction(&self, identity: &AllocationIdentity, phase: PendingEvictionPhase) {
-        {
+        let (attempts, retry_limit, became_deferred) = {
             let mut pending = self.pending_evictions.lock();
             let Some(entry) = pending.get_mut(identity) else {
                 return;
@@ -2494,6 +2940,23 @@ impl StorageOwnerState {
                     .min(PENDING_EVICTION_RETRY_MAX_MS)
             };
             entry.next_attempt_at_ms = now_ms().saturating_add(delay_ms);
+            let became_deferred = entry.confirmation_attempts >= retry_limit && !entry.deferred;
+            if became_deferred {
+                entry.deferred = true;
+            }
+            (entry.confirmation_attempts, retry_limit, became_deferred)
+        };
+        if became_deferred {
+            warn!(
+                runtime = %self.runtime,
+                segment = %identity.segment_name.0,
+                offset_bytes = identity.offset_bytes,
+                length_bytes = identity.length_bytes,
+                allocation_id = identity.allocation_id,
+                attempts,
+                retry_limit,
+                "reclaim pending remains deferred after bounded retries"
+            );
         }
         self.record_pending_eviction_metrics();
     }
@@ -2519,7 +2982,9 @@ impl StorageOwnerState {
         let mut committed = 0usize;
         for (token, phase) in work {
             match phase {
-                PendingEvictionPhase::Prepared => unreachable!("prepared tokens are not worker work"),
+                PendingEvictionPhase::Prepared => {
+                    unreachable!("prepared tokens are not worker work")
+                }
                 PendingEvictionPhase::ReadyToCommit => {
                     if self.commit_eviction(&token)? {
                         committed = committed.saturating_add(1);
@@ -2651,7 +3116,8 @@ impl StorageOwnerState {
                             if matches!(
                                 references.as_slice(),
                                 [mooncake_store_core::AllocationRouteReferenceState::Exact]
-                            ) => {
+                            ) =>
+                        {
                             self.defer_pending_eviction(
                                 &token.identity,
                                 PendingEvictionPhase::PendingAllocationConfirmation,
@@ -2674,7 +3140,8 @@ impl StorageOwnerState {
                             if matches!(
                                 references.as_slice(),
                                 [mooncake_store_core::AllocationRouteReferenceState::Conflict]
-                            ) => {
+                            ) =>
+                        {
                             self.defer_pending_eviction(
                                 &token.identity,
                                 PendingEvictionPhase::PendingAllocationConfirmation,
@@ -2738,8 +3205,17 @@ impl StorageOwnerState {
         Ok(committed)
     }
 
-    pub(in super) fn current_materialized_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {
-        let Some(route) = self.route_ops.load_routes_bounded(std::slice::from_ref(key))?.into_iter().next().flatten() else {
+    pub(super) fn current_materialized_route(
+        &self,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectRoute>> {
+        let Some(route) = self
+            .route_ops
+            .load_routes_bounded(std::slice::from_ref(key))?
+            .into_iter()
+            .next()
+            .flatten()
+        else {
             self.hot_replicas.remove_key(key);
             return Ok(None);
         };
@@ -2905,7 +3381,11 @@ impl StorageClockState {
     }
 
     fn untrack_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
-        for replica in route.replicas.iter().filter(|replica| replica.owner == *runtime) {
+        for replica in route
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner == *runtime)
+        {
             self.remove_id(&ClockEntryId {
                 route_key: route.key.clone(),
                 segment_name: replica.segment_name.clone(),
@@ -3015,7 +3495,10 @@ impl StorageClockState {
         }
     }
 
-    fn pick_victim_clock(&mut self, preferred_segment: Option<&SegmentName>) -> Option<ClockEntryId> {
+    fn pick_victim_clock(
+        &mut self,
+        preferred_segment: Option<&SegmentName>,
+    ) -> Option<ClockEntryId> {
         if self.entries.is_empty() {
             return None;
         }
@@ -3134,14 +3617,16 @@ impl StorageClockState {
             .iter()
             .filter_map(Option::as_ref)
             .filter_map(|entry| {
-                entry.id.allocation_id.filter(|allocation_id| *allocation_id != 0).map(
-                    |allocation_id| AllocationIdentity {
+                entry
+                    .id
+                    .allocation_id
+                    .filter(|allocation_id| *allocation_id != 0)
+                    .map(|allocation_id| AllocationIdentity {
                         segment_name: entry.id.segment_name.clone(),
                         offset_bytes: entry.id.segment_offset,
                         length_bytes: entry.length_bytes,
                         allocation_id,
-                    },
-                )
+                    })
             })
             .collect()
     }
@@ -3302,9 +3787,7 @@ fn watermark_bytes(capacity_bytes: u64, percent: u8) -> u64 {
     if percent == 0 || capacity_bytes == 0 {
         return 0;
     }
-    capacity_bytes
-        .saturating_mul(percent as u64)
-        .div_ceil(100)
+    capacity_bytes.saturating_mul(percent as u64).div_ceil(100)
 }
 
 fn remote_segment_cache_refreshable(error: &StoreError) -> bool {
