@@ -15,6 +15,7 @@ use mooncake_store_route::{
 use std::time::{Duration, Instant};
 
 const SLOW_CONTROL_REQUEST_LOG_THRESHOLD: Duration = Duration::from_millis(1000);
+const MAX_ALLOCATION_REFERENCE_QUERY_BATCH: usize = 64;
 
 pub(crate) struct ControlPlaneHandle {
     address: String,
@@ -623,6 +624,52 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 routes: Vec::new(),
                 error: Some(pb_error(error)),
                 next_cursor: None,
+            },
+        };
+        Ok(Response::new(reply))
+    }
+
+    async fn get_allocation_route_references(
+        &self,
+        request: Request<pb::GetAllocationRouteReferencesRequest>,
+    ) -> std::result::Result<Response<pb::GetAllocationRouteReferencesReply>, Status> {
+        let request = request.into_inner();
+        if request.identities.len() > MAX_ALLOCATION_REFERENCE_QUERY_BATCH {
+            return Err(Status::invalid_argument(format!(
+                "allocation reference query exceeds the {} item batch limit",
+                MAX_ALLOCATION_REFERENCE_QUERY_BATCH
+            )));
+        }
+        let identities = request
+            .identities
+            .into_iter()
+            .map(try_allocation_route_identity)
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let route_request = RouteControlRequest::GetAllocationReferences {
+            namespace: request.namespace,
+            authority: ClientStableId::new(request.authority),
+            identities,
+        };
+        let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
+            Ok(RouteControlResponse::AllocationReferences(references)) => {
+                pb::GetAllocationRouteReferencesReply {
+                    references: references
+                        .into_iter()
+                        .map(pb_allocation_reference_state)
+                        .collect(),
+                    error: None,
+                }
+            }
+            Ok(_) => pb::GetAllocationRouteReferencesReply {
+                references: Vec::new(),
+                error: Some(pb_error(StoreError::Transport(
+                    "control plane returned a non-allocation-reference response".to_string(),
+                ))),
+            },
+            Err(error) => pb::GetAllocationRouteReferencesReply {
+                references: Vec::new(),
+                error: Some(pb_error(error)),
             },
         };
         Ok(Response::new(reply))

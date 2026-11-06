@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result,
-    RouteCasRequest, StoreError,
+    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
+    ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest, StoreError,
 };
 
 use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteOwnerPage};
@@ -36,6 +36,11 @@ pub enum RouteControlRequest {
         cursor: Option<String>,
         limit: usize,
     },
+    GetAllocationReferences {
+        namespace: String,
+        authority: ClientStableId,
+        identities: Vec<AllocationRouteIdentity>,
+    },
 }
 
 impl RouteControlRequest {
@@ -46,6 +51,7 @@ impl RouteControlRequest {
             Self::BatchCompareAndSwap { .. } => "control_route_batch_cas",
             Self::BatchReplace { .. } => "control_route_batch_replace",
             Self::ListByReplicaOwner { .. } => "control_route_list_by_replica_owner",
+            Self::GetAllocationReferences { .. } => "control_route_get_allocation_references",
         }
     }
 
@@ -56,6 +62,7 @@ impl RouteControlRequest {
                 requests.len()
             }
             Self::ListByReplicaOwner { .. } => 1,
+            Self::GetAllocationReferences { identities, .. } => identities.len(),
         }
     }
 
@@ -73,6 +80,9 @@ impl RouteControlRequest {
             Self::BatchReplace { requests, .. } if requests.is_empty() => {
                 Some(RouteControlResponse::BatchReplace(Vec::new()))
             }
+            Self::GetAllocationReferences { identities, .. } if identities.is_empty() => {
+                Some(RouteControlResponse::AllocationReferences(Vec::new()))
+            }
             _ => None,
         }
     }
@@ -85,6 +95,7 @@ pub enum RouteControlResponse {
     BatchCompareAndSwap(Vec<Result<CasResult>>),
     BatchReplace(Vec<Result<()>>),
     ListByReplicaOwner(RouteOwnerPage),
+    AllocationReferences(Vec<AllocationRouteReferenceState>),
 }
 
 pub trait RouteControlTransport: Send + Sync {
@@ -143,6 +154,13 @@ pub fn serve_route_control_request(
                 limit,
             )
             .map(RouteControlResponse::ListByReplicaOwner),
+        RouteControlRequest::GetAllocationReferences {
+            namespace,
+            authority,
+            identities,
+        } => service
+            .get_allocation_route_references(&namespace, &authority, &identities)
+            .map(RouteControlResponse::AllocationReferences),
     }
 }
 
@@ -157,6 +175,35 @@ impl RouteControlAuthorityClient {
 }
 
 impl RouteAuthorityClient for RouteControlAuthorityClient {
+    fn get_allocation_route_references(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.transport.send_route_control(
+            lease,
+            RouteControlRequest::GetAllocationReferences {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                identities: identities.to_vec(),
+            },
+        )?;
+        let RouteControlResponse::AllocationReferences(references) = response else {
+            return unexpected_response("get_allocation_route_references");
+        };
+        ensure_batch_len(
+            "get_allocation_route_references",
+            identities.len(),
+            references.len(),
+        )?;
+        Ok(references)
+    }
+
     fn batch_contains_routes(
         &self,
         lease: &ClientLease,

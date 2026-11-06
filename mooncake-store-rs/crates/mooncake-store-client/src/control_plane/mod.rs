@@ -5,9 +5,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mooncake_store_core::{
-    CasResult, ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId, CompatibilityDescriptor,
-    ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteVersion,
-    SegmentName, SegmentReservation, SegmentTargetChunk, StoreError, CONTROL_ADDR_LABEL,
+    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientEpoch, ClientLease,
+    ClientRuntimeId, ClientStableId, CompatibilityDescriptor, ObjectKey, ObjectRoute, ReplicaRoute,
+    ReplicaTier, Result, RouteCasRequest, RouteVersion, SegmentName, SegmentReservation,
+    SegmentTargetChunk, StoreError, CONTROL_ADDR_LABEL,
 };
 use parking_lot::Mutex;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};

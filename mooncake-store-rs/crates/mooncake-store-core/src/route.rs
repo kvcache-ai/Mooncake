@@ -191,6 +191,46 @@ pub struct SegmentReservation {
     pub allocation_id: u64,
 }
 
+/// Identifies one allocator generation that may be referenced by a route.
+///
+/// A zero allocation id is intentionally not representable as a reclaimable
+/// identity. Callers must retain legacy replicas without a generation fence.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct AllocationRouteIdentity {
+    pub owner: ClientRuntimeId,
+    pub segment_name: SegmentName,
+    pub offset_bytes: u64,
+    pub length_bytes: u64,
+    pub allocation_id: u64,
+}
+
+impl AllocationRouteIdentity {
+    /// Matches the physical allocation start. A length or generation mismatch
+    /// at the same start is a conflict, never proof that the allocation is absent.
+    pub fn matches_replica_start(&self, replica: &ReplicaRoute) -> bool {
+        self.owner == replica.owner
+            && self.segment_name == replica.segment_name
+            && self.offset_bytes == replica.segment_offset
+    }
+
+    pub fn matches_replica(&self, replica: &ReplicaRoute) -> bool {
+        self.matches_replica_start(replica)
+            && self.length_bytes == replica.length
+            && replica.allocation_id == Some(self.allocation_id)
+    }
+}
+
+/// One authority's payload-free observation for an allocation identity.
+///
+/// `Conflict` includes a different generation or length at the same physical
+/// allocation start. Reclaim callers must treat it the same as a live reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AllocationRouteReferenceState {
+    Absent,
+    Exact,
+    Conflict,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CasResult {
     pub applied: bool,

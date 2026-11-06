@@ -3,8 +3,9 @@ use std::hash::Hash;
 use std::ops::Bound;
 
 use mooncake_store_core::{
-    route_reuse_identity, CasResult, ClientRuntimeId, ColdBackingState, NamespaceScope, ObjectKey,
-    ObjectRoute, ReuseIdentity, RouteCasRequest, RouteVersion,
+    route_reuse_identity, AllocationRouteIdentity, AllocationRouteReferenceState, CasResult,
+    ClientRuntimeId, ColdBackingState, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
+    Result, ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
 };
 
 use crate::metrics::record_cas_outcome;
@@ -21,9 +22,39 @@ fn route_has_materialized_cold_backing(route: &ObjectRoute) -> bool {
 pub(crate) struct LocalRouteTable {
     routes: HashMap<String, ObjectRoute>,
     owner_index: HashMap<ClientRuntimeId, BTreeSet<String>>,
+    allocation_start_index: HashMap<AllocationRouteStart, BTreeSet<String>>,
     scope_index: HashMap<NamespaceScope, HashSet<String>>,
     reuse_index: HashMap<ReuseIdentity, HashSet<String>>,
     version_floors: HashMap<String, RouteVersion>,
+}
+
+/// The reverse index intentionally omits length and generation. Any route at
+/// the same physical start with a different identity must block reclamation.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct AllocationRouteStart {
+    owner: ClientRuntimeId,
+    segment_name: mooncake_store_core::SegmentName,
+    offset_bytes: u64,
+}
+
+impl From<&AllocationRouteIdentity> for AllocationRouteStart {
+    fn from(identity: &AllocationRouteIdentity) -> Self {
+        Self {
+            owner: identity.owner.clone(),
+            segment_name: identity.segment_name.clone(),
+            offset_bytes: identity.offset_bytes,
+        }
+    }
+}
+
+impl From<&ReplicaRoute> for AllocationRouteStart {
+    fn from(replica: &ReplicaRoute) -> Self {
+        Self {
+            owner: replica.owner.clone(),
+            segment_name: replica.segment_name.clone(),
+            offset_bytes: replica.segment_offset,
+        }
+    }
 }
 
 impl LocalRouteTable {
@@ -83,6 +114,56 @@ impl LocalRouteTable {
 
     pub(crate) fn list_routes(&self) -> Vec<ObjectRoute> {
         self.routes.values().cloned().collect()
+    }
+
+    pub(crate) fn allocation_route_references(
+        &self,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        identities
+            .iter()
+            .map(|identity| {
+                if identity.allocation_id == 0 {
+                    return Ok(AllocationRouteReferenceState::Conflict);
+                }
+                let Some(keys) = self
+                    .allocation_start_index
+                    .get(&AllocationRouteStart::from(identity))
+                else {
+                    return Ok(AllocationRouteReferenceState::Absent);
+                };
+                let mut saw_exact = false;
+                for key in keys {
+                    let route = self.routes.get(key).ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "allocation reverse index references missing route {key}"
+                        ))
+                    })?;
+                    let mut route_has_start = false;
+                    for replica in route
+                        .replicas
+                        .iter()
+                        .filter(|replica| identity.matches_replica_start(replica))
+                    {
+                        route_has_start = true;
+                        if !identity.matches_replica(replica) {
+                            return Ok(AllocationRouteReferenceState::Conflict);
+                        }
+                        saw_exact = true;
+                    }
+                    if !route_has_start {
+                        return Err(StoreError::InvalidState(format!(
+                            "allocation reverse index route {key} does not reference the indexed start"
+                        )));
+                    }
+                }
+                Ok(if saw_exact {
+                    AllocationRouteReferenceState::Exact
+                } else {
+                    AllocationRouteReferenceState::Conflict
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn list_by_replica_owner_page(
@@ -246,6 +327,17 @@ impl LocalRouteTable {
                 .or_default()
                 .insert(key.0.clone());
         }
+        for start in route
+            .replicas
+            .iter()
+            .map(AllocationRouteStart::from)
+            .collect::<BTreeSet<_>>()
+        {
+            self.allocation_start_index
+                .entry(start)
+                .or_default()
+                .insert(key.0.clone());
+        }
         if let Some(scope) = route.namespace.clone() {
             self.scope_index
                 .entry(scope)
@@ -268,6 +360,14 @@ impl LocalRouteTable {
             .collect::<BTreeSet<_>>()
         {
             remove_ordered_index_key(&mut self.owner_index, &owner, key.0.as_str());
+        }
+        for start in route
+            .replicas
+            .iter()
+            .map(AllocationRouteStart::from)
+            .collect::<BTreeSet<_>>()
+        {
+            remove_ordered_index_key(&mut self.allocation_start_index, &start, key.0.as_str());
         }
         if let Some(scope) = route.namespace.as_ref() {
             remove_index_key(&mut self.scope_index, scope, key.0.as_str());
@@ -479,5 +579,58 @@ mod tests {
             .routes
             .is_empty());
         assert!(!table.owner_index.contains_key(&owner));
+    }
+
+    #[test]
+    fn allocation_reverse_index_fails_closed_on_same_start_generation_or_length_change() {
+        let key = ObjectKey::new("route-allocation-reference".to_string());
+        let mut route = test_route(&key, 1);
+        route.replicas[0].allocation_id = Some(7);
+        let identity = AllocationRouteIdentity {
+            owner: route.replicas[0].owner.clone(),
+            segment_name: route.replicas[0].segment_name.clone(),
+            offset_bytes: route.replicas[0].segment_offset,
+            length_bytes: route.replicas[0].length,
+            allocation_id: 7,
+        };
+        let mut table = LocalRouteTable::default();
+        table.replace(&key, Some(&route));
+
+        assert_eq!(
+            table
+                .allocation_route_references(std::slice::from_ref(&identity))
+                .expect("exact generation should be indexed"),
+            vec![AllocationRouteReferenceState::Exact]
+        );
+
+        let mut replacement = route.clone();
+        replacement.version = RouteVersion(2);
+        replacement.replicas[0].allocation_id = Some(8);
+        table.replace(&key, Some(&replacement));
+        assert_eq!(
+            table
+                .allocation_route_references(std::slice::from_ref(&identity))
+                .expect("new generation at the same start must block reclaim"),
+            vec![AllocationRouteReferenceState::Conflict]
+        );
+
+        replacement.replicas[0].allocation_id = Some(7);
+        replacement.replicas[0].length = 99;
+        replacement.version = RouteVersion(3);
+        table.replace(&key, Some(&replacement));
+        assert_eq!(
+            table
+                .allocation_route_references(std::slice::from_ref(&identity))
+                .expect("length change at the same start must block reclaim"),
+            vec![AllocationRouteReferenceState::Conflict]
+        );
+
+        table.replace(&key, None);
+        assert_eq!(
+            table
+                .allocation_route_references(&[identity])
+                .expect("removed route should be absent"),
+            vec![AllocationRouteReferenceState::Absent]
+        );
     }
 }

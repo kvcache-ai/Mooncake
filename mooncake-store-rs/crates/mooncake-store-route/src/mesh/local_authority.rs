@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use mooncake_store_core::{
-    CasResult, ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest,
-    RouteVersion,
+    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientRuntimeId,
+    ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest, RouteVersion,
 };
 
 use super::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
-    authority_get, authority_get_many, authority_list_routes,
-    authority_list_routes_by_replica_owner, authority_list_routes_by_replica_owner_page,
-    authority_replace, authority_replace_many, bind_local_authority_service,
+    authority_get, authority_get_allocation_route_references, authority_get_many,
+    authority_list_routes, authority_list_routes_by_replica_owner,
+    authority_list_routes_by_replica_owner_page, authority_replace, authority_replace_many,
+    bind_local_authority_service,
 };
 use crate::shim::RouteAuthorityService;
 use crate::RouteOwnerPage;
@@ -46,6 +47,13 @@ impl LocalRouteAuthority {
 
     pub fn list_routes(&self) -> Result<Vec<ObjectRoute>> {
         authority_list_routes(&self.namespace, &self.authority)
+    }
+
+    pub fn get_allocation_route_references(
+        &self,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReferenceState>> {
+        authority_get_allocation_route_references(&self.namespace, &self.authority, identities)
     }
 
     pub fn list_routes_by_replica_owner(

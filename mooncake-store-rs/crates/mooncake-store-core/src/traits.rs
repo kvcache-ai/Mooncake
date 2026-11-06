@@ -9,7 +9,7 @@ use crate::identity::{
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
 use crate::nof::NofBackingRouteFilter;
 use crate::route::{
-    CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
+    CasResult, ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
     SegmentReservation, TenantObjectAccounting, TenantPolicy, TenantPolicyScope,
     TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
@@ -17,6 +17,17 @@ use crate::route::{
     TenantQuotaState,
 };
 use std::sync::Arc;
+
+/// Result of an exact replica-reference confirmation for one object key.
+///
+/// `Absent` is only valid when the directory has checked every authority that
+/// can currently serve the key. Callers must treat a directory error as an
+/// indeterminate result and retain the local allocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RouteReplicaReference {
+    Referenced(Box<ObjectRoute>),
+    Absent,
+}
 
 pub trait MetadataBackend: Send + Sync {
     fn route_namespace(&self) -> String;
@@ -467,6 +478,33 @@ pub trait RouteDirectory: Send + Sync {
             .into_iter()
             .map(|r| r.is_some())
             .collect())
+    }
+
+    /// Proves whether any currently serving authority still references the
+    /// exact replica. The default is deliberately unsupported: a canonical
+    /// route read cannot prove absence when authorities may diverge.
+    fn confirm_replica_reference(
+        &self,
+        _observer: &ClientLease,
+        _key: &ObjectKey,
+        _replica: &ReplicaRoute,
+    ) -> Result<RouteReplicaReference> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not support exact replica confirmation".to_string(),
+        ))
+    }
+
+    /// Classifies allocator candidates across all currently serving route
+    /// authorities. `Absent` is returned only when every authority agrees;
+    /// transport errors, membership changes, and divergent answers fail closed.
+    fn get_allocation_route_references_consistent(
+        &self,
+        _observer: &ClientLease,
+        _identities: &[crate::route::AllocationRouteIdentity],
+    ) -> Result<Vec<crate::route::AllocationRouteReferenceState>> {
+        Err(crate::error::StoreError::Unsupported(
+            "route directory does not provide allocation reference queries".to_string(),
+        ))
     }
 
     fn compare_and_swap_object_route(

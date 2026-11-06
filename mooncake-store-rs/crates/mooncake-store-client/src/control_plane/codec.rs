@@ -93,6 +93,82 @@ pub(super) fn try_runtime_id(runtime: &pb::ClientRuntimeId) -> Result<ClientRunt
     })
 }
 
+pub(super) fn pb_allocation_route_identity(
+    identity: &AllocationRouteIdentity,
+) -> pb::AllocationRouteIdentity {
+    pb::AllocationRouteIdentity {
+        owner: Some(pb_runtime_id(&identity.owner)),
+        segment_name: identity.segment_name.0.clone(),
+        offset_bytes: identity.offset_bytes,
+        length_bytes: identity.length_bytes,
+        allocation_id: identity.allocation_id,
+    }
+}
+
+pub(super) fn try_allocation_route_identity(
+    identity: pb::AllocationRouteIdentity,
+) -> Result<AllocationRouteIdentity> {
+    let owner = identity
+        .owner
+        .as_ref()
+        .map(try_runtime_id)
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::Transport("allocation reference identity is missing owner".to_string())
+        })?;
+    if identity.segment_name.trim().is_empty()
+        || identity.length_bytes == 0
+        || identity.allocation_id == 0
+    {
+        return Err(StoreError::Transport(
+            "allocation reference identity is invalid".to_string(),
+        ));
+    }
+    Ok(AllocationRouteIdentity {
+        owner,
+        segment_name: SegmentName::new(identity.segment_name),
+        offset_bytes: identity.offset_bytes,
+        length_bytes: identity.length_bytes,
+        allocation_id: identity.allocation_id,
+    })
+}
+
+pub(super) fn pb_allocation_reference_state(
+    state: AllocationRouteReferenceState,
+) -> pb::AllocationRouteReferenceState {
+    let state = match state {
+        AllocationRouteReferenceState::Absent => {
+            pb::allocation_route_reference_state::State::Absent(true)
+        }
+        AllocationRouteReferenceState::Exact => {
+            pb::allocation_route_reference_state::State::Exact(true)
+        }
+        AllocationRouteReferenceState::Conflict => {
+            pb::allocation_route_reference_state::State::Conflict(true)
+        }
+    };
+    pb::AllocationRouteReferenceState { state: Some(state) }
+}
+
+pub(super) fn try_allocation_reference_state(
+    state: pb::AllocationRouteReferenceState,
+) -> Result<AllocationRouteReferenceState> {
+    match state.state {
+        Some(pb::allocation_route_reference_state::State::Absent(true)) => {
+            Ok(AllocationRouteReferenceState::Absent)
+        }
+        Some(pb::allocation_route_reference_state::State::Exact(true)) => {
+            Ok(AllocationRouteReferenceState::Exact)
+        }
+        Some(pb::allocation_route_reference_state::State::Conflict(true)) => {
+            Ok(AllocationRouteReferenceState::Conflict)
+        }
+        _ => Err(StoreError::Transport(
+            "allocation reference reply contains an invalid state".to_string(),
+        )),
+    }
+}
+
 pub(super) fn pb_compatibility(
     descriptor: &CompatibilityDescriptor,
 ) -> pb::CompatibilityDescriptor {

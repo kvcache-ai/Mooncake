@@ -17,6 +17,7 @@ service ControlPlaneService {
   rpc Release(ReleaseRequest) returns (ReleaseReply);
   rpc BatchRelease(BatchReleaseRequest) returns (BatchReleaseReply);
   rpc ListRoutesByReplicaOwner(ListRoutesByReplicaOwnerRequest) returns (ListRoutesByReplicaOwnerReply);
+  rpc GetAllocationRouteReferences(GetAllocationRouteReferencesRequest) returns (GetAllocationRouteReferencesReply);
   rpc BatchReportRouteHits(BatchReportRouteHitsRequest) returns (BatchReportRouteHitsReply);
   rpc BatchTrackReplicaRoutes(BatchTrackReplicaRoutesRequest) returns (BatchTrackReplicaRoutesReply);
   rpc SubmitMigrationTask(SubmitMigrationTaskRequest) returns (SubmitMigrationTaskReply);
@@ -360,6 +361,33 @@ message ListRoutesByReplicaOwnerReply {
   repeated ObjectRoute routes = 1;
   ErrorDetail error = 2;
   optional string next_cursor = 3;
+}
+
+message AllocationRouteIdentity {
+  ClientRuntimeId owner = 1;
+  string segment_name = 2;
+  uint64 offset_bytes = 3;
+  uint64 length_bytes = 4;
+  uint64 allocation_id = 5;
+}
+
+message AllocationRouteReferenceState {
+  oneof state {
+    bool absent = 1;
+    bool exact = 2;
+    bool conflict = 3;
+  }
+}
+
+message GetAllocationRouteReferencesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated AllocationRouteIdentity identities = 3;
+}
+
+message GetAllocationRouteReferencesReply {
+  repeated AllocationRouteReferenceState references = 1;
+  ErrorDetail error = 2;
 }
 
 message BatchReportRouteHitsRequest {
