@@ -1579,6 +1579,11 @@ impl StoreClient {
                 },
             ) {
                 Ok(next) => {
+                    refresh_live_client_cache(
+                        self.metadata.as_ref(),
+                        &self.live_client_cache,
+                        "live_client_snapshot_after_drain_route_publish",
+                    )?;
                     writer.ensure_object_route_at_least(&next)?;
                     if let Err(error) = self.reclaim_route(&confirmed, ReclaimMode::Immediate) {
                         warn!(
@@ -1691,6 +1696,11 @@ impl StoreClient {
                 },
             ) {
                 Ok(next) => {
+                    refresh_live_client_cache(
+                        self.metadata.as_ref(),
+                        &self.live_client_cache,
+                        "live_client_snapshot_after_drain_route_publish",
+                    )?;
                     writer.ensure_object_route_at_least(&next)?;
                     if let Err(error) = self.reclaim_route(&confirmed, ReclaimMode::Immediate) {
                         warn!(
