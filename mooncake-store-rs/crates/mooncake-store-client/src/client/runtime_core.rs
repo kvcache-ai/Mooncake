@@ -578,6 +578,30 @@ impl StoreClient {
         }
     }
 
+    fn lookup_runtime_lease_for_release_once(
+        &self,
+        runtime: &ClientRuntimeId,
+        force_refresh: bool,
+    ) -> Result<ClientLease> {
+        self.compatible_live_clients(force_refresh)?
+            .into_iter()
+            .find(|lease| lease.runtime == *runtime)
+            .ok_or_else(|| StoreError::NotFound(format!("runtime {} is not available", runtime)))
+    }
+
+    fn lookup_runtime_lease_for_release(
+        &self,
+        runtime: &ClientRuntimeId,
+    ) -> Result<ClientLease> {
+        match self.lookup_runtime_lease_for_release_once(runtime, false) {
+            Ok(lease) => Ok(lease),
+            Err(StoreError::NotFound(_)) => {
+                self.lookup_runtime_lease_for_release_once(runtime, true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn transport_open_segment_name<'a>(
         segment_name: &'a SegmentName,
         transport_endpoint: Option<&'a str>,
@@ -654,7 +678,7 @@ impl StoreClient {
         force_refresh: bool,
     ) -> Result<BTreeMap<ClientRuntimeId, ClientLease>> {
         let mut leases = BTreeMap::new();
-        for lease in self.available_compatible_live_clients(force_refresh)? {
+        for lease in self.compatible_live_clients(force_refresh)? {
             if !wanted.contains(&lease.runtime) {
                 continue;
             }

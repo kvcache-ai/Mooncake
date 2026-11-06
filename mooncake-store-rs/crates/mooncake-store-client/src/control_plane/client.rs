@@ -1023,6 +1023,7 @@ impl ControlPlaneClient {
                         segment_name: request.segment_name.0.clone(),
                         offset_bytes: request.offset_bytes,
                         length_bytes: request.length_bytes,
+                        allocation_id: request.allocation_id,
                     })
                     .collect(),
             };

@@ -886,6 +886,7 @@ fn managed_nof_hot_replica_owner_writes_for_remote_target_owner() {
     let mut reassigned = route.clone();
     reassigned.version = route.version.next();
     reassigned.replicas.push(ReplicaRoute {
+            allocation_id: None,
         owner: non_writer.runtime_id().clone(),
         segment_name: SegmentName::new("nof-managed-stale-writer-segment"),
         offset: None,

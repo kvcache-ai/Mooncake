@@ -50,6 +50,7 @@ pub(crate) trait AllocatorService: Send + Sync {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> Result<()>;
 
     fn batch_reserve_any(
@@ -85,6 +86,7 @@ pub(crate) trait AllocatorService: Send + Sync {
                     &request.segment_name,
                     request.offset_bytes,
                     request.length_bytes,
+                    request.allocation_id,
                 )
             })
             .collect()
@@ -149,6 +151,7 @@ pub(crate) struct ReleaseOp {
     pub segment_name: SegmentName,
     pub offset_bytes: u64,
     pub length_bytes: u64,
+    pub allocation_id: u64,
 }
 
 pub(crate) struct ControlPlaneClient {

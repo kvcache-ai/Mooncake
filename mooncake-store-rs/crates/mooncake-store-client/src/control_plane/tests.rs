@@ -168,6 +168,7 @@ impl AllocatorService for TestAllocator {
             segment_name: SegmentName::new("auto-segment"),
             offset_bytes,
             length_bytes,
+            allocation_id: offset_bytes.saturating_add(1),
         })
     }
 
@@ -182,6 +183,7 @@ impl AllocatorService for TestAllocator {
             segment_name: segment_name.clone(),
             offset_bytes: 4_096,
             length_bytes,
+            allocation_id: 4_097,
         })
     }
 
@@ -191,11 +193,13 @@ impl AllocatorService for TestAllocator {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> mooncake_store_core::Result<()> {
         self.released.lock().push(ReleaseOp {
             segment_name: segment_name.clone(),
             offset_bytes,
             length_bytes,
+            allocation_id,
         });
         Ok(())
     }
@@ -1190,6 +1194,7 @@ fn sample_route(key: &str, version: u64, owner: &ClientRuntimeId) -> ObjectRoute
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: SegmentName::new("segment-a"),
+            allocation_id: Some(73),
             offset: Some(128),
             segment_offset: 128,
             length: 16,
@@ -1406,11 +1411,16 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
                 segment_name: SegmentName::new("segment-c"),
                 offset_bytes: 4_096,
                 length_bytes: 48,
+                allocation_id: batch_specific[0]
+                    .as_ref()
+                    .expect("batch reserve_specific should return a reservation")
+                    .allocation_id,
             }],
         )
         .expect("batch release should succeed");
     assert!(release_results[0].is_ok());
     assert_eq!(allocator.released.lock().len(), 1);
+    assert_eq!(allocator.released.lock()[0].allocation_id, 4_097);
 
     client.clear_channels();
     assert_eq!(client.active_stream_sessions(), 0);
@@ -1847,6 +1857,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
         segment_name: SegmentName::new("segment-r"),
         offset_bytes: 7,
         length_bytes: 11,
+        allocation_id: 99,
     };
     assert_eq!(
         try_segment_reservation(pb_segment_reservation(&reservation))
@@ -1857,6 +1868,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let replica_error = try_replica_route(pb::ReplicaRoute {
         owner: None,
         segment_name: "segment-a".to_string(),
+        allocation_id: None,
         offset: Some(0),
         segment_offset: 0,
         length: 1,
@@ -1925,6 +1937,7 @@ fn object_route_round_trip_preserves_namespace_fields() {
         replicas: vec![ReplicaRoute {
             owner,
             segment_name: SegmentName::new("segment-a"),
+            allocation_id: Some(91),
             offset: Some(128),
             segment_offset: 64,
             length: 16,
@@ -2208,6 +2221,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 segment_name: "segment-a".to_string(),
                 offset_bytes: 0,
                 length_bytes: 8,
+                allocation_id: 0,
             }))
             .await
             .expect("release should reply")
@@ -2221,6 +2235,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                     segment_name: "segment-a".to_string(),
                     offset_bytes: 0,
                     length_bytes: 8,
+                    allocation_id: 0,
                 }],
             }))
             .await
@@ -2481,11 +2496,16 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
                 segment_name: SegmentName::new("segment-z"),
                 offset_bytes: 4_096,
                 length_bytes: 24,
+                allocation_id: reserve_specific[0]
+                    .as_ref()
+                    .expect("fallback reserve_specific should return a reservation")
+                    .allocation_id,
             }],
         )
         .expect("fallback release should succeed");
     assert!(release[0].is_ok());
     assert_eq!(allocator.released.lock().len(), 1);
+    assert_eq!(allocator.released.lock()[0].allocation_id, 4_097);
 
     assert_eq!(
         client

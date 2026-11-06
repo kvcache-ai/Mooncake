@@ -2027,6 +2027,7 @@ impl MetadataBackend for RedisMetadataBackend {
                 segment_name: segment.clone(),
                 offset_bytes: result.1 as u64,
                 length_bytes,
+                allocation_id: 0,
             }),
             _ if result.1 == -1 => Err(StoreError::NotFound(key)),
             _ if result.1 == -2 => Err(StoreError::InvalidState(format!(
@@ -3399,6 +3400,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: sample_runtime(),
                 segment_name: SegmentName::new("segment-a"),
+                allocation_id: None,
                 offset: Some(32),
                 segment_offset: 32,
                 length: 12,

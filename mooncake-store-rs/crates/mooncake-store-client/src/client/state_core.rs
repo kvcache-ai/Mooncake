@@ -520,12 +520,19 @@ impl LocalAllocatorState {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> Result<()> {
         let segment = self
             .segments
             .get_mut(segment_name)
             .ok_or_else(|| StoreError::NotFound(format!("segment {} not found", segment_name.0)))?;
-        segment.release(owner, segment_name, offset_bytes, length_bytes)?;
+        segment.release(
+            owner,
+            segment_name,
+            offset_bytes,
+            length_bytes,
+            allocation_id,
+        )?;
         self.pending_allocations.remove(&AllocationSpan {
             segment_name: segment_name.clone(),
             offset_bytes,
@@ -626,11 +633,18 @@ impl LocalAllocatorState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SegmentAllocation {
+    length_bytes: u64,
+    allocation_id: u64,
+}
+
 struct SegmentAllocator {
     announcement: SegmentAnnouncement,
     cursor_bytes: u64,
     free_spans: FreeSpanSet,
-    allocations: BTreeMap<u64, u64>,
+    allocations: BTreeMap<u64, SegmentAllocation>,
+    next_allocation_id: u64,
 }
 
 impl SegmentAllocator {
@@ -640,6 +654,7 @@ impl SegmentAllocator {
             announcement,
             free_spans: FreeSpanSet::default(),
             allocations: BTreeMap::new(),
+            next_allocation_id: 1,
         }
     }
 
@@ -660,7 +675,7 @@ impl SegmentAllocator {
     fn contains_allocation(&self, offset_bytes: u64, length_bytes: u64) -> bool {
         self.allocations
             .get(&offset_bytes)
-            .is_some_and(|stored| *stored == length_bytes)
+            .is_some_and(|stored| stored.length_bytes == length_bytes)
     }
 
     fn remaining_capacity(&self) -> u64 {
@@ -672,12 +687,20 @@ impl SegmentAllocator {
     fn allocations(&self) -> Vec<AllocationSpan> {
         self.allocations
             .iter()
-            .map(|(offset_bytes, length_bytes)| AllocationSpan {
+            .map(|(offset_bytes, allocation)| AllocationSpan {
                 segment_name: self.announcement.segment_name.clone(),
                 offset_bytes: *offset_bytes,
-                length_bytes: *length_bytes,
+                length_bytes: allocation.length_bytes,
             })
             .collect()
+    }
+
+    fn take_allocation_id(&mut self) -> Result<u64> {
+        let allocation_id = self.next_allocation_id.max(1);
+        self.next_allocation_id = allocation_id.checked_add(1).ok_or_else(|| {
+            StoreError::Allocator("segment allocation generation exhausted".to_string())
+        })?;
+        Ok(allocation_id)
     }
 
     fn reserve(
@@ -699,6 +722,7 @@ impl SegmentAllocator {
         }
         let alignment = self.announcement.alignment_bytes.max(1);
         let reserved_len = align_up_u64(length_bytes, alignment);
+        let allocation_id = self.take_allocation_id()?;
 
         if let Some(offset_bytes) = self.free_spans.take_first_fit(reserved_len) {
             self.announcement.used_bytes = self
@@ -708,12 +732,13 @@ impl SegmentAllocator {
                 .ok_or_else(|| {
                 StoreError::Allocator("segment reservation overflow".to_string())
             })?;
-            self.allocations.insert(offset_bytes, length_bytes);
+            self.allocations.insert(offset_bytes, SegmentAllocation { length_bytes, allocation_id });
             return Ok(mooncake_store_core::SegmentReservation {
                 owner: owner.clone(),
                 segment_name: segment_name.clone(),
                 offset_bytes,
                 length_bytes,
+                allocation_id,
             });
         }
 
@@ -736,12 +761,19 @@ impl SegmentAllocator {
             .used_bytes
             .checked_add(reserved_len)
             .ok_or_else(|| StoreError::Allocator("segment reservation overflow".to_string()))?;
-        self.allocations.insert(offset, length_bytes);
+        self.allocations.insert(
+            offset,
+            SegmentAllocation {
+                length_bytes,
+                allocation_id,
+            },
+        );
         Ok(mooncake_store_core::SegmentReservation {
             owner: owner.clone(),
             segment_name: segment_name.clone(),
             offset_bytes: offset,
             length_bytes,
+            allocation_id,
         })
     }
 
@@ -751,6 +783,7 @@ impl SegmentAllocator {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> Result<()> {
         let alignment = self.announcement.alignment_bytes.max(1);
         let reserved_len = align_up_u64(length_bytes, alignment);
@@ -763,18 +796,22 @@ impl SegmentAllocator {
                 owner, segment_name.0, offset_bytes, length_bytes
             )));
         }
-        let reserved = self.allocations.remove(&offset_bytes).ok_or_else(|| {
+        let reserved = self.allocations.get(&offset_bytes).copied().ok_or_else(|| {
             StoreError::Allocator(format!(
                 "segment release missing live allocation for {}:{} offset={} len={}",
                 owner, segment_name.0, offset_bytes, length_bytes
             ))
         })?;
-        if reserved != length_bytes {
+        if reserved.length_bytes != length_bytes {
             return Err(StoreError::Allocator(format!(
                 "segment release length mismatch for {}:{} offset={} expected={} actual={}",
-                owner, segment_name.0, offset_bytes, reserved, length_bytes
+                owner, segment_name.0, offset_bytes, reserved.length_bytes, length_bytes
             )));
         }
+        if allocation_id != 0 && reserved.allocation_id != allocation_id {
+            return Err(StoreError::Allocator(format!("segment release stale allocation generation for {}:{} offset={} expected={} actual={}", owner, segment_name.0, offset_bytes, reserved.allocation_id, allocation_id)));
+        }
+        self.allocations.remove(&offset_bytes);
         self.free_spans.insert(offset_bytes, reserved_len);
         self.announcement.used_bytes = self.announcement.used_bytes.saturating_sub(reserved_len);
         self.trim_tail();
@@ -945,6 +982,7 @@ struct AllocationReleaseRequest {
     segment_name: SegmentName,
     offset_bytes: u64,
     length_bytes: u64,
+    allocation_id: u64,
 }
 
 struct PendingRoutePublish {
@@ -1017,6 +1055,7 @@ struct PendingReclaim {
     segment_name: SegmentName,
     offset_bytes: u64,
     length_bytes: u64,
+    allocation_id: u64,
     #[allow(dead_code)] // cold tier cleanup schedules SSD deletion after route removal
     cold_backing: Option<mooncake_store_core::ColdBackingRoute>,
 }

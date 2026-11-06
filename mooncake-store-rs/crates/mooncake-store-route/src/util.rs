@@ -82,11 +82,17 @@ fn append_replica_key(key: &mut String, replica: &ReplicaRoute) {
         .offset
         .map(|offset| offset.to_string())
         .unwrap_or_else(|| "legacy".to_string());
+    let allocation_id = replica
+        .allocation_id
+        .filter(|allocation_id| *allocation_id != 0)
+        .map(|allocation_id| format!("0:{allocation_id:020}"))
+        .unwrap_or_else(|| "1:legacy".to_string());
     let _ = write!(
         key,
-        "{}|{}|{}|{}|{}|{}|{}|{};",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{};",
         replica.owner,
         replica.segment_name.0,
+        allocation_id,
         offset,
         replica.segment_offset,
         replica.length,

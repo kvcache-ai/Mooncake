@@ -683,7 +683,7 @@ fn clone_restore_promotion_client(client: &StoreClient) -> StoreClient {
 
 fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) -> Result<()> {
     client.ensure_local_memory()?;
-    client.flush_due_reclaims()?;
+    client.flush_due_reclaims_best_effort();
 
     let tenant = task.object_id.scope.tenant.as_str();
     let key = task.object_id.logical_key.as_str();
@@ -745,6 +745,7 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
         .map(|(priority, target)| ReplicaRoute {
             owner: target.storage_runtime.clone(),
             segment_name: target.segment_name.clone(),
+            allocation_id: Some(reservations[priority].allocation_id),
             offset: None,
             segment_offset: reservations[priority].offset_bytes,
             length: task.payload.len() as u64,
@@ -1314,6 +1315,7 @@ fn release_owner_restore_reservation(
         &reservation.segment_name,
         reservation.offset_bytes,
         reservation.length_bytes,
+        reservation.allocation_id,
     ) {
         warn!(
             runtime = %storage_owner.runtime,
@@ -1355,6 +1357,7 @@ fn build_owner_restored_route(
     next.replicas = vec![ReplicaRoute {
         owner: storage_owner.runtime.clone(),
         segment_name: reservation.segment_name.clone(),
+        allocation_id: Some(reservation.allocation_id),
         offset: absolute_offset,
         segment_offset: reservation.offset_bytes,
         length: cold_backing.length,
