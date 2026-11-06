@@ -688,13 +688,10 @@ Status MultiTransport::mp_submitTransfer(
         return Status::NotSupportedTransport(
             "event-enabled batch does not support mp_submitTransfer");
     }
-    const bool append = !batch_desc.task_list.empty();
     batch_desc.counter_eligible = false;
     batch_desc.status_cached.store(false, std::memory_order_relaxed);
     batch_desc.is_finished.store(false, std::memory_order_relaxed);
     batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
-    (void)append;
-    syncTerminalNotify(batch_desc);
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
@@ -733,8 +730,6 @@ Status MultiTransport::mp_submitTransfer(
             overall_status = status;
         }
     }
-    syncTerminalNotify(batch_desc);
-    clearQueuedTerminal(batch_id);
     return overall_status;
 }
 #endif
