@@ -1015,19 +1015,25 @@ impl StoreClient {
                 reservations: &mut reservations,
             };
 
-            self.reserve_preferred_segments(
+            if let Err(error) = self.reserve_preferred_segments(
                 &mut preferred,
                 &policy.required_preferred_segments,
                 PreferredSegmentSource::Request,
                 false,
-            )?;
+            ) {
+                rollback(self, preferred.targets, preferred.reservations);
+                return Err(error);
+            }
             if preferred.targets.len() != policy.replica_count {
-                self.reserve_preferred_segments(
+                if let Err(error) = self.reserve_preferred_segments(
                     &mut preferred,
                     &policy.hint_preferred_segments,
                     PreferredSegmentSource::TenantPolicy,
                     true,
-                )?;
+                ) {
+                    rollback(self, preferred.targets, preferred.reservations);
+                    return Err(error);
+                }
             }
         }
         if targets.len() == policy.replica_count {
@@ -1069,7 +1075,10 @@ impl StoreClient {
                         "skipping preferred storage owner after reservation failure"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    rollback(self, &targets, &reservations);
+                    return Err(error);
+                }
             }
         }
 
@@ -1099,13 +1108,23 @@ impl StoreClient {
                         "skipping local preferred owner after reservation failure"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    rollback(self, &targets, &reservations);
+                    return Err(error);
+                }
             }
         }
 
-        let ranked = self
+        let ranked = match self
             .request_placement_planner()
-            .ranked_candidates(self, object)?;
+            .ranked_candidates(self, object)
+        {
+            Ok(ranked) => ranked,
+            Err(error) => {
+                rollback(self, &targets, &reservations);
+                return Err(error);
+            }
+        };
         for owner in ranked {
             if excluded.contains(&owner) {
                 continue;
@@ -1133,7 +1152,10 @@ impl StoreClient {
                         "skipping fallback storage owner after reservation failure"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    rollback(self, &targets, &reservations);
+                    return Err(error);
+                }
             }
         }
 
