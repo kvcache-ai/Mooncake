@@ -350,6 +350,32 @@ mod state_core_tests {
             ]
         );
     }
+
+    #[test]
+    fn membership_equivalent_ignores_order_and_lease_expiry() {
+        let left = vec![
+            sample_lease("node-a", 1, ClientLifecycleState::Active, 100),
+            sample_lease("node-b", 2, ClientLifecycleState::Draining, 200),
+        ];
+        let right = vec![
+            sample_lease("node-b", 2, ClientLifecycleState::Draining, 300),
+            sample_lease("node-a", 1, ClientLifecycleState::Active, 400),
+        ];
+
+        assert!(membership_equivalent(&left, &right));
+    }
+
+    #[test]
+    fn membership_equivalent_rejects_unmatched_duplicate_runtime() {
+        let duplicate = sample_lease("node-a", 1, ClientLifecycleState::Active, 100);
+        let left = vec![duplicate.clone(), duplicate];
+        let right = vec![
+            sample_lease("node-a", 1, ClientLifecycleState::Active, 200),
+            sample_lease("node-b", 1, ClientLifecycleState::Active, 200),
+        ];
+
+        assert!(!membership_equivalent(&left, &right));
+    }
 }
 
 #[derive(Default)]
