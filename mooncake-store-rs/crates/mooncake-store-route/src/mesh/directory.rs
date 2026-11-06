@@ -1282,13 +1282,36 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         }
 
         let mut referenced: Option<ObjectRoute> = None;
+        let mut last_error = None;
         for authority in authorities {
-            let mut responses = self.read_authority_batch(&authority, std::slice::from_ref(key))?;
-            let response = responses.pop().ok_or_else(|| {
-                StoreError::InvalidState(
-                    "route authority returned no result for exact replica confirmation".to_string(),
-                )
-            })??;
+            let response = (|| {
+                let mut responses =
+                    self.read_authority_batch(&authority, std::slice::from_ref(key))?;
+                responses.pop().ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "route authority returned no result for exact replica confirmation"
+                            .to_string(),
+                    )
+                })?
+            })();
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "exact_replica_confirmation_transport_failed",
+                    );
+                    debug!(
+                        authority = %authority.runtime,
+                        key = %key.0,
+                        error = %error,
+                        "exact replica confirmation authority is unavailable"
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             let references_replica = response.as_ref().is_some_and(|route| {
                 route.replicas.iter().any(|candidate| {
                     candidate.owner == replica.owner
@@ -1321,6 +1344,9 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         }
         if let Some(route) = referenced {
             return Ok(RouteReplicaReference::Referenced(Box::new(route)));
+        }
+        if let Some(error) = last_error {
+            return Err(error);
         }
         Ok(RouteReplicaReference::Absent)
     }
@@ -1403,17 +1429,39 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             ));
         }
         let mut consensus: Vec<Option<AllocationRouteReference>> = vec![None; identities.len()];
+        let mut reachable_authorities = 0usize;
+        let mut last_error = None;
         for authority in &authorities {
-            let references =
-                self.get_allocation_route_reference_keys_from_authority(authority, identities)?;
+            let references = match self
+                .get_allocation_route_reference_keys_from_authority(authority, identities)
+            {
+                Ok(references) => references,
+                Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        authority,
+                        &error,
+                        "allocation_reference_key_query_transport_failed",
+                    );
+                    debug!(
+                        authority = %authority.runtime,
+                        identities = identities.len(),
+                        error = %error,
+                        "allocation reference key authority is unavailable"
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             if references.len() != identities.len() {
-                return Err(StoreError::Transport(format!(
+                last_error = Some(StoreError::Transport(format!(
                     "route authority {} returned {} allocation reference keys for {} identities",
                     authority.runtime,
                     references.len(),
                     identities.len()
                 )));
+                continue;
             }
+            reachable_authorities = reachable_authorities.saturating_add(1);
             for (slot, observed) in consensus.iter_mut().zip(references) {
                 *slot = Some(merge_allocation_route_reference(slot.as_ref(), observed));
             }
@@ -1429,10 +1477,26 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     .to_string(),
             ));
         }
+        if reachable_authorities == 0 {
+            return Err(last_error.unwrap_or_else(|| {
+                StoreError::Transport(
+                    "allocation reference key query reached no authorities".to_string(),
+                )
+            }));
+        }
+        let has_unavailable_authority = last_error.is_some();
         Ok(consensus
             .into_iter()
             .map(|reference| {
-                reference.expect("nonempty authorities populate every allocation reference key")
+                let reference = reference
+                    .expect("reachable authorities populate every allocation reference key");
+                if has_unavailable_authority
+                    && reference.state == AllocationRouteReferenceState::Absent
+                {
+                    AllocationRouteReference::conflict()
+                } else {
+                    reference
+                }
             })
             .collect())
     }
@@ -2201,7 +2265,12 @@ mod owner_page_contract_tests {
             authority: &ClientStableId,
             keys: &[ObjectKey],
         ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
-            let route = self.routes.get(&authority.0).cloned().unwrap_or(None);
+            let route = self.routes.get(&authority.0).cloned().ok_or_else(|| {
+                StoreError::Transport(format!(
+                    "injected route authority failure for {}",
+                    authority.0
+                ))
+            })?;
             Ok(keys.iter().map(|_| Ok(route.clone())).collect())
         }
 
@@ -2268,6 +2337,38 @@ mod owner_page_contract_tests {
             }
             Ok(references)
         }
+
+        fn get_allocation_route_reference_keys(
+            &self,
+            lease: &ClientLease,
+            namespace: &str,
+            authority: &ClientStableId,
+            identities: &[AllocationRouteIdentity],
+        ) -> Result<Vec<AllocationRouteReference>> {
+            self.get_allocation_route_references(lease, namespace, authority, identities)?
+                .into_iter()
+                .map(|state| match state {
+                    AllocationRouteReferenceState::Absent => {
+                        Ok(AllocationRouteReference::absent())
+                    }
+                    AllocationRouteReferenceState::Conflict => {
+                        Ok(AllocationRouteReference::conflict())
+                    }
+                    AllocationRouteReferenceState::Exact => self
+                        .routes
+                        .get(&authority.0)
+                        .and_then(|route| route.as_ref())
+                        .map(|route| AllocationRouteReference::exact(route.key.clone()))
+                        .ok_or_else(|| {
+                            StoreError::InvalidState(format!(
+                                "exact allocation reference for {} has no route",
+                                authority.0
+                            ))
+                        }),
+                })
+                .collect()
+        }
+
     }
 
 
@@ -2407,6 +2508,36 @@ mod owner_page_contract_tests {
             directory
                 .confirm_replica_reference(&observer, &referenced.key, &referenced.replicas[0])
                 .expect("an exact reference on any proof authority must retain the allocation"),
+            RouteReplicaReference::Referenced(_)
+        ));
+    }
+
+    #[test]
+    fn exact_replica_confirmation_keeps_positive_proof_when_peer_is_unavailable() {
+        let observer = test_lease("observer");
+        let replica_owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut referenced = test_route("confirmation-partial-key", &replica_owner);
+        referenced.replicas[0].allocation_id = Some(7);
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::from([(
+                    "authority-a".to_string(),
+                    Some(referenced.clone()),
+                )]),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        assert!(matches!(
+            directory
+                .confirm_replica_reference(&observer, &referenced.key, &referenced.replicas[0])
+                .expect("one exact authority must prove the live replica"),
             RouteReplicaReference::Referenced(_)
         ));
     }
@@ -2665,6 +2796,77 @@ mod owner_page_contract_tests {
                 .get_allocation_route_references_consistent(&observer, &[identity])
                 .expect("divergent observations should resolve fail-closed"),
             vec![AllocationRouteReferenceState::Conflict],
+        );
+    }
+
+    #[test]
+    fn allocation_reference_key_query_keeps_exact_proof_when_peer_is_unavailable() {
+        let observer = test_lease("observer");
+        let owner = ClientRuntimeId::new("owner", ClientEpoch(1));
+        let mut route = test_route("allocation-partial-key", &owner);
+        route.replicas[0].allocation_id = Some(7);
+        let identity = AllocationRouteIdentity {
+            owner,
+            segment_name: route.replicas[0].segment_name.clone(),
+            offset_bytes: route.replicas[0].segment_offset,
+            length_bytes: route.replicas[0].length,
+            allocation_id: 7,
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::from([("authority-a".to_string(), Some(route.clone()))]),
+                allocation_references: BTreeMap::from([(
+                    "authority-a".to_string(),
+                    vec![AllocationRouteReferenceState::Exact],
+                )]),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        assert_eq!(
+            directory
+                .get_allocation_route_reference_keys_consistent(&observer, &[identity])
+                .expect("an exact positive proof must survive an unavailable peer"),
+            vec![AllocationRouteReference::exact(route.key)],
+        );
+    }
+
+    #[test]
+    fn allocation_reference_key_query_rejects_absence_when_peer_is_unavailable() {
+        let observer = test_lease("observer");
+        let identity = AllocationRouteIdentity {
+            owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
+            segment_name: SegmentName::new("segment-a".to_string()),
+            offset_bytes: 64,
+            length_bytes: 16,
+            allocation_id: 7,
+        };
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::from([(
+                    "authority-a".to_string(),
+                    vec![AllocationRouteReferenceState::Absent],
+                )]),
+            }),
+            Arc::new(TestMembership {
+                leases: vec![test_lease("authority-a"), test_lease("authority-b")],
+            }),
+        );
+
+        assert_eq!(
+            directory
+                .get_allocation_route_reference_keys_consistent(&observer, &[identity])
+                .expect("partial absence must remain indeterminate"),
+            vec![AllocationRouteReference::conflict()],
         );
     }
 
