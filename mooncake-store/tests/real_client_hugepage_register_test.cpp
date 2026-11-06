@@ -206,7 +206,7 @@ TEST_F(RealClientHugepageRegisterTest, HotCacheShmRegistersAlignedSegment) {
     EXPECT_TRUE(client_opt.value()->IsHotCacheEnabled())
         << "hot cache registration must use the aligned segment size";
 
-    client_opt.reset();  // tear down before restoring the environment
+    client_opt.value().reset();  // tear down before restoring the environment
     if (orig_size) {
         setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", orig_size, 1);
     } else {
