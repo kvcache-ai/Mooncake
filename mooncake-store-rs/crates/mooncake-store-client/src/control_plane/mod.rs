@@ -5,10 +5,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mooncake_store_core::{
-    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientEpoch, ClientLease,
-    ClientRuntimeId, ClientStableId, CompatibilityDescriptor, ObjectKey, ObjectRoute, ReplicaRoute,
-    ReplicaTier, Result, RouteCasRequest, RouteVersion, SegmentName, SegmentReservation,
-    SegmentTargetChunk, StoreError, CONTROL_ADDR_LABEL,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId, CompatibilityDescriptor, ObjectKey,
+    ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest, RouteVersion, SegmentName,
+    SegmentReservation, SegmentTargetChunk, StoreError, CONTROL_ADDR_LABEL,
 };
 use parking_lot::Mutex;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
@@ -65,6 +65,20 @@ pub(crate) trait AllocatorService: Send + Sync {
             .collect()
     }
 
+    fn batch_reserve_any_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveAnyOp],
+    ) -> Vec<Result<SegmentReservation>> {
+        self.batch_reserve_any(
+            owner,
+            &requests
+                .iter()
+                .map(|request| request.length_bytes)
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn batch_reserve_specific(
         &self,
         owner: &ClientRuntimeId,
@@ -76,6 +90,14 @@ pub(crate) trait AllocatorService: Send + Sync {
                 self.reserve_specific(owner, &request.segment_name, request.length_bytes)
             })
             .collect()
+    }
+
+    fn batch_reserve_specific_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Vec<Result<SegmentReservation>> {
+        self.batch_reserve_specific(owner, requests)
     }
 
     fn batch_release(&self, owner: &ClientRuntimeId, requests: &[ReleaseOp]) -> Vec<Result<()>> {
@@ -92,6 +114,12 @@ pub(crate) trait AllocatorService: Send + Sync {
             })
             .collect()
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReserveAnyOp {
+    pub(crate) length_bytes: u64,
+    pub(crate) route_key: Option<ObjectKey>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -145,6 +173,7 @@ impl MigrationService for UnsupportedMigrationService {
 pub(crate) struct ReserveSpecificOp {
     pub segment_name: SegmentName,
     pub length_bytes: u64,
+    pub route_key: Option<ObjectKey>,
 }
 
 #[derive(Clone, Debug)]

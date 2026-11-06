@@ -17,8 +17,8 @@ pub use cold_tier::{
     ColdTierPutDeviceResult, ColdTierTarget, ColdTierTargetSpec, ColdTierUsageDelta,
 };
 pub use compat::{
-    CompatibilityDescriptor, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY,
-    ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
+    CompatibilityDescriptor, ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY,
+    ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 pub use error::{Result, StoreError};
 pub use hugepage::{parse_hugepage_size, HugePageConfig};
@@ -33,15 +33,15 @@ pub use identity_codec::{
 };
 pub use lifecycle::{ClientLifecycleState, HandoffKind, HandoffPlan};
 pub use route::{
-    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease, ObjectKey,
-    ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest, RouteControlMode, RoutePolicy,
-    RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-    SegmentName, SegmentReservation, SegmentTargetChunk, TenantBandwidthShapingPolicy,
-    TenantExecutionFairnessPolicy, TenantObjectAccounting, TenantObjectAccountingState,
-    TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
-    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest,
-    TenantQuotaPolicy, TenantQuotaReservation, TenantQuotaReservationOutcome,
-    TenantQuotaReservationRequest, TenantQuotaReservationState, TenantQuotaState,
-    TenantRoutePolicy,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteCasRequest,
+    RouteControlMode, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    SegmentTargetChunk, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
+    TenantObjectAccounting, TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicy,
+    TenantPolicyScope, TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+    TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservation,
+    TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaReservationState,
+    TenantQuotaState, TenantRoutePolicy,
 };
 pub use traits::{MetadataBackend, PlacementStrategy, RouteDirectory, RouteReplicaReference};

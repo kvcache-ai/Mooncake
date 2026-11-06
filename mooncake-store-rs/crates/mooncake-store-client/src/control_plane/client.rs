@@ -106,8 +106,18 @@ fn decode_route_list_by_replica_owner_reply(
 
 fn decode_allocation_route_references_reply(
     reply: pb::GetAllocationRouteReferencesReply,
+    include_route_key: bool,
 ) -> Result<RouteControlResponse> {
     decode_error(reply.error)?;
+    if include_route_key {
+        return Ok(RouteControlResponse::AllocationReferenceKeys(
+            reply
+                .references
+                .into_iter()
+                .map(try_allocation_reference)
+                .collect::<Result<Vec<_>>>()?,
+        ));
+    }
     Ok(RouteControlResponse::AllocationReferences(
         reply
             .references
@@ -235,7 +245,14 @@ impl ControlPlaneClient {
                 namespace,
                 authority,
                 identities,
-            } => self.send_route_allocation_references(lease, namespace, authority, identities),
+                include_route_key,
+            } => self.send_route_allocation_references(
+                lease,
+                namespace,
+                authority,
+                identities,
+                include_route_key,
+            ),
         }
     }
 
@@ -452,6 +469,7 @@ impl ControlPlaneClient {
         namespace: String,
         authority: ClientStableId,
         identities: Vec<AllocationRouteIdentity>,
+        include_route_key: bool,
     ) -> Result<RouteControlResponse> {
         let request = pb::GetAllocationRouteReferencesRequest {
             namespace,
@@ -460,13 +478,14 @@ impl ControlPlaneClient {
                 .iter()
                 .map(pb_allocation_route_identity)
                 .collect(),
+            include_route_key,
         };
         let reply = self.rpc_for_lease(lease, move |mut client| async move {
             client
                 .get_allocation_route_references(Request::new(request))
                 .await
         })?;
-        decode_allocation_route_references_reply(reply)
+        decode_allocation_route_references_reply(reply, include_route_key)
     }
 
     fn send_route_batch_replace(
@@ -848,20 +867,62 @@ impl ControlPlaneClient {
         })?
     }
 
+    pub(crate) fn reserve_any_with_pending_publication(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+        route_key: Option<ObjectKey>,
+    ) -> Result<SegmentReservation> {
+        let mut replies = self.batch_reserve_any_with_pending_publication(
+            lease,
+            owner,
+            &[ReserveAnyOp {
+                length_bytes,
+                route_key,
+            }],
+        )?;
+        replies.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane reserve_any publication reply is missing batch item".to_string(),
+            )
+        })?
+    }
+
     pub(crate) fn batch_reserve_any(
         &self,
         lease: &ClientLease,
         owner: &ClientRuntimeId,
         length_bytes: &[u64],
     ) -> Result<Vec<Result<SegmentReservation>>> {
+        let requests = length_bytes
+            .iter()
+            .map(|length_bytes| ReserveAnyOp {
+                length_bytes: *length_bytes,
+                route_key: None,
+            })
+            .collect::<Vec<_>>();
+        self.batch_reserve_any_with_pending_publication(lease, owner, &requests)
+    }
+
+    pub(crate) fn batch_reserve_any_with_pending_publication(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveAnyOp],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
         let tracker = OperationTracker::new("control_allocator_batch_reserve_any");
         let result = (|| {
-            if length_bytes.is_empty() {
+            if requests.is_empty() {
                 return Ok(Vec::new());
             }
             let request = pb::BatchReserveAnyRequest {
                 owner: Some(pb_runtime_id(owner)),
-                length_bytes: length_bytes.to_vec(),
+                length_bytes: requests
+                    .iter()
+                    .map(|request| request.length_bytes)
+                    .collect(),
+                route_keys: Vec::new(),
             };
             match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
                 request_id,
@@ -883,7 +944,7 @@ impl ControlPlaneClient {
                             "control stream batch_reserve_any reply type mismatch".to_string(),
                         ));
                     };
-                    ensure_batch_len("batch_reserve_any", length_bytes.len(), reply.replies.len())?;
+                    ensure_batch_len("batch_reserve_any", requests.len(), reply.replies.len())?;
                     return Ok(reply
                         .replies
                         .into_iter()
@@ -902,7 +963,7 @@ impl ControlPlaneClient {
                 Err(error) => {
                     warn!(
                         owner = %owner,
-                        items = length_bytes.len(),
+                        items = requests.len(),
                         error = %error,
                         "control stream batch_reserve_any failed; falling back to unary batch rpc"
                     );
@@ -911,7 +972,7 @@ impl ControlPlaneClient {
             let reply = self.rpc_for_lease(lease, move |mut client| async move {
                 client.batch_reserve_any(Request::new(request)).await
             })?;
-            ensure_batch_len("batch_reserve_any", length_bytes.len(), reply.replies.len())?;
+            ensure_batch_len("batch_reserve_any", requests.len(), reply.replies.len())?;
             Ok(reply
                 .replies
                 .into_iter()
@@ -944,11 +1005,37 @@ impl ControlPlaneClient {
             &[ReserveSpecificOp {
                 segment_name: segment_name.clone(),
                 length_bytes,
+                route_key: None,
             }],
         )?;
         results.pop().ok_or_else(|| {
             StoreError::Transport(
                 "control plane reserve_specific reply is missing batch item".to_string(),
+            )
+        })?
+    }
+
+    pub(crate) fn reserve_specific_with_pending_publication(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+        route_key: Option<ObjectKey>,
+    ) -> Result<SegmentReservation> {
+        let mut results = self.batch_reserve_specific(
+            lease,
+            owner,
+            &[ReserveSpecificOp {
+                segment_name: segment_name.clone(),
+                length_bytes,
+                route_key,
+}],
+        )?;
+        results.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane reserve_specific publication reply is missing batch item"
+                    .to_string(),
             )
         })?
     }
@@ -971,6 +1058,7 @@ impl ControlPlaneClient {
                     .map(|request| pb::ReserveSpecificEntry {
                         segment_name: request.segment_name.0.clone(),
                         length_bytes: request.length_bytes,
+                        route_key: String::new(),
                     })
                     .collect(),
             };

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use mooncake_store_core::{
-    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
-    ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest, StoreError,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest,
+    StoreError,
 };
 
 use crate::shim::{
@@ -43,6 +44,7 @@ pub enum RouteControlRequest {
         namespace: String,
         authority: ClientStableId,
         identities: Vec<AllocationRouteIdentity>,
+        include_route_key: bool,
     },
 }
 
@@ -54,6 +56,10 @@ impl RouteControlRequest {
             Self::BatchCompareAndSwap { .. } => "control_route_batch_cas",
             Self::BatchReplace { .. } => "control_route_batch_replace",
             Self::ListByReplicaOwner { .. } => "control_route_list_by_replica_owner",
+            Self::GetAllocationReferences {
+                include_route_key: true,
+                ..
+            } => "control_route_get_allocation_reference_keys",
             Self::GetAllocationReferences { .. } => "control_route_get_allocation_references",
         }
     }
@@ -83,9 +89,15 @@ impl RouteControlRequest {
             Self::BatchReplace { requests, .. } if requests.is_empty() => {
                 Some(RouteControlResponse::BatchReplace(Vec::new()))
             }
-            Self::GetAllocationReferences { identities, .. } if identities.is_empty() => {
-                Some(RouteControlResponse::AllocationReferences(Vec::new()))
-            }
+            Self::GetAllocationReferences {
+                identities,
+                include_route_key,
+                ..
+            } if identities.is_empty() => Some(if *include_route_key {
+                RouteControlResponse::AllocationReferenceKeys(Vec::new())
+            } else {
+                RouteControlResponse::AllocationReferences(Vec::new())
+            }),
             _ => None,
         }
     }
@@ -99,6 +111,7 @@ pub enum RouteControlResponse {
     BatchReplace(Vec<Result<()>>),
     ListByReplicaOwner(RouteOwnerPage),
     AllocationReferences(Vec<AllocationRouteReferenceState>),
+    AllocationReferenceKeys(Vec<AllocationRouteReference>),
 }
 
 pub trait RouteControlTransport: Send + Sync {
@@ -163,9 +176,18 @@ pub fn serve_route_control_request(
             namespace,
             authority,
             identities,
-        } => service
-            .get_allocation_route_references(&namespace, &authority, &identities)
-            .map(RouteControlResponse::AllocationReferences),
+            include_route_key,
+        } => {
+            if include_route_key {
+                service
+                    .get_allocation_route_reference_keys(&namespace, &authority, &identities)
+                    .map(RouteControlResponse::AllocationReferenceKeys)
+            } else {
+                service
+                    .get_allocation_route_references(&namespace, &authority, &identities)
+                    .map(RouteControlResponse::AllocationReferences)
+            }
+        }
     }
 }
 
@@ -196,6 +218,7 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
                 namespace: namespace.to_string(),
                 authority: authority.clone(),
                 identities: identities.to_vec(),
+                include_route_key: false,
             },
         )?;
         let RouteControlResponse::AllocationReferences(references) = response else {
@@ -203,6 +226,36 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         };
         ensure_batch_len(
             "get_allocation_route_references",
+            identities.len(),
+            references.len(),
+        )?;
+        Ok(references)
+    }
+
+    fn get_allocation_route_reference_keys(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.transport.send_route_control(
+            lease,
+            RouteControlRequest::GetAllocationReferences {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                identities: identities.to_vec(),
+                include_route_key: true,
+            },
+        )?;
+        let RouteControlResponse::AllocationReferenceKeys(references) = response else {
+            return unexpected_response("get_allocation_route_reference_keys");
+        };
+        ensure_batch_len(
+            "get_allocation_route_reference_keys",
             identities.len(),
             references.len(),
         )?;

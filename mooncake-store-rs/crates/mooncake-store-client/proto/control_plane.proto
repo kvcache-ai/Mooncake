@@ -280,6 +280,7 @@ message BatchReplaceRoutesReply {
 message ReserveAnyRequest {
   ClientRuntimeId owner = 1;
   uint64 length_bytes = 2;
+  string route_key = 3;
 }
 
 message ReserveAnyReply {
@@ -290,6 +291,7 @@ message ReserveAnyReply {
 message BatchReserveAnyRequest {
   ClientRuntimeId owner = 1;
   repeated uint64 length_bytes = 2;
+  repeated string route_keys = 3;
 }
 
 message BatchReserveAnyReply {
@@ -300,6 +302,7 @@ message ReserveSpecificRequest {
   ClientRuntimeId owner = 1;
   string segment_name = 2;
   uint64 length_bytes = 3;
+  string route_key = 4;
 }
 
 message ReserveSpecificReply {
@@ -310,6 +313,7 @@ message ReserveSpecificReply {
 message ReserveSpecificEntry {
   string segment_name = 1;
   uint64 length_bytes = 2;
+  string route_key = 3;
 }
 
 message BatchReserveSpecificRequest {
@@ -379,12 +383,14 @@ message AllocationRouteReferenceState {
     bool exact = 2;
     bool conflict = 3;
   }
+  string route_key = 4;
 }
 
 message GetAllocationRouteReferencesRequest {
   string namespace = 1;
   string authority = 2;
   repeated AllocationRouteIdentity identities = 3;
+  bool include_route_key = 4;
 }
 
 message GetAllocationRouteReferencesReply {

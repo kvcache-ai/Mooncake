@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use mooncake_store_core::{
-    AllocationRouteIdentity, AllocationRouteReferenceState, CasResult, ClientLease,
-    ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute,
-    ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory, RouteReplicaReference,
-    RouteVersion, StoreError, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
+    AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
+    ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey,
+    ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
+    RouteReplicaReference, RouteVersion, StoreError, ROUTE_OWNER_LIST_PAGINATION_CAPABILITY,
+    ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 use tracing::{debug, trace, warn};
 
@@ -23,10 +24,11 @@ use crate::mesh::read_repair::{
 };
 use crate::mesh::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
-    authority_get_allocation_route_references, authority_get_many, authority_get_version_floor,
-    authority_get_version_floors, authority_is_local, authority_list_reuse_candidates,
-    authority_list_routes, authority_list_routes_in_scope, local_authority_service,
-    authority_list_routes_by_replica_owner_page, register_local_authority, unregister_local_authority,
+    authority_get_allocation_route_reference_keys, authority_get_allocation_route_references,
+    authority_list_routes_by_replica_owner_page, authority_get_many, authority_get_version_floor, authority_get_version_floors,
+    authority_is_local, authority_list_reuse_candidates, authority_list_routes,
+    authority_list_routes_in_scope, local_authority_service, register_local_authority,
+    unregister_local_authority,
 };
 use crate::mesh::selection::{
     authority_candidates, ranked_authorities, ranked_top_authorities,
@@ -299,6 +301,33 @@ impl EmbeddedWrhRouteDirectory {
             );
         }
         self.authority_client.get_allocation_route_references(
+            authority,
+            &self.namespace,
+            &authority.runtime.stable_id,
+            identities,
+        )
+    }
+
+    fn get_allocation_route_reference_keys_from_authority(
+        &self,
+        authority: &ClientLease,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        if self.authority_is_local(authority) {
+            if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
+                return service.get_allocation_route_reference_keys(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    identities,
+                );
+            }
+            return authority_get_allocation_route_reference_keys(
+                &self.namespace,
+                &authority.runtime.stable_id,
+                identities,
+            );
+        }
+        self.authority_client.get_allocation_route_reference_keys(
             authority,
             &self.namespace,
             &authority.runtime.stable_id,
@@ -1276,7 +1305,8 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 "allocation reference query has no live route authorities".to_string(),
             ));
         }
-        let mut consensus = vec![None; identities.len()];
+        let mut consensus: Vec<Option<AllocationRouteReferenceState>> =
+            vec![None; identities.len()];
         for authority in &authorities {
             let references =
                 self.get_allocation_route_references_from_authority(authority, identities)?;
@@ -1309,6 +1339,65 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         Ok(consensus
             .into_iter()
             .map(|state| state.expect("nonempty authorities populate every allocation reference"))
+            .collect())
+    }
+
+    fn get_allocation_route_reference_keys_consistent(
+        &self,
+        observer: &ClientLease,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let current_candidates = self.authority_candidates(observer)?;
+        let expected_members = current_candidates
+            .iter()
+            .map(|authority| authority.runtime.clone())
+            .collect::<BTreeSet<_>>();
+        let authorities =
+            self.allocation_confirmation_authorities(observer, &current_candidates)?;
+        if authorities.is_empty() {
+            return Err(StoreError::Transport(
+                "allocation reference key query has no live route authorities".to_string(),
+            ));
+        }
+        let mut consensus: Vec<Option<AllocationRouteReference>> = vec![None; identities.len()];
+        for authority in &authorities {
+            let references =
+                self.get_allocation_route_reference_keys_from_authority(authority, identities)?;
+            if references.len() != identities.len() {
+                return Err(StoreError::Transport(format!(
+                    "route authority {} returned {} allocation reference keys for {} identities",
+                    authority.runtime,
+                    references.len(),
+                    identities.len()
+                )));
+            }
+            for (slot, observed) in consensus.iter_mut().zip(references) {
+                *slot = Some(match slot.as_ref() {
+                    None => observed,
+                    Some(previous) if previous == &observed => previous.clone(),
+                    Some(_) => AllocationRouteReference::conflict(),
+                });
+            }
+        }
+        let refreshed_members = self
+            .authority_candidates(observer)?
+            .into_iter()
+            .map(|authority| authority.runtime)
+            .collect::<BTreeSet<_>>();
+        if refreshed_members != expected_members {
+            return Err(StoreError::StaleEpoch(
+                "route authority membership changed during allocation reference key query"
+                    .to_string(),
+            ));
+        }
+        Ok(consensus
+            .into_iter()
+            .map(|reference| {
+                reference.expect("nonempty authorities populate every allocation reference key")
+            })
             .collect())
     }
 

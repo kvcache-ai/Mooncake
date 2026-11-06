@@ -3,9 +3,10 @@ use std::hash::Hash;
 use std::ops::Bound;
 
 use mooncake_store_core::{
-    route_reuse_identity, AllocationRouteIdentity, AllocationRouteReferenceState, CasResult,
-    ClientRuntimeId, ColdBackingState, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
-    Result, ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
+    route_reuse_identity, AllocationRouteIdentity, AllocationRouteReference,
+    AllocationRouteReferenceState, CasResult, ClientRuntimeId, ColdBackingState, NamespaceScope,
+    ObjectKey, ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteState,
+    RouteVersion, StoreError,
 };
 
 use crate::metrics::record_cas_outcome;
@@ -162,6 +163,60 @@ impl LocalRouteTable {
                     AllocationRouteReferenceState::Exact
                 } else {
                     AllocationRouteReferenceState::Conflict
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn allocation_route_reference_keys(
+        &self,
+        identities: &[AllocationRouteIdentity],
+    ) -> Result<Vec<AllocationRouteReference>> {
+        identities
+            .iter()
+            .map(|identity| {
+                if identity.allocation_id == 0 {
+                    return Ok(AllocationRouteReference::conflict());
+                }
+                let Some(keys) = self
+                    .allocation_start_index
+                    .get(&AllocationRouteStart::from(identity))
+                else {
+                    return Ok(AllocationRouteReference::absent());
+                };
+                let mut exact_key = None;
+                for key in keys {
+                    let route = self.routes.get(key).ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "allocation reverse index references missing route {key}"
+                        ))
+                    })?;
+                    if route.state != RouteState::Active {
+                        continue;
+                    }
+                    let mut route_has_start = false;
+                    for replica in route
+                        .replicas
+                        .iter()
+                        .filter(|replica| identity.matches_replica_start(replica))
+                    {
+                        route_has_start = true;
+                        if !identity.matches_replica(replica) {
+                            return Ok(AllocationRouteReference::conflict());
+                        }
+                    }
+                    if !route_has_start {
+                        return Err(StoreError::InvalidState(format!(
+                            "allocation reverse index route {key} does not reference the indexed start"
+                        )));
+                    }
+                    if exact_key.replace(ObjectKey::new(key.clone())).is_some() {
+                        return Ok(AllocationRouteReference::conflict());
+                    }
+                }
+                Ok(match exact_key {
+                    Some(key) => AllocationRouteReference::exact(key),
+                    None => AllocationRouteReference::absent(),
                 })
             })
             .collect()
@@ -699,5 +754,27 @@ mod tests {
                 .expect("removed route should be absent"),
             vec![AllocationRouteReferenceState::Absent]
         );
+    }
+
+    #[test]
+    fn allocation_reverse_index_returns_the_unique_exact_route_key() {
+        let key = ObjectKey::new("route-allocation-reference-key".to_string());
+        let mut route = test_route(&key, 1);
+        route.replicas[0].allocation_id = Some(7);
+        let identity = AllocationRouteIdentity {
+            owner: route.replicas[0].owner.clone(),
+            segment_name: route.replicas[0].segment_name.clone(),
+            offset_bytes: route.replicas[0].segment_offset,
+            length_bytes: route.replicas[0].length,
+            allocation_id: 7,
+        };
+        let mut table = LocalRouteTable::default();
+        table.replace(&key, Some(&route));
+
+        let references = table
+            .allocation_route_reference_keys(std::slice::from_ref(&identity))
+            .expect("exact identity should have a unique route key");
+        assert_eq!(references[0].state, AllocationRouteReferenceState::Exact);
+        assert_eq!(references[0].route_key, Some(key));
     }
 }

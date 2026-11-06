@@ -1,6 +1,7 @@
 struct PreferredSegmentReservationContext<'a> {
     tenant: &'a str,
     key: &'a str,
+    route_key: &'a ObjectKey,
     length_bytes: usize,
     replica_count: usize,
     excluded: &'a mut BTreeSet<ClientRuntimeId>,
@@ -54,16 +55,14 @@ impl StoreClient {
         owner: &ClientRuntimeId,
         segment_name: Option<&SegmentName>,
         length_bytes: u64,
+        _route_key: Option<&ObjectKey>,
     ) -> Result<mooncake_store_core::SegmentReservation> {
         let deadline_ms = self.pending_publish_deadline_ms(length_bytes);
         let mut allocator = self.allocator.lock();
         match segment_name {
-            Some(segment_name) => allocator.reserve_specific_with_pending(
-                owner,
-                segment_name,
-                length_bytes,
-                deadline_ms,
-            ),
+            Some(segment_name) => {
+                allocator.reserve_specific_with_pending(owner, segment_name, length_bytes, deadline_ms)
+            }
             None => allocator.reserve_any_with_pending(owner, length_bytes, deadline_ms),
         }
     }
@@ -771,12 +770,30 @@ impl StoreClient {
             }))
     }
 
+    #[cfg(test)]
     fn reserve_segment_allocation(
         &self,
         owner: &ClientRuntimeId,
         segment_name: Option<&SegmentName>,
         length_bytes: u64,
         require_local_memory: bool,
+    ) -> Result<mooncake_store_core::SegmentReservation> {
+        self.reserve_segment_allocation_for_route(
+            owner,
+            segment_name,
+            length_bytes,
+            require_local_memory,
+            None,
+        )
+    }
+
+    fn reserve_segment_allocation_for_route(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: Option<&SegmentName>,
+        length_bytes: u64,
+        require_local_memory: bool,
+        route_key: Option<&ObjectKey>,
     ) -> Result<mooncake_store_core::SegmentReservation> {
         if *owner == self.lease.runtime {
             lifecycle_accepts_writes(&self.lifecycle_state, "local storage allocator")?;
@@ -798,12 +815,22 @@ impl StoreClient {
                 .get("storage")
                 .is_some_and(|value| value == "true");
             if !allow_local_eviction {
-                let reservation = self.reserve_local_pending(owner, segment_name, length_bytes)?;
+                let reservation = self.reserve_local_pending(
+                    owner,
+                    segment_name,
+                    length_bytes,
+                    route_key,
+                )?;
                 return Ok(reservation);
             }
             let mut last_error = None;
             for _ in 0..=32usize {
-                let reservation = self.reserve_local_pending(owner, segment_name, length_bytes);
+                let reservation = self.reserve_local_pending(
+                    owner,
+                    segment_name,
+                    length_bytes,
+                    route_key,
+                );
                 match reservation {
                     Ok(reservation) => return Ok(reservation),
                     Err(StoreError::Allocator(message)) => {
@@ -829,16 +856,29 @@ impl StoreClient {
         }
 
         let owner_lease = self.lookup_runtime_lease(owner)?;
-        let rpc_result = match segment_name {
-            Some(segment_name) => self.control_client.reserve_specific(
+        let lifecycle_enabled = owner_lease
+            .compatibility
+            .supports(ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY);
+        let rpc_result = match (segment_name, lifecycle_enabled) {
+            (Some(segment_name), true) => self
+                .control_client
+                .reserve_specific_with_pending_publication(
+                    &owner_lease,
+                    owner,
+                    segment_name,
+                    length_bytes,
+                    None,
+                ),
+            (None, true) => self.control_client.reserve_any_with_pending_publication(
                 &owner_lease,
                 owner,
-                segment_name,
                 length_bytes,
+                None,
             ),
-            None => self
+            (Some(segment_name), false) => self
                 .control_client
-                .reserve_any(&owner_lease, owner, length_bytes),
+                .reserve_specific(&owner_lease, owner, segment_name, length_bytes),
+            (None, false) => self.control_client.reserve_any(&owner_lease, owner, length_bytes),
         };
         match rpc_result {
             Ok(reservation) => Ok(reservation),
@@ -987,18 +1027,31 @@ impl StoreClient {
         &self,
         candidate: &ReplicaPlacementTarget,
         length_bytes: usize,
+        route_key: &ObjectKey,
     ) -> Result<(ReplicaWriteTarget, mooncake_store_core::SegmentReservation)> {
         let storage_runtime = candidate.storage_runtime();
         let is_local = storage_runtime == &self.lease.runtime;
+        let remote_route_key = (!is_local).then_some(route_key);
         match candidate {
             ReplicaPlacementTarget::StorageRuntime(storage_runtime) => {
-                self.reserve_storage_runtime_segment(storage_runtime, length_bytes, is_local)
+                self.reserve_storage_runtime_segment_for_route(
+                    storage_runtime,
+                    length_bytes,
+                    is_local,
+                    remote_route_key,
+                )
             }
             ReplicaPlacementTarget::Segment {
                 storage_runtime,
                 segment_name,
             } => {
-                self.reserve_specific_segment(storage_runtime, segment_name, length_bytes, is_local)
+                self.reserve_specific_segment_for_route(
+                    storage_runtime,
+                    segment_name,
+                    length_bytes,
+                    is_local,
+                    remote_route_key,
+                )
             }
         }
     }
@@ -1006,6 +1059,7 @@ impl StoreClient {
     fn reserve_replica_targets(
         &self,
         object: &ObjectRef<'_>,
+        route_key: &ObjectKey,
         length_bytes: usize,
         policy: &ResolvedReplicationPolicy,
     ) -> Result<(
@@ -1027,6 +1081,7 @@ impl StoreClient {
             let mut preferred = PreferredSegmentReservationContext {
                 tenant,
                 key,
+                route_key,
                 length_bytes,
                 replica_count: policy.replica_count,
                 excluded: &mut excluded,
@@ -1084,7 +1139,7 @@ impl StoreClient {
             if excluded.contains(storage_runtime) {
                 continue;
             }
-            match self.reserve_candidate(&candidate.target, length_bytes) {
+            match self.reserve_candidate(&candidate.target, length_bytes, route_key) {
                 Ok((target, reservation)) => {
                     excluded.insert(storage_runtime.clone());
                     targets.push(target);
@@ -1117,7 +1172,7 @@ impl StoreClient {
                 target: ReplicaPlacementTarget::StorageRuntime(self.lease.runtime.clone()),
                 soft: true,
             };
-            match self.reserve_candidate(&candidate.target, length_bytes) {
+            match self.reserve_candidate(&candidate.target, length_bytes, route_key) {
                 Ok((target, reservation)) => {
                     excluded.insert(self.lease.runtime.clone());
                     targets.push(target);
@@ -1161,7 +1216,7 @@ impl StoreClient {
                 soft: true,
             };
             let storage_runtime = candidate.target.storage_runtime().clone();
-            match self.reserve_candidate(&candidate.target, length_bytes) {
+            match self.reserve_candidate(&candidate.target, length_bytes, route_key) {
                 Ok((target, reservation)) => {
                     excluded.insert(storage_runtime);
                     targets.push(target);
@@ -1260,7 +1315,11 @@ impl StoreClient {
                     if preferred.excluded.contains(&storage_runtime) {
                         continue;
                     }
-                    match self.reserve_candidate(&candidate.target, preferred.length_bytes) {
+                    match self.reserve_candidate(
+                        &candidate.target,
+                        preferred.length_bytes,
+                        preferred.route_key,
+                    ) {
                         Ok((target, reservation)) => {
                             preferred.excluded.insert(storage_runtime);
                             preferred.targets.push(target);

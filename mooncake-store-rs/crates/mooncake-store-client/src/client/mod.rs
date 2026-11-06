@@ -12,15 +12,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use mooncake_store_core::ALLOCATION_LIFECYCLE_CLOCK_CAPABILITY;
 use mooncake_store_core::{
-    CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierDeviceUpdate,
-    CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId, MetadataBackend,
-    NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result, RouteCasRequest,
-    RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState, RouteVersion,
-    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentTargetChunk, StoreError,
-    TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicyScope, TenantPolicySpec,
-    TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
+    AllocationRouteIdentity, CasResult, ClientEndpointSet, ClientEpoch, ClientLease,
+    ClientLifecycleState, ClientRuntimeId, ClientStableId, ColdTierDeviceRecord,
+    ColdTierDeviceState, ColdTierDeviceUpdate, CompatibilityDescriptor, HandoffKind, HandoffPlan,
+    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
+    ReplicaTier, Result, RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy,
+    RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
+    SegmentName, SegmentTargetChunk, StoreError, TenantObjectAccountingState,
+    TenantPlacementPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest,
+    TenantQuotaPolicy, TenantQuotaReservationRequest,
 };
 use mooncake_store_route::{RouteHitReporter, RouteOperations};
 use mooncake_store_rs_transport::{
@@ -33,8 +35,8 @@ use tracing::{debug, info, info_span, trace, warn};
 use crate::control_plane::pb;
 use crate::control_plane::{
     control_address_label, AllocatorService, ControlPlaneClient, ControlPlaneHandle,
-    EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp, ReserveSpecificOp,
-    RouteTrafficReport, UnsupportedColdTierControlService,
+    EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp, ReserveAnyOp,
+    ReserveSpecificOp, RouteTrafficReport, UnsupportedColdTierControlService,
 };
 use crate::memory::{
     execute_copy_instructions, LocalMemoryConfig, LocalMemoryState, PreparedCopy, RegionAllocation,

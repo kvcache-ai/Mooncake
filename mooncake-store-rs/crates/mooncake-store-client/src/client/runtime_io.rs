@@ -470,7 +470,7 @@ impl StoreClient {
                 .attribute_u64("mooncake.item_count", 1)
                 .attribute_u64("mooncake.replica_count", policy.replica_count as u64)
                 .input_bytes(value.len() as u64);
-            let reserve_result = self.reserve_replica_targets(&object_ref, value.len(), &policy);
+            let reserve_result = self.reserve_replica_targets(&object_ref, &scoped_key, value.len(), &policy);
             reserve_tracker.finish(&reserve_result, 0);
             let (targets, reservations) = match reserve_result {
                 Ok(reserved) => reserved,
@@ -1243,6 +1243,10 @@ impl StoreClient {
     )> {
         let tenant = object.tenant.unwrap_or(self.default_tenant());
         let key = object.key;
+        let route_key = ObjectKey::from_logical_id(&LogicalObjectId::new(
+            NamespaceScope::with_defaults(object.tenant, object.domain, object.object_set),
+            object.key,
+        ));
         let allow_partial_copy =
             !plan.all_or_nothing && matches!(plan.mode, ExplicitMigrationMode::Copy);
         let mut targets = Vec::with_capacity(plan.target_segments.len());
@@ -1305,11 +1309,12 @@ impl StoreClient {
                 return Err(error);
             }
             let is_local = preferred.owner == self.lease.runtime;
-            let (target, reservation) = match self.reserve_specific_segment(
+            let (target, reservation) = match self.reserve_specific_segment_for_route(
                 &preferred.owner,
                 &preferred.segment_name,
                 length_bytes,
                 is_local,
+                Some(&route_key),
             ) {
                 Ok(result) => result,
                 Err(error) if allow_partial_copy => {

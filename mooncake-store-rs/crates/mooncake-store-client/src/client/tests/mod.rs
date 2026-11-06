@@ -15398,6 +15398,7 @@ fn local_control_plane_and_state_adapters_cover_single_and_batch_paths() {
             &[crate::control_plane::ReserveSpecificOp {
                 segment_name: primary.clone(),
                 length_bytes: 8,
+                route_key: None,
             }],
         )
         .expect("rpc reserve_specific should succeed");
@@ -15873,6 +15874,7 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
             segment_name: None,
             length_bytes: 16,
             require_local_memory: false,
+            route_key: None,
         }])
         .expect("remote reserve_any batch should return per-item results");
     assert_released(
@@ -15888,6 +15890,7 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
             segment_name: Some(segment.clone()),
             length_bytes: 16,
             require_local_memory: false,
+            route_key: None,
         }])
         .expect("remote reserve_specific batch should return per-item results");
     assert_released(
@@ -15913,6 +15916,7 @@ fn reservation_target_metadata_failure_releases_all_reserve_paths() {
             segment_name: None,
             length_bytes: 16,
             require_local_memory: true,
+            route_key: None,
         }])
         .expect("local reserve batch should return a per-item result");
     assert!(matches!(
@@ -15973,8 +15977,13 @@ fn partial_replica_reservation_is_released_when_required_segment_lookup_fails() 
                 .preferred_segments([segment.0.as_str(), "missing-required-segment"]),
         ))
         .expect("replication policy should resolve");
-    let result =
-        writer.reserve_replica_targets(&ObjectRef::new("partial-reserve-key"), 16, &policy);
+    let route_key = ObjectKey::new("default::partial-reserve-key");
+    let result = writer.reserve_replica_targets(
+        &ObjectRef::new("partial-reserve-key"),
+        &route_key,
+        16,
+        &policy,
+    );
 
     assert!(matches!(result, Err(StoreError::NotFound(_))));
     assert_eq!(
@@ -18635,6 +18644,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         &[crate::control_plane::ReserveSpecificOp {
             segment_name: primary.segment_name.clone(),
             length_bytes: 8,
+            route_key: None,
         }],
     );
     assert!(specific[0].is_ok());
@@ -20045,6 +20055,147 @@ fn orphaned_pending_allocation_reclaims_after_publication_deadline() {
     assert_eviction_guard_event_at_least(&metrics, "allocation_confirmation", "absent", 1);
     assert_eviction_guard_event_at_least(&metrics, "local_commit", "released", 1);
     assert_eq!(reservation.length_bytes, 16);
+}
+
+#[test]
+fn pending_publication_recovery_releases_absent_identity_without_candidate_scan() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("pending-publication-absent-segment"));
+    let client = StoreClientBuilder::new(metadata, "pending-publication-absent")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route_key = ObjectKey::new("default::pending-publication-absent");
+    let reservation = client
+        .allocator
+        .lock()
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0, Some(route_key))
+        .expect("reservation should create a tracked pending publication");
+
+    assert_eq!(
+        client
+            .storage_owner
+            .recover_due_pending_publications()
+            .expect("absent pending publication recovery should succeed"),
+        1,
+        "only the exact confirmed-absent allocation should release"
+    );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 0);
+    assert!(client
+        .allocator
+        .lock()
+        .pending_allocations(now_ms())
+        .is_empty());
+    assert_eq!(reservation.length_bytes, 16);
+
+    let metrics = render_prometheus_metrics();
+    assert!(!metrics.lines().any(|line| {
+        line.starts_with(
+            "mooncake_store_eviction_guard_event_total{tenant=\"default\",source=\"allocator_candidate\",outcome=\"pending_confirmation\"}",
+        ) && !line.ends_with(" 0")
+    }));
+}
+
+#[test]
+fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("pending-publication-exact-segment"));
+    let client = StoreClientBuilder::new(metadata, "pending-publication-exact")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route_key = ObjectKey::new("default::pending-publication-exact");
+    let reservation = client
+        .allocator
+        .lock()
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0, Some(route_key.clone()))
+        .expect("reservation should create a tracked pending publication");
+    let route = ObjectRoute {
+        key: route_key,
+        namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
+        logical_key: Some("pending-publication-exact".to_string()),
+        canonical_key: None,
+        sharing_scope: Some("default".to_string()),
+        qos_tier: Some("default".to_string()),
+        version: RouteVersion(1),
+        state: RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: client.runtime_id().clone(),
+            segment_name: reservation.segment_name.clone(),
+            allocation_id: Some(reservation.allocation_id),
+            offset: Some(reservation.offset_bytes),
+            segment_offset: reservation.offset_bytes,
+            length: reservation.length_bytes,
+            checksum: None,
+            tier: ReplicaTier::Dram,
+            priority: 0,
+        }],
+        cold_backing: None,
+        nof_backing: None,
+    };
+    let cas = client
+        .route_ops()
+        .publish_route(&route.key, None, &route)
+        .expect("route publication should succeed");
+    assert!(cas.applied);
+
+    assert_eq!(
+        client
+            .storage_owner
+            .recover_due_pending_publications()
+            .expect("exact pending publication recovery should succeed"),
+        0,
+        "a live route must finalize CLOCK rather than release its allocation"
+    );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 16);
+    assert!(client
+        .allocator
+        .lock()
+        .pending_allocations(now_ms())
+        .is_empty());
+    wait_for_storage_clock_route(&client, &route, false);
+
+    let metrics = render_prometheus_metrics();
+    assert!(!metrics.lines().any(|line| {
+        line.starts_with(
+            "mooncake_store_eviction_guard_event_total{tenant=\"default\",source=\"allocator_candidate\",outcome=\"pending_confirmation\"}",
+        ) && !line.ends_with(" 0")
+    }));
 }
 
 #[test]

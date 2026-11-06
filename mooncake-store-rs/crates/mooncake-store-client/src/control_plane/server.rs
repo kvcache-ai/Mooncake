@@ -764,6 +764,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             namespace: request.namespace,
             authority: ClientStableId::new(request.authority),
             identities,
+            include_route_key: request.include_route_key,
         };
         let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
             Ok(RouteControlResponse::AllocationReferences(references)) => {
@@ -771,6 +772,15 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     references: references
                         .into_iter()
                         .map(pb_allocation_reference_state)
+                        .collect(),
+                    error: None,
+                }
+            }
+            Ok(RouteControlResponse::AllocationReferenceKeys(references)) => {
+                pb::GetAllocationRouteReferencesReply {
+                    references: references
+                        .into_iter()
+                        .map(pb_allocation_reference)
                         .collect(),
                     error: None,
                 }
@@ -1073,7 +1083,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         "control plane reserve_any request is missing owner".to_string(),
                     )
                 })?;
-                self.allocator.reserve_any(&owner, request.length_bytes)
+                self.allocator.batch_reserve_any_with_pending_publication(&owner, &[ReserveAnyOp { length_bytes: request.length_bytes, route_key: None }]).into_iter().next().expect("single reserve request must produce one result")
             }) {
             Ok(reservation) => pb::ReserveAnyReply {
                 reservation: Some(pb_segment_reservation(&reservation)),
@@ -1103,7 +1113,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         })?;
         let replies = self
             .allocator
-            .batch_reserve_any(&owner, &request.length_bytes)
+            .batch_reserve_any_with_pending_publication(&owner, &request.length_bytes.iter().map(|length_bytes| ReserveAnyOp { length_bytes: *length_bytes, route_key: None }).collect::<Vec<_>>())
             .into_iter()
             .map(|result| match result {
                 Ok(reservation) => pb::ReserveAnyReply {
@@ -1135,11 +1145,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         "control plane reserve_specific request is missing owner".to_string(),
                     )
                 })?;
-                self.allocator.reserve_specific(
-                    &owner,
-                    &SegmentName::new(request.segment_name),
-                    request.length_bytes,
-                )
+                self.allocator.batch_reserve_specific_with_pending_publication(&owner, &[ReserveSpecificOp { segment_name: SegmentName::new(request.segment_name), length_bytes: request.length_bytes, route_key: None }]).into_iter().next().expect("single reserve request must produce one result")
             }) {
             Ok(reservation) => pb::ReserveSpecificReply {
                 reservation: Some(pb_segment_reservation(&reservation)),
@@ -1175,11 +1181,12 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             .map(|entry| ReserveSpecificOp {
                 segment_name: SegmentName::new(entry.segment_name),
                 length_bytes: entry.length_bytes,
+                route_key: None,
             })
             .collect::<Vec<_>>();
         let replies = self
             .allocator
-            .batch_reserve_specific(&owner, &entries)
+            .batch_reserve_specific_with_pending_publication(&owner, &entries)
             .into_iter()
             .map(|result| match result {
                 Ok(reservation) => pb::ReserveSpecificReply {

@@ -701,6 +701,7 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
     }
 
     let policy = client.resolve_replication_policy(Some(&task.policy))?;
+    let route_key = ObjectKey::from_logical_id(&task.object_id);
     let reserve_tracker =
         OperationTracker::new("restore_promote_reserve").input_bytes(task.payload.len() as u64);
     let reserve_result = if let (Some(target_runtime), Some(target_segment)) =
@@ -713,10 +714,11 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
                     segment_name: target_segment.clone(),
                 },
                 task.payload.len(),
+                &route_key,
             )
             .map(|(target, reservation)| (vec![target], vec![reservation]))
     } else {
-        client.reserve_replica_targets(&object_ref, task.payload.len(), &policy)
+        client.reserve_replica_targets(&object_ref, &route_key, task.payload.len(), &policy)
     };
     reserve_tracker.finish(&reserve_result, 0);
     let (targets, reservations) = reserve_result?;

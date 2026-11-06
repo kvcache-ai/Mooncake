@@ -147,7 +147,18 @@ pub(super) fn pb_allocation_reference_state(
             pb::allocation_route_reference_state::State::Conflict(true)
         }
     };
-    pb::AllocationRouteReferenceState { state: Some(state) }
+    pb::AllocationRouteReferenceState {
+        state: Some(state),
+        route_key: String::new(),
+    }
+}
+
+pub(super) fn pb_allocation_reference(
+    reference: AllocationRouteReference,
+) -> pb::AllocationRouteReferenceState {
+    let mut encoded = pb_allocation_reference_state(reference.state);
+    encoded.route_key = reference.route_key.map(|key| key.0).unwrap_or_default();
+    encoded
 }
 
 pub(super) fn try_allocation_reference_state(
@@ -166,6 +177,26 @@ pub(super) fn try_allocation_reference_state(
         _ => Err(StoreError::Transport(
             "allocation reference reply contains an invalid state".to_string(),
         )),
+    }
+}
+
+pub(super) fn try_allocation_reference(
+    state: pb::AllocationRouteReferenceState,
+) -> Result<AllocationRouteReference> {
+    let route_key = (!state.route_key.is_empty()).then(|| ObjectKey::new(state.route_key.clone()));
+    let state = try_allocation_reference_state(state)?;
+    match state {
+        AllocationRouteReferenceState::Exact if route_key.is_none() => Err(StoreError::Transport(
+            "exact allocation reference reply is missing route key".to_string(),
+        )),
+        AllocationRouteReferenceState::Exact => Ok(AllocationRouteReference { state, route_key }),
+        _ if route_key.is_some() => Err(StoreError::Transport(
+            "non-exact allocation reference reply contains a route key".to_string(),
+        )),
+        _ => Ok(AllocationRouteReference {
+            state,
+            route_key: None,
+        }),
     }
 }
 
