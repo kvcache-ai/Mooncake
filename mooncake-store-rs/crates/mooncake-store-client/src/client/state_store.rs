@@ -1,6 +1,7 @@
 include!("cold_tier_restore_state.rs");
 
 const STALE_RECLAIM_SCAN_INTERVAL_MS: u64 = 100;
+const BACKGROUND_EVICTION_BATCH_SIZE: usize = 256;
 
 impl RouteWriteGate {
     fn lock(&self) -> RouteWritePermit<'_> {
@@ -1168,6 +1169,7 @@ impl StorageOwnerState {
     fn evict_until_low_watermark(&self, high_percent: u8, low_percent: u8) -> Result<usize> {
         let tracker = OperationTracker::new("storage_owner_background_eviction");
         let started = Instant::now();
+        let used_before = self.allocator.lock().usage_bytes().0;
         let result = (|| {
             let (used_bytes, capacity_bytes) = self.allocator.lock().usage_bytes();
             if capacity_bytes == 0 {
@@ -1184,10 +1186,14 @@ impl StorageOwnerState {
                 if used_bytes <= low_watermark {
                     break;
                 }
-                if !self.evict_one_blocking(None)? {
+                let reclaimed = self.evict_background_batch(
+                    used_bytes.saturating_sub(low_watermark),
+                    BACKGROUND_EVICTION_BATCH_SIZE,
+                )?;
+                if reclaimed == 0 {
                     break;
                 }
-                evicted = evicted.saturating_add(1);
+                evicted = evicted.saturating_add(reclaimed);
             }
             if evicted != 0 {
                 let (used_bytes, _) = self.allocator.lock().usage_bytes();
@@ -1203,12 +1209,167 @@ impl StorageOwnerState {
             }
             Ok(evicted)
         })();
-        tracker.finish(&result, result.as_ref().copied().unwrap_or_default() as u64);
-        registry::record_eviction(
-            if result.is_ok() { "ok" } else { "error" },
-            started.elapsed(),
-        );
+        let used_after = self.allocator.lock().usage_bytes().0;
+        tracker.finish(&result, used_before.saturating_sub(used_after));
+        match &result {
+            Ok(evicted) if *evicted != 0 => registry::record_eviction("ok", started.elapsed()),
+            Err(_) => registry::record_eviction("error", started.elapsed()),
+            Ok(_) => {}
+        }
         result
+    }
+
+    fn evict_background_batch(
+        &self,
+        bytes_to_reclaim: u64,
+        batch_size: usize,
+    ) -> Result<usize> {
+        if batch_size <= 1 || self.has_usable_cold_tier_device()? {
+            return Ok(usize::from(self.evict_one_blocking(None)?));
+        }
+
+        let budget = self.hot_replicas.clock.lock().eviction_budget();
+        let mut victims = Vec::with_capacity(batch_size.min(budget));
+        let mut seen = BTreeSet::new();
+        for _ in 0..budget.max(1) {
+            let victim = self.hot_replicas.clock.lock().pick_victim(
+                None,
+                self.offload_priority.eviction_policy,
+                self.offload_priority.eviction_scan_limit,
+            );
+            let Some(victim) = victim else {
+                break;
+            };
+            if seen.insert(victim.clone()) {
+                victims.push(victim);
+                if victims.len() == batch_size {
+                    break;
+                }
+            }
+        }
+        if victims.is_empty() {
+            return Ok(usize::from(self.evict_one_blocking(None)?));
+        }
+
+        let keys = victims
+            .iter()
+            .map(|victim| victim.route_key.clone())
+            .collect::<Vec<_>>();
+        let routes = self.route_ops.load_routes_bounded(&keys)?;
+        if routes.len() != victims.len() {
+            return Err(StoreError::InvalidState(format!(
+                "background eviction route lookup returned {} results for {} candidates",
+                routes.len(),
+                victims.len()
+            )));
+        }
+
+        let mut reclaimed = 0usize;
+        let mut planned_bytes = 0u64;
+        let mut prepared = Vec::new();
+        for (victim, route) in victims.into_iter().zip(routes) {
+            let Some(route) = route else {
+                if self.reclaim_stale_local_allocations_for_key(&victim.route_key, None)? > 0 {
+                    reclaimed = reclaimed.saturating_add(1);
+                } else {
+                    self.hot_replicas.clock.lock().remove_id(&victim);
+                }
+                continue;
+            };
+            let Some(replica_index) = self.replica_index_for_victim(&route, &victim) else {
+                if self.reclaim_stale_local_allocations_for_key(
+                    &victim.route_key,
+                    Some(&route),
+                )? > 0
+                {
+                    reclaimed = reclaimed.saturating_add(1);
+                } else {
+                    self.sync_route(&route);
+                }
+                continue;
+            };
+            let cold_backing_not_on_disk = route.cold_backing.is_none()
+                || route.cold_backing.as_ref().is_some_and(|backing| {
+                    backing.state == mooncake_store_core::ColdBackingState::PendingOffload
+                });
+            if route.state != RouteState::Active || !cold_backing_not_on_disk {
+                if self.evict_candidate(&victim)? {
+                    reclaimed = reclaimed.saturating_add(1);
+                }
+                continue;
+            }
+
+            let evicted_replica = route.replicas[replica_index].clone();
+            let next = cold_tier::route_after_replica_eviction(&route, replica_index, true);
+            planned_bytes = planned_bytes.saturating_add(evicted_replica.length);
+            prepared.push((victim, route, evicted_replica, next));
+            if planned_bytes >= bytes_to_reclaim {
+                break;
+            }
+        }
+        if prepared.is_empty() {
+            return Ok(reclaimed);
+        }
+
+        let requests = prepared
+            .iter()
+            .map(|(_, route, _, next)| RouteCasRequest {
+                key: route.key.clone(),
+                expected: Some(route.version),
+                next: next.clone(),
+            })
+            .collect::<Vec<_>>();
+        let results = self.route_ops.publish_routes(&requests)?;
+        if results.len() != prepared.len() {
+            return Err(StoreError::InvalidState(format!(
+                "background eviction route CAS returned {} results for {} requests",
+                results.len(),
+                prepared.len()
+            )));
+        }
+
+        let mut first_error = None;
+        let mut evicted_replicas = 0usize;
+        let mut evicted_bytes = 0u64;
+        for ((victim, route, evicted_replica, next), result) in
+            prepared.into_iter().zip(results)
+        {
+            match result {
+                Ok(cas) if cas.applied => {
+                    let finish = self.finish_evicted_replica(
+                        &victim,
+                        &route,
+                        &evicted_replica,
+                        next.as_ref(),
+                        true,
+                    );
+                    match finish {
+                        Ok(()) => {
+                            reclaimed = reclaimed.saturating_add(1);
+                            evicted_replicas = evicted_replicas.saturating_add(1);
+                            evicted_bytes = evicted_bytes.saturating_add(evicted_replica.length);
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
+                Ok(cas) => match cas.current.as_ref() {
+                    Some(current) => self.sync_route(current),
+                    None => self.hot_replicas.clock.lock().remove_id(&victim),
+                },
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if evicted_replicas != 0 {
+            registry::record_evicted_replicas(evicted_replicas, evicted_bytes);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(reclaimed),
+        }
     }
 
     fn evict_one(self: &Arc<Self>, preferred_segment: Option<&SegmentName>) -> Result<bool> {
@@ -1656,6 +1817,25 @@ impl StorageOwnerState {
             return Ok(false);
         }
 
+        self.finish_evicted_replica(
+            victim,
+            route,
+            &evicted_replica,
+            next.as_ref(),
+            delete_empty_route,
+        )?;
+        registry::record_evicted_replicas(1, evicted_replica.length);
+        Ok(true)
+    }
+
+    fn finish_evicted_replica(
+        &self,
+        victim: &ClockEntryId,
+        route: &ObjectRoute,
+        evicted_replica: &ReplicaRoute,
+        next: Option<&ObjectRoute>,
+        delete_empty_route: bool,
+    ) -> Result<()> {
         self.hot_replicas.clock.lock().remove_id(victim);
         if let Err(error) = self.allocator.lock().release(
             &self.runtime,
@@ -1678,7 +1858,7 @@ impl StorageOwnerState {
                 return Err(error);
             }
         }
-        if let Some(next_route) = &next {
+        if let Some(next_route) = next {
             self.sync_route(next_route);
         }
         info!(
@@ -1705,7 +1885,7 @@ impl StorageOwnerState {
                 "sampled storage-owner replica eviction"
             );
         }
-        Ok(true)
+        Ok(())
     }
 
     pub(in super) fn current_materialized_route(&self, key: &ObjectKey) -> Result<Option<ObjectRoute>> {

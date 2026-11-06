@@ -3,11 +3,11 @@ use super::registry::{
     MetadataInflightKey, MetadataOperationKey, MetricsSnapshot, PhaseKey, PhaseResultKey,
     PreferredSegmentSkipKey, ReplicaDistributionKey, RequestBytesKey, RequestInflightKey,
     RequestKey, ResultKey, RuntimeKey, RuntimeStatusKey, TenantKey, TransportBytesKey,
-    TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, COLD_TIER_IO_BUCKETS, EVICTION_DURATION,
-    EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES, HEARTBEAT_LAST_SUCCESS_MS,
-    MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL, METADATA_OPERATION_DURATION,
-    METADATA_OPERATION_INFLIGHT, METADATA_OPERATION_TOTAL, OBJECT_ROUTES,
-    PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL, REBALANCE_ROUTES_TOTAL,
+    TransportOperationKey, CHECKSUM_VALIDATION_TOTAL, COLD_TIER_IO_BUCKETS, EVICTED_BYTES_TOTAL,
+    EVICTED_REPLICAS_TOTAL, EVICTION_DURATION, EVICTION_TOTAL, HEARTBEAT_CONSECUTIVE_FAILURES,
+    HEARTBEAT_LAST_SUCCESS_MS, MEMBERSHIP_REFRESH_DURATION, MEMBERSHIP_REFRESH_TOTAL,
+    METADATA_OPERATION_DURATION, METADATA_OPERATION_INFLIGHT, METADATA_OPERATION_TOTAL,
+    OBJECT_ROUTES, PREFERRED_SEGMENT_SKIP_TOTAL, REBALANCE_BYTES_TOTAL, REBALANCE_ROUTES_TOTAL,
     RECLAIM_RELEASE_TOTAL, REPLICATION_PUBLISH_DURATION, REPLICATION_PUBLISH_TOTAL,
     REPLICA_DISTRIBUTION, REQUEST_BYTES, REQUEST_DURATION, REQUEST_DURATION_BUCKETS,
     REQUEST_INFLIGHT, REQUEST_TOTAL, ROUTE_CAS_TOTAL, RUNTIME_LEASE_EXPIRES_AT_MS, RUNTIME_STATUS,
@@ -560,6 +560,25 @@ fn render_recovery_metrics(output: &mut String, snapshot: &MetricsSnapshot) {
     for sample in &snapshot.eviction_duration {
         render_result_histogram(output, EVICTION_DURATION, &tenant, sample);
     }
+
+    counter_family(
+        output,
+        EVICTED_REPLICAS_TOTAL,
+        "Successfully evicted DRAM replicas.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        EVICTED_REPLICAS_TOTAL, tenant, snapshot.evicted_replicas
+    ));
+    counter_family(
+        output,
+        EVICTED_BYTES_TOTAL,
+        "Successfully evicted DRAM replica bytes.",
+    );
+    output.push_str(&format!(
+        "{}{{tenant=\"{}\"}} {}\n",
+        EVICTED_BYTES_TOTAL, tenant, snapshot.evicted_bytes
+    ));
 
     counter_family(
         output,

@@ -426,6 +426,9 @@ fn batch_is_readable_uses_bounded_lookup_for_evicted_cold_only_entry() {
         get_object_routes_calls: AtomicUsize::new(0),
         bounded_reads: bounded_reads.clone(),
         full_reads: full_reads.clone(),
+        single_cas_calls: AtomicUsize::new(0),
+        batch_cas_calls: AtomicUsize::new(0),
+        max_cas_batch_size: AtomicUsize::new(0),
     });
 
     let payload = vec![7u8; 24];
