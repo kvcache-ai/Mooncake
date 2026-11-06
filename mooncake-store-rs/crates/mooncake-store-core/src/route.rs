@@ -269,6 +269,10 @@ pub struct CasResult {
     pub applied: bool,
     pub current: Option<ObjectRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_version: Option<RouteVersion>,
+    /// Rolling-upgrade compatibility with authorities that still retain
+    /// unbounded version floors. New authorities always return `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_floor: Option<RouteVersion>,
 }
 

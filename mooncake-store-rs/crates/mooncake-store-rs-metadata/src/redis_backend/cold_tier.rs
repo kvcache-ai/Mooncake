@@ -348,6 +348,7 @@ impl RedisMetadataBackend {
         Ok(CasResult {
             applied: current_payload.0 == 1,
             current,
+            delete_version: None,
             version_floor: None,
         })
     }

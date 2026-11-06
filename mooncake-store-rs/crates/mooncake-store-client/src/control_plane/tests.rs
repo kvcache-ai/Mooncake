@@ -146,6 +146,7 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
         Ok(CasResult {
             applied,
             current,
+            delete_version: None,
             version_floor: None,
         })
     }
@@ -2149,6 +2150,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let cas = CasResult {
         applied: true,
         current: Some(route.clone()),
+        delete_version: None,
         version_floor: None,
     };
     assert_eq!(
@@ -2159,12 +2161,25 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let cas_with_floor = CasResult {
         applied: false,
         current: None,
+        delete_version: None,
         version_floor: Some(RouteVersion(42)),
     };
     assert_eq!(
         try_cas_result(pb_cas_result(&cas_with_floor))
             .expect("cas result with version_floor should round-trip"),
         cas_with_floor
+    );
+
+    let cas_with_marker = CasResult {
+        applied: false,
+        current: None,
+        delete_version: Some(RouteVersion(43)),
+        version_floor: None,
+    };
+    assert_eq!(
+        try_cas_result(pb_cas_result(&cas_with_marker))
+            .expect("cas result with delete_version should round-trip"),
+        cas_with_marker
     );
 
     let reservation = SegmentReservation {

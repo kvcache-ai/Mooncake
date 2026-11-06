@@ -2131,6 +2131,7 @@ impl RouteDirectory for EmptyConflictRouteDirectory {
             return Ok(mooncake_store_core::CasResult {
                 applied: false,
                 current: None,
+                delete_version: None,
                 version_floor: None,
             });
         }
@@ -2156,6 +2157,7 @@ impl RouteDirectory for EmptyConflictRouteDirectory {
                         Ok(mooncake_store_core::CasResult {
                             applied: false,
                             current: None,
+                            delete_version: None,
                             version_floor: None,
                         })
                     } else {
@@ -2624,6 +2626,7 @@ impl MetadataBackend for BlockingCasMetadataBackend {
             return Ok(mooncake_store_core::CasResult {
                 applied: false,
                 current: None,
+                delete_version: None,
                 version_floor: None,
             });
         }
@@ -2658,6 +2661,7 @@ impl MetadataBackend for BlockingCasMetadataBackend {
             return Ok(mooncake_store_core::CasResult {
                 applied: false,
                 current: None,
+                delete_version: None,
                 version_floor: None,
             });
         }
@@ -3024,6 +3028,7 @@ fn test_storage_owner_state(
     let route_directory = build_route_directory(
         RouteControlMode::MetadataOnly,
         2,
+        128 * 1024 * 1024,
         metadata.clone(),
         &lease,
         control_client.clone(),

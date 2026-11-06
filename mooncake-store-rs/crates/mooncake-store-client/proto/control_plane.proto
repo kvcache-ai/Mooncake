@@ -177,6 +177,7 @@ message CasResult {
   bool applied = 1;
   ObjectRoute current = 2;
   optional uint64 version_floor = 3;
+  optional uint64 delete_version = 4;
 }
 
 message SegmentReservation {
@@ -196,6 +197,7 @@ message GetRouteRequest {
 message GetRouteReply {
   ObjectRoute route = 1;
   ErrorDetail error = 2;
+  optional uint64 delete_version = 3;
 }
 
 message BatchGetRoutesRequest {

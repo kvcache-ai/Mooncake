@@ -657,6 +657,20 @@ pub trait RouteDirectory: Send + Sync {
             .collect()
     }
 
+    fn get_delete_marker(&self, _observer: &ClientLease, _key: &ObjectKey) -> Option<RouteVersion> {
+        None
+    }
+
+    fn get_delete_markers(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Vec<Option<RouteVersion>> {
+        keys.iter()
+            .map(|key| self.get_delete_marker(observer, key))
+            .collect()
+    }
+
     /// Best-effort flush of locally-held authority routes to peer authorities.
     ///
     /// Called during graceful shutdown to ensure routes are not lost if
@@ -912,6 +926,7 @@ mod tests {
             Ok(CasResult {
                 applied: expected == Some(RouteVersion(7)),
                 current: next.cloned().or_else(|| Some(sample_route(key.0.as_str()))),
+                delete_version: None,
                 version_floor: None,
             })
         }

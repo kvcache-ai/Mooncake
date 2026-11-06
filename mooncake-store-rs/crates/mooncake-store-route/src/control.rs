@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
-    ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, ObjectRoute, Result, RouteCasRequest,
+    ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, Result, RouteCasRequest,
     StoreError,
 };
 
 use crate::shim::{
-    RouteAuthorityClient, RouteAuthorityService, RouteOwnerPage, RouteOwnerPageQuery,
+    RouteAuthorityClient, RouteAuthorityRecord, RouteAuthorityService, RouteOwnerPage,
+    RouteOwnerPageQuery,
 };
 
 #[derive(Clone, Debug)]
@@ -105,7 +106,7 @@ impl RouteControlRequest {
 
 #[derive(Clone, Debug)]
 pub enum RouteControlResponse {
-    BatchGet(Vec<Result<Option<ObjectRoute>>>),
+    BatchGet(Vec<Result<RouteAuthorityRecord>>),
     BatchContains(Vec<Result<bool>>),
     BatchCompareAndSwap(Vec<Result<CasResult>>),
     BatchReplace(Vec<Result<()>>),
@@ -132,7 +133,7 @@ pub fn serve_route_control_request(
             authority,
             keys,
         } => Ok(RouteControlResponse::BatchGet(
-            service.batch_get_routes(&namespace, &authority, &keys),
+            service.batch_get_route_records(&namespace, &authority, &keys),
         )),
         RouteControlRequest::BatchContains {
             namespace,
@@ -293,7 +294,7 @@ impl RouteAuthorityClient for RouteControlAuthorityClient {
         namespace: &str,
         authority: &ClientStableId,
         keys: &[ObjectKey],
-    ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+    ) -> Result<Vec<Result<RouteAuthorityRecord>>> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }

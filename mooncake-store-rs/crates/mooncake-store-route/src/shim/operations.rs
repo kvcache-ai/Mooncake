@@ -245,7 +245,7 @@ impl RouteOperations {
             .map(|route| route.version.next())
             .unwrap_or_else(|| {
                 self.directory
-                    .get_version_floor(&self.observer, key)
+                    .get_delete_marker(&self.observer, key)
                     .map(|version| version.next())
                     .unwrap_or(RouteVersion(1))
             })
@@ -278,7 +278,7 @@ impl RouteOperations {
         }
         let floors = self
             .directory
-            .get_version_floors(&self.observer, &missing_keys);
+            .get_delete_markers(&self.observer, &missing_keys);
         for (index, floor) in missing_indices.into_iter().zip(floors) {
             versions[index] = Some(
                 floor

@@ -1439,9 +1439,13 @@ impl StoreClient {
             let pending = &routes[index];
             if let Ok(cas) = result {
                 if !cas.applied && pending.expected_version.is_none() && cas.current.is_none() {
+                    if cas.delete_version.is_none() && cas.version_floor.is_some() {
+                        registry::record_delete_marker_event("legacy_floor_retry", 1);
+                    }
                     let retry_version = cas
-                        .version_floor
-                        .map(|floor| floor.next())
+                        .delete_version
+                        .or(cas.version_floor)
+                        .map(|version| version.next())
                         .unwrap_or_else(|| {
                             let keys = &[routes[index].key.clone()];
                             let current = vec![None; 1];
@@ -1541,7 +1545,7 @@ impl StoreClient {
                             Ok(cas) if !cas.applied && cas.current.is_none() => {
                                 routes[index].expected_version = None;
                                 fallback_indices.push(index);
-                                fallback_floors.push(cas.version_floor);
+                                fallback_floors.push(cas.delete_version.or(cas.version_floor));
                             }
                             _ => {
                                 cas_results[index] = result;
