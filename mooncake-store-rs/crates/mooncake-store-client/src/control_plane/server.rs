@@ -1106,7 +1106,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
     ) -> std::result::Result<Response<pb::ReserveAnyReply>, Status> {
         let request = request.into_inner();
         let allocator = self.allocator.clone();
-        let result = (move || {
+        let result = run_blocking_allocator("reserve_any", move || {
             request
                 .owner
                 .as_ref()
@@ -1131,7 +1131,8 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         allocator.reserve_any(&owner, request.length_bytes)
                     }
                 })
-        })();
+        })
+        .await?;
         let reply = match result {
             Ok(reservation) => pb::ReserveAnyReply {
                 reservation: Some(pb_segment_reservation(&reservation)),
@@ -1162,13 +1163,14 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         let length_bytes = request.length_bytes;
         let pending_publication = request.pending_publication;
         let allocator = self.allocator.clone();
-        let results = (move || {
+        let results = run_blocking_allocator("batch reserve_any", move || {
             if pending_publication {
                 allocator.batch_reserve_any_with_pending_publication(&owner, &length_bytes)
             } else {
                 allocator.batch_reserve_any(&owner, &length_bytes)
             }
-        })();
+        })
+        .await?;
         let replies = results
             .into_iter()
             .map(|result| match result {
@@ -1191,7 +1193,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
     ) -> std::result::Result<Response<pb::ReserveSpecificReply>, Status> {
         let request = request.into_inner();
         let allocator = self.allocator.clone();
-        let result = (move || {
+        let result = run_blocking_allocator("reserve_specific", move || {
             request
                 .owner
                 .as_ref()
@@ -1223,7 +1225,8 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                         )
                     }
                 })
-        })();
+        })
+        .await?;
         let reply = match result {
             Ok(reservation) => pb::ReserveSpecificReply {
                 reservation: Some(pb_segment_reservation(&reservation)),
@@ -1263,13 +1266,14 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             .collect::<Vec<_>>();
         let pending_publication = request.pending_publication;
         let allocator = self.allocator.clone();
-        let results = (move || {
+        let results = run_blocking_allocator("batch reserve_specific", move || {
             if pending_publication {
                 allocator.batch_reserve_specific_with_pending_publication(&owner, &entries)
             } else {
                 allocator.batch_reserve_specific(&owner, &entries)
             }
-        })();
+        })
+        .await?;
         let replies = results
             .into_iter()
             .map(|result| match result {
@@ -1411,6 +1415,21 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+async fn run_blocking_allocator<T, F>(
+    operation: &'static str,
+    allocate: F,
+) -> std::result::Result<T, Status>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(allocate)
+        .await
+        .map_err(|error| {
+            Status::internal(format!("control plane {operation} worker failed: {error}"))
+        })
 }
 
 fn control_stream_request_operation(request: &pb::ControlStreamRequest) -> &'static str {
