@@ -58,7 +58,7 @@ class LeaseEvictionIndexTest : public ::testing::Test {
     static void SetDeadline(const ObjectMetadata& metadata,
                             Clock::time_point deadline) {
         SpinLocker locker(&metadata.lock);
-        metadata.lease_->SetDeadline(deadline);
+        metadata.GetLease().SetDeadline(deadline);
     }
 
     // An entry a walk handed out, with its keys copied off the cursor.

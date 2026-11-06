@@ -513,7 +513,7 @@ class MasterServiceTest : public ::testing::Test {
         return ns->objects.GroupMembers(group_id);
     }
 
-    std::shared_ptr<Lease> GetGroupLeaseForTest(
+    std::shared_ptr<const Lease> GetGroupLeaseForTest(
         MasterService& service, const std::string& group_id,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
@@ -528,7 +528,7 @@ class MasterServiceTest : public ::testing::Test {
         }
         for (const auto& member_key : ns->objects.GroupMembers(group_id)) {
             if (auto hold = ns->objects.Read(member_key)) {
-                return hold->metadata().lease_;
+                return hold->metadata().GroupLease();
             }
         }
         return nullptr;

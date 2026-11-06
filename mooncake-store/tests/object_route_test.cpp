@@ -26,13 +26,13 @@ using test::PublishObject;
 
 // The lease the object under `key` holds, read under the key's read lock and
 // the envelope's own lease lock; null when the key holds no object.
-std::shared_ptr<Lease> LeaseOf(const ObjectRoute& route, std::string_view key) {
+const Lease* LeaseOf(const ObjectRoute& route, std::string_view key) {
     auto guard = route.Read(key);
     if (!guard) {
         return nullptr;
     }
     SpinLocker locker(&guard->metadata().lock);
-    return guard->metadata().lease_;
+    return &guard->metadata().GetLease();
 }
 
 // Tears down whatever `key` holds; false when it holds nothing.
@@ -234,7 +234,7 @@ TEST(ObjectRouteTest, PublishJoinsTheGroupOnItsSharedLease) {
     // deadline.
     const auto first_lease = LeaseOf(route, "k1");
     ASSERT_NE(first_lease, nullptr);
-    EXPECT_EQ(first_lease.get(), LeaseOf(route, "k2").get());
+    EXPECT_EQ(first_lease, LeaseOf(route, "k2"));
 }
 
 TEST(ObjectRouteTest, PublishLeavesAnUngroupedObjectOnItsOwnLease) {
@@ -247,7 +247,7 @@ TEST(ObjectRouteTest, PublishLeavesAnUngroupedObjectOnItsOwnLease) {
     EXPECT_TRUE(route.GroupMembers("").empty());
     const auto lease = LeaseOf(route, "k1");
     ASSERT_NE(lease, nullptr);
-    EXPECT_NE(lease.get(), LeaseOf(route, "k2").get());
+    EXPECT_NE(lease, LeaseOf(route, "k2"));
     EXPECT_TRUE(route.Read("k1")->metadata().IsLeaseExpired());
 }
 
@@ -260,7 +260,7 @@ TEST(ObjectRouteTest, TearDownDropsOnlyItsOwnMembership) {
     // The group keeps its other member and the one lease both of them held.
     ASSERT_TRUE(TearDownKey(route, "k1"));
     EXPECT_EQ(route.GroupMembers("g1"), (std::vector<std::string>{"k2"}));
-    EXPECT_EQ(LeaseOf(route, "k2").get(), group_lease.get());
+    EXPECT_EQ(LeaseOf(route, "k2"), group_lease);
     EXPECT_FALSE(route.Empty());
 
     ASSERT_TRUE(TearDownKey(route, "k2"));
@@ -276,14 +276,18 @@ TEST(ObjectRouteTest, AGroupKeepsOneLeaseAcrossReplacementOfItsKeys) {
     ASSERT_NE(PublishObject(route, "k2", "g1"), 0u);
     const auto group_lease = LeaseOf(route, "k1");
     ASSERT_NE(group_lease, nullptr);
+    // Hold the group's lease across the teardown below, so a fresh lease
+    // cannot land on the freed allocation's address and pass for this one.
+    const auto held_group_lease = route.Read("k1")->metadata().GroupLease();
+    ASSERT_NE(held_group_lease, nullptr);
 
     // Replacing one key of the group re-registers that member and keeps both
     // on the group's one lease.
     ASSERT_TRUE(TearDownKey(route, "k1"));
     ASSERT_NE(PublishObject(route, "k1", "g1"), 0u);
     ASSERT_EQ(route.GroupMembers("g1").size(), 2u);
-    EXPECT_EQ(LeaseOf(route, "k1").get(), group_lease.get());
-    EXPECT_EQ(LeaseOf(route, "k2").get(), group_lease.get());
+    EXPECT_EQ(LeaseOf(route, "k1"), group_lease);
+    EXPECT_EQ(LeaseOf(route, "k2"), group_lease);
 
     // The group, and its lease, go with the last member; a later publication
     // gets the fresh lease of a new group.
@@ -294,7 +298,9 @@ TEST(ObjectRouteTest, AGroupKeepsOneLeaseAcrossReplacementOfItsKeys) {
     ASSERT_NE(PublishObject(route, "k1", "g1"), 0u);
     const auto late_lease = LeaseOf(route, "k1");
     ASSERT_NE(late_lease, nullptr);
-    EXPECT_NE(late_lease.get(), group_lease.get());
+    EXPECT_NE(late_lease, group_lease);
+    // The new group starts on a never-granted lease.
+    EXPECT_TRUE(late_lease->IsExpired(std::chrono::system_clock::now()));
 }
 
 TEST(ObjectRouteTest, RebuildGroupStateRegroupsMembersOnTheLatestDeadline) {
@@ -316,10 +322,8 @@ TEST(ObjectRouteTest, RebuildGroupStateRegroupsMembersOnTheLatestDeadline) {
     const auto restore_lease = [&](std::string_view key, int seconds) {
         auto guard = route.Write(key);
         ASSERT_TRUE(guard.has_value());
-        auto lease = std::make_shared<Lease>();
-        lease->ExtendTo(at(seconds));
         SpinLocker locker(&guard->metadata().lock);
-        guard->metadata().lease_ = std::move(lease);
+        guard->metadata().GetLease().ExtendTo(at(seconds));
     };
     restore_lease("k1", 100);
     restore_lease("k2", 300);
@@ -336,14 +340,14 @@ TEST(ObjectRouteTest, RebuildGroupStateRegroupsMembersOnTheLatestDeadline) {
     EXPECT_EQ(route.GroupMembers("g2"), (std::vector<std::string>{"k3"}));
     const auto g1_lease = LeaseOf(route, "k1");
     ASSERT_NE(g1_lease, nullptr);
-    EXPECT_EQ(LeaseOf(route, "k2").get(), g1_lease.get());
+    EXPECT_EQ(LeaseOf(route, "k2"), g1_lease);
     EXPECT_EQ(g1_lease->ExpiresAt(), at(300));
     const auto g2_lease = LeaseOf(route, "k3");
     ASSERT_NE(g2_lease, nullptr);
-    EXPECT_NE(g2_lease.get(), g1_lease.get());
+    EXPECT_NE(g2_lease, g1_lease);
     EXPECT_EQ(g2_lease->ExpiresAt(), at(200));
     // An ungrouped object keeps its own lease.
-    EXPECT_EQ(LeaseOf(route, "solo").get(), solo_lease.get());
+    EXPECT_EQ(LeaseOf(route, "solo"), solo_lease);
     EXPECT_EQ(solo_lease->ExpiresAt(), at(50));
     EXPECT_EQ(route.ObjectCount(), 4u);
 }
@@ -1056,8 +1060,9 @@ TEST(ObjectRouteTest, ChurnKeepsTheRouteAndTheGroupConsistent) {
                 continue;
             }
             pairs_observed.fetch_add(1, std::memory_order_relaxed);
-            if (first->metadata().lease_ != second->metadata().lease_ ||
-                !is_member("k1") || !is_member("k2")) {
+            const bool same_lease =
+                &first->metadata().GetLease() == &second->metadata().GetLease();
+            if (!same_lease || !is_member("k1") || !is_member("k2")) {
                 violation();
             }
         }
