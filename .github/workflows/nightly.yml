@@ -29,7 +29,8 @@ concurrency:
 # 3. Specialized platform and packaging checks run nightly instead of on every PR.
 # 4. publish-testpypi uploads standard and ROCm nightly artifacts to TestPyPI.
 # 5. MI350X hardware tests require NIGHTLY_ROCM_INTEGRATION=true or a manual opt-in.
-#    ROCm wheel builds and their smoke tests always run.
+#    ROCm wheel builds and their smoke tests always run. When hardware tests run,
+#    classic then TENT share the exclusive MI350X lock (sequential, not parallel).
 # 6. T-One SGLang integration runs classic and TENT in parallel from the nightly
 #    cuda13 x86 wheel (use-tent). Runtime stays classic unless MC_USE_TENT=1.
 # 7. nightly-gate aggregates required results; notify-failure files an issue.
@@ -142,6 +143,17 @@ jobs:
     uses: ./.github/workflows/integration-test-rocm.yml
     with:
       checkout_ref: ${{ github.sha }}
+    secrets: inherit
+
+  # Same wheel and cases as rocm-integration-test, with MC_USE_TENT=1.
+  # Sequential: the MI350X runner is exclusive (concurrency group + flock).
+  rocm-integration-test-tent:
+    needs: [version-stamp, build-wheel-rocm, rocm-integration-test]
+    if: ${{ needs.version-stamp.outputs.run_rocm_integration == 'true' }}
+    uses: ./.github/workflows/integration-test-rocm.yml
+    with:
+      checkout_ref: ${{ github.sha }}
+      use-tent: true
     secrets: inherit
 
   build-musa:
@@ -687,6 +699,7 @@ jobs:
       - tone-sglang-integration-tent
       - build-wheel-rocm
       - rocm-integration-test
+      - rocm-integration-test-tent
       - build-musa
       - build-docker
       - ascend-test
@@ -718,7 +731,9 @@ jobs:
                  $allow_publish_skip != "true") and
                 (.key != "rocm-integration-test" or
                  .value.result != "skipped" or
-                 $allow_rocm_skip != "true")
+                 $allow_rocm_skip != "true") and
+                (.key != "rocm-integration-test-tent" or
+                 .value.result != "skipped")
               ) |
               "\(.key): \(.value.result)"')
           if [ -n "$failing" ]; then

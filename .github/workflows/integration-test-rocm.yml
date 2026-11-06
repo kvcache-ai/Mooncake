@@ -12,10 +12,18 @@ on:
         required: false
         default: true
         type: boolean
+      use-tent:
+        description: >-
+          Run the MI350X job against the TENT runtime (MC_USE_TENT=1) instead
+          of the classic engine. The CI/nightly ROCm wheel carries both
+          engines; the env var selects which one the containers activate.
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   test-rocm-integration:
-    name: ROCm MI350X external PD
+    name: ${{ inputs.use-tent && 'ROCm MI350X external PD (TENT)' || 'ROCm MI350X external PD' }}
     runs-on: [self-hosted, Linux, X64, amd, rocm, gfx950, mooncake-pd]
     timeout-minutes: 390
     concurrency:
@@ -82,6 +90,11 @@ jobs:
           set +a
           export REGISTRY_ADDR_SGLANG REGISTRY_ADDR_VLLM
           export WHEEL_DIR_SGLANG WHEEL_DIR_VLLM
+          # Dual-engine ROCm wheel: classic unless this job asked for TENT.
+          export USE_TENT=false
+          if [ "${{ inputs.use-tent }}" = "true" ]; then
+            export USE_TENT=true
+          fi
 
           required_vars=(
             CI_ACCELERATOR LOCAL_IP REMOTE_IP REMOTE_SSH_TARGET
@@ -163,7 +176,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rocm-external-pd-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: rocm-external-pd-logs-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.use-tent && '-tent' || '' }}
           path: scripts/rocm_tests/run/logs
           if-no-files-found: warn
           retention-days: 14

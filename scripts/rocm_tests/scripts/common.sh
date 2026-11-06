@@ -2,6 +2,13 @@
 # Platform-specific lifecycle; test helpers are shared.
 source "${E2E_DIR:?E2E_DIR must point to the shared E2E directory}/scripts/common.sh"
 
+# TENT runtime toggle for the mooncake transfer engine. The CI/nightly ROCm
+# wheel (ci_rocm.yml, -DUSE_TENT=ON) carries both engines: without MC_USE_TENT
+# the facade runs classic, with it the TENT runtime activates. The e2e and
+# nightly pipelines run TWO MI350X jobs — classic (this unset/false) then
+# TENT (USE_TENT=true) — sequential because the runner is exclusive.
+USE_TENT=${USE_TENT:-false}
+
 prepare_rocm_runtime_cache_args() {
     local registry_addr=$1
     local cache_root=${MOONCAKE_RUNTIME_CACHE:-}
@@ -191,6 +198,12 @@ docker_launch(){
         export HF_TOKEN="$hf_token"
         docker_args+=(-e HF_TOKEN)
     fi
+    if [ "${USE_TENT}" = "true" ]; then
+        # Container-level env: every serving process inherits TENT. Metrics
+        # disabled: all ranks inherit one TENT_METRICS_HTTP_PORT, so only one
+        # rank would ever expose an endpoint. Same as tone_tests/scripts/common.sh.
+        docker_args+=(-e MC_USE_TENT=1 -e TENT_METRICS_ENABLED=false)
+    fi
     printf 'Executing Docker run command:'
     printf ' %q' docker "${docker_args[@]}" "$registry_addr" -c 'hostname; sleep 360000'
     printf '\n'
@@ -337,6 +350,19 @@ case \"\$gid\" in ''|'::'|'0:0:0:0:0:0:0:0') echo 'RDMA GID is empty' >&2; exit 
     if ! ${docker_exec} "${mooncake_install_check}"; then
         echo "ERROR: The ROCm wheel did not replace all image-provided Mooncake files" >&2
         return 1
+    fi
+
+    # Fail fast if TENT was requested but the installed engine cannot provide
+    # it: MC_USE_TENT=1 against a classic-only engine.so silently falls back
+    # to classic, which would make the test pass without testing TENT at all.
+    if [ "${USE_TENT}" = "true" ]; then
+        echo "=== Verifying TENT runtime in installed mooncake ==="
+        if ! ${docker_exec} "python3 -c 'import mooncake, os; from pathlib import Path; raise SystemExit(0 if b\"MC_USE_TENT\" in (Path(os.path.dirname(mooncake.__file__)) / \"engine.so\").read_bytes() else 1)' && python3 -c 'import mooncake.engine'"; then
+            echo "ERROR: USE_TENT=true but the installed mooncake wheel lacks the TENT runtime." >&2
+            echo "       The CI wheel must be built with -DUSE_TENT=ON (ci_rocm.yml)." >&2
+            return 1
+        fi
+        echo "TENT runtime verified."
     fi
 
     return 0
