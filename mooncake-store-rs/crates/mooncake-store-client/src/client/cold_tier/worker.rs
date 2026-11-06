@@ -1,19 +1,8 @@
 use super::super::{
     ClientLease, ClientRuntimeId, LocalMemoryConfig, Result, SharedRestorePromotionQueue,
-    StorageOwnerState, StoreError, DEFAULT_OFFLOAD_POLL_INTERVAL,
+    StorageOwnerState, StoreError,
 };
 use std::sync::Arc;
-
-const OFFLOAD_POLL_INTERVAL_MS_ENV: &str = "MC_STORE_RS_COLD_TIER_OFFLOAD_POLL_INTERVAL_MS";
-
-fn offload_poll_interval_with_override(
-    lookup: impl Fn(&str) -> Option<String>,
-) -> std::time::Duration {
-    lookup(OFFLOAD_POLL_INTERVAL_MS_ENV)
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(|millis| std::time::Duration::from_millis(millis.max(1)))
-        .unwrap_or(DEFAULT_OFFLOAD_POLL_INTERVAL)
-}
 
 pub(in super::super) struct AsyncOffloadHandle {
     shutdown: Option<std::sync::mpsc::Sender<()>>,
@@ -47,7 +36,7 @@ impl AsyncOffloadHandle {
         }
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
         let stable_id = runtime.stable_id.0.clone();
-        let interval = offload_poll_interval_with_override(|name| std::env::var(name).ok());
+        let interval = storage_owner.cold_tier_devices.offload_poll_interval();
         let thread = std::thread::Builder::new()
             .name(format!("mooncake-async-offload-{stable_id}"))
             .spawn(move || {
@@ -102,26 +91,5 @@ impl AsyncRestorePromotionHandle {
 impl Drop for AsyncRestorePromotionHandle {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn offload_poll_interval_override_is_clamped_and_defaults_when_invalid() {
-        assert_eq!(
-            offload_poll_interval_with_override(|_| Some("10".to_string())),
-            std::time::Duration::from_millis(10)
-        );
-        assert_eq!(
-            offload_poll_interval_with_override(|_| Some("0".to_string())),
-            std::time::Duration::from_millis(1)
-        );
-        assert_eq!(
-            offload_poll_interval_with_override(|_| Some("invalid".to_string())),
-            DEFAULT_OFFLOAD_POLL_INTERVAL
-        );
     }
 }

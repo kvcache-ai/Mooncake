@@ -343,6 +343,8 @@ pub struct ColdTierRateLimitConfig {
     pub offload_device_max_in_flight: usize,
     pub offload_runtime_ops_per_sec: u32,
     pub offload_device_ops_per_sec: u32,
+    /// Background offload worker poll interval in milliseconds.
+    pub offload_poll_interval_ms: u64,
     pub restore_runtime_max_in_flight: usize,
     pub restore_device_max_in_flight: usize,
     pub restore_runtime_ops_per_sec: u32,
@@ -393,6 +395,7 @@ impl Default for ColdTierRateLimitConfig {
             offload_device_max_in_flight: 2,
             offload_runtime_ops_per_sec: 512,
             offload_device_ops_per_sec: 512,
+            offload_poll_interval_ms: 500,
             restore_runtime_max_in_flight: 64,
             restore_device_max_in_flight: 32,
             restore_runtime_ops_per_sec: 1024,
@@ -435,6 +438,11 @@ impl ColdTierRateLimitConfig {
 
     pub fn offload_device_ops_per_sec(mut self, limit: u32) -> Self {
         self.offload_device_ops_per_sec = limit.max(1);
+        self
+    }
+
+    pub fn offload_poll_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.offload_poll_interval_ms = interval_ms.max(1);
         self
     }
 

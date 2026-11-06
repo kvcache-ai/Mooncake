@@ -2,12 +2,12 @@ use super::super::{
     refresh_cold_tier_device_cache, ClockEntryId, DebugEvictAllResult, ObjectRoute, OperationTracker,
     PendingOffloadPrepareOutcome, RestorePromotionQueue, Result, StorageOwnerState,
 };
-use super::{local_hot_replica_checksum, read_local_hot_replica_payload};
+use super::{payload_checksum, pin_local_hot_replica_payload};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 impl StorageOwnerState {
     pub(in super::super) fn evict_all(
@@ -211,10 +211,10 @@ impl StorageOwnerState {
             Some(mooncake_store_core::ColdBackingState::Materialized) => Ok(Some(route.clone())),
             Some(mooncake_store_core::ColdBackingState::PendingOffload) => {
                 if !self.materialize_pending_offload_route_for_eviction(route)? {
-                    warn!(
+                    debug!(
                         runtime = %self.runtime,
                         key = %route.key.0,
-                        "eviction_inline_offload_failed: PendingOffload materialization failed, eviction skipped"
+                        "eviction_inline_offload_deferred: PendingOffload is busy or not ready, eviction skipped"
                     );
                     return Ok(None);
                 }
@@ -234,10 +234,10 @@ impl StorageOwnerState {
                     return Ok(None);
                 };
                 if !self.materialize_pending_offload_route_for_eviction(&route)? {
-                    warn!(
+                    debug!(
                         runtime = %self.runtime,
                         key = %route.key.0,
-                        "eviction_inline_offload_failed_after_publish: eviction skipped"
+                        "eviction_inline_offload_deferred_after_publish: eviction skipped"
                     );
                     return Ok(None);
                 }
@@ -255,10 +255,10 @@ impl StorageOwnerState {
         else {
             return Ok(None);
         };
-        let checksum = match replica.checksum {
-            Some(checksum) => checksum,
-            None => local_hot_replica_checksum(&self.allocator, &self.state, route, replica)?,
-        };
+        let payload = pin_local_hot_replica_payload(&self.allocator, &self.state, replica)?;
+        let checksum = replica
+            .checksum
+            .unwrap_or_else(|| payload_checksum(payload.as_slice()));
         let Some(target) =
             self.cold_tier_devices
                 .nof_targets
@@ -266,14 +266,6 @@ impl StorageOwnerState {
         else {
             return Ok(None);
         };
-        let backend = self.cold_tier_devices.backend_for(&target)?;
-        let payload = read_local_hot_replica_payload(
-            &self.allocator,
-            &self.state,
-            backend.as_ref(),
-            route,
-            replica,
-        )?;
         self.cold_tier_devices
             .nof_targets
             .put_selected(&target, payload.as_slice())?;

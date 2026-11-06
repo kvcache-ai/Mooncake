@@ -20705,6 +20705,92 @@ fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan(
 }
 
 #[test]
+fn pending_publication_recovery_prepares_cold_backing_before_releasing_fence() {
+    let _cold_guard = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("pending-publication-cold-segment"));
+    let client = StoreClientBuilder::new(metadata, "pending-publication-cold")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(32)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .cold_tier_target(cold_tier_test_config("pending-publication-cold"))
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let route_key = ObjectKey::new("default::pending-publication-cold");
+    let reservation = client
+        .allocator
+        .lock()
+        .reserve_any_with_pending_publication(client.runtime_id(), 16, 0)
+        .expect("reservation should create a tracked pending publication");
+    let route = ObjectRoute {
+        key: route_key.clone(),
+        namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
+        logical_key: Some("pending-publication-cold".to_string()),
+        canonical_key: None,
+        sharing_scope: Some("default".to_string()),
+        qos_tier: Some("default".to_string()),
+        version: RouteVersion(1),
+        state: RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: vec![ReplicaRoute {
+            owner: client.runtime_id().clone(),
+            segment_name: reservation.segment_name.clone(),
+            allocation_id: Some(reservation.allocation_id),
+            offset: Some(reservation.offset_bytes),
+            segment_offset: reservation.offset_bytes,
+            length: reservation.length_bytes,
+            checksum: None,
+            tier: ReplicaTier::Dram,
+            priority: 0,
+        }],
+        cold_backing: None,
+        nof_backing: None,
+    };
+    assert!(
+        client
+            .route_ops()
+            .publish_route(&route.key, None, &route)
+            .expect("route publication should succeed")
+            .applied
+    );
+
+    client
+        .storage_owner
+        .recover_due_pending_publications()
+        .expect("recovery should prepare cold backing while the allocation is fenced");
+
+    let current = client
+        .route_ops()
+        .load_route(&route_key)
+        .expect("route lookup should succeed")
+        .expect("route should remain published");
+    let cold_backing = current
+        .cold_backing
+        .expect("recovery must publish cold backing before releasing the allocation fence");
+    assert_eq!(cold_backing.length, 16);
+    assert!(client
+        .allocator
+        .lock()
+        .pending_allocations(now_ms())
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(cold_tier_existing_test_root("pending-publication-cold"));
+}
+
+#[test]
 fn delete_pending_releases_absent_exact_identity() {
     let _metrics_guard = metrics_test_lock().lock();
     reset_metrics();

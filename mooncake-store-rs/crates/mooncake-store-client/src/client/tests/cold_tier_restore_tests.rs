@@ -1549,17 +1549,20 @@ fn pending_offloads_balance_and_write_distinct_targets_concurrently() {
         .register_local_memory()
         .expect("local memory should register");
 
-    let payload = vec![0x5au8; 128];
-    for index in 0..16 {
+    let payload_sizes = [512, 128, 128, 128, 128];
+    for (index, payload_size) in payload_sizes.into_iter().enumerate() {
         client
-            .put(&format!("parallel-offload-{index}"), &payload)
+            .put(
+                &format!("parallel-offload-{index}"),
+                &vec![0x5au8; payload_size],
+            )
             .expect("put should publish pending cold backing");
     }
 
     let selected = client
         .storage_owner
         .cold_tier_devices
-        .accumulated_writes
+        .accumulated_write_bytes
         .lock()
         .clone();
     let selected_a = selected
@@ -1570,10 +1573,10 @@ fn pending_offloads_balance_and_write_distinct_targets_concurrently() {
         .get("parallel-offload-b")
         .copied()
         .unwrap_or_default();
-    assert_eq!(selected_a + selected_b, 16);
-    assert!(
-        selected_a.abs_diff(selected_b) <= 1,
-        "equal targets should be balanced, got {selected_a} and {selected_b}"
+    assert_eq!(selected_a + selected_b, 1024);
+    assert_eq!(
+        selected_a, selected_b,
+        "different object sizes should balance by bytes, got {selected_a} and {selected_b}"
     );
 
     for _ in 0..20 {

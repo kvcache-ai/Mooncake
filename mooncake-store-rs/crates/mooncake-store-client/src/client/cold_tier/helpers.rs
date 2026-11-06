@@ -344,14 +344,7 @@ pub(in super::super) fn read_local_hot_replica_payload(
     route: &ObjectRoute,
     replica: &ReplicaRoute,
 ) -> Result<PendingOffloadPayload> {
-    if let Some(announcement) = allocator.lock().announcement(&replica.segment_name) {
-        if announcement.owner != replica.owner {
-            return Err(StoreError::InvalidState(format!(
-                "segment {} owner mismatch while materializing {}",
-                replica.segment_name.0, route.key.0
-            )));
-        }
-    }
+    validate_local_hot_replica_owner(allocator, replica)?;
     let payload = pin_replica_payload_in_local_memory(allocator, state, replica).or_else(|_| {
         load_offload_source(backend, route)?
             .map(PendingOffloadPayload::from_vec)
@@ -362,42 +355,50 @@ pub(in super::super) fn read_local_hot_replica_payload(
                 ))
             })
     })?;
-    if payload.len() != replica.length as usize {
-        return Err(StoreError::InvalidState(format!(
-            "route {} local payload length mismatch: expected {} actual {}",
-            route.key.0,
-            replica.length,
-            payload.len()
-        )));
-    }
+    validate_local_hot_replica_length(replica, &payload)?;
     validate_replica_checksum(replica, payload.as_slice())?;
     Ok(payload)
 }
 
-pub(in super::super) fn local_hot_replica_checksum(
+pub(in super::super) fn pin_local_hot_replica_payload(
     allocator: &Arc<Mutex<LocalAllocatorState>>,
     state: &Arc<Mutex<StoreState>>,
-    route: &ObjectRoute,
     replica: &ReplicaRoute,
-) -> Result<u64> {
+) -> Result<PendingOffloadPayload> {
+    validate_local_hot_replica_owner(allocator, replica)?;
+    let payload = pin_replica_payload_in_local_memory(allocator, state, replica)?;
+    validate_local_hot_replica_length(replica, &payload)?;
+    Ok(payload)
+}
+
+fn validate_local_hot_replica_owner(
+    allocator: &Arc<Mutex<LocalAllocatorState>>,
+    replica: &ReplicaRoute,
+) -> Result<()> {
     if let Some(announcement) = allocator.lock().announcement(&replica.segment_name) {
         if announcement.owner != replica.owner {
             return Err(StoreError::InvalidState(format!(
-                "segment {} owner mismatch while checksumming {}",
-                replica.segment_name.0, route.key.0
+                "segment {} owner mismatch while pinning cold-tier source",
+                replica.segment_name.0
             )));
         }
     }
-    let payload = pin_replica_payload_in_local_memory(allocator, state, replica)?;
+    Ok(())
+}
+
+fn validate_local_hot_replica_length(
+    replica: &ReplicaRoute,
+    payload: &PendingOffloadPayload,
+) -> Result<()> {
     if payload.len() != replica.length as usize {
         return Err(StoreError::InvalidState(format!(
-            "route {} local payload length mismatch while checksumming: expected {} actual {}",
-            route.key.0,
+            "segment {} local payload length mismatch: expected {} actual {}",
+            replica.segment_name.0,
             replica.length,
             payload.len()
         )));
     }
-    Ok(payload_checksum(payload.as_slice()))
+    Ok(())
 }
 
 fn pin_replica_payload_in_local_memory(

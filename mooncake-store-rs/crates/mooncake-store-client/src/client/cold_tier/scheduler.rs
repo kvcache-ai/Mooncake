@@ -1,6 +1,6 @@
 use super::super::{
     current_time_ms, ClientEpoch, ClientLease, ClientRuntimeId, LocalMemoryConfig, ObjectRoute,
-    Result, RouteTrafficReport, SharedRestorePromotionQueue, StorageOwnerState,
+    Result, SharedRestorePromotionQueue, StorageOwnerState,
 };
 use super::{AsyncOffloadHandle, AsyncRestorePromotionHandle};
 use std::sync::{atomic::Ordering, Arc};
@@ -124,22 +124,7 @@ impl ColdTierHandle {
         if !self.active || super::cold_tier_disabled() {
             return None;
         }
-        storage_owner.track_route(route);
-        Self::publish_initial_cold_backing_for_tracked_route(storage_owner, route)
-    }
-
-    pub(in super::super) fn on_routes_tracked(
-        storage_owner: &StorageOwnerState,
-        routes: &[ObjectRoute],
-    ) -> RouteTrafficReport {
-        let report = storage_owner.track_routes(routes);
-        if super::cold_tier_disabled() {
-            return report;
-        }
-        for route in routes {
-            Self::publish_initial_cold_backing_for_tracked_route(storage_owner, route);
-        }
-        report
+        Self::publish_initial_cold_backing(storage_owner, route)
     }
 
     pub(in super::super) fn kick_offload_for_allocator_eviction(storage_owner: &StorageOwnerState) {
@@ -155,7 +140,7 @@ impl ColdTierHandle {
         }
     }
 
-    fn publish_initial_cold_backing_for_tracked_route(
+    fn publish_initial_cold_backing(
         storage_owner: &StorageOwnerState,
         route: &ObjectRoute,
     ) -> Option<ObjectRoute> {
