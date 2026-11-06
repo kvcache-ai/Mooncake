@@ -351,6 +351,38 @@ pub(in super::super) fn materialize_pending_offloads_bounded(
     result
 }
 
+pub(in super::super) fn materialize_pending_offload_routes_bounded(
+    storage_owner: &StorageOwnerState,
+    routes: &[ObjectRoute],
+) -> Result<usize> {
+    if super::cold_tier_disabled() || routes.is_empty() {
+        return Ok(0);
+    }
+    let Some(_run_guard) = storage_owner.pending_offloads.try_begin_materialization() else {
+        registry::record_cold_tier_operation("offload", "admission_reject", "concurrent");
+        return Ok(0);
+    };
+    let entries = routes
+        .iter()
+        .filter(|route| pending_persistent_backing(route).is_some())
+        .filter_map(|route| {
+            storage_owner
+                .pending_offloads
+                .claim(&route.key, route.version)
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut pending = prepare_pending_offload_entries(storage_owner, entries)?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let result = materialize_ready_pending_offload_groups(storage_owner, &mut pending);
+    storage_owner.record_cold_tier_observability_snapshots();
+    result
+}
+
 fn ensure_pending_offload_work_available(storage_owner: &StorageOwnerState) -> Result<()> {
     if !storage_owner.pending_offloads.is_empty() {
         return Ok(());

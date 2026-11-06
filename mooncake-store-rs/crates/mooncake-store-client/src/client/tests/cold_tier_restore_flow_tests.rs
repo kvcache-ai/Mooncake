@@ -237,6 +237,77 @@ fn configured_cold_tier_eviction_materializes_cold_backing() {
 }
 
 #[test]
+fn allocator_pressure_batches_pending_cold_victims() {
+    let _metrics_guard = metrics_test_lock().lock();
+    reset_metrics();
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let cold_root = cold_tier_test_root("background-eviction-batch-offload");
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "background-eviction-batch-offload")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "background-eviction-batch-offload-segment",
+        )))
+        .local_memory(
+            storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO),
+        )
+        .cold_tier_target(cold_tier_test_config_with_root(
+            "background-eviction-batch-offload",
+            cold_root.clone(),
+        ))
+        .cold_tier_offload_mode(ColdTierOffloadMode::Passthrough)
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed with cold tier target");
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+    client.cold_tier.shutdown();
+
+    let keys = (0..4)
+        .map(|index| {
+            let key = format!("background-eviction-batch-{index}");
+            client
+                .put(&key, &[index as u8; 20])
+                .expect("put should succeed");
+            key
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        client
+            .storage_owner
+            .evict_one_for_reservation_blocking(None)
+            .expect("allocator-pressure eviction should succeed")
+    );
+    for key in &keys {
+        let route = client
+            .query_route(key)
+            .expect("route query should succeed")
+            .expect("cold-backed route should remain after eviction");
+        assert!(route.replicas.is_empty());
+        assert!(route.cold_backing.as_ref().is_some_and(|backing| {
+            backing.state == mooncake_store_core::ColdBackingState::Materialized
+        }));
+    }
+
+    let metrics = render_prometheus_metrics();
+    let backend_batches = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("mooncake_store_operation_total{")
+                && line.contains("operation=\"cold_offload_backend_write_batch\"")
+                && line.contains("status=\"ok\"")
+        })
+        .and_then(|line| line.split_whitespace().last())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    assert_eq!(backend_batches, 1, "pending victims should share one backend write batch");
+
+    let _ = std::fs::remove_dir_all(cold_root);
+}
+
+#[test]
 fn embedded_client_remote_cold_only_read_promotes_on_owner() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());

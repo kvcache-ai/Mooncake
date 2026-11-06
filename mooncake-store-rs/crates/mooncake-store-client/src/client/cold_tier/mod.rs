@@ -74,10 +74,10 @@ pub(super) use offload::{
 };
 #[allow(unused_imports)] // publish_pending_cold_backing_for_eviction used by PR6
 pub(super) use offload::{
-    enqueue_pending_offload, materialize_pending_offloads_bounded,
-    materialize_prepared_pending_offload_batch, prepare_pending_offload_entries,
-    prepare_pending_offload_entry, publish_initial_write_cold_backing,
-    publish_pending_cold_backing_for_eviction,
+    enqueue_pending_offload, materialize_pending_offload_routes_bounded,
+    materialize_pending_offloads_bounded, materialize_prepared_pending_offload_batch,
+    prepare_pending_offload_entries, prepare_pending_offload_entry,
+    publish_initial_write_cold_backing, publish_pending_cold_backing_for_eviction,
 };
 pub(super) use resolve::resolved_uses_cold_backing;
 #[allow(unused_imports)]
