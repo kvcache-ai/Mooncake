@@ -483,7 +483,7 @@ impl StoreClient {
         };
         let release_prepared = |entries: &[PreparedObjectWrite<'_>], context: &str| {
             for entry in entries {
-                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+                self.release_reservations_or_enqueue(&entry.reservations, context);
                 let _ =
                     self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
             }
@@ -522,7 +522,7 @@ impl StoreClient {
 
             let release_pending = |entries: &[PendingBatchReservation<'_>], context: &str| {
                 for entry in entries {
-                    let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+                    self.release_reservations_or_enqueue(&entry.reservations, context);
                     let _ = self.abort_tenant_quota_reservation(
                         entry.quota_reservation.as_ref(),
                         context,
@@ -1655,9 +1655,9 @@ impl StoreClient {
                     published.push(route);
                 }
                 Ok(cas) => {
-                    let _ = self.release_reserved_allocations(
-                        &prepared[index].targets,
+                    self.release_reservations_or_enqueue(
                         &prepared[index].reservations,
+                        "batch_put_route_compare_and_swap_conflict",
                     );
                     let _ = self.abort_tenant_quota_reservation(
                         prepared[index].quota_reservation.as_ref(),
@@ -1719,9 +1719,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) => {
-                    let _ = self.release_reserved_allocations(
-                        &prepared[index].targets,
+                    self.release_reservations_or_enqueue(
                         &prepared[index].reservations,
+                        "batch_put_route_compare_and_swap_error",
                     );
                     let _ = self.abort_tenant_quota_reservation(
                         prepared[index].quota_reservation.as_ref(),

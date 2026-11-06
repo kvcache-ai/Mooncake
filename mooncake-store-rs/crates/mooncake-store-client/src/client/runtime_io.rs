@@ -16,14 +16,16 @@ impl StoreClient {
         reservations: &[mooncake_store_core::SegmentReservation],
         reason: &str,
     ) {
-        if let Err(error) = self.release_reserved_allocations(targets, reservations) {
+        if targets.len() != reservations.len() {
             warn!(
                 runtime = %self.lease.runtime,
-                error = %error,
+                targets = targets.len(),
+                reservations = reservations.len(),
                 reason,
-                "failed to release reserved allocations"
+                "rollback target and reservation counts differ"
             );
         }
+        self.release_reservations_or_enqueue(reservations, reason);
     }
 
     fn load_tenant_quota_policies(

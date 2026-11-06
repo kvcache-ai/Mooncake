@@ -88,22 +88,106 @@ impl StoreClient {
         &self,
         reservation: &mooncake_store_core::SegmentReservation,
     ) {
-        let release = AllocationReleaseRequest {
-            storage_runtime: reservation.owner.clone(),
-            segment_name: reservation.segment_name.clone(),
-            offset_bytes: reservation.offset_bytes,
-            length_bytes: reservation.length_bytes,
-        };
-        if let Err(error) = self.release_segment_allocations_batch(&[release]) {
-            warn!(
-                storage_runtime = %reservation.owner,
-                segment = %reservation.segment_name.0,
-                offset_bytes = reservation.offset_bytes,
-                length_bytes = reservation.length_bytes,
-                error = %error,
-                "failed to release reservation after target metadata lookup"
-            );
+        self.release_reservation_or_enqueue(reservation, "replica_target_lookup_failed");
+    }
+
+    fn release_reservations_or_enqueue(
+        &self,
+        reservations: &[mooncake_store_core::SegmentReservation],
+        reason: &str,
+    ) {
+        let mut releases_by_owner = BTreeMap::<ClientRuntimeId, Vec<AllocationReleaseRequest>>::new();
+        for reservation in reservations {
+            releases_by_owner
+                .entry(reservation.owner.clone())
+                .or_default()
+                .push(AllocationReleaseRequest {
+                    storage_runtime: reservation.owner.clone(),
+                    segment_name: reservation.segment_name.clone(),
+                    offset_bytes: reservation.offset_bytes,
+                    length_bytes: reservation.length_bytes,
+                });
         }
+        for releases in releases_by_owner.into_values() {
+            self.release_allocation_requests_or_enqueue(&releases, reason);
+        }
+    }
+
+    fn release_reservation_or_enqueue(
+        &self,
+        reservation: &mooncake_store_core::SegmentReservation,
+        reason: &str,
+    ) {
+        self.release_allocation_requests_or_enqueue(
+            &[AllocationReleaseRequest {
+                storage_runtime: reservation.owner.clone(),
+                segment_name: reservation.segment_name.clone(),
+                offset_bytes: reservation.offset_bytes,
+                length_bytes: reservation.length_bytes,
+            }],
+            reason,
+        );
+    }
+
+    fn release_allocation_requests_or_enqueue(
+        &self,
+        releases: &[AllocationReleaseRequest],
+        reason: &str,
+    ) {
+        if releases.is_empty() {
+            return;
+        }
+        match self.release_segment_allocations_batch(releases) {
+            Ok(()) => {
+                for release in releases {
+                    debug!(
+                        storage_runtime = %release.storage_runtime,
+                        segment = %release.segment_name.0,
+                        offset_bytes = release.offset_bytes,
+                        length_bytes = release.length_bytes,
+                        reason,
+                        "released reserved allocation during rollback"
+                    );
+                }
+            }
+            Err(error) if Self::reclaim_unavailable_runtime_is_skippable(&error) => {
+                warn!(
+                    storage_runtime = %releases[0].storage_runtime,
+                    reservations = releases.len(),
+                    error = %error,
+                    reason,
+                    "dropping reservation rollback after owner lease disappeared"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    storage_runtime = %releases[0].storage_runtime,
+                    reservations = releases.len(),
+                    error = %error,
+                    reason,
+                    "queueing reservation rollback after immediate release failed"
+                );
+                for release in releases.iter().cloned() {
+                    self.enqueue_unresolved_reservation_reclaim(release);
+                }
+            }
+        }
+    }
+
+    fn enqueue_unresolved_reservation_reclaim(&self, release: AllocationReleaseRequest) {
+        let qos_tier = mooncake_store_core::DEFAULT_QOS_TIER.to_string();
+        self.state.lock().enqueue_pending_reclaim(PendingReclaim {
+            due_at_ms: now_ms(),
+            policy_rank: Self::reclaim_policy_rank(&qos_tier),
+            tenant: self.default_tenant.clone(),
+            qos_tier,
+            storage_runtime: release.storage_runtime,
+            segment_name: release.segment_name,
+            offset_bytes: release.offset_bytes,
+            length_bytes: release.length_bytes,
+            route_key: ObjectKey(String::new()),
+            cold_backing: None,
+        });
     }
 
     fn reserve_specific_segment(
@@ -704,29 +788,6 @@ impl StoreClient {
             }
         }
         Ok(())
-    }
-
-    fn release_reserved_allocations(
-        &self,
-        targets: &[ReplicaWriteTarget],
-        reservations: &[mooncake_store_core::SegmentReservation],
-    ) -> Result<()> {
-        if targets.len() != reservations.len() {
-            return Err(StoreError::InvalidState(
-                "targets and reservations length mismatch".to_string(),
-            ));
-        }
-        let releases = targets
-            .iter()
-            .zip(reservations.iter())
-            .map(|(target, reservation)| AllocationReleaseRequest {
-                storage_runtime: target.storage_runtime.clone(),
-                segment_name: target.segment_name.clone(),
-                offset_bytes: reservation.offset_bytes,
-                length_bytes: reservation.length_bytes,
-            })
-            .collect::<Vec<_>>();
-        self.release_segment_allocations_batch(&releases)
     }
 
     pub fn flush_due_reclaims(&self) -> Result<()> {
