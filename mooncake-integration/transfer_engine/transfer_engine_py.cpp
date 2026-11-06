@@ -22,6 +22,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <thread>
 
 #include <pybind11/stl.h>
 
@@ -63,6 +64,20 @@
 static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
+
+// Pause between status polls of a synchronous transfer. Polls spin for the
+// first kSpinTime, so transfers shorter than that see no added latency; later
+// ones sleep briefly. Each poll scans every task of the batch under the batch
+// progress lock, and an unthrottled loop starves the threads completing the
+// batch, which made large TENT host-staged batches 10-40x slower. The spin
+// window is wall time, not a poll count: a few hundred polls take only tens of
+// microseconds, and one sleep lasts ~100 us with the default 50 us timer slack.
+static void backOffSyncPoll(std::chrono::steady_clock::time_point poll_start) {
+    constexpr auto kSpinTime = std::chrono::milliseconds(1);
+    constexpr auto kSleepTime = std::chrono::microseconds(50);
+    if (std::chrono::steady_clock::now() - poll_start > kSpinTime)
+        std::this_thread::sleep_for(kSleepTime);
+}
 
 enum class ScatterTransferCompletionStatus : int {
     COMPLETED = 0,
@@ -1037,6 +1052,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         bool completed = false;
         bool release_scheduled = false;
         TransferStatus status;
+        const auto poll_start = std::chrono::steady_clock::now();
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
@@ -1067,6 +1083,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                 }
                 return -1;
             }
+            backOffSyncPoll(poll_start);
         }
     }
     return -1;
@@ -1165,6 +1182,7 @@ int TransferEnginePy::batchTransferSync(
         bool completed = false;
         bool release_scheduled = false;
         TransferStatus status;
+        const auto poll_start = std::chrono::steady_clock::now();
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
@@ -1196,6 +1214,7 @@ int TransferEnginePy::batchTransferSync(
                 }
                 return -1;
             }
+            backOffSyncPoll(poll_start);
         }
     }
     LOG(ERROR) << "batchTransferSync: all " << max_retry
