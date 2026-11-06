@@ -12,8 +12,8 @@ use mooncake_store_route::{
 };
 
 use crate::client::{
-    cached_live_client_snapshot, refresh_live_client_cache, SharedLiveClientCache,
-    SharedSuspectRuntimeCache,
+    cached_live_client_snapshot, cached_retained_live_client_snapshot, refresh_live_client_cache,
+    SharedLiveClientCache, SharedSuspectRuntimeCache,
 };
 use crate::control_plane::ControlPlaneClient;
 use crate::observability::{registry, OperationTracker};
@@ -170,6 +170,10 @@ impl RouteMembershipProvider for ClientRouteMembership {
         self.suspect_runtime_cache
             .lock()
             .reconcile_with_leases(leases);
+    }
+
+    fn retained_live_clients(&self, _operation: &'static str) -> Result<Vec<ClientLease>> {
+        cached_retained_live_client_snapshot(&self.live_client_cache)
     }
 
     fn is_suspect(&self, runtime: &ClientRuntimeId) -> bool {
