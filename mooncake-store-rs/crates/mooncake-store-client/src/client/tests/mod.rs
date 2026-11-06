@@ -20550,6 +20550,12 @@ fn pending_publication_recovery_releases_absent_identity_without_candidate_scan(
         .register_local_memory()
         .expect("local memory should register");
 
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
     let reservation = client
         .allocator
         .lock()
@@ -20557,8 +20563,7 @@ fn pending_publication_recovery_releases_absent_identity_without_candidate_scan(
         .expect("reservation should create a tracked pending publication");
 
     assert_eq!(
-        client
-            .storage_owner
+        owner
             .recover_due_pending_publications()
             .expect("absent pending publication recovery should succeed"),
         1,
@@ -20572,12 +20577,12 @@ fn pending_publication_recovery_releases_absent_identity_without_candidate_scan(
         .is_empty());
     assert_eq!(reservation.length_bytes, 16);
 
-    let metrics = render_prometheus_metrics();
-    assert!(!metrics.lines().any(|line| {
-        line.starts_with(
-            "mooncake_store_eviction_guard_event_total{tenant=\"default\",source=\"allocator_candidate\",outcome=\"pending_confirmation\"}",
-        ) && !line.ends_with(" 0")
-    }));
+    assert_eq!(
+        directory.bounded_reads(),
+        0,
+        "recovery must query the exact allocation ledger, not scan CLOCK candidates"
+    );
+    assert_eq!(directory.full_reads(), 0);
 }
 
 #[test]
@@ -20669,6 +20674,12 @@ fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan(
         .expect("local memory should register");
 
     let route_key = ObjectKey::new("default::pending-publication-exact");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
     let reservation = client
         .allocator
         .lock()
@@ -20705,8 +20716,7 @@ fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan(
     assert!(cas.applied);
 
     assert_eq!(
-        client
-            .storage_owner
+        owner
             .recover_due_pending_publications()
             .expect("exact pending publication recovery should succeed"),
         0,
@@ -20718,14 +20728,19 @@ fn pending_publication_recovery_finalizes_exact_identity_without_candidate_scan(
         .lock()
         .pending_allocations(now_ms())
         .is_empty());
-    wait_for_storage_clock_route(&client, &route, false);
+    assert!(!owner
+        .hot_replicas
+        .clock
+        .lock()
+        .allocation_spans_for_key(&route.key)
+        .is_empty());
 
-    let metrics = render_prometheus_metrics();
-    assert!(!metrics.lines().any(|line| {
-        line.starts_with(
-            "mooncake_store_eviction_guard_event_total{tenant=\"default\",source=\"allocator_candidate\",outcome=\"pending_confirmation\"}",
-        ) && !line.ends_with(" 0")
-    }));
+    assert_eq!(
+        directory.bounded_reads(),
+        0,
+        "recovery must query the exact allocation ledger, not scan CLOCK candidates"
+    );
+    assert_eq!(directory.full_reads(), 0);
 }
 
 #[test]
@@ -20885,6 +20900,7 @@ fn delete_pending_releases_absent_exact_identity() {
 
 #[test]
 fn delete_pending_queue_backpressure_preserves_pending_publication_recovery() {
+    let _metrics_guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("delete-pending-queue-full-segment"));
     let client = StoreClientBuilder::new(metadata, "delete-pending-queue-full")
@@ -20981,10 +20997,20 @@ fn delete_pending_queue_backpressure_preserves_pending_publication_recovery() {
         ),
         "a dropped notification must retain PendingPublish as the exact recovery fence"
     );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 16);
+    assert_eq!(
+        client
+            .storage_owner
+            .recover_due_pending_publications()
+            .expect("the retained fence must remain recoverable"),
+        1
+    );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 0);
 }
 
 #[test]
 fn delete_pending_force_notification_overrides_grace_without_blind_release() {
+    let _metrics_guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("delete-pending-force-segment"));
     let client = StoreClientBuilder::new(metadata, "delete-pending-force")
@@ -21045,6 +21071,26 @@ fn delete_pending_force_notification_overrides_grace_without_blind_release() {
         .storage_owner
         .enqueue_delete_pending(std::slice::from_ref(&forced))
         .expect("shutdown force notification should be accepted");
+    client
+        .storage_owner
+        .read_pin_registry
+        .pin(&reservation.segment_name, reservation.offset_bytes);
+    assert_eq!(
+        client
+            .storage_owner
+            .process_due_delete_pending_for_reserve()
+            .expect("a force notification must still respect active readers"),
+        0
+    );
+    assert_eq!(client.allocator.lock().usage_bytes().0, 16);
+    client
+        .storage_owner
+        .read_pin_registry
+        .unpin(&reservation.segment_name, reservation.offset_bytes);
+    client
+        .storage_owner
+        .enqueue_delete_pending(std::slice::from_ref(&forced))
+        .expect("the unpinned notification should be retried");
     assert_eq!(
         client
             .storage_owner
@@ -21057,6 +21103,7 @@ fn delete_pending_force_notification_overrides_grace_without_blind_release() {
 
 #[test]
 fn delete_pending_retains_republished_exact_identity() {
+    let _metrics_guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("delete-pending-referenced-segment"));
     let client = StoreClientBuilder::new(metadata, "delete-pending-referenced")
@@ -21133,6 +21180,22 @@ fn delete_pending_retains_republished_exact_identity() {
         .storage_owner
         .enqueue_delete_pending(std::slice::from_ref(&entry))
         .expect("delete pending should be accepted");
+    assert!(
+        client
+            .route_directory
+            .compare_and_swap_object_route(&client.lease, &route.key, Some(route.version), None,)
+            .expect("the original publication must be removed")
+            .applied
+    );
+    let mut republished = route.clone();
+    republished.version = RouteVersion(2);
+    assert!(
+        client
+            .route_ops()
+            .publish_route(&republished.key, None, &republished)
+            .expect("the same allocation generation must be republished")
+            .applied
+    );
     assert_eq!(
         client
             .storage_owner
@@ -21147,7 +21210,7 @@ fn delete_pending_retains_republished_exact_identity() {
         .lock()
         .entries
         .is_empty());
-    wait_for_storage_clock_route(&client, &route, false);
+    wait_for_storage_clock_route(&client, &republished, false);
 }
 
 #[test]
@@ -21407,6 +21470,7 @@ fn overwrite_uses_delete_pending_before_releasing_replaced_allocation() {
 
 #[test]
 fn deleted_untracked_route_reclaims_non_pending_owner_allocation() {
+    let _metrics_guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("delete-non-pending-owner-segment"));
     let client = StoreClientBuilder::new(metadata, "delete-non-pending-owner")
@@ -21462,6 +21526,7 @@ fn deleted_untracked_route_reclaims_non_pending_owner_allocation() {
 
 #[test]
 fn capacity_pressure_forces_bounded_reclaim_of_untracked_allocation() {
+    let _metrics_guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("capacity-force-untracked-segment"));
     let client = StoreClientBuilder::new(metadata, "capacity-force-untracked")
