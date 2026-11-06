@@ -1763,12 +1763,13 @@ impl StorageOwnerState {
                 );
             }
         }
-        let pending_evictions = self
-            .pending_evictions
-            .lock()
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let (pending_before, pending_evictions) = {
+            let pending = self.pending_evictions.lock();
+            (
+                pending.len(),
+                pending.keys().cloned().collect::<BTreeSet<_>>(),
+            )
+        };
         let candidates = self.allocator.lock().untracked_reconcile_candidates(
             &tracked_identities,
             &legacy_tracked_spans,
@@ -1777,12 +1778,26 @@ impl StorageOwnerState {
             preferred_segment,
             PENDING_EVICTION_CONFIRMATION_BATCH,
         );
+        let allocator_candidate_count = candidates.len();
         for identity in candidates {
             self.begin_untracked_candidate_confirmation(&identity);
         }
         released = released.saturating_add(
             self.process_pending_evictions(PENDING_EVICTION_CONFIRMATION_BATCH)?,
         );
+        let pending_after = self.pending_evictions.lock().len();
+        if allocator_candidate_count != 0 || released != 0 || pending_before != pending_after {
+            debug!(
+                runtime = %self.runtime,
+                clock_candidate_keys = candidate_keys.len(),
+                allocator_candidates = allocator_candidate_count,
+                pending_before,
+                pending_after,
+                released,
+                force_scan,
+                "bounded eviction guard reconciliation completed"
+            );
+        }
         self.stale_candidate_reconcile_completed_at_ms.store(
             now_ms(),
             std::sync::atomic::Ordering::Relaxed,
@@ -1936,9 +1951,14 @@ impl StorageOwnerState {
             }
             Err(error) => {
                 self.defer_pending_eviction(&token.identity, PendingEvictionPhase::PendingConfirmation);
+                registry::record_eviction_guard_event("route_cas", "outcome_unknown");
                 debug!(
                     runtime = %self.runtime,
                     key = %route.key.0,
+                    segment = %token.identity.segment_name.0,
+                    offset_bytes = token.identity.offset_bytes,
+                    length_bytes = token.identity.length_bytes,
+                    allocation_id = token.identity.allocation_id,
                     error = %error,
                     "route eviction CAS outcome is unknown; retaining pending token"
                 );
@@ -2016,6 +2036,8 @@ impl StorageOwnerState {
                 confirmation_in_progress: false,
             },
         );
+        drop(pending);
+        self.record_pending_eviction_metrics();
         Ok(Some(token))
     }
 
@@ -2071,7 +2093,7 @@ impl StorageOwnerState {
             next_route: None,
         };
         pending.insert(
-            identity,
+            identity.clone(),
             PendingEviction {
                 token,
                 phase: PendingEvictionPhase::PendingConfirmation,
@@ -2079,6 +2101,18 @@ impl StorageOwnerState {
                 next_attempt_at_ms: now_ms(),
                 confirmation_in_progress: false,
             },
+        );
+        drop(pending);
+        self.record_pending_eviction_metrics();
+        registry::record_eviction_guard_event("clock_candidate", "pending_confirmation");
+        debug!(
+            runtime = %self.runtime,
+            key = %victim.route_key.0,
+            segment = %identity.segment_name.0,
+            offset_bytes = identity.offset_bytes,
+            length_bytes = identity.length_bytes,
+            allocation_id = identity.allocation_id,
+            "historical CLOCK candidate entered exact route confirmation"
         );
     }
 
@@ -2128,10 +2162,29 @@ impl StorageOwnerState {
                 confirmation_in_progress: false,
             },
         );
+        drop(pending);
+        self.record_pending_eviction_metrics();
+        registry::record_eviction_guard_event("allocator_candidate", "pending_confirmation");
+        debug!(
+            runtime = %self.runtime,
+            segment = %identity.segment_name.0,
+            offset_bytes = identity.offset_bytes,
+            length_bytes = identity.length_bytes,
+            allocation_id = identity.allocation_id,
+            "allocator candidate entered exact route confirmation"
+        );
     }
 
     fn abort_eviction(&self, token: &EvictionToken, current: Option<&ObjectRoute>) {
-        self.pending_evictions.lock().remove(&token.identity);
+        let was_guarded = self
+            .pending_evictions
+            .lock()
+            .remove(&token.identity)
+            .is_some_and(|entry| entry.phase != PendingEvictionPhase::Prepared);
+        if was_guarded {
+            self.record_pending_eviction_metrics();
+            registry::record_eviction_guard_event("pending_token", "aborted");
+        }
         if let Some(current) = current {
             self.sync_route(current);
         } else if let Some(route_key) = token.route_key.as_ref() {
@@ -2142,6 +2195,38 @@ impl StorageOwnerState {
         }
     }
 
+    fn record_pending_eviction_metrics(&self) {
+        let mut prepared = 0usize;
+        let mut ready_to_commit = 0usize;
+        let mut pending_confirmation = 0usize;
+        let mut pending_allocation_confirmation = 0usize;
+        {
+            let pending = self.pending_evictions.lock();
+            for entry in pending.values() {
+                match entry.phase {
+                    PendingEvictionPhase::Prepared => prepared = prepared.saturating_add(1),
+                    PendingEvictionPhase::ReadyToCommit => {
+                        ready_to_commit = ready_to_commit.saturating_add(1)
+                    }
+                    PendingEvictionPhase::PendingConfirmation => {
+                        pending_confirmation = pending_confirmation.saturating_add(1)
+                    }
+                    PendingEvictionPhase::PendingAllocationConfirmation => {
+                        pending_allocation_confirmation =
+                            pending_allocation_confirmation.saturating_add(1)
+                    }
+                }
+            }
+        }
+        registry::set_eviction_guard_pending("prepared", prepared);
+        registry::set_eviction_guard_pending("ready_to_commit", ready_to_commit);
+        registry::set_eviction_guard_pending("pending_confirmation", pending_confirmation);
+        registry::set_eviction_guard_pending(
+            "pending_allocation_confirmation",
+            pending_allocation_confirmation,
+        );
+    }
+
     fn commit_eviction(&self, token: &EvictionToken) -> Result<bool> {
         if self
             .read_pin_registry
@@ -2150,6 +2235,11 @@ impl StorageOwnerState {
             self.defer_pending_eviction(&token.identity, PendingEvictionPhase::ReadyToCommit);
             return Ok(false);
         }
+        let was_guarded = self
+            .pending_evictions
+            .lock()
+            .get(&token.identity)
+            .is_some_and(|entry| entry.phase != PendingEvictionPhase::Prepared);
         let release_result = {
             let mut allocator = self.allocator.lock();
             match allocator.allocation_identity(&AllocationSpan {
@@ -2157,30 +2247,54 @@ impl StorageOwnerState {
                 offset_bytes: token.identity.offset_bytes,
                 length_bytes: token.identity.length_bytes,
             }) {
-                Some(current) if current == token.identity => allocator.release(
-                    &self.runtime,
-                    &token.identity.segment_name,
-                    token.identity.offset_bytes,
-                    token.identity.length_bytes,
-                    token.identity.allocation_id,
-                ),
-                Some(_) | None => Ok(()),
+                Some(current) if current == token.identity => allocator
+                    .release(
+                        &self.runtime,
+                        &token.identity.segment_name,
+                        token.identity.offset_bytes,
+                        token.identity.length_bytes,
+                        token.identity.allocation_id,
+                    )
+                    .map(|()| "released"),
+                Some(_) | None => Ok("identity_replaced"),
             }
         };
-        if let Err(error) = release_result {
-            self.defer_pending_eviction(&token.identity, PendingEvictionPhase::ReadyToCommit);
-            debug!(
-                runtime = %self.runtime,
-                key = ?token.route_key,
-                error = %error,
-                "eviction local commit deferred; retaining pending token"
-            );
-            return Ok(false);
-        }
+        let release_outcome = match release_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.defer_pending_eviction(&token.identity, PendingEvictionPhase::ReadyToCommit);
+                registry::record_eviction_guard_event("local_commit", "release_deferred");
+                debug!(
+                    runtime = %self.runtime,
+                    key = ?token.route_key,
+                    segment = %token.identity.segment_name.0,
+                    offset_bytes = token.identity.offset_bytes,
+                    length_bytes = token.identity.length_bytes,
+                    allocation_id = token.identity.allocation_id,
+                    error = %error,
+                    "eviction local commit deferred; retaining pending token"
+                );
+                return Ok(false);
+            }
+        };
         if let Some(clock_id) = token.clock_id.as_ref() {
             self.hot_replicas.clock.lock().remove_id(clock_id);
         }
         self.pending_evictions.lock().remove(&token.identity);
+        if was_guarded {
+            self.record_pending_eviction_metrics();
+            registry::record_eviction_guard_event("local_commit", release_outcome);
+            debug!(
+                runtime = %self.runtime,
+                key = ?token.route_key,
+                segment = %token.identity.segment_name.0,
+                offset_bytes = token.identity.offset_bytes,
+                length_bytes = token.identity.length_bytes,
+                allocation_id = token.identity.allocation_id,
+                outcome = release_outcome,
+                "guarded eviction local commit completed"
+            );
+        }
         trace!(
             runtime = %self.runtime,
             key = ?token.route_key,
@@ -2195,25 +2309,28 @@ impl StorageOwnerState {
     }
 
     fn defer_pending_eviction(&self, identity: &AllocationIdentity, phase: PendingEvictionPhase) {
-        let mut pending = self.pending_evictions.lock();
-        let Some(entry) = pending.get_mut(identity) else {
-            return;
-        };
-        entry.phase = phase;
-        entry.confirmation_in_progress = false;
-        entry.confirmation_attempts = entry.confirmation_attempts.saturating_add(1);
-        let retry_limit = self.offload_priority.pending_eviction_retry_limit.max(1);
-        let delay_ms = if entry.confirmation_attempts >= retry_limit {
-            // Keep the token after transient retries are exhausted, but do not
-            // turn a persistent authority disagreement into a hot RPC loop.
-            PENDING_EVICTION_RETRY_MAX_MS
-        } else {
-            let exponent = entry.confirmation_attempts.saturating_sub(1).min(7);
-            PENDING_EVICTION_RETRY_BASE_MS
-                .saturating_mul(1u64 << exponent)
-                .min(PENDING_EVICTION_RETRY_MAX_MS)
-        };
-        entry.next_attempt_at_ms = now_ms().saturating_add(delay_ms);
+        {
+            let mut pending = self.pending_evictions.lock();
+            let Some(entry) = pending.get_mut(identity) else {
+                return;
+            };
+            entry.phase = phase;
+            entry.confirmation_in_progress = false;
+            entry.confirmation_attempts = entry.confirmation_attempts.saturating_add(1);
+            let retry_limit = self.offload_priority.pending_eviction_retry_limit.max(1);
+            let delay_ms = if entry.confirmation_attempts >= retry_limit {
+                // Keep the token after transient retries are exhausted, but do not
+                // turn a persistent authority disagreement into a hot RPC loop.
+                PENDING_EVICTION_RETRY_MAX_MS
+            } else {
+                let exponent = entry.confirmation_attempts.saturating_sub(1).min(7);
+                PENDING_EVICTION_RETRY_BASE_MS
+                    .saturating_mul(1u64 << exponent)
+                    .min(PENDING_EVICTION_RETRY_MAX_MS)
+            };
+            entry.next_attempt_at_ms = now_ms().saturating_add(delay_ms);
+        }
+        self.record_pending_eviction_metrics();
     }
 
     fn process_pending_evictions(&self, limit: usize) -> Result<usize> {
@@ -2263,9 +2380,32 @@ impl StorageOwnerState {
                         .confirm_replica_reference(route_key, evicted_replica)
                     {
                         Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
+                            registry::record_eviction_guard_event(
+                                "route_confirmation",
+                                "referenced",
+                            );
+                            debug!(
+                                runtime = %self.runtime,
+                                key = ?token.route_key,
+                                segment = %token.identity.segment_name.0,
+                                offset_bytes = token.identity.offset_bytes,
+                                length_bytes = token.identity.length_bytes,
+                                allocation_id = token.identity.allocation_id,
+                                "exact route confirmation retained the allocation"
+                            );
                             self.abort_eviction(&token, Some(&route));
                         }
                         Ok(mooncake_store_core::RouteReplicaReference::Absent) => {
+                            registry::record_eviction_guard_event("route_confirmation", "absent");
+                            debug!(
+                                runtime = %self.runtime,
+                                key = ?token.route_key,
+                                segment = %token.identity.segment_name.0,
+                                offset_bytes = token.identity.offset_bytes,
+                                length_bytes = token.identity.length_bytes,
+                                allocation_id = token.identity.allocation_id,
+                                "exact route confirmation permits local commit"
+                            );
                             {
                                 let mut pending = self.pending_evictions.lock();
                                 if let Some(entry) = pending.get_mut(&token.identity) {
@@ -2283,9 +2423,17 @@ impl StorageOwnerState {
                                 &token.identity,
                                 PendingEvictionPhase::PendingConfirmation,
                             );
+                            registry::record_eviction_guard_event(
+                                "route_confirmation",
+                                "indeterminate",
+                            );
                             debug!(
                                 runtime = %self.runtime,
                                 key = ?token.route_key,
+                                segment = %token.identity.segment_name.0,
+                                offset_bytes = token.identity.offset_bytes,
+                                length_bytes = token.identity.length_bytes,
+                                allocation_id = token.identity.allocation_id,
                                 error = %error,
                                 "exact eviction confirmation is indeterminate; retaining token"
                             );
@@ -2310,6 +2458,18 @@ impl StorageOwnerState {
                                 [mooncake_store_core::AllocationRouteReferenceState::Absent]
                             ) =>
                         {
+                            registry::record_eviction_guard_event(
+                                "allocation_confirmation",
+                                "absent",
+                            );
+                            debug!(
+                                runtime = %self.runtime,
+                                segment = %token.identity.segment_name.0,
+                                offset_bytes = token.identity.offset_bytes,
+                                length_bytes = token.identity.length_bytes,
+                                allocation_id = token.identity.allocation_id,
+                                "allocator candidate is absent from every authority; committing release"
+                            );
                             {
                                 let mut pending = self.pending_evictions.lock();
                                 if let Some(entry) = pending.get_mut(&token.identity) {
@@ -2326,20 +2486,46 @@ impl StorageOwnerState {
                             if matches!(
                                 references.as_slice(),
                                 [mooncake_store_core::AllocationRouteReferenceState::Exact]
-                                    | [mooncake_store_core::AllocationRouteReferenceState::Conflict]
-                            ) =>
-                        {
+                            ) => {
                             self.defer_pending_eviction(
                                 &token.identity,
                                 PendingEvictionPhase::PendingAllocationConfirmation,
                             );
-                            trace!(
+                            registry::record_eviction_guard_event(
+                                "allocation_confirmation",
+                                "referenced",
+                            );
+                            debug!(
                                 runtime = %self.runtime,
                                 segment = %token.identity.segment_name.0,
                                 offset_bytes = token.identity.offset_bytes,
+                                length_bytes = token.identity.length_bytes,
                                 allocation_id = token.identity.allocation_id,
                                 references = ?references,
-                                "allocator candidate remains route-referenced or conflicted; retaining token"
+                                "allocator candidate remains route-referenced; retaining token"
+                            );
+                        }
+                        Ok(references)
+                            if matches!(
+                                references.as_slice(),
+                                [mooncake_store_core::AllocationRouteReferenceState::Conflict]
+                            ) => {
+                            self.defer_pending_eviction(
+                                &token.identity,
+                                PendingEvictionPhase::PendingAllocationConfirmation,
+                            );
+                            registry::record_eviction_guard_event(
+                                "allocation_confirmation",
+                                "conflict",
+                            );
+                            debug!(
+                                runtime = %self.runtime,
+                                segment = %token.identity.segment_name.0,
+                                offset_bytes = token.identity.offset_bytes,
+                                length_bytes = token.identity.length_bytes,
+                                allocation_id = token.identity.allocation_id,
+                                references = ?references,
+                                "allocator candidate authority results conflict; retaining token"
                             );
                         }
                         Ok(references) => {
@@ -2347,8 +2533,16 @@ impl StorageOwnerState {
                                 &token.identity,
                                 PendingEvictionPhase::PendingAllocationConfirmation,
                             );
+                            registry::record_eviction_guard_event(
+                                "allocation_confirmation",
+                                "invalid_response",
+                            );
                             debug!(
                                 runtime = %self.runtime,
+                                segment = %token.identity.segment_name.0,
+                                offset_bytes = token.identity.offset_bytes,
+                                length_bytes = token.identity.length_bytes,
+                                allocation_id = token.identity.allocation_id,
                                 references = ?references,
                                 "allocation reference response length was indeterminate; retaining token"
                             );
@@ -2358,10 +2552,15 @@ impl StorageOwnerState {
                                 &token.identity,
                                 PendingEvictionPhase::PendingAllocationConfirmation,
                             );
+                            registry::record_eviction_guard_event(
+                                "allocation_confirmation",
+                                "indeterminate",
+                            );
                             debug!(
                                 runtime = %self.runtime,
                                 segment = %token.identity.segment_name.0,
                                 offset_bytes = token.identity.offset_bytes,
+                                length_bytes = token.identity.length_bytes,
                                 allocation_id = token.identity.allocation_id,
                                 error = %error,
                                 "allocation reference confirmation is indeterminate; retaining token"
