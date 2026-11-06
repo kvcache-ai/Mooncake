@@ -31,6 +31,7 @@ use mooncake_store_core::{
     CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
     RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation, StoreError,
 };
+use mooncake_store_route::RouteOwnerPageQuery;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -1499,10 +1500,12 @@ fn control_plane_owner_route_pages_bound_large_control_replies() {
                 &lease,
                 "ns-a",
                 &authority_id,
-                &owner,
-                cursor.as_deref(),
-                snapshot_epoch,
-                4096,
+                RouteOwnerPageQuery {
+                    owner: owner.clone(),
+                    cursor: cursor.clone(),
+                    snapshot_epoch,
+                    limit: 4096,
+                },
             )
             .expect("paged owner listing should succeed");
         assert!(
@@ -1561,7 +1564,17 @@ fn control_plane_owner_route_snapshot_rejects_mutation_between_pages() {
     let authority_id = ClientStableId::new("authority");
 
     let first = client
-        .list_routes_by_replica_owner_page(&lease, "ns-a", &authority_id, &owner, None, None, 1)
+        .list_routes_by_replica_owner_page(
+            &lease,
+            "ns-a",
+            &authority_id,
+            RouteOwnerPageQuery {
+                owner: owner.clone(),
+                cursor: None,
+                snapshot_epoch: None,
+                limit: 1,
+            },
+        )
         .expect("first page should establish an owner-route snapshot");
     let cursor = first
         .next_cursor
@@ -1578,10 +1591,12 @@ fn control_plane_owner_route_snapshot_rejects_mutation_between_pages() {
             &lease,
             "ns-a",
             &authority_id,
-            &owner,
-            Some(cursor),
-            Some(snapshot_epoch),
-            1,
+            RouteOwnerPageQuery {
+                owner: owner.clone(),
+                cursor: Some(cursor.to_string()),
+                snapshot_epoch: Some(snapshot_epoch),
+                limit: 1,
+            },
         )
         .expect_err("a changed owner route set must invalidate its continuation page");
     assert!(matches!(error, StoreError::StaleEpoch(_)));

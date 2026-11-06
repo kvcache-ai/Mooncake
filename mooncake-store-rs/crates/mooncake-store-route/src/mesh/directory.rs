@@ -1,3 +1,4 @@
+use crate::RouteOwnerPageQuery;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -457,14 +458,17 @@ impl EmbeddedWrhRouteDirectory {
                 authority.runtime
             )));
         }
+        let query = RouteOwnerPageQuery {
+            owner: owner.clone(),
+            cursor: cursor.map(ToOwned::to_owned),
+            snapshot_epoch,
+            limit: DEFAULT_ROUTE_OWNER_PAGE_SIZE,
+        };
         self.authority_client.list_routes_by_replica_owner_page(
             authority,
             &self.namespace,
             &authority.runtime.stable_id,
-            owner,
-            cursor,
-            snapshot_epoch,
-            DEFAULT_ROUTE_OWNER_PAGE_SIZE,
+            &query,
         )
     }
 
@@ -1933,9 +1937,7 @@ mod owner_page_contract_tests {
             _lease: &ClientLease,
             _namespace: &str,
             _authority: &ClientStableId,
-            _owner: &ClientRuntimeId,
-            _cursor: Option<&str>,
-            _limit: usize,
+            _query: &RouteOwnerPageQuery,
         ) -> Result<RouteOwnerPage> {
             Err(StoreError::Unsupported("unused test operation".to_string()))
         }
@@ -2366,11 +2368,11 @@ mod snapshot_tests {
             _lease: &ClientLease,
             _namespace: &str,
             _authority: &ClientStableId,
-            owner: &ClientRuntimeId,
-            cursor: Option<&str>,
-            snapshot_epoch: Option<u64>,
-            _limit: usize,
+            query: &RouteOwnerPageQuery,
         ) -> Result<crate::RouteOwnerPage> {
+            let owner = &query.owner;
+            let cursor = query.cursor.as_deref();
+            let snapshot_epoch = query.snapshot_epoch;
             let call = self.page_calls.fetch_add(1, Ordering::SeqCst);
             if cursor.is_none() && self.fail_initial_page_after == Some(call) {
                 return Err(StoreError::Transport(

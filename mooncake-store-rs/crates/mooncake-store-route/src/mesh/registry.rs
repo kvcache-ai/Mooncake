@@ -177,9 +177,8 @@ pub(crate) fn authority_list_routes_by_replica_owner_page(
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
     }
-    Ok(slot
-        .table
-        .list_by_replica_owner_page_at_epoch(owner, cursor, limit, snapshot_epoch)?)
+    slot.table
+        .list_by_replica_owner_page_at_epoch(owner, cursor, limit, snapshot_epoch)
 }
 
 pub(crate) fn authority_list_routes(

@@ -19,6 +19,15 @@ pub struct RouteOwnerPage {
     pub snapshot_epoch: Option<u64>,
 }
 
+/// Parameters for one bounded owner-route page request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteOwnerPageQuery {
+    pub owner: ClientRuntimeId,
+    pub cursor: Option<String>,
+    pub snapshot_epoch: Option<u64>,
+    pub limit: usize,
+}
+
 impl RouteOwnerPage {
     pub fn empty() -> Self {
         Self {
@@ -67,10 +76,7 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         lease: &ClientLease,
         namespace: &str,
         authority: &ClientStableId,
-        owner: &ClientRuntimeId,
-        cursor: Option<&str>,
-        snapshot_epoch: Option<u64>,
-        limit: usize,
+        query: &RouteOwnerPageQuery,
     ) -> Result<RouteOwnerPage>;
 
     fn get_allocation_route_references(
