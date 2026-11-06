@@ -1249,15 +1249,15 @@ mod tests {
     use mooncake_store_client::{ColdTierKind, ColdTierSsdEngine};
 
     use super::{
-        build_cold_tier_rate_limits, build_cold_tier_specs, build_runtime_args, compat_warnings, drained_message,
-        dummy_worker_scope, effective_heartbeat_interval, emit_compat_warnings, fetch_http_body,
-        heartbeat_retry_delay_ms, initial_heartbeat_delay_ms, normalize_trace_filter, now_ms,
-        parse_cli_from, parse_falsey_env_bool, parse_hugepage_size_arg, parse_label,
-        parse_route_control_arg, parse_transport_backend_arg, requested_initial_state,
-        resolve_timeout_config, should_activate_after_ready, start_metrics_if_needed,
-        started_message, startup_initial_state, validate_args, ColdTierKindArg,
-        ColdTierSsdEngineArg, Command, HeartbeatLoopState, InitialStateArg, RouteControlArg,
-        RunArgs, TransportBackendArg,
+        build_cold_tier_rate_limits, build_cold_tier_specs, build_runtime_args, compat_warnings,
+        drained_message, dummy_worker_scope, effective_heartbeat_interval, emit_compat_warnings,
+        fetch_http_body, heartbeat_retry_delay_ms, initial_heartbeat_delay_ms,
+        normalize_trace_filter, now_ms, parse_cli_from, parse_falsey_env_bool,
+        parse_hugepage_size_arg, parse_label, parse_route_control_arg, parse_transport_backend_arg,
+        requested_initial_state, resolve_timeout_config, should_activate_after_ready,
+        start_metrics_if_needed, started_message, startup_initial_state, validate_args,
+        ColdTierKindArg, ColdTierSsdEngineArg, Command, HeartbeatLoopState, InitialStateArg,
+        RouteControlArg, RunArgs, TransportBackendArg,
     };
     use mooncake_store_rs_runtime::DEFAULT_COMPAT_WORKER_SCOPE;
 

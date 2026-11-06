@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mooncake_store_client::{
-    http_transport_label, ClassicTeTransportFactory, ColdTierRateLimitConfig, HttpStoreTransportFactory,
-    HttpTransportServerHandle, LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner,
-    RouteControlMode, StoreClient, StoreClientBuilder, StoreTransportFactory, TentTransportFactory,
+    http_transport_label, ClassicTeTransportFactory, ColdTierRateLimitConfig,
+    HttpStoreTransportFactory, HttpTransportServerHandle, LocalMemoryConfig,
+    MooncakeCompatibilityFacade, PlacementPlanner, RouteControlMode, StoreClient,
+    StoreClientBuilder, StoreTransportFactory, TentTransportFactory,
 };
 use mooncake_store_core::{ClientEpoch, ClientLifecycleState, CompatibilityDescriptor, Result};
 

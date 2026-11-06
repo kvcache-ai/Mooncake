@@ -2144,11 +2144,11 @@ mod owner_page_contract_tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLifecycleState, CompatibilityDescriptor,
         ReplicaRoute, ReplicaTier, RouteState, SegmentName,
     };
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 
     struct TestMembership {
         leases: Vec<ClientLease>,
@@ -2472,9 +2472,7 @@ mod owner_page_contract_tests {
                 })
                 .collect()
         }
-
     }
-
 
     fn route(key: &str) -> ObjectRoute {
         ObjectRoute {
@@ -2500,7 +2498,7 @@ mod owner_page_contract_tests {
             validate_owner_route_page(
                 cursor,
                 &crate::RouteOwnerPage {
-                snapshot_epoch: None,
+                    snapshot_epoch: None,
                     routes: vec![route(key)],
                     next_cursor: Some(key.to_string()),
                 },
@@ -3467,7 +3465,6 @@ mod owner_page_contract_tests {
             );
         }
     }
-
 }
 
 #[cfg(test)]
@@ -3476,12 +3473,12 @@ mod snapshot_tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
     use crate::RouteOwnerPage;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLifecycleState, CompatibilityDescriptor,
         ReplicaRoute, ReplicaTier, RouteState, SegmentName,
     };
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 
     struct TestMembership {
         leases: Vec<ClientLease>,
@@ -3865,4 +3862,3 @@ mod snapshot_tests {
         assert_eq!(authority_client.page_calls.load(Ordering::SeqCst), 2);
     }
 }
-

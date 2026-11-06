@@ -8,13 +8,13 @@ use super::cold_tier_server::{
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
 use crate::observability::registry;
+use mooncake_store_route::RouteOwnerPage;
 use mooncake_store_route::{
     serve_route_control_request, RouteControlRequest, RouteControlResponse,
     DEFAULT_ROUTE_OWNER_PAGE_SIZE,
 };
-use std::time::{Duration, Instant};
-use mooncake_store_route::RouteOwnerPage;
 use prost::Message;
+use std::time::{Duration, Instant};
 
 const MAX_ROUTE_OWNER_PAGE_RESPONSE_BYTES: usize = 1024 * 1024;
 
@@ -731,7 +731,12 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
             Ok(RouteControlResponse::ListByReplicaOwner(page)) => match pb_route_owner_page(page) {
                 Ok(reply) => reply,
-                Err(error) => pb::ListRoutesByReplicaOwnerReply { routes: Vec::new(), error: Some(pb_error(error)), next_cursor: None, snapshot_epoch: None },
+                Err(error) => pb::ListRoutesByReplicaOwnerReply {
+                    routes: Vec::new(),
+                    error: Some(pb_error(error)),
+                    next_cursor: None,
+                    snapshot_epoch: None,
+                },
             },
             Ok(_) => pb::ListRoutesByReplicaOwnerReply {
                 routes: Vec::new(),

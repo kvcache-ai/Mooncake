@@ -249,8 +249,14 @@ impl LocalRouteTable {
             .collect()
     }
 
-    pub(crate) fn list_by_replica_owner_page(&self, owner: &ClientRuntimeId, cursor: Option<&str>, limit: usize) -> RouteOwnerPage {
-        self.list_by_replica_owner_page_at_epoch(owner, cursor, limit, None).expect("unconditional owner page must succeed")
+    pub(crate) fn list_by_replica_owner_page(
+        &self,
+        owner: &ClientRuntimeId,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> RouteOwnerPage {
+        self.list_by_replica_owner_page_at_epoch(owner, cursor, limit, None)
+            .expect("unconditional owner page must succeed")
     }
 
     pub(crate) fn list_by_replica_owner_page_at_epoch(

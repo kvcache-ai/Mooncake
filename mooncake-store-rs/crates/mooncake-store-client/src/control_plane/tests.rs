@@ -1,6 +1,6 @@
-use std::sync::atomic::AtomicUsize;
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -120,12 +120,7 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
         let mut routes = Vec::with_capacity(limit);
         for route in route_table
             .range::<str, _>((start, Bound::Unbounded))
-            .filter(|(_, route)| {
-                route
-                    .replicas
-                    .iter()
-                    .any(|replica| &replica.owner == owner)
-            })
+            .filter(|(_, route)| route.replicas.iter().any(|replica| &replica.owner == owner))
             .map(|(_, route)| route.clone())
         {
             if routes.len() == limit {
@@ -271,7 +266,6 @@ impl AllocatorService for TestAllocator {
             .fetch_add(requests.len(), Ordering::Relaxed);
         self.batch_reserve_specific(owner, requests)
     }
-
 }
 
 #[derive(Default)]
@@ -543,8 +537,6 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
     ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
         self.inner.batch_notify_delete_pending(request).await
     }
-
-
 }
 
 struct ClosingStreamHandle {
@@ -864,8 +856,6 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
     ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
         self.inner.batch_notify_delete_pending(request).await
     }
-
-
 }
 
 struct DelayedUnaryHandle {
@@ -1193,8 +1183,6 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
     ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
         self.inner.batch_notify_delete_pending(request).await
     }
-
-
 }
 
 struct InvalidMigrationStatusHandle {
@@ -2801,7 +2789,7 @@ fn owner_route_rpc_defaults_and_clamps_page_limit() {
                     owner: Some(pb_runtime_id(&owner)),
                     cursor: None,
                     limit,
-                snapshot_epoch: None,
+                    snapshot_epoch: None,
                 }))
                 .await
                 .expect("bounded owner route request should reply")
@@ -2963,7 +2951,6 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
     handle.shutdown();
 }
 
-
 struct LegacyOnlyAllocator;
 
 impl AllocatorService for LegacyOnlyAllocator {
@@ -2994,7 +2981,6 @@ impl AllocatorService for LegacyOnlyAllocator {
     ) -> mooncake_store_core::Result<()> {
         Err(StoreError::Unsupported("test allocator".to_string()))
     }
-
 }
 
 struct GatedRpcAllocator {

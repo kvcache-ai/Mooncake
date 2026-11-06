@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
-    ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, Result, RouteCasRequest,
-    StoreError,
+    ClientLease, ClientRuntimeId, ClientStableId, ObjectKey, Result, RouteCasRequest, StoreError,
 };
 
 use crate::shim::{
