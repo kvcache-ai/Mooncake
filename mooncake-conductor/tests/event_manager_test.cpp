@@ -1779,6 +1779,43 @@ TEST(KVEventHandlerTest, SglangLocalLifecyclePreservesIndependentStore) {
     }
 }
 
+// A publisher restart retracts the source's entries like a stale source does,
+// but the handler keeps serving so the new epoch repopulates the index.
+TEST(KVEventHandler, SourceResetRetractsEntriesAndStaysAvailable) {
+    EventManager manager({}, 0);
+    const auto engine = VllmService("engine-a", "default", 0, 4);
+    ASSERT_TRUE(EventManagerTestPeer::Register(manager, engine).first);
+    auto handler = EventManagerTestPeer::HandlerFor(
+        manager,
+        MakeServiceKey(engine.instance_id, engine.tenant_id, engine.dp_rank));
+    ASSERT_NE(handler, nullptr);
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine), TestProfile(), tokens).front();
+    const auto device_hit = [&] {
+        return manager.GetIndexer()
+            ->Query(ContextFor(engine), tokens)
+            .at(engine.instance_id)
+            .device;
+    };
+
+    ASSERT_TRUE(DispatchVllm(*handler, engine, {VllmStored(prefix.value, 4)}, 0)
+                    .empty());
+    EXPECT_EQ(device_hit(), 4);
+
+    handler->OnSourceReset("test", MetadataFor(engine), "publisher restarted");
+    EXPECT_EQ(device_hit(), 0);
+    EXPECT_TRUE(KVEventHandlerTestPeer::IsAvailable(*handler));
+
+    ASSERT_TRUE(DispatchVllm(*handler, engine, {VllmStored(prefix.value, 4)}, 0)
+                    .empty());
+    EXPECT_EQ(device_hit(), 4);
+
+    handler->OnSourceStale("test", MetadataFor(engine), "unrecoverable gap");
+    EXPECT_EQ(device_hit(), 0);
+    EXPECT_FALSE(KVEventHandlerTestPeer::IsAvailable(*handler));
+}
+
 class LevelSink : public google::LogSink {
    public:
     explicit LevelSink(google::LogSeverity level) : level_(level) {

@@ -35,6 +35,15 @@ class EventHandler {
     virtual void OnSourceStale(const std::string& cache_pool_key,
                                const MessageMetadata& metadata,
                                const std::string& reason) = 0;
+
+    // Called when the live sequence moved backwards, which means the publisher
+    // restarted and began a new epoch. Implementations should drop entries
+    // attributed to this source; the client keeps consuming from the new
+    // epoch, so the handler must stay available. metadata.sequence is the last
+    // sequence applied before the restart.
+    virtual void OnSourceReset(const std::string& cache_pool_key,
+                               const MessageMetadata& metadata,
+                               const std::string& reason) = 0;
 };
 
 struct ZMQClientConfig {
@@ -131,6 +140,10 @@ class ZMQClient {
     void StartRecovery(const std::string& reason);
     std::string AttemptRecovery();
     void MarkStale(const std::string& reason);
+    // Forgets the previous epoch's sequence state and buffered messages, then
+    // notifies the handler. The caller continues with restarted_seq as the
+    // first message of the new epoch.
+    void ResetSource(int64_t restarted_seq);
 
     ZMQClientConfig config_;
     std::shared_ptr<EventHandler> event_handler_;
