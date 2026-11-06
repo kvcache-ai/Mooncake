@@ -1161,7 +1161,6 @@ impl PyMooncakeDistributedStore {
                     })
                 })
                 .map_err(store_error_to_py)?;
-                dispatcher.untrack_key(&cache_key, cache_tenant.as_deref());
                 dispatcher.invalidate_key(cache_key, cache_tenant);
                 Ok(0)
             }
@@ -1206,7 +1205,6 @@ impl PyMooncakeDistributedStore {
                     })
                 })
                 .map_err(store_error_to_py)?;
-                dispatcher.untrack_keys(&cache_keys, cache_tenant.as_deref());
                 dispatcher.invalidate_keys(cache_keys, cache_tenant);
                 Ok(vec![0; key_count])
             }
@@ -1478,9 +1476,17 @@ impl PyMooncakeDistributedStore {
                 }
                 Ok(removed)
             }
-            StoreBackend::Real(_) => Err(PyRuntimeError::new_err(
-                "remove_all is not available for real-mode native store",
-            )),
+            StoreBackend::Real(dispatcher) => {
+                let (status, evicted) =
+                    run_without_gil(move || dispatcher.remove_all_blocking(force))
+                        .map_err(store_error_to_py)?;
+                if status != 0 {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "real remove_all did not complete (evicted={evicted})"
+                    )));
+                }
+                Ok(evicted)
+            }
         }
     }
 
@@ -3166,7 +3172,12 @@ mod tests {
                 .expect("batch_remove should succeed"),
             vec![0, 0]
         );
-        assert!(store.remove_all(false).is_err());
+        assert!(
+            store
+                .remove_all(false)
+                .expect("real remove_all should use native evict-all")
+                >= 0
+        );
         assert!(!store.metrics_text().is_empty());
 
         store.enter_draining().expect("draining should succeed");
