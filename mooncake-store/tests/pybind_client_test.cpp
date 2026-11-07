@@ -171,6 +171,17 @@ class RealClientTest : public ::testing::Test {
         return config;
     }
 
+    uint64_t RpcCount(const std::string& name) const {
+        auto summary = py_client_->client_->GetSummaryMetrics();
+        EXPECT_TRUE(summary.has_value());
+        if (!summary) return 0;
+        const std::string prefix = "\n" + name + ": count=";
+        const auto pos = summary->find(prefix);
+        return pos == std::string::npos
+                   ? 0
+                   : std::stoull(summary->substr(pos + prefix.size()));
+    }
+
     std::string CreateTempSegmentFile(size_t size) {
         std::string path = "/tmp/mooncake_real_client_segment_XXXXXX";
         int fd = mkstemp(path.data());
@@ -1023,6 +1034,143 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
     EXPECT_EQ(std::string(dst, test_data.size()), test_data);
 }
 
+TEST_F(RealClientTest, RangedReadBatchesMetadataAcrossBuffers) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    constexpr size_t object_count = 129;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<std::vector<size_t>> dst_offsets;
+    std::vector<std::vector<size_t>> src_offsets;
+    std::vector<std::vector<size_t>> sizes;
+    for (size_t i = 0; i < object_count; ++i) {
+        keys.push_back("ranged_batch_" + std::to_string(i));
+        values.emplace_back(32, static_cast<char>('A' + i % 26));
+        ASSERT_EQ(
+            py_client_->put(keys.back(), std::span<const char>(values.back())),
+            0);
+        dst_offsets.push_back({i * 4});
+        src_offsets.push_back({4});
+        sizes.push_back({4});
+    }
+    keys.push_back("ranged_batch_missing");
+    dst_offsets.push_back({object_count * 4});
+    src_offsets.push_back({0});
+    sizes.push_back({4});
+    auto destination = py_client_->allocate_client_buffer(keys.size() * 4);
+    auto duplicate = py_client_->allocate_client_buffer(object_count * 4);
+    ASSERT_TRUE(destination.has_value());
+    ASSERT_TRUE(duplicate.has_value());
+    std::memset(destination->ptr(), '?', keys.size() * 4);
+    std::vector<std::vector<size_t>> duplicate_offsets;
+    for (size_t i = 0; i < object_count; ++i) {
+        duplicate_offsets.push_back({i * 4});
+    }
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    auto results = py_client_->get_into_ranges(
+        {destination->ptr(), duplicate->ptr()},
+        {keys, std::vector<std::string>(object_count, keys.front())},
+        {dst_offsets, duplicate_offsets},
+        {src_offsets, std::vector<std::vector<size_t>>(object_count, {8})},
+        {sizes, std::vector<std::vector<size_t>>(object_count, {4})});
+
+    ASSERT_EQ(results.size(), 2);
+    ASSERT_EQ(results[0].size(), keys.size());
+    for (size_t i = 0; i < object_count; ++i) {
+        EXPECT_EQ(results[0][i], std::vector<int64_t>{4});
+        EXPECT_EQ(
+            std::string(static_cast<char*>(destination->ptr()) + i * 4, 4),
+            values[i].substr(4, 4));
+    }
+    EXPECT_EQ(results[0].back(),
+              std::vector<int64_t>{toInt(ErrorCode::OBJECT_NOT_FOUND)});
+    EXPECT_EQ(std::string(
+                  static_cast<char*>(destination->ptr()) + object_count * 4, 4),
+              "????");
+    ASSERT_EQ(results[1].size(), object_count);
+    for (size_t i = 0; i < object_count; ++i) {
+        EXPECT_EQ(results[1][i], std::vector<int64_t>{4});
+        EXPECT_EQ(std::string(static_cast<char*>(duplicate->ptr()) + i * 4, 4),
+                  values.front().substr(8, 4));
+    }
+    EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+    // Two bounded planning queries, plus the existing pre-transfer lease
+    // renewal. Duplicate keys share the planning result across buffers.
+    EXPECT_EQ(RpcCount("BatchGetReplicaList") - batch_before, 3);
+}
+
+TEST_F(RealClientTest, RangedReadQueriesOnlyMissingOrExpiredCacheEntries) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    const std::vector<std::string> keys = {"ranged_cached", "ranged_expired",
+                                           "ranged_uncached",
+                                           "ranged_cached_error"};
+    for (const auto& key : keys) {
+        ASSERT_EQ(py_client_->put(key, std::span<const char>("abcdefgh", 8)),
+                  0);
+    }
+    auto queries = py_client_->batch_query({keys[0], keys[1]});
+    ASSERT_EQ(queries.size(), 2);
+    ASSERT_TRUE(queries[0]);
+    ASSERT_TRUE(queries[1]);
+    PyClient::QueryResultCache cache;
+    cache.emplace(keys[0], queries[0]);
+    cache.emplace(
+        keys[1],
+        QueryResult(
+            std::vector<Replica::Descriptor>(queries[1]->replicas),
+            std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+    cache.emplace(keys[3], tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    // A live cache entry must still select its old leased replica, whereas
+    // an expired entry must query the replacement before reading.
+    ASSERT_EQ(py_client_->upsert(keys[0], std::span<const char>("XXXXXXXX", 8)),
+              0);
+    ASSERT_EQ(py_client_->upsert(keys[1], std::span<const char>("12345678", 8)),
+              0);
+    auto destination = py_client_->allocate_client_buffer(16);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', 16);
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    auto result = py_client_->get_into_ranges(
+        {destination->ptr()}, {keys}, {{{0}, {4}, {8}, {12}}},
+        {{{0}, {2}, {4}, {0}}}, {{{4}, {4}, {4}, {4}}}, &cache);
+    EXPECT_EQ(result,
+              (std::vector<std::vector<std::vector<int64_t>>>{
+                  {{4}, {4}, {4}, {toInt(ErrorCode::OBJECT_NOT_FOUND)}}}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 16),
+              "abcd3456efgh????");
+    EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+    // One query for the expired and absent entries, then lease renewal.
+    EXPECT_EQ(RpcCount("BatchGetReplicaList") - batch_before, 2);
+    EXPECT_TRUE(cache.at(keys[1])->IsLeaseExpired());
+    EXPECT_FALSE(cache.contains(keys[2]));
+}
+
+TEST_F(RealClientTest, RangedReadInvalidGroupsDoNotQueryMetadata) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    auto destination = py_client_->allocate_client_buffer(8);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', 8);
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    auto result = py_client_->get_into_ranges(
+        {nullptr, destination->ptr(), destination->ptr()},
+        {{"null_buffer"}, {"invalid_group"}, {"invalid_ranges"}},
+        {{{0}}, {}, {{0, 4}}}, {{{0}}, {{0}}, {{0}}}, {{{4}}, {{4}}, {{4}}});
+    EXPECT_EQ(result, (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::INVALID_PARAMS)}},
+                          {{toInt(ErrorCode::INVALID_PARAMS)}},
+                          {{toInt(ErrorCode::INVALID_PARAMS),
+                            toInt(ErrorCode::INVALID_PARAMS)}}}));
+    EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+    EXPECT_EQ(RpcCount("BatchGetReplicaList"), batch_before);
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 8),
+              "????????");
+}
+
 TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     StartMasterAndSetupClient();
     const std::string key = "ranged_snapshot_upsert";
@@ -1066,6 +1214,7 @@ TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
 }
 
 TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
     StartMasterAndSetupClient();
     const std::string key = "ranged_snapshot_expired";
     const std::string data(32, 'A');
@@ -1081,8 +1230,13 @@ TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
     auto destination = py_client_->allocate_client_buffer(data.size());
     ASSERT_TRUE(destination.has_value());
     auto read = [&]() {
-        return py_client_->get_into_ranges_from_snapshot(
+        const auto single_before = RpcCount("GetReplicaList");
+        const auto batch_before = RpcCount("BatchGetReplicaList");
+        auto result = py_client_->get_into_ranges_from_snapshot(
             {destination->ptr()}, {{key}}, {{{0}}}, {{{4}}}, {{{4}}}, snapshot);
+        EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+        EXPECT_EQ(RpcCount("BatchGetReplicaList"), batch_before);
+        return result;
     };
     EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
                           {{toInt(ErrorCode::LEASE_EXPIRED)}}}));
