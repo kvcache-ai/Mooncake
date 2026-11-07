@@ -95,10 +95,11 @@ tl::expected<int, ErrorCode> PosixFsAdapter::OpenFile(const std::string& path) {
 }
 
 tl::expected<int, ErrorCode> PosixFsAdapter::OpenExistingFile(
-    const std::string& path) {
+    const std::string& path, bool write) {
+    const int flags = (write ? O_RDWR : O_RDONLY) | O_CLOEXEC;
     int fd;
     do {
-        fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+        fd = ::open(path.c_str(), flags);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0) return tl::make_unexpected(ReadOpenError());
     return fd;

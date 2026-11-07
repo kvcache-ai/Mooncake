@@ -108,10 +108,14 @@ tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFile(const std::string& path) {
 }
 
 tl::expected<int, ErrorCode> Hf3fsAdapter::OpenExistingFile(
-    const std::string& path) {
+    const std::string& path, bool write) {
+    // The 3FS FUSE client opens and closes a metadata session only for
+    // writable opens, so a read-only open skips two synchronous metadata round
+    // trips: one on open and one on close.
+    const int flags = (write ? O_RDWR : O_RDONLY) | O_CLOEXEC;
     int fd;
     do {
-        fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+        fd = open(path.c_str(), flags);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
         return tl::make_unexpected(errno == ENOENT ? ErrorCode::FILE_NOT_FOUND
