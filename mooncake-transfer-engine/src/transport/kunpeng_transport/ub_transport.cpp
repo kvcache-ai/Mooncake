@@ -220,8 +220,10 @@ Status UbTransport::submitTransferTask(
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
+    // The in-flight window that throttles a submit burst is per-jetty, so
+    // derive the watermark from the jetty count (not the RDMA QP knob).
     const size_t kSubmitWatermark =
-        globalConfig().max_wr * globalConfig().num_qp_per_ep;
+        globalConfig().max_wr * globalConfig().num_jetty_per_ep;
     uint64_t nr_slices;
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
@@ -242,9 +244,11 @@ Status UbTransport::submitTransferTask(
              offset += kBlockSize) {
             Slice* slice = getSliceCache().allocate();
             assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
-            }
+            // Count every slice, including slices served from SliceCache.
+            // Counting only non-cached slices made nr_slices stay 0 in steady
+            // state, so the watermark was never reached and an entire task was
+            // buffered instead of being streamed to the transport.
+            nr_slices++;
             bool merge_final_slice =
                 request.length - offset <= kBlockSize + kFragmentSize;
             slice->source_addr = (char*)request.source + offset;
