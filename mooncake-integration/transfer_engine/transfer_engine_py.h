@@ -341,7 +341,7 @@ class TransferEnginePy {
     void reconcileExternalRegistrations(const std::vector<uintptr_t> &addresses,
                                         bool registration, int result);
 
-    void releaseManagedBuffers();
+    int releaseManagedBuffers();
 
    private:
     std::shared_ptr<TransferEngine> engine_;

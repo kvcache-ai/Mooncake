@@ -79,6 +79,13 @@ if(WITH_TE)
                                         gflags::gflags)
   endif()
 
+  if(BUILD_UNIT_TESTS)
+    add_executable(managed_buffer_release_test
+                   tests/managed_buffer_release_test.cpp)
+    add_test(NAME managed_buffer_release_test
+             COMMAND managed_buffer_release_test)
+  endif()
+
   if(USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)

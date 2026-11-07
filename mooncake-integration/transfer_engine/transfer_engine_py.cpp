@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include "managed_buffer_release.h"
 #include "shared_segment_py.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
@@ -404,7 +405,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                    << "Use 'hip' instead.";
         return -1;
     }
-    if (engine_) releaseManagedBuffers();
+    if (engine_ && releaseManagedBuffers() != 0) return -1;
     if (!initMemoryAllocator(protocol)) return -1;
 
     std::string proto = protocol ? std::string(protocol) : "";
@@ -550,20 +551,17 @@ int TransferEnginePy::getRpcPort() {
     return engine_ ? engine_->getRpcPort() : 0;
 }
 
-void TransferEnginePy::releaseManagedBuffers() {
-    for (auto* buffer : buffer_list_) {
-        engine_->unregisterLocalMemory(buffer);
-        freeMemory(buffer);
+int TransferEnginePy::releaseManagedBuffers() {
+    const int status = detail::releaseManagedBuffers(
+        buffer_list_, large_buffer_list_, free_list_, active_managed_buffers_,
+        kDefaultBufferCapacity,
+        [this](void* buffer) { return engine_->unregisterLocalMemory(buffer); },
+        [](void* buffer) { freeMemory(buffer); });
+    if (status != 0) {
+        LOG(ERROR) << "Cannot release managed buffers while transport "
+                      "deregistration is incomplete";
     }
-    buffer_list_.clear();
-    for (auto* buffer : large_buffer_list_) {
-        engine_->unregisterLocalMemory(buffer);
-        freeMemory(buffer);
-    }
-    large_buffer_list_.clear();
-    active_managed_buffers_.clear();
-    free_list_.clear();
-    free_list_.resize(kSlabSizeKBTabLen);
+    return status;
 }
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
