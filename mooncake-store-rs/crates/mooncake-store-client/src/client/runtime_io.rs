@@ -1712,11 +1712,21 @@ impl StoreClient {
             })
     }
 
-    fn current_owned_allocations(&self) -> Result<BTreeSet<AllocationSpan>> {
+    fn current_owned_allocations(
+        &self,
+        previous_owner_scan: mooncake_store_core::RouteOwnerScanStatus,
+    ) -> Result<BTreeSet<AllocationSpan>> {
+        if previous_owner_scan == mooncake_store_core::RouteOwnerScanStatus::Incomplete {
+            return Err(StoreError::Transport(
+                "owner route scan incomplete; stale allocation reclamation is deferred"
+                    .to_string(),
+            ));
+        }
         let mut allocations = BTreeSet::new();
         let owner = self.lease.runtime.clone();
-        self.route_ops()
-            .visit_routes_by_replica_owner(&owner, &mut |route| {
+        let scan_status = self
+            .route_ops()
+            .visit_routes_by_replica_owner_with_status(&owner, &mut |route| {
                 let object_id = self.route_object_id(&route)?;
                 let tenant = object_id.scope.tenant;
                 let key = object_id.logical_key;
@@ -1739,6 +1749,12 @@ impl StoreClient {
                 }
                 Ok(())
             })?;
+        if scan_status == mooncake_store_core::RouteOwnerScanStatus::Incomplete {
+            return Err(StoreError::Transport(
+                "owner route scan incomplete; stale allocation reclamation is deferred"
+                    .to_string(),
+            ));
+        }
         Ok(allocations)
     }
 
@@ -1891,8 +1907,9 @@ impl StoreClient {
             self.pin_draining_lease_for_evacuation()?;
             let owner = self.lease.runtime.clone();
             let mut had_routes = false;
-            self.route_ops()
-                .visit_routes_by_replica_owner(&owner, &mut |route| {
+            let owner_scan_status = self
+                .route_ops()
+                .visit_routes_by_replica_owner_with_status(&owner, &mut |route| {
                     had_routes = true;
                     if migrate_route(&route)? {
                         migrated = migrated.saturating_add(1);
@@ -1901,7 +1918,7 @@ impl StoreClient {
                 })?;
 
             flush_reclaims(self)?;
-            let live_allocations = self.current_owned_allocations()?;
+            let live_allocations = self.current_owned_allocations(owner_scan_status)?;
             let _ = self.release_stale_local_allocations(&live_allocations)?;
             flush_reclaims(self)?;
             self.retire_empty_draining_segments()?;

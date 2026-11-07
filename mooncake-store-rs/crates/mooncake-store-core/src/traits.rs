@@ -424,6 +424,12 @@ pub trait MetadataBackend: Send + Sync {
     fn get_handoff(&self, stable_id: &ClientStableId) -> Result<Option<HandoffPlan>>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteOwnerScanStatus {
+    Complete,
+    Incomplete,
+}
+
 pub trait RouteDirectory: Send + Sync {
     fn get_object_route(
         &self,
@@ -542,6 +548,21 @@ pub trait RouteDirectory: Send + Sync {
             visitor(route)?;
         }
         Ok(())
+    }
+
+    /// Visits owner routes and reports whether every authority was scanned.
+    ///
+    /// Implementations that can query mirrored authorities should return
+    /// [`RouteOwnerScanStatus::Incomplete`] when any authority failed while
+    /// still delivering routes from the authorities that responded.
+    fn visit_routes_by_replica_owner_with_status(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+        visitor: &mut dyn FnMut(ObjectRoute) -> Result<()>,
+    ) -> Result<RouteOwnerScanStatus> {
+        self.visit_routes_by_replica_owner(observer, owner, visitor)?;
+        Ok(RouteOwnerScanStatus::Complete)
     }
 
     fn list_routes_by_cold_backing(
