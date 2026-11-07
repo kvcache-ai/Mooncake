@@ -84,25 +84,20 @@ if(WITH_TE)
     target_link_libraries(engine PRIVATE CUDA::cudart)
 
     if(BUILD_UNIT_TESTS)
-      # This test embeds Python, so it needs libpython. The manylinux wheel
-      # builders have none; PR CI builds the unit tests there only to catch
-      # compile breaks, so it skips this one.
-      find_package(Python3 COMPONENTS Development.Embed)
-      if(Python3_Development.Embed_FOUND)
-        add_executable(on_cuda_transport_guard_test
-                       tests/on_cuda_transport_guard_test.cpp)
-        target_include_directories(
-          on_cuda_transport_guard_test
-          PRIVATE
-            $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>)
-        target_link_libraries(on_cuda_transport_guard_test
-                              PRIVATE pybind11::headers Python3::Python)
-        add_test(NAME on_cuda_transport_guard_test
-                 COMMAND on_cuda_transport_guard_test)
-      else()
-        message(STATUS "Skipping on_cuda_transport_guard_test: "
-                       "no embeddable Python3 library")
-      endif()
+      find_package(
+        Python3
+        COMPONENTS Development.Embed
+        REQUIRED)
+      add_executable(on_cuda_transport_guard_test
+                     tests/on_cuda_transport_guard_test.cpp)
+      target_include_directories(
+        on_cuda_transport_guard_test
+        PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>
+      )
+      target_link_libraries(on_cuda_transport_guard_test
+                            PRIVATE pybind11::headers Python3::Python)
+      add_test(NAME on_cuda_transport_guard_test
+               COMMAND on_cuda_transport_guard_test)
     endif()
   endif()
 
