@@ -72,6 +72,10 @@ class DeviceSelector {
         int dev_id;
         double score;
         bool is_cross_numa;
+        uint64_t inflight_bytes;
+        double bandwidth_bps;
+        double numa_penalty;
+        double jitter;
     };
 
     // 64-byte aligned so the padding below really does put each hot atomic
@@ -291,7 +295,12 @@ class DeviceSelector {
     void fillDevicePriorities();
     int getDevicePriority(int dev_id) const;
 
+    enum class BatchAllocationPolicy { InverseScore, VirtualLoad };
+
     struct SchedulingParams {
+        // Startup-only policy for normal aggregate allocation.
+        BatchAllocationPolicy batch_allocation_policy =
+            BatchAllocationPolicy::InverseScore;
         // NUMA tier penalties (rank 0 = local, should be smallest)
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
