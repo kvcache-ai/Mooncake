@@ -704,6 +704,30 @@ TEST_F(MasterServiceTenantQuotaTest, PutRevokeRefundsStartCharge) {
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
+       UpsertTakingOverAnUnfinishedWriteIsNotChargedForIt) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 100}}));
+    UUID client_id = MountSegment(service);
+
+    auto start =
+        service.PutStart(client_id, "key", tenant_id, 100, MemoryConfig());
+    ASSERT_TRUE(start.has_value()) << toString(start.error());
+    ASSERT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
+
+    // The write it takes over completed nothing, so only the upsert's own
+    // write is charged.
+    auto upsert =
+        service.UpsertStart(client_id, "key", tenant_id, 100, MemoryConfig());
+    ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
+
+    auto end =
+        service.UpsertEnd(client_id, "key", tenant_id, ReplicaType::MEMORY);
+    ASSERT_TRUE(end.has_value()) << toString(end.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
        SizeChangingUpsertTransfersAndReleasesReplacementCharge) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
