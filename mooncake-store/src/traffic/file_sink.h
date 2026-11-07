@@ -10,7 +10,8 @@ namespace mooncake::traffic {
 
 class FileSink final : public TrafficSink {
    public:
-    FileSink(std::uint64_t segment_bytes, std::uint64_t segment_seconds);
+    FileSink(std::uint64_t segment_bytes, std::uint64_t segment_seconds,
+             std::uint64_t max_total_bytes = 0);
     ~FileSink() override;
 
     bool OpenSession(const std::string& output_dir,
@@ -19,9 +20,6 @@ class FileSink final : public TrafficSink {
                     std::uint32_t records, std::uint32_t block_type) override;
     bool WriteRecords(const struct iovec* iov, int iov_count,
                       std::uint64_t bytes, std::uint32_t records) override;
-    bool WriteRouteTable(
-        const std::vector<std::pair<std::uint32_t, std::string>>& routes)
-        override;
     bool Flush() override;
     void Close() override;
 
@@ -36,6 +34,7 @@ class FileSink final : public TrafficSink {
 
     std::uint64_t segment_bytes_;
     std::uint64_t segment_seconds_;
+    std::uint64_t max_total_bytes_;
     std::string session_dir_;
     std::string segment_path_;
     std::FILE* file_ = nullptr;

@@ -178,6 +178,9 @@ set_tests_properties(master_service_hca_affinity_test
                      PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
+add_store_test(traffic_recorder_test traffic_recorder_test.cpp)
+target_include_directories(traffic_recorder_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
 add_test(
   NAME object_checksum_client_test

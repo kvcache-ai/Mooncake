@@ -5,7 +5,6 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -87,15 +86,11 @@ class TrafficRecorder {
     void StopInternal();
     void StartControlServer();
     std::string StatusJson() const;
-    void RememberRoute(const RequestView& view);
-    std::vector<std::pair<std::uint32_t, std::string>> RouteTable() const;
 
     mutable std::mutex lifecycle_mu_;
     mutable std::mutex status_mu_;
     mutable std::mutex shards_mu_;
     mutable std::mutex writer_mu_;
-    mutable std::mutex routes_mu_;
-    std::map<std::uint32_t, std::string> routes_;
     std::condition_variable writer_cv_;
 
     std::atomic<bool> active_{false};
@@ -117,6 +112,7 @@ class TrafficRecorder {
     std::uint64_t segment_seconds_ = 300;
     std::uint64_t ring_bytes_ = 1024ull * 1024 * 1024;
     std::uint64_t max_record_bytes_ = 4ull * 1024 * 1024;
+    std::uint64_t max_total_bytes_ = 0;
     std::uint32_t ring_shards_ = 8;
     std::uint64_t stop_timeout_ms_ = 30000;
     std::atomic<std::uint64_t> stop_deadline_ms_{0};

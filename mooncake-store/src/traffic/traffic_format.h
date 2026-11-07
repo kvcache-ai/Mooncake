@@ -12,7 +12,6 @@ inline constexpr std::uint32_t kTrafficFooterMagic = 0x4745434d;  // MCEG
 inline constexpr std::uint16_t kTrafficVersionMajor = 1;
 inline constexpr std::uint16_t kTrafficVersionMinor = 0;
 inline constexpr std::uint32_t kTrafficBlockData = 0;
-inline constexpr std::uint32_t kTrafficBlockRouteTable = 1;
 inline constexpr std::uint32_t kTrafficPadMagic = 0x50414431;  // PAD1
 inline constexpr std::size_t kTrafficPadSize = 8;
 inline constexpr std::size_t kTrafficFileHeaderSize = 64;
@@ -30,7 +29,7 @@ struct TrafficFileHeader {
     std::uint8_t session_uuid[16]{};
     std::uint64_t segment_seq = 0;
     std::uint64_t start_ms = 0;
-    std::uint32_t route_count = 0;
+    std::uint32_t route_count = 0;  // reserved, v1 records use numeric keys
     std::uint32_t reserved = 0;
     std::uint64_t reserved2 = 0;
     std::uint32_t reserved3 = 0;

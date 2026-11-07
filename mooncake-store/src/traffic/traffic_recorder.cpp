@@ -106,6 +106,8 @@ void TrafficRecorder::Install() {
         !ParseSize(root["segment_seconds"], "segment_seconds",
                    &segment_seconds_) ||
         !ParseSize(root["block_bytes"], "block_bytes", &block_bytes_) ||
+        !ParseSize(root["max_total_bytes"], "max_total_bytes",
+                   &max_total_bytes_) ||
         !ParseSize(root["stop_timeout_ms"], "stop_timeout_ms",
                    &stop_timeout_ms_)) {
         state_ = "error";
@@ -177,6 +179,11 @@ void TrafficRecorder::Install() {
         state_ = "error";
         return;
     }
+    if (max_total_bytes_ > 0 && max_total_bytes_ < segment_bytes_) {
+        LOG(ERROR) << "traffic: max_total_bytes must be >= segment_bytes";
+        state_ = "error";
+        return;
+    }
     config_loaded_ = true;
     state_ = "idle";
     static std::once_flag atexit_once;
@@ -230,7 +237,8 @@ bool TrafficRecorder::Start() {
     block_.clear();
     block_.reserve(block_bytes_);
     sink_.reset();
-    sink_ = std::make_unique<FileSink>(segment_bytes_, segment_seconds_);
+    sink_ = std::make_unique<FileSink>(segment_bytes_, segment_seconds_,
+                                       max_total_bytes_);
     const std::uint64_t start_ms = TrafficNowMs();
     if (!sink_->OpenSession(output_dir_, start_ms)) {
         state_ = "error";
@@ -303,10 +311,6 @@ void TrafficRecorder::StopInternal() {
             }
         }
         FlushBlock(tail_block, tail_records);
-        const auto routes = RouteTable();
-        if (!routes.empty()) {
-            sink_->WriteRouteTable(routes);
-        }
         sink_->Flush();
         sink_->Close();
     }
@@ -346,11 +350,6 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
     }
     Shard& shard = *tls_shard;
     shard.observed.fetch_add(1, std::memory_order_relaxed);
-    static thread_local std::uint32_t last_route_key = 0;
-    if (view.route_key != last_route_key && !view.route_name.empty()) {
-        last_route_key = view.route_key;
-        RememberRoute(view);
-    }
     if (!allow_all_routes_ &&
         allowed_routes_.find(view.route_key) == allowed_routes_.end()) {
         shard.dropped_filtered.fetch_add(1, std::memory_order_relaxed);
@@ -444,6 +443,12 @@ void TrafficRecorder::WriterLoop() {
                 DrainShardDirect(*shard);
             }
         }
+        if (sink_ != nullptr && sink_->failed()) {
+            active_.store(false, std::memory_order_release);
+            state_ = "error";
+            writer_stop_.store(true, std::memory_order_release);
+            break;
+        }
         if (writer_stop_.load(std::memory_order_acquire)) {
             break;
         }
@@ -461,6 +466,11 @@ void TrafficRecorder::DrainShardDirect(Shard& shard) {
     while (tail != head) {
         const std::uint64_t index = tail & shard.mask;
         if (index + kTrafficPadSize > shard.capacity) {
+            if (!FlushRecords(shard, iov, bytes, records, commit_tail)) {
+                return;
+            }
+            bytes = 0;
+            records = 0;
             tail += shard.capacity - index;
             commit_tail = tail;
             shard.tail.store(tail, std::memory_order_release);
@@ -477,6 +487,11 @@ void TrafficRecorder::DrainShardDirect(Shard& shard) {
                 shard.tail.store(head, std::memory_order_release);
                 return;
             }
+            if (!FlushRecords(shard, iov, bytes, records, commit_tail)) {
+                return;
+            }
+            bytes = 0;
+            records = 0;
             tail += pad_len;
             commit_tail = tail;
             shard.tail.store(tail, std::memory_order_release);
@@ -535,6 +550,26 @@ void TrafficRecorder::DrainShard(Shard& shard, std::vector<char>& block,
     const std::uint64_t head = shard.head.load(std::memory_order_acquire);
     while (tail != head) {
         const std::uint64_t index = tail & shard.mask;
+        if (index + kTrafficPadSize > shard.capacity) {
+            tail += shard.capacity - index;
+            shard.tail.store(tail, std::memory_order_release);
+            continue;
+        }
+        std::uint32_t pad_len = 0;
+        std::uint32_t pad_magic = 0;
+        std::memcpy(&pad_len, shard.ring.get() + index, sizeof(pad_len));
+        std::memcpy(&pad_magic, shard.ring.get() + index + sizeof(pad_len),
+                    sizeof(pad_magic));
+        if (pad_magic == kTrafficPadMagic) {
+            if (pad_len < kTrafficPadSize || pad_len > shard.capacity - index) {
+                shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
+                shard.tail.store(head, std::memory_order_release);
+                break;
+            }
+            tail += pad_len;
+            shard.tail.store(tail, std::memory_order_release);
+            continue;
+        }
         TrafficRecordHeader header;
         std::memcpy(&header, shard.ring.get() + index, sizeof(header));
         if (header.total_len < kTrafficRecordHeaderSize ||
@@ -578,7 +613,14 @@ void TrafficRecorder::StartControlServer() {
             2, control_port_, control_host_);
         control_server_->set_http_handler<GET>(
             "/v1/recording/status",
-            [this](coro_http_request&, coro_http_response& resp) {
+            [this](coro_http_request& req, coro_http_response& resp) {
+                if (!control_token_.empty() &&
+                    req.get_header_value("Authorization") !=
+                        "Bearer " + control_token_) {
+                    resp.set_status_and_content(status_type::unauthorized,
+                                                "{\"error\":\"unauthorized\"}");
+                    return;
+                }
                 resp.add_header("Content-Type", "application/json");
                 resp.set_status_and_content(status_type::ok, StatusJson());
             });
@@ -628,17 +670,6 @@ void TrafficRecorder::StartControlServer() {
         LOG(ERROR) << "traffic: control server exception: " << e.what();
         control_server_.reset();
     }
-}
-
-void TrafficRecorder::RememberRoute(const RequestView& view) {
-    std::lock_guard<std::mutex> lock(routes_mu_);
-    routes_.emplace(view.route_key, std::string(view.route_name));
-}
-
-std::vector<std::pair<std::uint32_t, std::string>>
-TrafficRecorder::RouteTable() const {
-    std::lock_guard<std::mutex> lock(routes_mu_);
-    return {routes_.begin(), routes_.end()};
 }
 
 std::string TrafficRecorder::StatusJson() const {

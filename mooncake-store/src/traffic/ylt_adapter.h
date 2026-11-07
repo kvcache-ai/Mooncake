@@ -39,9 +39,9 @@ class RecordingRouter : public coro_rpc::protocol::router<Protocol> {
         typename Protocol::supported_serialize_protocols protocols,
         const typename Protocol::route_key_t& route_key) {
         if (handler != nullptr) {
-            TrafficRecorder::Instance().OnRequest(RequestView{
-                static_cast<std::uint32_t>(route_key), this->get_name(route_key),
-                data, conn_id, static_cast<std::uint32_t>(req_id), 0});
+            TrafficRecorder::Instance().OnRequest(
+                RequestView{static_cast<std::uint32_t>(route_key), data, conn_id,
+                            static_cast<std::uint32_t>(req_id), 0});
         }
         return Base::route(conn_id, req_id, handler, data, context_info,
                            protocols, route_key);
@@ -54,9 +54,9 @@ class RecordingRouter : public coro_rpc::protocol::router<Protocol> {
                typename Protocol::supported_serialize_protocols protocols,
                const typename Protocol::route_key_t& route_key) {
         if (handler != nullptr) {
-            TrafficRecorder::Instance().OnRequest(RequestView{
-                static_cast<std::uint32_t>(route_key), this->get_name(route_key),
-                data, conn_id, static_cast<std::uint32_t>(req_id), 0});
+            TrafficRecorder::Instance().OnRequest(
+                RequestView{static_cast<std::uint32_t>(route_key), data, conn_id,
+                            static_cast<std::uint32_t>(req_id), 0});
         }
         co_return co_await Base::route_coro(conn_id, req_id, handler, data,
                                             protocols, route_key);

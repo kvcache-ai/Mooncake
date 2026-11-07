@@ -4,8 +4,6 @@
 
 #include <cstdint>
 #include <string>
-#include <utility>
-#include <vector>
 
 namespace mooncake::traffic {
 
@@ -21,8 +19,6 @@ class TrafficSink {
     virtual bool WriteRecords(const struct iovec* iov, int iov_count,
                               std::uint64_t bytes,
                               std::uint32_t records) = 0;
-    virtual bool WriteRouteTable(
-        const std::vector<std::pair<std::uint32_t, std::string>>& routes) = 0;
     virtual bool Flush() = 0;
     virtual void Close() = 0;
 

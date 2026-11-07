@@ -53,8 +53,11 @@ std::string MakeSessionDir(const std::string& output_dir,
 }  // namespace
 
 FileSink::FileSink(std::uint64_t segment_bytes,
-                   std::uint64_t segment_seconds)
-    : segment_bytes_(segment_bytes), segment_seconds_(segment_seconds) {}
+                   std::uint64_t segment_seconds,
+                   std::uint64_t max_total_bytes)
+    : segment_bytes_(segment_bytes),
+      segment_seconds_(segment_seconds),
+      max_total_bytes_(max_total_bytes) {}
 
 FileSink::~FileSink() { Close(); }
 
@@ -78,6 +81,13 @@ bool FileSink::OpenSession(const std::string& output_dir,
 }
 
 bool FileSink::OpenNextSegment() {
+    if (max_total_bytes_ > 0 &&
+        bytes_written_ + kTrafficFileHeaderSize + kTrafficFooterSize >
+            max_total_bytes_) {
+        LOG(ERROR) << "traffic: max_total_bytes exceeded before segment";
+        failed_ = true;
+        return false;
+    }
     if (segment_seq_ != 0) {
         segment_start_ms_ = TrafficNowMs();
     }
@@ -132,6 +142,12 @@ bool FileSink::WriteBlock(const void* data, std::uint32_t bytes,
     }
     const std::uint64_t block_total =
         kTrafficBlockHeaderSize + static_cast<std::uint64_t>(bytes);
+    if (max_total_bytes_ > 0 &&
+        bytes_written_ + block_total + kTrafficFooterSize > max_total_bytes_) {
+        LOG(ERROR) << "traffic: max_total_bytes exceeded";
+        failed_ = true;
+        return false;
+    }
     const bool rotate_by_bytes =
         segment_bytes_ > 0 && block_count_ > 0 &&
         segment_bytes_written_ + block_total + kTrafficFooterSize >
@@ -169,6 +185,13 @@ bool FileSink::WriteBlock(const void* data, std::uint32_t bytes,
 bool FileSink::WriteRecords(const struct iovec* iov, int iov_count,
                             std::uint64_t bytes, std::uint32_t records) {
     if (file_ == nullptr || failed_ || bytes > 0xffffffffu) {
+        return false;
+    }
+    if (max_total_bytes_ > 0 &&
+        bytes_written_ + kTrafficBlockHeaderSize + bytes + kTrafficFooterSize >
+            max_total_bytes_) {
+        LOG(ERROR) << "traffic: max_total_bytes exceeded";
+        failed_ = true;
         return false;
     }
     const std::uint64_t block_total =
@@ -228,22 +251,6 @@ bool FileSink::WriteRecords(const struct iovec* iov, int iov_count,
     record_count_ += records;
     payload_bytes_ += bytes;
     return true;
-}
-
-bool FileSink::WriteRouteTable(
-    const std::vector<std::pair<std::uint32_t, std::string>>& routes) {
-    std::vector<char> data;
-    for (const auto& [key, name] : routes) {
-        const std::uint32_t name_len = static_cast<std::uint32_t>(name.size());
-        const char* key_bytes = reinterpret_cast<const char*>(&key);
-        const char* len_bytes = reinterpret_cast<const char*>(&name_len);
-        data.insert(data.end(), key_bytes, key_bytes + sizeof(key));
-        data.insert(data.end(), len_bytes, len_bytes + sizeof(name_len));
-        data.insert(data.end(), name.begin(), name.end());
-    }
-    return WriteBlock(data.data(), static_cast<std::uint32_t>(data.size()),
-                      static_cast<std::uint32_t>(routes.size()),
-                      kTrafficBlockRouteTable);
 }
 
 bool FileSink::Flush() {
