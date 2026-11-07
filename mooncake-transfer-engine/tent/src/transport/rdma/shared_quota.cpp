@@ -145,10 +145,17 @@ Status SharedSlotManager::detach() {
 
 bool SharedSlotManager::canSend(int priority) {
     if (!hdr_) return true;
-    if (background_error_.load(std::memory_order_acquire) != 0) return false;
 
-    // Get current global slot
-    int current_slot = hdr_->current_slot.load(std::memory_order_acquire);
+    int current_slot;
+    if (background_error_.load(std::memory_order_acquire) != 0) {
+        // The slot is time-derived. A stopped publisher can still follow the
+        // same host-wide arbitration schedule using the local clock.
+        const uint64_t now = getCurrentTimeInNano();
+        const uint64_t base_slot = now / (rotation_interval_ms_ * 1000000ull);
+        current_slot = static_cast<int>(base_slot % NUM_SLOTS);
+    } else {
+        current_slot = hdr_->current_slot.load(std::memory_order_acquire);
+    }
 
     // Check if the given priority is allowed in current global slot
     // Slot 0: HIGH only (priority 0 <= 0)

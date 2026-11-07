@@ -543,6 +543,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(tent_shared_quota_test shared_quota_test.cpp)
   target_link_libraries(tent_shared_quota_test PRIVATE gtest gtest_main
                                                        tent_link_group)
+  target_link_options(tent_shared_quota_test PRIVATE "-Wl,--wrap=clock_gettime")
   target_include_directories(tent_shared_quota_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_shared_quota_test COMMAND tent_shared_quota_test)

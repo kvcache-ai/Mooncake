@@ -16,9 +16,27 @@
 #include <poll.h>
 #include <sys/wait.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <ctime>
 
 #include "tent/transport/rdma/shared_quota.h"
+
+namespace {
+std::atomic<int64_t> frozen_time_ns{-1};
+}
+
+extern "C" int __real_clock_gettime(clockid_t clock, struct timespec* ts);
+extern "C" int __wrap_clock_gettime(clockid_t clock, struct timespec* ts) {
+    const int64_t now = frozen_time_ns.load();
+    if (clock == CLOCK_REALTIME && now >= 0) {
+        ts->tv_sec = now / 1000000000;
+        ts->tv_nsec = now % 1000000000;
+        return 0;
+    }
+    return __real_clock_gettime(clock, ts);
+}
 
 namespace mooncake {
 namespace tent {
@@ -173,7 +191,7 @@ TEST(SharedQuota, ShutdownDoesNotWaitForAnotherOwner) {
     });
 }
 
-TEST(SharedQuota, UnrecoverableMutexStopsPublishingAndReportsError) {
+TEST(SharedQuota, UnrecoverableMutexUsesLocalSlotAndReportsError) {
     withinDeadline([] {
         SharedQuotaState state;
         ASSERT_NO_FATAL_FAILURE(state.initialize());
@@ -184,11 +202,19 @@ TEST(SharedQuota, UnrecoverableMutexStopsPublishingAndReportsError) {
                   EOWNERDEAD);
         // Deliberately abandon recovery to produce ENOTRECOVERABLE.
         ASSERT_EQ(pthread_mutex_unlock(&state.header->global_mutex), 0);
+        // Freeze slot 1: 8 ms / 2 ms % NUM_SLOTS. Shared memory still holds
+        // kInterruptedSlot, so only the local fallback can reject LOW here.
+        state.manager.setRotationIntervalMs(2);
+        frozen_time_ns.store(8000000);
         ASSERT_TRUE(state.manager.attach(state.name).ok());
         const auto deadline = Clock::now() + std::chrono::seconds(2);
-        while (state.manager.canSend(PRIO_HIGH) && Clock::now() < deadline)
+        while (state.manager.canSend(PRIO_LOW) && Clock::now() < deadline)
             usleep(1000);
-        EXPECT_FALSE(state.manager.canSend(PRIO_HIGH));
+        EXPECT_TRUE(state.manager.canSend(PRIO_MEDIUM));
+        EXPECT_FALSE(state.manager.canSend(PRIO_LOW));
+        // The fallback keeps following the clock after the publisher exits.
+        frozen_time_ns.store(10000000);  // Slot 2 admits all priorities.
+        EXPECT_TRUE(state.manager.canSend(PRIO_LOW));
         EXPECT_EQ(state.header->current_slot.load(), kInterruptedSlot);
         const auto status = state.manager.detach();
         EXPECT_TRUE(status.IsInternalError());
