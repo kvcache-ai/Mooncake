@@ -272,6 +272,10 @@ Status TransferEngine::freeBatchID(BatchID batch_id) {
     return impl_->freeBatchID(batch_id);
 }
 
+void TransferEngine::waitUntilDeferredCleanupDone(BatchID batch_id) {
+    impl_->waitUntilDeferredCleanupDone(batch_id);
+}
+
 int TransferEngine::getNotifies(
     std::vector<TransferMetadata::NotifyDesc>& notifies) {
     return impl_->getNotifies(notifies);
@@ -301,6 +305,16 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+int TransferEngine::completionFd() const { return impl_->completionFd(); }
+
+Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
+    return impl_->enableBatchCompletionNotification(batch_id);
+}
+
+Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
+    return impl_->drainCompletions(out);
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
@@ -918,6 +932,10 @@ Status TransferEngine::freeBatchID(BatchID batch_id) {
     }
 }
 
+void TransferEngine::waitUntilDeferredCleanupDone(BatchID batch_id) {
+    if (!use_tent_) impl_->waitUntilDeferredCleanupDone(batch_id);
+}
+
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     if (use_tent_) {
@@ -1068,6 +1086,30 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
             return Status::OK();
     } else
         return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+int TransferEngine::completionFd() const {
+    // TENT batches do not use classic BatchDesc, so the eventfd stays off
+    // until that runtime publishes through its own progress path.
+    if (use_tent_) return -1;
+    return impl_->completionFd();
+}
+
+Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
+    if (use_tent_) {
+        return Status::NotSupportedTransport(
+            "completion notification is not available for the TENT runtime");
+    }
+    return impl_->enableBatchCompletionNotification(batch_id);
+}
+
+Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
+    if (use_tent_) {
+        out.clear();
+        return Status::NotSupportedTransport(
+            "completion eventfd is not available for the TENT runtime");
+    }
+    return impl_->drainCompletions(out);
 }
 
 Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {

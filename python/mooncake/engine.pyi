@@ -20,6 +20,10 @@ SUPPORT_MNNVL: bool
 SUPPORT_MULTI_PROTOCOL: bool
 SUPPORT_MUSA: bool
 
+class CompletionNotificationFallback(Exception):
+    """Notification was requested, but this submit must fall back to polling."""
+
+
 class TransferOpcode:
     Read: ClassVar[TransferOpcode]
     Write: ClassVar[TransferOpcode]
@@ -290,7 +294,18 @@ class TransferEngine:
         opcode: _TransferOpcode,
         transport_hint: str = "",
         nic_hint: str = "",
-    ) -> int: ...
+        enable_completion_notification: bool = False,
+    ) -> int:
+        """Return a batch id.
+
+        With completion notification enabled, an unsupported transport raises
+        CompletionNotificationFallback. openSegment failure, mismatched list
+        lengths, and any other failure on that path raise RuntimeError.
+        The exception is raised only after the batch has been released. When
+        the message does not say buffers may still be in use, the caller may
+        reuse them. Without the flag, those failures still return 0.
+        """
+        ...
     # The *_on_cuda methods are only bound when SUPPORT_CUDA is true.
     def transfer_write_on_cuda(
         self,
@@ -333,6 +348,11 @@ class TransferEngine:
         nic_hint: str = "",
     ) -> None: ...
     def get_batch_transfer_status(self, batch_ids: Sequence[int], /) -> int: ...
+    def completion_fd(self) -> int: ...
+    def enable_batch_completion_notification(self, batch_id: int) -> None: ...
+    def allocate_batch_id(self, batch_size: int) -> int: ...
+    def free_batch_id(self, batch_id: int) -> int: ...
+    def drain_completions(self) -> list[dict[str, int]]: ...
     def transfer_submit_write(
         self,
         target_hostname: str,

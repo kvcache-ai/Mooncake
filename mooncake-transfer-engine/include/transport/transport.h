@@ -311,6 +311,13 @@ class Transport {
             status = Slice::FAILED;
             TransferTask *t = task.load(std::memory_order_acquire);
             __atomic_fetch_add(&t->failed_slice_count, 1, __ATOMIC_ACQ_REL);
+            // Store the failure before the completion count becomes visible.
+            // A sibling slice can otherwise observe the count, publish
+            // COMPLETED, and leave getBatchTransferStatus returning FAILED.
+            if (t->batch_id) {
+                toBatchDesc(t->batch_id)
+                    .has_failure.store(true, std::memory_order_release);
+            }
             const uint64_t state =
                 __atomic_add_fetch(&t->completion_state, 1, __ATOMIC_ACQ_REL);
             finishIfComplete(t, state, true);
@@ -356,8 +363,11 @@ class Transport {
             // Non-EDC: is_finished stays with getTransferStatus on the
             // completion walk. The WAITING fast path never frees the batch;
             // COMPLETED always walks first, so CQ must not write is_finished.
-            batch_desc.finished_task_count.fetch_add(1,
-                                                     std::memory_order_acq_rel);
+            // The terminal notify is a separate wake. It does not settle
+            // is_finished and does not require a status poll.
+            const uint64_t prev = batch_desc.finished_task_count.fetch_add(
+                1, std::memory_order_acq_rel);
+            batch_desc.publishTerminalIfDone(prev);
 #else
             // EDC waiters can freeBatchID after the CV without a walk.
 #ifdef WITH_METRICS
@@ -379,8 +389,17 @@ class Transport {
 
             auto prev = batch_desc.finished_task_count.fetch_add(
                 1, std::memory_order_acq_rel);
-            if (prev + 1 == batch_desc.batch_size) {
-                // Last task in the batch: wake up waiting thread directly.
+            // #5147 sync wait stays on allocated capacity. A legacy batch
+            // may submit again, so this thread must not read task_list.size()
+            // unless the batch opted into the eventfd path, which rejects a
+            // second submit and keeps that size stable. publishTerminalIfDone
+            // is the only submitted-count boundary.
+            const uint64_t wake_at =
+                batch_desc.event_enabled
+                    ? static_cast<uint64_t>(batch_desc.task_list.size())
+                    : static_cast<uint64_t>(batch_desc.batch_size);
+            if (prev + 1 == wake_at) {
+                // Wake transferSync on the boundary chosen above.
                 // Publish completion under the same mutex used by the waiter
                 // to avoid lost notifications.
                 //
@@ -400,6 +419,7 @@ class Transport {
                 // only to block again on the mutex.
                 batch_desc.completion_cv.notify_all();
             }
+            batch_desc.publishTerminalIfDone(prev);
 #endif
         }
 
@@ -567,11 +587,56 @@ class Transport {
         // As with task_list, submission and polling must be serialized.
         bool counter_eligible = false;
 
+        // Opt-in for the engine-owned completion eventfd (RFC #5164 v1).
+        // Set by enableBatchCompletionNotification before the first submit.
+        // Only an event-enabled, counter-eligible batch installs
+        // terminal_notify and writes the fd. Legacy batches leave this false
+        // and keep today's submit/status path with no eventfd write.
+        bool event_enabled = false;
+
         // Number of completion callbacks currently holding a pin on this
         // BatchDesc and therefore still allowed to read or update it and the
         // TransferTask objects in task_list. freeBatchID() must not delete
         // this object while a pin is held.
         std::atomic<uint64_t> active_completion_callbacks{0};
+
+        // Installed by MultiTransport for the engine-owned completion
+        // eventfd. Null when this batch has no completion queue. The callback
+        // must not throw and must not call getBatchTransferStatus.
+        using TerminalNotifyFn = void (*)(void *ctx, BatchID batch_id,
+                                          TransferStatus status);
+        TerminalNotifyFn terminal_notify = nullptr;
+        void *terminal_notify_ctx = nullptr;
+        // Touched only under MultiTransport's completion lock.
+        bool terminal_suppressed = false;
+        bool terminal_enqueued = false;
+
+        // Called when this completion made finished_task_count reach the
+        // number of submitted tasks (task_list.size()), matching
+        // getBatchTransferStatus and completion_cv. batch_size is capacity
+        // only. The notify target drops the event if freeBatchID already
+        // suppressed it. Status is COMPLETED or FAILED only; v1 does not
+        // publish TIMEOUT or CANCELED onto the fd.
+        void publishTerminalIfDone(uint64_t prev) {
+            if (terminal_notify == nullptr || prev + 1 != task_list.size())
+                return;
+            TransferStatus status;
+            status.s = has_failure.load(std::memory_order_acquire)
+                           ? TransferStatusEnum::FAILED
+                           : TransferStatusEnum::COMPLETED;
+            status.transferred_bytes = 0;
+            // Same rule as getBatchTransferStatus: a FAILED task contributes
+            // no bytes. A successful slice beside a failed slice must not
+            // show up on the fd and disappear from the status query.
+            for (auto &task : task_list) {
+                if (__atomic_load_n(&task.failed_slice_count,
+                                    __ATOMIC_ACQUIRE) != 0)
+                    continue;
+                status.transferred_bytes +=
+                    __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
+            }
+            terminal_notify(terminal_notify_ctx, id, status);
+        }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Synchronization primitives for direct notification

@@ -21,10 +21,19 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "transport/transport.h"
 
 namespace mooncake {
+
+// Snapshot of a batch that reached a terminal state. Drain copies this out
+// of the ready queue and does not look the batch up again.
+struct BatchCompletion {
+    Transport::BatchID batch_id = 0;
+    Transport::TransferStatus status{};
+};
+
 class TransferEngineImpl;
 class TransferEngineImplTestPeer;
 class MultiTransportTestPeer;
@@ -59,6 +68,11 @@ class MultiTransport {
     // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
+    // Block until batch_id has left the deferred-cleanup set. The handle is
+    // already invalid. Returns when that batch no longer owns its buffers,
+    // or when shutdown stops the cleaner.
+    void waitUntilDeferredCleanupDone(BatchID batch_id);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
 
@@ -79,6 +93,30 @@ class MultiTransport {
         std::vector<TransferStatusEnum> &request_statuses);
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+
+    // Engine-owned counter-mode eventfd. -1 when this platform has no
+    // eventfd, or eventfd() failed. The caller may dup it; this object
+    // closes the original in its destructor.
+    //
+    // A non-negative fd means the engine has a notification facility. It
+    // does not mean a particular batch can finish without polling. Only a
+    // batch that opted in via enableBatchCompletionNotification, then
+    // submitted once on a counter-capable path, writes the fd. See RFC
+    // #5164.
+    int completionFd() const { return completion_fd_; }
+
+    // Opt in before the first submitTransfer. Fails when the facility is
+    // unavailable, when slice timeouts require foreground polling, or when
+    // the batch already has submitted tasks. Success only marks the batch;
+    // submit still rejects unsupported transports before dispatch.
+    Status enableBatchCompletionNotification(BatchID batch_id);
+
+    // Non-blocking. Swaps out every completion freeBatchID has not removed.
+    // One read of the counter, then the whole queue. An empty queue with a
+    // stale counter is discarded. A non-empty queue is returned even when
+    // that read is EAGAIN. Does not free batch handles and does not send
+    // peer notify.
+    Status drainCompletions(std::vector<BatchCompletion> &out);
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);
@@ -139,6 +177,25 @@ class MultiTransport {
 
     void deferredCleanupLoop();
 
+    // Drops a still-queued id and ignores a later terminal callback. The
+    // batch must still be alive. Called only once freeBatchID has committed
+    // to invalidating the handle.
+    void discardQueuedCompletion(BatchID batch_id);
+
+    // Clears a queued ready entry and terminal_enqueued for demoted or
+    // rejected event paths. No-op when freeBatchID already suppressed the
+    // batch. Not used to start a second terminal wave: event-enabled
+    // batches reject a second submit instead.
+    void clearQueuedTerminal(BatchID batch_id);
+
+    // Install terminal_notify once, before dispatch. The function pointer
+    // stays immutable afterwards; terminal_suppressed hides publication.
+    void syncTerminalNotify(BatchDesc &batch_desc);
+
+    void enqueueTerminal(BatchID batch_id, TransferStatus status);
+
+    static void onTerminal(void *ctx, BatchID batch_id, TransferStatus status);
+
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,
                               Transport *&transport,
@@ -158,6 +215,12 @@ class MultiTransport {
         deferred_cleanup_batches_;
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
+
+    // completion_mu_ guards ready_ and the two terminal flags on BatchDesc.
+    // The eventfd write stays outside the lock and is not retried.
+    std::mutex completion_mu_;
+    std::vector<BatchCompletion> ready_;
+    int completion_fd_ = -1;
 };
 }  // namespace mooncake
 
