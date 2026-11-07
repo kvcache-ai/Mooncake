@@ -329,8 +329,11 @@ class LeaseEvictionIndex final : public EvictionIndex {
         size_t pos_ = 0;
     };
 
+    // By EvictionOrder(), which differs from the deadline only for an object
+    // restored from a standby and not read or written since; a read or write
+    // only moves it later.
     static Rank RankOf(const ObjectMetadata& metadata) {
-        return BucketOf(metadata.EvictionDeadline());
+        return BucketOf(metadata.EvictionOrder());
     }
 
     static Rank BucketOf(Clock::time_point deadline) {
