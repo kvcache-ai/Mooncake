@@ -104,9 +104,23 @@ class TestHttpMetadataServerPut(unittest.IsolatedAsyncioTestCase):
         # Same value must be accepted, not rejected as a duplicate.
         self.assertEqual(resp.status, 200)
 
+    async def test_republish_with_new_version_is_accepted(self) -> None:
+        v1 = b'{"ip_or_host_name": "10.0.0.1", "rpc_port": 1, "metadata_version": 1}'
+        v2 = b'{"ip_or_host_name": "10.0.0.1", "rpc_port": 1, "metadata_version": 2}'
+        await self.server._handle_put(RPC_META_KEY, _request(v1))
+        resp = await self.server._handle_put(RPC_META_KEY, _request(v2))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.server.store[RPC_META_KEY], v2)
+        # The replaced entry is re-charged against the size budget.
+        self.assertEqual(self.server._total_bytes, len(RPC_META_KEY.encode()) + len(v2))
+
     async def test_conflicting_rpc_meta_is_rejected(self) -> None:
-        await self.server._handle_put(RPC_META_KEY, _request(b'{"rpc_port": 1}'))
-        resp = await self.server._handle_put(RPC_META_KEY, _request(b'{"rpc_port": 2}'))
+        await self.server._handle_put(
+            RPC_META_KEY, _request(b'{"ip_or_host_name": "10.0.0.1", "rpc_port": 1}')
+        )
+        resp = await self.server._handle_put(
+            RPC_META_KEY, _request(b'{"ip_or_host_name": "10.0.0.1", "rpc_port": 2}')
+        )
         self.assertEqual(resp.status, 400)
 
     async def test_non_rpc_meta_key_can_be_overwritten(self) -> None:

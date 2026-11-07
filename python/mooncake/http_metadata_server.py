@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import signal
@@ -41,6 +42,18 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _same_rpc_endpoint(old: bytes, new: bytes) -> bool:
+    """True if two rpc_meta payloads name the same host and port."""
+    try:
+        a, b = json.loads(old), json.loads(new)
+    except ValueError:
+        return False
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    keys = ("ip_or_host_name", "rpc_port")
+    return all(k in a and k in b and a[k] == b[k] for k in keys)
 
 
 class KVPoll(Enum):
@@ -204,11 +217,15 @@ class KVBootstrapServer:
                         status=200,
                         content_type="application/json",
                     )
-                return web.Response(
-                    text="Duplicate rpc_meta key not allowed",
-                    status=400,
-                    content_type="application/json",
-                )
+                # A republish carries a fresh metadata_version, so accept it
+                # when the endpoint (host and port) is unchanged. It is stored
+                # through the normal path below so the size budget still holds.
+                if not _same_rpc_endpoint(self.store[key], data):
+                    return web.Response(
+                        text="Duplicate rpc_meta key not allowed",
+                        status=400,
+                        content_type="application/json",
+                    )
             old = self.store.get(key)
             if old is None and len(self.store) >= self.max_keys:
                 return web.Response(

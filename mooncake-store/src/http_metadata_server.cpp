@@ -4,10 +4,33 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <glog/logging.h>
 
+#include <json/json.h>
+
+#include <memory>
 #include <mutex>
 #include <string>
 
 namespace mooncake {
+
+namespace {
+// A republish of an rpc_meta entry carries a fresh metadata_version, so the
+// body differs even though the endpoint is unchanged. Treat it as the same
+// registration when ip_or_host_name and rpc_port match.
+bool IsSameRpcEndpoint(const std::string& a, const std::string& b) {
+    Json::Value va, vb;
+    Json::CharReaderBuilder builder;
+    std::string errs;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    if (!reader->parse(a.data(), a.data() + a.size(), &va, &errs) ||
+        !reader->parse(b.data(), b.data() + b.size(), &vb, &errs)) {
+        return false;
+    }
+    return va.isObject() && vb.isObject() && va.isMember("ip_or_host_name") &&
+           va.isMember("rpc_port") &&
+           va["ip_or_host_name"] == vb["ip_or_host_name"] &&
+           va["rpc_port"] == vb["rpc_port"];
+}
+}  // namespace
 
 HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
     : port_(port),
@@ -64,6 +87,12 @@ void HttpMetadataServer::init_server() {
                         if (it->second == body) {
                             resp.set_status_and_content(status_type::ok,
                                                         "metadata unchanged");
+                            return;
+                        }
+                        if (IsSameRpcEndpoint(it->second, body)) {
+                            it->second = body;
+                            resp.set_status_and_content(status_type::ok,
+                                                        "metadata updated");
                             return;
                         }
                         resp.set_status_and_content(
