@@ -815,6 +815,25 @@ class TerminalFailureTransport : public BatchResultTransport {
     std::vector<TransferTask*> tasks_;
 };
 
+// Models RDMA's completion order: a task's status query already reports
+// COMPLETED while the worker has not yet bumped the batch's finished-task
+// counter.
+class CounterLaggingTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) task->slice_count = 1;
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+
+    bool supportsBatchCompletionCounter() const override { return true; }
+};
+
 enum class ScatterPollFailure { kStatusError, kTimeout };
 
 class ScatterDrainProbeTransport : public BatchResultTransport {
@@ -1576,6 +1595,42 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
     EXPECT_EQ(
         engine.unregisterLocalMemoryBatch({buffer.data(), buffer.data() + 1}),
         0);
+}
+
+TEST_F(TransportTest, TaskCompletedSendsNotifyBeforeBatchCounterCatchesUp) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<CounterLaggingTransport>();
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"counter-lagging", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "127.0.0.1:1";
+    descriptor->protocol = "counter-lagging";
+    engine.getMetadata()->addLocalSegment(kSegmentId, "127.0.0.1:1",
+                                          std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = buffer.data(),
+                            .target_id = kSegmentId,
+                            .target_offset = 0,
+                            .length = buffer.size()};
+    auto batch_id = engine.allocateBatchID(1);
+    ASSERT_TRUE(
+        engine
+            .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
+            .ok());
+    ASSERT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
+
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(Transport::toBatchDesc(batch_id).finished_task_count.load(), 0u);
+    // A caller that frees the batch now must not lose the notification.
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
 }
 
 TEST_F(TransportTest, FreeBatchClearsPendingNotify) {
