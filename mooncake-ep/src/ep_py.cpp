@@ -2,10 +2,11 @@
 // Intel XPU: the SYCL buffer in xpu/ has the methods mooncake_ep_buffer.Buffer
 // uses, under the same Python names.
 #include "xpu/mooncake_ep_xpu_buffer.h"
+#include "xpu/mooncake_ep_xpu_elastic_buffer.h"
 #else
 #include <mooncake_ep_buffer.h>
 #endif
-// No elastic buffer on MACA or XPU.
+// No elastic buffer on MACA; XPU binds its own below.
 #if !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_XPU)
 #define MOONCAKE_EP_HAS_ELASTIC 1
 #include <elastic/mooncake_ep_elastic_buffer.h>
@@ -40,6 +41,10 @@ PYBIND11_MODULE(_ep, m) {
     m.def("calculate_elastic_buffer_size",
           &MooncakeElasticBuffer::calculate_buffer_size);
     m.def("create_nccl_unique_id", &create_elastic_nccl_unique_id);
+#endif
+#if defined(MOONCAKE_EP_USE_XPU)
+    m.def("calculate_elastic_buffer_size",
+          &xpu_ep::MooncakeEpXpuElasticBuffer::calculate_buffer_size);
 #endif
     m.def("has_nccl_device_support", []() {
 #ifdef USE_NCCL_DEVICE
@@ -174,6 +179,41 @@ PYBIND11_MODULE(_ep, m) {
              &MooncakeElasticBuffer::sync_nvlink_ipc_handles)
         .def("dispatch", &MooncakeElasticBuffer::dispatch)
         .def("combine", &MooncakeElasticBuffer::combine);
+#endif
+
+#if defined(MOONCAKE_EP_USE_XPU)
+    // One node over Level Zero IPC. Like the XPU Buffer it allocates on the
+    // caller's queue, so it takes stream_ptr as well.
+    using xpu_ep::MooncakeEpXpuElasticBuffer;
+    py::class_<MooncakeEpXpuElasticBuffer>(m, "ElasticBuffer")
+        .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,
+                      bool, bool, bool, int, int, int, int, std::string,
+                      std::vector<int32_t>, uint64_t>(),
+             py::arg("rank"), py::arg("num_ranks"), py::arg("num_buffer_bytes"),
+             py::arg("num_max_tokens_per_rank"), py::arg("hidden"),
+             py::arg("num_topk"), py::arg("use_fp8_dispatch"),
+             py::arg("deterministic"), py::arg("allow_hybrid_mode"),
+             py::arg("allow_multiple_reduction"),
+             py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
+             py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
+             py::arg("num_gpu_timeout_secs"), py::arg("transport") = "ipc",
+             py::arg("nccl_unique_id") = std::vector<int32_t>{},
+             py::arg("stream_ptr") = 0)
+        .def("destroy", &MooncakeEpXpuElasticBuffer::destroy)
+        .def("using_nccl", &MooncakeEpXpuElasticBuffer::using_nccl)
+        .def_static("calculate_buffer_size",
+                    &MooncakeEpXpuElasticBuffer::calculate_buffer_size)
+        .def("get_physical_domain_size",
+             &MooncakeEpXpuElasticBuffer::get_physical_domain_size)
+        .def("get_logical_domain_size",
+             &MooncakeEpXpuElasticBuffer::get_logical_domain_size)
+        .def("ibgda_disabled", &MooncakeEpXpuElasticBuffer::ibgda_disabled)
+        .def("use_fast_path", &MooncakeEpXpuElasticBuffer::use_fast_path)
+        .def("get_ipc_handle", &MooncakeEpXpuElasticBuffer::get_ipc_handle)
+        .def("sync_nvlink_ipc_handles",
+             &MooncakeEpXpuElasticBuffer::sync_nvlink_ipc_handles)
+        .def("dispatch", &MooncakeEpXpuElasticBuffer::dispatch)
+        .def("combine", &MooncakeEpXpuElasticBuffer::combine);
 #endif
 }
 
