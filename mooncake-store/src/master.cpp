@@ -26,6 +26,7 @@
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
 #include "rpc_worker_pool.h"
+#include "traffic/ylt_adapter.h"
 #include "rpc_service.h"
 #include "shutdown_request.h"
 #include "types.h"
@@ -1718,7 +1719,7 @@ int main(int argc, char* argv[]) {
     } else {
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
-        coro_rpc::coro_rpc_server server(
+        mooncake::traffic::RecordingServer server(
             master_config.rpc_thread_num, master_config.rpc_port,
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),

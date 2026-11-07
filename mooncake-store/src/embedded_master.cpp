@@ -43,7 +43,7 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
             http_metadata_port_ = meta_server_->port();
         }
 
-        server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+        server_ = std::make_unique<traffic::RecordingServer>(
             /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"127.0.0.1",
             std::chrono::seconds(0), /*tcp_no_delay=*/true);
         const char* value = std::getenv("MC_RPC_PROTOCOL");

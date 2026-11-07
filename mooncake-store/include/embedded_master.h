@@ -9,6 +9,7 @@
 #include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
+#include "traffic/ylt_adapter.h"
 
 namespace mooncake {
 
@@ -47,7 +48,7 @@ class EmbeddedMaster {
     std::shared_ptr<WrappedMasterService> service() const { return wrapped_; }
 
    private:
-    std::unique_ptr<coro_rpc::coro_rpc_server> server_;
+    std::unique_ptr<traffic::RecordingServer> server_;
     std::shared_ptr<WrappedMasterService> wrapped_;
     std::unique_ptr<MasterAdminServer> admin_server_;
     std::unique_ptr<HttpMetadataServer> meta_server_;
