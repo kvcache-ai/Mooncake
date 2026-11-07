@@ -727,6 +727,10 @@ jobs:
         cmake --build build --parallel 128 --target $targets
       shell: bash
 
+    - name: Configure CUDA driver runtime
+      # The runner has no NVIDIA driver; expose the stub libcuda the tests load.
+      uses: ./.github/actions/setup-cuda-runtime
+
     - name: Run the EFA unit tests that need no EFA hardware
       # The rest need an EFA device; they are only compiled here.
       run: |
