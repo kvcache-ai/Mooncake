@@ -1,5 +1,9 @@
 #pragma once
 
+// The only file that depends on coro_rpc's router internals. Keeping it
+// separate lets the recorder, file format, sink, and replay tool stay
+// independent of the RPC framework.
+
 #include <string>
 #include <string_view>
 #include <utility>
