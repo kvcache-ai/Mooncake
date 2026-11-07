@@ -16,6 +16,7 @@
 #define TENT_YLT_RPC_H
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <functional>
@@ -91,10 +92,17 @@ class CoroRpcAgent {
     Status call(const std::string &server_addr, int func_id,
                 const std::string_view &request, std::string &response);
 
-    // Same as call(), but moves the request into the coroutine instead of
-    // copying it, for large payloads.
+    // Data-path call: owns the payload and checks an idle pooled connection
+    // before dispatch, replacing a dead one once. Connect and request share
+    // one deadline. After dispatch, a missing/incomplete reply is
+    // RpcUnknownEffect, never retried; a peer-reported error is
+    // RpcServiceError. This does not change call()/callAsync() or their
+    // control-plane policies.
     Status callOwned(const std::string &server_addr, int func_id,
                      std::string request, std::string &response);
+    Status callOwned(const std::string &server_addr, int func_id,
+                     std::string request, std::string &response,
+                     std::chrono::steady_clock::time_point deadline);
 
     using AsyncCallback = std::function<void(Status, std::string)>;
     void callAsync(const std::string &server_addr, int func_id,
@@ -111,6 +119,10 @@ class CoroRpcAgent {
 
    private:
     async_simple::coro::Lazy<void> process(int func_id);
+
+    async_simple::coro::Lazy<std::pair<Status, std::string>> callOwnedCoroutine(
+        std::string server_addr, int func_id, std::string request,
+        std::chrono::steady_clock::time_point deadline);
 
     std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);
 
