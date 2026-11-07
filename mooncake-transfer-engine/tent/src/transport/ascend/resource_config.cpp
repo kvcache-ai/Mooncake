@@ -469,6 +469,57 @@ std::vector<std::string> ParseHixlNames(const MemorySegmentDesc& detail) {
     return {};
 }
 
+const std::string HixlNameResolver::empty_{};
+
+HixlNameResolver::HixlNameResolver(const MemorySegmentDesc& detail) {
+    names_ = ParseHixlNames(detail);
+    if (names_.size() <= 1) {
+        return;
+    }
+    ranges_.reserve(detail.buffers.size());
+    for (const auto& buf : detail.buffers) {
+        size_t name_idx = 0;
+        bool resolved = false;
+        auto attr = buf.transport_attrs.find(AscendDirect);
+        if (attr != buf.transport_attrs.end() && !attr->second.empty()) {
+            try {
+                const auto idx = static_cast<size_t>(std::stoul(attr->second));
+                if (idx < names_.size()) {
+                    name_idx = idx;
+                    resolved = true;
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        if (!resolved) {
+            LocationParser location(buf.location);
+            if (location.type() == "npu" && location.index() >= 0) {
+                const auto idx = static_cast<size_t>(location.index());
+                if (idx < names_.size()) {
+                    name_idx = idx;
+                }
+            }
+        }
+        ranges_.push_back(BufferRange{buf.addr, buf.length, name_idx});
+    }
+}
+
+const std::string& HixlNameResolver::Resolve(uint64_t dest_addr) const {
+    if (names_.empty()) {
+        return empty_;
+    }
+    if (names_.size() == 1) {
+        return names_.front();
+    }
+    for (const auto& range : ranges_) {
+        if (dest_addr >= range.begin &&
+            dest_addr - range.begin < range.length) {
+            return names_[range.name_idx];
+        }
+    }
+    return names_.front();
+}
+
 std::string ResolveRemoteHixlName(const MemorySegmentDesc& detail,
                                   uint64_t dest_addr) {
     auto names = ParseHixlNames(detail);
