@@ -180,35 +180,12 @@ class WorkerPoolTestPeer {
 
     static bool waitForPollTs(WorkerPool &pool,
                               std::chrono::milliseconds timeout) {
-        if (lastPollTs(pool) != 0) return true;
-
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool observed = false;
-        std::thread waiter([&] {
-            uint64_t poll_ts =
-                pool.last_poll_ts_ns_.load(std::memory_order_acquire);
-            while (poll_ts == 0) {
-                pool.last_poll_ts_ns_.wait(poll_ts, std::memory_order_acquire);
-                poll_ts = pool.last_poll_ts_ns_.load(std::memory_order_acquire);
-            }
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                observed = true;
-            }
-            cv.notify_one();
-        });
-
-        std::unique_lock<std::mutex> lock(mutex);
-        const bool ok = cv.wait_for(lock, timeout, [&] { return observed; });
-        if (!ok) {
-            pool.last_poll_ts_ns_.store(std::numeric_limits<uint64_t>::max(),
-                                        std::memory_order_release);
-            pool.last_poll_ts_ns_.notify_all();
-        }
-        lock.unlock();
-        waiter.join();
-        return ok;
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        do {
+            if (lastPollTs(pool) != 0) return true;
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return lastPollTs(pool) != 0;
     }
 };
 

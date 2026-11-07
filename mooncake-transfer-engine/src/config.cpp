@@ -983,9 +983,13 @@ void dumpGlobalConfig() {
 }
 
 GlobalConfig& globalConfig() {
-    static GlobalConfig config;
-    static std::once_flag g_once_flag;
-    std::call_once(g_once_flag, []() { loadGlobalConfig(config); });
+    // C++ function-local static initialization is thread safe and retries
+    // after an exception. The hot path only needs the initialized guard.
+    static GlobalConfig config = [] {
+        GlobalConfig value;
+        loadGlobalConfig(value);
+        return value;
+    }();
     return config;
 }
 

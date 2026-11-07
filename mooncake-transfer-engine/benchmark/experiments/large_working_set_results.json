@@ -1,0 +1,78 @@
+{
+  "measured_dates": [
+    "2026-10-28",
+    "2026-10-29"
+  ],
+  "direction": "A to B RDMA Write",
+  "active_bytes": 8589934592,
+  "submission_threads": 8,
+  "logical_cpus_per_host": 16,
+  "prefetch_enabled": false,
+  "ddio_changed": false,
+  "target_400_GBps_achieved": false,
+  "measurements_are_pr_head": false,
+  "summary": {
+    "repeat_baseline": {
+      "n": 3,
+      "mean_GBps": 258.6709167146095,
+      "min_GBps": 257.44262862905396,
+      "max_GBps": 259.8746287332801,
+      "runs": [
+        257.44262862905396,
+        259.8746287332801,
+        258.6954927814945
+      ]
+    },
+    "repeat_notify": {
+      "n": 3,
+      "mean_GBps": 274.464066149987,
+      "min_GBps": 272.2108495954645,
+      "max_GBps": 277.11438862120514,
+      "runs": [
+        272.2108495954645,
+        277.11438862120514,
+        274.0669602332914
+      ]
+    },
+    "repeat_window": {
+      "n": 3,
+      "mean_GBps": 272.6351157347232,
+      "min_GBps": 271.36225713269374,
+      "max_GBps": 273.6620851002582,
+      "runs": [
+        271.36225713269374,
+        273.6620851002582,
+        272.8810049712176
+      ]
+    },
+    "cycle256k_depth64": {
+      "n": 3,
+      "mean_GBps": 267.94083333333333,
+      "min_GBps": 266.715,
+      "max_GBps": 269.54125,
+      "runs": [
+        266.715,
+        267.56624999999997,
+        269.54125
+      ]
+    }
+  },
+  "tested_binary_sha256": {
+    "baseline": "fa9d5eea9c6bd4c5672e75c0fc7529c075a533ad3bf5ab264d201859de235441",
+    "window": "3d4ff61d2bc42530cab82e90b8c864399e41db04a2257705aae5717611faf166",
+    "notify": "dacf64d0bb69fdd9a2e0422627eb4d5b7a84b2d5b86094f8cf00cc50853c862b",
+    "cyclic_perftest": "3ccc4ba31270249214f9e8bf8d7976e9852603e35c6a43b5d71b91a32b73595f"
+  },
+  "profile_self_percent": {
+    "performPollCq_before": 28.02,
+    "performPollCq_after": 3.89
+  },
+  "validation_on_archived_experiment": {
+    "payload_write_seed_read_verify": true,
+    "all_eight_nics_active": true,
+    "completed_byte_accounting": true,
+    "measurement_full_workset_coverage": true,
+    "endpoint_state_tests_passed": 10,
+    "cleanup_completed": true
+  }
+}

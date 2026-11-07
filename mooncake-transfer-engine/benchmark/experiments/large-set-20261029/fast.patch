@@ -1,0 +1,94 @@
+--- a/mooncake-transfer-engine/benchmark/te_backend.cpp
++++ b/mooncake-transfer-engine/benchmark/te_backend.cpp
+@@ -19,6 +19,7 @@
+ #include <algorithm>
+
+ #include "te_backend.h"
++#include "config.h"
+ #include "utils.h"
+ #include "split_output.h"
+ #include "common.h"
+@@ -822,6 +823,14 @@
+         std::strcmp(std::getenv("MC_EXPERIMENTAL_REUSE_REQUESTS"), "1") == 0;
+     const char* pause_env = std::getenv("MC_EXPERIMENTAL_POLL_PAUSE");
+     const unsigned poll_pause = pause_env ? std::min(65536ul, std::strtoul(pause_env, nullptr, 10)) : 0;
++    const bool counter_poll = std::getenv("MC_EXPERIMENTAL_COUNTER_POLL") &&
++        std::strcmp(std::getenv("MC_EXPERIMENTAL_COUNTER_POLL"), "1") == 0;
++    // Experimental classic-RDMA-only observation. The batch stays owned by
++    // this slot. Never bypass the official terminal status/cleanup path.
++    if (counter_poll) {
++        CHECK_EQ(XferBenchConfig::xport_type, "rdma");
++        CHECK_LE(globalConfig().slice_timeout, 0);
++    }
+     XferBenchTimer clock;
+     const char* initiator_warm_env = std::getenv("MC_EXPERIMENTAL_INITIATOR_WARM_US");
+     const uint64_t initiator_warm_us = initiator_warm_env ? std::strtoull(initiator_warm_env, nullptr, 10) : 0;
+@@ -894,6 +903,14 @@
+         for (size_t i = 0; i < slots.size(); ++i) {
+             auto& slot = slots[i];
+             if (!slot.active) continue;
++            if (counter_poll) {
++                const auto& batch = Transport::toBatchDesc(slot.id);
++                if (batch.counter_eligible &&
++                    !batch.has_failure.load(std::memory_order_acquire) &&
++                    batch.finished_task_count.load(std::memory_order_acquire) <
++                        batch.task_list.size())
++                    continue;
++            }
+             TransferStatus status;
+             auto polled = engine_->getBatchTransferStatus(slot.id, status);
+             if (!polled.ok() ||
+--- a/mooncake-transfer-engine/include/transfer_engine_impl.h
++++ b/mooncake-transfer-engine/include/transfer_engine_impl.h
+@@ -201,6 +201,9 @@
+         }
+ #endif
+
++        // Monotonic marker: after the first notification submission, retain
++        // the original locking path for the entire engine lifetime.
++        notification_path_used_.store(true, std::memory_order_release);
+         // store notify
+         RWSpinlock::WriteGuard guard(send_notifies_lock_);
+         notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
+@@ -263,6 +266,9 @@
+         }
+ #endif
+
++        // Monotonic marker: after the first notification submission, retain
++        // the original locking path for the entire engine lifetime.
++        notification_path_used_.store(true, std::memory_order_release);
+         // store notify
+         RWSpinlock::WriteGuard guard(send_notifies_lock_);
+         notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
+@@ -281,6 +287,9 @@
+     }
+
+     Status freeBatchID(BatchID batch_id) {
++        if (skip_unused_notification_lock_ &&
++            !notification_path_used_.load(std::memory_order_acquire))
++            return multi_transports_->freeBatchID(batch_id);
+         return multi_transports_->freeBatchID(batch_id, [this, batch_id] {
+             // BatchID is pointer-derived. Remove side-table state before the
+             // descriptor is deleted and its address can be reused.
+@@ -382,6 +391,9 @@
+         }
+ #endif
+         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
++            if (skip_unused_notification_lock_ &&
++                !notification_path_used_.load(std::memory_order_acquire))
++                return result;
+             std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
+             {
+                 RWSpinlock::WriteGuard guard(send_notifies_lock_);
+@@ -509,6 +521,11 @@
+     MemoryRegionMap registering_memory_regions_;
+     std::shared_ptr<Topology> local_topology_;
+
++    const bool skip_unused_notification_lock_ = [] {
++        const char* value = std::getenv("MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK");
++        return value && std::string(value) == "1";
++    }();
++    std::atomic<bool> notification_path_used_{false};
+     RWSpinlock send_notifies_lock_;
+     std::unordered_map<BatchID,
+                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
