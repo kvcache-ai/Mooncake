@@ -653,4 +653,5 @@ increase(mooncake_te_read_size_bytes_sum[2m])
 :maxdepth: 1
 
 transfer-engine-bench-tuning
+rdma-pxn-samerail-send
 :::
