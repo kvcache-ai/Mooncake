@@ -794,6 +794,21 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
 // public API. The functionality is now encapsulated within the Allocate()
 // method.
 
+TEST_F(AllocationStrategyTest, SnapshotHcaHintsAreRequestLocal) {
+    AllocatorManager manager;
+    manager.addAllocator("segment",
+                         std::make_shared<OffsetBufferAllocator>(
+                             "segment", 0x100000000ULL, 64 * MiB, "segment"));
+    auto first = manager.Snapshot();
+    auto second = manager.Snapshot();
+    first.SetHcaAffinity({"mlx5_0"});
+    second.SetHcaAffinity({"mlx5_1"});
+    EXPECT_TRUE(manager.GetHcaAffinity().empty());
+    EXPECT_EQ(first.GetHcaAffinity(), std::vector<std::string>{"mlx5_0"});
+    EXPECT_EQ(second.GetHcaAffinity(), std::vector<std::string>{"mlx5_1"});
+    EXPECT_TRUE(first.Snapshot().GetHcaAffinity().empty());
+}
+
 class SsdPlacementTestState {
    public:
     void AddSegment(const std::string& name, size_t index, size_t segment_size,
@@ -803,7 +818,7 @@ class SsdPlacementTestState {
                       name, 0x100000000ULL + index * segment_size, segment_size,
                       name));
         const UUID client_id{index + 1, index + 100};
-        client_by_name.emplace(name, client_id);
+        allocators.SetOwnerClientId(name, client_id);
         ASSERT_EQ(local_ssd.RegisterClient(client_id, true), ErrorCode::OK);
         ASSERT_TRUE(
             local_ssd.ReportCapacity(client_id, total_capacity).has_value());
@@ -814,12 +829,11 @@ class SsdPlacementTestState {
         allocators.addAllocator(
             name, std::make_shared<OffsetBufferAllocator>(name, 0x100000000ULL,
                                                           segment_size, name));
-        client_by_name.emplace(name, UUID{1, 100});
+        allocators.SetOwnerClientId(name, UUID{1, 100});
     }
 
     ScopedAllocatorAccess GetPlacement() {
-        return ScopedAllocatorAccess(allocators, segments_by_host,
-                                     client_by_name, mutex);
+        return ScopedAllocatorAccess(allocators, segments_by_host, mutex);
     }
 
     AllocatorManager allocators;
@@ -827,7 +841,6 @@ class SsdPlacementTestState {
 
    private:
     HostSegmentIndex segments_by_host;
-    std::unordered_map<std::string, UUID> client_by_name;
     std::shared_mutex mutex;
 };
 
@@ -876,6 +889,15 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstSnapshotPreservesOwnerRanking) {
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               "free");
+    // Placement membership is frozen, but SSD capacity remains live.
+    ASSERT_TRUE(state.local_ssd.AdjustUsedBytes(UUID{2, 101}, 850 * MiB));
+    auto updated = strategy.Allocate(snapshot, 64 * 1024);
+    ASSERT_TRUE(updated.has_value());
+    EXPECT_EQ(updated->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "busy");
 }
 
 TEST_F(AllocationStrategyTest, SsdFreeRatioFirstWithoutUsageAllocates) {
