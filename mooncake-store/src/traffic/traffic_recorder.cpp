@@ -225,6 +225,7 @@ bool TrafficRecorder::Start() {
             shards_.push_back(std::move(shard));
         }
         next_shard_.store(0, std::memory_order_relaxed);
+        dropped_no_shard_.store(0, std::memory_order_relaxed);
     }
     block_.clear();
     block_.reserve(block_bytes_);
@@ -335,6 +336,7 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
         const std::uint64_t index =
             next_shard_.fetch_add(1, std::memory_order_relaxed);
         if (index >= shards_.size()) {
+            dropped_no_shard_.fetch_add(1, std::memory_order_relaxed);
             starting_.fetch_sub(1, std::memory_order_release);
             return;
         }
@@ -701,11 +703,12 @@ RecorderStatus TrafficRecorder::GetStatus() const {
     }
     status.observed_requests = observed;
     status.recorded_requests = recorded;
-    status.dropped_ring = dropped_ring;
+    status.dropped_ring =
+        dropped_ring + dropped_no_shard_.load(std::memory_order_relaxed);
     status.dropped_filtered = dropped_filtered;
     status.dropped_oversize = dropped_oversize;
     status.dropped_requests =
-        dropped_ring + dropped_filtered + dropped_oversize;
+        status.dropped_ring + dropped_filtered + dropped_oversize;
     status.ring_used_bytes = used;
     status.ring_capacity_bytes = capacity;
     if (sink_ != nullptr) {

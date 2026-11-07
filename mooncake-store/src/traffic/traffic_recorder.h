@@ -104,6 +104,7 @@ class TrafficRecorder {
     std::atomic<std::uint32_t> starting_{0};
     std::atomic<std::uint64_t> generation_{0};
     std::atomic<std::uint64_t> next_shard_{0};
+    std::atomic<std::uint64_t> dropped_no_shard_{0};
 
     std::vector<std::unique_ptr<Shard>> shards_;
     std::thread writer_thread_;
