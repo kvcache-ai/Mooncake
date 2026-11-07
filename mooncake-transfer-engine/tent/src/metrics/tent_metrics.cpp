@@ -115,6 +115,70 @@ const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     }
     return "unknown";
 }
+
+const char* shmMappingEventName(TentMetrics::ShmMappingEvent event) {
+    switch (event) {
+        case TentMetrics::ShmMappingEvent::CacheHit:
+            return "cache_hit";
+        case TentMetrics::ShmMappingEvent::CacheMiss:
+            return "cache_miss";
+        case TentMetrics::ShmMappingEvent::MetadataError:
+            return "metadata_error";
+        case TentMetrics::ShmMappingEvent::OpenError:
+            return "open_error";
+        case TentMetrics::ShmMappingEvent::StatError:
+            return "stat_error";
+        case TentMetrics::ShmMappingEvent::SizeMismatch:
+            return "size_mismatch";
+        case TentMetrics::ShmMappingEvent::MapError:
+            return "map_error";
+        case TentMetrics::ShmMappingEvent::Created:
+            return "created";
+    }
+    return "unknown";
+}
+
+const char* shmCopyOutcomeName(TentMetrics::ShmCopyOutcome outcome) {
+    switch (outcome) {
+        case TentMetrics::ShmCopyOutcome::Success:
+            return "success";
+        case TentMetrics::ShmCopyOutcome::Error:
+            return "error";
+    }
+    return "unknown";
+}
+
+const char* segmentEventName(TentMetrics::SegmentEvent event) {
+    switch (event) {
+        case TentMetrics::SegmentEvent::SnapshotPublished:
+            return "snapshot_published";
+        case TentMetrics::SegmentEvent::MutationError:
+            return "mutation_error";
+        case TentMetrics::SegmentEvent::RegistryPublishSuccess:
+            return "registry_publish_success";
+        case TentMetrics::SegmentEvent::RegistryPublishError:
+            return "registry_publish_error";
+        case TentMetrics::SegmentEvent::RegistryDeleteSuccess:
+            return "registry_delete_success";
+        case TentMetrics::SegmentEvent::RegistryDeleteError:
+            return "registry_delete_error";
+        case TentMetrics::SegmentEvent::CacheHit:
+            return "cache_hit";
+        case TentMetrics::SegmentEvent::CacheMiss:
+            return "cache_miss";
+        case TentMetrics::SegmentEvent::CacheReset:
+            return "cache_reset";
+        case TentMetrics::SegmentEvent::FetchSuccess:
+            return "fetch_success";
+        case TentMetrics::SegmentEvent::FetchError:
+            return "fetch_error";
+        case TentMetrics::SegmentEvent::EntryInvalidated:
+            return "entry_invalidated";
+        case TentMetrics::SegmentEvent::GenerationAdvanced:
+            return "generation_advanced";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -339,6 +403,9 @@ void TentMetrics::registerMetrics() {
         &task_failures_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
+        &shm_mapping_events_total_,
+        &shm_copy_events_total_,
+        &segment_events_total_,
     };
 
     gauges_ = {
@@ -515,6 +582,38 @@ void TentMetrics::recordLogicalRequestFinished(
     logical_requests_inflight_.incResolved(operationSlot(operation), -1);
 }
 
+void TentMetrics::recordShmMappingEvent(ShmMappingEvent event) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    shm_mapping_events_total_.incCached(static_cast<size_t>(event), [event] {
+        return std::array<std::string, 1>{shmMappingEventName(event)};
+    });
+}
+
+void TentMetrics::recordShmCopy(Request::OpCode operation,
+                                ShmCopyOutcome outcome, double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    const size_t slot = shmCopySlot(operation, outcome);
+    auto labels = [operation, outcome] {
+        return std::array<std::string, 2>{operationName(operation),
+                                          shmCopyOutcomeName(outcome)};
+    };
+    shm_copy_events_total_.incCached(slot, labels);
+    if (latency_us >= 0.0) {
+        shm_copy_latency_.observeCached(slot, labels,
+                                        static_cast<int64_t>(latency_us));
+    }
+}
+
+void TentMetrics::recordSegmentEvent(SegmentEvent event) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    segment_events_total_.incCached(static_cast<size_t>(event), [event] {
+        return std::array<std::string, 1>{segmentEventName(event)};
+    });
+}
+
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
 // engine state through paired add/sub operations (attempt start/finish,
 // register/unregister), and skipping one half of a pair across a
@@ -676,6 +775,7 @@ bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
             // N=2 transport-attempt latency histogram (labels: transport,
             // operation) goes through the same helper, instantiated for N=2.
             serializeHistogramPrometheus(transport_attempt_latency_, output);
+            serializeHistogramPrometheus(shm_copy_latency_, output);
 
             // Gauges: current value per label.
             for (auto* gauge : gauges_) {
@@ -998,6 +1098,12 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&deadline_infeasible_total_);
             root[quarantined_batches_total_.str_name()] =
                 static_cast<int64_t>(quarantined_batches_total_.value());
+            root[shm_mapping_events_total_.str_name()] =
+                sumCounterValues(&shm_mapping_events_total_);
+            root[shm_copy_events_total_.str_name()] =
+                sumCounterValues(&shm_copy_events_total_);
+            root[segment_events_total_.str_name()] =
+                sumCounterValues(&segment_events_total_);
 
             // Gauges: aggregate across transport labels (total in-flight
             // attempts / total registered bytes). Per-transport breakdown is
@@ -1022,6 +1128,7 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             serializeHistogramToJson(root, stage_dispatch_);
             serializeHistogramToJson(root, stage_transport_);
             serializeHistogramToJson(root, transport_attempt_latency_);
+            serializeHistogramToJson(root, shm_copy_latency_);
 
             root["tent_metrics_build_info"] = {
                 {"version", TENT_BUILD_VERSION},
@@ -1161,6 +1268,9 @@ void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
+void TentMetrics::recordShmMappingEvent(ShmMappingEvent) {}
+void TentMetrics::recordShmCopy(Request::OpCode, ShmCopyOutcome, double) {}
+void TentMetrics::recordSegmentEvent(SegmentEvent) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

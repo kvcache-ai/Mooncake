@@ -441,6 +441,10 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordDeadlineInfeasible(TCP);
     metrics.recordBatchQuarantined();
     metrics.recordTaskFailure(RDMA, TentMetrics::TaskFailureReason::Timeout);
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheHit);
+    metrics.recordShmCopy(Request::WRITE, TentMetrics::ShmCopyOutcome::Success,
+                          18.0);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::CacheHit);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -450,7 +454,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 34>
+    const std::array<std::pair<std::string_view, std::string_view>, 38>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -467,6 +471,9 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_task_failures_total", "counter"},
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
+            {"tent_shm_mapping_events_total", "counter"},
+            {"tent_shm_copy_events_total", "counter"},
+            {"tent_segment_events_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_logical_requests_inflight", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
@@ -479,6 +486,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stage_dispatch_us", "histogram"},
             {"tent_stage_transport_us", "histogram"},
             {"tent_transport_attempt_latency_us", "histogram"},
+            {"tent_shm_copy_latency_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -503,6 +511,60 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
                         "json\"}"),
               std::string::npos);
+}
+
+TEST_F(MetricsRecordingTest, ShmSignalsUseBoundedOperationAndEventLabels) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::CacheMiss);
+    metrics.recordShmMappingEvent(TentMetrics::ShmMappingEvent::Created);
+    metrics.recordShmCopy(Request::WRITE, TentMetrics::ShmCopyOutcome::Success,
+                          23.0);
+    metrics.recordShmCopy(Request::READ, TentMetrics::ShmCopyOutcome::Error,
+                          31.0);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_shm_mapping_events_total{event=\"cache_miss\"}") -
+            before.series(
+                "tent_shm_mapping_events_total{event=\"cache_miss\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_shm_mapping_events_total{event=\"created\"}") -
+            before.series("tent_shm_mapping_events_total{event=\"created\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_shm_copy_events_total{operation=\"write\","
+                     "outcome=\"success\"}") -
+            before.series("tent_shm_copy_events_total{operation=\"write\","
+                          "outcome=\"success\"}"),
+        1);
+    EXPECT_EQ(after.series("tent_shm_copy_events_total{operation=\"read\","
+                           "outcome=\"error\"}") -
+                  before.series("tent_shm_copy_events_total{operation=\"read\","
+                                "outcome=\"error\"}"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_shm_copy_latency_us") -
+                  before.histogramCount("tent_shm_copy_latency_us"),
+              2);
+}
+
+TEST_F(MetricsRecordingTest, SegmentSignalsUseBoundedLifecycleEvents) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::CacheMiss);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::FetchError);
+    metrics.recordSegmentEvent(TentMetrics::SegmentEvent::GenerationAdvanced);
+
+    auto after = MetricsSnapshot(metrics);
+    for (std::string_view event :
+         {"cache_miss", "fetch_error", "generation_advanced"}) {
+        const std::string series =
+            "tent_segment_events_total{event=\"" + std::string(event) + "\"}";
+        EXPECT_EQ(after.series(series) - before.series(series), 1) << event;
+    }
 }
 
 TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {

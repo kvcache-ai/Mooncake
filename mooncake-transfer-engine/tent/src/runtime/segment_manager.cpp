@@ -19,9 +19,17 @@
 #include <set>
 
 #include "tent/common/status.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment_registry.h"
 #include "tent/common/utils/os.h"
+
+#if TENT_METRICS_ENABLED
+#define TENT_RECORD_SEGMENT_EVENT(event) \
+    TentMetrics::instance().recordSegmentEvent(event)
+#else
+#define TENT_RECORD_SEGMENT_EVENT(event) static_cast<void>(0)
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -55,6 +63,8 @@ Status SegmentManager::openRemote(SegmentID &handle,
         id_to_name_map_[handle] = segment_name;
         LOG(INFO) << "Opened segment #" << handle << ": " << segment_name;
         version_.fetch_add(1, std::memory_order_relaxed);
+        TENT_RECORD_SEGMENT_EVENT(
+            TentMetrics::SegmentEvent::GenerationAdvanced);
     }
     return Status::OK();
 }
@@ -67,6 +77,7 @@ Status SegmentManager::closeRemote(SegmentID handle) {
     name_to_id_map_.erase(segment_name);
     id_to_name_map_.erase(handle);
     version_.fetch_add(1, std::memory_order_relaxed);
+    TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::GenerationAdvanced);
     return Status::OK();
 }
 
@@ -76,7 +87,11 @@ Status SegmentManager::updateLocal(
     // No concurrent writer exists (serialized by local_update_mu_), so
     // reading local_desc_ without local_desc_lock_ is safe here.
     auto next = std::make_shared<SegmentDesc>(*local_desc_);
-    CHECK_STATUS(mutator(*next));
+    auto mutation_status = mutator(*next);
+    if (!mutation_status.ok()) {
+        TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::MutationError);
+        return mutation_status;
+    }
     {
         std::unique_lock<std::shared_mutex> guard(local_desc_lock_);
         local_desc_ = std::move(next);
@@ -92,6 +107,7 @@ Status SegmentManager::updateLocal(
         std::lock_guard<std::mutex> jg(local_json_cache_mu_);
         local_json_cache_.reset();
     }
+    TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::SnapshotPublished);
     return Status::OK();
 }
 
@@ -112,8 +128,10 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
         cache.id_to_desc_map.clear();
         cache.last_refresh = current_ts;
         cache.version = current_version;
+        TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::CacheReset);
     }
     if (!cache.id_to_desc_map.count(handle)) {
+        TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::CacheMiss);
         SegmentDescRef desc_ref;
         auto status = getRemote(desc_ref, handle);
         if (!status.ok()) return status;
@@ -133,6 +151,8 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
                        << peer_rpc_addr << "', local: '" << local_rpc_addr
                        << "'.";
         }
+    } else {
+        TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::CacheHit);
     }
     desc = cache.id_to_desc_map[handle];
     assert(desc);
@@ -146,27 +166,35 @@ Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
         RWSpinlock::ReadGuard guard(lock_);
         auto it = id_to_name_map_.find(handle);
         if (it == id_to_name_map_.end()) {
+            TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::FetchError);
             return Status::InvalidArgument("Invalid segment handle" LOC_MARK);
         }
         segment_name = it->second;
     }
-    if (segment_name.starts_with(kLocalFileSegmentPrefix)) {
-        CHECK_STATUS(makeFileRemote(desc, segment_name));
-    } else {
-        CHECK_STATUS(registry_->getSegmentDesc(desc, segment_name));
-    }
-    return Status::OK();
+    auto status = segment_name.starts_with(kLocalFileSegmentPrefix)
+                      ? makeFileRemote(desc, segment_name)
+                      : registry_->getSegmentDesc(desc, segment_name);
+    TENT_RECORD_SEGMENT_EVENT(status.ok()
+                                  ? TentMetrics::SegmentEvent::FetchSuccess
+                                  : TentMetrics::SegmentEvent::FetchError);
+    return status;
 }
 
 Status SegmentManager::getRemote(SegmentDescRef &desc,
                                  const std::string &segment_name) {
-    return registry_->getSegmentDesc(desc, segment_name);
+    auto status = registry_->getSegmentDesc(desc, segment_name);
+    TENT_RECORD_SEGMENT_EVENT(status.ok()
+                                  ? TentMetrics::SegmentEvent::FetchSuccess
+                                  : TentMetrics::SegmentEvent::FetchError);
+    return status;
 }
 
 Status SegmentManager::invalidateRemote(SegmentID handle) {
     if (handle == LOCAL_SEGMENT_ID) return Status::OK();
     auto &cache = tl_remote_cache_.get();
-    cache.id_to_desc_map.erase(handle);
+    if (cache.id_to_desc_map.erase(handle) != 0) {
+        TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::EntryInvalidated);
+    }
     return Status::OK();
 }
 
@@ -181,6 +209,7 @@ Status SegmentManager::invalidateAllCacheForRemote(
     // fast-path performance of `getRemoteCached`.
     (void)segment_name;
     version_.fetch_add(1, std::memory_order_relaxed);
+    TENT_RECORD_SEGMENT_EVENT(TentMetrics::SegmentEvent::GenerationAdvanced);
     return Status::OK();
 }
 
@@ -252,7 +281,12 @@ Status SegmentManager::synchronizeLocal() {
         // from peers until the next synchronizeLocal call.
         std::lock_guard<std::mutex> g(local_sync_mu_);
         auto snapshot = getLocal();
-        CHECK_STATUS(registry_->putSegmentDesc(snapshot));
+        auto publish_status = registry_->putSegmentDesc(snapshot);
+        TENT_RECORD_SEGMENT_EVENT(
+            publish_status.ok()
+                ? TentMetrics::SegmentEvent::RegistryPublishSuccess
+                : TentMetrics::SegmentEvent::RegistryPublishError);
+        if (!publish_status.ok()) return publish_status;
     }
 
     std::vector<std::string> subscribers_snapshot;
@@ -283,8 +317,14 @@ Status SegmentManager::synchronizeLocal() {
 }
 
 Status SegmentManager::deleteLocal() {
-    return registry_->deleteSegmentDesc(getLocal()->name);
+    auto status = registry_->deleteSegmentDesc(getLocal()->name);
+    TENT_RECORD_SEGMENT_EVENT(
+        status.ok() ? TentMetrics::SegmentEvent::RegistryDeleteSuccess
+                    : TentMetrics::SegmentEvent::RegistryDeleteError);
+    return status;
 }
 
 }  // namespace tent
 }  // namespace mooncake
+
+#undef TENT_RECORD_SEGMENT_EVENT
