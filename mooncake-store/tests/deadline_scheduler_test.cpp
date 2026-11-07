@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -213,6 +214,49 @@ TEST(DeadlineSchedulerTest, RunsExpiredBeforePendingRecord) {
     ASSERT_EQ(records.size(), 2);
     EXPECT_EQ(records[0], past_item);
     EXPECT_EQ(records[1], future_item);
+}
+
+TEST(DeadlineSchedulerTest, CancelSelectsOneRecordEvenWhenIdsMatch) {
+    CallbackRecorder recorder;
+    Scheduler scheduler([&](const UUID& id) { recorder.Record(id); });
+    const auto now = Clock::now();
+    auto first = scheduler.Schedule(MakeUuid(100), now + std::chrono::hours(1));
+    auto second =
+        scheduler.Schedule(MakeUuid(100), now + std::chrono::milliseconds(10));
+    EXPECT_NE(first, second);
+    EXPECT_TRUE(scheduler.Cancel(first));
+    EXPECT_FALSE(scheduler.Cancel(first));
+    EXPECT_FALSE(scheduler.Cancel(0));
+    ASSERT_TRUE(recorder.WaitForSize(1, std::chrono::seconds(5)));
+    scheduler.Stop();
+    EXPECT_EQ(recorder.Size(), 1);
+    EXPECT_FALSE(scheduler.Cancel(second));
+    EXPECT_EQ(scheduler.Schedule(MakeUuid(101), now), 0);
+}
+
+TEST(DeadlineSchedulerTest, RemovedHandlesCannotCancelLaterRecords) {
+    CallbackRecorder recorder;
+    Scheduler scheduler([&](const UUID& id) { recorder.Record(id); });
+    auto removed =
+        scheduler.Schedule(MakeUuid(110), Clock::now() + std::chrono::hours(1));
+    scheduler.RemoveIf([](const UUID&) { return true; });
+    auto later = scheduler.Schedule(MakeUuid(111), Clock::now());
+    EXPECT_NE(removed, later);
+    EXPECT_FALSE(scheduler.Cancel(removed));
+    ASSERT_TRUE(recorder.WaitForSize(1, std::chrono::seconds(5)));
+    EXPECT_FALSE(scheduler.Cancel(later));
+    EXPECT_EQ(recorder.Records().front(), MakeUuid(111));
+}
+
+TEST(DeadlineSchedulerTest, StopReleasesPendingPayloadBeforeDestruction) {
+    DeadlineScheduler<std::shared_ptr<int>> scheduler([](const auto&) {});
+    auto payload = std::make_shared<int>(42);
+    std::weak_ptr<int> observer = payload;
+    scheduler.Schedule(payload, Clock::now() + std::chrono::hours(1));
+    payload.reset();
+    ASSERT_FALSE(observer.expired());
+    scheduler.Stop();
+    EXPECT_TRUE(observer.expired());
 }
 
 }  // namespace mooncake::test
