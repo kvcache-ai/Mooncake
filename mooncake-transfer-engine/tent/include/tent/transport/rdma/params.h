@@ -53,6 +53,14 @@ struct QpPoolSegment {
 
 struct EndPointParams {
     int endpoint_store_cap = 65536;
+    // Retire an endpoint that has carried no traffic for this long, so a peer
+    // that left (or restarted under a new ip:port) stops holding its QPs and
+    // its 32 MiB of pinned notification buffers for the lifetime of the
+    // process. endpoint_store_cap only evicts when a new endpoint is
+    // inserted, which never happens again for a peer that is gone. The peer
+    // rebuilds the connection on its next transfer through the same
+    // stale-endpoint bootstrap path a restart already uses. 0 disables it.
+    int endpoint_idle_timeout_secs = 1800;
     int qp_mul_factor = 6;  // Derived from RdmaParams::num_lanes.
     int max_sge = 4;
     int max_qp_wr = 256;

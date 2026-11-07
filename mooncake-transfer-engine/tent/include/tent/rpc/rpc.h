@@ -16,6 +16,7 @@
 #define TENT_YLT_RPC_H
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <functional>
@@ -88,6 +89,23 @@ class CoroRpcAgent {
 
     Status stop();
 
+    // Drops pooled client connections that have been idle for longer than
+    // idle_timeout, and forgets the pools that are then empty and unused.
+    // A pool is only ever grown, and a peer that has left is never called
+    // again, so without this its idle sockets sit in CLOSE-WAIT (and its
+    // epoll/timer/event fds stay allocated) until the process exits.
+    // Swept from getOrCreatePool(), rate-limited to a few seconds apart.
+    // Reclaiming on the call path keeps this free of a timer thread, which a
+    // per-thread client agent cannot afford; the price is that a process that
+    // makes no RPC at all never sweeps - but it is not accumulating pools
+    // either. Returns the number of connections dropped.
+    size_t evictIdleClients(std::chrono::nanoseconds idle_timeout);
+
+    // Test-only hooks: idle reclamation is time-based, so a test runs a
+    // sweep with its own threshold instead of waiting out the production one.
+    size_t idleClientCountForTest(const std::string &server_addr);
+    size_t poolCountForTest();
+
     Status call(const std::string &server_addr, int func_id,
                 const std::string_view &request, std::string &response);
 
@@ -124,6 +142,9 @@ class CoroRpcAgent {
 
     std::mutex pools_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;
+    // Guarded by pools_mutex_. Bounds how often getOrCreatePool() walks
+    // every pool.
+    std::chrono::steady_clock::time_point last_idle_sweep_{};
 
     std::mutex func_map_mutex_;
     std::unordered_map<int, Handler> func_map_;

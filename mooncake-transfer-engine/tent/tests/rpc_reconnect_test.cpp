@@ -14,7 +14,8 @@
 
 // A peer restart invalidates every connection pooled for that peer, not just
 // the one that happens to notice first. These tests pin what a failed pooled
-// call does to the rest of the pool.
+// call does to the rest of the pool, and what happens to a pool whose peer
+// left for good and will never be called again.
 
 #include <gtest/gtest.h>
 
@@ -262,6 +263,61 @@ TEST_F(RpcReconnectTest, ConcurrentStaleCallsAllRecover) {
     (void)round("first");
     // By the second round every caller is on a fresh connection.
     EXPECT_EQ(round("second"), kCallers);
+}
+
+// Per-peer pooled connections are only ever added to: a client goes back to
+// the pool after every successful call, and the pool is flushed only when a
+// later call to the same address fails. A peer that has left is never called
+// again, so nothing notices its sockets and they sit in CLOSE-WAIT, with
+// their epoll/timer/event descriptors, for the lifetime of the process. Idle
+// reclamation is what gives them back.
+TEST_F(RpcReconnectTest, IdlePooledConnectionsAreReclaimed) {
+    StartServer(0);
+    CoroRpcAgent client;
+    ASSERT_NO_FATAL_FAILURE(FillPool(client));
+    ASSERT_EQ(client.idleClientCountForTest(addr_),
+              static_cast<size_t>(kPooled));
+    ASSERT_EQ(client.poolCountForTest(), 1u);
+
+    // The peer is gone, and nothing will ever call this address again.
+    StopServer();
+
+    // A zero window makes everything already pooled idle.
+    EXPECT_EQ(client.evictIdleClients(0ns), static_cast<size_t>(kPooled));
+    EXPECT_EQ(client.idleClientCountForTest(addr_), 0u);
+    // The pool itself is gone too, so the map does not grow once per peer.
+    EXPECT_EQ(client.poolCountForTest(), 0u);
+}
+
+// Guard, not a regression test: a peer that is merely between bursts must
+// keep its connections, otherwise every call pays a reconnect.
+TEST_F(RpcReconnectTest, PooledConnectionsSurviveWithinTheIdleWindow) {
+    StartServer(0);
+    CoroRpcAgent client;
+    ASSERT_NO_FATAL_FAILURE(FillPool(client));
+
+    EXPECT_EQ(client.evictIdleClients(1h), 0u);
+    EXPECT_EQ(client.idleClientCountForTest(addr_),
+              static_cast<size_t>(kPooled));
+
+    std::string response;
+    auto status = client.call(addr_, kEchoFunc, "still-pooled", response);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(response, "still-pooled");
+}
+
+// A reclaimed address is not a dead address: dropping idle connections must
+// leave the next call free to reconnect.
+TEST_F(RpcReconnectTest, ACallAfterReclamationReconnects) {
+    StartServer(0);
+    CoroRpcAgent client;
+    ASSERT_NO_FATAL_FAILURE(FillPool(client));
+    ASSERT_EQ(client.evictIdleClients(0ns), static_cast<size_t>(kPooled));
+
+    std::string response;
+    auto status = client.call(addr_, kEchoFunc, "reconnected", response);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(response, "reconnected");
 }
 
 }  // namespace

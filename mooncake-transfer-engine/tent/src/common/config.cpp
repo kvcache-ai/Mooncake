@@ -219,6 +219,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     setConfig(config, "MC_MAX_CQE_PER_CTX", "transports/rdma/device/max_cqe");
     setConfig(config, "MC_MAX_EP_PER_CTX",
               "transports/rdma/endpoint/endpoint_store_cap");
+    setConfig(config, "MC_EP_IDLE_TIMEOUT_SECS",
+              "transports/rdma/endpoint/endpoint_idle_timeout_secs");
     setConfig(config, "MC_NUM_QP_PER_EP",
               "transports/rdma/endpoint/qp_mul_factor");
     setConfig(config, "MC_MAX_SGE", "transports/rdma/endpoint/max_sge");
