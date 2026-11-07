@@ -26,6 +26,8 @@ _UNIT_MAP = {
     "tib": 1024**4,
 }
 
+_HUGEPAGE_SYSFS_ROOT = Path("/sys/kernel/mm/hugepages")
+
 
 @dataclass(frozen=True)
 class BudgetSummary:
@@ -66,12 +68,16 @@ def read_available_hugetlb(page_size_bytes: int) -> int | None:
         return None
 
     page_size_kib = page_size_bytes // 1024
-    path = Path(f"/sys/kernel/mm/hugepages/hugepages-{page_size_kib}kB/nr_hugepages")
+    path = (
+        _HUGEPAGE_SYSFS_ROOT
+        / f"hugepages-{page_size_kib}kB"
+        / "free_hugepages"
+    )
     try:
-        nr_hugepages = int(path.read_text(encoding="utf-8").strip())
+        free_hugepages = int(path.read_text(encoding="utf-8").strip())
     except (FileNotFoundError, PermissionError, ValueError, OSError):
         return None
-    return nr_hugepages * page_size_bytes
+    return free_hugepages * page_size_bytes
 
 
 def evaluate_budget(
