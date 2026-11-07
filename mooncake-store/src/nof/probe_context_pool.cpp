@@ -9,6 +9,7 @@ void NofProbeContext::Reset() {
     error_reason.clear();
     adaptor = {};
     seg = nullptr;
+    probe_buffer = nullptr;
 }
 
 NofProbeContext* NofProbeContextPool::Acquire() {

@@ -22,6 +22,7 @@ class SpdkInitiator : public NVMeoFInitiator {
     NofSegmentHandle* OpenSegment(const std::string& transport_str) override;
     bool ProbeSegment(const std::string& transport_str, uint32_t timeout_ms,
                       std::string* error_reason) override;
+    void ReleaseProbeResources(const std::string& transport_str) override;
     uint32_t GetBlockSize(const NofSegmentHandle* handle) override;
     int SubmitIO(NofSegmentHandle* handle, void* buffer, uint64_t byte_offset,
                  uint64_t byte_length, NofIOOp op,
