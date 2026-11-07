@@ -278,6 +278,13 @@ In addition to CUDA, Mooncake also supports other accelerator backends, along wi
 - [Deployment Guide](https://kvcache-ai.github.io/Mooncake/deployment/mooncake-store-deployment-guide.html)
 
 
+### Incident diagnostics
+
+Use the standard-library [incident ZIP tool](scripts/diagnostics/README.md) to
+collect environment snapshots and package redacted P/D logs and troubleshooting
+records. Review the generated ZIP, then attach it to a Mooncake issue or give it
+to an AI assistant. No skill installation is required.
+
 ### Skills for AI Assistants
 
 Mooncake ships a set of **built-in skills** under [`.claude/skills`](.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command.
