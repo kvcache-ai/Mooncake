@@ -90,6 +90,7 @@ class Namespace final : private route::RouteObserver {
     [[nodiscard]] const EvictionIndex& eviction_index() const {
         return *eviction_index_;
     }
+    [[nodiscard]] EvictionIndex& eviction_index() { return *eviction_index_; }
 
     // --- Work in flight ------------------------------------------------------
     //
@@ -133,6 +134,7 @@ class Namespace final : private route::RouteObserver {
 
     static bool IsInitial(const route::SlotOwnerState& owner) {
         return !owner.in_flight_listed && !owner.eviction_filed &&
+               !owner.eviction_postponed &&
                owner.policy_words == decltype(owner.policy_words){};
     }
 
