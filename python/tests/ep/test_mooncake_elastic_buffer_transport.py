@@ -541,3 +541,33 @@ def test_dispatch_cpu_sync_waits_for_async_kernels(
     )
 
     assert calls == expected_calls
+
+
+def test_expanded_dispatch_output_includes_alignment_padding(monkeypatch) -> None:
+    # One rank, one token, top-2 experts 0 and 1, alignment 8: expert 1's row
+    # starts at 8, so the output needs at least 9 rows, not 1 * 2.
+    monkeypatch.setattr(elastic_buffer_module, "_native_current_stream_ptr", lambda: 0)
+    buffer = object.__new__(ElasticBuffer)
+    buffer.runtime = types.SimpleNamespace(dispatch=lambda *args: object())
+    buffer.num_ranks = 1
+    buffer.num_scaleup_ranks = 1
+    buffer.num_scaleout_ranks = 1
+    buffer._active_ranks = torch.ones(1, dtype=torch.int32)
+    buffer._generation = 0
+
+    with pytest.warns(RuntimeWarning, match="do_expand=True"):
+        recv_x, _, recv_topk_weights, _, _ = buffer.dispatch(
+            torch.zeros((1, 4), dtype=torch.bfloat16),
+            topk_idx=torch.tensor([[0, 1]], dtype=torch.int64),
+            topk_weights=torch.ones((1, 2), dtype=torch.float32),
+            num_experts=2,
+            num_max_tokens_per_rank=1,
+            expert_alignment=8,
+            do_expand=True,
+            do_cpu_sync=False,
+            num_sms=1,
+            async_with_compute_stream=False,
+        )
+
+    assert recv_x.shape[0] >= 9
+    assert recv_topk_weights.shape[0] == recv_x.shape[0]

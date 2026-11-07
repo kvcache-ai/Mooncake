@@ -1084,8 +1084,13 @@ class ElasticBuffer:
             if handle is not None
             else max_num_recv_tokens
         )
+        # Expanded, each local expert's rows start at an expert_alignment
+        # boundary, so leave room for up to expert_alignment - 1 padding rows
+        # per expert.
         num_recv_output_capacity = (
-            num_recv_tokens * num_topk if do_expand else num_recv_tokens
+            num_recv_tokens * num_topk + num_local_experts * (expert_alignment - 1)
+            if do_expand
+            else num_recv_tokens
         )
         use_hybrid = self.num_scaleout_ranks != 1
         hybrid_channels = self._hybrid_num_channels(num_sms) if use_hybrid else 0
