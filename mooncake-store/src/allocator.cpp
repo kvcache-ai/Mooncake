@@ -74,7 +74,7 @@ AllocatedBuffer::~AllocatedBuffer() {
     }
 }
 
-AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+AllocatedBuffer::AllocatedBuffer(std::weak_ptr<BufferAllocatorBase> allocator,
                                  const AllocatedBuffer::Descriptor& descriptor)
     : allocator_(std::move(allocator)),
       buffer_ptr_(reinterpret_cast<void*>(descriptor.buffer_address_)),
@@ -265,7 +265,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         MasterMetricManager::instance().inc_allocated_nof_size(segment_name_,
                                                                size);
     }
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size);
+    return std::make_unique<AllocatedBuffer>(weak_from_this(), buffer, size);
 }
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
@@ -305,7 +305,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
             segment_name_, allocation.requested_size);
     }
     return std::make_unique<AllocatedBuffer>(
-        shared_from_this(),
+        weak_from_this(),
         reinterpret_cast<void*>(base_ + allocation.offset_from_base),
         allocation.requested_size);
 }
@@ -410,6 +410,11 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         LOG(ERROR) << "allocator_status=not_initialized";
         return nullptr;
     }
+    auto allocator = weak_from_this();
+    if (allocator.expired()) {
+        LOG(ERROR) << "allocator_status=not_shared";
+        return nullptr;
+    }
 
     std::unique_ptr<AllocatedBuffer> allocated_buffer = nullptr;
     try {
@@ -428,7 +433,8 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Create a custom AllocatedBuffer that manages the
         // OffsetAllocationHandle
         allocated_buffer = std::make_unique<AllocatedBuffer>(
-            shared_from_this(), buffer_ptr, size, std::move(allocation_handle));
+            std::move(allocator), buffer_ptr, size,
+            std::move(allocation_handle));
         VLOG(1) << "allocation_succeeded size=" << size
                 << " segment=" << segment_name_ << " address=" << buffer_ptr;
     } catch (const std::exception& e) {
