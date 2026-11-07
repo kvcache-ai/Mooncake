@@ -64,6 +64,16 @@ typedef struct tent_status tent_status_t;
 
 typedef void* tent_engine_t;
 
+/* Integer-returning operations return 0 on success or the negative native
+ * mooncake::tent::Status::Code on failure (not errno). For example, -2 is
+ * TooManyRequests and -134 is RpcConnectionError. Invalid arguments remain
+ * -1; wrapper allocation failures return -199 (InternalError).
+ * tent_available is a boolean query. Pointer/handle/void return values are
+ * unchanged. Transfer state in tent_status_t is separate from the return code
+ * of a status query: a successful query can report STATUS_FAILED.
+ * An error code alone is not proof of physical quiescence or permission to
+ * replay a batch: earlier accepted tasks may have taken effect. */
+
 struct tent_buffer_info {
     uint64_t base, length;
     char location[64];
