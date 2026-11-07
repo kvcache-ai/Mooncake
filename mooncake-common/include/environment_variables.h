@@ -23,6 +23,7 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint32_t,
                       MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS);
     MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS);
+    MC_DEFINE_ENV_VAR(uint32_t, MOONCAKE_OFFLOAD_CLIENT_BUFFER_ALLOC_WAIT_MS);
 
     // Keep legacy bool/ratio values as strings so their custom parsing and
     // silent invalid-value behavior remain unchanged.
