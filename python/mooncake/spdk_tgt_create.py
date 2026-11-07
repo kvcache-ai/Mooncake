@@ -52,10 +52,16 @@ class SPDKTgtCreator:
         transport_options: Dict[str, Any] = None,
         core_mask: str = "0xff",
         port: int = 22,
+        username: str = "root",
+        password: Optional[str] = None,
+        key_file: Optional[str] = None,
     ):
         self.spdk_targets = spdk_targets
         self.core_mask = core_mask
         self.port = port
+        self.username = username
+        self.password = password
+        self.key_file = key_file
         self.transport_options = dict(self.DEFAULT_TRANSPORT_OPTIONS)
         if transport_options:
             self.transport_options.update(transport_options)
@@ -466,7 +472,13 @@ done""",
 
         try:
             # Establish SSH connection
-            ssh = self._ssh_connect(ip, port=self.port)
+            ssh = self._ssh_connect(
+                ip,
+                username=self.username,
+                password=self.password,
+                key_file=self.key_file,
+                port=self.port,
+            )
 
             try:
                 auto_discovered = not pci_devices
@@ -638,6 +650,9 @@ def main():
             transport_options,
             args.core_mask,
             args.port,
+            username=args.username,
+            password=args.password,
+            key_file=args.key_file,
         )
         success = creator.deploy_all_targets()
         exit(0 if success else 1)
