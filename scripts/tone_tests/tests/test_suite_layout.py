@@ -114,10 +114,10 @@ class TestSuiteLayout(unittest.TestCase):
     def test_store_rs_tone_job_reuses_the_sglang_run_all_lifecycle(self):
         runner = SCRIPTS / "tone_tests" / "scripts" / "run_test.sh"
         output = self.shell(
-            f'''RUN_STORE_RS_TESTS=true LOCAL_IP=192.0.2.1 REMOTE_IP=192.0.2.2
+            f"""RUN_STORE_RS_TESTS=true LOCAL_IP=192.0.2.1 REMOTE_IP=192.0.2.2
             source "{runner}"
             main() {{ printf '%s\\n' "$@"; }}
-            run_requested_suite run-all SGLANG'''
+            run_requested_suite run-all SGLANG"""
         )
         self.assertEqual(output.splitlines(), ["run-all"])
 
@@ -135,9 +135,7 @@ class TestSuiteLayout(unittest.TestCase):
 
         self.assertIn("build-wheel-store-rs-tone:", nightly_workflow)
         self.assertIn("artifact-prefix: tone-store-rs-wheel", nightly_workflow)
-        self.assertIn(
-            "artifact_name: tone-store-rs-wheel-py312", nightly_workflow
-        )
+        self.assertIn("artifact_name: tone-store-rs-wheel-py312", nightly_workflow)
         self.assertIn("run-store-rs: true", nightly_workflow)
         self.assertNotIn("tone-store-rs-integration:", nightly_workflow)
         self.assertNotIn("tone-store-rs-integration-tent:", nightly_workflow)
