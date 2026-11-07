@@ -54,13 +54,17 @@ class AcceleratorRegistryImpl final : public AcceleratorRegistry {
 
    private:
     void Register(const AcceleratorDevice& device) {
+        bool replaced = false;
         for (auto*& registered_device : registered_devices_) {
             if (registered_device->Vendor() == device.Vendor()) {
                 registered_device = &device;
-                return;
+                replaced = true;
+                break;
             }
         }
-        registered_devices_.push_back(&device);
+        if (!replaced) registered_devices_.push_back(&device);
+        // Drop the cached runtime list on replacement too; otherwise it keeps
+        // serving the device that was just replaced.
         std::atomic_store(&available_devices_, DeviceListPtr());
     }
 
