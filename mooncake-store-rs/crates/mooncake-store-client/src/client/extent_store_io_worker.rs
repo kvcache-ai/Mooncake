@@ -1144,17 +1144,23 @@ impl ExtentStoreGdsBackend {
 }
 
 fn iouring_read_lane(read: &ReservedExtentStoreRead<'_>) -> ExtentStoreLocalReadLane {
-    let value_len = read.locator.value_len as usize;
-    if direct_reads_enabled()
-        && read.direct_file.as_ref().is_some_and(|_| {
-            direct_payload_io_compatible(
-                read.locator.offset + read.locator.value_offset,
-                &read.dst[..value_len],
+    if read
+        .direct_file
+        .as_ref()
+        .is_some_and(|_| {
+            direct_read_len(
+                &read.locator,
+                read.dst,
+                read.allow_padded_direct_read,
             )
+            .is_some()
         })
     {
         ExtentStoreLocalReadLane::IoUringDirect
-    } else if read.direct_file.is_some() && direct_scratch_read_len(&read.locator).is_some() {
+    } else if read.allow_intermediate_buffer
+        && read.direct_file.is_some()
+        && direct_scratch_read_len(&read.locator).is_some()
+    {
         ExtentStoreLocalReadLane::IoUringDirectScratch
     } else {
         ExtentStoreLocalReadLane::Buffered
@@ -2286,13 +2292,20 @@ fn submit_read_batch_io_worker(
                 .saturating_add(read_offsets[index] as u64);
             let value_len = read.locator.value_len as usize;
             let payload_offset = read_offsets[index];
-            let payload_start =
-                read.locator.offset + read.locator.value_offset + payload_offset as u64;
-            let use_direct = direct_reads_enabled()
-                && read.direct_file.as_ref().is_some_and(|_| {
-                    direct_payload_io_compatible(payload_start, &read.dst[payload_offset..value_len])
+            let direct_len = read
+                .direct_file
+                .as_ref()
+                .and_then(|_| {
+                    direct_read_len(
+                        &read.locator,
+                        read.dst,
+                        read.allow_padded_direct_read,
+                    )
                 });
-            let mut direct_scratch_len = (!use_direct && read.direct_file.is_some())
+            let use_direct = direct_len.is_some();
+            let mut direct_scratch_len = (read.allow_intermediate_buffer
+                && !use_direct
+                && read.direct_file.is_some())
                 .then(|| direct_scratch_read_len(&read.locator))
                 .flatten();
             if let Some(aligned_len) = direct_scratch_len {
@@ -2308,7 +2321,8 @@ fn submit_read_batch_io_worker(
                     .direct_file
                     .as_ref()
                     .expect("direct file checked above");
-                let payload = &mut read.dst[payload_offset..value_len];
+                let direct_len = direct_len.expect("direct length checked above");
+                let payload = &mut read.dst[payload_offset..direct_len];
                 ExtentStoreIoOp::Read {
                     fd: file.as_raw_fd(),
                     buf: payload.as_mut_ptr(),
@@ -2379,6 +2393,8 @@ fn submit_read_batch_io_worker(
             };
             let len = if let Some(aligned_len) = direct_scratch_len {
                 aligned_len - payload_offset
+            } else if let Some(direct_len) = direct_len {
+                direct_len - payload_offset
             } else {
                 value_len - payload_offset
             };
@@ -2608,11 +2624,18 @@ fn plan_generic_span_reads(
             if plan.completed.get(index).copied().unwrap_or(false)
                 || plan.results[index].is_err()
                 || plan.read_offsets[index] != 0
+                || !read.allow_intermediate_buffer
                 || read.locator.value_len == 0
                 || read.locator.value_len > EXTENT_STORE_GENERIC_SPAN_MAX_VALUE_LEN
                 || !is_aligned_u64(read.locator.offset + read.locator.value_offset)
                 || !is_aligned_u64(read.locator.value_len)
                 || read.direct_file.is_none()
+                || direct_read_len(
+                    &read.locator,
+                    read.dst,
+                    read.allow_padded_direct_read,
+                )
+                .is_some()
             {
                 return None;
             }
@@ -2657,6 +2680,7 @@ fn plan_coalesced_direct_scratch_reads(
             if plan.completed.get(index).copied().unwrap_or(false)
                 || plan.results[index].is_err()
                 || plan.read_offsets[index] != 0
+                || !read.allow_intermediate_buffer
                 || read.locator.value_len == 0
             {
                 return None;
@@ -2671,6 +2695,14 @@ fn plan_coalesced_direct_scratch_reads(
             let aligned_start = is_aligned_u64(payload_start);
             let direct_scratch_sized = read.locator.value_len <= direct_scratch_max_read_len();
             let dense_payload = read.locator.value_len <= EXTENT_STORE_DENSE_COALESCE_MAX_VALUE_LEN;
+            if direct_read_len(
+                &read.locator,
+                read.dst,
+                read.allow_padded_direct_read,
+            )
+            .is_some() {
+                return None;
+            }
             if (!aligned_start && !dense_payload)
                 || (aligned_start && !direct_scratch_sized && !direct_compatible)
                 || (direct_compatible

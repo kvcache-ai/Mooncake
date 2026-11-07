@@ -35,6 +35,10 @@ pub(crate) const MEMBERSHIP_REFRESH_TOTAL: &str = "mooncake_store_membership_ref
 pub(crate) const MEMBERSHIP_REFRESH_DURATION: &str =
     "mooncake_store_membership_refresh_duration_seconds";
 pub(crate) const ROUTE_CAS_TOTAL: &str = "mooncake_store_route_cas_total";
+pub(crate) const DELETE_MARKER_ENTRIES: &str = "mooncake_store_delete_marker_entries";
+pub(crate) const DELETE_MARKER_BYTES: &str = "mooncake_store_delete_marker_bytes";
+pub(crate) const DELETE_MARKER_BUDGET_BYTES: &str = "mooncake_store_delete_marker_budget_bytes";
+pub(crate) const DELETE_MARKER_EVENT_TOTAL: &str = "mooncake_store_delete_marker_event_total";
 pub(crate) const REPLICATION_PUBLISH_TOTAL: &str = "mooncake_store_replication_publish_total";
 pub(crate) const REPLICATION_PUBLISH_DURATION: &str =
     "mooncake_store_replication_publish_duration_seconds";
@@ -50,8 +54,12 @@ pub(crate) const REBALANCE_ROUTES_TOTAL: &str = "mooncake_store_rebalance_routes
 pub(crate) const REBALANCE_BYTES_TOTAL: &str = "mooncake_store_rebalance_bytes_total";
 pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecycle_total";
 pub(crate) const RECLAIM_RELEASE_TOTAL: &str = "mooncake_store_reclaim_release_total";
+pub(crate) const EVICTION_GUARD_EVENT_TOTAL: &str = "mooncake_store_eviction_guard_event_total";
+pub(crate) const EVICTION_GUARD_PENDING_TOTAL: &str = "mooncake_store_eviction_guard_pending_total";
 pub(crate) const EVICTION_TOTAL: &str = "mooncake_store_eviction_total";
 pub(crate) const EVICTION_DURATION: &str = "mooncake_store_eviction_duration_seconds";
+pub(crate) const EVICTED_REPLICAS_TOTAL: &str = "mooncake_store_evicted_replicas_total";
+pub(crate) const EVICTED_BYTES_TOTAL: &str = "mooncake_store_evicted_bytes_total";
 pub(crate) const TRANSPORT_OPERATION_TOTAL: &str = "mooncake_store_transport_operation_total";
 pub(crate) const TRANSPORT_BYTES_TOTAL: &str = "mooncake_store_transport_bytes_total";
 pub(crate) const METADATA_OPERATION_TOTAL: &str = "mooncake_store_metadata_operation_total";
@@ -103,6 +111,10 @@ pub struct MetricsSnapshot {
     pub membership_refresh: Vec<CounterSample<ResultKey>>,
     pub membership_refresh_duration: Vec<HistogramSample<ResultKey>>,
     pub route_cas: Vec<CounterSample<ResultKey>>,
+    pub delete_marker_entries: u64,
+    pub delete_marker_bytes: u64,
+    pub delete_marker_budget_bytes: u64,
+    pub delete_marker_events: Vec<CounterSample<ResultKey>>,
     pub replication_publish: Vec<CounterSample<ResultKey>>,
     pub replication_publish_duration: Vec<HistogramSample<ResultKey>>,
     pub checksum_validation: Vec<CounterSample<ResultKey>>,
@@ -116,8 +128,12 @@ pub struct MetricsSnapshot {
     pub rebalance_bytes: Vec<CounterSample<PhaseKey>>,
     pub segment_lifecycle: Vec<CounterSample<ActionResultKey>>,
     pub reclaim_release: Vec<CounterSample<ActionResultKey>>,
+    pub eviction_guard_events: Vec<CounterSample<PhaseResultKey>>,
+    pub eviction_guard_pending: Vec<GaugeSample<PhaseKey>>,
     pub eviction: Vec<CounterSample<ResultKey>>,
     pub eviction_duration: Vec<HistogramSample<ResultKey>>,
+    pub evicted_replicas: u64,
+    pub evicted_bytes: u64,
     pub transport_operations: Vec<CounterSample<TransportOperationKey>>,
     pub transport_bytes: Vec<CounterSample<TransportBytesKey>>,
     pub metadata_operations: Vec<CounterSample<MetadataOperationKey>>,
@@ -417,6 +433,23 @@ impl<K: Ord + Clone> GaugeFamily<K> {
             })
             .collect()
     }
+
+    fn snapshot_with_defaults<I>(&self, defaults: I) -> Vec<GaugeSample<K>>
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let mut inner = self.inner.clone();
+        for key in defaults {
+            inner.entry(key).or_default();
+        }
+        inner
+            .iter()
+            .map(|(key, value)| GaugeSample {
+                key: key.clone(),
+                value: *value,
+            })
+            .collect()
+    }
 }
 
 pub(crate) struct HistogramFamily<K> {
@@ -527,6 +560,10 @@ struct MetricsRegistry {
     membership_refresh: CounterFamily<ResultKey>,
     membership_refresh_duration: HistogramFamily<ResultKey>,
     route_cas: CounterFamily<ResultKey>,
+    delete_marker_entries: u64,
+    delete_marker_bytes: u64,
+    delete_marker_budget_bytes: u64,
+    delete_marker_events: CounterFamily<ResultKey>,
     replication_publish: CounterFamily<ResultKey>,
     replication_publish_duration: HistogramFamily<ResultKey>,
     checksum_validation: CounterFamily<ResultKey>,
@@ -540,8 +577,12 @@ struct MetricsRegistry {
     rebalance_bytes: CounterFamily<PhaseKey>,
     segment_lifecycle: CounterFamily<ActionResultKey>,
     reclaim_release: CounterFamily<ActionResultKey>,
+    eviction_guard_events: CounterFamily<PhaseResultKey>,
+    eviction_guard_pending: GaugeFamily<PhaseKey>,
     eviction: CounterFamily<ResultKey>,
     eviction_duration: HistogramFamily<ResultKey>,
+    evicted_replicas: u64,
+    evicted_bytes: u64,
     transport_operations: CounterFamily<TransportOperationKey>,
     transport_bytes: CounterFamily<TransportBytesKey>,
     metadata_operations: CounterFamily<MetadataOperationKey>,
@@ -606,6 +647,10 @@ impl Default for MetricsRegistry {
             membership_refresh: CounterFamily::default(),
             membership_refresh_duration: HistogramFamily::default(),
             route_cas: CounterFamily::default(),
+            delete_marker_entries: 0,
+            delete_marker_bytes: 0,
+            delete_marker_budget_bytes: 0,
+            delete_marker_events: CounterFamily::default(),
             replication_publish: CounterFamily::default(),
             replication_publish_duration: HistogramFamily::default(),
             checksum_validation: CounterFamily::default(),
@@ -619,8 +664,12 @@ impl Default for MetricsRegistry {
             rebalance_bytes: CounterFamily::default(),
             segment_lifecycle: CounterFamily::default(),
             reclaim_release: CounterFamily::default(),
+            eviction_guard_events: CounterFamily::default(),
+            eviction_guard_pending: GaugeFamily::default(),
             eviction: CounterFamily::default(),
             eviction_duration: HistogramFamily::default(),
+            evicted_replicas: 0,
+            evicted_bytes: 0,
             transport_operations: CounterFamily::default(),
             transport_bytes: CounterFamily::default(),
             metadata_operations: CounterFamily::default(),
@@ -796,6 +845,10 @@ impl MetricsRegistry {
             membership_refresh: self.membership_refresh.snapshot(),
             membership_refresh_duration: self.membership_refresh_duration.snapshot(),
             route_cas: self.route_cas.snapshot(),
+            delete_marker_entries: self.delete_marker_entries,
+            delete_marker_bytes: self.delete_marker_bytes,
+            delete_marker_budget_bytes: self.delete_marker_budget_bytes,
+            delete_marker_events: self.delete_marker_events.snapshot(),
             replication_publish: self.replication_publish.snapshot(),
             replication_publish_duration: self.replication_publish_duration.snapshot(),
             checksum_validation: self.checksum_validation.snapshot(),
@@ -829,8 +882,16 @@ impl MetricsRegistry {
             reclaim_release: self
                 .reclaim_release
                 .snapshot_with_defaults(reclaim_release_keys()),
+            eviction_guard_events: self
+                .eviction_guard_events
+                .snapshot_with_defaults(eviction_guard_event_keys()),
+            eviction_guard_pending: self
+                .eviction_guard_pending
+                .snapshot_with_defaults(phase_keys(EVICTION_GUARD_PENDING_PHASES)),
             eviction: self.eviction.snapshot(),
             eviction_duration: self.eviction_duration.snapshot(),
+            evicted_replicas: self.evicted_replicas,
+            evicted_bytes: self.evicted_bytes,
             transport_operations: self.transport_operations.snapshot(),
             transport_bytes: self.transport_bytes.snapshot(),
             metadata_operations: self.metadata_operations.snapshot(),
@@ -973,6 +1034,31 @@ const RECLAIM_RELEASE_RESULTS: &[&str] = &[
     "skipped_missing_runtime_lease",
     "error",
 ];
+const EVICTION_GUARD_PENDING_PHASES: &[&str] = &[
+    "prepared",
+    "ready_to_commit",
+    "pending_confirmation",
+    "pending_allocation_confirmation",
+];
+const EVICTION_GUARD_EVENT_OUTCOMES: &[(&str, &str)] = &[
+    ("route_cas", "outcome_unknown"),
+    ("clock_candidate", "pending_confirmation"),
+    ("allocator_candidate", "pending_confirmation"),
+    ("pending_token", "aborted"),
+    ("local_commit", "release_deferred"),
+    ("local_commit", "released"),
+    ("local_commit", "identity_replaced"),
+    ("route_confirmation", "referenced"),
+    ("route_confirmation", "absent"),
+    ("route_confirmation", "indeterminate"),
+    ("allocation_confirmation", "absent"),
+    ("allocation_confirmation", "referenced"),
+    ("allocation_confirmation", "conflict"),
+    ("allocation_confirmation", "invalid_response"),
+    ("allocation_confirmation", "indeterminate"),
+    ("reservation_rollback", "queued"),
+    ("reservation_rollback", "released"),
+];
 
 fn result_keys(results: &'static [&'static str]) -> impl Iterator<Item = ResultKey> {
     results.iter().copied().map(|result| ResultKey { result })
@@ -990,6 +1076,12 @@ fn phase_result_keys(
         .iter()
         .copied()
         .map(move |result| PhaseResultKey { phase, result })
+}
+
+fn eviction_guard_event_keys() -> impl Iterator<Item = PhaseResultKey> {
+    EVICTION_GUARD_EVENT_OUTCOMES
+        .iter()
+        .map(|(phase, result)| PhaseResultKey { phase, result })
 }
 
 fn preferred_segment_skip_keys() -> impl Iterator<Item = PreferredSegmentSkipKey> {
@@ -1132,6 +1224,23 @@ pub(crate) fn record_route_cas(result: &'static str) {
         .lock()
         .route_cas
         .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_delete_marker_state(entries: u64, bytes: u64, budget_bytes: u64) {
+    let mut registry = global_metrics_registry().lock();
+    registry.delete_marker_entries = entries;
+    registry.delete_marker_bytes = bytes;
+    registry.delete_marker_budget_bytes = budget_bytes;
+}
+
+pub(crate) fn record_delete_marker_event(event: &'static str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    global_metrics_registry()
+        .lock()
+        .delete_marker_events
+        .add(ResultKey { result: event }, count);
 }
 
 pub(crate) fn record_replication_publish(result: &'static str, duration: Duration) {
@@ -1407,6 +1516,23 @@ pub(crate) fn record_reclaim_release(action: &'static str, result: &'static str)
         .add(ActionResultKey { action, result }, 1);
 }
 
+pub(crate) fn record_eviction_guard_event(source: &'static str, outcome: &'static str) {
+    global_metrics_registry().lock().eviction_guard_events.add(
+        PhaseResultKey {
+            phase: source,
+            result: outcome,
+        },
+        1,
+    );
+}
+
+pub(crate) fn set_eviction_guard_pending(phase: &'static str, count: usize) {
+    global_metrics_registry()
+        .lock()
+        .eviction_guard_pending
+        .set(PhaseKey { phase }, count as f64);
+}
+
 pub(crate) struct ColdTierDeviceMetrics<'a> {
     pub runtime: &'a str,
     pub total_devices: usize,
@@ -1443,6 +1569,12 @@ pub(crate) fn record_eviction(result: &'static str, duration: Duration) {
     registry
         .eviction_duration
         .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_evicted_replicas(replicas: usize, bytes: u64) {
+    let mut registry = global_metrics_registry().lock();
+    registry.evicted_replicas = registry.evicted_replicas.saturating_add(replicas as u64);
+    registry.evicted_bytes = registry.evicted_bytes.saturating_add(bytes);
 }
 
 pub(crate) fn record_cold_tier_device_metrics(metrics: ColdTierDeviceMetrics<'_>) {
@@ -1879,5 +2011,76 @@ fn cold_tier_device_state_label(state: ColdTierDeviceState) -> &'static str {
         ColdTierDeviceState::DisabledByAdmin => "disabled_by_admin",
         ColdTierDeviceState::Draining => "draining",
         ColdTierDeviceState::Failed => "failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mooncake_store_core::{
+        ClientEpoch, ClientRuntimeId, CompatibilityDescriptor, ReplicaRoute, RouteState,
+        RouteVersion, SegmentName,
+    };
+
+    fn route(key: &str, replicas: &[(&str, ReplicaTier)]) -> ObjectRoute {
+        ObjectRoute {
+            key: ObjectKey::new(key),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(1),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::default(),
+            replicas: replicas
+                .iter()
+                .enumerate()
+                .map(|(index, (owner, tier))| ReplicaRoute {
+                    owner: ClientRuntimeId::new(*owner, ClientEpoch(1)),
+                    segment_name: SegmentName::new(format!("segment-{index}")),
+                    allocation_id: Some(index as u64),
+                    offset: Some(0),
+                    segment_offset: 0,
+                    length: 1,
+                    checksum: None,
+                    tier: *tier,
+                    priority: index as u16,
+                })
+                .collect(),
+            cold_backing: None,
+            nof_backing: None,
+        }
+    }
+
+    #[test]
+    fn route_metrics_handle_empty_identical_and_duplicate_replicas() {
+        let mut registry = MetricsRegistry::default();
+        let empty = route("tenant-a::key", &[]);
+        registry.routes.insert(empty.key.0.clone(), empty.clone());
+        registry.routes.insert(empty.key.0.clone(), empty);
+        assert_eq!(registry.object_route_snapshot()[0].value, 1.0);
+        assert!(registry.replica_distribution_snapshot().is_empty());
+
+        let duplicates = route(
+            "tenant-a::key",
+            &[
+                ("runtime-a", ReplicaTier::Dram),
+                ("runtime-a", ReplicaTier::Dram),
+            ],
+        );
+        registry
+            .routes
+            .insert(duplicates.key.0.clone(), duplicates.clone());
+        registry
+            .routes
+            .insert(duplicates.key.0.clone(), duplicates.clone());
+        assert_eq!(registry.object_route_snapshot()[0].value, 1.0);
+        let replicas = registry.replica_distribution_snapshot();
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(replicas[0].value, 2.0);
+        registry.routes.remove(&duplicates.key.0);
+        assert!(registry.object_route_snapshot().is_empty());
+        assert!(registry.replica_distribution_snapshot().is_empty());
     }
 }

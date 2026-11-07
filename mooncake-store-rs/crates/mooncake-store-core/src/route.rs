@@ -108,6 +108,8 @@ pub struct ReplicaRoute {
     pub owner: ClientRuntimeId,
     pub segment_name: SegmentName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
     #[serde(default)]
     pub segment_offset: u64,
@@ -185,12 +187,91 @@ pub struct SegmentReservation {
     pub segment_name: SegmentName,
     pub offset_bytes: u64,
     pub length_bytes: u64,
+    #[serde(default)]
+    pub allocation_id: u64,
+}
+
+/// Identifies one allocator generation that may be referenced by a route.
+///
+/// A zero allocation id is intentionally not representable as a reclaimable
+/// identity. Callers must retain legacy replicas without a generation fence.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct AllocationRouteIdentity {
+    pub owner: ClientRuntimeId,
+    pub segment_name: SegmentName,
+    pub offset_bytes: u64,
+    pub length_bytes: u64,
+    pub allocation_id: u64,
+}
+
+impl AllocationRouteIdentity {
+    /// Matches the physical allocation start. A length or generation mismatch
+    /// at the same start is a conflict, never proof that the allocation is absent.
+    pub fn matches_replica_start(&self, replica: &ReplicaRoute) -> bool {
+        self.owner == replica.owner
+            && self.segment_name == replica.segment_name
+            && self.offset_bytes == replica.segment_offset
+    }
+
+    pub fn matches_replica(&self, replica: &ReplicaRoute) -> bool {
+        self.matches_replica_start(replica)
+            && self.length_bytes == replica.length
+            && replica.allocation_id == Some(self.allocation_id)
+    }
+}
+
+/// One authority's payload-free observation for an allocation identity.
+///
+/// `Conflict` includes a different generation or length at the same physical
+/// allocation start. Reclaim callers must treat it the same as a live reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AllocationRouteReferenceState {
+    Absent,
+    Exact,
+    Conflict,
+}
+
+/// One authority's exact allocation observation for background lifecycle recovery.
+///
+/// `route_key` is present only for a single exact active route. Multiple matching
+/// keys are reported as `Conflict` so a reclaim caller remains fail-closed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AllocationRouteReference {
+    pub state: AllocationRouteReferenceState,
+    pub route_key: Option<ObjectKey>,
+}
+
+impl AllocationRouteReference {
+    pub fn absent() -> Self {
+        Self {
+            state: AllocationRouteReferenceState::Absent,
+            route_key: None,
+        }
+    }
+
+    pub fn exact(route_key: ObjectKey) -> Self {
+        Self {
+            state: AllocationRouteReferenceState::Exact,
+            route_key: Some(route_key),
+        }
+    }
+
+    pub fn conflict() -> Self {
+        Self {
+            state: AllocationRouteReferenceState::Conflict,
+            route_key: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CasResult {
     pub applied: bool,
     pub current: Option<ObjectRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_version: Option<RouteVersion>,
+    /// Rolling-upgrade compatibility with authorities that still retain
+    /// unbounded version floors. New authorities always return `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_floor: Option<RouteVersion>,
 }
@@ -763,8 +844,9 @@ mod tests {
     use super::{
         default_segment_alignment_bytes, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
         RoutePolicy, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-        SegmentName, SegmentTargetChunk, TenantObjectAccountingState, TenantPolicyScope,
-        TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantRoutePolicy,
+        SegmentName, SegmentReservation, SegmentTargetChunk, TenantObjectAccountingState,
+        TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
+        TenantRoutePolicy,
     };
     use crate::NamespaceScope;
     use crate::{
@@ -1214,6 +1296,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("node", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg"),
+                allocation_id: Some(42),
                 offset: Some(0),
                 segment_offset: 0,
                 length: 1024,
@@ -1255,7 +1338,21 @@ mod tests {
 
         let decoded: ObjectRoute = serde_json::from_str(encoded).unwrap();
         assert_eq!(decoded.replicas[0].offset, None);
+        assert_eq!(decoded.replicas[0].allocation_id, None);
         assert_eq!(decoded.replicas[0].segment_offset, 64);
+    }
+
+    #[test]
+    fn segment_reservation_serde_accepts_legacy_payload_without_allocation_id() {
+        let encoded = r#"{
+            "owner":{"stable_id":"node","epoch":1},
+            "segment_name":"seg",
+            "offset_bytes":64,
+            "length_bytes":16
+        }"#;
+
+        let decoded: SegmentReservation = serde_json::from_str(encoded).unwrap();
+        assert_eq!(decoded.allocation_id, 0);
     }
 
     #[test]

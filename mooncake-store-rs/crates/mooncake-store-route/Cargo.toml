@@ -5,9 +5,13 @@ edition = "2021"
 
 [dependencies]
 dashmap.workspace = true
+hashlink.workspace = true
 mooncake-store-core = { path = "../mooncake-store-core" }
 parking_lot.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+mooncake-store-rs-metadata = { path = "../mooncake-store-rs-metadata" }
 
 [lints]
 workspace = true

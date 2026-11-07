@@ -56,7 +56,7 @@ pub(super) fn pb_error(error: StoreError) -> pb::ErrorDetail {
         StoreError::Allocator(message) => (pb::ErrorKind::Allocator, message),
         StoreError::Metadata(message) => (pb::ErrorKind::Metadata, message),
         StoreError::Transport(message) => (pb::ErrorKind::Transport, message),
-        StoreError::Backpressure(message) => (pb::ErrorKind::Transport, message),
+        StoreError::Backpressure(message) => (pb::ErrorKind::Backpressure, message),
     };
     pb::ErrorDetail {
         kind: kind as i32,
@@ -73,6 +73,7 @@ pub(super) fn store_error_from_pb(error: pb::ErrorDetail) -> StoreError {
         pb::ErrorKind::Unsupported => StoreError::Unsupported(error.message),
         pb::ErrorKind::Allocator => StoreError::Allocator(error.message),
         pb::ErrorKind::Metadata => StoreError::Metadata(error.message),
+        pb::ErrorKind::Backpressure => StoreError::Backpressure(error.message),
         pb::ErrorKind::Transport | pb::ErrorKind::Unspecified => {
             StoreError::Transport(error.message)
         }
@@ -91,6 +92,172 @@ pub(super) fn try_runtime_id(runtime: &pb::ClientRuntimeId) -> Result<ClientRunt
         stable_id: ClientStableId::new(runtime.stable_id.clone()),
         epoch: ClientEpoch(runtime.epoch),
     })
+}
+
+pub(super) fn pb_allocation_route_identity(
+    identity: &AllocationRouteIdentity,
+) -> pb::AllocationRouteIdentity {
+    pb::AllocationRouteIdentity {
+        owner: Some(pb_runtime_id(&identity.owner)),
+        segment_name: identity.segment_name.0.clone(),
+        offset_bytes: identity.offset_bytes,
+        length_bytes: identity.length_bytes,
+        allocation_id: identity.allocation_id,
+    }
+}
+
+pub(super) fn try_allocation_route_identity(
+    identity: pb::AllocationRouteIdentity,
+) -> Result<AllocationRouteIdentity> {
+    let owner = identity
+        .owner
+        .as_ref()
+        .map(try_runtime_id)
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::Transport("allocation reference identity is missing owner".to_string())
+        })?;
+    if identity.segment_name.is_empty() || identity.length_bytes == 0 || identity.allocation_id == 0
+    {
+        return Err(StoreError::Transport(
+            "allocation reference identity is invalid".to_string(),
+        ));
+    }
+    Ok(AllocationRouteIdentity {
+        owner,
+        segment_name: SegmentName::new(identity.segment_name),
+        offset_bytes: identity.offset_bytes,
+        length_bytes: identity.length_bytes,
+        allocation_id: identity.allocation_id,
+    })
+}
+
+pub(super) fn pb_delete_pending_entry(entry: &DeletePendingEntry) -> pb::DeletePendingEntry {
+    pb::DeletePendingEntry {
+        route_key: entry.route_key.0.clone(),
+        identity: entry.identity.as_ref().map(pb_allocation_route_identity),
+        cold_backing: entry.cold_backing.as_ref().map(|target| {
+            pb_cold_backing_route(&mooncake_store_core::ColdBackingRoute {
+                owner: target.owner.clone(),
+                cold_tier_id: target.cold_tier_id.clone(),
+                object_locator: target.object_locator.clone(),
+                length: target.length,
+                checksum: target.checksum,
+                state: mooncake_store_core::ColdBackingState::PendingDelete,
+                replicas: Vec::new(),
+            })
+        }),
+        reclaim_grace_ms: entry.reclaim_grace_ms,
+        prepare_only: entry.prepare_only,
+        expected_route_version: entry.expected_route_version.map(|version| version.0),
+    }
+}
+
+pub(super) fn try_delete_pending_entry(
+    entry: pb::DeletePendingEntry,
+) -> Result<DeletePendingEntry> {
+    if entry.route_key.is_empty() {
+        return Err(StoreError::Transport(
+            "delete pending entry is missing route key".to_string(),
+        ));
+    }
+    let identity = entry
+        .identity
+        .map(try_allocation_route_identity)
+        .transpose()?;
+    let cold_backing = entry
+        .cold_backing
+        .map(try_cold_backing_route)
+        .transpose()?
+        .map(|route| ColdDeleteTarget {
+            owner: route.owner,
+            cold_tier_id: route.cold_tier_id,
+            object_locator: route.object_locator,
+            length: route.length,
+            checksum: route.checksum,
+        });
+    if identity.is_none() && cold_backing.is_none() {
+        return Err(StoreError::Transport(
+            "delete pending entry is missing identity and cold backing".to_string(),
+        ));
+    }
+    Ok(DeletePendingEntry {
+        route_key: ObjectKey::new(entry.route_key),
+        identity,
+        cold_backing,
+        reclaim_grace_ms: entry.reclaim_grace_ms,
+        prepare_only: entry.prepare_only,
+        expected_route_version: entry
+            .expected_route_version
+            .map(mooncake_store_core::RouteVersion),
+    })
+}
+
+pub(super) fn pb_allocation_reference_state(
+    state: AllocationRouteReferenceState,
+) -> pb::AllocationRouteReferenceState {
+    let state = match state {
+        AllocationRouteReferenceState::Absent => {
+            pb::allocation_route_reference_state::State::Absent(true)
+        }
+        AllocationRouteReferenceState::Exact => {
+            pb::allocation_route_reference_state::State::Exact(true)
+        }
+        AllocationRouteReferenceState::Conflict => {
+            pb::allocation_route_reference_state::State::Conflict(true)
+        }
+    };
+    pb::AllocationRouteReferenceState {
+        state: Some(state),
+        route_key: String::new(),
+    }
+}
+
+pub(super) fn pb_allocation_reference(
+    reference: AllocationRouteReference,
+) -> pb::AllocationRouteReferenceState {
+    let mut encoded = pb_allocation_reference_state(reference.state);
+    encoded.route_key = reference.route_key.map(|key| key.0).unwrap_or_default();
+    encoded
+}
+
+pub(super) fn try_allocation_reference_state(
+    state: pb::AllocationRouteReferenceState,
+) -> Result<AllocationRouteReferenceState> {
+    match state.state {
+        Some(pb::allocation_route_reference_state::State::Absent(true)) => {
+            Ok(AllocationRouteReferenceState::Absent)
+        }
+        Some(pb::allocation_route_reference_state::State::Exact(true)) => {
+            Ok(AllocationRouteReferenceState::Exact)
+        }
+        Some(pb::allocation_route_reference_state::State::Conflict(true)) => {
+            Ok(AllocationRouteReferenceState::Conflict)
+        }
+        _ => Err(StoreError::Transport(
+            "allocation reference reply contains an invalid state".to_string(),
+        )),
+    }
+}
+
+pub(super) fn try_allocation_reference(
+    state: pb::AllocationRouteReferenceState,
+) -> Result<AllocationRouteReference> {
+    let route_key = (!state.route_key.is_empty()).then(|| ObjectKey::new(state.route_key.clone()));
+    let state = try_allocation_reference_state(state)?;
+    match state {
+        AllocationRouteReferenceState::Exact if route_key.is_none() => Err(StoreError::Transport(
+            "exact allocation reference reply is missing route key".to_string(),
+        )),
+        AllocationRouteReferenceState::Exact => Ok(AllocationRouteReference { state, route_key }),
+        _ if route_key.is_some() => Err(StoreError::Transport(
+            "non-exact allocation reference reply contains a route key".to_string(),
+        )),
+        _ => Ok(AllocationRouteReference {
+            state,
+            route_key: None,
+        }),
+    }
 }
 
 pub(super) fn pb_compatibility(
@@ -161,6 +328,7 @@ pub(super) fn pb_replica_route(replica: &ReplicaRoute) -> pb::ReplicaRoute {
     pb::ReplicaRoute {
         owner: Some(pb_runtime_id(&replica.owner)),
         segment_name: replica.segment_name.0.clone(),
+        allocation_id: replica.allocation_id,
         offset: replica.offset,
         segment_offset: replica.segment_offset,
         length: replica.length,
@@ -188,6 +356,7 @@ pub(super) fn try_replica_route(replica: pb::ReplicaRoute) -> Result<ReplicaRout
     Ok(ReplicaRoute {
         owner,
         segment_name: SegmentName::new(replica.segment_name),
+        allocation_id: replica.allocation_id,
         offset: replica.offset,
         segment_offset: replica.segment_offset,
         length: replica.length,
@@ -280,6 +449,7 @@ pub(super) fn pb_cas_result(result: &CasResult) -> pb::CasResult {
         applied: result.applied,
         current: result.current.as_ref().map(pb_object_route),
         version_floor: result.version_floor.map(|v| v.0),
+        delete_version: result.delete_version.map(|v| v.0),
     }
 }
 
@@ -287,6 +457,7 @@ pub(super) fn try_cas_result(result: pb::CasResult) -> Result<CasResult> {
     Ok(CasResult {
         applied: result.applied,
         current: result.current.map(try_object_route).transpose()?,
+        delete_version: result.delete_version.map(RouteVersion),
         version_floor: result.version_floor.map(RouteVersion),
     })
 }
@@ -297,6 +468,7 @@ pub(super) fn pb_segment_reservation(reservation: &SegmentReservation) -> pb::Se
         segment_name: reservation.segment_name.0.clone(),
         offset_bytes: reservation.offset_bytes,
         length_bytes: reservation.length_bytes,
+        allocation_id: reservation.allocation_id,
     }
 }
 
@@ -316,5 +488,6 @@ pub(super) fn try_segment_reservation(
         segment_name: SegmentName::new(reservation.segment_name),
         offset_bytes: reservation.offset_bytes,
         length_bytes: reservation.length_bytes,
+        allocation_id: reservation.allocation_id,
     })
 }

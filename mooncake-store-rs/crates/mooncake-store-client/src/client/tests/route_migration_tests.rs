@@ -137,6 +137,7 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
             ReplicaRoute {
                 owner: source_owner.clone(),
                 segment_name: SegmentName::new("seg-a"),
+                allocation_id: None,
                 offset: Some(0),
                 segment_offset: 0,
                 length: 11,
@@ -147,6 +148,7 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
             ReplicaRoute {
                 owner: replica_b_owner.clone(),
                 segment_name: SegmentName::new("seg-b"),
+                allocation_id: None,
                 offset: Some(128),
                 segment_offset: 128,
                 length: 11,
@@ -167,6 +169,7 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
             ReplicaRoute {
                 owner: target_c_owner.clone(),
                 segment_name: SegmentName::new("seg-c"),
+                allocation_id: None,
                 offset: Some(256),
                 segment_offset: 256,
                 length: 11,
@@ -177,6 +180,7 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
             ReplicaRoute {
                 owner: target_d_owner.clone(),
                 segment_name: SegmentName::new("seg-d"),
+                allocation_id: None,
                 offset: Some(384),
                 segment_offset: 384,
                 length: 11,
@@ -227,6 +231,7 @@ fn explicit_move_route_delta_replaces_source_replica_with_target() {
             ReplicaRoute {
                 owner: source_owner.clone(),
                 segment_name: SegmentName::new("seg-a"),
+                allocation_id: None,
                 offset: Some(0),
                 segment_offset: 0,
                 length: 17,
@@ -237,6 +242,7 @@ fn explicit_move_route_delta_replaces_source_replica_with_target() {
             ReplicaRoute {
                 owner: replica_b_owner.clone(),
                 segment_name: SegmentName::new("seg-b"),
+                allocation_id: None,
                 offset: Some(128),
                 segment_offset: 128,
                 length: 17,
@@ -256,6 +262,7 @@ fn explicit_move_route_delta_replaces_source_replica_with_target() {
         ReplicaRoute {
             owner: target_c_owner.clone(),
             segment_name: SegmentName::new("seg-c"),
+            allocation_id: None,
             offset: Some(256),
             segment_offset: 256,
             length: 17,
@@ -301,6 +308,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         replicas: vec![ReplicaRoute {
             owner: source_owner,
             segment_name: SegmentName::new("seg-a"),
+            allocation_id: None,
             offset: Some(0),
             segment_offset: 0,
             length: 9,
@@ -319,6 +327,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         vec![ReplicaRoute {
             owner: ClientRuntimeId::new("store-b", ClientEpoch(1)),
             segment_name: SegmentName::new("seg-b"),
+            allocation_id: None,
             offset: Some(64),
             segment_offset: 64,
             length: 9,
@@ -336,6 +345,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         vec![ReplicaRoute {
             owner: ClientRuntimeId::new("store-b", ClientEpoch(1)),
             segment_name: SegmentName::new("seg-a"),
+            allocation_id: None,
             offset: Some(64),
             segment_offset: 64,
             length: 9,
@@ -353,6 +363,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
             ReplicaRoute {
                 owner: ClientRuntimeId::new("store-c", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg-b"),
+                allocation_id: None,
                 offset: Some(128),
                 segment_offset: 128,
                 length: 9,
@@ -370,6 +381,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         vec![ReplicaRoute {
             owner: ClientRuntimeId::new("store-b", ClientEpoch(1)),
             segment_name: SegmentName::new("seg-b"),
+            allocation_id: None,
             offset: Some(128),
             segment_offset: 128,
             length: 9,
@@ -387,6 +399,7 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         ReplicaRoute {
             owner: ClientRuntimeId::new("store-b", ClientEpoch(1)),
             segment_name: SegmentName::new("seg-a"),
+            allocation_id: None,
             offset: Some(64),
             segment_offset: 64,
             length: 9,
@@ -2358,6 +2371,7 @@ fn explicit_source_selector_resolves_route_replica_by_segment_and_owner() {
             ReplicaRoute {
                 owner: source_owner.clone(),
                 segment_name: SegmentName::new("seg-a"),
+                allocation_id: None,
                 offset: Some(0),
                 segment_offset: 0,
                 length: 13,
@@ -2368,6 +2382,7 @@ fn explicit_source_selector_resolves_route_replica_by_segment_and_owner() {
             ReplicaRoute {
                 owner: replica_b_owner.clone(),
                 segment_name: SegmentName::new("seg-b"),
+                allocation_id: None,
                 offset: Some(128),
                 segment_offset: 128,
                 length: 13,
@@ -2419,6 +2434,7 @@ fn explicit_source_selector_rejects_missing_or_owner_mismatched_replicas() {
         replicas: vec![ReplicaRoute {
             owner: source_owner.clone(),
             segment_name: SegmentName::new("seg-a"),
+            allocation_id: None,
             offset: Some(0),
             segment_offset: 0,
             length: 7,
