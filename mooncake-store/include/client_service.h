@@ -870,6 +870,14 @@ class Client {
     }
 
     /**
+     * @brief Whether a DFS replica is served by an fs adapter that accepts
+     * arbitrary host read buffers, so a host destination can be read into
+     * directly without a staging buffer.
+     */
+    bool CanReadDfsReplicaIntoHostMemory(
+        const Replica::Descriptor& replica) const;
+
+    /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
      */
