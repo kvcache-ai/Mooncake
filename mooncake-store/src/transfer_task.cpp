@@ -23,7 +23,9 @@
 #ifdef USE_TENT
 #include "tent/transfer_engine.h"
 #endif
+#include "memory_alloc.h"
 #include "nof/nvmeof_initiator.h"
+#include "nof_io_layout.h"
 
 namespace mooncake {
 
@@ -2011,29 +2013,120 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     }
 
     uint32_t block_size = nof_initiator_->GetBlockSize(seg_handle);
+    if (block_size == kInvalidBlockSize || block_size == 0) {
+        LOG(ERROR) << "Invalid NoF block size " << block_size
+                   << " for endpoint=" << handle.transport_endpoint_;
+        return std::nullopt;
+    }
     // Without SGL, ptr must be block-aligned; with SGL (supports_sgl) the
     // requirement relaxes to dma_alignment.
     const auto caps = nof_initiator_->GetCapabilities();
     const uint64_t ptr_alignment =
         caps.supports_sgl ? caps.dma_alignment : block_size;
-    if (block_size == kInvalidBlockSize ||
-        handle.buffer_address_ % block_size != 0 || size % block_size != 0 ||
-        reinterpret_cast<std::uintptr_t>(ptr) % ptr_alignment != 0) {
+
+    // Upstream callers pass logical object sizes and buffer addresses that
+    // need not be block multiples, so pad the I/O up to a block boundary
+    // instead of rejecting the request.
+    NoFIoLayout layout;
+    if (!BuildNoFIoLayout(block_size, handle.buffer_address_,
+                          reinterpret_cast<std::uintptr_t>(ptr), size, layout,
+                          ptr_alignment)) {
         LOG(ERROR) << "NoF request offset=" << handle.buffer_address_
                    << ", ptr=" << ptr << ", size=" << size
-                   << " is not aligned to block size " << block_size;
+                   << " cannot be mapped onto block size " << block_size;
+        return std::nullopt;
+    }
+    // A padded write overwrites the bytes between the logical end of the
+    // object and the end of its last block, which is only safe when the
+    // allocation reserved them. Reads just discard the padding.
+    const uint64_t io_bytes = layout.io_bytes(block_size);
+    if (op_code == TransferRequest::WRITE && io_bytes > handle.size_) {
+        LOG(ERROR) << "NoF write offset=" << handle.buffer_address_
+                   << ", size=" << size << " pads to " << io_bytes
+                   << " bytes, beyond the allocated buffer_size="
+                   << handle.size_;
         return std::nullopt;
     }
 
     const NofIOOp op =
         (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;
-    auto state = std::make_shared<NofOperationState>();
-    NofTask task(seg_handle, ptr, handle.buffer_address_, size, op, state);
-    task.metric = nof_metric_;
-    nof_pool_->submitTask(std::move(task));
+    char* buffer = static_cast<char*>(ptr);
+    if (layout.is_direct()) {
+        const auto& segment = layout.segments.front();
+        auto state = std::make_shared<NofOperationState>();
+        NofTask task(seg_handle, buffer + segment.buffer_offset,
+                     segment.lba * block_size,
+                     static_cast<uint64_t>(segment.lba_count) * block_size, op,
+                     state);
+        task.metric = nof_metric_;
+        nof_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_;
+        VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_;
+        return TransferFuture(state);
+    }
+
+    // Every bounce buffer is allocated before the first task is queued: once
+    // a task reaches the worker pool its completion is guaranteed, so bailing
+    // out halfway would leave the shared state waiting forever.
+    std::vector<NofStagingBuffer> staging;
+    std::vector<NofStagedOperationState::CopyBack> copy_backs;
+    std::vector<void*> segment_buffers(layout.segments.size(), nullptr);
+    for (size_t i = 0; i < layout.segments.size(); ++i) {
+        const auto& segment = layout.segments[i];
+        if (segment.kind == NoFIoSegmentKind::kDirect) {
+            segment_buffers[i] = buffer + segment.buffer_offset;
+            continue;
+        }
+
+        const size_t staging_size =
+            static_cast<size_t>(segment.lba_count) * block_size;
+        // DMA allocator memory, zeroed and page aligned (which covers every
+        // namespace block size the initiator reports).
+        void* staged = hugepage_memory_alloc(staging_size);
+        if (!staged) {
+            LOG(ERROR) << "Failed to allocate " << staging_size
+                       << " bytes of NoF staging memory for endpoint="
+                       << handle.transport_endpoint_;
+            return std::nullopt;
+        }
+        staging.emplace_back(staged);
+        segment_buffers[i] = staged;
+
+        if (op_code == TransferRequest::WRITE) {
+            // The staging memory comes back zeroed, so the padding bytes are
+            // already zero and the caller's buffer is never read past its
+            // logical end.
+            std::memcpy(staged, buffer + segment.buffer_offset,
+                        segment.payload_size);
+        } else {
+            copy_backs.push_back({buffer + segment.buffer_offset, staged,
+                                  static_cast<size_t>(segment.payload_size)});
+        }
+    }
+
+    auto state = std::make_shared<NofStagedOperationState>(
+        static_cast<int>(layout.segments.size()), std::move(staging),
+        std::move(copy_backs));
+    for (size_t i = 0; i < layout.segments.size(); ++i) {
+        const auto& segment = layout.segments[i];
+        NofTask task(seg_handle, segment_buffers[i], segment.lba * block_size,
+                     static_cast<uint64_t>(segment.lba_count) * block_size, op,
+                     state);
+        task.metric = nof_metric_;
+        nof_pool_->submitTask(std::move(task));
+    }
+
+    VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_
+            << " in " << layout.segments.size() << " parts, "
+            << layout.staging_bytes(block_size) << " staged bytes";
     return TransferFuture(state);
+}
+
+void NofStagingBuffer::Release() {
+    if (ptr) {
+        hugepage_memory_free(ptr);
+        ptr = nullptr;
+    }
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(

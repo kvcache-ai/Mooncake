@@ -186,7 +186,8 @@ class NofOperationState : public OperationState {
         return result_.has_value();
     }
 
-    void set_completed(ErrorCode error_code, std::string error_detail = "") {
+    virtual void set_completed(ErrorCode error_code,
+                               std::string error_detail = "") {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(!result_.has_value());
@@ -422,6 +423,100 @@ class MemcpyWorkerPool {
 
 struct NofQos;
 struct NofMetric;
+
+/**
+ * @brief DMA capable bounce buffer owned by a NoF operation
+ *
+ * The NoF initiator can only DMA from memory the DMA allocator handed out,
+ * so unaligned requests borrow one of these instead of the caller's buffer.
+ */
+struct NofStagingBuffer {
+    void* ptr = nullptr;
+
+    NofStagingBuffer() = default;
+    explicit NofStagingBuffer(void* buffer) : ptr(buffer) {}
+    NofStagingBuffer(const NofStagingBuffer&) = delete;
+    NofStagingBuffer& operator=(const NofStagingBuffer&) = delete;
+    NofStagingBuffer(NofStagingBuffer&& other) noexcept : ptr(other.ptr) {
+        other.ptr = nullptr;
+    }
+    NofStagingBuffer& operator=(NofStagingBuffer&& other) noexcept {
+        if (this != &other) {
+            Release();
+            ptr = other.ptr;
+            other.ptr = nullptr;
+        }
+        return *this;
+    }
+    ~NofStagingBuffer() { Release(); }
+
+   private:
+    void Release();
+};
+
+/**
+ * @brief Operation state for a NoF request split into several block aligned
+ * I/Os
+ *
+ * An unaligned request expands into more than one task, or into a task that
+ * runs against a bounce buffer. The request only completes once every part
+ * has completed, at which point read payloads staged in a bounce buffer are
+ * copied back into the caller's buffer.
+ */
+class NofStagedOperationState : public NofOperationState {
+   public:
+    // A read payload to move from a bounce buffer back to the caller.
+    struct CopyBack {
+        void* dest = nullptr;
+        const void* source = nullptr;
+        size_t size = 0;
+    };
+
+    NofStagedOperationState(int part_count,
+                            std::vector<NofStagingBuffer> staging,
+                            std::vector<CopyBack> copy_backs)
+        : staging_(std::move(staging)),
+          copy_backs_(std::move(copy_backs)),
+          pending_parts_(part_count) {}
+
+    void set_completed(ErrorCode error_code,
+                       std::string error_detail = "") override {
+        if (error_code != ErrorCode::OK) {
+            std::lock_guard<std::mutex> lock(detail_mutex_);
+            if (!failed_) {
+                failed_ = true;
+                first_error_detail_ = std::move(error_detail);
+            }
+        }
+        if (pending_parts_.fetch_sub(1, std::memory_order_acq_rel) > 1) {
+            return;
+        }
+
+        bool failed;
+        std::string detail;
+        {
+            std::lock_guard<std::mutex> lock(detail_mutex_);
+            failed = failed_;
+            detail = std::move(first_error_detail_);
+        }
+        if (!failed) {
+            for (const auto& copy_back : copy_backs_) {
+                std::memcpy(copy_back.dest, copy_back.source, copy_back.size);
+            }
+        }
+        NofOperationState::set_completed(
+            failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK,
+            std::move(detail));
+    }
+
+   private:
+    std::vector<NofStagingBuffer> staging_;
+    std::vector<CopyBack> copy_backs_;
+    std::atomic<int> pending_parts_;
+    std::mutex detail_mutex_;
+    bool failed_ = false;
+    std::string first_error_detail_;
+};
 
 /**
  * @brief NoF operation descriptor (byte-oriented, opaque handle)
