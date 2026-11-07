@@ -37,6 +37,12 @@ namespace xpu_ep {
 // there is no IBGDA, NCCL or hybrid (scale-out) mode, and those arguments are
 // rejected rather than ignored. The constructor additionally takes the
 // torch.xpu stream (`sycl_queue`) to allocate on.
+//
+// The kernels run on the caller's stream. Setting
+// MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE (experimental, off by
+// default) runs them on a queue of the buffer's own instead, as CUDA runs
+// them on a communication stream; only launchQueue, finish and maxWgs differ
+// between the two.
 class MooncakeEpXpuElasticBuffer {
    public:
     MooncakeEpXpuElasticBuffer(
@@ -82,6 +88,12 @@ class MooncakeEpXpuElasticBuffer {
     // their grids from the device's compute units. Both launch on the
     // compute stream; with async_with_compute_stream they return an event
     // the caller can wait on, else nothing.
+    //
+    // With the communication queue they launch there once the work queued on
+    // the compute stream is done, and num_sms caps the work-groups of the
+    // kernels whose grid is not fixed by the number of ranks or experts.
+    // Without async_with_compute_stream the compute stream then waits for
+    // them; with it, compute queued meanwhile can overlap them.
     std::optional<XpuEventHandle> dispatch(
         uint64_t x_ptr, int x_element_size, uint64_t sf_ptr, int num_tokens,
         int hidden, int num_sf_packs, int sf_token_stride, int sf_hidden_stride,
@@ -118,15 +130,25 @@ class MooncakeEpXpuElasticBuffer {
     };
     void checkAlive() const;
     sycl::queue& queueFor(uint64_t stream_ptr);
-    // Both need mu_ held.
+    // All need mu_ held. launchQueue orders the call after the previous ones
+    // and returns the queue to launch on; finish records the launch and
+    // returns what dispatch and combine return.
     void orderAfterLast(sycl::queue& q);
     Half takeHalf(size_t need_bytes);
+    sycl::queue& launchQueue(sycl::queue& q);
+    std::optional<XpuEventHandle> finish(sycl::queue& q, sycl::event done,
+                                         bool async_with_compute_stream);
+    int maxWgs(int num_sms) const;
 
     int rank_, num_ranks_;
     size_t half_stride_;
     int64_t timeout_ticks_;
     int max_wgs_;
     sycl::queue queue_;
+    // The communication queue, set only with
+    // MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE. In order, so calls run
+    // in issue order: they share the arrival counter and the buffer halves.
+    std::optional<sycl::queue> comm_queue_;
     std::unique_ptr<XpuIpcBuffer> ipc_;
     uint8_t* workspace_ = nullptr;
 

@@ -10,6 +10,7 @@ from .mooncake_ep_buffer import (
     _device_type,
     _native_current_stream_ptr,
     _synchronize_device,
+    _wait_native_event_on_current_stream,
 )
 from .mooncake_ep_tcpstore import TCPStoreCollectives
 
@@ -1313,7 +1314,9 @@ class ElasticBuffer:
 
     def get_theoretical_num_sms(self, num_experts: int, num_topk: int) -> int:
         if _ep_device_type() == "xpu":
-            # The XPU kernels size their grids themselves and ignore num_sms.
+            # The XPU kernels ignore num_sms unless
+            # MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE is set; then it
+            # caps their work-groups, with the same defaults as on CUDA.
             props = torch.xpu.get_device_properties(torch.xpu.current_device())
             sm_count = int(getattr(props, "max_compute_units", 1))
         else:
@@ -1579,6 +1582,13 @@ class ElasticBuffer:
 
         num_recv_tokens_per_expert_list: List[int] = []
         if do_cpu_sync:
+            # With async_with_compute_stream the dispatch kernels run on the
+            # communication stream, but .cpu() copies on the compute stream. Make
+            # the compute stream wait for the dispatch so the copy reads the
+            # final counts. This makes do_cpu_sync=True effectively synchronous:
+            # for overlap, pass do_cpu_sync=False or a cached handle.
+            if async_with_compute_stream:
+                _wait_native_event_on_current_stream(event)
             scaleup_psum_cpu = psum_num_recv_tokens_per_scaleup_rank.cpu()
             expert_psum_cpu = full_psum_num_recv_tokens_per_expert.cpu()
             actual_num_recv_tokens = int(

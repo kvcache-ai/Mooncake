@@ -176,9 +176,16 @@ rank travels back. It differs from CUDA in that:
 - Kernels run on the caller's `torch.xpu` stream, also with
   `async_with_compute_stream=True`, so communication does not overlap compute
   queued on that stream. The returned `EventOverlap` works as on CUDA.
-- `num_sms`, `prefer_overlap_with_compute`, `sl_idx`, `num_allocated_qps` and
-  `num_cpu_timeout_secs` are accepted and ignored; the kernels size their
-  grids from the device's compute units.
+- `MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE=1` (experimental, off by
+  default) runs the kernels on a queue of the buffer's own once the compute
+  stream's queued work is done, as CUDA runs them on a communication stream.
+  With `async_with_compute_stream=True` they can then overlap compute queued
+  later, and `num_sms` caps their work-groups. Whether the GPU runs the two
+  concurrently depends on the device and on the compute kernels.
+- Without that setting, `num_sms` and `prefer_overlap_with_compute` (which
+  lowers the default `num_sms`) are accepted and ignored: the kernels size
+  their grids from the device's compute units. `sl_idx`, `num_allocated_qps`
+  and `num_cpu_timeout_secs` are always ignored.
 - Combine accumulates in FP32 as on CUDA, but in another order, so results can
   differ from CUDA by BF16 rounding.
 

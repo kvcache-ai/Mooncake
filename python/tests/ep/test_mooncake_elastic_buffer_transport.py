@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 import mooncake.mooncake_elastic_buffer as elastic_buffer_module
+import mooncake.mooncake_ep_buffer as ep_buffer_module
 from mooncake.mooncake_ep_buffer import Buffer as LegacyBuffer
 from mooncake.mooncake_elastic_buffer import (
     ElasticBuffer,
@@ -501,3 +502,55 @@ def test_nccl_unique_id_exchange_uses_cpu_metadata(monkeypatch, backend_name) ->
     monkeypatch.setattr(dist, "broadcast", fake_broadcast)
     assert buffer._exchange_nccl_unique_id(fake_ep) == expected_id
     assert broadcasts == [[0], expected_id]
+
+
+@pytest.mark.parametrize(
+    ("do_cpu_sync", "async_with_compute_stream", "expected_calls"),
+    [
+        (True, True, ["dispatch", "wait", "cpu", "cpu"]),
+        (True, False, ["dispatch", "cpu", "cpu"]),
+        (False, True, ["dispatch"]),
+    ],
+)
+def test_dispatch_cpu_sync_waits_for_async_kernels(
+    monkeypatch, do_cpu_sync: bool, async_with_compute_stream: bool, expected_calls
+) -> None:
+    calls = []
+
+    class FakeEvent:
+        def current_stream_wait(self, stream_ptr: int) -> None:
+            calls.append("wait")
+
+    def fake_dispatch(*args) -> FakeEvent:
+        calls.append("dispatch")
+        return FakeEvent()
+
+    original_cpu = torch.Tensor.cpu
+
+    def recording_cpu(self, *args, **kwargs):
+        calls.append("cpu")
+        return original_cpu(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", recording_cpu)
+    monkeypatch.setattr(elastic_buffer_module, "_native_current_stream_ptr", lambda: 0)
+    monkeypatch.setattr(ep_buffer_module, "_native_current_stream_ptr", lambda: 0)
+    buffer = object.__new__(ElasticBuffer)
+    buffer.runtime = types.SimpleNamespace(dispatch=fake_dispatch)
+    buffer.num_ranks = 1
+    buffer.num_scaleup_ranks = 1
+    buffer.num_scaleout_ranks = 1
+    buffer._active_ranks = torch.ones(1, dtype=torch.int32)
+    buffer._generation = 0
+
+    buffer.dispatch(
+        torch.zeros((2, 4), dtype=torch.bfloat16),
+        topk_idx=torch.zeros((2, 1), dtype=torch.int64),
+        num_experts=2,
+        num_max_tokens_per_rank=2,
+        expert_alignment=1,
+        do_cpu_sync=do_cpu_sync,
+        num_sms=1,
+        async_with_compute_stream=async_with_compute_stream,
+    )
+
+    assert calls == expected_calls
