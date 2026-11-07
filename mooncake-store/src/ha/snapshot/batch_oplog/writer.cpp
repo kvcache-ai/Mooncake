@@ -104,10 +104,15 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
 
     ha::BatchOpLogSnapshotManifest manifest;
     const bool has_weight_state =
-        capture.weight_metadata != WeightMetadataSnapshot{};
+        capture.weight_metadata != WeightMetadataSnapshot{} ||
+        capture.object_storage.target.has_value();
     if (has_weight_state) {
         manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
         manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
+    }
+    if (capture.object_storage.target) {
+        manifest.schema_version = ha::kBatchOpLogObjectSnapshotSchemaVersion;
+        manifest.snapshot_format = ha::kBatchOpLogObjectSnapshotFormat;
     }
     manifest.snapshot_id = snapshot_id;
     manifest.last_included_seq = capture.last_included_seq;
@@ -148,6 +153,20 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
         std::vector<uint8_t>().swap(weights);
     }
 
+    if (capture.object_storage.target) {
+        auto bytes = struct_pack::serialize<std::vector<uint8_t>>(
+            capture.object_storage);
+        const auto key = ha::BuildBatchOpLogSnapshotObjectStorageKey(
+            snapshot_root, snapshot_id);
+        manifest.object_storage = ha::BatchOpLogSnapshotObjectDescriptor{
+            .key = key,
+            .stored_size = bytes.size(),
+            .crc32c = Crc32cValue(bytes.data(), bytes.size())};
+        upload = object_store_.UploadBuffer(key, bytes);
+        if (!upload)
+            return fail("Failed to upload object storage state: " +
+                        upload.error());
+    }
     uint64_t chunk_index = 0;
     while (!capture.done()) {
         std::vector<StandbyObjectEntry> objects;
@@ -186,6 +205,12 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
                      manifest.segments.stored_size, manifest.segments.crc32c);
     if (!verify) {
         return fail(std::move(verify.error()));
+    }
+    if (manifest.object_storage) {
+        const auto& objects = *manifest.object_storage;
+        verify = VerifyObject(object_store_, objects.key, objects.stored_size,
+                              objects.crc32c);
+        if (!verify) return fail(std::move(verify.error()));
     }
     if (manifest.weight_metadata) {
         verify = VerifyObject(object_store_, manifest.weight_metadata->key,
@@ -255,6 +280,8 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
             metrics.chunk_bytes + manifest.segments.stored_size +
             (manifest.weight_metadata ? manifest.weight_metadata->stored_size
                                       : 0) +
+            (manifest.object_storage ? manifest.object_storage->stored_size
+                                     : 0) +
             manifest_json.size() + descriptor_json.size();
     });
     return metric_timer.Success(descriptor_json);
