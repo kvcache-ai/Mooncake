@@ -556,6 +556,34 @@ Performs a batch read operation to transfer multiple data chunks from remote buf
 **Raises:**
 - `RuntimeError`: If the segment cannot be opened or if the `cudaLaunchHostFunc` call fails.
 
+### Managed Single-Range Transfers
+
+`submit_transfer(target_hostname, buffer, peer_buffer_address, length, opcode)`
+submits one registered byte range and returns a `ScatterTransferTicket`. Use
+`TransferEngine.TransferOpcode.Read` or `TransferEngine.TransferOpcode.Write`.
+The ticket retains its engine and uses the existing scatter operation ownership;
+it does not expose a raw batch ID.
+
+Call `ticket.poll()` to obtain `(completed, error)`. Pending work returns
+`(False, "")`; success returns `(True, "")`; a drained failure returns
+`(True, error_message)`. Polling releases the Python GIL. `ticket.drain(timeout_ms)`
+remains available when a bounded blocking wait is preferred.
+
+A wait timeout does not cancel DMA. Keep local and remote registered buffers
+alive until completion, and coordinate with peers before unregistering them.
+Dropping an unfinished ticket may block while native I/O drains. Do not submit
+from a CUDA host callback; the caller must establish CUDA producer/consumer
+ordering outside that callback.
+
+`get_endpoint()` returns the engine's actual metadata endpoint. Exchange it
+through a trusted control plane. `refresh_remote(target_hostname)` refreshes
+cached segment registrations after the peer changes its registered memory.
+Both submission and endpoint lookup reject an uninitialized engine.
+
+An explicit `protocol="tcp"` selects TCP even on hosts with RDMA devices. CUDA
+TCP staging uses a private nonblocking stream, allowing a graph replay on the
+default stream to wait for the transfer without a circular stream dependency.
+
 ### Buffer I/O Operations
 
 #### write_bytes_to_buffer()
