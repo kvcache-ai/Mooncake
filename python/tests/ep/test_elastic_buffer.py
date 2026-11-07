@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-topk", type=int, default=8)
     parser.add_argument("--num-sms", type=int, default=24)
     parser.add_argument(
+        "--expert-alignment",
+        type=int,
+        default=1,
+        help="expert_alignment for the expanded dispatch stage.",
+    )
+    parser.add_argument(
         "--transport",
         choices=("auto", "ibgda", "nccl", "ipc"),
         default=os.getenv("MOONCAKE_EP_TRANSPORT", "auto"),
@@ -624,14 +630,15 @@ def main() -> None:
     expected2 = (x2.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
     check_combined(rank=rank, combined=combined2, expected=expected2, label="async")
 
-    # Expanded dispatch layout: check output extent and metadata shape.
+    # Expanded dispatch layout: check output extent, metadata shape, and that
+    # combine sums every pick.
     expanded_recv, expanded_idx, expanded_w, expanded_handle, _ = buffer.dispatch(
         x0,
         topk_idx=route_plan.topk_idx,
         topk_weights=weights,
         num_experts=num_experts,
         num_max_tokens_per_rank=max_tokens,
-        expert_alignment=1,
+        expert_alignment=args.expert_alignment,
         do_expand=True,
         do_cpu_sync=True,
         num_sms=args.num_sms,
@@ -643,13 +650,28 @@ def main() -> None:
     )
     if expanded_actual != route_plan.expected_recv_tokens:
         raise AssertionError(f"rank={rank}: expanded dispatch received-token mismatch")
-    expanded_output = int(expanded_handle.psum_num_recv_tokens_per_expert[-1].item())
+    # The expanded psum holds each expert's end, then the aligned total; the
+    # output ends at the last expert's end.
+    expanded_output = int(expanded_handle.psum_num_recv_tokens_per_expert[-2].item())
     if expanded_recv.shape[0] != expanded_output:
         raise AssertionError(f"rank={rank}: expanded output extent mismatch")
     if expanded_w is not None and expanded_w.shape[0] != expanded_output:
         raise AssertionError(f"rank={rank}: expanded weights extent mismatch")
     if expanded_idx.shape[0] != expanded_actual:
         raise AssertionError(f"rank={rank}: expanded metadata extent mismatch")
+    expanded_combined, _, _ = buffer.combine(
+        expanded_recv.contiguous(),
+        expanded_handle,
+        num_sms=args.num_sms,
+        async_with_compute_stream=False,
+    )
+    synchronize()
+    check_combined(
+        rank=rank,
+        combined=expanded_combined,
+        expected=(x0.float() * args.num_topk).to(torch.bfloat16),
+        label="expanded",
+    )
 
     if args.reconfigure:
         if buffer.transport != "nccl":
@@ -730,7 +752,7 @@ def main() -> None:
             world_size=world_size,
             max_tokens=max_tokens,
             num_experts=num_experts,
-            expert_alignment=1,
+            expert_alignment=args.expert_alignment,
             transport_kwargs=transport_kwargs,
         )
 

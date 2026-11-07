@@ -298,8 +298,13 @@ sycl::event dispatch_copy(sycl::queue& q, const ElasticDispatchArgs a,
                 // A cached handle sized for fewer tokens than now arrive
                 // (a different routing) must not write past its outputs.
                 const int N = sycl::min(s_rank_start[R], a.num_recv_tokens);
-                const size_t out_rows = static_cast<size_t>(a.num_recv_tokens) *
-                                        (a.do_expand ? K : 1);
+                // The capacity mooncake_elastic_buffer.py allocates: expanded,
+                // K rows per token plus alignment padding for each expert.
+                const size_t out_rows =
+                    a.do_expand ? static_cast<size_t>(a.num_recv_tokens) * K +
+                                      static_cast<size_t>(num_local) *
+                                          (a.expert_alignment - 1)
+                                : static_cast<size_t>(a.num_recv_tokens);
 
                 if (wg == 0 && tid == 0) {
                     for (int r = 0; r < R; ++r)
