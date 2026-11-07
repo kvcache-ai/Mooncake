@@ -15,6 +15,8 @@
 #include "mooncake_ep_xpu_elastic_buffer.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <string>
 
 #include "xpu_ep_elastic_kernels.h"
@@ -33,6 +35,16 @@ constexpr size_t kRecvCountOffset = 0;
 constexpr size_t kExpertCountOffset = kMaxRanks * sizeof(int);
 constexpr size_t kDoneOffset = kExpertCountOffset + kMaxExperts * sizeof(int);
 constexpr size_t kWorkspaceBytes = kDoneOffset + kLineBytes;
+
+// As _env_enabled in mooncake_ep_buffer.py.
+bool envEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    std::string s(value);
+    for (char& ch : s)
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    return s == "1" || s == "ON" || s == "TRUE" || s == "YES";
+}
 
 sycl::queue* asQueue(uint64_t stream_ptr) {
     XPU_EP_CHECK(stream_ptr != 0,
@@ -58,9 +70,7 @@ MooncakeEpXpuElasticBuffer::MooncakeEpXpuElasticBuffer(
     int num_allocated_qps, int num_cpu_timeout_secs, int num_gpu_timeout_secs,
     const std::string& transport, const std::vector<int32_t>& nccl_unique_id,
     uint64_t stream_ptr)
-    : rank_(rank),
-      num_ranks_(num_ranks),
-      queue_(*asQueue(stream_ptr)) {
+    : rank_(rank), num_ranks_(num_ranks), queue_(*asQueue(stream_ptr)) {
     // Shape hints, the hybrid switch (a single node never needs it), and the
     // RDMA and SM knobs have nothing to act on here. Every slot is assigned in
     // token order, so dispatch is deterministic either way.
@@ -88,6 +98,9 @@ MooncakeEpXpuElasticBuffer::MooncakeEpXpuElasticBuffer(
                  "invalid rank or number of ranks");
     XPU_EP_CHECK(num_buffer_bytes > 0, "buffer size must be positive");
     XPU_EP_CHECK(queue_.is_in_order(), "the torch.xpu stream must be in-order");
+    if (envEnabled("MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE"))
+        comm_queue_.emplace(queue_.get_context(), queue_.get_device(),
+                            sycl::property::queue::in_order{});
     half_stride_ = static_cast<size_t>(num_buffer_bytes) / 2 / 4096 * 4096;
     XPU_EP_CHECK(half_stride_ > 0, "buffer too small");
 
@@ -191,6 +204,34 @@ void MooncakeEpXpuElasticBuffer::orderAfterLast(sycl::queue& q) {
     last_queue_ = q;
 }
 
+sycl::queue& MooncakeEpXpuElasticBuffer::launchQueue(sycl::queue& q) {
+    if (comm_queue_) {
+        // In order, so after every earlier call; and after the compute
+        // stream's queued work, which produces the inputs.
+        comm_queue_->ext_oneapi_submit_barrier({q.ext_oneapi_submit_barrier()});
+        return *comm_queue_;
+    }
+    orderAfterLast(q);
+    return q;
+}
+
+std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::finish(
+    sycl::queue& q, sycl::event done, bool async_with_compute_stream) {
+    last_event_ = done;
+    if (comm_queue_) {
+        if (async_with_compute_stream) return XpuEventHandle(std::move(done));
+        q.ext_oneapi_submit_barrier({done});
+        return std::nullopt;
+    }
+    if (!async_with_compute_stream) return std::nullopt;
+    return XpuEventHandle(q.ext_oneapi_submit_barrier());
+}
+
+int MooncakeEpXpuElasticBuffer::maxWgs(int num_sms) const {
+    if (!comm_queue_ || num_sms <= 0) return max_wgs_;
+    return std::min(num_sms, max_wgs_);
+}
+
 MooncakeEpXpuElasticBuffer::Half MooncakeEpXpuElasticBuffer::takeHalf(
     size_t need_bytes) {
     XPU_EP_CHECK(need_bytes <= half_stride_,
@@ -219,7 +260,6 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::dispatch(
     uint64_t channel_linked_list_ptr, uint64_t recv_x_ptr,
     uint64_t recv_x_scales_ptr, uint64_t recv_topk_idx_ptr,
     uint64_t recv_topk_weights_ptr, uint64_t recv_src_metadata_ptr) {
-    (void)num_sms;
     checkAlive();
     XPU_EP_CHECK(
         token_metadata_at_forward_ptr == 0 && channel_linked_list_ptr == 0,
@@ -267,7 +307,7 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::dispatch(
 
     std::lock_guard<std::mutex> lock(mu_);
     const Half half = takeHalf(hl.ready_bytes + hl.dispatch_end);
-    orderAfterLast(q);
+    sycl::queue& launch_q = launchQueue(q);
 
     ElasticDispatchArgs a{};
     a.x = reinterpret_cast<const void*>(x_ptr);
@@ -307,11 +347,9 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::dispatch(
     a.num_ranks = num_ranks_;
     a.do_expand = do_expand;
     a.timeout_ticks = timeout_ticks_;
-    a.max_wgs = max_wgs_;
+    a.max_wgs = maxWgs(num_sms);
 
-    last_event_ = elastic_dispatch(q, a);
-    if (!async_with_compute_stream) return std::nullopt;
-    return XpuEventHandle(q.ext_oneapi_submit_barrier());
+    return finish(q, elastic_dispatch(launch_q, a), async_with_compute_stream);
 }
 
 std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
@@ -324,7 +362,6 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
     bool async_with_compute_stream, uint64_t compute_stream_ptr,
     uint64_t combined_x_ptr) {
     (void)topk_weights_ptr;
-    (void)num_sms;
     checkAlive();
     XPU_EP_CHECK(
         token_metadata_at_forward_ptr == 0 && channel_linked_list_ptr == 0,
@@ -358,7 +395,7 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
 
     std::lock_guard<std::mutex> lock(mu_);
     const Half half = takeHalf(hl.ready_bytes + hl.combine_end);
-    orderAfterLast(q);
+    sycl::queue& launch_q = launchQueue(q);
 
     ElasticCombineArgs a{};
     a.x = reinterpret_cast<const void*>(x_ptr);
@@ -383,11 +420,9 @@ std::optional<XpuEventHandle> MooncakeEpXpuElasticBuffer::combine(
     a.num_ranks = num_ranks_;
     a.do_expand = do_expand;
     a.timeout_ticks = timeout_ticks_;
-    a.max_wgs = max_wgs_;
+    a.max_wgs = maxWgs(num_sms);
 
-    last_event_ = elastic_combine(q, a);
-    if (!async_with_compute_stream) return std::nullopt;
-    return XpuEventHandle(q.ext_oneapi_submit_barrier());
+    return finish(q, elastic_combine(launch_q, a), async_with_compute_stream);
 }
 
 }  // namespace xpu_ep
