@@ -77,6 +77,8 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "RpcConnectionError";
         case Code::kMalformedJson:
             return "MalformedJson";
+        case Code::kTimeout:
+            return "Timeout";
         case Code::kInternalError:
             return "InternalError";
         case Code::kNotImplemented:

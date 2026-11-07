@@ -109,6 +109,7 @@ class Status final {
         kRpcServiceError = 132,
         kMalformedJson = 133,
         kRpcConnectionError = 134,  // Failed before dispatching the request.
+        kTimeout = 135,
         kInternalError = 199,
 
         kNotImplemented = 200,
@@ -170,6 +171,7 @@ class Status final {
         return Status(Code::kRpcServiceError, msg);
     }
     TYPE_CHECK(MalformedJson);
+    TYPE_CHECK(Timeout);
     TYPE_CHECK(InternalError);
 
     TYPE_CHECK(NotImplemented);

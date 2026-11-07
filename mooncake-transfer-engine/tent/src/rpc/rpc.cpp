@@ -16,6 +16,8 @@
 #include <glog/logging.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include <chrono>
+#include <optional>
 #include <stdexcept>
 
 #include "transfer_engine_rpc_client_io_context.h"
@@ -241,15 +243,27 @@ bool peerAnswered(coro_rpc::errc ec) {
 
 }  // namespace
 
-Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
+Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutineWithTimeout(
     std::string server_addr, int func_id, std::string request,
-    bool retry_rpc_error_once) {
+    bool retry_rpc_error_once,
+    std::optional<std::chrono::milliseconds> call_timeout) {
     if (tl_inside_rpc_handler) {
         co_return std::make_pair(
             Status::InvalidArgument(
                 "RPC call from RPC handler is forbidden" LOC_MARK),
             "");
     }
+
+    const auto started_at = std::chrono::steady_clock::now();
+    auto remainingTimeout = [&]() -> std::optional<std::chrono::milliseconds> {
+        if (!call_timeout.has_value() || call_timeout->count() < 0)
+            return call_timeout;
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started_at);
+        if (elapsed >= *call_timeout) return std::chrono::milliseconds(0);
+        return *call_timeout - elapsed;
+    };
 
     const int max_attempts = retry_rpc_error_once ? 2 : 1;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
@@ -262,7 +276,19 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         if (!lease.client) {
             lease.client = std::make_unique<coro_rpc_client>(
                 GetTransferEngineRpcClientIoContextPool().get_executor());
-            auto conn_result = co_await lease.client->connect(server_addr);
+            const auto connect_timeout = remainingTimeout();
+            if (connect_timeout.has_value() && connect_timeout->count() == 0) {
+                lease.broken = true;
+                co_return std::make_pair(
+                    Status::RpcConnectionError(
+                        "RPC connect budget exhausted" LOC_MARK),
+                    "");
+            }
+            auto conn_result =
+                connect_timeout.has_value()
+                    ? co_await lease.client->connect(server_addr,
+                                                     *connect_timeout)
+                    : co_await lease.client->connect(server_addr);
             if (conn_result.val() != 0) {
                 lease.broken = true;
                 auto msg =
@@ -275,10 +301,19 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
             }
         }
 
-        lease->set_req_attachment(request);
+        coro_rpc::request_config_t request_config;
+        request_config.request_timeout_duration = remainingTimeout();
+        if (request_config.request_timeout_duration.has_value() &&
+            request_config.request_timeout_duration->count() == 0) {
+            co_return std::make_pair(
+                Status::RpcConnectionError(
+                    "RPC budget exhausted before request dispatch" LOC_MARK),
+                "");
+        }
+        request_config.request_attachment = request;
 
-        auto call_result =
-            co_await lease->call<&CoroRpcAgent::process>(func_id);
+        auto call_result = co_await lease->call<&CoroRpcAgent::process>(
+            std::move(request_config), func_id);
 
         if (!call_result.has_value()) {
             lease.broken = true;
@@ -292,6 +327,10 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
                        ", func_id: " + std::to_string(func_id) +
                        ", message: " + std::string{call_result.error().msg};
             if (attempt + 1 < max_attempts) continue;
+            if (call_timeout.has_value() && call_timeout->count() >= 0 &&
+                call_result.error().code == coro_rpc::errc::timed_out) {
+                co_return std::make_pair(Status::Timeout(msg + LOC_MARK), "");
+            }
             co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK),
                                      "");
         }
@@ -309,6 +348,14 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         Status::InternalError("RPC retry loop exhausted" LOC_MARK), "");
 }
 
+Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
+    std::string server_addr, int func_id, std::string request,
+    bool retry_rpc_error_once) {
+    return callCoroutineWithTimeout(std::move(server_addr), func_id,
+                                    std::move(request), retry_rpc_error_once,
+                                    std::nullopt);
+}
+
 Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
                           const std::string_view& request,
                           std::string& response) {
@@ -321,10 +368,38 @@ Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
     return status;
 }
 
+Status CoroRpcAgent::callWithTimeout(const std::string& server_addr,
+                                     int func_id,
+                                     const std::string_view& request,
+                                     std::string& response,
+                                     std::chrono::milliseconds call_timeout) {
+    auto [status, resp] =
+        async_simple::coro::syncAwait(callCoroutineWithTimeout(
+            server_addr, func_id, std::string(request), false, call_timeout));
+
+    if (status.ok()) {
+        response = std::move(resp);
+    }
+    return status;
+}
+
 Status CoroRpcAgent::callOwned(const std::string& server_addr, int func_id,
                                std::string request, std::string& response) {
     auto [status, resp] = async_simple::coro::syncAwait(
         callCoroutine(server_addr, func_id, std::move(request)));
+
+    if (status.ok()) {
+        response = std::move(resp);
+    }
+    return status;
+}
+
+Status CoroRpcAgent::callOwnedWithTimeout(
+    const std::string& server_addr, int func_id, std::string request,
+    std::string& response, std::chrono::milliseconds call_timeout) {
+    auto [status, resp] =
+        async_simple::coro::syncAwait(callCoroutineWithTimeout(
+            server_addr, func_id, std::move(request), false, call_timeout));
 
     if (status.ok()) {
         response = std::move(resp);
