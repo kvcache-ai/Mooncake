@@ -4001,6 +4001,25 @@ TEST_F(RdmaWorkersSharedQpTest,
     EXPECT_EQ(cq_.getQuota(), 5);
 }
 
+TEST_F(RdmaWorkersSharedQpTest, SubmitSlicesHonorsCandidateLimit) {
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> slices;
+    for (int index = 0; index < 5; ++index) slices.push_back(makeSlice());
+
+    ASSERT_EQ(endpoint_->submitSlices(slices, /*qp_index=*/0, nullptr,
+                                      /*max_slices=*/2),
+              2);
+    ASSERT_EQ(post_order.size(), 2u);
+    EXPECT_EQ(post_order[0], slices[0]);
+    EXPECT_EQ(post_order[1], slices[1]);
+    EXPECT_EQ(RdmaEndPointTestPeer::queueSize(endpoint_, 0), 2u);
+    EXPECT_EQ(slices[0]->completions_owed.load(), 1);
+    EXPECT_EQ(slices[1]->completions_owed.load(), 1);
+    EXPECT_EQ(slices[2]->completions_owed.load(), 0);
+    EXPECT_EQ(slices[3]->completions_owed.load(), 0);
+    EXPECT_EQ(slices[4]->completions_owed.load(), 0);
+}
+
 TEST_F(RdmaWorkersSharedQpTest,
        SelectiveSignalingCapsIntervalAtHalfTheSqDepth) {
     params_->endpoint.max_qp_wr = 8;
