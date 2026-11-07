@@ -157,6 +157,22 @@ class SubmitTransferTaskTest : public ::testing::Test {
         triggerError(req, task);
         return task.slice_list.front()->rdma.source_lkey;
     }
+
+    // Submits one WRITE from [source, source + length) and returns the status.
+    Status submitSingle(uint64_t source, size_t length) {
+        Transport::TransferRequest req;
+        req.opcode = Transport::TransferRequest::WRITE;
+        req.source = reinterpret_cast<void *>(source);
+        req.length = length;
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = 0;
+        Transport::TransferTask task;
+        task.request = &req;
+        task.batch_id = transport_->allocateBatchID(1);
+        auto status = transport_->submitTransferTask({&task});
+        EXPECT_EQ(transport_->freeBatchID(task.batch_id), Status::OK());
+        return status;
+    }
 };
 
 TEST_F(SubmitTransferTaskTest, NicHintUsesExistingTailPadding) {
@@ -304,6 +320,30 @@ TEST_F(SubmitTransferTaskTest, GroupedRequestsReportFailurePerRequest) {
               Status::OK());
     EXPECT_EQ(request_statuses, std::vector(2, status.s));
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+// The two causes of AddressNotRegistered need different fixes, so the error
+// says which one it is.
+TEST_F(SubmitTransferTaskTest, UnregisteredSourceReportsNoCoveringBuffer) {
+    auto status = submitSingle(kBufferAddr + 4 * block_size_, block_size_);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    EXPECT_NE(status.message().find("no registered buffer covers"),
+              std::string_view::npos)
+        << status.message();
+}
+
+TEST_F(SubmitTransferTaskTest, InactiveRnicsAreNamedForRegisteredSource) {
+    for (const auto &context : transport_->getContextList())
+        context->set_active(false);
+    auto status = submitSingle(kBufferAddr, block_size_);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    const std::string message(status.message());
+    EXPECT_NE(message.find("covered by buffer"), std::string::npos) << message;
+    EXPECT_NE(message.find("at cpu:0"), std::string::npos) << message;
+    EXPECT_NE(message.find("mlx5_local inactive"), std::string::npos)
+        << message;
+    EXPECT_NE(message.find("mlx5_global inactive"), std::string::npos)
+        << message;
 }
 
 TEST_F(SubmitTransferTaskTest,

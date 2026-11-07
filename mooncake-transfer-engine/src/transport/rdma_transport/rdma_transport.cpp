@@ -28,6 +28,7 @@
 #include <cstring>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -134,6 +135,47 @@ static uint64_t bytesUntilBufferEnd(
         }
     }
     return max_remaining;
+}
+
+// Says why no RNIC could be selected for [address, address + length): no
+// registered buffer covers the range, or one does but none of the RNICs is
+// active. The two need different fixes, and the bare address does not tell
+// them apart.
+static std::string describeUnselectableRange(
+    const TransferMetadata::SegmentDesc *segment_desc, uint64_t address,
+    size_t length, const std::vector<std::shared_ptr<RdmaContext>> &contexts) {
+    const TransferMetadata::BufferDesc *covering = nullptr;
+    if (segment_desc) {
+        for (const auto &buffer : segment_desc->buffers) {
+#ifdef ENABLE_MULTI_PROTOCOL
+            if (!buffer.protocol.empty() && buffer.protocol != "rdma") continue;
+#endif
+            if (bufferCoversRange(buffer.addr, buffer.length, address,
+                                  length)) {
+                covering = &buffer;
+                break;
+            }
+        }
+    }
+
+    std::ostringstream reason;
+    if (!covering) {
+        reason << "no registered buffer covers " << length
+               << " bytes at this address; registered buffers: "
+               << (segment_desc ? segment_desc->buffers.size() : 0);
+        return reason.str();
+    }
+    reason << "covered by buffer " << reinterpret_cast<void *>(covering->addr)
+           << "+" << covering->length << " at " << covering->name
+           << ", but no active RNIC was selected; RNICs:";
+    const char *separator = " ";
+    for (const auto &context : contexts) {
+        if (!context) continue;
+        reason << separator << context->deviceName()
+               << (context->active() ? " active" : " inactive");
+        separator = ", ";
+    }
+    return reason.str();
 }
 
 // Calculate slice length capped at MR boundary to avoid multi-MR WRs.
@@ -1416,13 +1458,18 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
+                const std::string reason = describeUnselectableRange(
+                    local_segment_desc.get(),
+                    reinterpret_cast<uint64_t>(source_addr), slice->length,
+                    context_list_);
                 fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
-                    << source_addr;
+                    << source_addr << " (" << reason << ")";
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active device(s): " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)) +
+                    " (" + reason + ")");
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
