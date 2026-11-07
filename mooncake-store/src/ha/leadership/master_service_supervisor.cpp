@@ -26,6 +26,7 @@
 #include "rpc_service.h"
 #include "rpc_worker_pool.h"
 #include "shutdown_request.h"
+#include "traffic/ylt_adapter.h"
 
 namespace mooncake {
 namespace ha {
@@ -726,7 +727,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 
         LOG(INFO) << "Starting serve phase...";
-        coro_rpc::coro_rpc_server server(
+        traffic::RecordingServer server(
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
         if (RpcProtocolConfig::FromEnvironment().use_rdma) {

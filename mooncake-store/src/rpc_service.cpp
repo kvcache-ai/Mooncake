@@ -8,11 +8,15 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include <glog/logging.h>
+
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "rpc_worker_pool.h"
 #include "rpc_helper.h"
+#include "traffic/ylt_adapter.h"
+#include "traffic/traffic_recorder.h"
 #include "types.h"
 #include "common/scoped_vlog_timer.h"
 #include "version.h"
@@ -2055,11 +2059,10 @@ WrappedMasterService::RestoreFromBatchOpLogPromotion(
 namespace {
 
 template <auto... Methods>
-void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
-                            WrappedMasterService& service,
+void RegisterPooledHandlers(auto& server, WrappedMasterService& service,
                             RpcWorkerPool* worker_pool) {
     if (worker_pool == nullptr) {
-        server.register_handler<Methods...>(&service);
+        (server.template register_handler<Methods>(&service), ...);
         return;
     }
     (worker_pool->Register<Methods>(server, service), ...);
@@ -2067,11 +2070,12 @@ void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
 
 }  // namespace
 
-void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+template <typename Server>
+void RegisterRpcService(Server& server,
                         WrappedMasterService& wrapped_master_service,
                         RpcWorkerPool* worker_pool) {
-    server.register_handler<&WrappedMasterService::Ping,
-                            &WrappedMasterService::ServiceReady>(
+    server.template register_handler<&WrappedMasterService::Ping,
+                                     &WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
     RegisterPooledHandlers<
         &WrappedMasterService::ExistKey, &WrappedMasterService::ProbeKey,
@@ -2145,15 +2149,24 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
     // The prefetch additions stay individual registrations on top of the
     // pool: read-only replica queries (no lease, no promotion-on-hit, no
     // metrics) and the prefetch task RPC. Purely additive for old peers.
-    server.register_handler<
+    server.template register_handler<
         &mooncake::WrappedMasterService::GetReplicaListForAdmin>(
         &wrapped_master_service);
-    server.register_handler<
+    server.template register_handler<
         &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
         &wrapped_master_service);
-    server.register_handler<
+    server.template register_handler<
         &mooncake::WrappedMasterService::RegisterPrefetchTask>(
         &wrapped_master_service);
+    traffic::TrafficRecorder::Instance().Install();
+    if (traffic::TrafficRecorder::Instance().GetStatus().state == "error") {
+        LOG(FATAL) << "traffic recorder configuration failed";
+    }
 }
+
+template void RegisterRpcService<traffic::RecordingServer>(
+    traffic::RecordingServer&, WrappedMasterService&, RpcWorkerPool*);
+template void RegisterRpcService<coro_rpc::coro_rpc_server>(
+    coro_rpc::coro_rpc_server&, WrappedMasterService&, RpcWorkerPool*);
 
 }  // namespace mooncake
