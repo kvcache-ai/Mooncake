@@ -302,15 +302,12 @@ void TrafficRecorder::StopInternal() {
         writer_thread_.join();
     }
     if (sink_ != nullptr) {
-        std::vector<char> tail_block;
-        std::uint32_t tail_records = 0;
         {
             std::lock_guard<std::mutex> lock(shards_mu_);
             for (auto& shard : shards_) {
-                DrainShard(*shard, tail_block, tail_records);
+                DrainShardDirect(*shard);
             }
         }
-        FlushBlock(tail_block, tail_records);
         sink_->Flush();
         sink_->Close();
     }
@@ -542,68 +539,6 @@ bool TrafficRecorder::FlushRecords(Shard& shard,
     shard.tail.store(commit_tail, std::memory_order_release);
     iov.clear();
     return true;
-}
-
-void TrafficRecorder::DrainShard(Shard& shard, std::vector<char>& block,
-                                 std::uint32_t& block_records) {
-    std::uint64_t tail = shard.tail.load(std::memory_order_acquire);
-    const std::uint64_t head = shard.head.load(std::memory_order_acquire);
-    while (tail != head) {
-        const std::uint64_t index = tail & shard.mask;
-        if (index + kTrafficPadSize > shard.capacity) {
-            tail += shard.capacity - index;
-            shard.tail.store(tail, std::memory_order_release);
-            continue;
-        }
-        std::uint32_t pad_len = 0;
-        std::uint32_t pad_magic = 0;
-        std::memcpy(&pad_len, shard.ring.get() + index, sizeof(pad_len));
-        std::memcpy(&pad_magic, shard.ring.get() + index + sizeof(pad_len),
-                    sizeof(pad_magic));
-        if (pad_magic == kTrafficPadMagic) {
-            if (pad_len < kTrafficPadSize || pad_len > shard.capacity - index) {
-                shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
-                shard.tail.store(head, std::memory_order_release);
-                break;
-            }
-            tail += pad_len;
-            shard.tail.store(tail, std::memory_order_release);
-            continue;
-        }
-        TrafficRecordHeader header;
-        std::memcpy(&header, shard.ring.get() + index, sizeof(header));
-        if (header.total_len < kTrafficRecordHeaderSize ||
-            header.total_len > shard.capacity ||
-            index + header.total_len > shard.capacity) {
-            shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
-            shard.tail.store(head, std::memory_order_release);
-            break;
-        }
-        if (block.size() + header.total_len > block_bytes_) {
-            FlushBlock(block, block_records);
-        }
-        block.insert(block.end(), shard.ring.get() + index,
-                     shard.ring.get() + index + header.total_len);
-        ++block_records;
-        tail += header.total_len;
-        shard.tail.store(tail, std::memory_order_release);
-    }
-}
-
-void TrafficRecorder::FlushBlock(std::vector<char>& block,
-                                 std::uint32_t& block_records) {
-    if (block.empty() || sink_ == nullptr) {
-        block.clear();
-        block_records = 0;
-        return;
-    }
-    if (!sink_->WriteBlock(block.data(),
-                           static_cast<std::uint32_t>(block.size()),
-                           block_records, kTrafficBlockData)) {
-        LOG(ERROR) << "traffic: write block failed";
-    }
-    block.clear();
-    block_records = 0;
 }
 
 void TrafficRecorder::StartControlServer() {

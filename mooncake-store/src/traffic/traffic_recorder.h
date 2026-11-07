@@ -76,13 +76,10 @@ class TrafficRecorder {
     Shard* BindShard();
     bool Allowed(std::uint32_t route_key);
     void WriterLoop();
-    void DrainShard(Shard& shard, std::vector<char>& block,
-                    std::uint32_t& block_records);
     void DrainShardDirect(Shard& shard);
     bool FlushRecords(Shard& shard, std::vector<struct iovec>& iov,
                       std::uint64_t bytes, std::uint32_t records,
                       std::uint64_t commit_tail);
-    void FlushBlock(std::vector<char>& block, std::uint32_t& block_records);
     void StopInternal();
     void StartControlServer();
     std::string StatusJson() const;
