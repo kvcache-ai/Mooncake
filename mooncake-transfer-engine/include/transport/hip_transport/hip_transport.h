@@ -18,6 +18,7 @@
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "transport/hip_transport/batch_copy.h"
 #include "transport/hip_transport/event_pool.h"
 #include "transport/hip_transport/stream_pool.h"
 
@@ -61,35 +62,44 @@ class HipTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void*>& addr_list) override;
 
+    // Maps dest_addr into this process. buffer_addr/buffer_length, if given,
+    // receive the registered buffer that contains it.
     int relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
-                                    uint64_t target_id);
+                                    uint64_t target_id,
+                                    uint64_t* buffer_addr = nullptr,
+                                    uint64_t* buffer_length = nullptr);
 
     const char* getName() const override { return "hip"; }
 
    private:
+    friend class HipTransportTestPeer;
+
     struct OpenedShmEntry {
         void* shm_addr;
         uint64_t length;
     };
 
-    struct PendingTransfer {
-        hipEvent_t event;
-        int device_id;
-        Slice* slice;
-    };
+    // Enqueue the copies without waiting for them; getTransferStatus() polls
+    // the recorded events.
+    Status submitTasks(
+        const std::vector<std::pair<TransferTask*, const TransferRequest*>>&
+            tasks);
 
-    // Start async transfer and return pending transfer info
-    Status startAsyncTransfer(const TransferRequest& request,
-                              TransferTask& task, PendingTransfer& pending);
-
-    // Synchronize pending transfers
-    void synchronizePendingTransfers(
-        std::vector<PendingTransfer>& pending_transfers);
+    // Enqueue one device's copies on one stream, followed by one event.
+    // Slices that could not be enqueued are failed and reported in the
+    // returned status; the others stay tracked by their event.
+    // device_memory[i]: both buffers of slices[i] are device memory.
+    Status submitDeviceCopies(int device_id, const std::vector<Slice*>& slices,
+                              const std::vector<bool>& device_memory);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
     RWSpinlock remap_lock_;
     bool use_fabric_mem_;
+    // IPC mode with peer access between every pair of devices. The batch copy
+    // kernel dereferences peer memory, so it runs only then; hipMemcpyAsync
+    // works without peer access.
+    bool all_peer_access_;
 
     std::mutex register_mutex_;
     // Registered sub-range address → its hipMalloc base; base → live alias
@@ -104,6 +114,11 @@ class HipTransport : public Transport {
     // Stream and event pools for async operations
     StreamPool stream_pool_;
     EventPool event_pool_;
+
+    // A device's submission with at least this many copies goes through
+    // batch_copy_ (0 disables it).
+    size_t batch_copy_min_copies_;
+    BatchCopyKernel batch_copy_;
 };
 
 }  // namespace mooncake
