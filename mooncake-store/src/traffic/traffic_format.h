@@ -6,8 +6,8 @@
 
 namespace mooncake::traffic {
 
-inline constexpr std::uint32_t kTrafficFileMagic = 0x3152434d;  // MCR1
-inline constexpr std::uint32_t kTrafficBlockMagic = 0x4b42434d;  // MCBK
+inline constexpr std::uint32_t kTrafficFileMagic = 0x3152434d;    // MCR1
+inline constexpr std::uint32_t kTrafficBlockMagic = 0x4b42434d;   // MCBK
 inline constexpr std::uint32_t kTrafficFooterMagic = 0x4745434d;  // MCEG
 inline constexpr std::uint16_t kTrafficVersionMajor = 1;
 inline constexpr std::uint16_t kTrafficVersionMinor = 0;

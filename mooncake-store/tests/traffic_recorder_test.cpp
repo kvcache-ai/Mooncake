@@ -48,7 +48,8 @@ TEST(FileSinkTest, StopsAtMaxTotalBytes) {
     FileSink sink(4096, 300, 1024);
     ASSERT_TRUE(sink.OpenSession(dir.path().string(), TrafficNowMs()));
     std::array<char, 512> data{};
-    ASSERT_TRUE(sink.WriteBlock(data.data(), data.size(), 1, kTrafficBlockData));
+    ASSERT_TRUE(
+        sink.WriteBlock(data.data(), data.size(), 1, kTrafficBlockData));
     EXPECT_FALSE(
         sink.WriteBlock(data.data(), data.size() * 2, 1, kTrafficBlockData));
     EXPECT_TRUE(sink.failed());
@@ -61,7 +62,8 @@ TEST(TrafficRecorderTest, RecordsAcrossWrapAndRestarts) {
     {
         std::ofstream out(config_path);
         out << R"({
-          "output_dir": ")" << dir.path().string() << R"(",
+          "output_dir": ")"
+            << dir.path().string() << R"(",
           "ring_bytes": 262144,
           "ring_shards": 2,
           "max_record_bytes": 2048,
@@ -107,7 +109,8 @@ TEST(TrafficRecorderTest, WriterFailureCanBeStoppedAndRestarted) {
     {
         std::ofstream out(config_path);
         out << R"({
-          "output_dir": ")" << dir.path().string() << R"(",
+          "output_dir": ")"
+            << dir.path().string() << R"(",
           "ring_bytes": 262144,
           "ring_shards": 2,
           "max_record_bytes": 2048,

@@ -39,8 +39,7 @@ std::uint64_t FloorPowerOfTwo(std::uint64_t value) {
     return result;
 }
 
-bool ParseSize(const Json::Value& node, const char* name,
-               std::uint64_t* out) {
+bool ParseSize(const Json::Value& node, const char* name, std::uint64_t* out) {
     if (node.isNull()) {
         return true;
     }
@@ -94,7 +93,8 @@ void TrafficRecorder::Install() {
         SetState("error");
         return;
     }
-    if (!root["output_dir"].isString() || root["output_dir"].asString().empty()) {
+    if (!root["output_dir"].isString() ||
+        root["output_dir"].asString().empty()) {
         LOG(ERROR) << "traffic: output_dir is required";
         SetState("error");
         return;
@@ -343,12 +343,17 @@ void TrafficRecorder::WriteSummaryJson(const RecorderStatus& status) const {
     }
     Json::Value root;
     root["state"] = status.state;
-    root["observed_requests"] = static_cast<Json::UInt64>(status.observed_requests);
-    root["recorded_requests"] = static_cast<Json::UInt64>(status.recorded_requests);
-    root["dropped_requests"] = static_cast<Json::UInt64>(status.dropped_requests);
+    root["observed_requests"] =
+        static_cast<Json::UInt64>(status.observed_requests);
+    root["recorded_requests"] =
+        static_cast<Json::UInt64>(status.recorded_requests);
+    root["dropped_requests"] =
+        static_cast<Json::UInt64>(status.dropped_requests);
     root["dropped_ring"] = static_cast<Json::UInt64>(status.dropped_ring);
-    root["dropped_filtered"] = static_cast<Json::UInt64>(status.dropped_filtered);
-    root["dropped_oversize"] = static_cast<Json::UInt64>(status.dropped_oversize);
+    root["dropped_filtered"] =
+        static_cast<Json::UInt64>(status.dropped_filtered);
+    root["dropped_oversize"] =
+        static_cast<Json::UInt64>(status.dropped_oversize);
     root["bytes_written"] = static_cast<Json::UInt64>(status.bytes_written);
     root["segments"] = static_cast<Json::UInt64>(status.segments);
     root["format_complete"] = status.format_complete;
@@ -406,8 +411,8 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
         shard.dropped_filtered.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const std::uint64_t total =
-        kTrafficRecordHeaderSize + static_cast<std::uint64_t>(view.payload.size());
+    const std::uint64_t total = kTrafficRecordHeaderSize +
+                                static_cast<std::uint64_t>(view.payload.size());
     if (total > max_record_bytes_ || total > shard.capacity) {
         shard.dropped_oversize.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -558,9 +563,8 @@ void TrafficRecorder::DrainShardDirect(Shard& shard) {
             shard.tail.store(head, std::memory_order_release);
             return;
         }
-        if (records > 0 &&
-            (bytes + header.total_len > block_bytes_ ||
-             iov.size() >= static_cast<std::size_t>(IOV_MAX))) {
+        if (records > 0 && (bytes + header.total_len > block_bytes_ ||
+                            iov.size() >= static_cast<std::size_t>(IOV_MAX))) {
             if (!FlushRecords(shard, iov, bytes, records, commit_tail)) {
                 return;
             }
@@ -576,10 +580,8 @@ void TrafficRecorder::DrainShardDirect(Shard& shard) {
     FlushRecords(shard, iov, bytes, records, commit_tail);
 }
 
-bool TrafficRecorder::FlushRecords(Shard& shard,
-                                   std::vector<struct iovec>& iov,
-                                   std::uint64_t bytes,
-                                   std::uint32_t records,
+bool TrafficRecorder::FlushRecords(Shard& shard, std::vector<struct iovec>& iov,
+                                   std::uint64_t bytes, std::uint32_t records,
                                    std::uint64_t commit_tail) {
     if (iov.empty()) {
         shard.tail.store(commit_tail, std::memory_order_release);
@@ -599,8 +601,8 @@ bool TrafficRecorder::FlushRecords(Shard& shard,
 void TrafficRecorder::StartControlServer() {
     using namespace coro_http;
     try {
-        control_server_ = std::make_unique<coro_http_server>(
-            2, control_port_, control_host_);
+        control_server_ =
+            std::make_unique<coro_http_server>(2, control_port_, control_host_);
         control_server_->set_http_handler<GET>(
             "/v1/recording/status",
             [this](coro_http_request& req, coro_http_response& resp) {
@@ -647,9 +649,8 @@ void TrafficRecorder::StartControlServer() {
             });
         auto ec = control_server_->async_start();
         if (ec.hasResult()) {
-            LOG(ERROR) << "traffic: control server failed on "
-                       << control_host_ << ":" << control_port_ << ": "
-                       << ec.value().message();
+            LOG(ERROR) << "traffic: control server failed on " << control_host_
+                       << ":" << control_port_ << ": " << ec.value().message();
             SetState("error");
             control_server_.reset();
             return;
@@ -681,8 +682,7 @@ std::string TrafficRecorder::StatusJson() const {
         static_cast<Json::UInt64>(status.dropped_oversize);
     root["bytes_written"] = static_cast<Json::UInt64>(status.bytes_written);
     root["segments"] = static_cast<Json::UInt64>(status.segments);
-    root["ring_used_bytes"] =
-        static_cast<Json::UInt64>(status.ring_used_bytes);
+    root["ring_used_bytes"] = static_cast<Json::UInt64>(status.ring_used_bytes);
     root["ring_capacity_bytes"] =
         static_cast<Json::UInt64>(status.ring_capacity_bytes);
     root["stop_timed_out"] = status.stop_timed_out;
@@ -713,8 +713,7 @@ RecorderStatus TrafficRecorder::GetStatus() const {
         for (const auto& shard : shards_) {
             observed += shard->observed.load(std::memory_order_relaxed);
             recorded += shard->recorded.load(std::memory_order_relaxed);
-            dropped_ring +=
-                shard->dropped_ring.load(std::memory_order_relaxed);
+            dropped_ring += shard->dropped_ring.load(std::memory_order_relaxed);
             dropped_filtered +=
                 shard->dropped_filtered.load(std::memory_order_relaxed);
             dropped_oversize +=
@@ -739,9 +738,9 @@ RecorderStatus TrafficRecorder::GetStatus() const {
         if (sink_ != nullptr) {
             status.bytes_written = sink_->bytes_written();
             status.segments = sink_->segments();
-            status.format_complete = !sink_->failed() &&
-                                     !writer_failed_.load(
-                                         std::memory_order_relaxed);
+            status.format_complete =
+                !sink_->failed() &&
+                !writer_failed_.load(std::memory_order_relaxed);
         }
     }
     status.stop_timed_out = stop_timed_out_.load(std::memory_order_relaxed);
@@ -751,9 +750,8 @@ RecorderStatus TrafficRecorder::GetStatus() const {
         TrafficNowMs() >= deadline) {
         status.stop_timed_out = true;
     }
-    status.capture_complete =
-        status.dropped_requests == 0 && status.format_complete &&
-        !status.stop_timed_out;
+    status.capture_complete = status.dropped_requests == 0 &&
+                              status.format_complete && !status.stop_timed_out;
     return status;
 }
 

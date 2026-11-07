@@ -52,8 +52,7 @@ std::string MakeSessionDir(const std::string& output_dir,
 
 }  // namespace
 
-FileSink::FileSink(std::uint64_t segment_bytes,
-                   std::uint64_t segment_seconds,
+FileSink::FileSink(std::uint64_t segment_bytes, std::uint64_t segment_seconds,
                    std::uint64_t max_total_bytes)
     : segment_bytes_(segment_bytes),
       segment_seconds_(segment_seconds),
@@ -115,11 +114,11 @@ bool FileSink::OpenNextSegment() {
     header.start_ms = segment_start_ms_;
     const std::uint64_t seed = segment_start_ms_ ^ (segment_seq_ + 1);
     for (std::size_t i = 0; i < sizeof(header.session_uuid); ++i) {
-        header.session_uuid[i] = static_cast<std::uint8_t>(seed >> ((i % 8) * 8));
+        header.session_uuid[i] =
+            static_cast<std::uint8_t>(seed >> ((i % 8) * 8));
     }
     if (std::fwrite(&header, sizeof(header), 1, file_) != 1) {
-        LOG(ERROR) << "traffic: write segment header failed: "
-                   << segment_path_;
+        LOG(ERROR) << "traffic: write segment header failed: " << segment_path_;
         failed_ = true;
         std::fclose(file_);
         file_ = nullptr;
@@ -135,8 +134,7 @@ bool FileSink::OpenNextSegment() {
 }
 
 bool FileSink::WriteBlock(const void* data, std::uint32_t bytes,
-                          std::uint32_t records,
-                          std::uint32_t block_type) {
+                          std::uint32_t records, std::uint32_t block_type) {
     std::lock_guard<std::mutex> lock(mu_);
     if (file_ == nullptr || failed_) {
         return false;
@@ -213,8 +211,7 @@ bool FileSink::WriteRecords(const struct iovec* iov, int iov_count,
 
     mooncake::Crc32c crc;
     for (int i = 0; i < iov_count; ++i) {
-        crc.Extend(iov[i].iov_base,
-                   static_cast<std::size_t>(iov[i].iov_len));
+        crc.Extend(iov[i].iov_base, static_cast<std::size_t>(iov[i].iov_len));
     }
     TrafficBlockHeader header;
     header.block_bytes = static_cast<std::uint32_t>(bytes);

@@ -17,8 +17,7 @@ class TrafficSink {
                             std::uint32_t records,
                             std::uint32_t block_type) = 0;
     virtual bool WriteRecords(const struct iovec* iov, int iov_count,
-                              std::uint64_t bytes,
-                              std::uint32_t records) = 0;
+                              std::uint64_t bytes, std::uint32_t records) = 0;
     virtual bool Flush() = 0;
     virtual void Close() = 0;
 
