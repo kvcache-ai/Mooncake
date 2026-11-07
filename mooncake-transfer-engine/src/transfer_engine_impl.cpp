@@ -20,6 +20,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <unordered_set>
 #include <sys/resource.h>
 #include <unistd.h>
 #ifdef WITH_METRICS
@@ -806,6 +807,7 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
     }
 
     std::vector<Transport*> attempted_transports;
+    bool registered_on_transport = false;
     for (auto transport : multi_transports_->listTransports()) {
         attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemory(
@@ -828,6 +830,15 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
             releaseMemoryRegions(regions);
             return ret;
         }
+        registered_on_transport |= ret != Transport::REGISTER_MEMORY_SKIPPED;
+    }
+
+    if (!registered_on_transport && !attempted_transports.empty()) {
+        for (auto it = attempted_transports.rbegin();
+             it != attempted_transports.rend(); ++it)
+            (*it)->unregisterLocalMemory(addr, update_metadata);
+        releaseMemoryRegions(regions);
+        return ERR_INVALID_ARGUMENT;
     }
 
     commitMemoryRegions(regions);
@@ -836,18 +847,24 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
-    // Best-effort: try every transport so one failure can't leave the region
-    // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
+    // A transport can skip a range while registration succeeds on the engine.
+    // Missing transport metadata must not retain the engine's reservation.
     int first_error = 0;
+    bool missing_on_transport = false;
     for (auto& transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret && !first_error) first_error = ret;
+        if (ret == ERR_ADDRESS_NOT_REGISTERED)
+            missing_on_transport = true;
+        else if (ret && !first_error)
+            first_error = ret;
     }
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    const bool registered =
+        local_memory_regions_.count(reinterpret_cast<uintptr_t>(addr)) != 0;
     eraseMemoryRegionLocked(addr);
-    return 0;
+    return missing_on_transport && !registered ? ERR_ADDRESS_NOT_REGISTERED : 0;
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -1014,10 +1031,11 @@ int TransferEngineImpl::registerLocalMemoryBatch(
     }
 
     std::vector<Transport*> attempted_transports;
+    bool registered_on_transport = false;
     for (auto transport : multi_transports_->listTransports()) {
         attempted_transports.push_back(transport);
         int ret = transport->registerLocalMemoryBatch(buffer_list, location);
-        if (ret) {
+        if (ret < 0) {
             for (auto it = attempted_transports.rbegin();
                  it != attempted_transports.rend(); ++it) {
                 int rollback_ret = (*it)->unregisterLocalMemoryBatch(addr_list);
@@ -1031,6 +1049,15 @@ int TransferEngineImpl::registerLocalMemoryBatch(
             releaseMemoryRegions(regions);
             return ret;
         }
+        registered_on_transport |= ret != Transport::REGISTER_MEMORY_SKIPPED;
+    }
+
+    if (!registered_on_transport && !attempted_transports.empty()) {
+        for (auto it = attempted_transports.rbegin();
+             it != attempted_transports.rend(); ++it)
+            (*it)->unregisterLocalMemoryBatch(addr_list);
+        releaseMemoryRegions(regions);
+        return ERR_INVALID_ARGUMENT;
     }
 
     commitMemoryRegions(regions);
@@ -1039,10 +1066,23 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    // A batch has one result. Reject an unknown or repeated address before
+    // removing any of its registered members.
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::unordered_set<uintptr_t> seen;
+        for (void* addr : addr_list) {
+            auto key = reinterpret_cast<uintptr_t>(addr);
+            if (!seen.insert(key).second || local_memory_regions_.count(key) == 0)
+                return ERR_ADDRESS_NOT_REGISTERED;
+        }
+    }
+
     int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret && !first_error) first_error = ret;
+        if (ret != ERR_ADDRESS_NOT_REGISTERED && ret && !first_error)
+            first_error = ret;
     }
     if (first_error) return first_error;
 
