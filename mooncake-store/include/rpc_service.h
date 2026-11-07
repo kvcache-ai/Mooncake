@@ -91,6 +91,11 @@ class WrappedMasterService {
     BatchGetReplicaList(const std::vector<std::string>& keys,
                         const std::string& tenant_id = "default");
 
+    std::vector<tl::expected<bool, ErrorCode>> BatchCheckReplicasLive(
+        const std::vector<std::string>& keys,
+        const std::vector<ReplicaReadToken>& tokens,
+        const std::string& tenant_id = "default");
+
     // Read-only admin variants: no lease grants, no promotion, no metric
     // updates.
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>

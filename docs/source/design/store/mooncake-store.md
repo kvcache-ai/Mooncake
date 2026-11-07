@@ -428,7 +428,7 @@ To avoid data conflicts, a per-object lease is granted whenever an `ExistKey` re
 
 For grouped objects, a successful `ExistKey` or `GetReplicaList` refreshes the lease for the current members of the group, so recently accessed members are less likely to be separated by memory eviction.
 
-However, if the lease expires before a `Get` operation finishes reading the data, the operation will be considered failed, and no data will be returned, in order to prevent potential data corruption.
+If the lease expires before a `Get` or `BatchGet` finishes reading the data, the client asks the master whether the replica it read is still there, still readable, and not rewritten since the query (same replica ID and write version). If so, the data is returned. Otherwise, the operation fails with `LEASE_EXPIRED` and no data is returned, in order to prevent potential data corruption.
 
 The default lease TTL is 10 seconds and is configurable via a startup parameter of `master_service`.
 

@@ -1139,14 +1139,20 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
         int put_result = py_client_->put(key, data_span, config);
         EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 
-        // Test Get operation using buffer handle
+        // The 1 ms lease expires during the read, but the object is
+        // unchanged, so the master revalidates the replica and both reads
+        // succeed.
         auto buffer_handle = py_client_->get_buffer(key);
-        ASSERT_TRUE(buffer_handle == nullptr) << "Get buffer should fail";
+        ASSERT_NE(buffer_handle, nullptr) << "Get buffer should succeed";
+        ASSERT_EQ(buffer_handle->size(), data_size);
+        EXPECT_EQ(
+            std::memcmp(buffer_handle->ptr(), test_data.data(), data_size), 0);
+        buffer_handle.reset();
 
-        // Test Get operation using buffer handle
         auto bytes_read =
             py_client_->get_into(key, test_data.data(), test_data.size());
-        ASSERT_TRUE(bytes_read < 0) << "Get into should fail";
+        EXPECT_EQ(bytes_read, static_cast<int64_t>(data_size))
+            << "Get into should succeed";
 
         // Clear the data for the next test
         std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl_));
@@ -1197,9 +1203,8 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
             }
         }
 
-        LOG(INFO) << "Batch get buffer " << fail_count << " out of "
-                  << num_slices << " keys failed";
-        ASSERT_NE(fail_count, 0) << "Should fail for some keys";
+        EXPECT_EQ(fail_count, 0) << "Batch get buffer should succeed";
+        buffer_handles.clear();
 
         // Test Batch Get operation using batch_get_into
         std::vector<int64_t> bytes_read_results;
@@ -1216,9 +1221,7 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
                 fail_count++;
             }
         }
-        LOG(INFO) << "Batch get into " << fail_count << " out of " << num_slices
-                  << " keys failed";
-        ASSERT_NE(fail_count, 0) << "Should fail for some keys";
+        EXPECT_EQ(fail_count, 0) << "Batch get into should succeed";
 
         // Clear the data for the next test
         std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl_));

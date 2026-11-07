@@ -231,6 +231,11 @@ class MasterClient {
     BatchGetReplicaList(const std::vector<std::string>& object_keys,
                         const std::string& tenant_id);
 
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>>
+    BatchCheckReplicasLive(const std::vector<std::string>& object_keys,
+                           const std::vector<ReplicaReadToken>& tokens,
+                           const std::string& tenant_id);
+
     /**
      * @brief Read-only variants of GetReplicaList / BatchGetReplicaList.
      *

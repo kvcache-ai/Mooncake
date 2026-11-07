@@ -83,6 +83,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchCheckReplicasLive> {
+    static constexpr const char* value = "BatchCheckReplicasLive";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -774,6 +779,20 @@ MasterClient::BatchGetReplicaListReadOnly(
                          GetReplicaListResponse>(object_keys.size(),
                                                  object_keys, tenant_id);
     timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchCheckReplicasLive(
+    const std::vector<std::string>& object_keys,
+    const std::vector<ReplicaReadToken>& tokens, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchCheckReplicasLive");
+    timer.LogRequest("keys_count=", object_keys.size(),
+                     ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_batch_rpc<&WrappedMasterService::BatchCheckReplicasLive, bool>(
+            object_keys.size(), object_keys, tokens, tenant_id);
+    timer.LogResponse("result=", result.size(), " keys");
     return result;
 }
 

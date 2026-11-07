@@ -436,6 +436,23 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     return results;
 }
 
+std::vector<tl::expected<bool, ErrorCode>>
+WrappedMasterService::BatchCheckReplicasLive(
+    const std::vector<std::string>& keys,
+    const std::vector<ReplicaReadToken>& tokens, const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchCheckReplicasLive");
+    timer.LogRequest("keys_count=", keys.size());
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchCheckReplicasLive(keys, tokens,
+                                                          resolved_tenant_id);
+        });
+    timer.LogResponse("total=", results.size());
+    return results;
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaListForAdmin(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
@@ -2080,6 +2097,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
+        &WrappedMasterService::BatchCheckReplicasLive,
         &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
