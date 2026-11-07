@@ -7,8 +7,12 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
+#include <vector>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -36,18 +40,38 @@ bool pathExists(const std::string &path) {
     return lstat(path.c_str(), &st) == 0;
 }
 
-// Leaves a socket file with no listener behind, as a crashed owner would.
-bool createStaleSocketFile(const std::string &path) {
+std::string lockPathFor(const std::string &socket_path) {
+    return socket_path + ".lock";
+}
+
+// Removes the socket file and the ownership lock file an acceptor leaves.
+void removeSocketFiles(const std::string &path) {
+    unlink(path.c_str());
+    unlink(lockPathFor(path).c_str());
+}
+
+// Binds a socket at `path` without listening and returns its fd. Connecting
+// to it fails with ECONNREFUSED, exactly like a stale file.
+int bindWithoutListening(const std::string &path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+    if (fd < 0) return -1;
     sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-    bool bound =
-        bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
+    if (bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Leaves a socket file with no listener behind, as a crashed owner would.
+bool createStaleSocketFile(const std::string &path) {
+    int fd = bindWithoutListening(path);
+    if (fd < 0) return false;
     close(fd);
-    return bound;
+    return true;
 }
 
 int createTempFd(const char *content) {
@@ -312,8 +336,8 @@ TEST(UdsTransportTest, FilesystemSocketPassesFdAndRemovesFileOnStop) {
     struct stat st;
     ASSERT_EQ(lstat(path.c_str(), &st), 0);
     EXPECT_TRUE(S_ISSOCK(st.st_mode));
-    // Peers in another pod may run under a different uid.
-    EXPECT_EQ(static_cast<unsigned>(st.st_mode & 0777), 0666u);
+    // Only the owner's uid and gid may connect to the fd-passing endpoint.
+    EXPECT_EQ(static_cast<unsigned>(st.st_mode & 0777), 0660u);
 
     UdsConnector connector(path);
     auto connection_result = connector.connect();
@@ -329,6 +353,7 @@ TEST(UdsTransportTest, FilesystemSocketPassesFdAndRemovesFileOnStop) {
     ASSERT_TRUE(waitForFlag(received));
     acceptor.stop();
     EXPECT_FALSE(pathExists(path));
+    removeSocketFiles(path);
 }
 
 TEST(UdsTransportTest, FilesystemSocketReplacesStaleFile) {
@@ -346,6 +371,7 @@ TEST(UdsTransportTest, FilesystemSocketReplacesStaleFile) {
     EXPECT_TRUE(connector.connect());
     acceptor.stop();
     EXPECT_FALSE(pathExists(path));
+    removeSocketFiles(path);
 }
 
 TEST(UdsTransportTest, FilesystemSocketRefusesLiveOwner) {
@@ -366,6 +392,7 @@ TEST(UdsTransportTest, FilesystemSocketRefusesLiveOwner) {
     UdsConnector connector(path);
     EXPECT_TRUE(connector.connect());
     owner.stop();
+    removeSocketFiles(path);
 }
 
 TEST(UdsTransportTest, FilesystemSocketKeepsUnrelatedFile) {
@@ -381,7 +408,100 @@ TEST(UdsTransportTest, FilesystemSocketKeepsUnrelatedFile) {
     ASSERT_FALSE(start_result);
     EXPECT_NE(start_result.error().find("not a socket"), std::string::npos);
     EXPECT_TRUE(pathExists(path));
-    unlink(path.c_str());
+    removeSocketFiles(path);
+}
+
+// Models a sibling starter that has bound the path but not yet called
+// listen(): connecting gets ECONNREFUSED just like a stale file, so only the
+// ownership lock tells them apart.
+TEST(UdsTransportTest, FilesystemSocketKeepsSiblingBoundBeforeListen) {
+    std::string path = testFilesystemSocketPath("fs_bound");
+    removeSocketFiles(path);
+
+    int lock_fd = open(lockPathFor(path).c_str(), O_RDWR | O_CREAT, 0660);
+    ASSERT_GE(lock_fd, 0);
+    ASSERT_EQ(flock(lock_fd, LOCK_EX | LOCK_NB), 0);
+    int sibling_fd = bindWithoutListening(path);
+    ASSERT_GE(sibling_fd, 0);
+    struct stat before;
+    ASSERT_EQ(lstat(path.c_str(), &before), 0);
+
+    UdsAcceptor acceptor(path);
+    acceptor.registerHandler([](UdsConnection &) {});
+    auto start_result = acceptor.start();
+    ASSERT_FALSE(start_result);
+    EXPECT_NE(start_result.error().find("in use"), std::string::npos);
+
+    // The sibling's socket file must be untouched.
+    struct stat after;
+    ASSERT_EQ(lstat(path.c_str(), &after), 0);
+    EXPECT_EQ(after.st_ino, before.st_ino);
+
+    // Once the sibling dies, the path is stale and can be taken over.
+    close(sibling_fd);
+    close(lock_fd);
+    auto retry_result = acceptor.start();
+    ASSERT_TRUE(retry_result) << retry_result.error();
+    UdsConnector connector(path);
+    EXPECT_TRUE(connector.connect());
+    acceptor.stop();
+    removeSocketFiles(path);
+}
+
+TEST(UdsTransportTest, FilesystemSocketConcurrentStartHasSingleOwner) {
+    constexpr int kStarters = 8;
+    std::string path = testFilesystemSocketPath("fs_race");
+    // Start from a stale file so every starter sees ECONNREFUSED and would try
+    // to remove it without the ownership lock.
+    removeSocketFiles(path);
+    ASSERT_TRUE(createStaleSocketFile(path));
+
+    std::atomic<int> served_by{-1};
+    std::vector<std::unique_ptr<UdsAcceptor>> acceptors;
+    for (int i = 0; i < kStarters; ++i) {
+        acceptors.push_back(std::make_unique<UdsAcceptor>(path));
+        acceptors.back()->registerHandler(
+            [&served_by, i](UdsConnection &) { served_by = i; });
+    }
+
+    std::atomic<bool> go{false};
+    std::vector<int> started(kStarters, 0);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kStarters; ++i) {
+        threads.emplace_back([&, i]() {
+            while (!go.load()) std::this_thread::yield();
+            started[i] = acceptors[i]->start() ? 1 : 0;
+        });
+    }
+    go = true;
+    for (auto &thread : threads) thread.join();
+
+    int owner = -1;
+    int owners = 0;
+    for (int i = 0; i < kStarters; ++i) {
+        if (started[i]) {
+            owner = i;
+            ++owners;
+        }
+    }
+    ASSERT_EQ(owners, 1) << "exactly one starter may own the path";
+
+    // The path must lead to the owner, not to a socket that was unlinked.
+    UdsConnector connector(path);
+    auto connection = connector.connect();
+    ASSERT_TRUE(connection) << connection.error();
+    for (int i = 0; i < 100 && served_by.load() < 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(served_by.load(), owner);
+
+    // After the owner stops, another acceptor can take the path over.
+    acceptors[owner]->stop();
+    int next = (owner + 1) % kStarters;
+    auto next_result = acceptors[next]->start();
+    EXPECT_TRUE(next_result) << next_result.error();
+    for (auto &acceptor : acceptors) acceptor->stop();
+    removeSocketFiles(path);
 }
 
 TEST(UdsTransportTest, FilesystemSocketRejectsTooLongPath) {
@@ -515,6 +635,7 @@ TEST(UdsTransportTest, FilesystemSocketCrossesNetworkNamespace) {
 
     abstract_acceptor.stop();
     fs_acceptor.stop();
+    removeSocketFiles(fs_path);
 }
 #endif  // __linux__
 

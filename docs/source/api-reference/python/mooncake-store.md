@@ -1241,7 +1241,9 @@ def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address
   socket, which is required when the real client runs in another pod; mount
   the same directory into both pods. Any other value is a Linux abstract
   socket, visible only inside one network namespace. It must match the real
-  client's `--ipc_socket_path`.
+  client's `--ipc_socket_path`. The real client creates a filesystem socket
+  with mode `0660`, so this process must run with the real client's uid or
+  in its group.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)

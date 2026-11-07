@@ -29,8 +29,11 @@ std::string resolveClientIpcSocketName(const std::string &configured, int port);
 // transport instead for latency-sensitive, high-throughput, or long-lived I/O.
 //
 // A socket name starting with '/' is a filesystem path, reachable by any
-// process that can see the path (e.g. pods sharing a hostPath). Any other name
-// is a Linux abstract socket, visible only inside the same network namespace.
+// process that can see the path (e.g. pods sharing a hostPath) and runs with
+// the owner's uid or gid: the socket is created with mode 0660. The acceptor
+// also holds an exclusive flock on "<path>.lock" while it runs, so only one
+// acceptor at a time owns the path. Any other name is a Linux abstract socket,
+// visible only inside the same network namespace.
 class UdsConnection {
    public:
     UdsConnection() = default;
@@ -86,6 +89,7 @@ class UdsAcceptor {
     void acceptLoop();
     void wakeAccept();
     void unlinkBoundPath();
+    void releaseOwnershipLock();
 
     std::string socket_name_;
     // Filesystem path bound by this acceptor and removed on stop; empty for
@@ -93,6 +97,9 @@ class UdsAcceptor {
     std::string bound_socket_path_;
     Handler handler_;
     int listen_fd_ = -1;
+    // Holds the flock on "<socket_name_>.lock" while running; -1 for abstract
+    // sockets.
+    int lock_fd_ = -1;
     std::atomic<int> active_client_fd_{-1};
     std::atomic<bool> running_{false};
     std::thread thread_;

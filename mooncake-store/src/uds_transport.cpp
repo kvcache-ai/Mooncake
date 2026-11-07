@@ -11,6 +11,7 @@
 #include <utility>
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -141,6 +142,38 @@ tl::expected<void, std::string> removeStaleSocketFile(
     return {};
 }
 
+// Takes an exclusive flock on "<socket_path>.lock" and returns its fd. Every
+// acceptor takes this lock before probing, removing, or binding the socket
+// path and holds it until stop(), so a probe that gets ECONNREFUSED can only
+// see a dead owner: a live owner between bind() and listen() still holds the
+// lock. The kernel drops the lock when its holder exits, so a crash never
+// leaves the path locked. The lock file itself is never removed, because two
+// starters could otherwise lock different inodes.
+tl::expected<int, std::string> acquireOwnershipLock(
+    const std::string &socket_path) {
+    const std::string lock_path = socket_path + ".lock";
+    int fd = ::open(lock_path.c_str(),
+                    O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0660);
+    if (fd < 0) {
+        return tl::make_unexpected(
+            errnoMessage("Failed to open UDS lock file '" + lock_path + "'"));
+    }
+    while (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EINTR) continue;
+        int lock_errno = errno;
+        ::close(fd);
+        if (lock_errno == EWOULDBLOCK) {
+            return tl::make_unexpected("UDS socket path '" + socket_path +
+                                       "' is already in use by another "
+                                       "acceptor");
+        }
+        errno = lock_errno;
+        return tl::make_unexpected(
+            errnoMessage("Failed to lock UDS lock file '" + lock_path + "'"));
+    }
+    return fd;
+}
+
 tl::expected<int, std::string> createConnectedSocket(
     const std::string &socket_name, std::chrono::milliseconds connect_timeout) {
     if (connect_timeout.count() <= 0) {
@@ -167,11 +200,18 @@ tl::expected<int, std::string> createConnectedSocket(
     }
 
     if (::connect(sock_fd, reinterpret_cast<sockaddr *>(&addr), addr_len) < 0) {
+        const int connect_errno = errno;
         auto error =
-            errno == EAGAIN || errno == EINPROGRESS
+            connect_errno == EAGAIN || connect_errno == EINPROGRESS
                 ? "Timed out connecting UDS socket '" + socket_name + "'"
                 : errnoMessage("Failed to connect UDS socket '" + socket_name +
                                "'");
+        if (connect_errno == EACCES) {
+            // Filesystem sockets are mode 0660; see UdsAcceptor::start().
+            error +=
+                " (run this process with the same uid as the socket owner or "
+                "in its group)";
+        }
         close(sock_fd);
         return tl::make_unexpected(error);
     }
@@ -375,10 +415,19 @@ tl::expected<void, std::string> UdsAcceptor::start() {
 
     const bool is_filesystem = isFilesystemSocketName(socket_name_);
     if (is_filesystem) {
+        auto lock_result = acquireOwnershipLock(socket_name_);
+        if (!lock_result) {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            return tl::make_unexpected(lock_result.error());
+        }
+        lock_fd_ = lock_result.value();
+
         auto cleanup_result = removeStaleSocketFile(socket_name_);
         if (!cleanup_result) {
             ::close(listen_fd_);
             listen_fd_ = -1;
+            releaseOwnershipLock();
             return tl::make_unexpected(cleanup_result.error());
         }
     }
@@ -388,19 +437,23 @@ tl::expected<void, std::string> UdsAcceptor::start() {
             errnoMessage("Failed to bind UDS socket '" + socket_name_ + "'");
         ::close(listen_fd_);
         listen_fd_ = -1;
+        releaseOwnershipLock();
         return tl::make_unexpected(error);
     }
 
     if (is_filesystem) {
         bound_socket_path_ = socket_name_;
-        // Peers may run under a different uid (e.g. another pod). Access is
-        // meant to be controlled by the permissions of the parent directory.
-        if (chmod(socket_name_.c_str(), 0666) < 0) {
+        // The endpoint accepts shared-memory fds and hands out the hot-cache
+        // fd without further authentication, so only the owner's uid and gid
+        // may connect. Peers in other pods must share one of them. Nothing can
+        // connect before listen(), so the mode is final by the time it matters.
+        if (chmod(socket_name_.c_str(), 0660) < 0) {
             auto error = errnoMessage("Failed to chmod UDS socket '" +
                                       socket_name_ + "'");
             ::close(listen_fd_);
             listen_fd_ = -1;
             unlinkBoundPath();
+            releaseOwnershipLock();
             return tl::make_unexpected(error);
         }
     }
@@ -411,6 +464,7 @@ tl::expected<void, std::string> UdsAcceptor::start() {
         ::close(listen_fd_);
         listen_fd_ = -1;
         unlinkBoundPath();
+        releaseOwnershipLock();
         return tl::make_unexpected(error);
     }
 
@@ -436,6 +490,9 @@ void UdsAcceptor::stop() {
         ::close(listen_fd_);
         listen_fd_ = -1;
     }
+    // Release last, after the path is gone, so a successor that takes the lock
+    // never sees this acceptor's socket.
+    releaseOwnershipLock();
 }
 
 void UdsAcceptor::acceptLoop() {
@@ -472,6 +529,13 @@ void UdsAcceptor::unlinkBoundPath() {
                      << bound_socket_path_ << ": " << strerror(errno);
     }
     bound_socket_path_.clear();
+}
+
+void UdsAcceptor::releaseOwnershipLock() {
+    if (lock_fd_ < 0) return;
+    // Closing the fd drops the flock.
+    ::close(lock_fd_);
+    lock_fd_ = -1;
 }
 
 }  // namespace mooncake
