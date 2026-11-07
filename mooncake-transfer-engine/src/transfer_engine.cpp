@@ -298,6 +298,16 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     return impl_->getTransferStatus(batch_id, task_id, status);
 }
 
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
+}
+
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     return impl_->getBatchTransferStatus(batch_id, status);
@@ -1053,6 +1063,30 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         return impl_->getTransferStatus(batch_id, task_id, status);
     }
+}
+
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    if (use_tent_) {
+        state = TaskCongestionState::kUnknown;
+        if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+            return Status::InvalidArgument("Invalid Batch ID");
+        return Status::NotImplemented(
+            "Task congestion queries are not supported by the TENT backend");
+    }
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    if (use_tent_) {
+        detail = TaskCongestionDetail{};
+        if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+            return Status::InvalidArgument("Invalid Batch ID");
+        return Status::NotImplemented(
+            "Task congestion queries are not supported by the TENT backend");
+    }
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
 }
 
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,

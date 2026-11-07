@@ -284,6 +284,10 @@ Common calls:
 
 `evacuate_owned_replicas()` drains the local client, rewrites every live route that still references it, immediately reclaims old allocations, and retires emptied local segments.
 
+If an owner-route scan fails, evacuation returns the error and the client remains
+draining. Restore the authority or remove its stale membership before retrying;
+an incomplete owner-route scan cannot authorize allocation reclamation.
+
 During evacuation, payload copy is pinned to the exact local replica being removed. The writer does not satisfy the migration read from another live mirror, because that would publish the wrong bytes when replicas temporarily diverge during a shrink.
 The migration read uses the replica's transport target offset, not the allocator reservation offset, and maps that target coordinate through the storage target map before touching local memory.
 
