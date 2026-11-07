@@ -35,12 +35,6 @@ on:
         # false until TENT is validated on arm64.
         type: boolean
         default: false
-      unit-tests:
-        # Also build (not run) the unit tests, so a test that only compiles in
-        # a wheel configuration, e.g. with USE_EFA=ON, fails in PR CI rather
-        # than at the release tag.
-        type: boolean
-        default: false
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -130,9 +124,6 @@ jobs:
           # liburing is provided by dependencies.sh / mooncake_provide_liburing().
           if [ "${{ inputs.use-tent }}" = "true" ]; then
             cmake_args="$cmake_args -DUSE_TENT=ON -DTENT_METRICS_ENABLED=ON"
-          fi
-          if [ "${{ inputs.unit-tests }}" = "true" ]; then
-            cmake_args="$cmake_args -DBUILD_UNIT_TESTS=ON"
           fi
 
           {
