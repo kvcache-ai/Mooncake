@@ -1,0 +1,5 @@
+object_MiB,operation,tcp_MiB_per_second,cuobject_MiB_per_second,throughput_ratio,tcp_CPU_seconds_per_GiB,cuobject_CPU_seconds_per_GiB,client_CPU_reduction_pct
+4,GET,245.457,421.149,1.7158,1.75292,0.533087,69.589
+4,PUT,97.622,104.007,1.0654,3.00551,1.5488,48.468
+16,GET,378.239,808.582,2.1378,1.36005,0.219074,83.892
+16,PUT,137.326,136.557,0.9944,2.04472,0.808409,60.464
