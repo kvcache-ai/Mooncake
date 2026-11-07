@@ -34,6 +34,7 @@
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <thread>
 
@@ -56,6 +57,16 @@
 #include "transport/rdma_transport/worker_pool.h"
 #include "transport/transport.h"
 
+#ifdef USE_MACA
+// MACA 3.8.2 exports this extension but omits it from its public headers.
+// Newer SDKs declare the same signature, where this is a legal redeclaration.
+extern "C" mcError_t mcMemGetHandleForAddressRangeExt(void *handle, void *dptr,
+                                                      size_t size,
+                                                      int handle_type,
+                                                      unsigned long long flags,
+                                                      uint64_t *offset);
+#endif
+
 namespace mooncake {
 static int isNullGid(union ibv_gid *gid) {
     for (int i = 0; i < 16; ++i) {
@@ -65,6 +76,39 @@ static int isNullGid(union ibv_gid *gid) {
 }
 
 namespace {
+#ifdef USE_MACA
+class MacaDeviceGuard {
+   public:
+    explicit MacaDeviceGuard(int target_device) {
+        status_ = mcGetDevice(&previous_device_);
+        if (status_ != mcSuccess) return;
+        restore_device_ = previous_device_ != target_device;
+        status_ = mcSetDevice(target_device);
+    }
+
+    ~MacaDeviceGuard() {
+        if (restore_device_) {
+            const auto result = mcSetDevice(previous_device_);
+            if (result != mcSuccess) {
+                LOG(ERROR) << "Failed to restore MACA device "
+                           << previous_device_ << ": "
+                           << mcGetErrorString(result);
+            }
+        }
+    }
+
+    MacaDeviceGuard(const MacaDeviceGuard &) = delete;
+    MacaDeviceGuard &operator=(const MacaDeviceGuard &) = delete;
+
+    bool ok() const { return status_ == mcSuccess; }
+
+   private:
+    int previous_device_ = -1;
+    bool restore_device_ = false;
+    mcError_t status_ = mcSuccess;
+};
+#endif
+
 #ifdef USE_CUDA
 #if CUDA_VERSION < 12080
 #define CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE 0x1
@@ -574,20 +618,47 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     // memory uses the plain ibv_reg_mr() path. GPU memory is exported once as a
     // dma_buf fd that every NIC then imports, so the driver keeps a single
     // BAR1 window for the buffer instead of one per NIC.
-    CUmemorytype memType;
+    CUmemorytype memType{};
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+
+    const bool is_gpu_memory =
+        memType == CU_MEMORYTYPE_DEVICE
+#ifdef USE_MACA
+        // Fine-grained allocations are GPU-backed and exportable on MACA,
+        // although the runtime reports them as unified memory.
+        || memType == mcMemoryTypeUnified
+#endif
+        ;
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         out.method = DmabufExport::Method::kHostReg;
 #if defined(USE_CUDA) || defined(USE_SUPA)
-    } else if (memType == CU_MEMORYTYPE_DEVICE &&
-               globalConfig().with_nvidia_peermem && !data_direct) {
+    } else if (is_gpu_memory && globalConfig().with_nvidia_peermem &&
+               !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         out.method = DmabufExport::Method::kHostReg;
 #endif
-    } else if (memType == CU_MEMORYTYPE_DEVICE) {
+    } else if (is_gpu_memory) {
+#ifdef USE_MACA
+        unsigned int devOrd = 0;
+        result = cuPointerGetAttribute(
+            &devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            const char *errStr = nullptr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to query MACA device for " << (uintptr_t)addr
+                       << " error=" << (errStr ? errStr : "unknown");
+            return ERR_CONTEXT;
+        }
+        MacaDeviceGuard device_guard(static_cast<int>(devOrd));
+        if (!device_guard.ok()) {
+            LOG(ERROR) << "Failed to select MACA device " << devOrd
+                       << " for dma-buf export of " << (uintptr_t)addr;
+            return ERR_CONTEXT;
+        }
+#endif
 #if defined(USE_CUDA) || defined(USE_SUPA)
         // Ensure a CUDA context is current — worker threads or callers
         // from non-CUDA threads may lack one.
@@ -629,7 +700,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
             return ERR_CONTEXT;
         }
 
-        int dmabuf_fd;
+        int dmabuf_fd = -1;
         // cuMemGetAddressRange() only reports the mapping that contains addr.
         // For memory allocated through the CUDA virtual memory management API
         // (cuMemCreate + cuMemMap), as used by PyTorch's
@@ -689,9 +760,20 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         if (data_direct)
             export_flags = CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE;
 #endif
+#ifdef USE_MACA
+        uint64_t dmabuf_allocation_offset = 0;
+        // MACA may export the complete backing allocation even when asked for
+        // a sub-range. The returned offset locates exportBase in that dma-buf;
+        // exportOffset then locates the caller's address within exportBase.
+        result = mcMemGetHandleForAddressRangeExt(
+            &dmabuf_fd, reinterpret_cast<void *>(exportBase), exportSize,
+            mcMemHandleTypePosixFileDescriptor, export_flags,
+            &dmabuf_allocation_offset);
+#else
         result = cuMemGetHandleForAddressRange(
             &dmabuf_fd, exportBase, exportSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, export_flags);
+#endif
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
@@ -699,6 +781,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
                        << " base=" << (uintptr_t)exportBase
                        << " size=" << exportSize << " flags=" << export_flags
                        << " cuda error=" << errStr;
+            if (dmabuf_fd >= 0) close(dmabuf_fd);
 #if defined(USE_CUDA) || defined(USE_SUPA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -706,7 +789,19 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         }
         out.method = DmabufExport::Method::kDmabufReg;
         out.fd = dmabuf_fd;
+#ifdef USE_MACA
+        if (dmabuf_allocation_offset >
+            std::numeric_limits<uint64_t>::max() - exportOffset) {
+            LOG(ERROR) << "MACA dma-buf offset overflow for "
+                       << (uintptr_t)addr;
+            close(dmabuf_fd);
+            out.fd = -1;
+            return ERR_CONTEXT;
+        }
+        out.offset = dmabuf_allocation_offset + exportOffset;
+#else
         out.offset = exportOffset;
+#endif
 #if defined(USE_CUDA) || defined(USE_SUPA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
