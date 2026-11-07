@@ -57,16 +57,6 @@
 #include "transport/rdma_transport/worker_pool.h"
 #include "transport/transport.h"
 
-#ifdef USE_MACA
-// MACA 3.8.2 exports this extension but omits it from its public headers.
-// Newer SDKs declare the same signature, where this is a legal redeclaration.
-extern "C" mcError_t mcMemGetHandleForAddressRangeExt(void *handle, void *dptr,
-                                                      size_t size,
-                                                      int handle_type,
-                                                      unsigned long long flags,
-                                                      uint64_t *offset);
-#endif
-
 namespace mooncake {
 static int isNullGid(union ibv_gid *gid) {
     for (int i = 0; i < 16; ++i) {
@@ -77,35 +67,35 @@ static int isNullGid(union ibv_gid *gid) {
 
 namespace {
 #ifdef USE_MACA
-class MacaDeviceGuard {
+class GpuDeviceGuard {
    public:
-    explicit MacaDeviceGuard(int target_device) {
-        status_ = mcGetDevice(&previous_device_);
-        if (status_ != mcSuccess) return;
+    explicit GpuDeviceGuard(int target_device) {
+        status_ = cudaGetDevice(&previous_device_);
+        if (status_ != cudaSuccess) return;
         restore_device_ = previous_device_ != target_device;
-        status_ = mcSetDevice(target_device);
+        status_ = cudaSetDevice(target_device);
     }
 
-    ~MacaDeviceGuard() {
+    ~GpuDeviceGuard() {
         if (restore_device_) {
-            const auto result = mcSetDevice(previous_device_);
-            if (result != mcSuccess) {
-                LOG(ERROR) << "Failed to restore MACA device "
+            const auto result = cudaSetDevice(previous_device_);
+            if (result != cudaSuccess) {
+                LOG(ERROR) << "Failed to restore GPU device "
                            << previous_device_ << ": "
-                           << mcGetErrorString(result);
+                           << cudaGetErrorString(result);
             }
         }
     }
 
-    MacaDeviceGuard(const MacaDeviceGuard &) = delete;
-    MacaDeviceGuard &operator=(const MacaDeviceGuard &) = delete;
+    GpuDeviceGuard(const GpuDeviceGuard &) = delete;
+    GpuDeviceGuard &operator=(const GpuDeviceGuard &) = delete;
 
-    bool ok() const { return status_ == mcSuccess; }
+    bool ok() const { return status_ == cudaSuccess; }
 
    private:
     int previous_device_ = -1;
     bool restore_device_ = false;
-    mcError_t status_ = mcSuccess;
+    cudaError_t status_ = cudaSuccess;
 };
 #endif
 
@@ -627,7 +617,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 #ifdef USE_MACA
         // Fine-grained allocations are GPU-backed and exportable on MACA,
         // although the runtime reports them as unified memory.
-        || memType == mcMemoryTypeUnified
+        || memType == CU_MEMORYTYPE_UNIFIED
 #endif
         ;
 
@@ -648,13 +638,13 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         if (result != CUDA_SUCCESS) {
             const char *errStr = nullptr;
             cuGetErrorString(result, &errStr);
-            LOG(ERROR) << "Failed to query MACA device for " << (uintptr_t)addr
+            LOG(ERROR) << "Failed to query GPU device for " << (uintptr_t)addr
                        << " error=" << (errStr ? errStr : "unknown");
             return ERR_CONTEXT;
         }
-        MacaDeviceGuard device_guard(static_cast<int>(devOrd));
+        GpuDeviceGuard device_guard(static_cast<int>(devOrd));
         if (!device_guard.ok()) {
-            LOG(ERROR) << "Failed to select MACA device " << devOrd
+            LOG(ERROR) << "Failed to select GPU device " << devOrd
                        << " for dma-buf export of " << (uintptr_t)addr;
             return ERR_CONTEXT;
         }
@@ -762,12 +752,11 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 #endif
 #ifdef USE_MACA
         uint64_t dmabuf_allocation_offset = 0;
-        // MACA may export the complete backing allocation even when asked for
-        // a sub-range. The returned offset locates exportBase in that dma-buf;
-        // exportOffset then locates the caller's address within exportBase.
-        result = mcMemGetHandleForAddressRangeExt(
+        // Some GPU runtimes return an offset locating exportBase within the
+        // backing DMA-BUF; exportOffset locates addr within exportBase.
+        result = cuMemGetHandleForAddressRangeExt(
             &dmabuf_fd, reinterpret_cast<void *>(exportBase), exportSize,
-            mcMemHandleTypePosixFileDescriptor, export_flags,
+            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, export_flags,
             &dmabuf_allocation_offset);
 #else
         result = cuMemGetHandleForAddressRange(
@@ -792,7 +781,7 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 #ifdef USE_MACA
         if (dmabuf_allocation_offset >
             std::numeric_limits<uint64_t>::max() - exportOffset) {
-            LOG(ERROR) << "MACA dma-buf offset overflow for "
+            LOG(ERROR) << "DMA-BUF allocation offset overflow for "
                        << (uintptr_t)addr;
             close(dmabuf_fd);
             out.fd = -1;
