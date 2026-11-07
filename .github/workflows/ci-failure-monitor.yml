@@ -1,0 +1,47 @@
+name: CI Failure Monitor
+
+on:
+  schedule:
+    - cron: '23 */12 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-failure-monitor
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  failure-analysis:
+    if: github.repository == 'kvcache-ai/Mooncake'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Failure Analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd scripts/ci_monitor
+          python ci_failures_analysis.py \
+            --token $GITHUB_TOKEN \
+            --limit 50 \
+            --output ci_failure_report.json
+
+      - name: Upload Analysis Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-analysis-${{ github.run_number }}
+          path: scripts/ci_monitor/ci_failure_report.json
+          retention-days: 14
