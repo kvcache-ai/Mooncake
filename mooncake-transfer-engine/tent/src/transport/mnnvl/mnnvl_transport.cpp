@@ -40,6 +40,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include "cuda_memcpy_batch_compat.h"
 #include "tent/common/status.h"
 #include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
@@ -414,9 +415,9 @@ void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
     attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     size_t attrs_idx = 0;
     size_t fail_idx = tasks.size();
-    err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
-                               srcs.size(), &attr, &attrs_idx, 1, &fail_idx,
-                               batch->async_stream.get());
+    err = cudaMemcpyBatchAsyncCompat(dsts.data(), srcs.data(), sizes.data(),
+                                     srcs.size(), &attr, &attrs_idx, 1,
+                                     &fail_idx, batch->async_stream.get());
     if (err != cudaSuccess && fail_idx < tasks.size()) {
         LOG(ERROR) << "MnnvlTransport::startTransfer internal error: "
                    << "cudaMemcpyBatchAsync failed at task index " << fail_idx

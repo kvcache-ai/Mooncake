@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "common.h"
+#include "cuda_memcpy_batch_compat.h"
 #include "common/serialization.h"
 #include "config.h"
 #include "transfer_engine.h"
@@ -303,8 +304,13 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         LOG(INFO) << "NvlinkTransport: using cudaMemcpyBatchAsync "
                   << "(CUDA >= 13.0 path)";
 #elif CUDART_VERSION >= 12080
-        LOG(INFO) << "NvlinkTransport: using cudaMemcpyBatchAsync "
-                  << "(CUDA >= 12.8 path)";
+        if (loadCudaMemcpyBatchAsync()) {
+            LOG(INFO) << "NvlinkTransport: using cudaMemcpyBatchAsync "
+                      << "(CUDA >= 12.8 path)";
+        } else {
+            LOG(INFO) << "NvlinkTransport: using per-slice cudaMemcpyAsync "
+                      << "(libcudart.so.12 older than 12.8)";
+        }
 #else
         LOG(INFO) << "NvlinkTransport: using per-slice cudaMemcpyAsync "
                   << "(CUDA < 12.8 fallback path)";
@@ -352,10 +358,10 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         }
     }
 #elif CUDART_VERSION >= 12080
-    err = cudaMemcpyBatchAsync(const_cast<void **>(dsts.data()),
-                               const_cast<void **>(srcs.data()),
-                               mutable_sizes.data(), static_cast<size_t>(count),
-                               &attr, &attrs_idx, 1, &fail_idx, stream);
+    err = cudaMemcpyBatchAsyncCompat(
+        const_cast<void **>(dsts.data()), const_cast<void **>(srcs.data()),
+        mutable_sizes.data(), static_cast<size_t>(count), &attr, &attrs_idx, 1,
+        &fail_idx, stream);
     if (err != cudaSuccess) {
         if (fail_idx < count) {
             LOG(ERROR) << "NvlinkTransport: cudaMemcpyBatchAsync "
