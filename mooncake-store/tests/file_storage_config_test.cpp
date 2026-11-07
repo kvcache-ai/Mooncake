@@ -73,6 +73,8 @@ struct FileStorageEnvironment {
         "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO"};
     ScopedEnvVar use_uring{"MOONCAKE_OFFLOAD_USE_URING"};
     ScopedEnvVar legacy_use_uring{"MOONCAKE_USE_URING"};
+    ScopedEnvVar offload_write_concurrency{
+        "MOONCAKE_OFFLOAD_WRITE_CONCURRENCY"};
 };
 
 void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
@@ -87,6 +89,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.client_buffer_gc_interval_seconds, 1u);
     EXPECT_EQ(config.client_buffer_gc_ttl_ms, 5000u);
     EXPECT_FALSE(config.use_uring);
+    EXPECT_EQ(config.offload_write_concurrency, 0);
     EXPECT_FALSE(config.enable_dfs);
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
@@ -168,6 +171,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     env.disk_eviction_high_watermark_ratio.Set("0.75");
     env.disk_eviction_low_watermark_ratio.Set("0.50");
     env.use_uring.Set("1");
+    env.offload_write_concurrency.Set("6");
 
     const auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kDistributed);
@@ -185,6 +189,36 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.75);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.50);
     EXPECT_TRUE(config.use_uring);
+    EXPECT_EQ(config.offload_write_concurrency, 6);
+}
+
+TEST_F(FileStorageConfigTest, OffloadWriteConcurrencyFallsBackToAuto) {
+    for (const char* raw : {"0", "-1", "not-a-number", ""}) {
+        env.offload_write_concurrency.Set(raw);
+        EXPECT_EQ(
+            FileStorageConfig::FromEnvironment().offload_write_concurrency, 0)
+            << "raw=" << raw;
+    }
+}
+
+TEST_F(FileStorageConfigTest, ResolvesOffloadWriteConcurrency) {
+    FileStorageConfig config;
+    config.storage_filepath = "/tmp/disk0,/tmp/disk1,/tmp/disk2";
+
+    // Auto: one write stream per disk.
+    config.offload_write_concurrency = 0;
+    EXPECT_EQ(ResolveOffloadWriteConcurrency(config), 3u);
+
+    // An explicit value wins over the disk count, in both directions.
+    config.offload_write_concurrency = 8;
+    EXPECT_EQ(ResolveOffloadWriteConcurrency(config), 8u);
+    config.offload_write_concurrency = 1;
+    EXPECT_EQ(ResolveOffloadWriteConcurrency(config), 1u);
+
+    // Auto on a single disk is still a usable thread count.
+    config.offload_write_concurrency = 0;
+    config.storage_filepath = "/tmp/disk0";
+    EXPECT_EQ(ResolveOffloadWriteConcurrency(config), 1u);
 }
 
 TEST_F(FileStorageConfigTest, PreservesAliasPrecedence) {

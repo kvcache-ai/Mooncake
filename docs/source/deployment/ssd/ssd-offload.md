@@ -141,6 +141,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
 | `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
+| `MOONCAKE_OFFLOAD_WRITE_CONCURRENCY` | `0` (auto) | Buckets written to disk concurrently within one offload round. `0` means one write stream per configured disk; a negative value is rejected and treated as `0`. See {ref}`Multiple disks <ssd-offload-multiple-disks>` |
 | `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO` | `0.90` | Trigger proactive disk eviction when backend usage exceeds this ratio of its quota |
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |
@@ -231,6 +232,13 @@ export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST=$((200 * 1024 * 1024 * 1024))
   evens out naturally as the original disk's older buckets age out and get
   replaced by round-robin writes, but this can take a while — treat the
   imbalance as expected during that window rather than a misconfiguration.
+- **Writes run in parallel.** The buckets of one offload round are written
+  concurrently, so a round costs roughly the slowest disk rather than the sum of
+  all of them. The default concurrency is one write stream per configured disk;
+  override it with `MOONCAKE_OFFLOAD_WRITE_CONCURRENCY` when a disk sustains more
+  than one stream, or set it to `1` to restore the previous serial behaviour.
+  A round no longer stops at the first bucket that fails: every bucket is
+  attempted, and the round reports the first fatal error afterwards.
 - **Quotas, eviction and the physical cap are per disk.** Each disk keeps its own
   usage counter, its own FIFO/LRU order and its own
   `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` accounting, so a busy disk evicts
