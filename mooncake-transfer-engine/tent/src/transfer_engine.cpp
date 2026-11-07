@@ -199,5 +199,9 @@ Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
     return impl_->getNicLoadStats(stats);
 }
 
+Status TransferEngine::getSelectionStats(SelectionStats& stats) const {
+    return impl_->getSelectionStats(stats);
+}
+
 }  // namespace tent
 }  // namespace mooncake

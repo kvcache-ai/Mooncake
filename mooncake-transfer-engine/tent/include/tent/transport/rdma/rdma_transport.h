@@ -100,6 +100,7 @@ class RdmaTransport : public Transport {
 
     double getEstimatedBandwidth() const override;
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const override;
+    Status getSelectionStats(SelectionStats& stats) const override;
 
     virtual bool supportNotification() const override { return true; }
 

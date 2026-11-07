@@ -384,6 +384,54 @@ TEST(TransferEngineConfigOverrideTest,
     }
 }
 
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitRailTopologySurvivesMcTentConfThroughConstructor) {
+    const std::string env_config =
+        R"({"transports":{"rdma":{"workers":{"rail_topo_path":"/environment/rails.json"}}},"metrics":{"enabled":false}})";
+    TempConfigFile conf_file(env_config);
+    for (bool from_file : {false, true}) {
+        SCOPED_TRACE(from_file);
+        EnvVarGuard conf_guard("MC_TENT_CONF",
+                               from_file ? conf_file.path() : env_config);
+        auto config = std::make_shared<Config>();
+        config->set("metadata_type", "p2p");
+        config->set("rpc_server_hostname", kLoopbackHostname);
+        config->set("rpc_server_port", 0);
+        ConfigHelper::forceTcp(*config);
+        config->set("transports/rdma/workers/rail_topo_path",
+                    "/explicit/rails.json");
+
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        EXPECT_FALSE(config->get("metrics/enabled", true));
+        EXPECT_EQ(config->get("transports/rdma/workers/rail_topo_path", ""),
+                  "/explicit/rails.json");
+    }
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     EmptyOrUnsetRailTopologyRetainsMcTentConfThroughConstructor) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"rdma":{"workers":{"rail_topo_path":"/environment/rails.json"}}},"metrics":{"enabled":false}})");
+    for (bool set_empty : {false, true}) {
+        SCOPED_TRACE(set_empty);
+        auto config = std::make_shared<Config>();
+        config->set("metadata_type", "p2p");
+        config->set("rpc_server_hostname", kLoopbackHostname);
+        config->set("rpc_server_port", 0);
+        ConfigHelper::forceTcp(*config);
+        if (set_empty) {
+            config->set("transports/rdma/workers/rail_topo_path", "");
+        }
+
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        EXPECT_EQ(config->get("transports/rdma/workers/rail_topo_path", ""),
+                  "/environment/rails.json");
+    }
+}
+
 // MOONCAKE_LOCAL_HOSTNAME is the classic Transfer Engine + store env var that
 // names the local host for RPC binding and segment identity. TENT must honor
 // the same env so a single MOONCAKE_LOCAL_HOSTNAME works across both engines;

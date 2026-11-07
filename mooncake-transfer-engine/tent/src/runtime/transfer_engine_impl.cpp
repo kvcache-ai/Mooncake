@@ -99,6 +99,7 @@ struct PreservedTentConfigOverrides {
     std::optional<json> rpc_server_port;
     bool force_tcp{false};
     std::optional<std::vector<std::string>> rdma_whitelist;
+    std::optional<std::string> rail_topo_path;
     // Classic TE shim writes these nested leaves before construct(). Keep
     // them on the existing identity whitelist instead of growing Config.
     std::optional<bool> ascend_agent_mode;
@@ -231,6 +232,10 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         captureExplicitConfigValue(config, "rpc_server_port", json());
     preserved.rdma_whitelist = captureExplicitConfigValue(
         config, "topology/rdma_whitelist", std::vector<std::string>());
+    const auto rail_topo_path =
+        config.get("transports/rdma/workers/rail_topo_path", std::string());
+    // An empty benchmark flag leaves the environment-provided topology active.
+    if (!rail_topo_path.empty()) preserved.rail_topo_path = rail_topo_path;
     preserved.ascend_agent_mode = captureExplicitConfigValue(
         config, "transports/ascend_direct/agent_mode", false);
     preserved.ascend_store_te_init = captureExplicitConfigValue(
@@ -267,6 +272,8 @@ void restoreExplicitTransferEngineConfig(
     }
     restoreExplicitConfigValue(config, "topology/rdma_whitelist",
                                preserved.rdma_whitelist);
+    restoreExplicitConfigValue(config, "transports/rdma/workers/rail_topo_path",
+                               preserved.rail_topo_path);
     restoreExplicitConfigValue(config, "transports/ascend_direct/agent_mode",
                                preserved.ascend_agent_mode);
     restoreExplicitConfigValue(config, "transports/ascend_direct/store_te_init",
@@ -3790,6 +3797,14 @@ Status TransferEngineImpl::getNicLoadStats(
         if (transport) {
             CHECK_STATUS(transport->getNicLoadStats(stats));
         }
+    }
+    return Status::OK();
+}
+
+Status TransferEngineImpl::getSelectionStats(SelectionStats& stats) const {
+    stats = {};
+    for (const auto& transport : transport_list_) {
+        if (transport) CHECK_STATUS(transport->getSelectionStats(stats));
     }
     return Status::OK();
 }
