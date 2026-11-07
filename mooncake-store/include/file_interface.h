@@ -67,6 +67,14 @@ class StorageFile {
      */
     virtual tl::expected<void, ErrorCode> datasync() { return {}; }
 
+    /**
+     * @brief Advise the kernel to drop this file's cached pages
+     * @return true on success, false if posix_fadvise() failed
+     * @note Best-effort: only clean pages are evicted, so call datasync()
+     * first. Does not change the file's error state.
+     */
+    bool drop_page_cache();
+
     // Prevent destructor from unlinking the arena file on write failure.
     void SetDeleteOnWriteFail(bool v) { delete_on_write_fail_ = v; }
 
