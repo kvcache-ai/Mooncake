@@ -1,7 +1,10 @@
-import unittest
+import ctypes
+import gc
 import os
-import time
 import threading
+import time
+import unittest
+
 from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
@@ -134,6 +137,60 @@ class TestZeroLocalBufferSize(unittest.TestCase):
         # Verify that the key doesn't exist
         result = zero_buffer_store.is_exist(key)
         self.assertEqual(result, 0, "Key should not exist after failed put")
+
+
+class TestGetAllocationFailure(unittest.TestCase):
+    def test_get_reports_pool_exhaustion_without_hiding_the_object(self):
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+        self.assertEqual(store.setup(get_config_dict("16MB", "16MB")), 0)
+        key = f"test_get_allocation_failure_{os.getpid()}"
+        missing_key = f"test_get_allocation_failure_missing_{os.getpid()}"
+        payload = bytes(range(256)) * 1024
+        held = []
+        handle = None
+        destination = ctypes.create_string_buffer(len(payload))
+        destination_ptr = ctypes.addressof(destination)
+        registered = False
+        try:
+            self.assertEqual(store.put(key, payload), 0)
+            self.assertEqual(store.get(key), payload)
+            self.assertEqual(store.register_buffer(destination_ptr, len(payload)), 0)
+            registered = True
+            self.assertEqual(
+                store.get_into(key, destination_ptr, len(payload)), len(payload)
+            )
+
+            for _ in range(100):
+                handle = store.get_buffer(key)
+                if handle is None:
+                    break
+                held.append(handle)
+            else:
+                self.fail("client buffer pool was not exhausted")
+
+            self.assertEqual(len(held), 64)
+            self.assertEqual(store.get_size(key), len(payload))
+            with self.assertRaises(MemoryError):
+                store.get(key)
+            self.assertEqual(store.get(missing_key), b"")
+
+            ctypes.memset(destination_ptr, 0, len(payload))
+            self.assertEqual(
+                store.get_into(key, destination_ptr, len(payload)), len(payload)
+            )
+            self.assertEqual(destination.raw, payload)
+
+            held.clear()
+            handle = None
+            gc.collect()
+            self.assertEqual(store.get(key), payload)
+        finally:
+            held.clear()
+            handle = None
+            if registered:
+                store.unregister_buffer(destination_ptr)
+            store.remove(key, True)
 
 
 class TestDistributedObjectStoreSingleStore(unittest.TestCase):

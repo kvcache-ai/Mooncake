@@ -18,6 +18,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::SEGMENT_ALREADY_EXISTS, "SEGMENT_ALREADY_EXISTS"},
         {ErrorCode::CLIENT_NOT_FOUND, "CLIENT_NOT_FOUND"},
         {ErrorCode::NO_AVAILABLE_HANDLE, "NO_AVAILABLE_HANDLE"},
+        {ErrorCode::CLIENT_BUFFER_EXHAUSTED, "CLIENT_BUFFER_EXHAUSTED"},
         {ErrorCode::INVALID_VERSION, "INVALID_VERSION"},
         {ErrorCode::INVALID_KEY, "INVALID_KEY"},
         {ErrorCode::WRITE_FAIL, "WRITE_FAIL"},
