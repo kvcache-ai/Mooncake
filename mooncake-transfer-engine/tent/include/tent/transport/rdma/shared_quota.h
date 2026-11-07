@@ -92,6 +92,7 @@ class SharedSlotManager {
     // Background thread
     std::thread background_thread_;
     std::atomic<bool> background_running_;
+    std::atomic<int> background_error_{0};
 };
 
 }  // namespace tent
