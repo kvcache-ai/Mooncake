@@ -145,8 +145,9 @@ TEST_F(TCPTransportTest, Writetest) {
         LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         if (status.s == TransferStatusEnum::COMPLETED) completed = true;
     }
+    // Completion callbacks may still hold the batch after transfer completion.
     s = engine->freeBatchID(batch_id);
-    ASSERT_EQ(s, Status::OK());
+    ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
 }
 
 TEST_F(TCPTransportTest, WriteAndReadtest) {
@@ -191,7 +192,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
     }
 
     {
@@ -215,7 +216,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
         s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
@@ -264,7 +265,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
     }
 
     {
@@ -287,7 +288,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
         s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
@@ -314,7 +315,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
     }
 
     {
@@ -337,7 +338,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
         s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred()) << s.ToString();
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
@@ -393,8 +394,11 @@ TEST_F(TCPTransportTest, CApiBatchTransferStatus) {
     EXPECT_EQ(getBatchTransferStatus(c_engine, batch_id, nullptr),
               kInvalidArgument);
 
-    ASSERT_TRUE(engine->freeBatchID(batch_id).ok());
+    Status free_status = engine->freeBatchID(batch_id);
+    ASSERT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred())
+        << free_status.ToString();
     ASSERT_EQ(engine->unregisterLocalMemory(addr), 0);
+    engine.reset();
     numa_free(addr, ram_buffer_size);
 }
 
