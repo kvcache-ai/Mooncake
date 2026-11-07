@@ -21,9 +21,34 @@ bool isCpuMemory(void *addr) {
 }  // namespace
 
 HeterogeneousRdmaTransport::~HeterogeneousRdmaTransport() {
-    running_ = false;
-    transfer_queue_cv_.notify_one();
-    transfer_thread_.join();
+    // Flip running_ under the queue mutexes and use notify_all: a waiter
+    // must not evaluate its predicate in the window between our store and
+    // the notify (lost wakeup), and either CV may have several waiters.
+    {
+        std::lock_guard<std::mutex> lock(transfer_queue_mutex_);
+        running_ = false;
+    }
+    transfer_queue_cv_.notify_all();
+    {
+        // Pairs with acquireBlock() waiters, which evaluate running_
+        // while holding block_queue_mutx_. The store is idempotent.
+        std::lock_guard<std::mutex> lock(block_queue_mutx_);
+        running_ = false;
+    }
+    block_queue_cv_.notify_all();
+    // install() may have failed or been skipped before the worker thread
+    // was started; joining a non-joinable thread would throw.
+    if (transfer_thread_.joinable()) {
+        transfer_thread_.join();
+    }
+    if (int ret = aclrtSetDevice(logic_device_id_)) {
+        LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSetDevice failed in "
+                      "destructor, ret: "
+                   << ret;
+    }
+    if (stream_copy_created_) {
+        aclrtDestroyStream(stream_copy_);
+    }
     free(host_addr_);
     host_addr_ = nullptr;
     aclrtFree(dev_addr_);
@@ -37,19 +62,24 @@ void HeterogeneousRdmaTransport::transferLoop() {
     if (ret) {
         LOG(ERROR) << "HeterogeneousRdmaTransport: aclrtSetDevice error, ret: "
                    << ret;
+        return;
     }
 
+    bool stream_d2h_created = false;
     ret = aclrtCreateStream(&stream_d2h);
     if (ret) {
         LOG(ERROR)
             << "HeterogeneousRdmaTransport: aclrtCreateStream error, ret: "
             << ret;
+    } else {
+        stream_d2h_created = true;
     }
 
     while (running_) {
         auto transfer_info = getTransfer();
         const auto &task_list = transfer_info.tasks;
         if (task_list.empty()) {
+            if (!running_) break;
             LOG(ERROR)
                 << "HeterogeneousRdmaTransport: empty transfer task batch";
             continue;
@@ -96,6 +126,33 @@ void HeterogeneousRdmaTransport::transferLoop() {
                 << "HeterogeneousRdmaTransport: Rdma submitTransferTask error";
         }
         releaseBlock(transfer_info.block);  // 释放block
+    }
+
+    // Shutdown: drain queued TransferInfos so their blocks return to
+    // block_queue_; otherwise a concurrent aggTransport() would wait
+    // forever in allBlockReleased() after this thread exits. The pending
+    // transfers themselves are dropped.
+    size_t dropped_batches = 0;
+    while (true) {
+        TransferInfo transfer_info{};
+        {
+            std::lock_guard<std::mutex> lock(transfer_queue_mutex_);
+            if (transfer_queue_.empty()) break;
+            transfer_info = transfer_queue_.front();
+            transfer_queue_.pop();
+        }
+        if (transfer_info.block != nullptr) {
+            releaseBlock(transfer_info.block);
+        }
+        ++dropped_batches;
+    }
+    if (dropped_batches > 0) {
+        LOG(INFO) << "HeterogeneousRdmaTransport: discarded " << dropped_batches
+                  << " pending transfer batch(es) on shutdown";
+    }
+
+    if (stream_d2h_created) {
+        aclrtDestroyStream(stream_d2h);
     }
 }
 
@@ -352,6 +409,15 @@ Status HeterogeneousRdmaTransport::aggTransport(
     uint64_t index = 0;
     while (index < task_list.size()) {
         auto block = acquireBlock();
+        if (block == nullptr) {
+            // Shutdown in progress: acquireBlock() gave up waiting. Abort
+            // instead of copying into a null block; blocks of batches that
+            // were already queued are returned by the transferLoop() drain.
+            LOG(ERROR) << "HeterogeneousRdmaTransport: acquireBlock gave up "
+                          "during shutdown, aborting aggregate transfer";
+            return Status::InvalidArgument(
+                "HeterogeneousRdmaTransport: transport is shutting down");
+        }
         uint64_t block_offset = 0;
         std::vector<TransferTask *> tasks;
 
@@ -392,7 +458,11 @@ Status HeterogeneousRdmaTransport::aggTransport(
     }
 
     auto start = std::chrono::high_resolution_clock::now();
-    while (!allBlockReleased()) {  // 等待transfer_queue_被处理完毕
+    // Wait until transfer_queue_ has been processed. Also stop waiting
+    // once shutdown started: normally the worker drains the queue and
+    // every block comes back, but never deadlock against a worker thread
+    // that has already exited.
+    while (!allBlockReleased() && running_) {  // 等待transfer_queue_被处理完毕
         auto end = std::chrono::high_resolution_clock::now();
         auto duration_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -408,6 +478,15 @@ Status HeterogeneousRdmaTransport::aggTransport(
                 std::chrono::milliseconds(1));  // 休眠 1 毫秒
             // std::this_thread::yield();
         }
+    }
+
+    if (!allBlockReleased()) {
+        // Shutdown raced with the wait above (e.g. a batch submitted
+        // concurrently with shutdown). Stop waiting instead of hanging.
+        LOG(ERROR) << "HeterogeneousRdmaTransport: shutdown with blocks "
+                      "still in flight, stop waiting";
+        return Status::InvalidArgument(
+            "HeterogeneousRdmaTransport: transport is shutting down");
     }
 
     return Status::OK();

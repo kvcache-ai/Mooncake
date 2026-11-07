@@ -89,12 +89,16 @@ class HeterogeneousRdmaTransport : public Transport {
         for (size_t i = 1; true; ++i) {
             std::unique_lock<std::mutex> lock(block_queue_mutx_);
             if (block_queue_cv_.wait_for(lock, 1000ms, [&] {
-                    return !this->block_queue_.empty();
+                    return !this->block_queue_.empty() || !running_;
                 })) {
+                if (!running_ && block_queue_.empty()) {
+                    return nullptr;
+                }
                 auto block = block_queue_.front();
                 block_queue_.pop();
                 return block;
             } else {
+                if (!running_) return nullptr;
                 LOG(INFO)
                     << "HeterogeneousRdmaTransport: acquireBlock time out, idx:"
                     << i;
@@ -118,14 +122,16 @@ class HeterogeneousRdmaTransport : public Transport {
         for (size_t i = 1; true; ++i) {
             std::unique_lock<std::mutex> lock(transfer_queue_mutex_);
             if (transfer_queue_cv_.wait_for(lock, 10000ms, [&] {
-                    return !this->transfer_queue_.empty();
+                    return !this->transfer_queue_.empty() || !running_;
                 })) {
+                if (!running_ && transfer_queue_.empty()) {
+                    return TransferInfo{};
+                }
                 auto info = transfer_queue_.front();
                 transfer_queue_.pop();
                 return info;
             } else {
-                // LOG(INFO) << "HeterogeneousRdmaTransport: getTransfer time
-                // out, idx:" << i;
+                if (!running_) return TransferInfo{};
             }
         }
     }
@@ -142,12 +148,12 @@ class HeterogeneousRdmaTransport : public Transport {
         transfer_queue_cv_.notify_one();
     }
 
-    bool running_{};
+    std::atomic<bool> running_{};
     int logic_device_id_{};
 
     std::unique_ptr<RdmaTransport> transport_{};
     aclrtStream stream_copy_{};
-    bool stream_copy_created_{};
+    std::atomic<bool> stream_copy_created_{};
 
     char *dev_addr_{};
     char *host_addr_{};
