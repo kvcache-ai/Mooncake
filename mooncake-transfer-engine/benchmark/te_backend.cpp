@@ -704,6 +704,12 @@ int TEBenchRunner::startInitiator(int num_threads) {
     for (const auto& name : names) {
         SegmentID handle = engine_->openSegment(name);
         auto info = engine_->getMetadata()->getSegmentDescByID(handle);
+        if (!info) {
+            LOG(ERROR) << "Failed to open target segment " << name;
+            target_handles_.clear();
+            target_infos_.clear();
+            return -1;
+        }
         std::sort(info->buffers.begin(), info->buffers.end(),
                   [](const TransferMetadata::BufferDesc& a,
                      const TransferMetadata::BufferDesc& b) {
