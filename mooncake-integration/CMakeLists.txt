@@ -36,6 +36,21 @@ find_package(
   COMPONENTS Interpreter Development.Module
   REQUIRED)
 
+function(mooncake_limit_extension_exports target)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # pybind11 hides the module's own sources, but object and static library
+    # inputs can still export duplicate inline YLT definitions into every
+    # Python extension. Export only the Python entry point on ELF platforms.
+    set(export_map "${CMAKE_CURRENT_SOURCE_DIR}/${target}.exports")
+    target_link_options(${target} PRIVATE
+                        "LINKER:--version-script=${export_map}")
+    set_property(
+      TARGET ${target}
+      APPEND
+      PROPERTY LINK_DEPENDS "${export_map}")
+  endif()
+endfunction()
+
 execute_process(
   COMMAND ${Python3_EXECUTABLE} -c
           "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
@@ -53,6 +68,7 @@ if(WITH_TE)
     engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
     transfer_engine/transfer_engine_py.cpp
     transfer_engine/shared_segment_py.cpp)
+  mooncake_limit_extension_exports(engine)
   set_target_properties(engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 
   # Propagate EFA compile definition to engine target
@@ -169,6 +185,7 @@ if(WITH_STORE)
   pybind11_add_module(
     store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
     store/buffer_pool.cpp integration_utils.h)
+  mooncake_limit_extension_exports(store)
   set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
                                                               "$ORIGIN")
   if(USE_TENT)
@@ -187,10 +204,33 @@ endif()
 
 if(WITH_CONDUCTOR)
   pybind11_add_module(_conductor conductor/conductor_py.cpp)
+  mooncake_limit_extension_exports(_conductor)
   set_target_properties(_conductor PROPERTIES INSTALL_RPATH "$ORIGIN")
   target_link_libraries(_conductor PRIVATE conductor_cpp_core glog::glog)
   install(TARGETS _conductor LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                                      COMPONENT python)
+endif()
+
+if(BUILD_UNIT_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(python_extension_targets)
+  foreach(target IN ITEMS engine store _conductor)
+    if(TARGET ${target})
+      list(APPEND python_extension_targets ${target})
+    endif()
+  endforeach()
+  list(LENGTH python_extension_targets python_extension_count)
+  if(python_extension_count GREATER 1)
+    set(python_extension_files)
+    foreach(target IN LISTS python_extension_targets)
+      list(APPEND python_extension_files $<TARGET_FILE:${target}>)
+    endforeach()
+    add_test(
+      NAME python_extension_exports
+      COMMAND
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_python_extension_exports.py
+        ${python_extension_files})
+  endif()
 endif()
 
 if(NOT SKBUILD)
