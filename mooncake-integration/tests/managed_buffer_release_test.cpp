@@ -20,7 +20,8 @@
 
 namespace {
 
-bool contains(mooncake::detail::ManagedBufferFreeList& free_list, char* address) {
+bool contains(mooncake::detail::ManagedBufferFreeList& free_list,
+              char* address) {
     auto entries = free_list;
     for (auto& stack : entries) {
         while (!stack.empty()) {

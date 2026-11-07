@@ -25,8 +25,8 @@ namespace detail {
 
 using ManagedBufferFreeList = std::vector<std::stack<char*>>;
 
-inline void removeSlabFromFreeList(ManagedBufferFreeList& free_list,
-                                   char* slab, size_t slab_capacity) {
+inline void removeSlabFromFreeList(ManagedBufferFreeList& free_list, char* slab,
+                                   size_t slab_capacity) {
     const auto begin = reinterpret_cast<uintptr_t>(slab);
     const auto end = begin + slab_capacity;
     for (auto& stack : free_list) {
@@ -35,7 +35,8 @@ inline void removeSlabFromFreeList(ManagedBufferFreeList& free_list,
             auto* candidate = stack.top();
             stack.pop();
             const auto address = reinterpret_cast<uintptr_t>(candidate);
-            if (address < begin || address >= end) retained.push_back(candidate);
+            if (address < begin || address >= end)
+                retained.push_back(candidate);
         }
         for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
             stack.push(*it);
