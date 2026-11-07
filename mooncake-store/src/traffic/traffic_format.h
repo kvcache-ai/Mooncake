@@ -71,23 +71,6 @@ static_assert(sizeof(TrafficBlockHeader) == kTrafficBlockHeaderSize);
 static_assert(sizeof(TrafficRecordHeader) == kTrafficRecordHeaderSize);
 static_assert(sizeof(TrafficFooter) == kTrafficFooterSize);
 
-inline std::uint32_t TrafficCrc32Extend(std::uint32_t crc, const void* data,
-                                        std::size_t len) {
-    const auto* bytes = static_cast<const std::uint8_t*>(data);
-    for (std::size_t i = 0; i < len; ++i) {
-        crc ^= bytes[i];
-        for (int bit = 0; bit < 8; ++bit) {
-            const std::uint32_t mask = 0u - (crc & 1u);
-            crc = (crc >> 1) ^ (0x82f63b78u & mask);
-        }
-    }
-    return crc;
-}
-
-inline std::uint32_t TrafficCrc32(const void* data, std::size_t len) {
-    return ~TrafficCrc32Extend(0xffffffffu, data, len);
-}
-
 inline std::uint64_t TrafficNowMs() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(

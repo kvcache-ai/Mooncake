@@ -11,6 +11,7 @@
 
 #include <glog/logging.h>
 
+#include "crc32c.h"
 #include "traffic/traffic_format.h"
 
 namespace mooncake::traffic {
@@ -145,7 +146,7 @@ bool FileSink::WriteBlock(const void* data, std::uint32_t bytes,
     header.block_bytes = bytes;
     header.record_count = records;
     header.block_type = block_type;
-    header.crc32 = TrafficCrc32(data, bytes);
+    header.crc32 = mooncake::Crc32cValue(data, bytes);
     if (std::fwrite(&header, sizeof(header), 1, file_) != 1 ||
         (bytes > 0 && std::fwrite(data, bytes, 1, file_) != 1)) {
         LOG(ERROR) << "traffic: write block failed: " << segment_path_;
@@ -182,16 +183,16 @@ bool FileSink::WriteRecords(const struct iovec* iov, int iov_count,
         }
     }
 
-    std::uint32_t crc = 0xffffffffu;
+    mooncake::Crc32c crc;
     for (int i = 0; i < iov_count; ++i) {
-        crc = TrafficCrc32Extend(crc, iov[i].iov_base,
-                                 static_cast<std::size_t>(iov[i].iov_len));
+        crc.Extend(iov[i].iov_base,
+                   static_cast<std::size_t>(iov[i].iov_len));
     }
     TrafficBlockHeader header;
     header.block_bytes = static_cast<std::uint32_t>(bytes);
     header.record_count = records;
     header.block_type = kTrafficBlockData;
-    header.crc32 = ~crc;
+    header.crc32 = crc.Final();
     if (std::fwrite(&header, sizeof(header), 1, file_) != 1 ||
         std::fflush(file_) != 0) {
         LOG(ERROR) << "traffic: write block header failed: " << segment_path_;

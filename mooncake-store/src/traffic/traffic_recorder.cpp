@@ -12,7 +12,6 @@
 #include <pthread.h>
 #include <sched.h>
 #include <new>
-#include <sstream>
 #include <thread>
 
 #include <glog/logging.h>
@@ -586,26 +585,32 @@ TrafficRecorder::RouteTable() const {
 
 std::string TrafficRecorder::StatusJson() const {
     const RecorderStatus status = GetStatus();
-    std::ostringstream out;
-    out << "{\"state\":\"" << status.state << "\""
-        << ",\"observed_requests\":" << status.observed_requests
-        << ",\"recorded_requests\":" << status.recorded_requests
-        << ",\"dropped_requests\":" << status.dropped_requests
-        << ",\"dropped_ring\":" << status.dropped_ring
-        << ",\"dropped_filtered\":" << status.dropped_filtered
-        << ",\"dropped_oversize\":" << status.dropped_oversize
-        << ",\"bytes_written\":" << status.bytes_written
-        << ",\"segments\":" << status.segments
-        << ",\"ring_used_bytes\":" << status.ring_used_bytes
-        << ",\"ring_capacity_bytes\":" << status.ring_capacity_bytes
-        << ",\"stop_timed_out\":"
-        << (status.stop_timed_out ? "true" : "false")
-        << ",\"format_complete\":"
-        << (status.format_complete ? "true" : "false")
-        << ",\"capture_complete\":"
-        << (status.capture_complete ? "true" : "false")
-        << ",\"session_dir\":\"" << status.session_dir << "\"}";
-    return out.str();
+    Json::Value root;
+    root["state"] = status.state;
+    root["observed_requests"] =
+        static_cast<Json::UInt64>(status.observed_requests);
+    root["recorded_requests"] =
+        static_cast<Json::UInt64>(status.recorded_requests);
+    root["dropped_requests"] =
+        static_cast<Json::UInt64>(status.dropped_requests);
+    root["dropped_ring"] = static_cast<Json::UInt64>(status.dropped_ring);
+    root["dropped_filtered"] =
+        static_cast<Json::UInt64>(status.dropped_filtered);
+    root["dropped_oversize"] =
+        static_cast<Json::UInt64>(status.dropped_oversize);
+    root["bytes_written"] = static_cast<Json::UInt64>(status.bytes_written);
+    root["segments"] = static_cast<Json::UInt64>(status.segments);
+    root["ring_used_bytes"] =
+        static_cast<Json::UInt64>(status.ring_used_bytes);
+    root["ring_capacity_bytes"] =
+        static_cast<Json::UInt64>(status.ring_capacity_bytes);
+    root["stop_timed_out"] = status.stop_timed_out;
+    root["format_complete"] = status.format_complete;
+    root["capture_complete"] = status.capture_complete;
+    root["session_dir"] = status.session_dir;
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = "";
+    return Json::writeString(builder, root);
 }
 
 RecorderStatus TrafficRecorder::GetStatus() const {
