@@ -226,8 +226,14 @@ Status IOUringTransport::uninstall() {
         staging_pool_.reset();
         installed_ = false;
     }
+    std::lock_guard<std::mutex> lock(ring_cache_mutex_);
+    for (auto& cached : ring_cache_) io_uring_queue_exit(&cached.ring);
+    ring_cache_.clear();
     return Status::OK();
 }
+
+// Bounds the rings (one fd and mapping each) parked by freeSubBatch().
+static constexpr size_t kMaxCachedRings = 64;
 
 Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto io_uring_batch = Slab<IOUringSubBatch>::Get().allocate();
@@ -235,12 +241,36 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
         return Status::InternalError("Unable to allocate IO Uring sub-batch");
     io_uring_batch->max_size = max_size;
     io_uring_batch->task_list.reserve(max_size);
-    int rc = io_uring_queue_init(max_size, &io_uring_batch->ring, 0);
-    if (rc) {
-        Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
-        return Status::InternalError(
-            std::string("io_uring_queue_init failed: ") + strerror(-rc) +
-            LOC_MARK);
+    bool reused = false;
+    {
+        // The smallest cached ring that holds max_size SQEs.
+        std::lock_guard<std::mutex> lock(ring_cache_mutex_);
+        auto best = ring_cache_.end();
+        for (auto it = ring_cache_.begin(); it != ring_cache_.end(); ++it) {
+            if (it->sq_entries >= max_size &&
+                (best == ring_cache_.end() ||
+                 it->sq_entries < best->sq_entries))
+                best = it;
+        }
+        if (best != ring_cache_.end()) {
+            io_uring_batch->ring = best->ring;
+            io_uring_batch->sq_entries = best->sq_entries;
+            *best = ring_cache_.back();
+            ring_cache_.pop_back();
+            reused = true;
+        }
+    }
+    if (!reused) {
+        struct io_uring_params params{};
+        int rc = io_uring_queue_init_params(max_size, &io_uring_batch->ring,
+                                            &params);
+        if (rc) {
+            Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
+            return Status::InternalError(
+                std::string("io_uring_queue_init_params failed: ") +
+                strerror(-rc) + LOC_MARK);
+        }
+        io_uring_batch->sq_entries = params.sq_entries;
     }
     batch = io_uring_batch;
     return Status::OK();
@@ -282,15 +312,38 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
     if (!io_uring_batch)
         return Status::InvalidArgument("Invalid IO Uring sub-batch" LOC_MARK);
+    // Only a drained ring is reused: an unreaped completion or an unflushed
+    // SQE would surface in the next sub-batch with a dangling user_data.
     auto& ring = io_uring_batch->ring;
-    // io_uring_queue_exit() does not wait for in-flight I/O, which would then
-    // land in staging buffers freed below, or in caller memory reused once the
-    // batch is freed: reap it first.
-    size_t outstanding = 0;
-    for (auto& task : io_uring_batch->task_list)
-        if (task.status_word == TransferStatusEnum::PENDING) ++outstanding;
-    waitForInFlight(&ring, outstanding);
-    io_uring_queue_exit(&ring);
+    bool drained =
+        io_uring_sq_ready(&ring) == 0 && io_uring_cq_ready(&ring) == 0;
+    for (auto& task : io_uring_batch->task_list) {
+        if (task.status_word == TransferStatusEnum::PENDING) {
+            drained = false;
+            break;
+        }
+    }
+    // Writes of device memory staged through pageable buffers keep a ring per
+    // sub-batch: with reuse, 4-thread writes from Intel XPU memory ran up to
+    // 1.7x slower. Pinned staging and host memory showed no such cost.
+    bool cached = false;
+    if (drained && !io_uring_batch->pageable_device_write) {
+        std::lock_guard<std::mutex> lock(ring_cache_mutex_);
+        if (ring_cache_.size() < kMaxCachedRings) {
+            ring_cache_.push_back({ring, io_uring_batch->sq_entries});
+            cached = true;
+        }
+    }
+    if (!drained) {
+        // io_uring_queue_exit() does not wait for in-flight I/O, which would
+        // then land in staging buffers freed below, or in caller memory reused
+        // once the batch is freed: reap it first.
+        size_t outstanding = 0;
+        for (auto& task : io_uring_batch->task_list)
+            if (task.status_word == TransferStatusEnum::PENDING) ++outstanding;
+        waitForInFlight(&ring, outstanding);
+    }
+    if (!cached) io_uring_queue_exit(&ring);
     Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
     batch = nullptr;
     return Status::OK();
@@ -350,6 +403,7 @@ Status IOUringTransport::submitTransferTasks(
     contexts.reserve(request_list.size());
     std::vector<void*> staging_buffers;
     staging_buffers.reserve(request_list.size());
+    bool pageable_device_write = false;
     for (auto& request : request_list) {
         if (request.opcode != Request::READ &&
             request.opcode != Request::WRITE) {
@@ -376,6 +430,10 @@ Status IOUringTransport::submitTransferTasks(
                 return Status::InternalError("posix_memalign failed" LOC_MARK);
             }
             staging_buffers.push_back(buffer);
+            if (request.opcode == Request::WRITE &&
+                (mtype == MTYPE_CUDA || mtype == MTYPE_XPU) &&
+                !(staging_pool_ && staging_pool_->owns(buffer)))
+                pageable_device_write = true;
         } else {
             staging_buffers.push_back(nullptr);
         }
@@ -396,6 +454,7 @@ Status IOUringTransport::submitTransferTasks(
     // remainder instead; a persistent failure defers the flush of the
     // queued SQEs to the next submit attempt from getTransferStatus()'s
     // PENDING path while the tasks stay PENDING.
+    if (pageable_device_write) io_uring_batch->pageable_device_write = true;
     for (size_t i = 0; i < request_list.size(); ++i) {
         const auto& request = request_list[i];
         io_uring_batch->task_list.push_back(IOUringTask{});
