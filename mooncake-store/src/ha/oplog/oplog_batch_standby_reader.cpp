@@ -198,6 +198,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
             }
             const uint64_t expected = applier_.GetExpectedSequenceId();
             if (IsSequenceOlder(entry.sequence_id, expected)) {
+                ++result.skipped_entries;
                 continue;
             }
             if (IsSequenceNewer(entry.sequence_id, expected)) {
