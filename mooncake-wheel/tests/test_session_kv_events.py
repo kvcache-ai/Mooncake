@@ -41,6 +41,7 @@ def session_store(request, tmp_path):
                 "--enable_metric_reporting=false",
                 "--default_kv_lease_ttl=100ms",
                 "--enable_http_metadata_server=true",
+                "--http_metadata_server_host=127.0.0.1",
                 f"--http_metadata_server_port={metadata}",
                 "--enable_kv_events=true",
                 f"--kv_events_bind_endpoint={endpoint}",

@@ -28,6 +28,7 @@ ci_start_service master "$RUNNER_TEMP/mooncake-master.log" \
     --cluster_id="$MOONCAKE_STORE_CLUSTER_ID" \
     --port 50051 \
     --http_metadata_server_port=18080 \
+    --http_metadata_server_host=127.0.0.1 \
     --enable_http_metadata_server=true
 ci_wait_service master 50051 18080
 

@@ -205,7 +205,7 @@ jobs:
           # Start Mooncake master in background
           $MOONCAKE_MASTER \
             --enable_http_metadata_server=true \
-            --http_metadata_server_host=0.0.0.0 \
+            --http_metadata_server_host=127.0.0.1 \
             --http_metadata_server_port=8080 \
             > /tmp/mooncake_master.log 2>&1 &
           MASTER_PID=$!
