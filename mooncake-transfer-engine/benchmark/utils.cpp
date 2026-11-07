@@ -15,6 +15,7 @@
 #include "utils.h"
 
 #include <gflags/gflags.h>
+#include <numa.h>
 #include <cctype>
 #include <charconv>
 #include <iostream>
@@ -116,6 +117,10 @@ DEFINE_int32(local_gpu_id, 0,
              "Local device ordinal for VRAM, -1 for all visible devices. "
              "Selects an MLU or XPU device with --backend=tent in USE_MLU "
              "or USE_XPU builds.");
+DEFINE_int32(local_numa_id, -1,
+             "tent only: NUMA node for local DRAM buffers (including "
+             "--seg_type_mix). -1 allocates on all configured nodes; "
+             "a non-negative ID allocates one buffer on that node.");
 DEFINE_int32(target_gpu_id, 0,
              "Offset for round-robin assignment across target buffers; "
              "-1 uses 0.");
@@ -201,6 +206,7 @@ std::string XferBenchConfig::tent_transport_hint;
 std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
+int XferBenchConfig::local_numa_id = -1;
 int XferBenchConfig::target_gpu_id = 0;
 
 namespace {
@@ -295,7 +301,64 @@ void XferBenchConfig::loadFromFlags() {
     tent_intent_type = FLAGS_tent_intent_type;
 
     local_gpu_id = FLAGS_local_gpu_id;
+    local_numa_id = FLAGS_local_numa_id;
     target_gpu_id = FLAGS_target_gpu_id;
+}
+
+bool XferBenchConfig::validateLocalNuma(std::string& error) {
+    error.clear();
+    if (local_numa_id == -1) return true;
+    if (local_numa_id < -1) {
+        error = "--local_numa_id must be -1 or a non-negative NUMA node ID";
+        return false;
+    }
+    if (backend != "tent") {
+        error = "--local_numa_id requires --backend=tent";
+        return false;
+    }
+    auto types = splitCommaSeparated(seg_type_mix);
+    if (types.empty()) types.push_back(seg_type);
+    if (std::none_of(types.begin(), types.end(), [](const auto& type) {
+            return equalsIgnoreCase(type, "dram");
+        })) {
+        error = "--local_numa_id requires DRAM in --seg_type or --seg_type_mix";
+        return false;
+    }
+    int start_idx = 0, num_buffers = 0;
+    return resolveDramNumaRange(start_idx, num_buffers, error);
+}
+
+bool XferBenchConfig::resolveDramNumaRange(int& start_idx, int& num_buffers,
+                                           std::string& error) {
+    error.clear();
+    start_idx = 0;
+    num_buffers = 0;
+    if (local_numa_id == -1) {
+        num_buffers = numa_num_configured_nodes();
+        return true;
+    }
+    if (local_numa_id < -1) {
+        error = "--local_numa_id must be -1 or a non-negative NUMA node ID";
+        return false;
+    }
+    // Check node IDs, not the node count: NUMA IDs can be sparse. This does
+    // not assert Fabric capability, which remains the transport's job.
+    if (numa_available() < 0 || local_numa_id > numa_max_node() ||
+        !numa_all_nodes_ptr ||
+        !numa_bitmask_isbitset(numa_all_nodes_ptr, local_numa_id)) {
+        error = "--local_numa_id=" + std::to_string(local_numa_id) +
+                " is not an available memory NUMA node";
+        return false;
+    }
+    long long free_bytes = 0;
+    if (numa_node_size64(local_numa_id, &free_bytes) <= 0) {
+        error = "--local_numa_id=" + std::to_string(local_numa_id) +
+                " has no usable host memory";
+        return false;
+    }
+    start_idx = local_numa_id;
+    num_buffers = 1;
+    return true;
 }
 
 double XferMetricStats::percentile(double p) {
