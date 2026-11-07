@@ -50,7 +50,9 @@ struct RdmaSubBatch : public Transport::SubBatch {
     std::vector<RdmaTask*> task_list;
     std::vector<RdmaSlice*> slice_chain;
     size_t max_size;
-    virtual size_t size() const { return task_list.size(); }
+    // CQ workers update task state without sending an engine completion wake.
+    bool needsProgressPolling() const override { return true; }
+    size_t size() const override { return task_list.size(); }
 };
 
 class RdmaTransport : public Transport {
