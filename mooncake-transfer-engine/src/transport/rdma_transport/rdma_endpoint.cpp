@@ -51,6 +51,8 @@ static void fillLocalHandshakeDesc(RdmaContext &context,
     local_desc.local_nic_path = context.nicPath();
     local_desc.local_lid = context.lid();
     local_desc.local_gid = gid_selection.selection.gid;
+    local_desc.local_mtu_bytes =
+        mtuLengthToBytes(localPathMtu(context.activeMTU()));
     local_desc.peer_nic_path = peer_nic;
     local_desc.qp_num = qp_num;
     local_desc.ready_ack = false;
@@ -497,7 +499,8 @@ uint32_t RdmaEndPoint::notificationQpNum() const {
     return notify_.qp && !notify_.error ? notify_.qp->qp_num : 0;
 }
 int RdmaEndPoint::connectNotification(const ibv_gid &gid, uint32_t lid,
-                                      uint32_t peer_qp, int local_gid_index) {
+                                      uint32_t peer_qp, int local_gid_index,
+                                      ibv_mtu path_mtu) {
     auto &s = notify_;
     std::lock_guard<std::mutex> guard(s.mutex);
     if (s.error) return s.error;
@@ -507,7 +510,9 @@ int RdmaEndPoint::connectNotification(const ibv_gid &gid, uint32_t lid,
     auto &cfg = globalConfig();
     ibv_qp_attr attr{};
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = std::min(context_.activeMTU(), cfg.mtu_length);
+    // Same negotiated value as the data QPs: the peer's notification QP
+    // drops packets larger than its own path MTU just the same.
+    attr.path_mtu = path_mtu;
     attr.dest_qp_num = peer_qp;
     attr.rq_psn = 0;
     attr.max_dest_rd_atomic = 1;
@@ -926,7 +931,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                         peer_desc.qp_num,
                         local_gid_selection.selection.gid_index,
                         connected_status, &failure_message, &failure_info,
-                        peer_desc.notify_qp_num);
+                        peer_desc.notify_qp_num, peer_desc.local_mtu_bytes);
                 } else {
                     auto segment_desc =
                         context_.engine().meta()->getSegmentDescByName(
@@ -938,7 +943,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
                                     nic.gid, nic.lid, peer_desc.qp_num,
                                     local_gid_selection.selection.gid_index,
                                     connected_status, &failure_message,
-                                    &failure_info, peer_desc.notify_qp_num);
+                                    &failure_info, peer_desc.notify_qp_num,
+                                    peer_desc.local_mtu_bytes);
                                 break;
                             }
                         }
@@ -1134,7 +1140,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
             int ret = doSetupConnection(peer_gid, peer_lid, peer_desc.qp_num,
                                         local_gid_selection.selection.gid_index,
                                         connected_status, &local_desc.reply_msg,
-                                        &failure_info, peer_desc.notify_qp_num);
+                                        &failure_info, peer_desc.notify_qp_num,
+                                        peer_desc.local_mtu_bytes);
             if (ret == 0) {
                 describeNotification(local_desc);
                 rememberConnectedAutoGid(local_gid_selection, peer_desc);
@@ -1513,7 +1520,8 @@ int RdmaEndPoint::doSetupConnection(
     const std::string &peer_gid, uint32_t peer_lid,
     std::vector<uint32_t> peer_qp_num_list, int local_gid_index,
     Status connected_status, std::string *reply_msg,
-    SetupConnectionFailureInfo *failure_info, uint32_t notify_qp_num) {
+    SetupConnectionFailureInfo *failure_info, uint32_t notify_qp_num,
+    uint32_t peer_mtu_bytes) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
             "QP count mismatch in peer and local endpoints, check "
@@ -1541,16 +1549,21 @@ int RdmaEndPoint::doSetupConnection(
         return ret;
     }
 
+    // RC rejects packets larger than the receiver's path MTU, so both ends
+    // must be programmed with the same value even when their ports run
+    // different active MTUs.
+    ibv_mtu path_mtu =
+        negotiatePathMtu(localPathMtu(context_.activeMTU()), peer_mtu_bytes);
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         int ret = doSetupConnection(qp_index, peer_gid_raw, peer_lid,
                                     peer_qp_num_list[qp_index], local_gid_index,
-                                    reply_msg, failure_info);
+                                    path_mtu, reply_msg, failure_info);
         if (ret) return ret;
     }
 
     if (notify_.enabled) {
-        int notify_ret = connectNotification(peer_gid_raw, peer_lid,
-                                             notify_qp_num, local_gid_index);
+        int notify_ret = connectNotification(
+            peer_gid_raw, peer_lid, notify_qp_num, local_gid_index, path_mtu);
         if (notify_ret && notify_ret != ERR_NOT_IMPLEMENTED)
             LOG(ERROR) << "Notification connection setup failed: "
                        << notify_ret;
@@ -1564,7 +1577,8 @@ int RdmaEndPoint::doSetupConnection(
 
 int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                                     uint32_t peer_lid, uint32_t peer_qp_num,
-                                    int local_gid_index, std::string *reply_msg,
+                                    int local_gid_index, ibv_mtu path_mtu,
+                                    std::string *reply_msg,
                                     SetupConnectionFailureInfo *failure_info) {
     if (qp_index < 0 || qp_index >= (int)qp_list_.size())
         return ERR_INVALID_ARGUMENT;
@@ -1628,9 +1642,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     // INIT -> RTR
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = context_.activeMTU();
-    if (globalConfig().mtu_length < attr.path_mtu)
-        attr.path_mtu = globalConfig().mtu_length;
+    attr.path_mtu = path_mtu;
     attr.ah_attr.grh.dgid = peer_gid;
     // TODO gidIndex and portNum must fetch from REMOTE
     attr.ah_attr.grh.sgid_index = local_gid_index;
