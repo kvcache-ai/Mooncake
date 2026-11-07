@@ -12,6 +12,7 @@
 #endif
 
 #include "common/base64.h"
+#include "ha/oplog/oplog_batch_binary_codec.h"
 
 namespace mooncake {
 
@@ -147,6 +148,14 @@ bool JsonEntryToOpLogEntry(const Json::Value& root, uint64_t sequence_id,
 
 }  // namespace
 
+// The canonical logical checksum is the JSON writer's checksum projection, so
+// the binary reader verifies the same value the JSON reader verifies instead of
+// inventing a second checksum contract. It is defined outside the anonymous
+// namespace because the binary codec translation unit links against it.
+uint32_t ComputeOpLogBatchRecordChecksum(const OpLogBatchRecord& batch) {
+    return ComputeBatchChecksum(batch);
+}
+
 std::string EncodeDurablePrefix(const DurablePrefix& prefix) {
     Json::Value root;
     root["schema_version"] =
@@ -200,8 +209,12 @@ std::string EncodeOpLogBatchRecord(const OpLogBatchRecord& batch) {
     return WriteJson(BatchRecordToJson(encoded, /*include_checksum=*/true));
 }
 
-bool DecodeOpLogBatchRecord(const std::string& value, OpLogBatchRecord* batch,
-                            std::string* reason) {
+// JSON-only decoder. It is retained verbatim for non-magic inputs so the
+// historical acceptance domain (whitespace, BOM handling, parser behavior,
+// base64 canonicality, error strings) does not change.
+static bool DecodeOpLogBatchRecordJson(const std::string& value,
+                                       OpLogBatchRecord* batch,
+                                       std::string* reason) {
     if (reason != nullptr) {
         reason->clear();
     }
@@ -268,6 +281,31 @@ bool DecodeOpLogBatchRecord(const std::string& value, OpLogBatchRecord* batch,
     }
     *batch = std::move(decoded);
     return true;
+}
+
+bool DecodeOpLogBatchRecord(const std::string& value, OpLogBatchRecord* batch,
+                            std::string* reason) {
+    if (reason != nullptr) {
+        reason->clear();
+    }
+    if (batch == nullptr) {
+        SetReason(reason, "batch output is null");
+        return false;
+    }
+
+    // Single format/version dispatch. A complete binary magic selects the
+    // binary-only decoder; a truncated magic is its own error; every other
+    // input goes to the unchanged JSON reader exactly once. There is
+    // deliberately no "try binary, then retry JSON" fallback chain.
+    if (HasOpLogBatchBinaryMagic(value)) {
+        return DecodeOpLogBatchRecordBinary(value, batch, reason);
+    }
+    if (IsTruncatedOpLogBatchBinaryMagic(value)) {
+        SetReason(reason, "truncated binary batch record envelope");
+        return false;
+    }
+
+    return DecodeOpLogBatchRecordJson(value, batch, reason);
 }
 
 }  // namespace mooncake
