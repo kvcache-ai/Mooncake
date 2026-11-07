@@ -76,6 +76,14 @@ class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
 
+    tl::expected<int64_t, ErrorCode> SeedRangeObjects(
+        FileStorage& storage,
+        const std::unordered_map<std::string, std::vector<Slice>>& objects) {
+        auto initialized = storage.storage_backend_->Init();
+        if (!initialized) return tl::unexpected(initialized.error());
+        return storage.storage_backend_->BatchOffload(objects, nullptr);
+    }
+
     static uintmax_t StoredFileBytes(const std::string& path) {
         uintmax_t bytes = 0;
         for (const auto& entry : fs::recursive_directory_iterator(path)) {
@@ -1188,6 +1196,66 @@ TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     {
         FileStorage file_storage(config, nullptr, "localhost:9003");
         EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+    }
+}
+
+TEST_F(FileStorageTest, RangedRestoreKeepsDuplicateKeyWindows) {
+#ifdef USE_URING
+    const std::vector<bool> io_modes{false, true};
+#else
+    const std::vector<bool> io_modes{false};
+#endif
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "1048576");
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "16");
+    for (const bool offset_allocator : {false, true}) {
+        for (const bool use_uring : io_modes) {
+            SCOPED_TRACE(::testing::Message() << "offset=" << offset_allocator
+                                              << ", uring=" << use_uring);
+            auto config = FileStorageConfig::FromEnvironment();
+            config.storage_filepath = data_path + "/ranged-restore-" +
+                                      std::to_string(offset_allocator) + "-" +
+                                      std::to_string(use_uring);
+            std::filesystem::create_directories(config.storage_filepath);
+            config.storage_backend_type =
+                offset_allocator ? StorageBackendType::kOffsetAllocator
+                                 : StorageBackendType::kBucket;
+            config.local_buffer_size = 4 * 1024 * 1024;
+            config.total_size_limit = 16 * 1024 * 1024;
+            config.total_keys_limit = 1000;
+            config.use_uring = use_uring;
+            FileStorage storage(config, nullptr, "localhost:9003");
+            std::unordered_map<std::string, std::string> values{
+                {"ranged", std::string(65536, '\0')},
+                {"other", std::string(65536, '\0')}};
+            for (size_t i = 0; i < 65536; ++i) {
+                values.at("ranged")[i] = static_cast<char>(i % 251);
+                values.at("other")[i] = static_cast<char>(250 - i % 251);
+            }
+            std::unordered_map<std::string, std::vector<Slice>> objects;
+            for (auto& [key, value] : values)
+                objects.emplace(
+                    key, std::vector<Slice>{{value.data(), value.size()}});
+            ASSERT_TRUE(SeedRangeObjects(storage, objects));
+            const std::vector<std::string> keys{"ranged", "other", "ranged",
+                                                "ranged"};
+            const std::vector<int64_t> offsets{65024, 73, 1000, 65535};
+            const std::vector<int64_t> lengths{512, 1024, 1024, 1};
+            auto read = storage.BatchGetRanges(keys, offsets, lengths,
+                                               {65536, 65536, 65536, 65536});
+            ASSERT_TRUE(read);
+            ASSERT_EQ(read->pointers.size(), keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                EXPECT_EQ(
+                    std::string(reinterpret_cast<char*>(read->pointers[i]),
+                                lengths[i]),
+                    values.at(keys[i]).substr(offsets[i], lengths[i]));
+            }
+            EXPECT_EQ(std::unordered_set<uint64_t>(read->pointers.begin(),
+                                                   read->pointers.end())
+                          .size(),
+                      keys.size());
+            EXPECT_TRUE(storage.ReleaseBuffer(read->batch_id));
+        }
     }
 }
 
