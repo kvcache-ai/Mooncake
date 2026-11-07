@@ -719,7 +719,7 @@ jobs:
       run: |
         cmake -S . -B build -G Ninja \
           -DUSE_EFA=ON -DLIBFABRIC_INCLUDE_DIR="$RUNNER_TEMP/libfabric-headers/include" \
-          -DUSE_CUDA=ON -DUSE_HTTP=ON -DWITH_STORE=OFF \
+          -DUSE_CUDA=ON -DUSE_HTTP=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
           -DBUILD_UNIT_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DENABLE_SCCACHE=ON
         targets=$(cmake --build build --target help | sed -n 's/^\(efa_[a-z_]*test\):.*/\1/p' | sort -u)
         test -n "$targets"
