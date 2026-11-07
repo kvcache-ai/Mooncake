@@ -75,6 +75,10 @@ struct GlobalConfig {
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
+    // Handshake connections served at once, each on its own short-lived
+    // thread. Past this, a new connection is closed right after accept().
+    // Override via MC_HANDSHAKE_MAX_CONNECTIONS.
+    int handshake_max_connections = 256;
     // Connect timeout (seconds) for outbound handshake-port RPCs (QP
     // handshake, probe, notify, metadata exchange). A plain blocking
     // connect() has no deadline: to an unroutable address (e.g. a
