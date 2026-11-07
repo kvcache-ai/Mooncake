@@ -226,7 +226,83 @@ Status IOUringTransport::uninstall() {
         staging_pool_.reset();
         installed_ = false;
     }
+    std::lock_guard<std::mutex> lock(ring_cache_mutex_);
+    for (auto& ring : ring_cache_) io_uring_queue_exit(&ring);
+    ring_cache_.clear();
     return Status::OK();
+}
+
+// Bounds the rings (one fd and mapping each) parked by freeSubBatch().
+static constexpr size_t kMaxCachedRings = 64;
+
+// SQ ring size, read through kring_entries: liburing 2.2 and older (Ubuntu
+// 22.04 ships 2.1) have no ring_entries field.
+static unsigned sqEntries(const struct io_uring& ring) {
+    return *ring.sq.kring_entries;
+}
+
+// A staged READ of at least 2 * kMinStagingChunk bytes is split into up to
+// kMaxStagingChunks SQEs, so that each chunk's copy to the destination
+// overlaps with the reads of the others. Writes stay whole: on XPU,
+// overlapping their copies gained nothing with the CPU held out of deep
+// C-states and was slower without, likely as each extra synchronous copy
+// adds its own wait.
+static constexpr size_t kMaxStagingChunks = 4;
+static constexpr size_t kMinStagingChunk = 256 * 1024;
+
+// IORING_MAX_ENTRIES.
+static constexpr size_t kMaxRingEntries = 32768;
+
+// Enough SQEs to split every request of a full sub-batch; just max_size when
+// that would exceed the kernel limit, and requests then go unsplit.
+static size_t ringEntries(size_t max_size) {
+    return max_size <= kMaxRingEntries / kMaxStagingChunks
+               ? max_size * kMaxStagingChunks
+               : max_size;
+}
+
+static size_t stagingChunks(size_t length) {
+    return std::clamp(length / kMinStagingChunk, size_t{1}, kMaxStagingChunks);
+}
+
+// IOUringChunk is pointer-aligned, so bit 0 of its address tells a chunk's
+// user_data from a task's.
+static constexpr uint64_t kChunkTag = 1;
+static_assert(alignof(IOUringChunk) > 1);
+
+// Records one chunk's completion; the task settles with its last chunk. As
+// for an unsplit task, transferred_bytes counts only the bytes done without
+// a gap from the start of the request. Each chunk copies what it read as it
+// completes, so after a failed chunk, later chunks may still have filled the
+// destination past transferred_bytes; as for an unstaged read, those bytes
+// are unspecified when the task FAILED.
+static void completeChunk(IOUringChunk* chunk, int res) {
+    IOUringTask* task = chunk->task;
+    chunk->result = res;
+    if (res < 0) {
+        LOG(INFO) << "Received an event with error code " << res;
+    } else if (res > 0) {
+        // Copy now, while the other chunks are still being read.
+        Platform::getLoader().copy(
+            static_cast<char*>(task->request.source) + chunk->offset,
+            static_cast<char*>(task->buffer) + chunk->offset, res);
+    }
+    if (--task->chunks_pending) return;
+    size_t bytes = 0;
+    bool complete = true;
+    for (const auto& c : task->chunks) {
+        if (c.result >= 0 && static_cast<size_t>(c.result) == c.length) {
+            bytes += c.length;
+            continue;
+        }
+        if (c.result > 0) bytes += c.result;
+        complete = false;
+        break;
+    }
+    task->transferred_bytes = bytes;
+    task->status_word =
+        complete ? TransferStatusEnum::COMPLETED : TransferStatusEnum::FAILED;
+    task->releaseBuffer();
 }
 
 Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
@@ -235,12 +311,33 @@ Status IOUringTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
         return Status::InternalError("Unable to allocate IO Uring sub-batch");
     io_uring_batch->max_size = max_size;
     io_uring_batch->task_list.reserve(max_size);
-    int rc = io_uring_queue_init(max_size, &io_uring_batch->ring, 0);
-    if (rc) {
-        Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
-        return Status::InternalError(
-            std::string("io_uring_queue_init failed: ") + strerror(-rc) +
-            LOC_MARK);
+    const size_t entries = ringEntries(max_size);
+    bool reused = false;
+    {
+        // The smallest cached ring that holds `entries` SQEs.
+        std::lock_guard<std::mutex> lock(ring_cache_mutex_);
+        auto best = ring_cache_.end();
+        for (auto it = ring_cache_.begin(); it != ring_cache_.end(); ++it) {
+            if (sqEntries(*it) >= entries &&
+                (best == ring_cache_.end() ||
+                 sqEntries(*it) < sqEntries(*best)))
+                best = it;
+        }
+        if (best != ring_cache_.end()) {
+            io_uring_batch->ring = *best;
+            *best = ring_cache_.back();
+            ring_cache_.pop_back();
+            reused = true;
+        }
+    }
+    if (!reused) {
+        int rc = io_uring_queue_init(entries, &io_uring_batch->ring, 0);
+        if (rc) {
+            Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
+            return Status::InternalError(
+                std::string("io_uring_queue_init failed: ") + strerror(-rc) +
+                LOC_MARK);
+        }
     }
     batch = io_uring_batch;
     return Status::OK();
@@ -282,15 +379,39 @@ Status IOUringTransport::freeSubBatch(SubBatchRef& batch) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
     if (!io_uring_batch)
         return Status::InvalidArgument("Invalid IO Uring sub-batch" LOC_MARK);
+    // Only a drained ring is reused: an unreaped completion or an unflushed
+    // SQE would surface in the next sub-batch with a dangling user_data.
     auto& ring = io_uring_batch->ring;
-    // io_uring_queue_exit() does not wait for in-flight I/O, which would then
-    // land in staging buffers freed below, or in caller memory reused once the
-    // batch is freed: reap it first.
-    size_t outstanding = 0;
-    for (auto& task : io_uring_batch->task_list)
-        if (task.status_word == TransferStatusEnum::PENDING) ++outstanding;
-    waitForInFlight(&ring, outstanding);
-    io_uring_queue_exit(&ring);
+    bool drained =
+        io_uring_sq_ready(&ring) == 0 && io_uring_cq_ready(&ring) == 0;
+    for (auto& task : io_uring_batch->task_list) {
+        if (task.status_word == TransferStatusEnum::PENDING) {
+            drained = false;
+            break;
+        }
+    }
+    // Writes of device memory staged through pageable buffers keep a ring per
+    // sub-batch: with reuse, 4-thread writes from Intel XPU memory ran up to
+    // 1.7x slower. Pinned staging and host memory showed no such cost.
+    bool cached = false;
+    if (drained && !io_uring_batch->pageable_device_write) {
+        std::lock_guard<std::mutex> lock(ring_cache_mutex_);
+        if (ring_cache_.size() < kMaxCachedRings) {
+            ring_cache_.push_back(ring);
+            cached = true;
+        }
+    }
+    if (!drained) {
+        // io_uring_queue_exit() does not wait for in-flight I/O, which would
+        // then land in staging buffers freed below, or in caller memory reused
+        // once the batch is freed: reap it first.
+        size_t outstanding = 0;
+        for (auto& task : io_uring_batch->task_list)
+            if (task.status_word == TransferStatusEnum::PENDING)
+                outstanding += task.chunks.empty() ? 1 : task.chunks_pending;
+        waitForInFlight(&ring, outstanding);
+    }
+    if (!cached) io_uring_queue_exit(&ring);
     Slab<IOUringSubBatch>::Get().deallocate(io_uring_batch);
     batch = nullptr;
     return Status::OK();
@@ -350,6 +471,7 @@ Status IOUringTransport::submitTransferTasks(
     contexts.reserve(request_list.size());
     std::vector<void*> staging_buffers;
     staging_buffers.reserve(request_list.size());
+    bool pageable_device_write = false;
     for (auto& request : request_list) {
         if (request.opcode != Request::READ &&
             request.opcode != Request::WRITE) {
@@ -376,15 +498,31 @@ Status IOUringTransport::submitTransferTasks(
                 return Status::InternalError("posix_memalign failed" LOC_MARK);
             }
             staging_buffers.push_back(buffer);
+            if (request.opcode == Request::WRITE &&
+                (mtype == MTYPE_CUDA || mtype == MTYPE_XPU) &&
+                !(staging_pool_ && staging_pool_->owns(buffer)))
+                pageable_device_write = true;
         } else {
             staging_buffers.push_back(nullptr);
         }
     }
 
+    // Split staged requests only on a ring that holds every chunk of a full
+    // sub-batch; this also bounds the completions in flight by the CQ size.
+    const bool split = sqEntries(io_uring_batch->ring) >=
+                       io_uring_batch->max_size * kMaxStagingChunks;
+    std::vector<size_t> chunk_counts(request_list.size(), 1);
+    size_t sqe_count = 0;
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        if (split && staging_buffers[i] &&
+            request_list[i].opcode == Request::READ)
+            chunk_counts[i] = stagingChunks(request_list[i].length);
+        sqe_count += chunk_counts[i];
+    }
+
     // The capacity check above bounds the task count, but SQEs left queued
     // by a deferred submission (see below) may still occupy the ring.
-    if (io_uring_sq_space_left(&io_uring_batch->ring) <
-        (int)request_list.size()) {
+    if (io_uring_sq_space_left(&io_uring_batch->ring) < sqe_count) {
         releaseStagingBuffers(staging_pool_.get(), staging_buffers);
         return Status::TooManyRequests("Insufficient SQE space" LOC_MARK);
     }
@@ -396,6 +534,7 @@ Status IOUringTransport::submitTransferTasks(
     // remainder instead; a persistent failure defers the flush of the
     // queued SQEs to the next submit attempt from getTransferStatus()'s
     // PENDING path while the tasks stay PENDING.
+    if (pageable_device_write) io_uring_batch->pageable_device_write = true;
     for (size_t i = 0; i < request_list.size(); ++i) {
         const auto& request = request_list[i];
         io_uring_batch->task_list.push_back(IOUringTask{});
@@ -406,6 +545,34 @@ Status IOUringTransport::submitTransferTasks(
         task.buffer = staging_buffers[i];
         if (staging_pool_ && staging_pool_->owns(task.buffer))
             task.pool = staging_pool_;
+
+        const size_t chunk_count = chunk_counts[i];
+        if (chunk_count > 1) {
+            // Page-aligned chunks; the last one takes the remainder.
+            const size_t chunk_size =
+                ((request.length + chunk_count - 1) / chunk_count +
+                 kStagingAlignment - 1) /
+                kStagingAlignment * kStagingAlignment;
+            task.chunks.resize(chunk_count);
+            task.chunks_pending = chunk_count;
+            for (size_t k = 0; k < chunk_count; ++k) {
+                auto& chunk = task.chunks[k];
+                chunk.task = &task;
+                chunk.offset = k * chunk_size;
+                chunk.length =
+                    std::min(chunk_size, request.length - chunk.offset);
+                char* staged = static_cast<char*>(task.buffer) + chunk.offset;
+                chunk.iov = {staged, chunk.length};
+                struct io_uring_sqe* sqe =
+                    io_uring_get_sqe(&io_uring_batch->ring);
+                CHECK(sqe) << "SQE space was verified before preparation";
+                io_uring_prep_readv(sqe, contexts[i]->getHandle(), &chunk.iov,
+                                    1, request.target_offset + chunk.offset);
+                sqe->user_data = (uintptr_t)&chunk | kChunkTag;
+            }
+            continue;
+        }
+
         // Vectored ops with a single iovec: IORING_OP_READV/WRITEV have
         // existed since kernel 5.1, while the non-vectored READ/WRITE
         // opcodes used by io_uring_prep_read()/io_uring_prep_write() require
@@ -430,14 +597,14 @@ Status IOUringTransport::submitTransferTasks(
 
     int submitted = 0;
     int transient_retries = 0;
-    while (submitted < (int)request_list.size()) {
+    while (submitted < (int)sqe_count) {
         int rc = submitSqes(&io_uring_batch->ring);
         if ((rc == -EINTR || rc == -EAGAIN) && transient_retries++ < 3)
             continue;
         if (rc <= 0) {
             LOG(ERROR) << "IOUringTransport: io_uring_submit "
                        << (rc < 0 ? strerror(-rc) : "made no progress")
-                       << "; deferring " << request_list.size() - submitted
+                       << "; deferring " << sqe_count - submitted
                        << " SQE(s) to the poll path";
             break;
         }
@@ -466,7 +633,11 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                 std::string("io_uring_peek_cqe failed: ") + strerror(-err));
         }
         auto cqe_task = (IOUringTask*)cqe->user_data;
-        if (cqe_task) {
+        if (cqe->user_data & kChunkTag) {
+            completeChunk(
+                reinterpret_cast<IOUringChunk*>(cqe->user_data & ~kChunkTag),
+                cqe->res);
+        } else if (cqe_task) {
             if (cqe->res < 0) {
                 LOG(INFO) << "Received an event with error code " << cqe->res;
                 cqe_task->status_word = TransferStatusEnum::FAILED;
