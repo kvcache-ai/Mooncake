@@ -41,6 +41,9 @@ class EfaContext {
     struct AvSlotState;  // EfaOpContext holds a pointer to one.
     std::string name;
     EfaHandshakeTestTransport transport;
+    // Runs inside submitSlicesOnPeer(), i.e. while submitPostSend() holds the
+    // endpoint lock as a reader.
+    std::function<void()> on_submit;
     int inserts = 0;
     int removals = 0;
     explicit EfaContext(std::string path) : name(std::move(path)) {}
@@ -65,6 +68,7 @@ class EfaContext {
     bool slotHasInflight(fi_addr_t) { return false; }
     int submitSlicesOnPeer(fi_addr_t, std::vector<Transport::Slice*>&,
                            std::vector<Transport::Slice*>&) {
+        if (on_submit) on_submit();
         return 0;
     }
 };
