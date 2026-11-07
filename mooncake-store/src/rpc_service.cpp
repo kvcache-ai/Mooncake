@@ -2161,5 +2161,7 @@ void RegisterRpcService(Server& server,
 
 template void RegisterRpcService<traffic::RecordingServer>(
     traffic::RecordingServer&, WrappedMasterService&, RpcWorkerPool*);
+template void RegisterRpcService<coro_rpc::coro_rpc_server>(
+    coro_rpc::coro_rpc_server&, WrappedMasterService&, RpcWorkerPool*);
 
 }  // namespace mooncake

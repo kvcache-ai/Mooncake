@@ -80,8 +80,9 @@ class TrafficRecorder {
     void DrainShard(Shard& shard, std::vector<char>& block,
                     std::uint32_t& block_records);
     void DrainShardDirect(Shard& shard);
-    void FlushRecords(std::vector<struct iovec>& iov, std::uint64_t bytes,
-                      std::uint32_t records);
+    bool FlushRecords(Shard& shard, std::vector<struct iovec>& iov,
+                      std::uint64_t bytes, std::uint32_t records,
+                      std::uint64_t commit_tail);
     void FlushBlock(std::vector<char>& block, std::uint32_t& block_records);
     void StopInternal();
     void StartControlServer();

@@ -136,6 +136,12 @@ void TrafficRecorder::Install() {
             control_token_ = control["token"].asString();
         }
     }
+    if (control_host_ != "127.0.0.1" && control_host_ != "localhost" &&
+        control_host_ != "::1") {
+        LOG(ERROR) << "traffic: control.host must be a loopback address";
+        state_ = "error";
+        return;
+    }
     if (root["routes"].isArray()) {
         for (const auto& item : root["routes"]) {
             if (!item.isString()) {
@@ -222,15 +228,14 @@ bool TrafficRecorder::Start() {
     }
     block_.clear();
     block_.reserve(block_bytes_);
-    if (sink_ == nullptr) {
-        sink_ = std::make_unique<FileSink>(segment_bytes_, segment_seconds_);
-        const std::uint64_t start_ms = TrafficNowMs();
-        if (!sink_->OpenSession(output_dir_, start_ms)) {
-            state_ = "error";
-            return false;
-        }
-        session_dir_ = sink_->session_dir();
+    sink_.reset();
+    sink_ = std::make_unique<FileSink>(segment_bytes_, segment_seconds_);
+    const std::uint64_t start_ms = TrafficNowMs();
+    if (!sink_->OpenSession(output_dir_, start_ms)) {
+        state_ = "error";
+        return false;
     }
+    session_dir_ = sink_->session_dir();
     writer_stop_.store(false, std::memory_order_release);
     generation_.fetch_add(1, std::memory_order_acq_rel);
     writer_thread_ = std::thread(&TrafficRecorder::WriterLoop, this);
@@ -368,11 +373,29 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
         }
     }
 
-    const std::uint64_t head = shard.head.load(std::memory_order_relaxed);
+    std::uint64_t head = shard.head.load(std::memory_order_relaxed);
     const std::uint64_t tail = shard.tail.load(std::memory_order_acquire);
-    const std::uint64_t used = head - tail;
-    const std::uint64_t index = head & shard.mask;
-    if (total > shard.capacity - used || index + total > shard.capacity) {
+    std::uint64_t used = head - tail;
+    std::uint64_t index = head & shard.mask;
+    if (index + total > shard.capacity) {
+        const std::uint64_t remaining = shard.capacity - index;
+        if (used + remaining > shard.capacity) {
+            shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
+            shard.state.fetch_sub(1, std::memory_order_release);
+            return;
+        }
+        if (remaining >= kTrafficPadSize) {
+            const std::uint32_t pad_len = static_cast<std::uint32_t>(remaining);
+            const std::uint32_t pad_magic = kTrafficPadMagic;
+            std::memcpy(shard.ring.get() + index, &pad_len, sizeof(pad_len));
+            std::memcpy(shard.ring.get() + index + sizeof(pad_len), &pad_magic,
+                        sizeof(pad_magic));
+        }
+        head += remaining;
+        used += remaining;
+        index = 0;
+    }
+    if (total > shard.capacity - used) {
         shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
         shard.state.fetch_sub(1, std::memory_order_release);
         return;
@@ -432,8 +455,31 @@ void TrafficRecorder::DrainShardDirect(Shard& shard) {
     std::uint32_t records = 0;
     std::uint64_t tail = shard.tail.load(std::memory_order_acquire);
     const std::uint64_t head = shard.head.load(std::memory_order_acquire);
+    std::uint64_t commit_tail = tail;
     while (tail != head) {
         const std::uint64_t index = tail & shard.mask;
+        if (index + kTrafficPadSize > shard.capacity) {
+            tail += shard.capacity - index;
+            commit_tail = tail;
+            shard.tail.store(tail, std::memory_order_release);
+            continue;
+        }
+        std::uint32_t pad_len = 0;
+        std::uint32_t pad_magic = 0;
+        std::memcpy(&pad_len, shard.ring.get() + index, sizeof(pad_len));
+        std::memcpy(&pad_magic, shard.ring.get() + index + sizeof(pad_len),
+                    sizeof(pad_magic));
+        if (pad_magic == kTrafficPadMagic) {
+            if (pad_len < kTrafficPadSize || pad_len > shard.capacity - index) {
+                shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
+                shard.tail.store(head, std::memory_order_release);
+                return;
+            }
+            tail += pad_len;
+            commit_tail = tail;
+            shard.tail.store(tail, std::memory_order_release);
+            continue;
+        }
         TrafficRecordHeader header;
         std::memcpy(&header, shard.ring.get() + index, sizeof(header));
         if (header.total_len < kTrafficRecordHeaderSize ||
@@ -441,12 +487,14 @@ void TrafficRecorder::DrainShardDirect(Shard& shard) {
             index + header.total_len > shard.capacity) {
             shard.dropped_ring.fetch_add(1, std::memory_order_relaxed);
             shard.tail.store(head, std::memory_order_release);
-            break;
+            return;
         }
         if (records > 0 &&
             (bytes + header.total_len > block_bytes_ ||
              iov.size() >= static_cast<std::size_t>(IOV_MAX))) {
-            FlushRecords(iov, bytes, records);
+            if (!FlushRecords(shard, iov, bytes, records, commit_tail)) {
+                return;
+            }
             bytes = 0;
             records = 0;
         }
@@ -454,21 +502,29 @@ void TrafficRecorder::DrainShardDirect(Shard& shard) {
         bytes += header.total_len;
         ++records;
         tail += header.total_len;
-        shard.tail.store(tail, std::memory_order_release);
+        commit_tail = tail;
     }
-    FlushRecords(iov, bytes, records);
+    FlushRecords(shard, iov, bytes, records, commit_tail);
 }
 
-void TrafficRecorder::FlushRecords(std::vector<struct iovec>& iov,
+bool TrafficRecorder::FlushRecords(Shard& shard,
+                                   std::vector<struct iovec>& iov,
                                    std::uint64_t bytes,
-                                   std::uint32_t records) {
-    if (!iov.empty() && sink_ != nullptr) {
-        if (!sink_->WriteRecords(iov.data(), static_cast<int>(iov.size()),
-                                 bytes, records)) {
-            LOG(ERROR) << "traffic: write records failed";
-        }
+                                   std::uint32_t records,
+                                   std::uint64_t commit_tail) {
+    if (iov.empty()) {
+        shard.tail.store(commit_tail, std::memory_order_release);
+        return true;
     }
+    if (sink_ == nullptr ||
+        !sink_->WriteRecords(iov.data(), static_cast<int>(iov.size()), bytes,
+                             records)) {
+        LOG(ERROR) << "traffic: write records failed";
+        return false;
+    }
+    shard.tail.store(commit_tail, std::memory_order_release);
     iov.clear();
+    return true;
 }
 
 void TrafficRecorder::DrainShard(Shard& shard, std::vector<char>& block,

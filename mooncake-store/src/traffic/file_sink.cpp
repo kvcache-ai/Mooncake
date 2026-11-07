@@ -78,6 +78,9 @@ bool FileSink::OpenSession(const std::string& output_dir,
 }
 
 bool FileSink::OpenNextSegment() {
+    if (segment_seq_ != 0) {
+        segment_start_ms_ = TrafficNowMs();
+    }
     char name[64];
     std::snprintf(name, sizeof(name), "segment-%06llu.mcr",
                   static_cast<unsigned long long>(segment_seq_));
