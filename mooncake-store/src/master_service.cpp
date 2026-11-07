@@ -475,15 +475,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", error=" << toString(result.error());
               }
           }),
-      replica_cleanup_worker_([this] {
-          // RFC #4700 slice 1: no metadata sweep while a promotion restore
-          // is in flight; the restore itself owns the metadata transition.
-          if (AdmitsBusinessWorkers()) {
-              ClearInvalidHandles();
-          }
-      }),
+      replica_cleanup_worker_([this] { RunReplicaCleanupSweep(); }),
       kvcs_capacity_refresh_worker_([this] { RefreshKvcsDfsUsage(); }),
-      enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
+      // HA defers the sweep too: the segment cleanup barrier keeps a reused
+      // endpoint closed until the sweep has covered the invalidation, so the
+      // unmount RPC no longer has to scan the whole metadata itself. CXL
+      // keeps the synchronous sweep: its buffers are not unreadable the way a
+      // released memory allocator's are.
+      enable_async_segment_cleanup_(!config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
@@ -965,6 +964,7 @@ MasterService::~MasterService() {
         ordered_oplog_writer_->Stop();
     }
     graceful_unmount_scheduler_.Stop();
+    StallCleanupWaiters();
     replica_cleanup_worker_.Stop();
     kvcs_capacity_refresh_worker_.Stop();
 #ifdef USE_NOF
@@ -1022,14 +1022,41 @@ MasterService::~MasterService() {
     client_liveness_records_.clear();
 }
 
+OrderedOpLogWriter::TerminalCallback
+MasterService::MakeComposedTerminalCallback() {
+    return [this](const OrderedOpLogWriterTerminalState& state) {
+        // Wake the barrier waiters first: a mount must not keep waiting for an
+        // entry this writer can no longer accept.
+        StallCleanupWaiters();
+        OrderedOpLogWriter::TerminalCallback external;
+        {
+            std::lock_guard<std::mutex> lock(terminal_callback_mutex_);
+            external = external_terminal_callback_;
+        }
+        if (external) {
+            external(state);
+        }
+    };
+}
+
 void MasterService::SetBatchOpLogTerminalCallback(
     OrderedOpLogWriter::TerminalCallback callback) {
+    {
+        std::lock_guard<std::mutex> lock(terminal_callback_mutex_);
+        external_terminal_callback_ = std::move(callback);
+    }
+    // The writer keeps a single callback, so reinstall the composition rather
+    // than replacing the internal wake-up with the supervisor's.
     if (ordered_oplog_writer_) {
-        ordered_oplog_writer_->SetTerminalCallback(std::move(callback));
+        ordered_oplog_writer_->SetTerminalCallback(
+            MakeComposedTerminalCallback());
     }
 }
 
 void MasterService::StopBatchOpLogWriter() {
+    // Stop() may block on background I/O; wake the waiters before it so a
+    // mount does not keep waiting for an entry this writer will never take.
+    StallCleanupWaiters();
     if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
 }
 
@@ -1056,48 +1083,96 @@ TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
-    {
-        std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
-        auto [record_it, inserted] = client_liveness_records_.try_emplace(
-            client_id, std::make_shared<ClientLivenessRecord>(
-                           ClientLivenessRecord::Clock::now()));
-        const auto record = record_it->second;
-        if (inserted) {
-            MasterMetricManager::instance().client_liveness_record_created();
+    // A mount on an endpoint whose previous segment has not finished its
+    // cleanup waits here, outside every lock the sweep needs, and retries the
+    // admission once the endpoint is clear. The check and the mount share one
+    // ScopedSegmentAccess, so a publication cannot slip between them; if one
+    // does, the loop simply waits again. The deadline covers the whole call:
+    // a repeated wait does not buy a fresh budget.
+    const auto deadline =
+        std::chrono::steady_clock::now() + kMountCleanupWaitBudget;
+    for (;;) {
+        bool cleanup_pending = false;
+        bool cleanup_blocked = false;
+        {
+            std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+            auto [record_it, inserted] = client_liveness_records_.try_emplace(
+                client_id, std::make_shared<ClientLivenessRecord>(
+                               ClientLivenessRecord::Clock::now()));
+            const auto record = record_it->second;
+            if (inserted) {
+                MasterMetricManager::instance()
+                    .client_liveness_record_created();
+            }
+            const auto observation =
+                record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
+                    std::shared_lock<std::shared_mutex> snapshot_lock(
+                        master_state_mutex_);
+                    ScopedSegmentAccess segment_access =
+                        segment_manager_.getSegmentAccess();
+                    // Re-checked after every re-acquisition, before any
+                    // mount: a wait that ran out its budget must not mount
+                    // just because the endpoint cleared while it waited.
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        cleanup_blocked = true;
+                        return true;
+                    }
+                    {
+                        std::lock_guard<std::mutex> barrier_lock(
+                            barrier_mutex_);
+                        if (cleanup_gate_closed_ || cleanup_unrecoverable_) {
+                            cleanup_blocked = true;
+                            return true;
+                        }
+                        if (EndpointCleanupPendingLocked(segment.te_endpoint)) {
+                            cleanup_pending = true;
+                            return true;
+                        }
+                    }
+                    LOG(INFO) << "client_id=" << client_id
+                              << ", action=mount_segment, segment_name="
+                              << segment.name;
+                    mount_result =
+                        segment_access.MountSegment(segment, client_id, record);
+                    return mount_result == ErrorCode::OK ||
+                           mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
+                });
+            if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            if (cleanup_blocked) {
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+            if (!cleanup_pending) {
+                if (mount_result != ErrorCode::OK &&
+                    mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
+                    if (inserted) {
+                        client_liveness_records_.erase(client_id);
+                        MasterMetricManager::instance()
+                            .on_client_liveness_record_removed(
+                                ClientLivenessState::ACTIVE);
+                    }
+                    return tl::make_unexpected(mount_result);
+                }
+                if (observation ==
+                    ClientLivenessObservation::RECOVERED_ACTIVE) {
+                    MasterMetricManager::instance().client_liveness_recovered();
+                    LOG(INFO) << "client_id=" << client_id
+                              << ", action=client_liveness_recovered, "
+                                 "signal=memory_mount";
+                }
+                break;
+            }
         }
-        const auto observation =
-            record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
-                std::shared_lock<std::shared_mutex> snapshot_lock(
-                    master_state_mutex_);
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                LOG(INFO) << "client_id=" << client_id
-                          << ", action=mount_segment, segment_name="
-                          << segment.name;
-                mount_result =
-                    segment_access.MountSegment(segment, client_id, record);
-                return mount_result == ErrorCode::OK ||
-                       mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
-            });
-        if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
+        if (!WaitForEndpointCleanup(segment.te_endpoint, deadline)) {
+            LOG(WARNING)
+                << "client_id=" << client_id
+                << ", action=mount_segment_cleanup_pending, segment_name="
+                << segment.name;
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        }
-        if (mount_result != ErrorCode::OK &&
-            mount_result != ErrorCode::SEGMENT_ALREADY_EXISTS) {
-            if (inserted) {
-                client_liveness_records_.erase(client_id);
-                MasterMetricManager::instance()
-                    .on_client_liveness_record_removed(
-                        ClientLivenessState::ACTIVE);
-            }
-            return tl::make_unexpected(mount_result);
-        }
-        if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {
-            MasterMetricManager::instance().client_liveness_recovered();
-            LOG(INFO) << "client_id=" << client_id
-                      << ", action=client_liveness_recovered, "
-                         "signal=memory_mount";
         }
     }
 
@@ -1110,9 +1185,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.is_memory_segment = true;
         op.file_path.clear();
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHA("MountSegment", OpType::SEGMENT_MOUNT,
-                              segment.te_endpoint,
-                              std::string(bytes.begin(), bytes.end()));
+        (void)PersistSegmentOpForHAOrEnqueue(
+            "MountSegment", OpType::SEGMENT_MOUNT, segment.te_endpoint,
+            std::string(bytes.begin(), bytes.end()));
     }
     if (mount_result == ErrorCode::OK) {
         UpdateClientHostId(client_id, segment.host_id);
@@ -1277,8 +1352,24 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     segment_access.GetAllocator(segments[i].id) != nullptr;
             }
 
-            remount_error =
-                segment_access.ReMountSegment(segments, client_id, record);
+            // Remount comes from the heartbeat, which retries; do not wait
+            // here. The check shares the segment access with the remount, so
+            // an endpoint whose cleanup is still outstanding cannot be
+            // reopened in this window.
+            {
+                std::lock_guard<std::mutex> barrier_lock(barrier_mutex_);
+                for (const auto& segment : segments) {
+                    if (EndpointCleanupPendingLocked(segment.te_endpoint)) {
+                        remount_error =
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+                        break;
+                    }
+                }
+            }
+            if (remount_error == ErrorCode::OK) {
+                remount_error =
+                    segment_access.ReMountSegment(segments, client_id, record);
+            }
             if (remount_error == ErrorCode::OK) {
                 segment_access.BindClientLiveness(client_id, record);
                 for (const auto& segment : segments) {
@@ -1507,9 +1598,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.is_memory_segment = true;
             op.file_path.clear();
             auto bytes = struct_pack::serialize(op);
-            PersistSegmentOpForHA("ReMountSegment", OpType::SEGMENT_MOUNT,
-                                  seg.name,
-                                  std::string(bytes.begin(), bytes.end()));
+            (void)PersistSegmentOpForHAOrEnqueue(
+                "ReMountSegment", OpType::SEGMENT_MOUNT, seg.name,
+                std::string(bytes.begin(), bytes.end()));
         }
     }
     NotifyPolicyCapacityChanged();
@@ -2490,17 +2581,17 @@ void MasterService::CleanupExpiredSoftPins(
     }
 }
 
-void MasterService::ClearInvalidHandles() {
+tl::expected<void, ErrorCode> MasterService::ClearInvalidHandles() {
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
-    ClearInvalidHandles(retaining_clients);
+    return ClearInvalidHandles(retaining_clients);
 }
 
-void MasterService::ClearInvalidHandles(
+tl::expected<void, ErrorCode> MasterService::ClearInvalidHandles(
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-    (void)ClearStaleHandles([&retaining_clients](const Replica& replica) {
+    return ClearStaleHandles([&retaining_clients](const Replica& replica) {
         return (replica.has_invalid_mem_handle() ||
                 replica.has_invalid_nof_handle() ||
                 replica.has_stale_local_disk_client(retaining_clients)) &&
@@ -2513,6 +2604,286 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
         return replica.is_local_disk_replica() && replica.is_completed() &&
                replica.get_local_disk_client_id() == owner;
     });
+}
+
+bool MasterService::CleanupBarrierEnabled() const {
+    return enable_ha_ && enable_oplog_ && ordered_oplog_writer_ != nullptr;
+}
+
+std::shared_ptr<SegmentUnmountLogState> MasterService::PublishSegmentCleanup(
+    const UUID& segment_id, const std::string& endpoint) {
+    const bool submits = enable_oplog_ && ordered_oplog_writer_ != nullptr;
+    if (!submits) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(barrier_mutex_);
+    // One shared submission state per segment; the offboarding job keeps a
+    // reference so a retry still knows the entry was logged after the index
+    // below dropped it.
+    std::shared_ptr<SegmentUnmountLogState>& state =
+        unmount_log_states_[segment_id];
+    if (!state) {
+        state = std::make_shared<SegmentUnmountLogState>();
+        state->endpoint = endpoint;
+    }
+    if (!CleanupBarrierEnabled()) {
+        return state;
+    }
+    auto [it, inserted] = pending_cleanup_.try_emplace(segment_id);
+    if (inserted) {
+        it->second.segment_id = segment_id;
+        it->second.endpoint = endpoint;
+        it->second.seq = ++barrier_seq_;
+        ++pending_by_endpoint_[endpoint].outstanding;
+    }
+    return state;
+}
+
+void MasterService::MarkSegmentCleanupLogged(const UUID& segment_id,
+                                             bool logged) {
+    std::lock_guard<std::mutex> lock(barrier_mutex_);
+    auto it = pending_cleanup_.find(segment_id);
+    if (it == pending_cleanup_.end()) {
+        return;
+    }
+    if (!logged) {
+        // The unmount entry was not accepted. The caller released the claim
+        // so the background flush can retry it; the responsibility stays open
+        // until that retry lands, and a sweep must not clear it.
+        LOG(WARNING) << "segment_id=" << segment_id
+                     << ", endpoint=" << it->second.endpoint
+                     << ", error=segment_unmount_log_rejected";
+    } else {
+        it->second.unmount_logged = true;
+        MaybeClearCleanupLocked();
+    }
+    barrier_cv_.notify_all();
+}
+
+void MasterService::MarkCleanupSwept(
+    uint64_t sweep_seq,
+    const std::unordered_set<UUID, boost::hash<UUID>>* tokens) {
+    std::lock_guard<std::mutex> lock(barrier_mutex_);
+    for (auto& [segment_id, cleanup] : pending_cleanup_) {
+        if (tokens != nullptr && !tokens->contains(segment_id)) {
+            continue;
+        }
+        // A sweep that took its sequence before the publication cannot have
+        // observed the invalidation, even if it happened to walk the object.
+        if (cleanup.seq < sweep_seq) {
+            cleanup.swept = true;
+        }
+    }
+    MaybeClearCleanupLocked();
+    barrier_cv_.notify_all();
+}
+
+bool MasterService::TryClaimSegmentUnmount(
+    const UUID& segment_id, const std::string& endpoint,
+    const std::string& payload,
+    std::shared_ptr<SegmentUnmountLogState>* held_state) {
+    std::lock_guard<std::mutex> lock(barrier_mutex_);
+    std::shared_ptr<SegmentUnmountLogState> state;
+    if (held_state != nullptr && *held_state) {
+        // The offboarding job's own reference: it survives the index entry.
+        state = *held_state;
+    } else {
+        auto it = unmount_log_states_.find(segment_id);
+        if (it != unmount_log_states_.end()) {
+            state = it->second;
+        } else {
+            state = std::make_shared<SegmentUnmountLogState>();
+            state->endpoint = endpoint;
+            state->payload = payload;
+            unmount_log_states_.emplace(segment_id, state);
+        }
+        if (held_state != nullptr) {
+            *held_state = state;
+        }
+    }
+    switch (state->phase) {
+        case SegmentUnmountLogState::Phase::kLogged:
+            // Already in the log. Appending again would put a second unmount
+            // for this endpoint after a later mount, which the standby would
+            // apply in that order.
+            return false;
+        case SegmentUnmountLogState::Phase::kInFlight:
+            // Another submitter owns this token; its outcome decides.
+            return false;
+        case SegmentUnmountLogState::Phase::kPending:
+            // The submitter owns the payload: the state may have been created
+            // at prepare time, before the entry was serialized.
+            state->endpoint = endpoint;
+            state->payload = payload;
+            state->phase = SegmentUnmountLogState::Phase::kInFlight;
+            return true;
+    }
+    return false;
+}
+
+void MasterService::CompleteSegmentUnmountLog(
+    const UUID& segment_id,
+    const std::shared_ptr<SegmentUnmountLogState>& state) {
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        if (state) {
+            state->phase = SegmentUnmountLogState::Phase::kLogged;
+            auto it = unmount_log_states_.find(segment_id);
+            if (it != unmount_log_states_.end() && it->second == state) {
+                // The index drops its reference; any holder keeps the logged
+                // state alive for as long as it may still submit.
+                unmount_log_states_.erase(it);
+            }
+        }
+    }
+    MarkSegmentCleanupLogged(segment_id, true);
+}
+
+void MasterService::ReleaseSegmentUnmountClaim(
+    const UUID& segment_id,
+    const std::shared_ptr<SegmentUnmountLogState>& state) {
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        if (state && state->phase == SegmentUnmountLogState::Phase::kInFlight) {
+            state->phase = SegmentUnmountLogState::Phase::kPending;
+        }
+    }
+    // The endpoint stays closed until this entry lands; retry in the
+    // background rather than making the unmount RPC fail after its commit.
+    replica_cleanup_worker_.ScheduleAfter(kReplicaCleanupRetryDelay);
+}
+
+void MasterService::FlushPendingSegmentUnmounts() {
+    if (!enable_oplog_ || !ordered_oplog_writer_) {
+        return;
+    }
+    std::vector<std::pair<UUID, std::shared_ptr<SegmentUnmountLogState>>> batch;
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        if (cleanup_unrecoverable_) {
+            return;
+        }
+        for (auto& [segment_id, state] : unmount_log_states_) {
+            if (!state ||
+                state->phase != SegmentUnmountLogState::Phase::kPending ||
+                state->payload.empty()) {
+                // No payload yet: the responsibility was published but the
+                // unmount RPC has not serialized its entry, so there is
+                // nothing to submit until it claims the token.
+                continue;
+            }
+            state->phase = SegmentUnmountLogState::Phase::kInFlight;
+            batch.emplace_back(segment_id, state);
+        }
+    }
+    for (const auto& [segment_id, state] : batch) {
+        auto persisted = PersistSegmentOpForHAOrEnqueue(
+            "FlushPendingSegmentUnmount", OpType::SEGMENT_UNMOUNT,
+            state->endpoint, state->payload);
+        if (persisted) {
+            CompleteSegmentUnmountLog(segment_id, state);
+        } else {
+            ReleaseSegmentUnmountClaim(segment_id, state);
+        }
+    }
+}
+
+bool MasterService::EndpointCleanupPendingLocked(
+    const std::string& endpoint) const {
+    auto it = pending_by_endpoint_.find(endpoint);
+    return it != pending_by_endpoint_.end() && it->second.outstanding > 0;
+}
+
+void MasterService::MaybeClearCleanupLocked() {
+    for (auto it = pending_cleanup_.begin(); it != pending_cleanup_.end();) {
+        const auto& cleanup = it->second;
+        if (!cleanup.unmount_logged || !cleanup.swept) {
+            ++it;
+            continue;
+        }
+        auto endpoint_it = pending_by_endpoint_.find(cleanup.endpoint);
+        if (endpoint_it != pending_by_endpoint_.end()) {
+            if (endpoint_it->second.outstanding > 0) {
+                --endpoint_it->second.outstanding;
+            }
+            if (endpoint_it->second.outstanding == 0) {
+                pending_by_endpoint_.erase(endpoint_it);
+            }
+        }
+        it = pending_cleanup_.erase(it);
+    }
+}
+
+bool MasterService::WaitForEndpointCleanup(
+    const std::string& endpoint,
+    std::chrono::steady_clock::time_point deadline) {
+    if (!CleanupBarrierEnabled()) {
+        return true;
+    }
+    std::unique_lock<std::mutex> lock(barrier_mutex_);
+    for (;;) {
+        // The deadline is the whole mount's, so it is checked before "is the
+        // endpoint clear": a mount that spent its budget does not mount even
+        // if the endpoint became clear meanwhile.
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            LOG(WARNING) << "endpoint=" << endpoint
+                         << ", action=mount_cleanup_wait_exhausted";
+            return false;
+        }
+        if (cleanup_gate_closed_ || cleanup_unrecoverable_) {
+            return false;
+        }
+        if (!EndpointCleanupPendingLocked(endpoint)) {
+            return true;
+        }
+        barrier_cv_.wait_for(
+            lock,
+            std::min(kMountCleanupWaitSlice,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         deadline - now)));
+    }
+}
+
+void MasterService::StallCleanupWaiters() {
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        // Final: shutdown or a writer that reached its terminal state. Mount
+        // waiters fail from here on; no sweep or lifecycle change clears it.
+        cleanup_unrecoverable_ = true;
+    }
+    barrier_cv_.notify_all();
+}
+
+void MasterService::RunReplicaCleanupSweep() {
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        // RFC #4700 slice 1: no metadata sweep while a promotion restore is in
+        // flight; the restore itself owns the metadata transition. Mounts that
+        // wait on this sweep learn it is not coming instead of waiting out the
+        // budget.
+        cleanup_gate_closed_ = !AdmitsBusinessWorkers();
+        if (cleanup_gate_closed_ || cleanup_unrecoverable_) {
+            barrier_cv_.notify_all();
+            return;
+        }
+    }
+    // A SEGMENT_UNMOUNT the writer refused can still land; retrying it may
+    // open an endpoint without any sweep.
+    FlushPendingSegmentUnmounts();
+    uint64_t sweep_seq = 0;
+    {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        sweep_seq = ++barrier_seq_;
+    }
+    auto swept = ClearInvalidHandles();
+    if (swept) {
+        MarkCleanupSwept(sweep_seq, nullptr);
+        return;
+    }
+    LOG(WARNING) << "replica cleanup sweep failed, retrying, err="
+                 << static_cast<int>(swept.error());
+    replica_cleanup_worker_.ScheduleAfter(kReplicaCleanupRetryDelay);
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
@@ -2615,11 +2986,17 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 const auto err = segment_access.PrepareUnmountSegment(
                     it->segment_id, metrics_dec_capacity);
                 if (err == ErrorCode::OK) {
+                    // Same responsibility the unmount RPC publishes, under
+                    // the segment lock that ordered the invalidation. The job
+                    // keeps the submission state for the rest of its retries.
+                    auto unmount_log = PublishSegmentCleanup(
+                        it->segment_id, it->transport_endpoint);
                     job.prepared_segments.push_back(
                         {.segment_id = it->segment_id,
                          .segment_name = it->segment_name,
                          .transport_endpoint = it->transport_endpoint,
-                         .metrics_dec_capacity = metrics_dec_capacity});
+                         .metrics_dec_capacity = metrics_dec_capacity,
+                         .unmount_log = std::move(unmount_log)});
                     it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
@@ -2639,6 +3016,18 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         }
 
         if (!job.metadata_cleanup_accepted) {
+            // This job's sweep only covers the segments it prepared itself. It
+            // cannot stand in for the global sweep other endpoints wait on, so
+            // it reports its own tokens only.
+            std::unordered_set<UUID, boost::hash<UUID>> sweep_tokens;
+            for (const auto& prepared : job.prepared_segments) {
+                sweep_tokens.insert(prepared.segment_id);
+            }
+            uint64_t sweep_seq = 0;
+            {
+                std::lock_guard<std::mutex> barrier_lock(barrier_mutex_);
+                sweep_seq = ++barrier_seq_;
+            }
             const auto cleanup_result =
                 ClearStaleHandles([&job](const Replica& replica) {
                     if (!replica.is_completed()) {
@@ -2657,6 +3046,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                            << ", error=" << toString(cleanup_result.error());
                 return false;
             }
+            MarkCleanupSwept(sweep_seq, &sweep_tokens);
             bool unfinished_affiliated_replica = false;
             VisitNamespaces([&](const TenantId& /*tenant_id*/,
                                 metadata::Namespace& ns) {
@@ -2714,19 +3104,32 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 !it->transport_endpoint.empty()) {
                 SegmentUnmountOp op{it->transport_endpoint};
                 auto bytes = struct_pack::serialize(op);
-                auto persist_result = AppendOpLogVisibleBeforeDurable(
-                    OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
-                    it->transport_endpoint,
-                    std::string(bytes.begin(), bytes.end()));
-                if (!persist_result) {
-                    LOG(ERROR)
-                        << "client_id=" << job.client_id
-                        << ", segment_name=" << it->segment_name
-                        << ", action=queue_client_offboarding_unmount"
-                        << ", error=" << toString(persist_result.error());
-                    ++it;
-                    continue;
+                std::string payload(bytes.begin(), bytes.end());
+                // The background flush may already own this token; submitting
+                // again here would append a second unmount after a later
+                // mount of the same endpoint.
+                if (TryClaimSegmentUnmount(it->segment_id,
+                                           it->transport_endpoint, payload,
+                                           &it->unmount_log)) {
+                    auto persist_result = AppendOpLogVisibleBeforeDurable(
+                        OpType::SEGMENT_UNMOUNT, TenantId::Default().value(),
+                        it->transport_endpoint, payload);
+                    if (!persist_result) {
+                        LOG(ERROR)
+                            << "client_id=" << job.client_id
+                            << ", segment_name=" << it->segment_name
+                            << ", action=queue_client_offboarding_unmount"
+                            << ", error=" << toString(persist_result.error());
+                        MarkSegmentCleanupLogged(it->segment_id, false);
+                        ReleaseSegmentUnmountClaim(it->segment_id,
+                                                   it->unmount_log);
+                        ++it;
+                        continue;
+                    }
+                    CompleteSegmentUnmountLog(it->segment_id, it->unmount_log);
                 }
+            } else {
+                MarkSegmentCleanupLogged(it->segment_id, true);
             }
 
             cleanupHttpMetadata(it->segment_name);
@@ -2822,36 +3225,80 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
-    // 1. Prepare to unmount the segment by deleting its allocator
+    // 1. Prepare to unmount the segment by deleting its allocator. The
+    // endpoint is read here, under the same segment lock that orders the
+    // invalidation, so a later mount cannot slip in before the cleanup
+    // responsibility is published.
+    std::string segment_name;
+    std::string te_endpoint;
+    // Held from the prepare critical section to the submission below: this
+    // RPC must keep the same shared state, or a submitter that logged the
+    // token in between would leave it looking up an index entry that is
+    // already gone, and it would append a second unmount after a later mount.
+    std::shared_ptr<SegmentUnmountLogState> unmount_log;
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         ErrorCode err = segment_access.PrepareUnmountSegment(
             segment_id, metrics_dec_capacity);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-            // Return OK because this is an idempotent operation
+            // Idempotent: the segment is gone, but an earlier attempt may
+            // still owe its SEGMENT_UNMOUNT entry. Flush it before returning,
+            // otherwise the endpoint could stay closed forever.
+            FlushPendingSegmentUnmounts();
             return {};
         }
-        if (err != ErrorCode::OK) {
+        if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+            // A previous attempt prepared but did not commit. The allocator
+            // is already released and the segment is still registered as
+            // UNMOUNTING; finish the job instead of making the retry a no-op.
+            SegmentStatus status = SegmentStatus::UNDEFINED;
+            if (segment_access.GetSegmentStatusById(segment_id, status) !=
+                    ErrorCode::OK ||
+                status != SegmentStatus::UNMOUNTING) {
+                return tl::make_unexpected(err);
+            }
+            Segment pending_segment;
+            if (segment_access.GetSegment(segment_id, pending_segment)) {
+                segment_name = pending_segment.name;
+                te_endpoint = pending_segment.te_endpoint;
+                metrics_dec_capacity = pending_segment.size;
+            }
+        } else if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
+        } else {
+            Segment segment;
+            if (segment_access.GetSegment(segment_id, segment)) {
+                segment_name = segment.name;
+                te_endpoint = segment.te_endpoint;
+            }
         }
+        // After a successful prepare the allocator is released and cannot be
+        // restored, so the responsibility stays even if a later step fails.
+        unmount_log = PublishSegmentCleanup(segment_id, te_endpoint);
     }
 
-    // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
-    // become unreadable as soon as PrepareUnmountSegment releases their
-    // allocator; only the physical metadata sweep is deferred.
+    // 2. Sweep the metadata that pointed at the released allocator. With a
+    // cleanup barrier the RPC no longer pays for the whole scan: the worker
+    // runs it and keeps this endpoint closed to new mounts until it lands.
+    // CXL keeps the synchronous sweep (its buffers are not invalidated the
+    // same way).
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
-        ClearInvalidHandles(retaining_clients);
-    }
-
-    // Cache endpoint before commit removes segment from registry.
-    std::string segment_name;
-    std::string te_endpoint;
-    if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
-                                              te_endpoint)) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        uint64_t sweep_seq = 0;
+        {
+            std::lock_guard<std::mutex> barrier_lock(barrier_mutex_);
+            sweep_seq = ++barrier_seq_;
+        }
+        auto swept = ClearInvalidHandles(retaining_clients);
+        if (swept) {
+            MarkCleanupSwept(sweep_seq, nullptr);
+        } else {
+            LOG(WARNING) << "segment_id=" << segment_id
+                         << ", error=unmount_sweep_failed, err="
+                         << static_cast<int>(swept.error());
+        }
     }
 
     // 3. Commit the unmount operation
@@ -2865,12 +3312,34 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         }
     }
 
+    if (unmount_after_commit_hook_) {
+        unmount_after_commit_hook_();
+    }
+
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHA("UnmountSegment", OpType::SEGMENT_UNMOUNT,
-                              te_endpoint,
-                              std::string(bytes.begin(), bytes.end()));
+        std::string payload(bytes.begin(), bytes.end());
+        // One submitter per token: if the background flush (or an earlier
+        // attempt) already owns it, this RPC must not append a duplicate.
+        // A failed submission is retried in the background; the segment is
+        // already committed, so that retry is the only path that can complete
+        // the ordering the endpoint barrier waits on.
+        if (TryClaimSegmentUnmount(segment_id, te_endpoint, payload,
+                                   &unmount_log)) {
+            auto persisted = PersistSegmentOpForHAOrEnqueue(
+                "UnmountSegment", OpType::SEGMENT_UNMOUNT, te_endpoint,
+                payload);
+            if (persisted) {
+                CompleteSegmentUnmountLog(segment_id, unmount_log);
+            } else {
+                MarkSegmentCleanupLogged(segment_id, false);
+                ReleaseSegmentUnmountClaim(segment_id, unmount_log);
+            }
+        }
+    } else {
+        // No OpLog: nothing has to be ordered against the standby.
+        MarkSegmentCleanupLogged(segment_id, true);
     }
     NotifyPolicyCapacityChanged();
     return {};
@@ -3246,8 +3715,19 @@ struct MasterService::LegacyRestoreContext {
     std::unordered_map<std::string, uint64_t>& accounted_bytes;
     size_t& rejected_count;
     size_t& already_existing_count;
+    // Objects whose surviving replicas all sat on segments the handoff no
+    // longer carries. Their loss is the unmounted segment's contents, not a
+    // corrupt snapshot, so they do not count against the all-rejected guard.
+    size_t dropped_stale_object_count{0};
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>>& repair_canonical_keys;
+    // Repairs caused only by replicas whose endpoint the handoff no longer
+    // carries. They are re-derived by the next promotion from the same
+    // snapshot, so they may be submitted in several batches; the overlap
+    // repairs above must stay in one batch, since a durable prefix over a
+    // subset of them would leave the standby with a partial conflict fix.
+    std::vector<std::pair<TenantId, std::string>>& repair_stale_remove_keys;
+    std::vector<std::pair<TenantId, std::string>>& repair_stale_canonical_keys;
     std::vector<std::pair<TenantId, route::ObjectRef>>& installed;
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>& new_known_owner_records;
@@ -3256,6 +3736,8 @@ struct MasterService::LegacyRestoreContext {
         const StandbyObjectEntry* entry;
         TenantId tenant_id;
         std::string user_key;
+        // How many replicas were dropped because their endpoint is gone.
+        size_t endpoint_dropped_count{0};
     };
     std::vector<AcceptedEntry> accepted;
     std::unordered_set<std::string> object_ids;
@@ -3311,6 +3793,8 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             continue;
         }
         bool valid = true;
+        size_t endpoint_dropped_count = 0;
+        std::vector<size_t> dropped_desc_idx;
         // (segment, address, size, descriptor index) for this object's
         // live memory replicas. They join ctx.pending_ranges only after the
         // object is ctx.accepted, so a rejected object never leaves ranges
@@ -3328,9 +3812,17 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             auto segment_it =
                 ctx.segments_by_alias.find(buffer.transport_endpoint_);
             if (segment_it == ctx.segments_by_alias.end()) {
-                NoteLegacyStandbyRejection(ctx, entry, "unknown_endpoint");
-                valid = false;
-                break;
+                // The snapshot can still carry replicas on segments that were
+                // unloaded before the handoff. Those replicas are gone for
+                // good, so drop just them and keep whatever else the object
+                // has; the object is only lost when nothing else survives.
+                LOG(WARNING)
+                    << "RestoreFromStandbySnapshot: dropping replica id="
+                    << desc.id << " on unknown memory endpoint="
+                    << buffer.transport_endpoint_ << ", key=" << user_key;
+                ++endpoint_dropped_count;
+                dropped_desc_idx.push_back(desc_idx);
+                continue;
             }
             if (buffer.size_ != entry.metadata.size || buffer.size_ == 0 ||
                 buffer.buffer_address_ >
@@ -3351,8 +3843,15 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             continue;
         }
         const size_t owner = ctx.accepted.size();
-        ctx.accepted.push_back(
-            {&entry, std::move(tenant_id), std::move(user_key)});
+        ctx.accepted.push_back({&entry, std::move(tenant_id),
+                                std::move(user_key), endpoint_dropped_count});
+        // Registering the drops here is what keeps the rest of the walk
+        // honest: the reliable-replica count below and the construction phase
+        // both skip them, instead of counting a gone endpoint as reliable or
+        // looking it up with .at().
+        for (size_t desc_idx : dropped_desc_idx) {
+            ctx.discarded_replicas[owner].insert(desc_idx);
+        }
         for (const auto& [segment, addr, size, desc_idx] : object_ranges) {
             ctx.pending_ranges[segment].emplace_back(addr, size, owner,
                                                      desc_idx);
@@ -3400,6 +3899,17 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             continue;
         }
         const auto discarded_it = ctx.discarded_replicas.find(owner);
+        const size_t discarded_count =
+            discarded_it == ctx.discarded_replicas.end()
+                ? 0
+                : discarded_it->second.size();
+        // True when every replica this walk discarded was dropped because its
+        // endpoint is gone, with no overlap ambiguity mixed in. Only then is
+        // the object's loss an expected consequence of the unloaded segment
+        // rather than a possibly-corrupt entry.
+        const bool only_endpoint_discards =
+            accepted_entry.endpoint_dropped_count > 0 &&
+            accepted_entry.endpoint_dropped_count == discarded_count;
         size_t reliable = 0;
         for (size_t desc_idx = 0;
              desc_idx < accepted_entry.entry->metadata.replicas.size();
@@ -3415,21 +3925,40 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
             ++reliable;
         }
         if (reliable == 0) {
-            // Covers both overlap casualties and objects that arrived with
-            // every replica already REMOVED/FAILED: an object with no
-            // readable replica is dropped instead of lingering as
-            // metadata-only, and the durable REMOVE below stops a later
+            // Covers overlap casualties, objects that arrived with every
+            // replica already REMOVED/FAILED, and objects whose surviving
+            // replicas all sit on segments the handoff no longer carries: an
+            // object with no readable replica is dropped instead of lingering
+            // as metadata-only, and the durable REMOVE below stops a later
             // promotion from replaying it.
-            NoteLegacyStandbyRejection(ctx, *accepted_entry.entry,
-                                       "no_reliable_replica");
-            ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
-                                                accepted_entry.user_key);
+            if (only_endpoint_discards) {
+                // The segment was unloaded before the handoff, so this is an
+                // expected loss of its contents rather than a corrupt entry
+                // and must not trip the all-rejected guard.
+                ++ctx.dropped_stale_object_count;
+                LOG(WARNING)
+                    << "RestoreFromStandbySnapshot: dropping object whose "
+                       "replicas all sat on unloaded segments, key="
+                    << accepted_entry.entry->key;
+                ctx.repair_stale_remove_keys.emplace_back(
+                    accepted_entry.tenant_id, accepted_entry.user_key);
+            } else {
+                NoteLegacyStandbyRejection(ctx, *accepted_entry.entry,
+                                           "no_reliable_replica");
+                ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
+                                                    accepted_entry.user_key);
+            }
             accepted_entry.entry = nullptr;
         } else if (discarded_it != ctx.discarded_replicas.end()) {
             // Survives with some descriptors discarded: the canonical
-            // repair record carries only the survivors.
-            ctx.repair_canonical_keys.emplace_back(accepted_entry.tenant_id,
-                                                   accepted_entry.user_key);
+            // repair record carries only the survivors. A pure endpoint loss
+            // goes to the chunkable set; anything the overlap pass also
+            // touched stays in the atomic conflict set.
+            auto& repairs = only_endpoint_discards
+                                ? ctx.repair_stale_canonical_keys
+                                : ctx.repair_canonical_keys;
+            repairs.emplace_back(accepted_entry.tenant_id,
+                                 accepted_entry.user_key);
         }
     }
 
@@ -3565,14 +4094,22 @@ tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
     // A snapshot whose objects all fail to land is a failed restore, not
     // an empty cluster: reporting success here would let the supervisor
     // serve on zero state. Duplicates of already-served objects are the
-    // exception, since their state is present already. How partial
+    // exception, since their state is present already. Objects lost because
+    // their segments were unloaded before the handoff are the other
+    // exception: the cluster is legitimately empty of them. How partial
     // restores gate serving is N07/N08 scope (#3808), not this stop-gap.
     if (!ctx.objects.empty() && restored_count == 0 &&
-        ctx.already_existing_count < ctx.objects.size()) {
+        ctx.already_existing_count + ctx.dropped_stale_object_count <
+            ctx.objects.size()) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: every standby object "
                    << "was rejected, objects=" << ctx.objects.size()
                    << ", rejected=" << ctx.rejected_count;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (ctx.dropped_stale_object_count > 0) {
+        LOG(WARNING) << "RestoreFromStandbySnapshot: dropped objects whose "
+                        "segments were unloaded before the handoff, count="
+                     << ctx.dropped_stale_object_count;
     }
 
     if (auto published = PublishRestoredObjects(ctx.prepared, ctx.installed);
@@ -3956,6 +4493,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // the survivors.
     std::vector<std::pair<TenantId, std::string>> repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>> repair_canonical_keys;
+    // Repairs caused only by replicas on unloaded segments. Unlike the
+    // conflict repairs above they are re-derived by the next promotion from
+    // the same snapshot, so they can be submitted in several batches when the
+    // OpLog batch cap is smaller than the set.
+    std::vector<std::pair<TenantId, std::string>> repair_stale_remove_keys;
+    std::vector<std::pair<TenantId, std::string>> repair_stale_canonical_keys;
     // The publications this call installed, so a failed restore can roll its
     // own state back before reporting the error.
     std::vector<std::pair<TenantId, route::ObjectRef>> installed;
@@ -4139,8 +4682,17 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                     << "RestoreFromStandbySnapshot: skipping object with no "
                     << "surviving replicas, tenant=" << tenant_id.value()
                     << ", key=" << user_key;
+                // Persist the removal so a later promotion cannot replay
+                // these descriptors onto whatever segment reuses the
+                // endpoint.
+                repair_stale_remove_keys.emplace_back(tenant_id, user_key);
                 ++chunk_skipped_objects;
                 continue;
+            }
+            if (dropped_stale_replica) {
+                // Survives with some replicas dropped: persist the survivors
+                // so a later promotion cannot replay the unloaded ones.
+                repair_stale_canonical_keys.emplace_back(tenant_id, user_key);
             }
             prepared.push_back({&entry, std::move(tenant_id),
                                 std::move(user_key), std::move(replicas)});
@@ -4156,12 +4708,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     };
 
     if (legacy_objects) {
-        LegacyRestoreContext legacy_ctx{
-            *legacy_objects,     memory_segments_by_alias,
-            restored_allocators, restored_accounted_memory_bytes,
-            rejected_count,      already_existing_count,
-            repair_remove_keys,  repair_canonical_keys,
-            installed,           new_known_owner_records};
+        LegacyRestoreContext legacy_ctx{*legacy_objects,
+                                        memory_segments_by_alias,
+                                        restored_allocators,
+                                        restored_accounted_memory_bytes,
+                                        rejected_count,
+                                        already_existing_count,
+                                        /*dropped_stale_object_count=*/0,
+                                        repair_remove_keys,
+                                        repair_canonical_keys,
+                                        repair_stale_remove_keys,
+                                        repair_stale_canonical_keys,
+                                        installed,
+                                        new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }
@@ -4257,78 +4816,98 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Durable repair for conflict-derived discards: a later promotion must
-    // not replay what this one dropped. The whole repair set goes out as one
-    // indivisible batch record (REMOVE for full drops, canonical PUT_END
-    // carrying only the survivors for partial ones), and the restore fails
-    // unless that record becomes durable, so the candidate never serves an
-    // index whose discards could resurrect. Committing the entries one by
-    // one would let the set split across batch records, and a durable
-    // prefix covering only part of it leaves exactly one side of a conflict
-    // pair able to survive a later replay on its own. With no OpLog
-    // configured there is nothing to replay into, so the local filter
-    // stands alone. With OpLog enabled but no writer available (e.g. no HA
-    // backend connection string), a filtered discard would be silently
+    // Durable repairs for this promote's discards: a later promotion must not
+    // replay what this one dropped. They come in two classes with different
+    // ordering requirements:
+    //   - Conflict repairs (overlap ambiguity) go out as one indivisible
+    //     batch record (REMOVE for full drops, canonical PUT_END carrying
+    //     only the survivors for partial ones). Committing those one by one
+    //     would let the set split across batch records, and a durable prefix
+    //     covering only part of it leaves exactly one side of a conflict pair
+    //     able to survive a later replay on its own.
+    //   - Stale-endpoint repairs (replicas whose segment the handoff no
+    //     longer carries) are each a function of one object's metadata, and
+    //     the next promotion re-derives them from the same snapshot, so they
+    //     may span several batches when the OpLog batch cap is smaller than
+    //     the set.
+    // Either way the restore fails unless every record becomes durable, so
+    // the candidate never serves an index whose discards could resurrect.
+    // With no OpLog configured there is nothing to replay into, so the local
+    // filter stands alone. With OpLog enabled but no writer available (e.g.
+    // no HA backend connection string), a filtered discard would be silently
     // unrepaired, so the restore fails explicitly instead.
-    if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
-        enable_oplog_ && !ordered_oplog_writer_) {
+    const bool have_conflict_repairs =
+        !repair_remove_keys.empty() || !repair_canonical_keys.empty();
+    const bool have_stale_repairs = !repair_stale_remove_keys.empty() ||
+                                    !repair_stale_canonical_keys.empty();
+    if ((have_conflict_repairs || have_stale_repairs) && enable_oplog_ &&
+        !ordered_oplog_writer_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: conflict discards need "
                       "durable repair but no OpLog writer is available; "
                       "failing the restore";
         rollback_restored_state();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
-        enable_oplog_ && ordered_oplog_writer_) {
-        std::vector<OpLogEntry> repair_entries;
-        repair_entries.reserve(repair_remove_keys.size() +
-                               repair_canonical_keys.size());
-        for (const auto& [tenant, key] : repair_remove_keys) {
-            OpLogEntry entry;
-            entry.op_type = OpType::REMOVE;
-            entry.tenant_id = tenant.value();
-            entry.object_key = key;
-            repair_entries.push_back(std::move(entry));
-        }
-        for (const auto& [tenant, key] : repair_canonical_keys) {
-            MetadataAccessorRO accessor(this, {tenant, key});
-            OpLogEntry entry;
-            entry.tenant_id = tenant.value();
-            entry.object_key = key;
-            if (!accessor.IsPublished()) {
-                // Survived the conflict but failed construction (e.g.
-                // capacity): nothing installed, so the canonical state is
-                // absence. Repudiate the key outright.
-                entry.op_type = OpType::REMOVE;
-            } else {
-                entry.op_type = OpType::PUT_END;
-                entry.payload = SerializeMetadataForOpLog(accessor.Get());
-            }
-            repair_entries.push_back(std::move(entry));
-        }
+    if ((have_conflict_repairs || have_stale_repairs) && enable_oplog_ &&
+        ordered_oplog_writer_) {
+        // Every payload is built before anything is submitted: the canonical
+        // record serializes the installed metadata, and a later batch must not
+        // observe a state an earlier batch changed.
+        const auto build_entries =
+            [this](
+                const std::vector<std::pair<TenantId, std::string>>& removals,
+                const std::vector<std::pair<TenantId, std::string>>&
+                    canonicals) {
+                std::vector<OpLogEntry> entries;
+                entries.reserve(removals.size() + canonicals.size());
+                for (const auto& [tenant, key] : removals) {
+                    OpLogEntry entry;
+                    entry.op_type = OpType::REMOVE;
+                    entry.tenant_id = tenant.value();
+                    entry.object_key = key;
+                    entries.push_back(std::move(entry));
+                }
+                for (const auto& [tenant, key] : canonicals) {
+                    MetadataAccessorRO accessor(this, {tenant, key});
+                    OpLogEntry entry;
+                    entry.tenant_id = tenant.value();
+                    entry.object_key = key;
+                    if (!accessor.IsPublished()) {
+                        // Survived the conflict but failed construction (e.g.
+                        // capacity): nothing installed, so the canonical state
+                        // is absence. Repudiate the key outright.
+                        entry.op_type = OpType::REMOVE;
+                    } else {
+                        entry.op_type = OpType::PUT_END;
+                        entry.payload =
+                            SerializeMetadataForOpLog(accessor.Get());
+                    }
+                    entries.push_back(std::move(entry));
+                }
+                return entries;
+            };
 
-        const size_t total = repair_entries.size();
-        auto remaining = std::make_shared<std::atomic<size_t>>(total);
-        auto done = std::make_shared<std::promise<void>>();
-        std::future<void> durable_future = done->get_future();
-        auto on_durable = [remaining, done](const OpLogEntry&) {
-            if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                done->set_value();
+        // Submits one indivisible batch and waits for it to become durable.
+        // 0 means no cap: a slow backend should not turn a recoverable delay
+        // into a promotion failure. A positive timeout still fail-closes, and
+        // a later durable completion is left in the log for the retry to
+        // observe rather than rolling it back locally.
+        const auto append_and_await =
+            [this](std::vector<OpLogEntry> entries) -> ErrorCode {
+            auto remaining =
+                std::make_shared<std::atomic<size_t>>(entries.size());
+            auto done = std::make_shared<std::promise<void>>();
+            std::future<void> durable_future = done->get_future();
+            auto on_durable = [remaining, done](const OpLogEntry&) {
+                if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    done->set_value();
+                }
+            };
+            auto appended = AppendOpLogBatchWithDurableFinalize(
+                std::move(entries), on_durable);
+            if (!appended) {
+                return appended.error();
             }
-        };
-
-        ErrorCode repair_err = ErrorCode::OK;
-        auto appended = AppendOpLogBatchWithDurableFinalize(
-            std::move(repair_entries), on_durable);
-        if (!appended) {
-            repair_err = appended.error();
-        }
-        if (repair_err == ErrorCode::OK) {
-            // Wait on the writer's durability callback. 0 means no cap: a
-            // slow backend should not turn a recoverable delay into a
-            // promotion failure. A positive timeout still fail-closes, and
-            // a later durable completion is left in the log for the retry
-            // to observe rather than rolling it back locally.
             std::future_status durable_status = std::future_status::ready;
             if (restore_repair_durable_timeout_ms_ == 0) {
                 durable_future.wait();
@@ -4342,7 +4921,54 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                               "durable within "
                            << restore_repair_durable_timeout_ms_
                            << "ms, failing the restore";
-                repair_err = ErrorCode::INTERNAL_ERROR;
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            return ErrorCode::OK;
+        };
+
+        auto conflict_entries =
+            build_entries(repair_remove_keys, repair_canonical_keys);
+        auto stale_entries = build_entries(repair_stale_remove_keys,
+                                           repair_stale_canonical_keys);
+        const size_t total = conflict_entries.size() + stale_entries.size();
+        size_t durable_records = 0;
+        size_t durable_batches = 0;
+
+        ErrorCode repair_err = ErrorCode::OK;
+        if (!conflict_entries.empty()) {
+            // Conflict repairs stay in one indivisible batch: a durable prefix
+            // covering only part of them would leave one side of a conflict
+            // pair able to survive a later replay on its own.
+            durable_records += conflict_entries.size();
+            repair_err = append_and_await(std::move(conflict_entries));
+            if (repair_err == ErrorCode::OK) {
+                ++durable_batches;
+            }
+        }
+        if (repair_err == ErrorCode::OK && !stale_entries.empty()) {
+            // Stale-endpoint repairs carry no cross-key invariant: each one is
+            // a function of a single object's metadata and the next promotion
+            // re-derives it from the same snapshot, so they may span several
+            // batches when the OpLog batch cap is smaller than the set. Each
+            // batch is awaited before the next is reserved, which also keeps
+            // the writer's waiting-slot budget bounded.
+            const size_t batch_cap =
+                std::max<size_t>(1, oplog_batch_max_entries_);
+            for (size_t offset = 0; offset < stale_entries.size();
+                 offset += batch_cap) {
+                const size_t end =
+                    std::min(offset + batch_cap, stale_entries.size());
+                std::vector<OpLogEntry> chunk;
+                chunk.reserve(end - offset);
+                for (size_t i = offset; i < end; ++i) {
+                    chunk.push_back(std::move(stale_entries[i]));
+                }
+                repair_err = append_and_await(std::move(chunk));
+                if (repair_err != ErrorCode::OK) {
+                    break;
+                }
+                durable_records += end - offset;
+                ++durable_batches;
             }
         }
         if (repair_err != ErrorCode::OK) {
@@ -4353,7 +4979,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
             return tl::make_unexpected(repair_err);
         }
         LOG(INFO) << "RestoreFromStandbySnapshot: durable repair records="
-                  << total;
+                  << durable_records << ", batches=" << durable_batches
+                  << ", total=" << total;
     }
 
     // Publish the accounting swap only after nothing can fail anymore: the
@@ -7571,28 +8198,28 @@ long MasterService::RemoveAll(bool force) {
     std::unordered_set<std::string> tenants_with_remaining_objects;
 
     // Remove per object so managed weights and concurrent imports survive.
-    VisitNamespaces([&](const TenantId& tenant_id,
-                        metadata::Namespace& /*ns*/) {
-        const RemoveResult result =
-            RemoveTenantObjects(tenant_id, force, now, nullptr);
-        removed_count += result.removed_count;
-        total_freed_size += result.freed_bytes;
-        // Record the tenant only once the walk actually reached an object. A
-        // tenant row can outlive its objects, and recording it unconditionally
-        // made every empty-but-present tenant look like a fresh wipe and emit
-        // a spurious `cleared`. Under HA+oplog the erase is deferred to the
-        // durable callback, so only a skipped object means the tenant is not
-        // empty.
-        if (track_cleared_tenants && result.saw_object) {
-            tenants_seen.insert(tenant_id.value());
-            if (result.skipped_object) {
-                tenants_with_remaining_objects.insert(tenant_id.value());
+    VisitNamespaces(
+        [&](const TenantId& tenant_id, metadata::Namespace& /*ns*/) {
+            const RemoveResult result =
+                RemoveTenantObjects(tenant_id, force, now, nullptr);
+            removed_count += result.removed_count;
+            total_freed_size += result.freed_bytes;
+            // Record the tenant only once the walk actually reached an object.
+            // A tenant row can outlive its objects, and recording it
+            // unconditionally made every empty-but-present tenant look like a
+            // fresh wipe and emit a spurious `cleared`. Under HA+oplog the
+            // erase is deferred to the durable callback, so only a skipped
+            // object means the tenant is not empty.
+            if (track_cleared_tenants && result.saw_object) {
+                tenants_seen.insert(tenant_id.value());
+                if (result.skipped_object) {
+                    tenants_with_remaining_objects.insert(tenant_id.value());
+                }
             }
-        }
-        if (kv_remove_all_tenant_hook_) {
-            kv_remove_all_tenant_hook_(tenant_id);
-        }
-    });
+            if (kv_remove_all_tenant_hook_) {
+                kv_remove_all_tenant_hook_(tenant_id);
+            }
+        });
 
     // tenants_seen holds only tenants that actually held an object, so this
     // difference is "held objects and lost all of them" — a real wipe. Both
@@ -10207,6 +10834,66 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             << ", total_freed_size=" << total_freed_size;
 }
 
+ClientOffboardingJob MasterService::BuildClientOffboardingJob(
+    const UUID& client_id,
+    const std::shared_ptr<ClientLivenessRecord>& record) {
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.liveness = record;
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<Segment> segments;
+    const auto get_result =
+        segment_access.GetClientSegments(client_id, segments);
+    if (get_result != ErrorCode::OK) {
+        return job;
+    }
+    for (const auto& segment : segments) {
+        SegmentStatus status = SegmentStatus::UNDEFINED;
+        const auto status_result =
+            segment_access.GetSegmentStatusById(segment.id, status);
+        if (status_result == ErrorCode::SEGMENT_NOT_FOUND) {
+            continue;
+        }
+        if (status_result == ErrorCode::OK &&
+            status == SegmentStatus::UNMOUNTING) {
+            job.pending_prepare_segments.push_back(
+                {.segment_id = segment.id,
+                 .segment_name = segment.name,
+                 .transport_endpoint = segment.te_endpoint});
+            continue;
+        }
+
+        size_t metrics_dec_capacity = 0;
+        const auto prepare_result = segment_access.PrepareUnmountSegment(
+            segment.id, metrics_dec_capacity);
+        if (prepare_result == ErrorCode::OK) {
+            // Publish under the same segment lock that ordered the
+            // invalidation: the job may not run for a while, and until this
+            // responsibility is covered no new segment may mount on the
+            // endpoint. The job keeps the submission state for its retries.
+            auto unmount_log =
+                PublishSegmentCleanup(segment.id, segment.te_endpoint);
+            job.prepared_segments.push_back(
+                {.segment_id = segment.id,
+                 .segment_name = segment.name,
+                 .transport_endpoint = segment.te_endpoint,
+                 .metrics_dec_capacity = metrics_dec_capacity,
+                 .unmount_log = std::move(unmount_log)});
+        } else if (prepare_result != ErrorCode::SEGMENT_NOT_FOUND) {
+            job.pending_prepare_segments.push_back(
+                {.segment_id = segment.id,
+                 .segment_name = segment.name,
+                 .transport_endpoint = segment.te_endpoint});
+            LOG(ERROR) << "client_id=" << client_id
+                       << ", segment_name=" << segment.name
+                       << ", action=prepare_client_offboarding"
+                       << ", error=" << toString(prepare_result);
+        }
+    }
+    return job;
+}
+
 void MasterService::ClientMonitorFunc() {
     while (client_monitor_running_) {
         // RFC #4700 slice 1: liveness transitions retire clients and drive
@@ -10253,68 +10940,8 @@ void MasterService::ClientMonitorFunc() {
                             return pending.client_id == client_id;
                         });
 
-                    ClientOffboardingJob job;
-                    job.client_id = client_id;
-                    job.liveness = record;
-                    std::shared_lock<std::shared_mutex> snapshot_lock(
-                        master_state_mutex_);
-                    {
-                        ScopedSegmentAccess segment_access =
-                            segment_manager_.getSegmentAccess();
-                        std::vector<Segment> segments;
-                        const auto get_result =
-                            segment_access.GetClientSegments(client_id,
-                                                             segments);
-                        if (get_result == ErrorCode::OK) {
-                            for (const auto& segment : segments) {
-                                SegmentStatus status = SegmentStatus::UNDEFINED;
-                                const auto status_result =
-                                    segment_access.GetSegmentStatusById(
-                                        segment.id, status);
-                                if (status_result ==
-                                    ErrorCode::SEGMENT_NOT_FOUND) {
-                                    continue;
-                                }
-                                if (status_result == ErrorCode::OK &&
-                                    status == SegmentStatus::UNMOUNTING) {
-                                    job.pending_prepare_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint});
-                                    continue;
-                                }
-
-                                size_t metrics_dec_capacity = 0;
-                                const auto prepare_result =
-                                    segment_access.PrepareUnmountSegment(
-                                        segment.id, metrics_dec_capacity);
-                                if (prepare_result == ErrorCode::OK) {
-                                    job.prepared_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint,
-                                         .metrics_dec_capacity =
-                                             metrics_dec_capacity});
-                                } else if (prepare_result !=
-                                           ErrorCode::SEGMENT_NOT_FOUND) {
-                                    job.pending_prepare_segments.push_back(
-                                        {.segment_id = segment.id,
-                                         .segment_name = segment.name,
-                                         .transport_endpoint =
-                                             segment.te_endpoint});
-                                    LOG(ERROR)
-                                        << "client_id=" << client_id
-                                        << ", segment_name=" << segment.name
-                                        << ", action=prepare_client_offboarding"
-                                        << ", error="
-                                        << toString(prepare_result);
-                                }
-                            }
-                        }
-                    }
-
+                    ClientOffboardingJob job =
+                        BuildClientOffboardingJob(client_id, record);
                     MasterMetricManager::instance()
                         .client_liveness_became_offline();
                     client_offboarding_worker_.ScheduleReserved(std::move(job));
@@ -11849,6 +12476,7 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     batch_oplog_kv_backend_ = std::move(backend);
     batch_oplog_storage_ = std::move(storage);
     ordered_oplog_writer_ = std::move(writer);
+    ordered_oplog_writer_->SetTerminalCallback(MakeComposedTerminalCallback());
     ordered_oplog_writer_->ActivateRuntimeMetrics();
     return ErrorCode::OK;
 }
@@ -11991,16 +12619,25 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     return {};
 }
 
-void MasterService::PersistSegmentOpForHA(const char* why, OpType type,
-                                          const std::string& key,
-                                          const std::string& payload) {
-    auto result = AppendOpLogVisibleBeforeDurable(
-        type, TenantId::Default().value(), key, payload);
+tl::expected<void, ErrorCode> MasterService::PersistSegmentOpForHAOrEnqueue(
+    const char* why, OpType type, const std::string& key,
+    const std::string& payload) {
+    return PersistSegmentOpForHAOrEnqueue(why, type, TenantId::Default(), key,
+                                          payload);
+}
+
+tl::expected<void, ErrorCode> MasterService::PersistSegmentOpForHAOrEnqueue(
+    const char* why, OpType type, const TenantId& tenant_id,
+    const std::string& key, const std::string& payload) {
+    auto result =
+        AppendOpLogVisibleBeforeDurable(type, tenant_id.value(), key, payload);
     if (!result) {
         LOG(WARNING) << why << ": segment OpLog queue failed for key=" << key
                      << ", type=" << static_cast<int>(type)
                      << ", err=" << static_cast<int>(result.error());
+        return tl::make_unexpected(result.error());
     }
+    return {};
 }
 
 std::vector<Replica::Descriptor>

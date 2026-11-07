@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -31,6 +33,7 @@ class BackgroundWorker {
         }
         running_ = true;
         requested_ = false;
+        next_run_at_ = Clock::time_point{};
         thread_ = std::thread(&BackgroundWorker::ThreadFunc, this);
     }
 
@@ -49,29 +52,47 @@ class BackgroundWorker {
         }
     }
 
-    void Schedule() {
+    // Runs the callback once, as soon as the worker can.
+    void Schedule() { ScheduleAfter(std::chrono::milliseconds(0)); }
+
+    // Runs the callback once, no earlier than `delay` from now. Calls made
+    // before the callback runs coalesce: the earliest deadline wins, so a
+    // later ScheduleAfter() never postpones a request an earlier one made.
+    void ScheduleAfter(std::chrono::milliseconds delay) {
+        const auto deadline = Clock::now() + delay;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!running_) {
                 return;
             }
+            next_run_at_ =
+                requested_ ? std::min(next_run_at_, deadline) : deadline;
             requested_ = true;
         }
         cv_.notify_one();
     }
 
    private:
+    using Clock = std::chrono::steady_clock;
+
     void ThreadFunc() {
+        std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return !running_ || requested_; });
-                if (!running_) {
-                    return;
-                }
-                requested_ = false;
+            cv_.wait(lock, [this] { return !running_ || requested_; });
+            if (!running_) {
+                return;
             }
+            if (next_run_at_ > Clock::now()) {
+                // A later Schedule() or Stop() wakes this early; both are
+                // re-checked when the loop continues.
+                cv_.wait_until(lock, next_run_at_);
+                continue;
+            }
+            requested_ = false;
+            next_run_at_ = Clock::time_point{};
+            lock.unlock();
             callback_();
+            lock.lock();
         }
     }
 
@@ -81,6 +102,7 @@ class BackgroundWorker {
     std::thread thread_;
     bool running_{false};
     bool requested_{false};
+    Clock::time_point next_run_at_{};
 };
 
 }  // namespace mooncake

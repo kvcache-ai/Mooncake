@@ -431,11 +431,13 @@ class MasterServiceTestPeer {
         service_.ClearLocalDiskHandlesOwnedBy(owner);
     }
 
-    void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
+    tl::expected<void, ErrorCode> ClearInvalidHandles() {
+        return service_.ClearInvalidHandles();
+    }
 
-    void ClearInvalidHandles(
+    tl::expected<void, ErrorCode> ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-        service_.ClearInvalidHandles(retaining_clients);
+        return service_.ClearInvalidHandles(retaining_clients);
     }
 
     void DiscardExpiredProcessingReplicas(
@@ -549,6 +551,33 @@ class MasterServiceTestPeer {
 
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         return service_.ProcessClientOffboardingJob(job);
+    }
+
+    ClientOffboardingJob BuildClientOffboardingJob(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record) {
+        return service_.BuildClientOffboardingJob(client_id, record);
+    }
+
+    bool EndpointCleanupPending(const std::string& endpoint) {
+        std::lock_guard<std::mutex> lock(service_.barrier_mutex_);
+        return service_.pending_by_endpoint_.contains(endpoint);
+    }
+
+    void FlushPendingSegmentUnmounts() {
+        service_.FlushPendingSegmentUnmounts();
+    }
+
+    // Runs after the segment commit and before the unmount-log submission.
+    void SetUnmountAfterCommitHook(std::function<void()> hook) {
+        service_.unmount_after_commit_hook_ = std::move(hook);
+    }
+
+    // Whether the master still holds a reference to this token's submission
+    // state; once the entry is logged only the holders keep it alive.
+    bool HasUnmountLogState(const UUID& segment_id) {
+        std::lock_guard<std::mutex> lock(service_.barrier_mutex_);
+        return service_.unmount_log_states_.contains(segment_id);
     }
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(

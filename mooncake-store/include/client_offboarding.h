@@ -13,6 +13,7 @@
 
 #include "client_liveness.h"
 #include "types.h"
+#include "unmount_log.h"
 
 namespace mooncake {
 
@@ -32,6 +33,9 @@ struct PreparedSegmentOffboarding {
     std::string segment_name;
     std::string transport_endpoint;
     size_t metrics_dec_capacity{0};
+    // Held for the rest of the job so a retry still sees that the unmount
+    // entry is logged after the master's index dropped it.
+    std::shared_ptr<SegmentUnmountLogState> unmount_log;
 };
 
 // Process-local residual work for one terminal Client incarnation. The job is
