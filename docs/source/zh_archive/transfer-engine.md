@@ -7,7 +7,7 @@ Mooncake Transfer Engine 是一个围绕 Segment 和 BatchTransfer 两个核心�
 
 - [**BatchTransfer**](#batchtransfer) 封装了操作请求，具体负责将一个 Segment 中非连续的一组数据空间的数据和另外一组 Segment 的对应空间进行数据同步，支持 Read/Write 两种方向，因此类似一个异步且更灵活的的 AllScatter/AllGather。
 
-![transfer_engine](../../image/transfer-engine.png)
+![transfer_engine](../image/transfer-engine.png)
 
 如上图所示，每个特定的客户端对应一个 TransferEngine，其中不仅包含一个 RAM Segment，还集成了对于多线程多网卡高速传输的管理。RAM Segment 原则上就对应这个 TransferEngine 的全部虚拟地址空间，但实际上仅仅会注册其中的部分区域（被称为一个 Buffer）供外部 (GPUDirect) RDMA Read/Write。每一段 Buffer 可以分别设置权限（对应 RDMA rkey 等）和网卡亲和性（比如基于拓扑优先从哪张卡读写等）。
 
@@ -46,7 +46,7 @@ BatchTransfer API 使用请求（Request）对象数组传入用户请求，需�
 ### 拓扑感知路径选择（Topology Aware Path Selection）
 现代推理服务器通常由多个CPU插槽、DRAM、GPU和RDMA NIC设备组成。尽管从技术上讲，使用任何RDMA NIC将数据从本地DRAM或VRAM传输到远程位置是可能的，但这些传输可能会受到Ultra Path Interconnect (UPI)或PCIe交换机带宽限制的制约。为了克服这些限制，Transfer Engine 实现了拓扑感知路径选择算法。在处理请求之前，每个服务器生成一个拓扑矩阵（Topology Matrix）并将其广播到整个集群。拓扑矩阵将网络接口卡（NIC）分类为各种类型的内存的“首选”和“次要”列表，这些类型在内存注册时指定。在正常情况下，选择首选列表中的NIC进行传输，便于在本地NUMA或仅通过本地PCIe交换机进行GPU Direct RDMA操作。在出现故障的情况下，两个列表中的所有NIC都可能被使用。上述过程包括根据内存地址识别适当的本地和目标NIC，建立连接，并执行数据传输。
 
-![topology-matrix](../../image/topology-matrix.png)
+![topology-matrix](../image/topology-matrix.png)
 
 例如，如图所示，要将数据从本地节点分配给 `cpu:0` 的缓冲区0传输到目标节点分配给`cpu:1`的缓冲区1，引擎首先使用本地服务器的拓扑矩阵识别`cpu:0`的首选NIC，并选择一个，如`mlx5_1`，作为本地NIC。同样，根据目标内存地址选择目标NIC，如`mlx5_3`。这种设置允许建立从`mlx5_1@本地`到`mlx5_3@目标`的RDMA连接，以执行RDMA读写操作。
 
@@ -127,7 +127,7 @@ Transfer Engine 使用SIEVE算法来管理端点的逐出。如果由于链路�
 
 下面的视频显示了按上述操作正常运行的过程，其中右侧是 Target，左侧是 Initiator。测试结束后，Initiator 会报告测试时长（10 秒）、IOPS（379008 次请求/s）、吞吐率（19.87 GiB/s）等信息。这里的吞吐率超出了所用主机单卡支持的最大吞吐率。
 
-![transfer-engine-running](../../image/transfer-engine-running.gif)
+![transfer-engine-running](../image/transfer-engine-running.gif)
 
 > [!NOTE]
 > 如果在执行期间发生异常，大多数情况是参数设置不正确所致，建议参考[故障排除文档](troubleshooting.md)先行排查。

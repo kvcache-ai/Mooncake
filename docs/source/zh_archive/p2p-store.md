@@ -35,7 +35,7 @@ P2P Store 提供的是类似 Register 和 GetReplica 的接口。Register 相当
 
 下面的视频显示了按上述操作正常运行的过程，其中右侧是 Trainer，左侧是 Inferencer。传输数据量为 2 GiB。Trainer 首先使用 0.41s 完成 Register 操作，数据对集群所有节点可见；Inferencer 使用 0.64s 完成 GetReplica 操作，此时数据即可直接访问利用。
 
-![p2p-store](../../image/p2p-store.gif)
+![p2p-store](../image/p2p-store.gif)
 
 > 如果在执行期间发生异常，大多数情况是参数设置不正确所致，建议参考[故障排除文档](troubleshooting.md)先行排查。
 
