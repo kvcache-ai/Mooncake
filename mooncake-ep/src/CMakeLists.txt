@@ -15,7 +15,8 @@ if(USE_XPU)
   endif()
   pybind11_add_module(
     _ep MODULE ep_py.cpp xpu/mooncake_ep_xpu_buffer.cpp xpu/xpu_ipc.cpp
-    xpu/xpu_ep_kernels.cpp)
+    xpu/xpu_ep_kernels.cpp xpu/mooncake_ep_xpu_elastic_buffer.cpp
+    xpu/xpu_ep_elastic_kernels.cpp)
   target_compile_definitions(_ep PRIVATE MOONCAKE_EP_USE_XPU=1)
   set(_ep_xpu_sycl_flags -fsycl)
   if(MOONCAKE_EP_XPU_AOT_DEVICES)

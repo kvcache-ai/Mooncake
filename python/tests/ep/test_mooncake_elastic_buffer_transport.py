@@ -12,11 +12,13 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import mooncake.mooncake_elastic_buffer as elastic_buffer_module
 from mooncake.mooncake_ep_buffer import Buffer as LegacyBuffer
 from mooncake.mooncake_elastic_buffer import (
     ElasticBuffer,
     _bootstrap_collective_device,
     _requested_transport,
+    _requested_xpu_transport,
     _resolve_nccl_membership_masks,
     _resolve_transport_consensus,
     _select_transport,
@@ -390,10 +392,12 @@ def test_handle_without_generation_remains_valid_for_ibgda() -> None:
     buffer._validate_handle_generation(LegacyHandle())
 
 
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
 @pytest.mark.parametrize("backend_name", ["mooncake", "mooncake-cpu"])
 def test_active_rank_mask_uses_registered_mooncake_backend(
-    monkeypatch, backend_name: str
+    monkeypatch, backend_name: str, device_type: str
 ) -> None:
+    monkeypatch.setattr(elastic_buffer_module, "_ep_device_type", lambda: device_type)
     backend = object()
     buffer = object.__new__(ElasticBuffer)
     buffer.backend = backend
@@ -405,7 +409,9 @@ def test_active_rank_mask_uses_registered_mooncake_backend(
     monkeypatch.setitem(sys.modules, "mooncake.pg", fake_pg)
     monkeypatch.setattr(dist, "get_backend", lambda group: backend_name)
     synchronized_devices = []
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronized_devices.append)
+    monkeypatch.setattr(
+        getattr(torch, device_type), "synchronize", synchronized_devices.append
+    )
 
     assert buffer._active_ranks_mask() == [1, 0]
     assert synchronized_devices == [3]
@@ -423,12 +429,43 @@ def test_non_mooncake_group_uses_full_membership(monkeypatch, backend_name) -> N
 
 
 @pytest.mark.parametrize(
-    ("backend_name", "device"),
-    [("gloo", "cpu"), ("mooncake-cpu", "cpu"), ("mooncake", "cuda"), ("nccl", "cuda")],
+    ("ep_device", "backend_name", "device"),
+    [
+        ("cuda", "gloo", "cpu"),
+        ("cuda", "mooncake-cpu", "cpu"),
+        ("cuda", "mooncake", "cuda"),
+        ("cuda", "nccl", "cuda"),
+        ("xpu", "gloo", "cpu"),
+        ("xpu", "xccl", "xpu"),
+    ],
 )
-def test_bootstrap_collective_device(monkeypatch, backend_name, device) -> None:
+def test_bootstrap_collective_device(
+    monkeypatch, ep_device, backend_name, device
+) -> None:
+    monkeypatch.setattr(elastic_buffer_module, "_ep_device_type", lambda: ep_device)
     monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
     assert _bootstrap_collective_device(object()) == device
+
+
+@pytest.mark.parametrize("requested", ["auto", "ipc", " IPC "])
+def test_xpu_transport_is_ipc(monkeypatch, requested: str) -> None:
+    monkeypatch.delenv("MOONCAKE_EP_TRANSPORT", raising=False)
+    assert _requested_xpu_transport(requested) == "ipc"
+
+
+def test_xpu_auto_transport_honours_environment(monkeypatch) -> None:
+    monkeypatch.setenv("MOONCAKE_EP_TRANSPORT", "ipc")
+    assert _requested_xpu_transport("auto") == "ipc"
+    monkeypatch.setenv("MOONCAKE_EP_TRANSPORT", "ibgda")
+    with pytest.raises(ValueError, match="only transport 'ipc'"):
+        _requested_xpu_transport("auto")
+
+
+@pytest.mark.parametrize("requested", ["ibgda", "nccl", "xccl"])
+def test_xpu_rejects_other_transports(monkeypatch, requested: str) -> None:
+    monkeypatch.delenv("MOONCAKE_EP_TRANSPORT", raising=False)
+    with pytest.raises(ValueError, match="only transport 'ipc'"):
+        _requested_xpu_transport(requested)
 
 
 @pytest.mark.parametrize("backend_name", ["gloo", "mooncake-cpu"])
