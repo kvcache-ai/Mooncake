@@ -88,6 +88,7 @@ _RS_EXPORTS = frozenset(
         "READ_MODE_AS_STORED",
         "READ_MODE_SHARD",
         "READ_MODE_FULL",
+        "TENSOR_METADATA_WIRE_SIZE",
     }
 )
 
