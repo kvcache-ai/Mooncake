@@ -343,6 +343,176 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
     EXPECT_EQ(py_client_->unregister_buffer(second.data()), 0);
 }
 
+TEST_F(RealClientTest, DfsReadsIntoHostBuffersWithoutStaging) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_host_dfs_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17825";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 8192;
+    const std::vector<std::string> keys{"host_dfs_a", "host_dfs_b"};
+    std::vector<std::string> sources;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    for (size_t k = 0; k < keys.size(); ++k) {
+        std::string source(kObjectSize, '\0');
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i] = static_cast<char>((i * 7 + k * 13) % 251);
+        }
+        ASSERT_EQ(py_client_->put(keys[k], source, config), 0);
+        sources.push_back(std::move(source));
+    }
+    ASSERT_EQ(py_client_->batch_replica_clear(keys, kClientAddress).size(),
+              keys.size());
+    std::vector<Replica::Descriptor> dfs_replicas;
+    for (const auto& key : keys) {
+        const auto replicas = py_client_->get_replica_desc(key);
+        ASSERT_EQ(replicas.size(), 1);
+        ASSERT_TRUE(replicas.front().is_dfs_replica());
+        dfs_replicas.push_back(replicas.front());
+    }
+
+    // Three host destinations: both keys plus a duplicate of the first.
+    std::vector<std::string> destinations(3, std::string(kObjectSize, '\0'));
+    for (auto& destination : destinations) {
+        ASSERT_EQ(
+            py_client_->register_buffer(destination.data(), destination.size()),
+            0);
+    }
+
+    // Without a client buffer allocator, success proves host-destined DFS
+    // reads no longer stage through a temporary buffer.
+    auto client_buffer_allocator =
+        std::move(py_client_->client_buffer_allocator_);
+    EXPECT_EQ(py_client_->get_into(keys[1], destinations[0].data(),
+                                   destinations[0].size()),
+              static_cast<int64_t>(kObjectSize));
+    EXPECT_EQ(destinations[0], sources[1]);
+
+    const std::vector<std::string> batch_keys{keys[0], keys[1], keys[0]};
+    std::vector<void*> buffers;
+    for (auto& destination : destinations) {
+        std::fill(destination.begin(), destination.end(), '\0');
+        buffers.push_back(destination.data());
+    }
+    const std::vector<size_t> sizes(batch_keys.size(), kObjectSize);
+    EXPECT_EQ(py_client_->batch_get_into(batch_keys, buffers, sizes),
+              std::vector<int64_t>(batch_keys.size(), kObjectSize));
+    EXPECT_EQ(destinations[0], sources[0]);
+    EXPECT_EQ(destinations[1], sources[1]);
+    EXPECT_EQ(destinations[2], sources[0]);
+
+    // Multi-buffer: split each object across uneven host buffers, with excess
+    // capacity in the last one and a duplicate of the first key.
+    for (auto& destination : destinations) {
+        std::fill(destination.begin(), destination.end(), '\0');
+    }
+    constexpr size_t kHead = 3000;
+    std::vector<std::vector<void*>> multi_buffers;
+    std::vector<std::vector<size_t>> multi_sizes;
+    for (auto& destination : destinations) {
+        multi_buffers.push_back(
+            {destination.data(), destination.data() + kHead});
+        multi_sizes.push_back({kHead, destination.size() - kHead});
+    }
+    std::string tail(kObjectSize, '\0');
+    ASSERT_EQ(py_client_->register_buffer(tail.data(), tail.size()), 0);
+    multi_buffers[1] = {destinations[1].data(), tail.data()};
+    multi_sizes[1] = {kHead, tail.size()};
+    EXPECT_EQ(py_client_->batch_get_into_multi_buffers(
+                  batch_keys, multi_buffers, multi_sizes, false),
+              std::vector<int>(batch_keys.size(), kObjectSize));
+    EXPECT_EQ(destinations[0], sources[0]);
+    EXPECT_EQ(destinations[1].substr(0, kHead), sources[1].substr(0, kHead));
+    EXPECT_EQ(tail.substr(0, kObjectSize - kHead), sources[1].substr(kHead));
+    EXPECT_EQ(destinations[2], sources[0]);
+    EXPECT_EQ(py_client_->unregister_buffer(tail.data()), 0);
+
+#ifdef MOONCAKE_TEST_CUDA_H2D
+    // Device destinations keep staging through the client buffer allocator.
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0) {
+        py_client_->client_buffer_allocator_ = client_buffer_allocator;
+        void* gpu_destination = nullptr;
+        ASSERT_EQ(cudaMalloc(&gpu_destination, kObjectSize), cudaSuccess);
+        ASSERT_EQ(py_client_->register_buffer(gpu_destination, kObjectSize), 0);
+        EXPECT_EQ(py_client_->batch_get_into({keys[0]}, {gpu_destination},
+                                             {kObjectSize}),
+                  std::vector<int64_t>{static_cast<int64_t>(kObjectSize)});
+        std::string actual(kObjectSize, '\0');
+        EXPECT_EQ(cudaMemcpy(actual.data(), gpu_destination, kObjectSize,
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_EQ(actual, sources[0]);
+
+        // Mixed host/device multi-buffer destinations also keep staging.
+        std::fill(destinations[0].begin(), destinations[0].end(), '\0');
+        ASSERT_EQ(cudaMemset(gpu_destination, 0, kObjectSize), cudaSuccess);
+        EXPECT_EQ(py_client_->batch_get_into_multi_buffers(
+                      {keys[0]}, {{destinations[0].data(), gpu_destination}},
+                      {{kHead, kObjectSize}}, false),
+                  std::vector<int>{static_cast<int>(kObjectSize)});
+        EXPECT_EQ(destinations[0].substr(0, kHead),
+                  sources[0].substr(0, kHead));
+        actual.assign(kObjectSize - kHead, '\0');
+        EXPECT_EQ(cudaMemcpy(actual.data(), gpu_destination, actual.size(),
+                             cudaMemcpyDeviceToHost),
+                  cudaSuccess);
+        EXPECT_EQ(actual, sources[0].substr(kHead));
+        EXPECT_EQ(py_client_->unregister_buffer(gpu_destination), 0);
+        EXPECT_EQ(cudaFree(gpu_destination), cudaSuccess);
+        py_client_->client_buffer_allocator_ = nullptr;
+    }
+#endif
+
+    // Truncating the later object in the shard fails only that key.
+    const size_t bad = dfs_replicas[1].get_dfs_descriptor().offset >
+                       dfs_replicas[0].get_dfs_descriptor().offset;
+    const size_t good = 1 - bad;
+    const auto& truncated = dfs_replicas[bad].get_dfs_descriptor();
+    std::filesystem::resize_file(truncated.file_path,
+                                 truncated.offset + kObjectSize / 2);
+    std::vector<int64_t> expected(2, toInt(ErrorCode::FILE_READ_FAIL));
+    expected[good] = static_cast<int64_t>(kObjectSize);
+    EXPECT_EQ(
+        py_client_->batch_get_into({keys[0], keys[1]}, {buffers[0], buffers[1]},
+                                   {kObjectSize, kObjectSize}),
+        expected);
+    EXPECT_EQ(destinations[good], sources[good]);
+    EXPECT_EQ(py_client_->get_into(keys[bad], buffers[bad], kObjectSize),
+              toInt(ErrorCode::FILE_READ_FAIL));
+    py_client_->client_buffer_allocator_ = std::move(client_buffer_allocator);
+
+    for (auto& destination : destinations) {
+        EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+    }
+}
+
 #ifdef MOONCAKE_TEST_CUDA_H2D
 TEST_F(RealClientTest, LastHitOnlyGpuCheckpointRoundTrip) {
     int device_count = 0;
