@@ -14,6 +14,7 @@
 #include "dummy_client.h"
 #include "real_client.h"
 #include "types.h"
+#include "uds_transport.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
 #include "device/accelerator_registry.h"
@@ -2553,7 +2554,8 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
-               size_t local_buffer_size, const std::string &server_address) {
+               size_t local_buffer_size, const std::string &server_address,
+               const std::string &ipc_socket_path) {
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
@@ -2563,10 +2565,15 @@ PYBIND11_MODULE(_store, m) {
                 auto [ip, port] = parseHostNameWithPort(server_address);
                 return self.store_->setup_dummy(
                     mem_pool_size, local_buffer_size, server_address,
-                    "@mooncake_client_" + std::to_string(port) + ".sock");
+                    resolveClientIpcSocketName(ipc_socket_path, port));
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
-            py::arg("server_address"))
+            py::arg("server_address"), py::arg("ipc_socket_path") = "",
+            "Connect to a local real client as a dummy client.\n"
+            "  ipc_socket_path: Unix socket shared with the real client for "
+            "fd passing. Empty falls back to $MOONCAKE_IPC_SOCKET_PATH, then "
+            "@mooncake_client_<port>.sock. Use a path starting with '/' when "
+            "the real client runs in another pod.")
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,

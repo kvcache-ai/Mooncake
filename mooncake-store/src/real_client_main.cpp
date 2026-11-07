@@ -9,6 +9,7 @@
 #include "common/byte_size.h"
 #include "glog_compat.h"
 #include "real_client.h"
+#include "uds_transport.h"
 #include "version.h"
 
 using namespace mooncake;
@@ -21,6 +22,12 @@ DEFINE_string(master_server_address, "127.0.0.1:50051",
               "Master server address");
 DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
+DEFINE_string(ipc_socket_path, "",
+              "Unix socket that dummy clients use to pass shared-memory fds. "
+              "A value starting with '/' is a filesystem socket, needed when "
+              "dummy clients run in another pod; anything else is an abstract "
+              "socket. Empty falls back to $MOONCAKE_IPC_SOCKET_PATH, then "
+              "@mooncake_client_<port>.sock");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_string(local_buffer_size, "0", "Size of local buffer (e.g., 16MB, 1GB)");
 DEFINE_int32(threads, 1, "Number of threads for client service");
@@ -144,11 +151,13 @@ int main(int argc, char *argv[]) {
 #endif
 
     auto client_inst = RealClient::create();
+    const std::string ipc_socket_path =
+        resolveClientIpcSocketName(FLAGS_ipc_socket_path, FLAGS_port);
+    LOG(INFO) << "IPC socket for dummy clients: " << ipc_socket_path;
     auto res = client_inst->setup_internal(
         FLAGS_host, FLAGS_metadata_server, global_segment_size,
         local_buffer_size, FLAGS_protocol, FLAGS_device_names,
-        FLAGS_master_server_address, nullptr,
-        "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
+        FLAGS_master_server_address, nullptr, ipc_socket_path, FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
         FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port);
     if (!res) {
