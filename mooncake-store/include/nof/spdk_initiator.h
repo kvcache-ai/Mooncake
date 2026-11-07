@@ -28,6 +28,13 @@ class SpdkInitiator : public NVMeoFInitiator {
                  NofIOAdaptor* adaptor) override;
     int64_t PollCompletion(NofSegmentHandle* handle,
                            uint32_t max_completions) override;
+    std::shared_lock<std::shared_mutex> TryLockSegmentIo(
+        const NofSegmentHandle* handle) override;
+    bool IsSegmentFailed(const NofSegmentHandle* handle) override;
+    // Controller resets run on a background recovery thread; once one has
+    // succeeded the next call reconnects the io qpair here, on the owning
+    // thread, as SPDK requires.
+    bool TryRecoverSegment(NofSegmentHandle* handle) override;
     ErrorCode RegisterMemory(void* ptr, size_t size) override;
     ErrorCode UnregisterMemory(void* ptr) override;
     NofCapabilities GetCapabilities() const override;
