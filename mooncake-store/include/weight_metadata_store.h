@@ -13,6 +13,10 @@
 
 namespace mooncake {
 
+namespace test {
+struct WeightMetadataStoreTestPeer;
+}
+
 enum class WeightMetadataMutationKind : uint8_t {
     UPSERT = 0,
     ERASE = 1,
@@ -59,6 +63,8 @@ tl::expected<void, WeightManagementError> ValidateWeightMetadataSnapshot(
     const WeightMetadataSnapshot& snapshot);
 
 class WeightMetadataStore {
+    friend struct test::WeightMetadataStoreTestPeer;
+
    public:
     template <typename T>
     using Result = tl::expected<T, WeightManagementError>;
