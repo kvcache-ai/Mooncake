@@ -657,11 +657,19 @@ jobs:
       artifact-prefix: mooncake-wheel-cu130-arm64
       version-override: 0.0.0.dev0
 
-  build-wheel-efa:
+  # Every default wheel carries the EFA transport (USE_EFA=ON). Build one with
+  # the unit tests too: the EFA tests only compile with USE_EFA=ON, and a break
+  # there otherwise first shows up at the release tag (#5260).
+  build-wheel-unit-tests:
     needs: [spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
-    uses: ./.github/workflows/ci_efa.yml
-    secrets: inherit
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-cu130-unit-tests
+      version-override: 0.0.0.dev0
+      unit-tests: true
 
   build-wheel-rocm:
     needs: [spell-check, clang-format, check-paths]
@@ -1021,7 +1029,7 @@ jobs:
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-cu13-arm64
-      - build-wheel-efa
+      - build-wheel-unit-tests
       - build-wheel-rocm
       - tent-ci
       - store-rs-ci
@@ -1054,7 +1062,7 @@ jobs:
             ${{ needs.test-wheel-ubuntu.result }}
             ${{ needs.build-wheel-cu13.result }}
             ${{ needs.build-wheel-cu13-arm64.result }}
-            ${{ needs.build-wheel-efa.result }}
+            ${{ needs.build-wheel-unit-tests.result }}
             ${{ needs.build-wheel-rocm.result }}
         run: |
           for result in $RESULTS; do
