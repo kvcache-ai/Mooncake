@@ -8,6 +8,8 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include <glog/logging.h>
+
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "ha/oplog/oplog_test_failpoint.h"
@@ -2157,6 +2159,9 @@ void RegisterRpcService(Server& server,
         &mooncake::WrappedMasterService::RegisterPrefetchTask>(
         &wrapped_master_service);
     traffic::TrafficRecorder::Instance().Install();
+    if (traffic::TrafficRecorder::Instance().GetStatus().state == "error") {
+        LOG(FATAL) << "traffic recorder configuration failed";
+    }
 }
 
 template void RegisterRpcService<traffic::RecordingServer>(

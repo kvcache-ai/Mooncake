@@ -660,6 +660,7 @@ void TrafficRecorder::StartControlServer() {
             LOG(ERROR) << "traffic: control server failed on "
                        << control_host_ << ":" << control_port_ << ": "
                        << ec.value().message();
+            state_ = "error";
             control_server_.reset();
             return;
         }
@@ -668,6 +669,7 @@ void TrafficRecorder::StartControlServer() {
                   << control_port_;
     } catch (const std::exception& e) {
         LOG(ERROR) << "traffic: control server exception: " << e.what();
+        state_ = "error";
         control_server_.reset();
     }
 }
