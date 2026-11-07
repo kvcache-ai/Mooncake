@@ -82,6 +82,49 @@ TEST(StandbyControllerTest, OplogEnablementControlsReaderController) {
     EXPECT_EQ(ErrorCode::OK, unsupported->PromoteStandby());
 }
 
+namespace {
+StandbySyncStatus SyncStatus(StandbyState state, bool polled_once,
+                             uint64_t lag_entries) {
+    StandbySyncStatus status;
+    status.state = state;
+    status.polled_once = polled_once;
+    status.lag_entries = lag_entries;
+    return status;
+}
+}  // namespace
+
+// A cold replacement pod must stay out of an election a warm standby can win:
+// it is far behind until it has polled the OpLog and its lag is small.
+TEST(StandbyControllerTest, FarBehindCoversBootstrapUnknownLagAndLargeLag) {
+    constexpr uint64_t kMax = 1000;
+    for (auto state : {StandbyState::CONNECTING, StandbyState::SYNCING,
+                       StandbyState::RECOVERING, StandbyState::RECONNECTING,
+                       StandbyState::FAILED}) {
+        EXPECT_TRUE(ha::IsStandbyFarBehind(SyncStatus(state, true, 0), kMax));
+    }
+    // Watching, but no poll has finished yet: the lag is unknown.
+    EXPECT_TRUE(ha::IsStandbyFarBehind(
+        SyncStatus(StandbyState::WATCHING, false, 0), kMax));
+    // Millions of entries behind, as the cold pod was in the 2026-11-03 run.
+    EXPECT_TRUE(ha::IsStandbyFarBehind(
+        SyncStatus(StandbyState::WATCHING, true, 4900000), kMax));
+    EXPECT_TRUE(ha::IsStandbyFarBehind(
+        SyncStatus(StandbyState::WATCHING, true, kMax + 1), kMax));
+    // Warm and caught up, or within the threshold.
+    EXPECT_FALSE(ha::IsStandbyFarBehind(
+        SyncStatus(StandbyState::WATCHING, true, 0), kMax));
+    EXPECT_FALSE(ha::IsStandbyFarBehind(
+        SyncStatus(StandbyState::WATCHING, true, kMax), kMax));
+    // A rebootstrap keeps the state at WATCHING and only sets is_recovering;
+    // the lag it reports is stale or zero.
+    auto recovering = SyncStatus(StandbyState::WATCHING, true, 0);
+    recovering.is_recovering = true;
+    EXPECT_TRUE(ha::IsStandbyFarBehind(recovering, kMax));
+    // Not replicating: nothing to hold back for.
+    EXPECT_FALSE(ha::IsStandbyFarBehind(
+        SyncStatus(StandbyState::STOPPED, false, 0), kMax));
+}
+
 TEST(StandbyControllerTest, PromotionReportsStandbyStartFailure) {
     // Inject a synchronous startup failure so this test does not depend on
     // asynchronous HA backend connection behavior.
