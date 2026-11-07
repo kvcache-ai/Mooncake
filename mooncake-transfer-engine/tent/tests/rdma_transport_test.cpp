@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -70,6 +71,49 @@ constexpr int kGdrFailureThreshold = 2;
 // Friend accessor for driving initializeContexts() without a full install().
 class RdmaTransportTestPeer {
    public:
+    static void setBootstrapAdmissionConfig(RdmaTransport& transport,
+                                            bool enabled,
+                                            int max_global_inflight,
+                                            int max_per_peer_inflight,
+                                            int max_per_device_inflight,
+                                            int retry_after_ms) {
+        transport.bootstrap_admission_config_.enabled = enabled;
+        transport.bootstrap_admission_config_.max_global_inflight =
+            max_global_inflight;
+        transport.bootstrap_admission_config_.max_per_peer_inflight =
+            max_per_peer_inflight;
+        transport.bootstrap_admission_config_.max_per_device_inflight =
+            max_per_device_inflight;
+        transport.bootstrap_admission_config_.retry_after_ms = retry_after_ms;
+    }
+
+    static bool acquireBootstrapAdmission(RdmaTransport& transport,
+                                          const std::string& peer_server_name,
+                                          int local_device_id,
+                                          uint32_t protocol_version = 2,
+                                          int* retry_after_ms = nullptr) {
+        int retry_after = 0;
+        bool acquired = transport.tryAcquireBootstrapAdmission(
+            peer_server_name, local_device_id, protocol_version, retry_after);
+        if (retry_after_ms) *retry_after_ms = retry_after;
+        return acquired;
+    }
+
+    static void releaseBootstrapAdmission(RdmaTransport& transport,
+                                          const std::string& peer_server_name,
+                                          int local_device_id) {
+        transport.releaseBootstrapAdmission(peer_server_name, local_device_id);
+    }
+
+    static size_t bootstrapGlobalInflight(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> guard(transport.bootstrap_admission_mutex_);
+        return transport.bootstrap_global_inflight_;
+    }
+
+    static Status configureBootstrapAdmission(RdmaTransport& transport) {
+        return transport.configureBootstrapAdmission();
+    }
+
     static Status generatePostPath(Workers& workers, RdmaSlice* slice) {
         const int previous = tl_wid;
         tl_wid = 0;
@@ -94,6 +138,11 @@ class RdmaTransportTestPeer {
     static void bindContexts(RdmaTransport& transport,
                              RdmaContextSet contexts) {
         transport.context_set_ = std::move(contexts);
+    }
+
+    static void mapContextName(RdmaTransport& transport,
+                               const std::string& name, int index) {
+        transport.context_name_lookup_[name] = index;
     }
 
     // Defaults to a monitor tick: that is what the orphan tests stand in for.
@@ -158,6 +207,8 @@ class RdmaTransportTestPeer {
         return transport.params_;
     }
 
+    static Config& config(RdmaTransport& transport) { return *transport.conf_; }
+
     static Workers& prepareAllocation(RdmaTransport& transport,
                                       const std::string& rails) {
         transport.params_->workers.num_workers = 1;
@@ -202,6 +253,11 @@ class RdmaTransportTestPeer {
 
     static void addInflight(Workers& workers, size_t worker_id, int64_t delta) {
         workers.worker_context_[worker_id].inflight_slices.fetch_add(delta);
+    }
+    static bool workerInSuspend(Workers& workers, size_t worker_id) {
+        auto& worker = workers.worker_context_[worker_id];
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        return worker.in_suspend;
     }
 
     using NotifyAction = RdmaTransport::NotifyCompletionAction;
@@ -263,6 +319,33 @@ class RdmaTransportTestPeer {
         tl_wid = worker_id;
         workers.asyncPostSend();
         tl_wid = previous_worker_id;
+    }
+
+    static bool handleBootstrapAdmissionFailure(Workers& workers, int worker_id,
+                                                RdmaSlice* slice,
+                                                const Status& failure,
+                                                uint64_t now_ns) {
+        return workers.handleBootstrapAdmissionFailure(
+            workers.worker_context_[worker_id], slice, failure, now_ns);
+    }
+
+    static bool expireBootstrapAdmissionRetry(Workers& workers, int worker_id,
+                                              RdmaSlice* slice,
+                                              uint64_t now_ns) {
+        return workers.expireBootstrapAdmissionRetry(
+            workers.worker_context_[worker_id], slice, now_ns);
+    }
+
+    static size_t delayedBootstrapRetryCount(Workers& workers, int worker_id) {
+        auto& worker = workers.worker_context_[worker_id];
+        std::lock_guard<std::mutex> lock(worker.bootstrap_retry_mutex);
+        return worker.delayed_bootstrap_retries.size();
+    }
+
+    static void drainBootstrapAdmissionRetries(Workers& workers, int worker_id,
+                                               uint64_t now_ns) {
+        workers.drainBootstrapAdmissionRetries(
+            workers.worker_context_[worker_id], now_ns);
     }
 
     static void markPosted(Workers& workers, Workers::WorkerContext& worker,
@@ -428,6 +511,25 @@ class TicketLockTestPeer {
 
 class RdmaEndPointTestPeer {
    public:
+    static Status beginBootstrapAttempt(RdmaEndPoint& endpoint,
+                                        const Config& config, uint64_t now_ns) {
+        return endpoint.beginBootstrapAttempt(&config, now_ns);
+    }
+
+    static void finishBootstrapAttempt(RdmaEndPoint& endpoint,
+                                       const Config& config,
+                                       const Status& status, uint64_t now_ns) {
+        (void)endpoint.finishBootstrapAttempt(&config, status, now_ns);
+        endpoint.bootstrap_attempt_in_flight_.clear(std::memory_order_release);
+    }
+
+    static Status runBootstrapAttempt(
+        RdmaEndPoint& endpoint, const Config& config,
+        const RdmaEndPoint::BootstrapAttempt& attempt,
+        BootstrapDesc& peer_desc) {
+        return endpoint.runBootstrapAttempt(&config, attempt, peer_desc);
+    }
+
     static RdmaAddressSnapshot localAddress(const RdmaEndPoint& endpoint) {
         return endpoint.local_address_;
     }
@@ -530,6 +632,355 @@ std::shared_ptr<Config> makeRdmaConfig() {
     config->set("transports/tcp/enable", false);
     config->set("transports/shm/enable", false);
     return config;
+}
+
+TEST(RdmaBootstrapAdmissionTest, CountsLegacyPeersWithoutRejectingThem) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::setBootstrapAdmissionConfig(
+        transport, true, /*max_global_inflight=*/2,
+        /*max_per_peer_inflight=*/1,
+        /*max_per_device_inflight=*/1, /*retry_after_ms=*/17);
+
+    int retry_after_ms = 0;
+    ASSERT_TRUE(RdmaTransportTestPeer::acquireBootstrapAdmission(transport,
+                                                                 "peer-a", 0));
+    EXPECT_FALSE(RdmaTransportTestPeer::acquireBootstrapAdmission(
+        transport, "peer-a", 1, 2, &retry_after_ms));
+    EXPECT_EQ(retry_after_ms, 17);
+    EXPECT_FALSE(RdmaTransportTestPeer::acquireBootstrapAdmission(transport,
+                                                                  "peer-b", 0));
+    ASSERT_TRUE(RdmaTransportTestPeer::acquireBootstrapAdmission(
+        transport, "legacy", 2, /*protocol_version=*/1));
+    EXPECT_FALSE(RdmaTransportTestPeer::acquireBootstrapAdmission(transport,
+                                                                  "peer-b", 1));
+    RdmaTransportTestPeer::releaseBootstrapAdmission(transport, "legacy", 2);
+    ASSERT_TRUE(RdmaTransportTestPeer::acquireBootstrapAdmission(transport,
+                                                                 "peer-b", 1));
+    EXPECT_FALSE(RdmaTransportTestPeer::acquireBootstrapAdmission(transport,
+                                                                  "peer-c", 2));
+    RdmaTransportTestPeer::releaseBootstrapAdmission(transport, "peer-b", 1);
+    RdmaTransportTestPeer::releaseBootstrapAdmission(transport, "peer-a", 0);
+    EXPECT_EQ(RdmaTransportTestPeer::bootstrapGlobalInflight(transport), 0u);
+}
+
+TEST(RdmaBootstrapAdmissionTest, RejectsNegativeAdmissionLimits) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport,
+                                        std::make_shared<Topology>());
+    RdmaTransportTestPeer::config(transport).set(
+        "transports/rdma/bootstrap_admission/max_global_inflight", -1);
+    auto status = RdmaTransportTestPeer::configureBootstrapAdmission(transport);
+    EXPECT_TRUE(status.IsInvalidArgument()) << status.ToString();
+}
+
+TEST(RdmaBootstrapAdmissionTest, FullAdmissionRejectsBeforeEndpointCreation) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::setBootstrapAdmissionConfig(
+        transport, true, /*max_global_inflight=*/1,
+        /*max_per_peer_inflight=*/0,
+        /*max_per_device_inflight=*/0, /*retry_after_ms=*/23);
+    auto context = std::make_shared<RdmaContext>(transport);
+    ibv_gid gid{};
+    RdmaContextTestPeer::seedAddress(*context, "accept0", 1, 0, gid,
+                                     RdmaContext::DEVICE_ENABLED);
+    RdmaTransportTestPeer::bindContexts(transport, {context});
+    RdmaTransportTestPeer::mapContextName(transport, "accept0", 0);
+
+    BootstrapDesc request;
+    request.protocol_version = 2;
+    request.local_nic_path = "peer@init0";
+    request.peer_nic_path = "local@accept0";
+    BootstrapDesc response;
+    int rc = 0;
+    ASSERT_TRUE(RdmaTransportTestPeer::acquireBootstrapAdmission(
+        transport, "other-peer", 1));
+    rc = transport.onSetupRdmaConnections(request, response);
+    RdmaTransportTestPeer::releaseBootstrapAdmission(transport, "other-peer",
+                                                     1);
+
+    EXPECT_NE(rc, 0);
+    EXPECT_TRUE(
+        response.reply_msg.starts_with("NOT_READY: bootstrap throttled"));
+    EXPECT_NE(response.reply_msg.find("retry_after_ms=23"), std::string::npos);
+    EXPECT_EQ(context->endpointStore(), nullptr);
+}
+
+TEST(RdmaBootstrapAdmissionTest, EndpointSharesSingleFlightAndBackoff) {
+    Config config;
+    config.set("transports/rdma/bootstrap_retry/timeout_ms", 20);
+    config.set("transports/rdma/bootstrap_retry/base_ms", 5);
+    config.set("transports/rdma/bootstrap_retry/max_ms", 5);
+    config.set("transports/rdma/bootstrap_retry/jitter_ms", 0);
+    RdmaEndPoint endpoint;
+    const uint64_t now_ns = 1000000;
+    auto throttled = Status::TooManyRequests(
+        "NOT_READY: bootstrap throttled, retry_after_ms=5");
+    ASSERT_TRUE(
+        RdmaEndPointTestPeer::beginBootstrapAttempt(endpoint, config, now_ns)
+            .ok());
+    EXPECT_TRUE(
+        RdmaEndPointTestPeer::beginBootstrapAttempt(endpoint, config, now_ns)
+            .IsTooManyRequests());
+    RdmaEndPointTestPeer::finishBootstrapAttempt(endpoint, config, throttled,
+                                                 now_ns);
+
+    EXPECT_TRUE(RdmaEndPointTestPeer::beginBootstrapAttempt(endpoint, config,
+                                                            now_ns + 4999999)
+                    .IsTooManyRequests());
+    ASSERT_TRUE(RdmaEndPointTestPeer::beginBootstrapAttempt(endpoint, config,
+                                                            now_ns + 5000000)
+                    .ok());
+    RdmaEndPointTestPeer::finishBootstrapAttempt(endpoint, config, Status::OK(),
+                                                 now_ns + 5000000);
+}
+
+TEST(RdmaBootstrapAdmissionTest, RunBootstrapAttemptIsSingleFlight) {
+    Config config;
+    config.set("transports/rdma/bootstrap_retry/base_ms", 1000);
+    config.set("transports/rdma/bootstrap_retry/max_ms", 1000);
+    config.set("transports/rdma/bootstrap_retry/jitter_ms", 0);
+    RdmaEndPoint endpoint;
+    auto throttled = Status::TooManyRequests(
+        "NOT_READY: bootstrap throttled, retry_after_ms=1000");
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto entered_future = entered.get_future();
+    auto release_future = release.get_future().share();
+    std::atomic<int> attempts{0};
+    BootstrapDesc first_response;
+    Status first_status;
+    std::thread first([&] {
+        first_status = RdmaEndPointTestPeer::runBootstrapAttempt(
+            endpoint, config,
+            [&](BootstrapDesc&) {
+                attempts.fetch_add(1, std::memory_order_relaxed);
+                entered.set_value();
+                release_future.wait();
+                return throttled;
+            },
+            first_response);
+    });
+    const auto entered_status =
+        entered_future.wait_for(std::chrono::seconds(1));
+    if (entered_status != std::future_status::ready) {
+        release.set_value();
+        first.join();
+        FAIL() << "bootstrap callback did not start within one second";
+    }
+
+    BootstrapDesc second_response;
+    auto second_status = RdmaEndPointTestPeer::runBootstrapAttempt(
+        endpoint, config,
+        [&](BootstrapDesc&) {
+            attempts.fetch_add(1, std::memory_order_relaxed);
+            return Status::OK();
+        },
+        second_response);
+    EXPECT_TRUE(second_status.IsTooManyRequests()) << second_status.ToString();
+    EXPECT_NE(second_status.message().find("retry_after_ms=1000"),
+              std::string::npos);
+    EXPECT_EQ(attempts.load(std::memory_order_relaxed), 1);
+
+    release.set_value();
+    first.join();
+    EXPECT_TRUE(first_status.IsTooManyRequests()) << first_status.ToString();
+    EXPECT_NE(first_status.message().find("retry_after_ms=1000"),
+              std::string::npos);
+
+    BootstrapDesc backoff_response;
+    auto backoff_status = RdmaEndPointTestPeer::runBootstrapAttempt(
+        endpoint, config,
+        [&](BootstrapDesc&) {
+            attempts.fetch_add(1, std::memory_order_relaxed);
+            return Status::OK();
+        },
+        backoff_response);
+    EXPECT_TRUE(backoff_status.IsTooManyRequests())
+        << backoff_status.ToString();
+    EXPECT_EQ(attempts.load(std::memory_order_relaxed), 1);
+}
+
+TEST(RdmaBootstrapAdmissionTest, EachSliceOwnsItsAdmissionDeadline) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport,
+                                        std::make_shared<Topology>());
+    auto& config = RdmaTransportTestPeer::config(transport);
+    config.set("transports/rdma/bootstrap_retry/timeout_ms", 4);
+    config.set("transports/rdma/bootstrap_retry/base_ms", 1);
+    config.set("transports/rdma/bootstrap_retry/max_ms", 100);
+    config.set("transports/rdma/bootstrap_retry/jitter_ms", 0);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    RdmaTransportTestPeer::makeWorkerContexts(*workers, 1);
+
+    RdmaTask task{};
+    task.num_slices = 2;
+    task.status_word = PENDING;
+    task.first_error = PENDING;
+    RdmaSlice first;
+    first.task = &task;
+    first.word = PENDING;
+    first.owner_worker = 0;
+    first.counted_lane = 0;
+    RdmaSlice second;
+    second.task = &task;
+    second.word = PENDING;
+    second.owner_worker = 0;
+    second.counted_lane = 0;
+    RdmaTransportTestPeer::addInflight(*workers, 0, 2);
+    auto throttled = Status::TooManyRequests(
+        "NOT_READY: bootstrap backoff, retry_after_ms=50");
+    const uint64_t first_start_ns = 1000001;
+    const uint64_t second_start_ns = first_start_ns + 2000000;
+    ASSERT_TRUE(RdmaTransportTestPeer::handleBootstrapAdmissionFailure(
+        *workers, 0, &first, throttled, first_start_ns));
+    ASSERT_TRUE(RdmaTransportTestPeer::handleBootstrapAdmissionFailure(
+        *workers, 0, &second, throttled, second_start_ns));
+    EXPECT_EQ(first.bootstrap_retry_deadline_ns, first_start_ns + 4000000);
+    EXPECT_EQ(second.bootstrap_retry_deadline_ns, second_start_ns + 4000000);
+    EXPECT_EQ(RdmaTransportTestPeer::delayedBootstrapRetryCount(*workers, 0),
+              2u);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers, 0)
+                  .inflight_slices.load(),
+              0);
+
+    EXPECT_FALSE(RdmaTransportTestPeer::expireBootstrapAdmissionRetry(
+        *workers, 0, &first, first_start_ns + 3999999));
+    RdmaTransportTestPeer::drainBootstrapAdmissionRetries(
+        *workers, 0, first_start_ns + 4000000);
+    EXPECT_EQ(first.word, FAILED);
+    EXPECT_EQ(second.word, PENDING);
+    EXPECT_EQ(task.status_word, PENDING);
+    EXPECT_EQ(RdmaTransportTestPeer::delayedBootstrapRetryCount(*workers, 0),
+              1u);
+    RdmaTransportTestPeer::drainBootstrapAdmissionRetries(
+        *workers, 0, second_start_ns + 4000000);
+    EXPECT_EQ(second.word, FAILED);
+    EXPECT_EQ(task.status_word, FAILED);
+    EXPECT_EQ(RdmaTransportTestPeer::delayedBootstrapRetryCount(*workers, 0),
+              0u);
+    RdmaTransportTestPeer::destroyWorkerContexts(*workers);
+}
+
+TEST(RdmaBootstrapAdmissionTest, QuiesceDrainsParkedAdmissionRetry) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport,
+                                        std::make_shared<Topology>());
+    RdmaTransportTestPeer::setNumWorkers(transport, 1);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    ASSERT_TRUE(workers->start().ok());
+
+    RdmaTask task{};
+    task.num_slices = 1;
+    task.status_word = PENDING;
+    task.first_error = PENDING;
+    RdmaSlice slice;
+    slice.task = &task;
+    slice.word = PENDING;
+    slice.owner_worker = 0;
+    slice.counted_lane = 0;
+    RdmaTransportTestPeer::addInflight(*workers, 0, 1);
+    auto throttled = Status::TooManyRequests(
+        "NOT_READY: bootstrap backoff, retry_after_ms=60000");
+    ASSERT_TRUE(RdmaTransportTestPeer::handleBootstrapAdmissionFailure(
+        *workers, 0, &slice, throttled, getCurrentTimeInNano()));
+    ASSERT_EQ(RdmaTransportTestPeer::delayedBootstrapRetryCount(*workers, 0),
+              1u);
+
+    EXPECT_TRUE(workers->quiesce(/*timeout_ns=*/0).ok());
+    EXPECT_EQ(task.status_word, FAILED);
+    EXPECT_EQ(RdmaTransportTestPeer::delayedBootstrapRetryCount(*workers, 0),
+              0u);
+    EXPECT_EQ(RdmaTransportTestPeer::workerContext(*workers, 0)
+                  .inflight_slices.load(),
+              0);
+    EXPECT_TRUE(workers->stop().ok());
+}
+
+TEST(RdmaBootstrapAdmissionTest, CancelWakesLongParkedAdmissionRetry) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport,
+                                        std::make_shared<Topology>());
+    auto& config = RdmaTransportTestPeer::config(transport);
+    config.set("transports/rdma/bootstrap_retry/timeout_ms", 120000);
+    config.set("transports/rdma/bootstrap_retry/base_ms", 60000);
+    config.set("transports/rdma/bootstrap_retry/max_ms", 60000);
+    config.set("transports/rdma/bootstrap_retry/jitter_ms", 0);
+    RdmaTransportTestPeer::setNumWorkers(transport, 1);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    ASSERT_TRUE(workers->start().ok());
+
+    RdmaTask task{};
+    task.num_slices = 1;
+    task.status_word = PENDING;
+    task.first_error = PENDING;
+    RdmaSlice slice;
+    slice.task = &task;
+    slice.word = PENDING;
+    slice.owner_worker = 0;
+    slice.counted_lane = 0;
+    RdmaTransportTestPeer::addInflight(*workers, 0, 1);
+    auto throttled = Status::TooManyRequests(
+        "NOT_READY: bootstrap backoff, retry_after_ms=60000");
+    ASSERT_TRUE(RdmaTransportTestPeer::handleBootstrapAdmissionFailure(
+        *workers, 0, &slice, throttled, getCurrentTimeInNano()));
+    ASSERT_EQ(RdmaTransportTestPeer::delayedBootstrapRetryCount(*workers, 0),
+              1u);
+
+    ASSERT_TRUE(workers->cancel(&task).ok());
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (task.status_word == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(task.status_word, CANCELED);
+    EXPECT_EQ(RdmaTransportTestPeer::delayedBootstrapRetryCount(*workers, 0),
+              0u);
+    EXPECT_TRUE(workers->quiesce(/*timeout_ns=*/0).ok());
+    EXPECT_TRUE(workers->stop().ok());
+}
+
+TEST(RdmaBootstrapAdmissionTest, WorkerWakesAtParkedAdmissionDeadline) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport,
+                                        std::make_shared<Topology>());
+    auto& config = RdmaTransportTestPeer::config(transport);
+    config.set("transports/rdma/bootstrap_retry/timeout_ms", 100);
+    config.set("transports/rdma/bootstrap_retry/base_ms", 60000);
+    config.set("transports/rdma/bootstrap_retry/max_ms", 60000);
+    config.set("transports/rdma/bootstrap_retry/jitter_ms", 0);
+    RdmaTransportTestPeer::setNumWorkers(transport, 1);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    ASSERT_TRUE(workers->start().ok());
+
+    RdmaTask task{};
+    task.num_slices = 1;
+    task.status_word = PENDING;
+    task.first_error = PENDING;
+    RdmaSlice slice;
+    slice.task = &task;
+    slice.word = PENDING;
+    slice.owner_worker = 0;
+    slice.counted_lane = 0;
+    RdmaTransportTestPeer::addInflight(*workers, 0, 1);
+    auto throttled = Status::TooManyRequests(
+        "NOT_READY: bootstrap backoff, retry_after_ms=60000");
+    ASSERT_TRUE(RdmaTransportTestPeer::handleBootstrapAdmissionFailure(
+        *workers, 0, &slice, throttled, getCurrentTimeInNano()));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(task.status_word, PENDING);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (task.status_word == PENDING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(task.status_word, FAILED);
+    EXPECT_EQ(RdmaTransportTestPeer::delayedBootstrapRetryCount(*workers, 0),
+              0u);
+    EXPECT_TRUE(workers->quiesce(/*timeout_ns=*/0).ok());
+    EXPECT_TRUE(workers->stop().ok());
 }
 
 std::shared_ptr<Topology> topologyWithRdmaNics(size_t count) {
@@ -5645,7 +6096,7 @@ TEST(RdmaQuiesceTest, WorkersQuiesceWithoutStartRejectsSubmit) {
     EXPECT_TRUE(workers->submit(slice_list).IsInternalError());
 }
 
-TEST(RdmaQuiesceTest, IdleWorkersDrainAndRejectSubmit) {
+TEST(RdmaQuiesceTest, IdleWorkersDrainStaySuspendedAndRejectSubmit) {
     auto topology = std::make_shared<Topology>();
     RdmaTransport transport;
     RdmaTransportTestPeer::bindTopology(transport, topology);
@@ -5654,6 +6105,19 @@ TEST(RdmaQuiesceTest, IdleWorkersDrainAndRejectSubmit) {
     ASSERT_TRUE(workers->start().ok());
 
     EXPECT_TRUE(workers->quiesce().ok());
+    const auto suspend_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    bool worker_suspended = false;
+    while (!worker_suspended &&
+           std::chrono::steady_clock::now() < suspend_deadline) {
+        worker_suspended = RdmaTransportTestPeer::workerInSuspend(*workers, 0);
+        if (!worker_suspended) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    EXPECT_TRUE(worker_suspended);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_TRUE(RdmaTransportTestPeer::workerInSuspend(*workers, 0));
     RdmaSliceList slice_list;
     EXPECT_TRUE(workers->submit(slice_list).IsInternalError());
     EXPECT_TRUE(workers->quiesce().ok());

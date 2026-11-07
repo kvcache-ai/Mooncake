@@ -185,6 +185,8 @@ struct RdmaSlice {
     // (Workers::submitFromTick) while the old set entry drains later.
     std::atomic<int> counted_lane{-1};
     int retry_count = 0;
+    // Per-request bound; endpoint-level backoff/single-flight is shared.
+    uint64_t bootstrap_retry_deadline_ns = 0;
     // Flat (source,target) combination index last tried by
     // selectFallbackDevice; the next fallback resumes just past it so retries
     // rotate through all combinations with wraparound instead of hammering one.

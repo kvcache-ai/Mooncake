@@ -359,6 +359,13 @@ Status RdmaTransport::install(std::string& local_segment_name,
     params_ = std::make_shared<RdmaParams>();
     auto param_status = convertConfToRdmaParams(conf_, params_);
     if (!param_status.ok()) return param_status;
+    CHECK_STATUS(configureBootstrapAdmission());
+    {
+        std::lock_guard<std::mutex> guard(bootstrap_admission_mutex_);
+        bootstrap_global_inflight_ = 0;
+        bootstrap_peer_inflight_.clear();
+        bootstrap_device_inflight_.clear();
+    }
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
@@ -596,6 +603,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->length = length;
             slice->task = task;
             slice->retry_count = 0;
+            slice->bootstrap_retry_deadline_ns = 0;
             slice->last_fallback_idx = -1;
             slice->charged_dev = -1;
             slice->posted_dev = -1;
@@ -866,6 +874,29 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
         local_desc.reply_msg = ss.str();
         return -1;
     }
+
+    const auto peer_server_name =
+        getServerNameFromNicPath(peer_desc.local_nic_path);
+    int retry_after_ms = bootstrap_admission_config_.retry_after_ms;
+    if (!tryAcquireBootstrapAdmission(peer_server_name, index,
+                                      peer_desc.protocol_version,
+                                      retry_after_ms)) {
+        std::stringstream ss;
+        ss << "NOT_READY: bootstrap throttled, retry_after_ms="
+           << retry_after_ms;
+        local_desc.reply_msg = ss.str();
+        VLOG(1) << "BootstrapRdma throttled: peer=" << peer_desc.local_nic_path
+                << ", local_device=" << local_nic_name
+                << ", retry_after_ms=" << retry_after_ms;
+        return -1;
+    }
+    auto release_admission = [this, peer_server_name, index](void*) {
+        releaseBootstrapAdmission(peer_server_name, index);
+    };
+    std::unique_ptr<void, decltype(release_admission)> admission_guard(
+        bootstrap_admission_config_.enabled ? this : nullptr,
+        release_admission);
+
     // Endpoints are never reset. A peer process that reused the same nic path
     // (same IP:port after a restart) hits an EP_READY endpoint whose QPs no
     // longer exist. accept() retires it and the next getOrInsert() creates a
@@ -906,6 +937,79 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     }
 
     return -1;
+}
+
+Status RdmaTransport::configureBootstrapAdmission() {
+    bootstrap_admission_config_.enabled =
+        conf_->get("transports/rdma/bootstrap_admission/enabled", true);
+    bootstrap_admission_config_.max_global_inflight = conf_->get(
+        "transports/rdma/bootstrap_admission/max_global_inflight", 4);
+    bootstrap_admission_config_.max_per_peer_inflight = conf_->get(
+        "transports/rdma/bootstrap_admission/max_per_peer_inflight", 1);
+    bootstrap_admission_config_.max_per_device_inflight = conf_->get(
+        "transports/rdma/bootstrap_admission/max_per_device_inflight", 0);
+    if (bootstrap_admission_config_.max_global_inflight < 0 ||
+        bootstrap_admission_config_.max_per_peer_inflight < 0 ||
+        bootstrap_admission_config_.max_per_device_inflight < 0) {
+        return Status::InvalidArgument(
+            "RDMA bootstrap admission limits must be non-negative" LOC_MARK);
+    }
+    bootstrap_admission_config_.retry_after_ms = std::max(
+        1,
+        conf_->get("transports/rdma/bootstrap_admission/retry_after_ms", 10));
+    return Status::OK();
+}
+
+bool RdmaTransport::tryAcquireBootstrapAdmission(
+    const std::string& peer_server_name, int local_device_id,
+    uint32_t peer_protocol_version, int& retry_after_ms) {
+    retry_after_ms = bootstrap_admission_config_.retry_after_ms;
+    if (!bootstrap_admission_config_.enabled) return true;
+
+    std::lock_guard<std::mutex> guard(bootstrap_admission_mutex_);
+    auto atLimit = [](int limit, size_t current) {
+        return limit > 0 && current >= static_cast<size_t>(limit);
+    };
+    auto countFor = [](const auto& counters, const auto& key) {
+        auto it = counters.find(key);
+        return it == counters.end() ? size_t{0} : it->second;
+    };
+
+    if (peer_protocol_version >= 2 &&
+        (atLimit(bootstrap_admission_config_.max_global_inflight,
+                 bootstrap_global_inflight_) ||
+         (!peer_server_name.empty() &&
+          atLimit(bootstrap_admission_config_.max_per_peer_inflight,
+                  countFor(bootstrap_peer_inflight_, peer_server_name))) ||
+         (local_device_id >= 0 &&
+          atLimit(bootstrap_admission_config_.max_per_device_inflight,
+                  countFor(bootstrap_device_inflight_, local_device_id))))) {
+        return false;
+    }
+
+    ++bootstrap_global_inflight_;
+    if (!peer_server_name.empty()) ++bootstrap_peer_inflight_[peer_server_name];
+    if (local_device_id >= 0) ++bootstrap_device_inflight_[local_device_id];
+    return true;
+}
+
+void RdmaTransport::releaseBootstrapAdmission(
+    const std::string& peer_server_name, int local_device_id) {
+    std::lock_guard<std::mutex> guard(bootstrap_admission_mutex_);
+    if (bootstrap_global_inflight_ > 0) --bootstrap_global_inflight_;
+    auto release = [](auto& counters, const auto& key) {
+        auto it = counters.find(key);
+        if (it == counters.end()) return;
+        if (it->second > 1) {
+            --it->second;
+        } else {
+            counters.erase(it);
+        }
+    };
+    if (!peer_server_name.empty())
+        release(bootstrap_peer_inflight_, peer_server_name);
+    if (local_device_id >= 0)
+        release(bootstrap_device_inflight_, local_device_id);
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,

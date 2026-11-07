@@ -27,6 +27,7 @@
 
 namespace mooncake {
 namespace tent {
+class Config;
 class RailMonitor;
 
 class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
@@ -260,6 +261,14 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     bool reserveQuota(int qp_index, int wr_entries, int cqe_entries);
     void cancelQuota(int qp_index, int wr_entries, int cqe_entries);
 
+    using BootstrapAttempt = std::function<Status(BootstrapDesc&)>;
+    Status runBootstrapAttempt(const Config* config,
+                               const BootstrapAttempt& attempt,
+                               BootstrapDesc& peer_desc);
+    Status beginBootstrapAttempt(const Config* config, uint64_t now_ns);
+    Status finishBootstrapAttempt(const Config* config, const Status& status,
+                                  uint64_t now_ns);
+
    private:
     // Caller must hold lock_ in write mode.
     void beginDestroyNoLock();
@@ -321,6 +330,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::vector<uint32_t> peer_qp_num_list_;
+    std::atomic_flag bootstrap_attempt_in_flight_ = ATOMIC_FLAG_INIT;
+    std::atomic<uint64_t> bootstrap_retry_not_before_ns_{0};
+    std::atomic<uint32_t> bootstrap_retry_count_{0};
     // Notification QP (one per endpoint for control plane operations)
     ibv_qp* notify_qp_ = nullptr;
 

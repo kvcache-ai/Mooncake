@@ -20,9 +20,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cerrno>
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -71,6 +73,20 @@ void cancelSliceProbe(RdmaSlice* slice) {
     if (rail && token != 0)
         rail->cancelProbe(slice->source_dev_id, slice->target_dev_id, token);
 }
+
+uint64_t bootstrapRetryAfterMs(std::string_view message, uint64_t fallback,
+                               uint64_t maximum) {
+    constexpr std::string_view kKey = "retry_after_ms=";
+    auto pos = message.find(kKey);
+    if (pos == std::string_view::npos) return fallback;
+    pos += kKey.size();
+    uint64_t parsed = fallback;
+    auto result = std::from_chars(message.data() + pos,
+                                  message.data() + message.size(), parsed);
+    return result.ec == std::errc{} ? std::clamp(parsed, uint64_t{1}, maximum)
+                                    : fallback;
+}
+
 }  // namespace
 
 Workers::Workers(RdmaTransport* transport)
@@ -289,6 +305,10 @@ Status Workers::start() {
 Status Workers::stop() {
     if (!running_) return Status::OK();
     accepting_submits_.store(false, std::memory_order_release);
+    const uint64_t now_ns = getCurrentTimeInNano();
+    for (size_t id = 0; id < num_workers_; ++id)
+        drainBootstrapAdmissionRetries(worker_context_[id], now_ns,
+                                       /*force=*/true);
     running_ = false;
     for (size_t id = 0; id < num_workers_; ++id) {
         auto& worker = worker_context_[id];
@@ -306,6 +326,12 @@ Status Workers::stop() {
 
 Status Workers::quiesce(uint64_t timeout_ns) {
     accepting_submits_.store(false, std::memory_order_release);
+    if (worker_context_) {
+        const uint64_t now_ns = getCurrentTimeInNano();
+        for (size_t id = 0; id < num_workers_; ++id)
+            drainBootstrapAdmissionRetries(worker_context_[id], now_ns,
+                                           /*force=*/true);
+    }
     if (!running_.load(std::memory_order_acquire) || !worker_context_ ||
         num_workers_ == 0) {
         return Status::OK();
@@ -423,6 +449,134 @@ void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
     }
 }
 
+bool Workers::handleBootstrapAdmissionFailure(WorkerContext& worker,
+                                              RdmaSlice* slice,
+                                              const Status& failure,
+                                              uint64_t now_ns) {
+    if (!failure.IsTooManyRequests()) return false;
+    if (slice->bootstrap_retry_deadline_ns == 0) {
+        const uint64_t timeout_ms = static_cast<uint64_t>(std::max(
+            1, transport_->conf_->get(
+                   "transports/rdma/bootstrap_retry/timeout_ms", 30000)));
+        const uint64_t timeout_ns = timeout_ms * 1000000;
+        slice->bootstrap_retry_deadline_ns =
+            now_ns > std::numeric_limits<uint64_t>::max() - timeout_ns
+                ? std::numeric_limits<uint64_t>::max()
+                : now_ns + timeout_ns;
+    }
+    if (!accepting_submits_.load(std::memory_order_acquire))
+        slice->bootstrap_retry_deadline_ns = now_ns;
+    if (expireBootstrapAdmissionRetry(worker, slice, now_ns)) return true;
+
+    releaseSliceQuota(slice, now_ns);
+    cancelSliceProbe(slice);
+    if (!parkBootstrapAdmissionRetry(worker, slice, failure, now_ns)) {
+        if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
+            discountFromOwner(worker, slice);
+            updateSliceStatus(slice, CANCELED);
+        } else {
+            slice->bootstrap_retry_deadline_ns = now_ns;
+            expireBootstrapAdmissionRetry(worker, slice, now_ns);
+        }
+    }
+    return true;
+}
+
+bool Workers::expireBootstrapAdmissionRetry(WorkerContext& worker,
+                                            RdmaSlice* slice, uint64_t now_ns) {
+    if (slice->bootstrap_retry_deadline_ns == 0 ||
+        now_ns < slice->bootstrap_retry_deadline_ns)
+        return false;
+    releaseSliceQuota(slice, now_ns);
+    cancelSliceProbe(slice);
+    discountFromOwner(worker, slice);
+    updateSliceStatus(slice, FAILED);
+    return true;
+}
+
+bool Workers::parkBootstrapAdmissionRetry(WorkerContext& worker,
+                                          RdmaSlice* slice,
+                                          const Status& failure,
+                                          uint64_t now_ns) {
+    // The endpoint owns backoff/exponential/jitter policy and returns a
+    // normalized Retry-After. The worker only schedules that decision.
+    constexpr uint64_t kMaxDelayMs =
+        std::numeric_limits<uint64_t>::max() / 1000000;
+    const uint64_t delay_ms =
+        bootstrapRetryAfterMs(failure.message(), 10, kMaxDelayMs);
+    const uint64_t delay_ns = delay_ms * 1000000;
+    uint64_t not_before =
+        now_ns > std::numeric_limits<uint64_t>::max() - delay_ns
+            ? std::numeric_limits<uint64_t>::max()
+            : now_ns + delay_ns;
+    // A server-provided Retry-After may exceed this request's retry budget.
+    // Wake at the request deadline so it is settled on time instead of
+    // remaining parked until the longer backoff elapses.
+    if (slice->bootstrap_retry_deadline_ns != 0)
+        not_before = std::min(not_before, slice->bootstrap_retry_deadline_ns);
+
+    std::lock_guard<std::mutex> lock(worker.bootstrap_retry_mutex);
+    if (!accepting_submits_.load(std::memory_order_acquire) ||
+        slice->task->cancel_requested.load(std::memory_order_acquire))
+        return false;
+    worker.delayed_bootstrap_retries.emplace(not_before, slice);
+    // A delayed admission retry is not runnable work. Remove it from the
+    // worker load while it is parked so the lane can sleep instead of
+    // spinning until not_before. drainBootstrapAdmissionRetries() restores
+    // the count through submitFromTick() when the retry becomes runnable.
+    discountFromOwner(worker, slice);
+    return true;
+}
+
+void Workers::drainBootstrapAdmissionRetries(WorkerContext& worker,
+                                             uint64_t now_ns, bool force) {
+    std::vector<RdmaSlice*> ready;
+    const bool scan_canceled =
+        worker.bootstrap_retry_cancel_scan_requested.exchange(
+            false, std::memory_order_acq_rel);
+    {
+        std::lock_guard<std::mutex> lock(worker.bootstrap_retry_mutex);
+        if (!force && !scan_canceled) {
+            auto end = worker.delayed_bootstrap_retries.upper_bound(now_ns);
+            for (auto it = worker.delayed_bootstrap_retries.begin(); it != end;
+                 ++it)
+                ready.push_back(it->second);
+            worker.delayed_bootstrap_retries.erase(
+                worker.delayed_bootstrap_retries.begin(), end);
+        } else {
+            for (auto it = worker.delayed_bootstrap_retries.begin();
+                 it != worker.delayed_bootstrap_retries.end();) {
+                auto* slice = it->second;
+                const bool canceled = slice && slice->task &&
+                                      slice->task->cancel_requested.load(
+                                          std::memory_order_acquire);
+                if (force || canceled || it->first <= now_ns) {
+                    ready.push_back(slice);
+                    it = worker.delayed_bootstrap_retries.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+    for (auto* slice : ready) {
+        if (!slice || !slice->task) continue;
+        // Parked bootstrap retries have already returned quota/probe state,
+        // were discounted from the worker count, and have never been posted
+        // or inserted into inflight_slice_set. Settle them directly: using
+        // dropUnpostableSlice() here would let a quiesce/control thread race
+        // the worker-owned unordered_set.
+        if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
+            updateSliceStatus(slice, CANCELED);
+            continue;
+        }
+        if (force || !accepting_submits_.load(std::memory_order_acquire))
+            slice->bootstrap_retry_deadline_ns = now_ns;
+        if (expireBootstrapAdmissionRetry(worker, slice, now_ns)) continue;
+        submitFromTick(worker, slice);
+    }
+}
+
 Status Workers::cancel(RdmaTask* task) {
     if (!task) return Status::InvalidArgument("Invalid RDMA task" LOC_MARK);
     if (task->cancel_requested.exchange(true, std::memory_order_acq_rel)) {
@@ -437,6 +591,8 @@ Status Workers::cancel(RdmaTask* task) {
     // posted to a QP; those drain through the normal CQ path.
     for (size_t id = 0; id < num_workers_; ++id) {
         auto& worker = worker_context_[id];
+        worker.bootstrap_retry_cancel_scan_requested.store(
+            true, std::memory_order_release);
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
     }
@@ -623,7 +779,9 @@ void Workers::markPosted(WorkerContext& worker, RdmaSlice* slice,
     worker.inflight_slice_set.insert(slice);
 }
 
-std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
+std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path,
+                                                   Status* failure) {
+    if (failure) *failure = Status::OK();
     std::string rpc_server_addr, target_seg_name, target_dev_name,
         target_nic_path_name;
     RouteHint hint;
@@ -653,12 +811,17 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
         });
 
     if (!status.ok()) {
+        if (failure) *failure = status;
         LOG(ERROR) << status.ToString();
         return nullptr;
     }
 
     auto context = transport_->context_set_[path.local_device_id].get();
     if (context->status() != RdmaContext::DEVICE_ENABLED) {
+        if (failure) {
+            *failure =
+                Status::RdmaError("RDMA context is not enabled" LOC_MARK);
+        }
         // LOG(WARNING) << "Context " << context->name() << " is not serving";
         return nullptr;  // experimental: force to fail this slice and mark this
                          // connection unavailable
@@ -667,6 +830,10 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     auto peer_name = MakeNicPath(target_nic_path_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
+        if (failure) {
+            *failure =
+                Status::InternalError("Cannot allocate RDMA endpoint" LOC_MARK);
+        }
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
         return nullptr;
     }
@@ -674,6 +841,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
         auto status = endpoint->connect(target_seg_name, target_dev_name,
                                         rpc_server_addr);
         if (!status.ok()) {
+            if (failure) *failure = status;
             thread_local uint64_t tl_last_output_ts = 0;
             uint64_t current_ts = getCurrentTimeInNano();
             if (current_ts - tl_last_output_ts > 10000000000ull) {
@@ -789,8 +957,16 @@ void Workers::asyncPostSend() {
                                         return true;
                                     }),
                      slices.end());
+        const uint64_t endpoint_now_ns = getCurrentTimeInNano();
+        slices.erase(std::remove_if(slices.begin(), slices.end(),
+                                    [&](RdmaSlice* slice) {
+                                        return expireBootstrapAdmissionRetry(
+                                            worker, slice, endpoint_now_ns);
+                                    }),
+                     slices.end());
         if (slices.empty()) continue;
-        auto endpoint = getEndpoint(path);
+        Status endpoint_failure;
+        auto endpoint = getEndpoint(path, &endpoint_failure);
         if (!endpoint) {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
@@ -800,8 +976,14 @@ void Workers::asyncPostSend() {
                     cancelSliceProbe(slice);
                     continue;
                 }
+                const uint64_t now_ns = getCurrentTimeInNano();
+                if (handleBootstrapAdmissionFailure(worker, slice,
+                                                    endpoint_failure, now_ns)) {
+                    continue;
+                }
+
                 slice->retry_count++;
-                releaseSliceQuota(slice, getCurrentTimeInNano());
+                releaseSliceQuota(slice, now_ns);
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
                     VLOG(1)
@@ -826,6 +1008,8 @@ void Workers::asyncPostSend() {
             }
             continue;
         }
+
+        for (auto* slice : slices) slice->bootstrap_retry_deadline_ns = 0;
 
         // RFC #2792 (opt-in): these slices all contend for one NIC path
         // (local NIC -> remote NIC). submitSlices posts as many as the QP
@@ -1340,6 +1524,11 @@ void Workers::workerThread(int thread_id) {
     uint64_t last_perf_logging_ts = 0;
     while (running_) {
         auto current_ts = getCurrentTimeInNano();
+        // Parked retries are excluded from inflight_slices, so promote due
+        // entries before deciding whether this lane has runnable work. This
+        // also makes a timer wake productive after the normal grace period
+        // has elapsed.
+        drainBootstrapAdmissionRetries(worker, current_ts);
         auto inflight_slices =
             worker.inflight_slices.load(std::memory_order_relaxed);
         if (inflight_slices ||
@@ -1355,12 +1544,43 @@ void Workers::workerThread(int thread_id) {
                 last_perf_logging_ts = current_ts;
             }
         } else {
+            uint64_t next_bootstrap_retry_ns = 0;
+            {
+                std::lock_guard<std::mutex> retry_lock(
+                    worker.bootstrap_retry_mutex);
+                if (!worker.delayed_bootstrap_retries.empty())
+                    next_bootstrap_retry_ns =
+                        worker.delayed_bootstrap_retries.begin()->first;
+            }
             std::unique_lock<std::mutex> lock(worker.mutex);
             worker.in_suspend = true;
-            worker.cv.wait(lock, [&]() -> bool {
-                return !running_ || worker.inflight_slices.load(
-                                        std::memory_order_acquire) > 0;
-            });
+            if (next_bootstrap_retry_ns != 0 && running_ &&
+                accepting_submits_.load(std::memory_order_acquire) &&
+                worker.inflight_slices.load(std::memory_order_acquire) == 0) {
+                const uint64_t now_ns = getCurrentTimeInNano();
+                const uint64_t wait_ns = next_bootstrap_retry_ns > now_ns
+                                             ? next_bootstrap_retry_ns - now_ns
+                                             : 0;
+                // Submissions, cancellation and shutdown may wake the lane
+                // before the timer. Checking cancellation in the predicate
+                // also closes the notify-before-wait race.
+                worker.cv.wait_for(
+                    lock, std::chrono::nanoseconds(wait_ns), [&]() -> bool {
+                        if (!running_ ||
+                            !accepting_submits_.load(
+                                std::memory_order_acquire) ||
+                            worker.inflight_slices.load(
+                                std::memory_order_acquire) > 0)
+                            return true;
+                        return worker.bootstrap_retry_cancel_scan_requested
+                            .load(std::memory_order_acquire);
+                    });
+            } else {
+                worker.cv.wait(lock, [&]() -> bool {
+                    return !running_ || worker.inflight_slices.load(
+                                            std::memory_order_acquire) > 0;
+                });
+            }
             worker.in_suspend = false;
         }
     }

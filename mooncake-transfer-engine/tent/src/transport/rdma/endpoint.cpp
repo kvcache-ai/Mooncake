@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -77,6 +78,20 @@ static bool isStaleEndpointBootstrapError(const Status& status) {
            msg.find("Missing peer GID") != std::string_view::npos ||
            msg.find("Endpoint not in handshaking state") !=
                std::string_view::npos;
+}
+
+constexpr std::string_view kBootstrapThrottlePrefix =
+    "NOT_READY: bootstrap throttled";
+
+int parseRetryAfterMs(std::string_view message, int fallback, int maximum) {
+    constexpr std::string_view kKey = "retry_after_ms=";
+    auto pos = message.find(kKey);
+    if (pos == std::string_view::npos) return fallback;
+    pos += kKey.size();
+    int parsed = fallback;
+    auto result = std::from_chars(message.data() + pos,
+                                  message.data() + message.size(), parsed);
+    return result.ec == std::errc{} ? std::clamp(parsed, 1, maximum) : fallback;
 }
 
 RdmaEndPoint::RdmaEndPoint()
@@ -217,6 +232,82 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     }
 
     return 0;
+}
+
+Status RdmaEndPoint::beginBootstrapAttempt(const Config* config,
+                                           uint64_t now_ns) {
+    if (bootstrap_attempt_in_flight_.test_and_set(std::memory_order_acquire)) {
+        const int retry_after_ms = std::max(
+            1, config
+                   ? config->get("transports/rdma/bootstrap_retry/base_ms", 10)
+                   : 10);
+        return Status::TooManyRequests(
+            "NOT_READY: bootstrap attempt in progress, retry_after_ms=" +
+            std::to_string(retry_after_ms));
+    }
+    const uint64_t not_before =
+        bootstrap_retry_not_before_ns_.load(std::memory_order_acquire);
+    if (now_ns < not_before) {
+        bootstrap_attempt_in_flight_.clear(std::memory_order_release);
+        return Status::TooManyRequests(
+            "NOT_READY: bootstrap backoff, retry_after_ms=" +
+            std::to_string((not_before - now_ns + 999999) / 1000000));
+    }
+    return Status::OK();
+}
+
+Status RdmaEndPoint::finishBootstrapAttempt(const Config* config,
+                                            const Status& status,
+                                            uint64_t now_ns) {
+    if (!status.IsTooManyRequests()) {
+        bootstrap_retry_not_before_ns_.store(0, std::memory_order_relaxed);
+        bootstrap_retry_count_.store(0, std::memory_order_relaxed);
+        return status;
+    }
+
+    auto getConfig = [config](const std::string& key, int fallback) {
+        return config ? config->get(key, fallback) : fallback;
+    };
+    const int base_ms =
+        std::max(1, getConfig("transports/rdma/bootstrap_retry/base_ms", 10));
+    const int maximum_ms = std::max(
+        base_ms, getConfig("transports/rdma/bootstrap_retry/max_ms", 200));
+    int backoff_ms = parseRetryAfterMs(status.message(), base_ms, maximum_ms);
+    const uint32_t retry =
+        bootstrap_retry_count_.fetch_add(1, std::memory_order_relaxed);
+    for (uint32_t i = 0; i < std::min(retry, 5u); ++i)
+        backoff_ms = backoff_ms > maximum_ms / 2 ? maximum_ms : backoff_ms * 2;
+    const int jitter_ms =
+        std::max(0, getConfig("transports/rdma/bootstrap_retry/jitter_ms", 20));
+    uint64_t delay_ms = static_cast<uint64_t>(backoff_ms);
+    if (jitter_ms > 0) {
+        size_t hash = std::hash<std::string>{}(endpoint_name_);
+        hash ^= std::hash<std::string>{}(local_address_.gid) << 1;
+        hash ^= retry;
+        delay_ms += hash % (static_cast<uint64_t>(jitter_ms) + 1);
+    }
+
+    bootstrap_retry_not_before_ns_.store(now_ns + delay_ms * 1000000,
+                                         std::memory_order_release);
+    return Status::TooManyRequests(
+        "NOT_READY: bootstrap backoff, retry_after_ms=" +
+        std::to_string(delay_ms));
+}
+
+Status RdmaEndPoint::runBootstrapAttempt(const Config* config,
+                                         const BootstrapAttempt& attempt,
+                                         BootstrapDesc& peer_desc) {
+    auto gate = beginBootstrapAttempt(config, getCurrentTimeInNano());
+    if (!gate.ok()) return gate;
+    auto clear = [this](void*) {
+        bootstrap_attempt_in_flight_.clear(std::memory_order_release);
+    };
+    std::unique_ptr<void, decltype(clear)> attempt_guard(this, clear);
+
+    BootstrapDesc response;
+    auto status = attempt(response);
+    peer_desc = std::move(response);
+    return finishBootstrapAttempt(config, status, getCurrentTimeInNano());
 }
 
 int RdmaEndPoint::deconstruct() {
@@ -474,6 +565,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
 
         local_desc.local_nic_path =
             MakeNicPath(transport.rdma_server_name_, context_->name());
+        local_desc.protocol_version = 2;
         local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
         qp_num = qpNum();
         local_desc.qp_num = qp_num;
@@ -497,11 +589,18 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         peer_lid = local_address.lid;
     } else if (is_self) {
         // Same server, different NIC: call handler directly, bypass RPC
-        int rc = transport.onSetupRdmaConnections(local_desc, peer_desc);
-        if (rc != 0) {
-            return mooncake::tent::Status::InternalError(
-                "Local bootstrap failed: " + peer_desc.reply_msg + LOC_MARK);
-        }
+        auto bootstrap_status = runBootstrapAttempt(
+            transport.conf_.get(),
+            [&](BootstrapDesc& response) {
+                int rc = transport.onSetupRdmaConnections(local_desc, response);
+                if (rc == 0) return Status::OK();
+                if (response.reply_msg.starts_with(kBootstrapThrottlePrefix))
+                    return Status::TooManyRequests(response.reply_msg);
+                return Status::InternalError(
+                    "Local bootstrap failed: " + response.reply_msg + LOC_MARK);
+            },
+            peer_desc);
+        if (!bootstrap_status.ok()) return bootstrap_status;
         qp_num = peer_desc.qp_num;
         peer_gid = peer_desc.local_gid;
         peer_lid = peer_desc.local_lid;
@@ -519,8 +618,12 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             return mooncake::tent::Status::InvalidArgument(
                 "Missing peer RPC server address" LOC_MARK);
         }
-        auto bootstrap_status =
-            ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc);
+        auto remoteBootstrap = [&](BootstrapDesc& response) {
+            return ControlClient::bootstrap(rpc_server_addr, local_desc,
+                                            response);
+        };
+        auto bootstrap_status = runBootstrapAttempt(transport.conf_.get(),
+                                                    remoteBootstrap, peer_desc);
         auto simultaneousOpenReady = [&]() {
             RWSpinlock::WriteGuard guard(lock_);
             const bool same_peer = peer_server_name_ == peer_server_name &&
@@ -536,6 +639,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
             // establishment failed. Reuse only the exact endpoint generation
             // that issued this RPC; EP_READY alone is not sufficient.
             if (simultaneousOpenReady()) {
+                finishBootstrapAttempt(transport.conf_.get(), Status::OK(),
+                                       getCurrentTimeInNano());
                 LOG(WARNING)
                     << "Bootstrap RPC failed after simultaneous-open passive "
                        "setup completed; reusing the established endpoint "
@@ -551,10 +656,13 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                     << "Retrying RDMA bootstrap after stale peer endpoint: "
                     << bootstrap_status.ToString();
                 peer_desc = BootstrapDesc();
-                bootstrap_status = ControlClient::bootstrap(
-                    rpc_server_addr, local_desc, peer_desc);
+                bootstrap_status = runBootstrapAttempt(
+                    transport.conf_.get(), remoteBootstrap, peer_desc);
                 if (!bootstrap_status.ok()) {
                     if (simultaneousOpenReady()) {
+                        finishBootstrapAttempt(transport.conf_.get(),
+                                               Status::OK(),
+                                               getCurrentTimeInNano());
                         LOG(WARNING)
                             << "Bootstrap retry failed after simultaneous-open "
                                "passive setup completed; reusing the "

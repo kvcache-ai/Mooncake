@@ -132,6 +132,22 @@ class RdmaTransport : public Transport {
     std::shared_ptr<Config> config() const { return conf_; }
 
    private:
+    struct BootstrapAdmissionConfig {
+        bool enabled = true;
+        int max_global_inflight = 4;
+        int max_per_peer_inflight = 1;
+        int max_per_device_inflight = 0;
+        int retry_after_ms = 10;
+    };
+
+    bool tryAcquireBootstrapAdmission(const std::string& peer_server_name,
+                                      int local_device_id,
+                                      uint32_t peer_protocol_version,
+                                      int& retry_after_ms);
+    void releaseBootstrapAdmission(const std::string& peer_server_name,
+                                   int local_device_id);
+    Status configureBootstrapAdmission();
+
     // Builds context_set_ with one slot per NicID; returns how many RNICs
     // came up. Remaining slots hold inert contexts.
     size_t initializeContexts();
@@ -162,6 +178,12 @@ class RdmaTransport : public Transport {
     std::unordered_map<std::string, int> context_name_lookup_;
     std::unique_ptr<Workers> workers_;
     std::shared_ptr<RdmaParams> params_;
+
+    BootstrapAdmissionConfig bootstrap_admission_config_;
+    std::mutex bootstrap_admission_mutex_;
+    size_t bootstrap_global_inflight_{0};
+    std::unordered_map<std::string, size_t> bootstrap_peer_inflight_;
+    std::unordered_map<int, size_t> bootstrap_device_inflight_;
 
     // Local notification queue for receiveNotification()
     std::mutex notify_mutex_;

@@ -49,6 +49,8 @@ class CallbackInvocationGuard {
 // ControlClient::notify() tells apart from a notification not taken yet.
 constexpr char kMalformedNotification[] = "malformed notification: ";
 constexpr char kNotifyCallbackFailed[] = "notify callback failed: ";
+constexpr std::string_view kBootstrapThrottlePrefix =
+    "NOT_READY: bootstrap throttled";
 
 }  // namespace
 
@@ -81,6 +83,9 @@ Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
             std::string("Invalid bootstrap response: ") + e.what() + LOC_MARK);
     }
     if (!response.reply_msg.empty()) {
+        if (response.reply_msg.starts_with(kBootstrapThrottlePrefix)) {
+            return Status::TooManyRequests(response.reply_msg);
+        }
         return Status::RpcServiceError(response.reply_msg);
     }
     if (response.local_gid.empty()) {
