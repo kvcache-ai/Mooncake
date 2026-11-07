@@ -316,6 +316,7 @@ TransferEnginePy::TransferEnginePy() {
 }
 
 TransferEnginePy::~TransferEnginePy() {
+    std::unique_lock<std::shared_mutex> engine_guard(engine_mutex_);
     for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
     engine_.reset();
@@ -383,9 +384,16 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
+    pybind11::gil_scoped_release release;
+    std::unique_lock<std::shared_mutex> engine_guard(engine_mutex_);
     std::lock_guard<std::mutex> guard(mutex_);
-    if (engine_ && (!handle_map_.empty() || !buffer_list_.empty() ||
-                    !large_buffer_list_.empty() ||
+    if (engine_ && engine_->isUsingTent() &&
+        !external_registered_buffers_.empty()) {
+        std::vector<uintptr_t> addresses(external_registered_buffers_.begin(),
+                                         external_registered_buffers_.end());
+        reconcileExternalRegistrations(addresses, false, -1);
+    }
+    if (engine_ && (!handle_map_.empty() || !active_managed_buffers_.empty() ||
                     !external_registered_buffers_.empty())) {
         LOG(ERROR) << "Cannot replace a transfer engine with registered "
                       "buffers or cached segment handles; release them first";
@@ -396,6 +404,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                    << "Use 'hip' instead.";
         return -1;
     }
+    if (engine_) releaseManagedBuffers();
     if (!initMemoryAllocator(protocol)) return -1;
 
     std::string proto = protocol ? std::string(protocol) : "";
@@ -537,7 +546,24 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 }
 
 int TransferEnginePy::getRpcPort() {
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     return engine_ ? engine_->getRpcPort() : 0;
+}
+
+void TransferEnginePy::releaseManagedBuffers() {
+    for (auto* buffer : buffer_list_) {
+        engine_->unregisterLocalMemory(buffer);
+        freeMemory(buffer);
+    }
+    buffer_list_.clear();
+    for (auto* buffer : large_buffer_list_) {
+        engine_->unregisterLocalMemory(buffer);
+        freeMemory(buffer);
+    }
+    large_buffer_list_.clear();
+    active_managed_buffers_.clear();
+    free_list_.clear();
+    free_list_.resize(kSlabSizeKBTabLen);
 }
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
@@ -589,7 +615,10 @@ uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
     int class_id = findClassId(length);
     if (class_id < 0) {
         char* buffer = allocateRawBuffer(length);
-        if (buffer) large_buffer_list_.insert(buffer);
+        if (buffer) {
+            large_buffer_list_.insert(buffer);
+            active_managed_buffers_.insert((uintptr_t)buffer);
+        }
         return (uintptr_t)buffer;
     }
     if (free_list_[class_id].empty())
@@ -597,6 +626,7 @@ uintptr_t TransferEnginePy::allocateManagedBuffer(size_t length) {
     assert(!free_list_[class_id].empty());
     char* buffer = free_list_[class_id].top();
     free_list_[class_id].pop();
+    active_managed_buffers_.insert((uintptr_t)buffer);
     return (uintptr_t)buffer;
 }
 
@@ -608,8 +638,10 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
         large_buffer_list_.erase(buffer);
         engine_->unregisterLocalMemory(buffer);
         freeMemory(buffer);
+        active_managed_buffers_.erase(buffer_addr);
         return 0;
     }
+    active_managed_buffers_.erase(buffer_addr);
     free_list_[class_id].push(buffer);
     return 0;
 }
@@ -724,6 +756,7 @@ TransferEnginePy::scatterTransferSyncWithTicket(
     const std::vector<std::vector<size_t>>& remote_offsets,
     const std::vector<std::vector<size_t>>& lengths, TransferOpcode opcode) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     auto submission = submitScatterWithTicket(
         engine_, endpoint, local_base_addresses, local_capacities,
         remote_base_addresses, remote_capacities, local_offsets, remote_offsets,
@@ -998,6 +1031,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                                    const std::string& transport_hint,
                                    const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1109,6 +1143,7 @@ int TransferEnginePy::batchTransferSync(
     TransferOpcode opcode, TransferNotify* notify,
     const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1241,6 +1276,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
     const std::vector<size_t>& lengths, TransferOpcode opcode,
     const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1306,6 +1342,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
 int TransferEnginePy::getBatchTransferStatus(
     const std::vector<batch_id_t>& batch_ids) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     TransferStatus status;
     std::unordered_map<batch_id_t, int64_t> timeout_table{};
     for (auto& batch_id : batch_ids) {
@@ -1369,6 +1406,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
     uintptr_t peer_buffer_address, size_t length,
     const std::string& transport_hint, const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1404,6 +1442,7 @@ batch_id_t TransferEnginePy::transferSubmitWrite(
 
 int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     TransferStatus status;
     Status s = engine_->getTransferStatus(batch_id, 0, status);
     LOG_ASSERT(s.ok());
@@ -1421,10 +1460,50 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
     }
 }
 
+void TransferEnginePy::reconcileExternalRegistrations(
+    const std::vector<uintptr_t>& addresses, bool registration, int result) {
+    if (addresses.empty()) return;
+    if (!engine_->isUsingTent()) {
+        if (result != 0) return;
+        if (registration) {
+            external_registered_buffers_.insert(addresses.begin(),
+                                                addresses.end());
+        } else {
+            for (auto address : addresses) {
+                external_registered_buffers_.erase(address);
+            }
+        }
+        return;
+    }
+
+    // TENT can change its local tracker before metadata publication fails.
+    // Reconcile against that tracker rather than treating the return code as
+    // proof that registration or removal did not happen.
+    std::vector<SegmentBufferInfo> buffers;
+    if (engine_->getSegmentBuffers(0, buffers) != 0) {
+        LOG(ERROR)
+            << "Failed to reconcile registered buffers; keeping "
+               "reinitialization blocked until a later snapshot succeeds";
+        external_registered_buffers_.insert(addresses.begin(), addresses.end());
+        return;
+    }
+    std::unordered_set<uintptr_t> live_addresses;
+    live_addresses.reserve(buffers.size());
+    for (const auto& buffer : buffers) live_addresses.insert(buffer.addr);
+    for (auto address : addresses) {
+        if (live_addresses.count(address) != 0) {
+            external_registered_buffers_.insert(address);
+        } else {
+            external_registered_buffers_.erase(address);
+        }
+    }
+}
+
 int TransferEnginePy::batchRegisterMemory(
     std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
     const std::string& location) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     std::lock_guard<std::mutex> guard(mutex_);
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
@@ -1433,16 +1512,14 @@ int TransferEnginePy::batchRegisterMemory(
             BufferEntry{(void*)buffer_addresses[i], capacities[i]});
     }
     int result = engine_->registerLocalMemoryBatch(buffers, location);
-    if (result == 0) {
-        external_registered_buffers_.insert(buffer_addresses.begin(),
-                                            buffer_addresses.end());
-    }
+    reconcileExternalRegistrations(buffer_addresses, true, result);
     return result;
 }
 
 int TransferEnginePy::batchUnregisterMemory(
     std::vector<uintptr_t> buffer_addresses) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     std::lock_guard<std::mutex> guard(mutex_);
     auto batch_size = buffer_addresses.size();
     std::vector<void*> buffers;
@@ -1450,11 +1527,7 @@ int TransferEnginePy::batchUnregisterMemory(
         buffers.push_back(reinterpret_cast<char*>(buffer_addresses[i]));
     }
     int result = engine_->unregisterLocalMemoryBatch(buffers);
-    if (result == 0) {
-        for (auto address : buffer_addresses) {
-            external_registered_buffers_.erase(address);
-        }
-    }
+    reconcileExternalRegistrations(buffer_addresses, false, result);
     return result;
 }
 
@@ -1462,20 +1535,22 @@ int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
                                      const std::string& location,
                                      bool remote_accessible) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     std::lock_guard<std::mutex> guard(mutex_);
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     int result = engine_->registerLocalMemory(buffer, capacity, location,
                                               remote_accessible);
-    if (result == 0) external_registered_buffers_.insert(buffer_addr);
+    reconcileExternalRegistrations({buffer_addr}, true, result);
     return result;
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     std::lock_guard<std::mutex> guard(mutex_);
     char* buffer = reinterpret_cast<char*>(buffer_addr);
     int result = engine_->unregisterLocalMemory(buffer);
-    if (result == 0) external_registered_buffers_.erase(buffer_addr);
+    reconcileExternalRegistrations({buffer_addr}, false, result);
     return result;
 }
 
@@ -1570,6 +1645,7 @@ void TransferEnginePy::batchTransferOnCuda(
     uintptr_t stream_ptr, const std::string& transport_hint,
     const std::string& nic_hint) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle handle;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -1693,6 +1769,7 @@ void TransferEnginePy::batchTransferReadOnCuda(
 int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 #ifdef USE_EFA
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     auto* t = engine_->getTransport("efa");
     if (!t) return 0;  // EFA transport not installed; nothing to do.
     auto* efa = dynamic_cast<EfaTransport*>(t);
@@ -1707,6 +1784,7 @@ int TransferEnginePy::warmupEfaSegment(const std::string& segment_name) {
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string& segment_name) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     if (segment_id ==
@@ -1720,6 +1798,7 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
 
 std::string TransferEnginePy::getLocalTopology(const char* device_name) {
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     auto device_name_safe = device_name ? std::string(device_name) : "";
 
     const bool use_tent =
@@ -1756,6 +1835,7 @@ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
 }
 
 std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
     std::vector<TransferMetadata::NotifyDesc> notifies;
     std::vector<TransferNotify> result;
 
@@ -1774,8 +1854,9 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 }
 
 int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
-    if (!engine_) return -1;
     pybind11::gil_scoped_release release;
+    std::shared_lock<std::shared_mutex> engine_guard(engine_mutex_);
+    if (!engine_) return -1;
 
     if (engine_->isUsingTent()) {
         auto handle = engine_->openSegment(peer_server_name);
