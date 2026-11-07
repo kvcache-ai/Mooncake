@@ -160,7 +160,10 @@ TEST_F(NvmeKvConnectorConfigTest, AcceptsOnlyExistingTransportTokens) {
     const Case cases[] = {{"", NvmeKvTransport::kAuto},
                           {"auto", NvmeKvTransport::kAuto},
                           {"io_uring", NvmeKvTransport::kIoUring},
-                          {"ioctl", NvmeKvTransport::kIoctl}};
+                          {"ioctl", NvmeKvTransport::kIoctl},
+                          {"spdk", NvmeKvTransport::kSpdk},
+                          {"spdk_nof", NvmeKvTransport::kSpdk},
+                          {"nof_spdk", NvmeKvTransport::kSpdk}};
     SetDevicePath();
     for (const auto& entry : cases) {
         SCOPED_TRACE(entry.value);

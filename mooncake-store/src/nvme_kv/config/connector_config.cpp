@@ -35,6 +35,10 @@ tl::expected<NvmeKvTransport, ErrorCode> ReadTransport() {
     if (transport == "ioctl") {
         return NvmeKvTransport::kIoctl;
     }
+    if (transport == "spdk" || transport == "spdk_nof" ||
+        transport == "nof_spdk") {
+        return NvmeKvTransport::kSpdk;
+    }
     LOG(ERROR) << "Unknown MOONCAKE_NVME_KV_TRANSPORT: " << transport;
     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 }
@@ -49,6 +53,8 @@ const char* NvmeKvTransportName(NvmeKvTransport transport) {
             return "io_uring";
         case NvmeKvTransport::kIoctl:
             return "ioctl";
+        case NvmeKvTransport::kSpdk:
+            return "spdk";
     }
     return "unknown";
 }

@@ -381,6 +381,50 @@ jobs:
         df -h
       shell: bash
 
+  spdk-kv-build:
+    name: SPDK NVMe KV build
+    needs: [check-paths]
+    if: needs.check-paths.outputs.spdk == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Set up compiler cache
+      uses: ./.github/actions/setup-sccache
+
+    - name: Install SPDK build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build
+        sudo bash -x dependencies.sh -y --with-spdk
+      shell: bash
+
+    - name: Configure SPDK NVMe KV build
+      run: |
+        cmake -S . -B build-spdk -G Ninja \
+          -DUSE_NOF=ON \
+          -DBUILD_UNIT_TESTS=OFF \
+          -DWITH_STORE_RUST=OFF \
+          -DENABLE_SCCACHE=ON \
+          -DCMAKE_BUILD_TYPE=Release
+      shell: bash
+
+    - name: Compile and link the SPDK-enabled client
+      run: |
+        cmake --build build-spdk \
+          --target mooncake_client \
+          --parallel "$(nproc)"
+      shell: bash
+
   spell-check:
     name: Spell Check with Typos
     runs-on: ubuntu-22.04
@@ -573,6 +617,7 @@ jobs:
       pull-requests: read
     outputs:
       src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
+      spdk: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.spdk }}
       tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
       store_rs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.store_rs }}
       docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
@@ -599,6 +644,16 @@ jobs:
               - 'scripts/**'
               - '.github/actions/**'
               - '.github/workflows/**'
+            spdk:
+              - 'dependencies.sh'
+              - 'mooncake-store/include/nof/**'
+              - 'mooncake-store/include/nvme_kv/**'
+              - 'mooncake-store/src/CMakeLists.txt'
+              - 'mooncake-store/src/nof/**'
+              - 'mooncake-store/src/nvme_kv/**'
+              - 'mooncake-store/tests/CMakeLists.txt'
+              - 'mooncake-store/tests/nvme_kv/**'
+              - '.github/workflows/ci.yml'
             tent:
               - 'mooncake-transfer-engine/**'
               - 'mooncake-store/src/transfer_task.cpp'
@@ -1018,6 +1073,7 @@ jobs:
       - build-wheel
       - unit-tests
       - build-flags
+      - spdk-kv-build
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-cu13-arm64
@@ -1060,6 +1116,12 @@ jobs:
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1
           done
+
+      - name: Check SPDK job
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.spdk == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.spdk-kv-build.result }}
+        run: test "$RESULT" = "$EXPECTED"
 
       - name: Check TENT jobs
         env:

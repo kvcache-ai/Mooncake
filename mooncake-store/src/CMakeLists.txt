@@ -383,6 +383,7 @@ target_link_libraries(mooncake_nof_core
                       PUBLIC glog::glog yalantinglibs::yalantinglibs
                              cachelib_memory_allocator mooncake_common)
 
+set(MOONCAKE_HAVE_SPDK_NVME_KV OFF)
 if(USE_NOF)
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
@@ -393,79 +394,43 @@ if(USE_NOF)
   set(SPDK_LIB_DIR
       "/usr/local/lib"
       CACHE PATH "SPDK static library directory")
-  set(DPDK_LIB_DIR
-      "/usr/local/lib"
-      CACHE PATH "DPDK static library directory")
 
-  set(SPDK_ISA_L_LIB_DIR
-      "${CMAKE_SOURCE_DIR}/extern/spdk/isa-l/.libs"
-      CACHE PATH "isa-l static library directory")
-  if(NOT EXISTS "${SPDK_ISA_L_LIB_DIR}/libisal.a")
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(SPDK_PC REQUIRED spdk_nvme spdk_env_dpdk spdk_syslibs)
+
+  foreach(SPDK_WHOLE_ARCHIVE_LIB libspdk_nvme.a libspdk_sock_posix.a)
+    if(NOT EXISTS "${SPDK_LIB_DIR}/${SPDK_WHOLE_ARCHIVE_LIB}")
+      message(
+        FATAL_ERROR
+          "SPDK library not found: ${SPDK_LIB_DIR}/${SPDK_WHOLE_ARCHIVE_LIB}. "
+          "Run `sudo bash dependencies.sh --with-spdk`, or set "
+          "-DSPDK_LIB_DIR and PKG_CONFIG_PATH to the same SPDK installation.")
+    endif()
+  endforeach()
+
+  if(NOT SPDK_PC_STATIC_LDFLAGS)
     message(
       FATAL_ERROR
-        "isa-l not found at ${SPDK_ISA_L_LIB_DIR}/libisal.a. Run "
-        "`sudo bash dependencies.sh --with-spdk`, or set -DSPDK_ISA_L_LIB_DIR.")
+        "SPDK pkg-config metadata does not provide static link flags. Run "
+        "`sudo bash dependencies.sh --with-spdk`, or point PKG_CONFIG_PATH "
+        "at an SPDK installation containing spdk_nvme, spdk_env_dpdk, and "
+        "spdk_syslibs metadata.")
   endif()
 
+  # SPDK's pkg-config metadata is the canonical dependency graph. Keep the
+  # constructor-only NVMe transports and POSIX socket implementation alive;
+  # the remaining static dependencies stay in SPDK's published link order.
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
-      ${SPDK_LIB_DIR}/libspdk_event.a
-      ${SPDK_LIB_DIR}/libspdk_rdma.a
       ${SPDK_LIB_DIR}/libspdk_nvme.a
       ${SPDK_LIB_DIR}/libspdk_sock_posix.a
       -Wl,--no-whole-archive
-      ${SPDK_LIB_DIR}/libspdk_vfio_user.a
-      ${SPDK_LIB_DIR}/libspdk_dma.a
-      ${SPDK_LIB_DIR}/libspdk_init.a
-      ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
-      ${SPDK_LIB_DIR}/libspdk_log.a
-      ${SPDK_LIB_DIR}/libspdk_util.a
-      ${SPDK_LIB_DIR}/libspdk_blob.a
-      ${SPDK_LIB_DIR}/libspdk_blobfs.a
-      ${SPDK_LIB_DIR}/libspdk_bdev.a
-      ${SPDK_LIB_DIR}/libspdk_conf.a
-      ${SPDK_LIB_DIR}/libspdk_json.a
-      ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
-      ${SPDK_LIB_DIR}/libspdk_sock.a
-      ${SPDK_LIB_DIR}/libspdk_thread.a
-      ${SPDK_LIB_DIR}/libspdk_trace.a
-      ${SPDK_LIB_DIR}/libspdk_vmd.a
-      ${SPDK_LIB_DIR}/libspdk_rpc.a
-      ${DPDK_LIB_DIR}/librte_eal.a
-      ${DPDK_LIB_DIR}/librte_mempool.a
-      ${DPDK_LIB_DIR}/librte_ring.a
-      ${DPDK_LIB_DIR}/librte_bus_pci.a
-      ${DPDK_LIB_DIR}/librte_pci.a
-      ${DPDK_LIB_DIR}/librte_timer.a
-      ${DPDK_LIB_DIR}/librte_telemetry.a
-      ${DPDK_LIB_DIR}/librte_kvargs.a
-      ${DPDK_LIB_DIR}/librte_mbuf.a
-      -Wl,--whole-archive
-      ${DPDK_LIB_DIR}/librte_mempool_ring.a
-      -Wl,--no-whole-archive
-      ${DPDK_LIB_DIR}/librte_power.a
-      ${DPDK_LIB_DIR}/librte_ethdev.a
-      ${DPDK_LIB_DIR}/librte_net.a
-      ${DPDK_LIB_DIR}/librte_vhost.a
-      ${DPDK_LIB_DIR}/librte_cryptodev.a
-      ${DPDK_LIB_DIR}/librte_hash.a
-      ${DPDK_LIB_DIR}/librte_rcu.a
-      pthread
-      dl
-      numa
-      rt
-      m
-      uuid
-      crypto
-      aio
-      z
-      -L${SPDK_ISA_L_LIB_DIR}
-      isal
-      elf
-      ibverbs
-      rdmacm
-      ssl
-      bsd)
+      ${SPDK_PC_STATIC_LDFLAGS})
+
+  if(EXISTS "${SPDK_INCLUDE_DIR}/spdk/nvme_kv.h")
+    set(MOONCAKE_HAVE_SPDK_NVME_KV ON)
+    message(STATUS "SPDK NVMe KV typed API enabled")
+  endif()
 
   # ---------------------------------------------------------------------------
   # SPDK-backed NoF initiator implementation, linked PRIVATE so SPDK/DPDK
@@ -480,6 +445,11 @@ if(USE_NOF)
   target_link_libraries(mooncake_nof_spdk
                         PRIVATE ${SPDK_STATIC_LIBS} glog::glog
                                 mooncake_nof_core yalantinglibs::yalantinglibs)
+
+  if(MOONCAKE_HAVE_SPDK_NVME_KV)
+    target_compile_definitions(mooncake_nof_spdk
+                               PRIVATE MOONCAKE_HAVE_SPDK_NVME_KV=1)
+  endif()
 
   # spdk_mem_register (SPDK >= 22.05) compile-time probe.
   # CMAKE_TRY_COMPILE_TARGET_TYPE was added in CMake 3.6 (project requires
@@ -505,6 +475,12 @@ if(USE_NOF)
       "will remain unfixed: pure-NoF writes over RDMA will fail with "
       "'No translation for ptr' errors.")
   endif()
+endif()
+
+# The production path requires SPDK's typed KV API. Unit-test builds compile
+# the transport-independent scheduler against a fake NVMe-oF initiator.
+if(MOONCAKE_HAVE_SPDK_NVME_KV OR BUILD_UNIT_TESTS)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_spdk.cpp)
 endif()
 
 # Resolve target-independent configuration before defining the Store targets.
@@ -646,6 +622,10 @@ target_link_libraries(
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+endif()
+if(MOONCAKE_HAVE_SPDK_NVME_KV)
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_HAVE_SPDK_NVME_KV=1)
 endif()
 if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_URING)

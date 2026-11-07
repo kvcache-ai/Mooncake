@@ -13,7 +13,7 @@ namespace mooncake {
  * offset at 0, so the returned base matches what a peer process mapping the fd
  * at offset 0 sees (cross-process fd sharing is unchanged).
  *
- * SPDK before 26.09 (e.g. the v23.01.1 pinned by dependencies.sh) rejects
+ * SPDK before 26.09 (including the v26.05 pinned by dependencies.sh) rejects
  * spdk_mem_register() unless both the start and the length are 2MB-aligned;
  * plain mmap only guarantees 4KB alignment. Reserve a PROT_NONE region large
  * enough to contain a 2MB-aligned window, then MAP_FIXED the memfd into it
