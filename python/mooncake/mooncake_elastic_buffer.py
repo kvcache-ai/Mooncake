@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 from .mooncake_ep_buffer import EventOverlap, _native_current_stream_ptr
-from .mooncake_ep_store import TCPStoreCollectives
+from .mooncake_ep_tcpstore import TCPStoreCollectives
 
 
 _VALID_TRANSPORTS = {"auto", "ibgda", "nccl"}

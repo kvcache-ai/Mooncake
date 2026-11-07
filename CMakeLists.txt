@@ -42,10 +42,9 @@ option(WITH_RUST_EXAMPLE
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(WITH_CONDUCTOR_RUST
        "build the Rust bindings for the Mooncake Conductor client" OFF)
-option(
-  WITH_STORE_RS
-  "build the Rust-native Mooncake Store implementation (mooncake-store-rs)"
-  OFF)
+option(WITH_STORE_RS
+       "build the Rust-native Mooncake Store implementation (mooncake-store-rs)"
+       OFF)
 option(
   WITH_STORE_C_SHARED
   "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)"
@@ -211,8 +210,9 @@ if(WITH_CONDUCTOR_RUST)
   add_subdirectory(mooncake-conductor/rust)
 endif()
 
-if (WITH_STORE_RS)
-  message(STATUS "Mooncake Store Rust-native implementation (store-rs) will be built")
+if(WITH_STORE_RS)
+  message(
+    STATUS "Mooncake Store Rust-native implementation (store-rs) will be built")
   add_subdirectory(mooncake-store-rs)
 endif()
 
@@ -260,32 +260,39 @@ elseif(WITH_EP OR WITH_PG)
   if(WITH_PG)
     add_custom_target(
       mooncake_pg_jit_sources_stage ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory
-              "${EP_PG_STAGING_DIR}/_pg_jit"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/pg_py.cpp"
-              "${EP_PG_STAGING_DIR}/_pg_jit/pg_py.cpp"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/mooncake_backend.cpp"
-              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.cpp"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/work_handles.cpp"
-              "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.cpp"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/mooncake_backend.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.h"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/work_handles.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.h"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/torch_utils.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/torch_utils.h"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/pg_utils.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/pg_utils.h"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/mooncake_pg.h"
-              "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_pg.h"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}/_pg_jit"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/pg_py.cpp"
+        "${EP_PG_STAGING_DIR}/_pg_jit/pg_py.cpp"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/mooncake_backend.cpp"
+        "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.cpp"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/src/work_handles.cpp"
+        "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.cpp"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/mooncake_backend.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_backend.h"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/work_handles.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/work_handles.h"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/include/torch_utils.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/torch_utils.h"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/pg_utils.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/pg_utils.h"
+      COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/include/mooncake_pg.h"
+        "${EP_PG_STAGING_DIR}/_pg_jit/mooncake_pg.h"
       COMMENT "Staging Mooncake PG Torch JIT sources")
 
     add_custom_target(

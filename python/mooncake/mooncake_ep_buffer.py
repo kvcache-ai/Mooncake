@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from .mooncake_ep_store import fetch_peer_metadata
+from .mooncake_ep_tcpstore import fetch_peer_metadata
 
 if TYPE_CHECKING:
     from mooncake import ep

@@ -26,10 +26,11 @@ cmake_option_enabled() {
     local option_name="$1"
     local option_value
     option_value=$(sed -n "s/^${option_name}:[^=]*=//p" "$CMAKE_CACHE" | tail -n 1)
-    case "$option_value" in
-        ON|TRUE|YES|1) return 0 ;;
-        *) return 1 ;;
+    # Match CMake's case-insensitive false constants; NOTFOUND suffix matching is case-sensitive.
+    case "${option_value^^}" in
+        ""|0|OFF|NO|FALSE|N|IGNORE) return 1 ;;
     esac
+    [[ "$option_value" != NOTFOUND && "$option_value" != *-NOTFOUND ]]
 }
 
 if ! grep -q '^WITH_EP:' "$CMAKE_CACHE"; then
@@ -51,8 +52,13 @@ fi
 
 DEVICE_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 PG_JIT_STAGING_DIR="${DEVICE_STAGING_DIR}/_pg_jit"
-EP_DEVICE_LIBRARY="${DEVICE_STAGING_DIR}/libmooncake_ep_device.so"
-PG_DEVICE_LIBRARY="${DEVICE_STAGING_DIR}/libmooncake_pg_device.so"
+DEVICE_LIBRARY_BASENAMES=()
+if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ]; then
+    DEVICE_LIBRARY_BASENAMES+=(libmooncake_ep_device.so)
+fi
+if [ "$WITH_PG_BUILD" = "1" ]; then
+    DEVICE_LIBRARY_BASENAMES+=(libmooncake_pg_device.so)
+fi
 
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 echo "CMake components: WITH_EP=${WITH_EP_BUILD}, WITH_PG=${WITH_PG_BUILD}"
@@ -210,23 +216,15 @@ CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
 # directory is removed before auditwheel injection.
 DEVICE_STAGING_TEMP=""
 if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
-    HAS_DEVICE_LIBRARY=0
-    if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ] && [ -f "$EP_DEVICE_LIBRARY" ]; then
-        HAS_DEVICE_LIBRARY=1
-    fi
-    if [ "$WITH_PG_BUILD" = "1" ] && [ -f "$PG_DEVICE_LIBRARY" ]; then
-        HAS_DEVICE_LIBRARY=1
-    fi
-    if [ "$HAS_DEVICE_LIBRARY" = "1" ]; then
-        DEVICE_STAGING_TEMP=$(mktemp -d)
-        if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ] && [ -f "$EP_DEVICE_LIBRARY" ]; then
-            cp "$EP_DEVICE_LIBRARY" "$DEVICE_STAGING_TEMP/"
-            EP_DEVICE_LIBRARY="${DEVICE_STAGING_TEMP}/$(basename "$EP_DEVICE_LIBRARY")"
+    for device_library in "${DEVICE_LIBRARY_BASENAMES[@]}"; do
+        if [ -f "${DEVICE_STAGING_DIR}/${device_library}" ]; then
+            if [ -z "$DEVICE_STAGING_TEMP" ]; then
+                DEVICE_STAGING_TEMP=$(mktemp -d)
+            fi
+            cp "${DEVICE_STAGING_DIR}/${device_library}" "$DEVICE_STAGING_TEMP/"
         fi
-        if [ "$WITH_PG_BUILD" = "1" ] && [ -f "$PG_DEVICE_LIBRARY" ]; then
-            cp "$PG_DEVICE_LIBRARY" "$DEVICE_STAGING_TEMP/"
-            PG_DEVICE_LIBRARY="${DEVICE_STAGING_TEMP}/$(basename "$PG_DEVICE_LIBRARY")"
-        fi
+    done
+    if [ -n "$DEVICE_STAGING_TEMP" ]; then
         echo "Preserved selected EP/PG device libraries to ${DEVICE_STAGING_TEMP} before build-dir cleanup"
         if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ] && [ -d "$CUDA_EP_JIT_DIR" ]; then
             cp -r "$CUDA_EP_JIT_DIR" "$DEVICE_STAGING_TEMP/"
@@ -302,26 +300,21 @@ MIGRATED_PYTHON_MODULES=(
     transfer_engine_topology_dump.py
     buffer_pool.py
     mooncake_config.py
+    ep.py
+    mooncake_ep_buffer.py
+    mooncake_ep_tcpstore.py
+    mooncake_elastic_buffer.py
     _administration.py
     mooncake_ssd_register.py
     mooncake_ssd_unregister.py
     spdk_tgt_create.py
 )
-EP_PYTHON_MODULES=(
-    ep.py
-    mooncake_ep_buffer.py
-    mooncake_ep_store.py
-    mooncake_elastic_buffer.py
-)
-if [ "$WITH_EP_BUILD" = "1" ]; then
-    MIGRATED_PYTHON_MODULES+=("${EP_PYTHON_MODULES[@]}")
-fi
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
 PG_MODULE_SOURCE="${BUILD_ROOT}/mooncake-wheel/mooncake/pg.py"
 PG_MODULE_BACKUP=""
 cleanup_migrated_python_staging() {
-    for module in "${MIGRATED_PYTHON_MODULES[@]}" "${EP_PYTHON_MODULES[@]}"; do
+    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
         if [ "${module}" = "__init__.py" ]; then
             continue
         fi
@@ -740,13 +733,16 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
 
 # Inject only the selected EP and PG device libraries after auditwheel.
 # patchelf can corrupt CUDA fatbins, so these .so files stay out of repair.
+DEVICE_LIBRARY_SOURCE_DIR="$DEVICE_STAGING_DIR"
+if [ -n "$DEVICE_STAGING_TEMP" ]; then
+    DEVICE_LIBRARY_SOURCE_DIR="$DEVICE_STAGING_TEMP"
+fi
 HAS_SELECTED_DEVICE_LIBRARY=0
-if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ] && [ -f "$EP_DEVICE_LIBRARY" ]; then
-    HAS_SELECTED_DEVICE_LIBRARY=1
-fi
-if [ "$WITH_PG_BUILD" = "1" ] && [ -f "$PG_DEVICE_LIBRARY" ]; then
-    HAS_SELECTED_DEVICE_LIBRARY=1
-fi
+for device_library in "${DEVICE_LIBRARY_BASENAMES[@]}"; do
+    if [ -f "${DEVICE_LIBRARY_SOURCE_DIR}/${device_library}" ]; then
+        HAS_SELECTED_DEVICE_LIBRARY=1
+    fi
+done
 if [ "$HAS_SELECTED_DEVICE_LIBRARY" = "1" ]; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
@@ -754,14 +750,13 @@ if [ "$HAS_SELECTED_DEVICE_LIBRARY" = "1" ]; then
         WHEEL_UNPACK_DIR=$(mktemp -d)
         python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
-        if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ] && [ -f "$EP_DEVICE_LIBRARY" ]; then
-            echo "  Adding EP $(basename "$EP_DEVICE_LIBRARY")"
-            cp "$EP_DEVICE_LIBRARY" "$UNPACKED_PKG_DIR/mooncake/$(basename "$EP_DEVICE_LIBRARY")"
-        fi
-        if [ "$WITH_PG_BUILD" = "1" ] && [ -f "$PG_DEVICE_LIBRARY" ]; then
-            echo "  Adding PG $(basename "$PG_DEVICE_LIBRARY")"
-            cp "$PG_DEVICE_LIBRARY" "$UNPACKED_PKG_DIR/mooncake/$(basename "$PG_DEVICE_LIBRARY")"
-        fi
+        for device_library in "${DEVICE_LIBRARY_BASENAMES[@]}"; do
+            if [ -f "${DEVICE_LIBRARY_SOURCE_DIR}/${device_library}" ]; then
+                echo "  Adding ${device_library}"
+                cp "${DEVICE_LIBRARY_SOURCE_DIR}/${device_library}" \
+                   "$UNPACKED_PKG_DIR/mooncake/${device_library}"
+            fi
+        done
         # Kernel headers for the EP JIT (runtime nvcc).
         if [ "$WITH_EP_BUILD" = "1" ] && [ -d "$CUDA_EP_JIT_DIR" ]; then
             echo "  Adding EP JIT header tree"
