@@ -76,6 +76,16 @@ initialize(local_hostname, metadata_server, protocol, device_name)
 
 Initializes the transfer engine with basic configuration.
 
+Call `initialize()` or `initialize_ext()` once per instance. After a successful
+initialization, further calls return a negative value and preserve the active
+engine, registered buffers, and cached peer handles. Create a new instance to
+use another configuration. A failed initialization releases the candidate
+engine and can be retried on the same instance.
+
+Managed-buffer allocation uses the allocator selected for that instance's
+protocol. Initializing another instance does not change its allocator or bypass
+checks for optional protocols unavailable in the build.
+
 **Parameters:**
 - `local_hostname` (str): The hostname and port of the local server (e.g., "127.0.0.1:12345")
 - `metadata_server` (str): The metadata server connection string (e.g., "127.0.0.1:2379" or "etcd://127.0.0.1:2379")

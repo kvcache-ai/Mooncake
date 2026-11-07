@@ -60,10 +60,6 @@
 #include <cuda_runtime.h>
 #endif
 
-static void* (*allocateMemory)(size_t) = nullptr;
-static void (*freeMemory)(void*) = nullptr;
-static std::string g_protocol;
-
 enum class ScatterTransferCompletionStatus : int {
     COMPLETED = 0,
     FAILED_DRAINED = -1,
@@ -225,20 +221,15 @@ ScatterTransferSubmission submitScatterWithTicket(
 
 }  // namespace
 
-//  Handle allocateMemory function pointer based on protocol
-static bool initMemoryAllocator(const char* protocol) {
-    if (allocateMemory != nullptr) {
-        LOG(WARNING) << "Memory allocator already initialized with: "
-                     << g_protocol;
-        return true;
-    }
+// Select the allocator for this engine's protocol.
+bool TransferEnginePy::initMemoryAllocator(const char* protocol) {
     if (protocol == nullptr) protocol = "";
     if (strcmp(protocol, "nvlink") == 0) {
 #ifdef USE_MNNVL
-        allocateMemory = [](size_t s) -> void* {
+        allocate_memory_ = [](size_t s) -> void* {
             return mooncake::NvlinkTransport::allocatePinnedLocalMemory(s);
         };
-        freeMemory = [](void* p) {
+        free_memory_ = [](void* p) {
             mooncake::NvlinkTransport::freePinnedLocalMemory(p);
         };
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
@@ -248,22 +239,23 @@ static bool initMemoryAllocator(const char* protocol) {
 #endif
     } else if (strcmp(protocol, "musa") == 0) {
 #ifdef USE_MUSA
-        allocateMemory = [](size_t s) -> void* {
+        allocate_memory_ = [](size_t s) -> void* {
             return mooncake::MusaTransport::allocatePinnedLocalMemory(s);
         };
-        freeMemory = [](void* p) {
+        free_memory_ = [](void* p) {
             mooncake::MusaTransport::freePinnedLocalMemory(p);
         };
         LOG(INFO) << "Selected MUSA memory allocator";
 #else
         LOG(ERROR) << "Protocol 'musa' requires -DUSE_MUSA=ON";
+        return false;
 #endif
     } else if (strcmp(protocol, "hip") == 0) {
 #ifdef USE_HIP
-        allocateMemory = [](size_t s) -> void* {
+        allocate_memory_ = [](size_t s) -> void* {
             return mooncake::HipTransport::allocatePinnedLocalMemory(s);
         };
-        freeMemory = [](void* p) {
+        free_memory_ = [](void* p) {
             mooncake::HipTransport::freePinnedLocalMemory(p);
         };
         LOG(INFO) << "Selected HIP memory allocator";
@@ -273,11 +265,11 @@ static bool initMemoryAllocator(const char* protocol) {
 #endif
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
-        allocateMemory = [](size_t s) -> void* {
+        allocate_memory_ = [](size_t s) -> void* {
             return mooncake::IntraNodeNvlinkTransport::
                 allocatePinnedLocalMemory(s);
         };
-        freeMemory = [](void* p) {
+        free_memory_ = [](void* p) {
             mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(p);
         };
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
@@ -290,18 +282,18 @@ static bool initMemoryAllocator(const char* protocol) {
         // src_va. Fallback protocols (rdma/tcp/ascend) use posix_memalign to
         // guarantee 64KB alignment, otherwise aclrtHostRegister fails with
         // EINVAL on a misaligned address.
-        allocateMemory = [](size_t s) -> void* {
+        allocate_memory_ = [](size_t s) -> void* {
             void* p = nullptr;
             if (posix_memalign(&p, 64 * 1024, s) != 0) {
                 return nullptr;
             }
             return p;
         };
-        freeMemory = free;
-        LOG(WARNING) << "Using 64KB-aligned malloc/free for protocol: "
-                     << protocol;
+        free_memory_ = free;
+        LOG(INFO) << "Using 64KB-aligned malloc/free for protocol: "
+                  << protocol;
     }
-    g_protocol = protocol;
+
     return true;
 }
 
@@ -319,9 +311,9 @@ TransferEnginePy::~TransferEnginePy() {
     for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
     handle_map_.clear();
     engine_.reset();
-    for (auto& buffer : buffer_list_) freeMemory(buffer);
+    for (auto& buffer : buffer_list_) free_memory_(buffer);
     buffer_list_.clear();
-    for (auto& buffer : large_buffer_list_) freeMemory(buffer);
+    for (auto& buffer : large_buffer_list_) free_memory_(buffer);
     large_buffer_list_.clear();
 }
 
@@ -383,6 +375,11 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
+    if (engine_) {
+        LOG(ERROR)
+            << "TransferEngine is already initialized; create a new instance";
+        return -1;
+    }
     if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
@@ -396,6 +393,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
     bool use_flagcx = (proto == "flagcx");
+    std::shared_ptr<TransferEngine> candidate;
 
 #ifdef USE_EFA
     // Only protocol=efa is set up by hand. Every other protocol goes through
@@ -403,37 +401,37 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     // the RDMA transport, so the EFA wheel behaves like the default wheel on
     // IB/RoCE hosts.
     bool use_efa = (proto == "efa");
-    engine_ = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
-                                               device_filter);
+    candidate = std::make_unique<TransferEngine>(!use_efa && !use_flagcx,
+                                                 device_filter);
     if (use_efa) {
-        engine_->getLocalTopology()->discover(device_filter);
+        candidate->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for EFA. Found "
-                  << engine_->getLocalTopology()->getHcaList().size()
+                  << candidate->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
 #elif defined(USE_CXI)
 
     bool use_cxi = (proto == "cxi");
-    engine_ = std::make_unique<TransferEngine>(false, device_filter);
+    candidate = std::make_unique<TransferEngine>(false, device_filter);
     if (use_cxi) {
-        engine_->getLocalTopology()->discover(device_filter);
+        candidate->getLocalTopology()->discover(device_filter);
         LOG(INFO) << "Topology discovery complete for CXI. Found "
-                  << engine_->getLocalTopology()->getHcaList().size()
+                  << candidate->getLocalTopology()->getHcaList().size()
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
+    candidate = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret = engine_->init(conn_string, local_hostname,
-                                hostname_port.first.c_str(),
-                                hostname_port.second, proto);
+        int ret = candidate->init(conn_string, local_hostname,
+                                  hostname_port.first.c_str(),
+                                  hostname_port.second, proto);
         if (ret) return -1;
     } else {
         // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
+        int ret = candidate->init(conn_string, local_hostname, "", 0, proto);
         if (ret) return -1;
     }
 
@@ -442,7 +440,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("efa", nullptr);
+        auto transport = candidate->installTransport("efa", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install EFA transport";
             return -1;
@@ -451,7 +449,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     } else if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
             return -1;
@@ -462,7 +460,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_cxi) {
         LOG(INFO)
             << "Installing CXI transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("cxi", nullptr);
+        auto transport = candidate->installTransport("cxi", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install CXI transport";
             return -1;
@@ -471,7 +469,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     } else if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
             return -1;
@@ -483,7 +481,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         // (RDMA QP creation fails on EFA devices).
         LOG(INFO)
             << "Installing TCP transport (auto_discover disabled in CXI build)";
-        auto transport = engine_->installTransport("tcp", nullptr);
+        auto transport = candidate->installTransport("tcp", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install TCP transport";
             return -1;
@@ -494,7 +492,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("flagcx", nullptr);
+        auto transport = candidate->installTransport("flagcx", nullptr);
         if (!transport) {
             LOG(ERROR) << "Failed to install FlagCX transport";
             return -1;
@@ -504,21 +502,22 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 #endif
 
     free_list_.resize(kSlabSizeKBTabLen);
+    engine_ = std::move(candidate);
     return 0;
 }
 
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
-    if (allocateMemory == nullptr || freeMemory == nullptr) {
+    if (allocate_memory_ == nullptr || free_memory_ == nullptr) {
         LOG(ERROR) << "Memory allocator is not initialized";
         return nullptr;
     }
-    auto buffer = allocateMemory(capacity);
+    auto buffer = allocate_memory_(capacity);
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
-        freeMemory(buffer);
+        free_memory_(buffer);
         return nullptr;
     }
     return (char*)buffer;
@@ -576,7 +575,7 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     if (class_id < 0) {
         large_buffer_list_.erase(buffer);
         engine_->unregisterLocalMemory(buffer);
-        freeMemory(buffer);
+        free_memory_(buffer);
         return 0;
     }
     free_list_[class_id].push(buffer);
