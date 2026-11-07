@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "client_session/client_session_registry_test_peer.h"
 #include "master_service.h"
 
 namespace mooncake::test {
@@ -136,18 +137,19 @@ class MasterServiceTestPeer {
         return service.batch_oplog_storage_;
     }
 
-    static auto& ClientLivenessRecords(MasterService& service) {
-        return service.client_liveness_records_;
+    static auto& ClientSessions(MasterService& service) {
+        return service.client_sessions_;
     }
-    static const auto& ClientLivenessRecords(const MasterService& service) {
-        return service.client_liveness_records_;
+    static const auto& ClientSessions(const MasterService& service) {
+        return service.client_sessions_;
     }
-
-    static auto& ClientMutex(MasterService& service) {
-        return service.client_mutex_;
+    // Registry membership by client, not a frozen copy of session state.
+    static auto ClientSessionRecords(const MasterService& service) {
+        return ClientSessionRegistryTestPeer::SnapshotRecords(
+            service.client_sessions_);
     }
-    static const auto& ClientMutex(const MasterService& service) {
-        return service.client_mutex_;
+    static auto& ClientOffboarding(MasterService& service) {
+        return service.client_offboarding_worker_;
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
@@ -433,11 +435,6 @@ class MasterServiceTestPeer {
 
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-        service_.ClearInvalidHandles(retaining_clients);
-    }
-
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {
@@ -503,7 +500,8 @@ class MasterServiceTestPeer {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
-        return service_.FindClientRecord(client_id);
+        return ClientSessionRegistryTestPeer::Find(service_.client_sessions_,
+                                                   client_id);
     }
 
     // Resolves the namespace, creating it through the table's factory on first

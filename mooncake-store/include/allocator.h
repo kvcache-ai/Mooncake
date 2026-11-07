@@ -12,6 +12,7 @@
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "client_liveness.h"
+#include "common/atomic_shared_ptr.h"
 #include "offset_allocator/offset_allocator.h"
 #include "storage_usage.h"
 #include "types.h"
@@ -47,24 +48,32 @@ class BufferAllocatorBase;
 class Replica;
 class SegmentAllocatorRegistration;
 
+// Shared ownership of a segment incarnation, including its client session.
+// Copies retain the current generation, not future session replacements.
+// This is the state a buffer carries: which incarnation it belongs to and
+// whether that incarnation is still alive. Whether the segment currently
+// accepts new allocations belongs to SegmentAllocatorRegistration instead.
 class SegmentLifetime {
    public:
-    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
+    explicit SegmentLifetime(ClientSessionSharedPtr session = nullptr);
+    SegmentLifetime(const SegmentLifetime& other) noexcept;
+    SegmentLifetime& operator=(const SegmentLifetime& other) noexcept;
 
-    [[nodiscard]] bool isAvailable() const {
-        return available_->load(std::memory_order_acquire);
-    }
-
-    void setAvailable(bool available) const {
-        available_->store(available, std::memory_order_release);
-    }
-
-    [[nodiscard]] bool operator==(const SegmentLifetime& other) const {
-        return available_ == other.available_;
-    }
+    [[nodiscard]] bool isAvailable() const;
+    [[nodiscard]] bool isServing() const;
+    [[nodiscard]] bool operator==(const SegmentLifetime& other) const;
 
    private:
-    std::shared_ptr<std::atomic<bool>> available_;
+    friend class AllocatedBuffer;
+    friend class SegmentAllocatorRegistration;
+    [[nodiscard]] ClientSessionSharedPtr getClientSession() const;
+    // Mutations are serialized by the segment lock. Readers, including copies
+    // held by detached allocator snapshots, may run concurrently.
+    void BindSession(ClientSessionSharedPtr session);
+    void Invalidate();
+    struct State;
+    std::shared_ptr<State> Snapshot() const;
+    AtomicSharedPtr<State> state_;
 };
 
 class AllocatedBuffer {
@@ -106,25 +115,18 @@ class AllocatedBuffer {
     }
 
     [[nodiscard]] bool isAvailable() const {
-        if (!isAllocatorValid()) {
-            return false;
-        }
-        const ClientLivenessRecord* record = client_liveness_.get();
-        return record == nullptr || record->IsServing();
-    }
-
-    void bindClientLiveness(
-        std::shared_ptr<ClientLivenessRecord> client_liveness) {
-        client_liveness_ = std::move(client_liveness);
+        return !allocator_.expired() && segment_lifetime_.isServing();
     }
 
     void bindSegmentLifetime(SegmentLifetime lifetime) {
         segment_lifetime_ = std::move(lifetime);
     }
 
-    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
-        const {
-        return client_liveness_;
+    // Preserve the owning session's identity for replica affiliation checks
+    // and source admission; a client UUID alone cannot distinguish
+    // re-registers.
+    [[nodiscard]] ClientSessionSharedPtr getClientSession() const {
+        return segment_lifetime_.getClientSession();
     }
 
     // Serialize the buffer into a descriptor for transfer
@@ -158,13 +160,8 @@ class AllocatedBuffer {
     bool copyTransferProtocolFrom(const AllocatedBuffer& source);
 
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    // Both bindings are set before the buffer is published to readers and not
-    // changed while readers can see it, so neither needs atomic access. The
-    // one rebind of a published buffer is the snapshot restore pass
-    // (RebuildClientLivenessAfterSnapshotRestore), which runs inside the
-    // MasterService constructor, before any reader.
+    // SegmentLifetime synchronizes session rebinding with concurrent readers.
     SegmentLifetime segment_lifetime_;
-    std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};

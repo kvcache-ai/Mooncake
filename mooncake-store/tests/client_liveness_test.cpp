@@ -1,9 +1,6 @@
 #include "client_liveness.h"
 
 #include <chrono>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -44,73 +41,37 @@ TEST(ClientLivenessRecordTest, ObservationRecoversSuspectedButNotOffline) {
     EXPECT_FALSE(record.ShouldRetainResources());
 }
 
-TEST(ClientLivenessRecordTest, FailedOperationDoesNotRecoverOrRefresh) {
+TEST(ClientLivenessRecordTest, EveryStateChangeIsReportedToItsCaller) {
     const auto initial = ClientLivenessRecord::TimePoint{};
     ClientLivenessRecord record(initial);
+    using Observation = ClientLivenessObservation;
+    using Transition = ClientLivenessTransition;
+    // The return value is the only notification there is, so it must tell a
+    // state change from a call that changed nothing.
+    EXPECT_EQ(record.Observe(initial + 1s), Observation::REFRESHED_ACTIVE);
+    EXPECT_EQ(record.Evaluate(initial + 10s, 10s, 20s), Transition::NONE);
+    EXPECT_EQ(record.Evaluate(initial + 11s, 10s, 20s),
+              Transition::BECAME_SUSPECTED);
+    EXPECT_EQ(record.Evaluate(initial + 12s, 10s, 20s), Transition::NONE);
+    EXPECT_EQ(record.Observe(initial + 13s), Observation::RECOVERED_ACTIVE);
+    EXPECT_EQ(record.Observe(initial + 14s), Observation::REFRESHED_ACTIVE);
+    EXPECT_EQ(record.Evaluate(initial + 24s, 10s, 20s),
+              Transition::BECAME_SUSPECTED);
+    EXPECT_EQ(record.Evaluate(initial + 44s, 10s, 20s),
+              Transition::BECAME_OFFLINE);
+    EXPECT_EQ(record.Evaluate(initial + 100s, 10s, 20s), Transition::NONE);
+    EXPECT_EQ(record.Observe(initial + 101s), Observation::REJECTED_OFFLINE);
+}
 
-    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
-              ClientLivenessTransition::BECAME_SUSPECTED);
-    EXPECT_EQ(record.ObserveAndRun(initial + 11s, [] { return false; }),
-              ClientLivenessObservation::OBSERVATION_WITHHELD);
-    EXPECT_EQ(record.state(), ClientLivenessState::SUSPECTED);
+TEST(ClientLivenessRecordTest, DelayedObservationCannotMoveHeartbeatBackwards) {
+    const auto initial = ClientLivenessRecord::TimePoint{};
+    ClientLivenessRecord record(initial);
+    (void)record.Observe(initial + 20s);
+    (void)record.Observe(initial + 1s);
+    EXPECT_EQ(record.Evaluate(initial + 29s, 10s, 20s),
+              ClientLivenessTransition::NONE);
     EXPECT_EQ(record.Evaluate(initial + 30s, 10s, 20s),
-              ClientLivenessTransition::BECAME_OFFLINE);
-}
-
-TEST(ClientLivenessRecordTest, RetireCallbackRunsAfterTransitionGuardRelease) {
-    const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
-    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
               ClientLivenessTransition::BECAME_SUSPECTED);
-
-    std::mutex completion_mutex;
-    std::condition_variable completion_cv;
-    bool completed = false;
-    bool rejected_offline = false;
-    std::thread probe;
-
-    EXPECT_EQ(
-        record.EvaluateAndRetire(
-            initial + 30s, 10s, 20s,
-            [&] {
-                probe = std::thread([&] {
-                    rejected_offline =
-                        !record.TryAcquireRetainingGuard().has_value();
-                    {
-                        std::lock_guard<std::mutex> lock(completion_mutex);
-                        completed = true;
-                    }
-                    completion_cv.notify_one();
-                });
-
-                std::unique_lock<std::mutex> lock(completion_mutex);
-                EXPECT_TRUE(completion_cv.wait_for(lock, 1s,
-                                                   [&] { return completed; }));
-            }),
-        ClientLivenessTransition::BECAME_OFFLINE);
-
-    probe.join();
-    EXPECT_TRUE(rejected_offline);
-}
-
-TEST(ClientLivenessRecordTest, RetirementIsReservedBeforeOfflineIsPublished) {
-    const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientLivenessRecord record(initial);
-    ASSERT_EQ(record.Evaluate(initial + 10s, 10s, 20s),
-              ClientLivenessTransition::BECAME_SUSPECTED);
-
-    bool reserved = false;
-    EXPECT_EQ(record.EvaluateAndRetire(
-                  initial + 30s, 10s, 20s,
-                  [&] {
-                      EXPECT_EQ(record.state(), ClientLivenessState::SUSPECTED);
-                      reserved = true;
-                  },
-                  [&] {
-                      EXPECT_TRUE(reserved);
-                      EXPECT_EQ(record.state(), ClientLivenessState::OFFLINE);
-                  }),
-              ClientLivenessTransition::BECAME_OFFLINE);
 }
 
 }  // namespace

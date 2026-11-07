@@ -6,39 +6,30 @@ namespace mooncake {
 
 SegmentAllocatorRegistration::SegmentAllocatorRegistration(
     std::shared_ptr<BufferAllocatorBase> allocator,
-    std::shared_ptr<ClientLivenessRecord> client_liveness)
-    : allocator_(std::move(allocator)),
-      client_liveness_(std::move(client_liveness)) {}
+    ClientSessionSharedPtr owner_session)
+    : allocator_(std::move(allocator)), lifetime_(std::move(owner_session)) {}
 
-bool SegmentAllocatorRegistration::IsServing() const {
-    if (!allocation_lifetime_.isAvailable()) {
-        return false;
-    }
-    const auto record =
-        std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
-    return !record || record->IsServing();
+bool SegmentAllocatorRegistration::IsAllocatable() const {
+    return allocatable_.load(std::memory_order_acquire) &&
+           lifetime_.isServing();
 }
 
 std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
     size_t size) const {
-    if (!allocation_lifetime_.isAvailable()) {
-        return nullptr;
-    }
-    const auto record =
-        std::atomic_load_explicit(&client_liveness_, std::memory_order_acquire);
-    if (record && !record->IsServing()) {
+    // Capture one lifetime generation across allocation, even if the segment
+    // is rebound concurrently through another allocator-manager snapshot.
+    const auto lifetime = lifetime_;
+    if (!allocatable_.load(std::memory_order_acquire) ||
+        !lifetime.isServing()) {
         return nullptr;
     }
     auto buffer = GetAllocator()->allocate(size);
     if (!buffer) {
         return nullptr;
     }
-    buffer->bindSegmentLifetime(buffer_lifetime_);
-    buffer->bindClientLiveness(record);
-    if (!allocation_lifetime_.isAvailable() ||
-        record != std::atomic_load_explicit(&client_liveness_,
-                                            std::memory_order_acquire) ||
-        (record && !record->IsServing())) {
+    buffer->bindSegmentLifetime(lifetime);
+    if (!allocatable_.load(std::memory_order_acquire) ||
+        !lifetime.isServing() || !(lifetime == lifetime_)) {
         return nullptr;
     }
     return buffer;
@@ -46,39 +37,35 @@ std::unique_ptr<AllocatedBuffer> SegmentAllocatorRegistration::Allocate(
 
 std::shared_ptr<BufferAllocatorBase>
 SegmentAllocatorRegistration::GetAllocator() const {
-    return std::atomic_load_explicit(&allocator_, std::memory_order_acquire);
+    return allocator_.load(std::memory_order_acquire);
 }
 
 void SegmentAllocatorRegistration::BindAllocator(
     std::shared_ptr<BufferAllocatorBase> replacement) {
-    std::atomic_store_explicit(&allocator_, std::move(replacement),
-                               std::memory_order_release);
+    allocator_.store(std::move(replacement), std::memory_order_release);
 }
 
-void SegmentAllocatorRegistration::BindClientLiveness(
-    std::shared_ptr<ClientLivenessRecord> record) {
-    std::atomic_store_explicit(&client_liveness_, std::move(record),
-                               std::memory_order_release);
+void SegmentAllocatorRegistration::BindClientSession(
+    ClientSessionSharedPtr session) {
+    lifetime_.BindSession(std::move(session));
 }
 
 void SegmentAllocatorRegistration::BindBuffer(AllocatedBuffer& buffer) const {
-    buffer.bindSegmentLifetime(buffer_lifetime_);
-    buffer.bindClientLiveness(std::atomic_load_explicit(
-        &client_liveness_, std::memory_order_acquire));
+    buffer.bindSegmentLifetime(lifetime_);
 }
 
 bool SegmentAllocatorRegistration::OwnsBuffer(
     const AllocatedBuffer& buffer) const {
-    return buffer.segment_lifetime_ == buffer_lifetime_;
+    return buffer.segment_lifetime_ == lifetime_;
 }
 
 void SegmentAllocatorRegistration::SetAllocatable(bool allocatable) {
-    allocation_lifetime_.setAvailable(allocatable);
+    allocatable_.store(allocatable, std::memory_order_release);
 }
 
 void SegmentAllocatorRegistration::Invalidate() {
-    allocation_lifetime_.setAvailable(false);
-    buffer_lifetime_.setAvailable(false);
+    allocatable_.store(false, std::memory_order_release);
+    lifetime_.Invalidate();
 }
 
 }  // namespace mooncake

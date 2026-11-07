@@ -32,6 +32,74 @@ bool IsValidAllocation(const LiveAllocation& allocation,
 
 }  // namespace
 
+struct SegmentLifetime::State {
+    explicit State(ClientSessionSharedPtr owner) : session(std::move(owner)) {}
+    std::atomic<bool> available{true};
+    // Only initial snapshot restoration can change null to a session in place.
+    // Replacing a non-null session creates a new State instead.
+    AtomicSharedPtr<const ClientLivenessRecord> session;
+};
+
+SegmentLifetime::SegmentLifetime(ClientSessionSharedPtr session)
+    : state_(std::make_shared<State>(std::move(session))) {}
+
+SegmentLifetime::SegmentLifetime(const SegmentLifetime& other) noexcept
+    : state_(other.Snapshot()) {}
+
+SegmentLifetime& SegmentLifetime::operator=(
+    const SegmentLifetime& other) noexcept {
+    state_.store(other.Snapshot(), std::memory_order_release);
+    return *this;
+}
+
+std::shared_ptr<SegmentLifetime::State> SegmentLifetime::Snapshot() const {
+    return state_.load(std::memory_order_acquire);
+}
+
+bool SegmentLifetime::isAvailable() const {
+    return Snapshot()->available.load(std::memory_order_acquire);
+}
+
+bool SegmentLifetime::isServing() const {
+    const auto state = Snapshot();
+    const auto session = state->session.load(std::memory_order_acquire);
+    return state->available.load(std::memory_order_acquire) &&
+           (!session || session->IsServing());
+}
+
+ClientSessionSharedPtr SegmentLifetime::getClientSession() const {
+    return Snapshot()->session.load(std::memory_order_acquire);
+}
+
+bool SegmentLifetime::operator==(const SegmentLifetime& other) const {
+    return Snapshot() == other.Snapshot();
+}
+
+void SegmentLifetime::BindSession(ClientSessionSharedPtr session) {
+    CHECK(session);
+    const auto old = Snapshot();
+    const auto previous = old->session.load(std::memory_order_acquire);
+    if (previous == session) {
+        return;
+    }
+    if (!previous) {
+        // Deserialization binds buffers before rebuilding client sessions.
+        // Keep segment identity so those buffers acquire the restored owner.
+        old->session.store(std::move(session), std::memory_order_release);
+        return;
+    }
+    auto next = std::make_shared<State>(std::move(session));
+    next->available.store(old->available.load(std::memory_order_acquire));
+    // Old buffers retain the old session and become invalid; they must not
+    // silently migrate to a new client incarnation with the same UUID.
+    old->available.store(false, std::memory_order_release);
+    state_.store(std::move(next), std::memory_order_release);
+}
+
+void SegmentLifetime::Invalidate() {
+    Snapshot()->available.store(false, std::memory_order_release);
+}
+
 void BufferAllocatorBase::AttachUsageTracker(
     const std::shared_ptr<StorageUsageTracker>& usage_tracker) {
     if (!usage_tracker || usage_registration_) {
