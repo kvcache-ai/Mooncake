@@ -84,6 +84,21 @@ jobs:
         with:
           persist-credentials: ${{ inputs.build-profile == 'release' }}
 
+      - name: Check tag matches wheel version
+        if: ${{ inputs.build-profile == 'release' }}
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_version="${RELEASE_TAG#v}"
+          wheel_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' mooncake-wheel/pyproject.toml | head -n 1)"
+          if [[ "${tag_version}" != "${wheel_version}" ]]; then
+            echo "::error::Tag ${RELEASE_TAG} does not match mooncake-wheel/pyproject.toml version '${wheel_version}'; bump pyproject.toml and re-tag"
+            exit 1
+          fi
+          echo "Tag ${RELEASE_TAG} matches wheel version ${wheel_version}"
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:

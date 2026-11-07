@@ -2,8 +2,12 @@ name: Release Non-CUDA
 
 on:
   push:
+    # Stable tags only (vX.Y.Z or vX.Y.Z.postN). PEP 440 pre-release tags
+    # such as v0.3.14rc1 must not reach production PyPI; pre-release.yaml
+    # handles them.
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+.post[0-9]+'
 
 jobs:
   # manylinux2_28 for the toolchain only (USE_CUDA=OFF); keeps the glibc floor
