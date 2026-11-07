@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstring>
 #include "shared_segment_py.h"
+#include "transfer_engine_sync_wait.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_TENT
@@ -1037,7 +1038,10 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         bool completed = false;
         bool release_scheduled = false;
         TransferStatus status;
+        const int64_t deadline_nsec =
+            start_ts + transfer_timeout_nsec_ + length;  // 1GiB per second
         while (!completed) {
+            waitForBatchCompletion(engine_, batch_id, deadline_nsec);
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -1165,7 +1169,10 @@ int TransferEnginePy::batchTransferSync(
         bool completed = false;
         bool release_scheduled = false;
         TransferStatus status;
+        const int64_t deadline_nsec = start_ts + transfer_timeout_nsec_ +
+                                      total_length;  // 1GiB per second
         while (!completed) {
+            waitForBatchCompletion(engine_, batch_id, deadline_nsec);
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {

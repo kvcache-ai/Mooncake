@@ -79,6 +79,20 @@ if(WITH_TE)
                                         gflags::gflags)
   endif()
 
+  if(BUILD_UNIT_TESTS AND USE_EVENT_DRIVEN_COMPLETION)
+    add_executable(transfer_engine_sync_wait_test
+                   tests/transfer_engine_sync_wait_test.cpp)
+    target_link_libraries(transfer_engine_sync_wait_test
+                          PRIVATE transfer_engine glog::glog gflags::gflags)
+    add_test(NAME transfer_engine_sync_wait_test
+             COMMAND transfer_engine_sync_wait_test)
+    set_tests_properties(
+      transfer_engine_sync_wait_test
+      PROPERTIES
+        TIMEOUT 10 ENVIRONMENT
+        "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:asio_shared>:$ENV{LD_LIBRARY_PATH}")
+  endif()
+
   if(USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)
