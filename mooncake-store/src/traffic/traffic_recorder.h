@@ -73,14 +73,14 @@ class TrafficRecorder {
     TrafficRecorder& operator=(const TrafficRecorder&) = delete;
 
     static void OnRequestThunk(void* context, const RequestView& view) noexcept;
-    Shard* BindShard();
-    bool Allowed(std::uint32_t route_key);
     void WriterLoop();
     void DrainShardDirect(Shard& shard);
     bool FlushRecords(Shard& shard, std::vector<struct iovec>& iov,
                       std::uint64_t bytes, std::uint32_t records,
                       std::uint64_t commit_tail);
     void StopInternal();
+    void SetState(const char* state);
+    void WriteSummaryJson(const RecorderStatus& status) const;
     void StartControlServer();
     std::string StatusJson() const;
 
@@ -103,17 +103,17 @@ class TrafficRecorder {
     std::thread stop_thread_;
 
     std::unique_ptr<TrafficSink> sink_;
-    std::vector<char> block_;
     std::uint64_t block_bytes_ = 4ull * 1024 * 1024;
     std::uint64_t segment_bytes_ = 256ull * 1024 * 1024;
     std::uint64_t segment_seconds_ = 300;
     std::uint64_t ring_bytes_ = 1024ull * 1024 * 1024;
     std::uint64_t max_record_bytes_ = 4ull * 1024 * 1024;
     std::uint64_t max_total_bytes_ = 0;
-    std::uint32_t ring_shards_ = 8;
+    std::uint32_t ring_shards_ = 64;
     std::uint64_t stop_timeout_ms_ = 30000;
     std::atomic<std::uint64_t> stop_deadline_ms_{0};
     std::atomic<bool> stop_timed_out_{false};
+    std::atomic<bool> writer_failed_{false};
 
     std::string output_dir_;
     std::string config_path_;

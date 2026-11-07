@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <string>
 
 #include "traffic/traffic_sink.h"
@@ -24,13 +25,24 @@ class FileSink final : public TrafficSink {
     void Close() override;
 
     const std::string& session_dir() const override { return session_dir_; }
-    std::uint64_t bytes_written() const override { return bytes_written_; }
-    std::uint64_t segments() const override { return segments_; }
-    bool failed() const override { return failed_; }
+    std::uint64_t bytes_written() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return bytes_written_;
+    }
+    std::uint64_t segments() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return segments_;
+    }
+    bool failed() const override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return failed_;
+    }
 
    private:
     bool OpenNextSegment();
     bool CloseSegment(bool sync);
+
+    mutable std::mutex mu_;
 
     std::uint64_t segment_bytes_;
     std::uint64_t segment_seconds_;

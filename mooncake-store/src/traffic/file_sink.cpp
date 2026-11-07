@@ -137,6 +137,7 @@ bool FileSink::OpenNextSegment() {
 bool FileSink::WriteBlock(const void* data, std::uint32_t bytes,
                           std::uint32_t records,
                           std::uint32_t block_type) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (file_ == nullptr || failed_) {
         return false;
     }
@@ -184,6 +185,7 @@ bool FileSink::WriteBlock(const void* data, std::uint32_t bytes,
 
 bool FileSink::WriteRecords(const struct iovec* iov, int iov_count,
                             std::uint64_t bytes, std::uint32_t records) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (file_ == nullptr || failed_ || bytes > 0xffffffffu) {
         return false;
     }

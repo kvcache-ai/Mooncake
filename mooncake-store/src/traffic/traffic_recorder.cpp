@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/stat.h>
 #include <new>
 #include <thread>
 
@@ -77,7 +78,7 @@ void TrafficRecorder::Install() {
     std::ifstream input(config_path_);
     if (!input) {
         LOG(ERROR) << "traffic: cannot open config " << config_path_;
-        state_ = "error";
+        SetState("error");
         return;
     }
     Json::Value root;
@@ -85,17 +86,17 @@ void TrafficRecorder::Install() {
     std::string errors;
     if (!Json::parseFromStream(builder, input, &root, &errors)) {
         LOG(ERROR) << "traffic: invalid config: " << errors;
-        state_ = "error";
+        SetState("error");
         return;
     }
     if (!root.isObject()) {
         LOG(ERROR) << "traffic: config root must be an object";
-        state_ = "error";
+        SetState("error");
         return;
     }
     if (!root["output_dir"].isString() || root["output_dir"].asString().empty()) {
         LOG(ERROR) << "traffic: output_dir is required";
-        state_ = "error";
+        SetState("error");
         return;
     }
     output_dir_ = root["output_dir"].asString();
@@ -110,7 +111,7 @@ void TrafficRecorder::Install() {
                    &max_total_bytes_) ||
         !ParseSize(root["stop_timeout_ms"], "stop_timeout_ms",
                    &stop_timeout_ms_)) {
-        state_ = "error";
+        SetState("error");
         return;
     }
     if (root["ring_shards"].isUInt()) {
@@ -141,14 +142,14 @@ void TrafficRecorder::Install() {
     if (control_host_ != "127.0.0.1" && control_host_ != "localhost" &&
         control_host_ != "::1") {
         LOG(ERROR) << "traffic: control.host must be a loopback address";
-        state_ = "error";
+        SetState("error");
         return;
     }
     if (root["routes"].isArray()) {
         for (const auto& item : root["routes"]) {
             if (!item.isString()) {
                 LOG(ERROR) << "traffic: routes[] must contain strings";
-                state_ = "error";
+                SetState("error");
                 return;
             }
             const std::string route = item.asString();
@@ -160,7 +161,7 @@ void TrafficRecorder::Install() {
             const unsigned long key = std::strtoul(route.c_str(), &end, 10);
             if (end == route.c_str() || *end != '\0') {
                 LOG(ERROR) << "traffic: invalid route key " << route;
-                state_ = "error";
+                SetState("error");
                 return;
             }
             allowed_routes_.insert(static_cast<std::uint32_t>(key));
@@ -171,21 +172,21 @@ void TrafficRecorder::Install() {
     }
     if (block_bytes_ == 0 || block_bytes_ > segment_bytes_) {
         LOG(ERROR) << "traffic: block_bytes must be in (0, segment_bytes]";
-        state_ = "error";
+        SetState("error");
         return;
     }
     if (max_record_bytes_ == 0 || max_record_bytes_ > block_bytes_) {
         LOG(ERROR) << "traffic: max_record_bytes must be in (0, block_bytes]";
-        state_ = "error";
+        SetState("error");
         return;
     }
     if (max_total_bytes_ > 0 && max_total_bytes_ < segment_bytes_) {
         LOG(ERROR) << "traffic: max_total_bytes must be >= segment_bytes";
-        state_ = "error";
+        SetState("error");
         return;
     }
     config_loaded_ = true;
-    state_ = "idle";
+    SetState("idle");
     static std::once_flag atexit_once;
     std::call_once(atexit_once, [] {
         std::atexit([] { TrafficRecorder::Instance().Shutdown(); });
@@ -207,16 +208,20 @@ bool TrafficRecorder::Start() {
     if (stop_thread_.joinable()) {
         stop_thread_.join();
     }
+    if (writer_thread_.joinable()) {
+        Stop();
+    }
     if (active_.load(std::memory_order_acquire)) {
         return false;
     }
+    writer_failed_.store(false, std::memory_order_relaxed);
     stop_timed_out_.store(false, std::memory_order_relaxed);
     stop_deadline_ms_.store(0, std::memory_order_relaxed);
     const std::uint64_t shard_bytes =
         FloorPowerOfTwo(ring_bytes_ / std::max(1u, ring_shards_));
     if (shard_bytes < kMinShardBytes) {
         LOG(ERROR) << "traffic: ring is too small";
-        state_ = "error";
+        SetState("error");
         return false;
     }
     {
@@ -234,21 +239,22 @@ bool TrafficRecorder::Start() {
         next_shard_.store(0, std::memory_order_relaxed);
         dropped_no_shard_.store(0, std::memory_order_relaxed);
     }
-    block_.clear();
-    block_.reserve(block_bytes_);
-    sink_.reset();
-    sink_ = std::make_unique<FileSink>(segment_bytes_, segment_seconds_,
-                                       max_total_bytes_);
-    const std::uint64_t start_ms = TrafficNowMs();
-    if (!sink_->OpenSession(output_dir_, start_ms)) {
-        state_ = "error";
-        return false;
+    {
+        std::lock_guard<std::mutex> status_lock(status_mu_);
+        sink_.reset();
+        sink_ = std::make_unique<FileSink>(segment_bytes_, segment_seconds_,
+                                           max_total_bytes_);
+        const std::uint64_t start_ms = TrafficNowMs();
+        if (!sink_->OpenSession(output_dir_, start_ms)) {
+            state_ = "error";
+            return false;
+        }
+        session_dir_ = sink_->session_dir();
     }
-    session_dir_ = sink_->session_dir();
     writer_stop_.store(false, std::memory_order_release);
     generation_.fetch_add(1, std::memory_order_acq_rel);
     writer_thread_ = std::thread(&TrafficRecorder::WriterLoop, this);
-    state_ = "recording";
+    SetState("recording");
     active_.store(true, std::memory_order_release);
     return true;
 }
@@ -263,11 +269,14 @@ void TrafficRecorder::Stop() {
 
 void TrafficRecorder::StopAsync() {
     std::lock_guard<std::mutex> lifecycle(lifecycle_mu_);
-    if (!active_.load(std::memory_order_acquire) ||
-        stop_thread_.joinable()) {
+    if (stop_thread_.joinable()) {
         return;
     }
-    state_ = "stopping";
+    if (!active_.load(std::memory_order_acquire) &&
+        !writer_thread_.joinable()) {
+        return;
+    }
+    SetState("stopping");
     stop_timeout_ms_ =
         stop_timeout_ms_ == 0 ? kDefaultStopTimeoutMs : stop_timeout_ms_;
     stop_deadline_ms_.store(TrafficNowMs() + stop_timeout_ms_,
@@ -308,6 +317,7 @@ void TrafficRecorder::StopInternal() {
                 DrainShardDirect(*shard);
             }
         }
+        std::lock_guard<std::mutex> status_lock(status_mu_);
         sink_->Flush();
         sink_->Close();
     }
@@ -316,7 +326,46 @@ void TrafficRecorder::StopInternal() {
         stop_timed_out_.store(true, std::memory_order_relaxed);
     }
     stop_deadline_ms_.store(0, std::memory_order_relaxed);
-    state_ = "idle";
+    const bool failed = writer_failed_.load(std::memory_order_relaxed) ||
+                        (sink_ != nullptr && sink_->failed());
+    SetState(failed ? "error" : "idle");
+    WriteSummaryJson(GetStatus());
+}
+
+void TrafficRecorder::SetState(const char* state) {
+    std::lock_guard<std::mutex> lock(status_mu_);
+    state_ = state;
+}
+
+void TrafficRecorder::WriteSummaryJson(const RecorderStatus& status) const {
+    if (session_dir_.empty()) {
+        return;
+    }
+    Json::Value root;
+    root["state"] = status.state;
+    root["observed_requests"] = static_cast<Json::UInt64>(status.observed_requests);
+    root["recorded_requests"] = static_cast<Json::UInt64>(status.recorded_requests);
+    root["dropped_requests"] = static_cast<Json::UInt64>(status.dropped_requests);
+    root["dropped_ring"] = static_cast<Json::UInt64>(status.dropped_ring);
+    root["dropped_filtered"] = static_cast<Json::UInt64>(status.dropped_filtered);
+    root["dropped_oversize"] = static_cast<Json::UInt64>(status.dropped_oversize);
+    root["bytes_written"] = static_cast<Json::UInt64>(status.bytes_written);
+    root["segments"] = static_cast<Json::UInt64>(status.segments);
+    root["format_complete"] = status.format_complete;
+    root["capture_complete"] = status.capture_complete;
+    root["stop_timed_out"] = status.stop_timed_out;
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = "";
+    std::ofstream out(session_dir_ + "/summary.json", std::ios::trunc);
+    if (!out) {
+        LOG(ERROR) << "traffic: cannot write summary.json in " << session_dir_;
+        return;
+    }
+    out << Json::writeString(builder, root);
+    out.close();
+    if (::chmod((session_dir_ + "/summary.json").c_str(), 0600) != 0) {
+        LOG(WARNING) << "traffic: cannot chmod summary.json";
+    }
 }
 
 void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
@@ -333,7 +382,8 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
             starting_.fetch_sub(1, std::memory_order_release);
             return;
         }
-        std::lock_guard<std::mutex> lock(shards_mu_);
+        // shards_ is immutable while active_; binding must not wait on the
+        // writer lock on the request path.
         const std::uint64_t index =
             next_shard_.fetch_add(1, std::memory_order_relaxed);
         if (index >= shards_.size()) {
@@ -347,6 +397,10 @@ void TrafficRecorder::OnRequest(const RequestView& view) noexcept {
     }
     Shard& shard = *tls_shard;
     shard.observed.fetch_add(1, std::memory_order_relaxed);
+    if (view.attach_length != 0) {
+        shard.dropped_filtered.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (!allow_all_routes_ &&
         allowed_routes_.find(view.route_key) == allowed_routes_.end()) {
         shard.dropped_filtered.fetch_add(1, std::memory_order_relaxed);
@@ -441,8 +495,9 @@ void TrafficRecorder::WriterLoop() {
             }
         }
         if (sink_ != nullptr && sink_->failed()) {
+            writer_failed_.store(true, std::memory_order_relaxed);
             active_.store(false, std::memory_order_release);
-            state_ = "error";
+            SetState("error");
             writer_stop_.store(true, std::memory_order_release);
             break;
         }
@@ -595,7 +650,7 @@ void TrafficRecorder::StartControlServer() {
             LOG(ERROR) << "traffic: control server failed on "
                        << control_host_ << ":" << control_port_ << ": "
                        << ec.value().message();
-            state_ = "error";
+            SetState("error");
             control_server_.reset();
             return;
         }
@@ -604,7 +659,7 @@ void TrafficRecorder::StartControlServer() {
                   << control_port_;
     } catch (const std::exception& e) {
         LOG(ERROR) << "traffic: control server exception: " << e.what();
-        state_ = "error";
+        SetState("error");
         control_server_.reset();
     }
 }
@@ -679,10 +734,15 @@ RecorderStatus TrafficRecorder::GetStatus() const {
         status.dropped_ring + dropped_filtered + dropped_oversize;
     status.ring_used_bytes = used;
     status.ring_capacity_bytes = capacity;
-    if (sink_ != nullptr) {
-        status.bytes_written = sink_->bytes_written();
-        status.segments = sink_->segments();
-        status.format_complete = !sink_->failed();
+    {
+        std::lock_guard<std::mutex> status_lock(status_mu_);
+        if (sink_ != nullptr) {
+            status.bytes_written = sink_->bytes_written();
+            status.segments = sink_->segments();
+            status.format_complete = !sink_->failed() &&
+                                     !writer_failed_.load(
+                                         std::memory_order_relaxed);
+        }
     }
     status.stop_timed_out = stop_timed_out_.load(std::memory_order_relaxed);
     const std::uint64_t deadline =
@@ -706,6 +766,8 @@ void TrafficRecorder::Shutdown() {
         control_server_->stop();
         control_server_.reset();
     }
+    config_loaded_ = false;
+    shutdown_.store(false, std::memory_order_release);
 }
 
 }  // namespace mooncake::traffic
