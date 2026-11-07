@@ -26,56 +26,57 @@ std::vector<std::string> SortedInFlightKeys(const Namespace& ns) {
     return keys;
 }
 
-// Starts or finishes a primary write on the object under `key`, under a write
-// guard of its own.
-void SetProcessing(Namespace& ns, const std::string& key, bool processing) {
+// Starts or finishes the primary write on the object under `key`, under a write
+// guard of its own. `replica_id` is the replica PublishEnvelopeWithOpenWrite
+// left behind, which is what names that write.
+void SetProcessing(Namespace& ns, const std::string& key, ReplicaID replica_id,
+                   bool processing) {
     auto guard = ns.objects.Write(key);
     ASSERT_TRUE(guard.has_value());
-    guard->state().is_processing = processing;
+    test::SetWriteInFlight(guard->metadata(), replica_id, processing);
 }
 
 TEST(NamespaceTest, InFlightListsOnlyObjectsWithWork) {
     Namespace ns;
     ASSERT_NE(test::PublishObject(ns.objects, "idle"), 0u);
-    ASSERT_NE(test::PublishObject(ns.objects, "busy"), 0u);
-    EXPECT_TRUE(ns.InFlightKeys().empty());
-
+    ReplicaID write = 0;
     {
-        auto guard = ns.objects.Write("busy");
-        ASSERT_TRUE(guard.has_value());
-        guard->state().is_processing = true;
+        auto guard = ns.objects.WriteKey("busy");
+        ASSERT_FALSE(guard.has_object());
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, write), 0u);
         // Listed as the guard is released, not before.
         EXPECT_TRUE(ns.InFlightKeys().empty());
     }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"busy"}));
 
-    // A write guard on an object with no work lists nothing.
+    // A write guard on an object with no work lists nothing, and one on the
+    // listed object lists it once.
     {
         auto guard = ns.objects.Write("idle");
         ASSERT_TRUE(guard.has_value());
     }
-    // Starting work again on a listed object lists it once.
-    SetProcessing(ns, "busy", true);
+    {
+        auto guard = ns.objects.Write("busy");
+        ASSERT_TRUE(guard.has_value());
+    }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"busy"}));
 
-    SetProcessing(ns, "busy", false);
+    SetProcessing(ns, "busy", write, false);
     EXPECT_TRUE(ns.InFlightKeys().empty());
 }
 
 TEST(NamespaceTest, AKeyStaysListedWhileAnyWorkRemains) {
     Namespace ns;
-    ASSERT_NE(test::PublishObject(ns.objects, "k1"), 0u);
-
+    ReplicaID write = 0;
     {
-        auto guard = ns.objects.Write("k1");
-        ASSERT_TRUE(guard.has_value());
-        guard->state().is_processing = true;
-        guard->state().offloading_task =
+        auto guard = ns.objects.WriteKey("k1");
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, write), 0u);
+        guard.state().offloading_task =
             OffloadingTask{1, std::chrono::system_clock::now(), {}};
     }
 
     // The write finished but the offload has not, so the key stays listed.
-    SetProcessing(ns, "k1", false);
+    SetProcessing(ns, "k1", write, false);
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
 
     {
@@ -88,12 +89,12 @@ TEST(NamespaceTest, AKeyStaysListedWhileAnyWorkRemains) {
 
 TEST(NamespaceTest, PublishingWithWorkListsTheKeyOnRelease) {
     Namespace ns;
+    ReplicaID write = 0;
     {
         // The write that creates the object starts with work in flight.
         auto guard = ns.objects.WriteKey("k1");
         ASSERT_FALSE(guard.has_object());
-        (void)test::PublishEnvelope(guard);
-        guard.state().is_processing = true;
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, write), 0u);
         EXPECT_TRUE(ns.InFlightKeys().empty());
     }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
@@ -103,7 +104,7 @@ TEST(NamespaceTest, PublishingWithWorkListsTheKeyOnRelease) {
     EXPECT_EQ(test::PublishObject(ns.objects, "k1"), 0u);
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
 
-    SetProcessing(ns, "k1", false);
+    SetProcessing(ns, "k1", write, false);
     EXPECT_TRUE(ns.InFlightKeys().empty());
 }
 
@@ -118,10 +119,16 @@ TEST(NamespaceTest, AWriterThatPublishesNothingListsNothing) {
 
 TEST(NamespaceTest, TearDownTakesAKeyOffTheInFlightList) {
     Namespace ns;
-    ASSERT_NE(test::PublishObject(ns.objects, "k1"), 0u);
-    ASSERT_NE(test::PublishObject(ns.objects, "k2"), 0u);
-    SetProcessing(ns, "k1", true);
-    SetProcessing(ns, "k2", true);
+    ReplicaID first = 0;
+    ReplicaID second = 0;
+    {
+        auto guard = ns.objects.WriteKey("k1");
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, first), 0u);
+    }
+    {
+        auto guard = ns.objects.WriteKey("k2");
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, second), 0u);
+    }
     ASSERT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1", "k2"}));
 
     // The object still carried its write, yet the key leaves the list with
@@ -133,14 +140,18 @@ TEST(NamespaceTest, TearDownTakesAKeyOffTheInFlightList) {
     }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k2"}));
 
-    SetProcessing(ns, "k2", false);
+    SetProcessing(ns, "k2", second, false);
     EXPECT_TRUE(ns.InFlightKeys().empty());
 }
 
 TEST(NamespaceTest, AReplacementIsListedByItsOwnWork) {
     Namespace ns;
-    ASSERT_NE(test::PublishObject(ns.objects, "k1"), 0u);
-    SetProcessing(ns, "k1", true);
+    ReplicaID write = 0;
+    {
+        auto guard = ns.objects.WriteKey("k1");
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, write), 0u);
+    }
+    ASSERT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
 
     // A replacement under one guard starts with empty state, so the key is
     // unlisted unless the new publication carries work of its own.
@@ -156,22 +167,28 @@ TEST(NamespaceTest, AReplacementIsListedByItsOwnWork) {
         auto guard = ns.objects.Write("k1");
         ASSERT_TRUE(guard.has_value());
         guard->TearDown();
-        (void)test::PublishEnvelope(*guard);
-        guard->state().is_processing = true;
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(*guard, write), 0u);
     }
     EXPECT_EQ(SortedInFlightKeys(ns), (std::vector<std::string>{"k1"}));
 
-    SetProcessing(ns, "k1", false);
+    SetProcessing(ns, "k1", write, false);
+    EXPECT_TRUE(ns.InFlightKeys().empty());
 }
 
 TEST(NamespaceTest, DestroyingANamespaceWithListedKeysIsClean) {
     // The list is declared after the route, so it lets go of the slots' hooks
     // before the route destroys the slots: none is destroyed still linked.
     Namespace ns;
-    ASSERT_NE(test::PublishObject(ns.objects, "k1"), 0u);
-    ASSERT_NE(test::PublishObject(ns.objects, "k2", "g1"), 0u);
-    SetProcessing(ns, "k1", true);
-    SetProcessing(ns, "k2", true);
+    ReplicaID first = 0;
+    ReplicaID second = 0;
+    {
+        auto guard = ns.objects.WriteKey("k1");
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, first), 0u);
+    }
+    {
+        auto guard = ns.objects.WriteKey("k2");
+        ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, second, "g1"), 0u);
+    }
     ASSERT_EQ(ns.InFlightKeys().size(), 2u);
 }
 
@@ -205,13 +222,16 @@ TEST(NamespaceTest, ConcurrentWritersKeepTheInFlightListExact) {
     std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t) {
         threads.emplace_back([&, t] {
+            std::vector<ReplicaID> writes(kKeysPerThread, 0);
             for (int k = 0; k < kKeysPerThread; ++k) {
-                ASSERT_NE(test::PublishObject(ns.objects, key_of(t, k)), 0u);
+                auto guard = ns.objects.WriteKey(key_of(t, k));
+                ASSERT_NE(test::PublishEnvelopeWithOpenWrite(guard, writes[k]),
+                          0u);
             }
             for (int round = 0; round < kRounds; ++round) {
                 const bool last = round == kRounds - 1;
                 for (int k = 0; k < kKeysPerThread; ++k) {
-                    SetProcessing(ns, key_of(t, k),
+                    SetProcessing(ns, key_of(t, k), writes[k],
                                   last ? k % 2 == 0 : round % 2 == 0);
                 }
             }

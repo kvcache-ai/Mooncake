@@ -74,13 +74,18 @@ std::vector<Replica> MemoryReplicas(
 
 // Publishes an object of `length` bytes with `replicas` under the key `guard`
 // holds, which holds no object.
+// Publishes an object of `length` bytes with `replicas` under the key `guard`
+// holds, which holds no object. The replicas keep the status they are given.
 void PublishUnder(const route::WriteGuard& guard, size_t length,
                   std::vector<Replica> replicas) {
-    guard.Publish(
-        UUID{1, 2},
-        std::chrono::system_clock::time_point(std::chrono::seconds(1)), length,
-        std::move(replicas), std::nullopt, false, ObjectDataType::UNKNOWN,
-        std::string{}, TenantId(), guard.key());
+    (void)guard.Publish(/*part_count=*/1, TenantId(), guard.key(),
+                        std::string{}, ObjectDataType::UNKNOWN,
+                        /*hard_pinned=*/false, std::nullopt);
+    auto began = guard.metadata().BeginWrite(
+        /*index=*/0, length, std::move(replicas), UUID{1, 2},
+        /*session_id=*/"",
+        std::chrono::system_clock::time_point(std::chrono::seconds(1)));
+    ASSERT_TRUE(began.has_value());
 }
 
 void MarkMemoryReplicasComplete(const route::WriteGuard& guard) {
@@ -176,16 +181,25 @@ TEST(TenantQuotaPolicyChargeTest, ChargesEveryMemoryReplicaThatHoldsMemory) {
                         ReplicaStatus::COMPLETE, ReplicaStatus::REMOVED,
                         ReplicaStatus::FAILED});
     replicas.emplace_back("/tmp/disk-replica", 100, ReplicaStatus::COMPLETE);
-    const ObjectMetadata metadata(UUID{1, 2}, std::chrono::system_clock::now(),
-                                  100, std::move(replicas));
+    ObjectMetadata metadata(/*part_count=*/1, kTenantA, "key", "",
+                            ObjectDataType::UNKNOWN, /*hard_pinned=*/false,
+                            std::nullopt);
+    auto began = metadata.BeginWrite(
+        /*index=*/0, /*length=*/100, std::move(replicas), UUID{1, 2},
+        /*session_id=*/"", std::chrono::system_clock::now());
+    ASSERT_TRUE(began.has_value());
     EXPECT_EQ(TenantQuotaPolicy::MemoryCharge(metadata), 400u);
 }
 
 TEST(TenantQuotaPolicyChargeTest, SaturatesAtTheAccountingRange) {
-    const ObjectMetadata metadata(
-        UUID{1, 2}, std::chrono::system_clock::now(),
-        TenantQuotaAccount::kMaxChargedBytes,
-        MemoryReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::COMPLETE}));
+    ObjectMetadata metadata(/*part_count=*/1, kTenantA, "key", "",
+                            ObjectDataType::UNKNOWN, /*hard_pinned=*/false,
+                            std::nullopt);
+    auto began = metadata.BeginWrite(
+        /*index=*/0, TenantQuotaAccount::kMaxChargedBytes,
+        MemoryReplicas({ReplicaStatus::COMPLETE, ReplicaStatus::COMPLETE}),
+        UUID{1, 2}, /*session_id=*/"", std::chrono::system_clock::now());
+    ASSERT_TRUE(began.has_value());
     EXPECT_EQ(TenantQuotaPolicy::MemoryCharge(metadata),
               TenantQuotaAccount::kMaxChargedBytes);
 }

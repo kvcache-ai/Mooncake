@@ -30,7 +30,7 @@ TEST_F(MasterServiceTest, ResidencyAffinitySurvivesPutAndUpsert) {
         ASSERT_TRUE(accessor.Exists());
         const auto& metadata = accessor.Get();
         EXPECT_EQ("opaque-unit", metadata.residency_affinity_id);
-        EXPECT_EQ("write-session", metadata.session_id);
+        EXPECT_EQ("write-session", metadata.WriteSessionId());
         for (const auto& encoded :
              {MasterServiceTestPeer::SerializeMetadataForOpLogForTesting(
                   service, metadata),

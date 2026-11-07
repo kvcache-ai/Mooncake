@@ -14,24 +14,76 @@
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+
 #include "object_metadata.h"
 #include "metadata/object_route.h"
 
 namespace mooncake {
 namespace test {
 
-// Publishes a minimal 128 B, replica-less envelope under the key `guard` holds,
-// which holds no object, and returns its generation. These suites exercise the
-// object model, not replica validity, so nothing here sets a real replica. The
-// write time is fixed rather than read from the clock so a suite that ages a
-// lease cannot pick up a moving value.
+// Publishes an empty 128 B part under the key `guard` holds, which holds no
+// object, and returns its generation. The write time is fixed rather than read
+// from the clock, so a suite that ages a lease cannot pick up a moving value.
 inline route::Generation PublishEnvelope(const route::WriteGuard& guard,
                                          const std::string& group_id = {}) {
+    const auto generation = guard.Publish(
+        /*part_count=*/1, TenantId(), guard.key(), group_id,
+        ObjectDataType::UNKNOWN, /*hard_pinned=*/false, std::nullopt);
     const auto write_time =
         std::chrono::system_clock::time_point(std::chrono::seconds(1));
-    return guard.Publish(UUID{1, 2}, write_time, 128, std::vector<Replica>{},
-                         std::nullopt, false, ObjectDataType::UNKNOWN, group_id,
-                         TenantId(), guard.key());
+    auto begin_write = guard.metadata().BeginWrite(
+        /*index=*/0, /*length=*/128, std::vector<Replica>{}, UUID{1, 2},
+        /*session_id=*/"", write_time);
+    CHECK(begin_write.has_value())
+        << "an object published by this helper starts empty";
+    return generation;
+}
+
+// Publishes that envelope with one replica its writer has not ended, so the
+// object carries a primary write in flight until SetWriteInFlight finishes it.
+// `replica_id` names that replica, which is what a later guard needs to speak
+// of the same write.
+inline route::Generation PublishEnvelopeWithOpenWrite(
+    const route::WriteGuard& guard, ReplicaID& replica_id,
+    const std::string& group_id = {}) {
+    const auto generation = guard.Publish(
+        /*part_count=*/1, TenantId(), guard.key(), group_id,
+        ObjectDataType::UNKNOWN, /*hard_pinned=*/false, std::nullopt);
+    Replica replica("open-write.replica", 128, ReplicaStatus::PROCESSING);
+    replica_id = replica.id();
+    const auto write_time =
+        std::chrono::system_clock::time_point(std::chrono::seconds(1));
+    std::vector<Replica> replicas;
+    replicas.push_back(std::move(replica));
+    auto begin_write = guard.metadata().BeginWrite(
+        /*index=*/0, /*length=*/128, std::move(replicas), UUID{1, 2},
+        /*session_id=*/"", write_time);
+    CHECK(begin_write.has_value())
+        << "an object published by this helper starts empty";
+    return generation;
+}
+
+// Starts or finishes the write that left `replica_id` on `metadata`. The
+// attempt keeps naming that replica, so the object carries a write in flight
+// exactly while the replica is unfinished.
+inline void SetWriteInFlight(ObjectMetadata& metadata, ReplicaID replica_id,
+                             bool in_flight) {
+    const size_t visited = metadata.VisitReplicas(
+        [replica_id](const Replica& replica) {
+            return replica.id() == replica_id;
+        },
+        [in_flight](Replica& replica) {
+            if (in_flight == replica.is_processing()) {
+                return;
+            }
+            if (in_flight) {
+                replica.mark_processing();
+            } else {
+                replica.mark_complete();
+            }
+        });
+    CHECK_EQ(visited, 1u) << "the write left exactly one replica behind";
 }
 
 // Publishes that envelope under `key` and returns its generation, or 0 when
