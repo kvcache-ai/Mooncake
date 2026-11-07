@@ -112,5 +112,74 @@ TEST_F(TransferSubmitterConfigTest, NewConfigsReadCurrentEnvironment) {
     EXPECT_FALSE(third.memcpy_enabled_override.has_value());
 }
 
+class TransferTimeoutConfigTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        if (const char* value = std::getenv(kEnv)) {
+            original_ = value;
+        }
+        google::InitGoogleLogging("TransferTimeoutConfigTest");
+        original_logtostderr_ = FLAGS_logtostderr;
+        FLAGS_logtostderr = true;
+        ASSERT_EQ(unsetenv(kEnv), 0);
+    }
+
+    void TearDown() override {
+        if (original_.has_value()) {
+            EXPECT_EQ(setenv(kEnv, original_->c_str(), 1), 0);
+        } else {
+            EXPECT_EQ(unsetenv(kEnv), 0);
+        }
+        FLAGS_logtostderr = original_logtostderr_;
+        google::ShutdownGoogleLogging();
+    }
+
+    static constexpr const char* kEnv = "MC_STORE_TRANSFER_TIMEOUT_S";
+
+   private:
+    std::optional<std::string> original_;
+    bool original_logtostderr_ = false;
+};
+
+TEST_F(TransferTimeoutConfigTest, UnsetUsesDefault) {
+    ::testing::internal::CaptureStderr();
+    const auto config = TransferTimeoutConfig::FromEnvironment();
+    const auto diagnostics = ::testing::internal::GetCapturedStderr();
+
+    EXPECT_EQ(config.timeout_seconds, 60);
+    EXPECT_TRUE(diagnostics.empty()) << diagnostics;
+}
+
+TEST_F(TransferTimeoutConfigTest, ParsesPositiveValuesAndRejectsInvalid) {
+    struct Case {
+        const char* value;
+        int expected;
+        bool expect_warning;
+    };
+    const Case cases[] = {
+        {"1", 1, false},           {"300", 300, false}, {" 120 ", 120, false},
+        {"", 60, false},           {"0", 60, true},     {"-5", 60, true},
+        {"abc", 60, true},         {"10s", 60, true},   {"1.5", 60, true},
+        {"99999999999", 60, true},
+    };
+
+    for (const auto& test_case : cases) {
+        SCOPED_TRACE(test_case.value);
+        ASSERT_EQ(setenv(kEnv, test_case.value, 1), 0);
+        ::testing::internal::CaptureStderr();
+        const auto config = TransferTimeoutConfig::FromEnvironment();
+        const auto diagnostics = ::testing::internal::GetCapturedStderr();
+
+        EXPECT_EQ(config.timeout_seconds, test_case.expected);
+        if (test_case.expect_warning) {
+            EXPECT_NE(diagnostics.find(
+                          "Invalid value for MC_STORE_TRANSFER_TIMEOUT_S:"),
+                      std::string::npos);
+        } else {
+            EXPECT_TRUE(diagnostics.empty()) << diagnostics;
+        }
+    }
+}
+
 }  // namespace
 }  // namespace mooncake
