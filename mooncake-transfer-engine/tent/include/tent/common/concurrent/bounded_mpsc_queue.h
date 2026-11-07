@@ -43,17 +43,16 @@ struct BoundedMPSCQueue {
 
     ~BoundedMPSCQueue() = default;
 
-    void push(T &slice_list) {
-        while (!try_push(slice_list)) {
-            std::this_thread::yield();
-        }
-    }
+    struct Reservation {
+        Cell *cell = nullptr;
+        uint64_t position = 0;
+    };
 
-    // Non-blocking push: returns false when the queue is full. The worker
-    // thread re-enqueues through this so a full queue parks the entry in a
-    // local overflow instead of wedging the only consumer (issue #3637).
-    bool try_push(T &slice_list) {
-        if (slice_list.num_slices == 0) return true;
+    // Claim a producer slot without publishing data to the consumer. A caller
+    // can reserve several queues first, then either commit every real entry or
+    // cancel the reservations with empty entries. This prevents a partial
+    // multi-queue admission from exposing work before all queues have room.
+    bool try_reserve(Reservation &reservation) {
         uint64_t pos = tail.load(std::memory_order_relaxed);
         Cell *cell = &buffer[pos % Capacity];
 
@@ -64,9 +63,56 @@ struct BoundedMPSCQueue {
                                         std::memory_order_relaxed)) {
             return false;
         }
-        cell->data = slice_list;
-        cell->sequence.store(pos + 1, std::memory_order_release);
+        reservation.cell = cell;
+        reservation.position = pos;
         return true;
+    }
+
+    void commit(Reservation &reservation, T const &slice_list) {
+        reservation.cell->data = slice_list;
+        reservation.cell->sequence.store(reservation.position + 1,
+                                         std::memory_order_release);
+        reservation.cell = nullptr;
+    }
+
+    void cancel_reservation(Reservation &reservation) {
+        commit(reservation, T{});
+    }
+
+    // Non-blocking push: returns false when the queue is full. The worker
+    // thread re-enqueues through this so a full queue parks the entry in a
+    // local overflow instead of wedging the only consumer (issue #3637).
+    bool try_push(T &slice_list) {
+        if (slice_list.num_slices == 0) return true;
+        Reservation reservation;
+        if (!try_reserve(reservation)) return false;
+        commit(reservation, slice_list);
+        return true;
+    }
+
+    void push(T &slice_list) {
+        while (!try_push(slice_list)) {
+            std::this_thread::yield();
+        }
+    }
+
+    // A canceled reservation publishes an empty entry, which still needs to
+    // be consumed to release its slot. Check publication rather than T's
+    // contents, and do not report entries behind an uncommitted head as ready.
+    bool has_ready() const {
+        uint64_t pos = head.load(std::memory_order_relaxed);
+        const Cell *cell = &buffer[pos % Capacity];
+        return cell->sequence.load(std::memory_order_acquire) == pos + 1;
+    }
+
+    // Consumer-only: empty canceled entries do not require send quota. Stop
+    // at a real entry or an unpublished head so FIFO publication is preserved.
+    void discard_empty_entries() {
+        while (has_ready()) {
+            uint64_t pos = head.load(std::memory_order_relaxed);
+            if (buffer[pos % Capacity].data.num_slices != 0) break;
+            pop();
+        }
     }
 
     T pop() {
