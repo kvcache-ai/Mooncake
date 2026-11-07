@@ -948,6 +948,34 @@ TEST_F(ClientIntegrationTest, AffinityOnlyBatchWritesSkipChecksumFailures) {
     client_buffer_allocator_->deallocate(buffer, 4);
 }
 
+TEST_F(ClientIntegrationTest, ResidencyAffinityRejectsMutationAndEmptyValue) {
+    constexpr size_t value_size = 4;
+    void* buffer = client_buffer_allocator_->allocate(value_size);
+    ASSERT_NE(buffer, nullptr);
+    std::memcpy(buffer, "data", value_size);
+    std::vector<Slice> slices{{buffer, value_size}};
+
+    ReplicateConfig initial;
+    initial.residency_affinity_ids = std::vector<std::string>{"affinity-a"};
+    ASSERT_TRUE(test_client_->Put("residency-affinity-wire", slices, initial));
+
+    ReplicateConfig changed = initial;
+    changed.residency_affinity_ids = std::vector<std::string>{"affinity-b"};
+    auto upsert =
+        test_client_->Upsert("residency-affinity-wire", slices, changed);
+    ASSERT_FALSE(upsert);
+    EXPECT_EQ(upsert.error(), ErrorCode::INVALID_PARAMS);
+
+    ReplicateConfig empty;
+    empty.residency_affinity_ids = std::vector<std::string>{};
+    auto empty_put =
+        test_client_->Put("residency-affinity-empty", slices, empty);
+    ASSERT_FALSE(empty_put);
+    EXPECT_EQ(empty_put.error(), ErrorCode::INVALID_PARAMS);
+
+    client_buffer_allocator_->deallocate(buffer, value_size);
+}
+
 // Test Remove operation
 TEST_F(ClientIntegrationTest, RemoveOperation) {
     const std::string test_data = "Test data for removal";

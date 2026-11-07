@@ -29,6 +29,10 @@
 #include "tent/runtime/slab.h"
 #include "tent/runtime/topology.h"
 
+#if defined(USE_CUDA)
+#include "tent/platform/cuda_utils.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -182,11 +186,18 @@ Status FabricTransport::install(std::string& local_segment_name,
     }
 
     caps.dram_to_dram = true;
+    hmem_ = !contexts_.empty();
+    for (auto& context : contexts_) hmem_ = hmem_ && context->hmem();
+    if (hmem_) {
+        caps.dram_to_gpu = true;
+        caps.gpu_to_dram = true;
+        caps.gpu_to_gpu = true;
+    }
     shutting_down_.store(false, std::memory_order_release);
     installed_ = true;
     LOG(INFO) << "Fabric transport installed: provider=" << profile_->name
               << " nics=" << contexts_.size() << " slice_size=" << slice_size_
-              << (virt_addr_ ? " va" : " offset");
+              << (virt_addr_ ? " va" : " offset") << (hmem_ ? " hmem" : "");
     return Status::OK();
 }
 
@@ -417,12 +428,16 @@ Status FabricTransport::resolveTarget(const Request& request, Target& target) {
                             "Fabric buffer chunk has no NIC" LOC_MARK);
                 }
                 if (status.ok()) {
+                    // The owner's choice wins; it knows the PCIe layout.
                     const int numa_node = cpuNumaNode(buffer->location);
                     for (const auto& chunk : decoded->attr.chunks) {
                         decoded->preferred.push_back(
-                            numaLocalNics(chunk.nics, numa_node, [&](int nic) {
-                                return peer->attr.nics[nic].numa_node;
-                            }));
+                            !chunk.near.empty()
+                                ? chunk.near
+                                : numaLocalNics(
+                                      chunk.nics, numa_node, [&](int nic) {
+                                          return peer->attr.nics[nic].numa_node;
+                                      }));
                     }
                 }
                 if (!status.ok()) {
@@ -598,12 +613,15 @@ Status FabricTransport::getTransferStatus(SubBatchRef batch, int task_id,
 }
 
 Status FabricTransport::registerBuffer(
-    uint64_t addr, uint64_t length,
+    uint64_t addr, uint64_t length, int cuda_device,
     std::shared_ptr<FabricLocalBuffer>& buffer) {
     uint64_t page_size = 0;
     uint64_t chunk_limit = chunk_limit_;
     uint64_t pte_budget = 0;
-    if (profile_->limit_mr_by_pte && params_.max_pte_entries) {
+    // The PTE budget covers host pages; device memory is pinned by the GPU
+    // driver in 64 KiB pages.
+    if (profile_->limit_mr_by_pte && params_.max_pte_entries &&
+        cuda_device < 0) {
         page_size = detectPageSize(addr);
         pte_budget = params_.max_pte_entries;
         const uint64_t pte_limit = pte_budget * page_size;
@@ -648,7 +666,8 @@ Status FabricTransport::registerBuffer(
         const int nic = jobs[j].nic;
         results[j] = contexts_[nic]->registerMemory(
             reinterpret_cast<void*>(addr + chunk.range.offset),
-            chunk.range.length, chunk.mr[nic], chunk.desc[nic], chunk.key[nic]);
+            chunk.range.length, cuda_device, chunk.mr[nic], chunk.desc[nic],
+            chunk.key[nic]);
     };
     const size_t threads = std::min(
         jobs.size(), std::max<size_t>(1, params_.max_register_threads));
@@ -674,15 +693,65 @@ Status FabricTransport::registerBuffer(
     return Status::OK();
 }
 
+std::vector<int> FabricTransport::nearNics(const std::vector<int>& nics,
+                                           uint64_t addr,
+                                           const std::string& location,
+                                           int cuda_device) const {
+    int numa_node = -1;
+    if (cuda_device >= 0) {
+        const auto* mem = local_topology_
+                              ? local_topology_->getMemEntry(
+                                    "cuda:" + std::to_string(cuda_device))
+                              : nullptr;
+        if (mem) {
+            // Rank 0 holds the NICs nearest the GPU on the PCIe tree.
+            const auto& closest = mem->device_list[0];
+            const std::string suffix = profile_->domain_suffix;
+            std::vector<int> near;
+            for (int nic : nics) {
+                std::string name = contexts_[nic]->name();
+                if (!suffix.empty() && name.size() > suffix.size() &&
+                    name.compare(name.size() - suffix.size(), suffix.size(),
+                                 suffix) == 0)
+                    name.resize(name.size() - suffix.size());
+                const int id = local_topology_->getNicId(name);
+                if (id >= 0 && std::find(closest.begin(), closest.end(), id) !=
+                                   closest.end())
+                    near.push_back(nic);
+            }
+            if (!near.empty()) return near;
+            numa_node = mem->numa_node;
+        }
+    } else {
+        numa_node = cpuNumaNode(location);
+        if (numa_node < 0) {
+            auto located = Platform::getLoader().getLocation(
+                reinterpret_cast<void*>(addr), 1);
+            if (!located.empty()) numa_node = cpuNumaNode(located[0].location);
+        }
+    }
+    return numaLocalNics(nics, numa_node,
+                         [&](int nic) { return contexts_[nic]->numaNode(); });
+}
+
 Status FabricTransport::addMemoryBuffer(BufferDesc& desc,
                                         const MemoryOptions& options) {
     if (!installed_ || shutting_down_.load(std::memory_order_acquire)) {
         return Status::TooManyRequests(
             "Fabric transport is shutting down" LOC_MARK);
     }
-    // Device memory needs FI_HMEM and comes in a follow-up.
-    if (Platform::getLoader().getMemoryType(
-            reinterpret_cast<void*>(desc.addr)) != MTYPE_CPU) {
+    int cuda_device = -1;
+    const auto mtype =
+        Platform::getLoader().getMemoryType(reinterpret_cast<void*>(desc.addr));
+    if (mtype == MTYPE_CUDA) {
+#if defined(USE_CUDA)
+        if (hmem_)
+            cuda_device =
+                getCudaDeviceForPtr(reinterpret_cast<void*>(desc.addr));
+#endif
+        // Leave it to other transports.
+        if (cuda_device < 0) return Status::OK();
+    } else if (mtype != MTYPE_CPU) {
         return Status::OK();
     }
 
@@ -694,17 +763,11 @@ Status FabricTransport::addMemoryBuffer(BufferDesc& desc,
             buffer = it->second;
     }
     if (!buffer) {
-        CHECK_STATUS(registerBuffer(desc.addr, desc.length, buffer));
-        int numa_node = cpuNumaNode(desc.location);
-        if (numa_node < 0) {
-            auto located = Platform::getLoader().getLocation(
-                reinterpret_cast<void*>(desc.addr), 1);
-            if (!located.empty()) numa_node = cpuNumaNode(located[0].location);
-        }
+        CHECK_STATUS(
+            registerBuffer(desc.addr, desc.length, cuda_device, buffer));
         for (auto& chunk : buffer->chunks) {
-            chunk.post_nics = numaLocalNics(
-                chunk.nics, numa_node,
-                [&](int nic) { return contexts_[nic]->numaNode(); });
+            chunk.post_nics =
+                nearNics(chunk.nics, desc.addr, desc.location, cuda_device);
         }
         std::unique_lock<std::shared_mutex> guard(buffers_mutex_);
         auto& slot = buffers_[desc.addr];
@@ -722,6 +785,8 @@ Status FabricTransport::addMemoryBuffer(BufferDesc& desc,
             entry.nics.push_back(nic);
             entry.keys.push_back(chunk.key[nic]);
         }
+        if (chunk.post_nics.size() < chunk.nics.size())
+            entry.near = chunk.post_nics;
         attr.chunks.push_back(std::move(entry));
     }
     buffer->published = true;

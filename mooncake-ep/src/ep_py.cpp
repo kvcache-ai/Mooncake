@@ -79,7 +79,7 @@ PYBIND11_MODULE(_ep, m) {
         .def("get_ipc_handle", &EpBuffer::get_ipc_handle)
         .def("sync_nvlink_ipc_handles", &EpBuffer::sync_nvlink_ipc_handles);
 #if !defined(MOONCAKE_EP_USE_XPU)
-    // RDMA (IBGDA) bootstrap; XPU reaches peers over Level Zero IPC only.
+    // RDMA (IBGDA) bootstrap; XPU uses init_rdma and connect_rdma below.
     buffer.def("update_local_qpns", &EpBuffer::update_local_qpns)
         .def("sync_ibgda_peers", &EpBuffer::sync_ibgda_peers)
         .def("get_mr_info", &EpBuffer::get_mr_info)
@@ -127,7 +127,12 @@ PYBIND11_MODULE(_ep, m) {
         .def("combine", &MooncakeEpBuffer::combine);
 #else
     buffer.def("dispatch", &EpBuffer::dispatch)
-        .def("combine", &EpBuffer::combine);
+        .def("combine", &EpBuffer::combine)
+        // Ranks on other nodes: a host proxy's RDMA writes, not IBGDA.
+        .def_static("rdma_available", &EpBuffer::rdma_available)
+        .def("init_rdma", &EpBuffer::init_rdma, py::arg("remote"))
+        .def("connect_rdma", &EpBuffer::connect_rdma, py::arg("infos"),
+             py::arg("active_ranks_mask"));
 #endif
 
 #ifdef MOONCAKE_EP_HAS_ELASTIC
