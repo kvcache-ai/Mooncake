@@ -93,9 +93,12 @@ struct SelectionContext {
     // so XpuTransport can address it, unstaged, although the segment is not
     // local. Other transports still follow host_staging.
     bool xpu_ipc{false};
+    // A same-host MLU buffer has been mapped through CNRT IPC.
+    bool mlu_ipc{false};
     // Only XpuTransport may carry the request: the device memory has neither
     // a dma-buf RDMA registration nor a host staging route.
     bool xpu_ipc_only{false};
+    bool mlu_ipc_only{false};
 };
 
 /**

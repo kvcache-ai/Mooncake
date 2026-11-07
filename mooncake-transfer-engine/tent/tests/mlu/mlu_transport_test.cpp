@@ -237,6 +237,26 @@ class MluTransportTest : public ::testing::Test {
     MluTransport transport_;
 };
 
+TEST_F(MluTransportTest, RestrictedBuffersDoNotExportIpcHandle) {
+    uint8_t *device = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&device, kChunk));
+
+    BufferDesc desc;
+    desc.addr = reinterpret_cast<uint64_t>(device);
+    desc.length = kChunk;
+    desc.location = "mlu:0";
+    MemoryOptions options;
+    for (auto permission : {kLocalReadWrite, kGlobalReadOnly}) {
+        options.perm = permission;
+        desc.transport_attrs[MLU] = "stale IPC handle";
+        ASSERT_TRUE(transport_.addMemoryBuffer(desc, options).ok());
+        EXPECT_EQ(desc.transport_attrs.count(MLU), 0);
+        ASSERT_TRUE(transport_.removeMemoryBuffer(desc).ok());
+    }
+
+    EXPECT_TRUE(loader_->free(device, kChunk).ok());
+}
+
 struct RegisteredHost {
     explicit RegisteredHost(MluTransport &transport, size_t size)
         : transport(transport) {
@@ -522,17 +542,55 @@ TEST_F(MluTransportTest, FailsWhenNeitherSideIsDeviceMemory) {
     EXPECT_EQ(host_b[0], 2);
 }
 
-TEST_F(MluTransportTest, FailsWhenBothSidesAreDeviceMemory) {
+TEST_F(MluTransportTest, CopiesBetweenDeviceBuffers) {
     uint8_t *a = nullptr;
     uint8_t *b = nullptr;
     ASSERT_NO_FATAL_FAILURE(allocDevice(&a, kChunk));
     ASSERT_NO_FATAL_FAILURE(allocDevice(&b, kChunk));
 
+    std::vector<uint8_t> expected(kChunk, 0x5a), actual(kChunk);
+    ASSERT_TRUE(loader_->copy(a, expected.data(), kChunk).ok());
     auto status = run(makeRequest(Request::WRITE, a, (uint64_t)b, kChunk));
-    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kChunk);
+    ASSERT_TRUE(loader_->copy(actual.data(), b, kChunk).ok());
+    EXPECT_EQ(actual, expected);
+
+    std::fill(expected.begin(), expected.end(), 0x7c);
+    ASSERT_TRUE(loader_->copy(b, expected.data(), kChunk).ok());
+    status = run(makeRequest(Request::READ, a, (uint64_t)b, kChunk));
+    EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(loader_->copy(actual.data(), a, kChunk).ok());
+    EXPECT_EQ(actual, expected);
 
     loader_->free(a, kChunk);
     loader_->free(b, kChunk);
+}
+
+TEST_F(MluTransportTest, CopiesBetweenPeerDevices) {
+    unsigned int count = 0;
+    ASSERT_EQ(cnrtGetDeviceCount(&count), cnrtSuccess);
+    if (count < 2) GTEST_SKIP() << "Two MLU devices required";
+    unsigned int accessible = 0;
+    ASSERT_EQ(cnrtGetPeerAccessibility(&accessible, 1, 0), cnrtSuccess);
+    if (!accessible) GTEST_SKIP() << "MLU devices are not peer accessible";
+
+    uint8_t *src = nullptr;
+    ASSERT_NO_FATAL_FAILURE(allocDevice(&src, kChunk));
+    MemoryOptions options;
+    options.location = "mlu:1";
+    void *dst = nullptr;
+    ASSERT_TRUE(loader_->allocate(&dst, kChunk, options).ok());
+    std::vector<uint8_t> expected(kChunk, 0x6b), actual(kChunk);
+    ASSERT_TRUE(loader_->copy(src, expected.data(), kChunk).ok());
+    auto status = run(makeRequest(Request::WRITE, src,
+                                  reinterpret_cast<uint64_t>(dst), kChunk));
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, kChunk);
+    ASSERT_TRUE(loader_->copy(actual.data(), dst, kChunk).ok());
+    EXPECT_EQ(actual, expected);
+    EXPECT_TRUE(loader_->free(src, kChunk).ok());
+    EXPECT_TRUE(loader_->free(dst, kChunk).ok());
 }
 
 TEST_F(MluTransportTest, FailsOnNonLocalTarget) {
@@ -543,8 +601,11 @@ TEST_F(MluTransportTest, FailsOnNonLocalTarget) {
     auto request =
         makeRequest(Request::WRITE, dev, (uint64_t)staging.data(), kChunk);
     request.target_id = LOCAL_SEGMENT_ID + 1;
-    auto status = run(request);
-    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch, 1).ok());
+    EXPECT_FALSE(transport_.submitTransferTasks(batch, {request}).ok());
+    EXPECT_EQ(static_cast<MluSubBatch *>(batch)->task_list.size(), 0u);
+    EXPECT_TRUE(transport_.freeSubBatch(batch).ok());
 
     loader_->free(dev, kChunk);
 }
