@@ -13,6 +13,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <xxhash.h>
 
@@ -139,6 +140,7 @@ class FakeHaKvBackend : public HaKvBackend {
         if (range_error_ != ErrorCode::OK) {
             return range_error_;
         }
+        range_begin_keys_.emplace_back(begin_key);
         kvs.clear();
         for (const auto& [key, value] : values_) {
             if (key >= begin_key && key < end_key) {
@@ -179,10 +181,15 @@ class FakeHaKvBackend : public HaKvBackend {
         std::lock_guard<std::mutex> lock(mutex_);
         next_get_error_ = err;
     }
+    std::vector<std::string> TakeRangeBeginKeys() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return std::exchange(range_begin_keys_, {});
+    }
 
    private:
     mutable std::mutex mutex_;
     std::map<std::string, std::string> values_;
+    std::vector<std::string> range_begin_keys_;
     ErrorCode get_error_{ErrorCode::OK};
     ErrorCode range_error_{ErrorCode::OK};
     ErrorCode next_get_error_{ErrorCode::OK};
@@ -513,6 +520,106 @@ TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
     // No new entries after restart, so only the recovered baseline can have
     // restored the gauge.
     EXPECT_EQ(1, metrics.get_oplog_applied_sequence_id());
+}
+
+// A warm start must resume the batch scan after the last applied batch. If
+// it scans from batch 1 again, a standby with a long OpLog cannot catch up
+// inside the promotion deadline, and a failed promotion restarts the scan.
+TEST_F(HotStandbyServiceTest, TestWarmStart_ResumesBatchCursor) {
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 2);
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id_, 2),
+                           EncodeOpLogBatchRecord(MakeBatch(2, 3, 4))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 2, .last_seq = 4})));
+    config_.enable_oplog_following = true;
+    config_.enable_snapshot_bootstrap = false;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 4));
+    service_->Stop();
+    backend->TakeRangeBeginKeys();
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id_, 3),
+                           EncodeOpLogBatchRecord(MakeBatch(3, 5, 5))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 3, .last_seq = 5})));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 5));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    const auto range_begin_keys = backend->TakeRangeBeginKeys();
+    ASSERT_FALSE(range_begin_keys.empty());
+    const std::string first_batch_key =
+        BuildBatchRecordRange(cluster_id_, 0).begin_key;
+    const std::string resume_key =
+        BuildBatchRecordRange(cluster_id_, 2).begin_key;
+    for (const auto& key : range_begin_keys) {
+        EXPECT_NE(first_batch_key, key);
+    }
+    EXPECT_EQ(resume_key, range_begin_keys.front());
+}
+
+// A Start that fails before bootstrap must keep the saved batch cursor for
+// the next Start.
+TEST_F(HotStandbyServiceTest, TestWarmStart_KeepsBatchCursorAfterFailedStart) {
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 2);
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id_, 2),
+                           EncodeOpLogBatchRecord(MakeBatch(2, 3, 4))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 2, .last_seq = 4})));
+    config_.enable_oplog_following = true;
+    config_.enable_snapshot_bootstrap = false;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 4));
+    service_->Stop();
+
+    // Fail the next Start when it opens the OpLog backend.
+    service_->SetCatchUpBatchKvBackendForTesting(nullptr);
+    service_->SetOpLogBackendType(ha::HABackendType::UNKNOWN);
+    EXPECT_NE(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    service_->Stop();
+    service_->SetOpLogBackendType(ha::HABackendType::ETCD);
+    service_->SetCatchUpBatchKvBackendForTesting(backend);
+    backend->TakeRangeBeginKeys();
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id_, 3),
+                           EncodeOpLogBatchRecord(MakeBatch(3, 5, 5))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 3, .last_seq = 5})));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 5));
+
+    const auto range_begin_keys = backend->TakeRangeBeginKeys();
+    ASSERT_FALSE(range_begin_keys.empty());
+    const std::string first_batch_key =
+        BuildBatchRecordRange(cluster_id_, 0).begin_key;
+    for (const auto& key : range_begin_keys) {
+        EXPECT_NE(first_batch_key, key);
+    }
+    EXPECT_EQ(BuildBatchRecordRange(cluster_id_, 2).begin_key,
+              range_begin_keys.front());
 }
 
 TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
