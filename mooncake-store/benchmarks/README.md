@@ -2,6 +2,91 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## DFS Storage Backend Benchmark
+
+`storage_backend_bench --backend=dfs` (also `--backend=distributed`) measures
+`DistributedStorageBackend::BatchWrite` and `BatchRead` using real DFS
+descriptors. It supports the `hf3fs` USRBIO adapter and the `posix` adapter,
+with either the `shard` or immutable `bucket` allocator. It runs the allocator
+inside the benchmark process; no Mooncake master or client service is needed.
+
+Build from a configured Mooncake tree with `BUILD_BENCHMARK=ON`. HF3FS runs also
+require `USE_3FS=ON`, the 3FS headers/library, and a writable 3FS mount:
+
+```bash
+cmake --build build --target storage_backend_bench -j 8
+```
+
+Run a small local check using the POSIX adapter:
+
+```bash
+./build/mooncake-store/benchmarks/storage_backend_bench \
+  --backend=dfs --dfs_adapter=posix --dfs_allocator=shard \
+  --test=all --storage_path=/tmp/mooncake-dfs-bench \
+  --dfs_file_count=2 --dfs_shard_capacity_mb=512 \
+  --value_size=4097 --batch_size=19 \
+  --num_operations=10 --warmup_operations=2 --num_threads=2
+```
+
+Measure native 3FS writes, then reads:
+
+```bash
+./build/mooncake-store/benchmarks/storage_backend_bench \
+  --backend=dfs --dfs_adapter=hf3fs --dfs_allocator=shard \
+  --test=offload --storage_path=/mnt/3fs/mooncake-bench \
+  --dfs_file_count=4 \
+  --value_size=131072 --batch_size=16 \
+  --num_operations=1000 --warmup_operations=100
+
+# Use the same arguments with --test=load for reads, or
+# --test=concurrent_load --num_threads=4 for concurrent reads.
+# Add files or reduce operation count for the larger concurrent dataset.
+```
+
+Use `--dfs_allocator=bucket` to measure the immutable DFS bucket path. This is
+separate from the local backend selected by `--backend=bucket`.
+
+- `--dfs_adapter` defaults to `posix`. Pass `--dfs_adapter=hf3fs` to measure
+  USRBIO; it fails explicitly in a build without 3FS support or when
+  `--storage_path` is not on a 3FS mount. POSIX checks exercise DFS descriptor
+  handling but do not measure USRBIO batching.
+- DFS capacity is `--dfs_file_count` (shard count or maximum bucket count,
+  default 4) times the file size. File sizes default to the Mooncake
+  defaults: `--dfs_shard_capacity_mb=4096` (`MOONCAKE_DFS_SHARD_CAPACITY`)
+  and `--dfs_bucket_capacity_mb=1024` (`MOONCAKE_DFS_BUCKET_CAPACITY`).
+  `--capacity_gb` applies only to local backends and is rejected for DFS.
+  Shards are preallocated at init, so all shard files must fit on the target
+  filesystem; buckets are created as the dataset is allocated. Eviction is
+  disabled.
+- `--num_operations` and `--warmup_operations` count batches per thread.
+  `offload` and `load` use one thread; `concurrent_load` uses `--num_threads`.
+  The dataset contains `(operations + warmup) * batch_size * threads` objects
+  and must fit the DFS files; values are 4 KiB-aligned and never span files.
+  DFS traverses distinct keys in generation order; `--pattern` is not used.
+- Allocation, request construction, and payload generation are outside the
+  operation timer. Read tests populate the dataset first. Each worker warms up
+  its own I/O resources before measurement. Write verification runs afterward;
+  read verification runs outside the operation timer.
+- Latencies describe a whole batch. `Throughput` uses the sum of call latencies;
+  `Wall throughput` uses elapsed time across all threads and includes request
+  preparation and in-loop verification. Use the wall figure for aggregate
+  concurrency scaling. Failed I/O or verification makes the DFS run exit nonzero.
+- Every test creates and prints a unique `dfs-bench-*` subdirectory below
+  `--storage_path`. Only that subdirectory is removed afterward; use
+  `--skip_cleanup` to retain it. Existing files under the supplied path are
+  preserved.
+- DFS supports `init`, `offload`, `load`, `concurrent_load`, and `all` (these four
+  tests). Metadata lookup, churn, restart, mixed read/write, and `--run_all`
+  sweeps are not implemented for DFS. Cache-control modes and per-operation
+  fsync are also unsupported; HF3FS uses USRBIO regardless of the default
+  `--cache_mode=buffered` flag. POSIX uses its normal buffered path.
+
+Start the batching comparison with one thread and batch sizes `1, 4, 16, 64`.
+Keep the total object count constant by adjusting `--num_operations` and
+`--warmup_operations`. For a comparison against an earlier adapter commit,
+build the same benchmark changes against both revisions and use identical
+adapter, allocator, capacity, and workload settings.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment
