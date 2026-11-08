@@ -1109,11 +1109,30 @@ ErrorCode Client::InitTransferEngine(
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "cxi") {
+            // Auto-discovery is RDMA-only, so populate the topology with the
+            // CXI NICs before installing the transport (an empty device list
+            // means "all NICs"); otherwise CxiTransport finds no devices.
+            std::vector<std::string> devices;
+            if (device_names.has_value() && !device_names->empty()) {
+                devices = ParseDeviceNames(device_names.value());
+            }
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete for CXI. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
             try {
                 transport = transfer_engine_->installTransport("cxi", nullptr);
             } catch (std::exception& e) {
                 LOG(ERROR) << "cxi_transport_install_failed error_message=\""
                            << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install CXI transport";
+                return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
