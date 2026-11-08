@@ -928,6 +928,38 @@ TEST(TransferEngineConfigOverrideTest,
 }
 
 TEST(TransferEngineConfigOverrideTest,
+     OwnershipCheckedDeleteRejectsUnsupportedSegmentType) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    const auto port = reserveUnusedTcpPort();
+    TestHttpMetadataServer server(port);
+    ASSERT_TRUE(server.start());
+    CentralSegmentRegistry registry("http", buildHttpMetadataEndpoint(port));
+    auto expected = std::make_shared<SegmentDesc>();
+    expected->name = kSegmentName;
+    expected->type = SegmentType::Memory;
+    expected->machine_id = "machine";
+    expected->rpc_server_addr = "127.0.0.1:12345";
+    expected->owner_id = "owner";
+    const auto key = buildMetadataKey(kSegmentName);
+    json unsupported = *expected;
+    unsupported["type"] = "future-transport";
+    server.seed(key, unsupported.dump());
+
+    SegmentDescRef current;
+    auto read_status = registry.getSegmentDesc(current, kSegmentName);
+    EXPECT_TRUE(read_status.IsMetadataError()) << read_status;
+    EXPECT_EQ(current, nullptr);
+    auto delete_status =
+        registry.deleteSegmentDescIfOwned(kSegmentName, expected);
+    EXPECT_TRUE(delete_status.IsMetadataError()) << delete_status;
+    EXPECT_EQ(server.getStoredValue(key), unsupported.dump());
+    EXPECT_EQ(server.deleteRequests(), 0);
+#endif
+}
+
+TEST(TransferEngineConfigOverrideTest,
      OwnershipCheckedDeleteSupportsExactLegacyRecord) {
 #ifdef _WIN32
     GTEST_SKIP() << "Requires local HTTP metadata server support";

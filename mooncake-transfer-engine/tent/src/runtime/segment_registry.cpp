@@ -15,6 +15,7 @@
 #include "tent/runtime/segment_registry.h"
 
 #include <cassert>
+#include <exception>
 #include <mutex>
 #include <set>
 
@@ -57,7 +58,7 @@ Status CentralSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
     desc = std::make_shared<SegmentDesc>();
     try {
         *desc = json::parse(jstr).get<SegmentDesc>();
-    } catch (const json::exception &error) {
+    } catch (const std::exception &error) {
         desc = nullptr;
         return Status::MetadataError("Failed to parse segment descriptor " +
                                      segment_name + ": " + error.what() +
@@ -127,7 +128,7 @@ Status PeerSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
     desc = std::make_shared<SegmentDesc>();
     try {
         *desc = json::parse(response).get<SegmentDesc>();
-    } catch (const json::exception &error) {
+    } catch (const std::exception &error) {
         desc = nullptr;
         return Status::MetadataError("Failed to parse segment descriptor " +
                                      segment_name + ": " + error.what() +
