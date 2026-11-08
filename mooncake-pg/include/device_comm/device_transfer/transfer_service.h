@@ -12,6 +12,7 @@
 #include "control_plane/control_types.h"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
 #include "device_comm/device_transfer/routes/rdma_route/rdma_route.h"
+#include "device_comm/device_transfer/routes/nccl_device_route/nccl_device_route.h"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.h"
 #include "device_comm/device_transfer/routes/route_provider.h"
 #include "device_comm/device_transfer/transfer_region.h"
@@ -29,6 +30,7 @@ struct DeviceTransferHandle;
 struct DeviceRouteConfig {
     P2pRouteOptions p2p;
     RdmaRouteOptions rdma;
+    NcclDeviceRouteOptions nccl_device;
     HostProxyRouteOptions host_proxy;
 };
 

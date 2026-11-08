@@ -70,6 +70,8 @@ PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
                                         config.p2p.enabled));
     PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_RDMA_ROUTE",
                                         config.rdma.enabled));
+    PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_NCCL_DEVICE_ROUTE",
+                                        config.nccl_device.enabled));
     PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_HOST_PROXY_ROUTE",
                                         config.host_proxy.enabled));
     return config;

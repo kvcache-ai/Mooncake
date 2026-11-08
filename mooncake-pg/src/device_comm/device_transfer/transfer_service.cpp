@@ -18,6 +18,7 @@
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
 #include "device_comm/device_transfer/routes/rdma_route/rdma_route.h"
+#include "device_comm/device_transfer/routes/nccl_device_route/nccl_device_route.h"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.h"
 #include "device_comm/device_transfer/routes/route_provider.h"
 #include "gpu_runtime.h"
@@ -34,6 +35,8 @@ const char* routeTypeName(DeviceRouteType type) {
             return "P2P";
         case DeviceRouteType::Rdma:
             return "RDMA";
+        case DeviceRouteType::NcclDevice:
+            return "NCCL device";
         case DeviceRouteType::HostProxy:
             return "HostProxy";
     }
@@ -226,12 +229,15 @@ struct DeviceTransferService::DeviceState {
 
     void loadRoutes(TransferEngine& engine, LinkManager& link_manager,
                     const DeviceRouteConfig& config) {
-        // Route preference: P2P > RDMA > host proxy.
+        // Route preference: P2P > RDMA > NCCL device > host proxy.
         tryLoadRoute<P2pRoute>(config.p2p.enabled, device_index, self_rank,
                                max_world_size);
         tryLoadRoute<RdmaRoute>(config.rdma.enabled, device_index,
                                 route_stream.get(), self_rank, max_world_size,
                                 config.rdma);
+        tryLoadRoute<NcclDeviceRoute>(config.nccl_device.enabled, device_index,
+                                      self_rank, max_world_size,
+                                      config.nccl_device);
         tryLoadRoute<HostProxyRoute>(config.host_proxy.enabled, device_index,
                                      engine, link_manager, max_world_size);
     }
@@ -492,7 +498,7 @@ struct DeviceTransferService::DeviceState {
     DeviceTransferHandle::PauseMailbox* pause_mailbox = nullptr;
     DeviceTransferHandle::PauseMailbox::PauseSlot::RequestHandle pause_request;
     std::optional<uint64_t> installed_version;
-    // Selection follows provider order: P2P, RDMA, host proxy.
+    // Selection follows provider order: P2P, RDMA, NCCL device, host proxy.
     std::vector<std::unique_ptr<RouteProvider>> route_providers;
     // These route providers initialized successfully, but a subsequent
     // operation failed. Because they may have already published their routes
