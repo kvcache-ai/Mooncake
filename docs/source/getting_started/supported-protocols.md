@@ -339,16 +339,25 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 **Requirements:**
 - NVIDIA NVLink hardware
 - Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
-- Registered buffers must be legacy device allocations (`cudaMalloc` / `cuMemAlloc`), because the transport shares them with `cudaIpcGetMemHandle`. Virtual-memory allocations (`cuMemCreate`) have no such handle. In particular, PyTorch tensors allocated with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` cannot be registered: allocate the transfer buffers separately, or disable `expandable_segments` for them.
-- Peers in containers must share the IPC **and** PID namespaces, e.g. `docker run --ipc=host --pid=host` (Kubernetes: `hostIPC` plus `hostPID` or `shareProcessNamespace`). A CUDA IPC handle carries the exporting process's PID. Two containers with separate PID namespaces can hand out the same PID, and the importer then rejects the peer's handle as its own: `cudaIpcOpenMemHandle failed: invalid device context`. A typical symptom is that only the peer pairs with the same worker index fail.
+- Registered GPU buffers are either legacy allocations (`cudaMalloc` / `cuMemAlloc`) or virtual-memory allocations (`cuMemCreate`) created with `CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`. PyTorch with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` creates such segments by default, with two exceptions: if `TORCH_CUDA_EXPANDABLE_SEGMENTS_IPC=0` is set (or the build turns IPC off by default), set it to `1`; and if the GPUs have fabric access (e.g. IMEX is configured), PyTorch uses FABRIC handles instead, so add `expandable_segments_handle_type:posix_fd` to `PYTORCH_CUDA_ALLOC_CONF`.
+- For legacy buffers, peers in containers must share the IPC **and** PID namespaces, e.g. `docker run --ipc=host --pid=host` (Kubernetes: `hostIPC` plus `hostPID` or `shareProcessNamespace`). A CUDA IPC handle carries the exporting process's PID. Two containers with separate PID namespaces can hand out the same PID, and the importer then rejects the peer's handle as its own: `cudaIpcOpenMemHandle failed: invalid device context`. A typical symptom is that only the peer pairs with the same worker index fail. Virtual-memory buffers do not depend on the PID namespace; see below.
 
 **Configuration:**
 ```bash
 # Select the intra-node NVLink transport. Cannot be combined with MC_FORCE_MNNVL.
 export MC_INTRANODE_NVLINK=true
+
+# Optional: share virtual-memory buffers through socket files in this
+# directory instead of abstract sockets (see below).
+export MC_NVLINK_FD_DIR=/dev/shm
+
+# Optional: set to 0 to reject virtual-memory buffers, as before.
+export MC_NVLINK_VMM=1
 ```
 
 **Note:** On a build without `USE_MNNVL=ON`, leaving `MC_INTRANODE_NVLINK` unset keeps the usual RDMA (or TCP, when no HCA is detected) selection.
+
+**Virtual-memory buffers:** A virtual-memory buffer has no `cudaIpc` handle. Each process that registers one runs a small server on a Unix domain socket, and peers fetch the buffer's file descriptors from it with `SCM_RIGHTS`. Only processes of the same user, or root, may connect. By default the socket is an abstract socket, which peers can reach only from the same network namespace (for containers, `--network host`). If the peers share a directory but not a network namespace, set `MC_NVLINK_FD_DIR` in the processes that register buffers to a directory that the peers see at the same path. Unlike legacy buffers, virtual-memory buffers also work across separate PID namespaces. Register only memory that stays mapped while peers use it: the transport maps what is mapped at registration time and does not follow later `cuMemMap` / `cuMemUnmap` calls, such as a PyTorch expandable segment growing or shrinking.
 
 ### HIP Transport (hip)
 
