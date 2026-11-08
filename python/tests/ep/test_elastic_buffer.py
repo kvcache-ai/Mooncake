@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "ibgda", "nccl", "ipc"),
         default=os.getenv("MOONCAKE_EP_TRANSPORT", "auto"),
         help="Device transport; auto prefers NCCL and falls back to IPC + IBGDA. "
-        "XPU supports only auto/ipc (single node).",
+        "XPU supports only auto/ipc.",
     )
     parser.add_argument(
         "--route",

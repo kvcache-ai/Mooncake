@@ -43,7 +43,8 @@ def _ep_device_type() -> str:
 
 
 def _requested_xpu_transport(transport: str) -> str:
-    """XPU has one transport: Level Zero IPC between the ranks of one node."""
+    """XPU has one transport setting, 'ipc': Level Zero IPC, and RDMA
+    through a host proxy to remote ranks."""
     requested = transport.strip().lower()
     if requested == "auto":
         requested = os.getenv("MOONCAKE_EP_TRANSPORT", "auto").strip().lower()
@@ -53,6 +54,10 @@ def _requested_xpu_transport(transport: str) -> str:
             f"got {requested!r}"
         )
     return "ipc"
+
+
+class _XpuRdmaError(RuntimeError):
+    """Raised on every rank when XPU ranks on other nodes cannot connect."""
 
 
 def _current_device_index() -> int:
@@ -451,12 +456,6 @@ class ElasticBuffer:
         self.num_rdma_ranks, self.num_nvlink_ranks = (
             self._calculate_physical_domain_size(group)
         )
-        if on_xpu and self.num_rdma_ranks > 1:
-            raise NotImplementedError(
-                "ElasticBuffer on XPU supports a single node only: "
-                f"{self.num_ranks} ranks with {self.num_nvlink_ranks} per node "
-                "span several nodes"
-            )
 
         self.backend = group
         self._generation: Optional[Tuple[int, ...]] = None
@@ -510,6 +509,9 @@ class ElasticBuffer:
         # exact native launch topology for both backends.
         self._refresh_topology_from_runtime()
         self._connect_native()
+        if on_xpu:
+            # The XPU runtime learns the nodes while connecting (init_rdma).
+            self._refresh_topology_from_runtime()
         # The native elastic kernels currently use fixed communicator
         # membership. Reuse this compatibility argument instead of allocating
         # and filling a CUDA tensor for every dispatch and combine call.
@@ -843,7 +845,14 @@ class ElasticBuffer:
             remote_handles = [h.tolist() for h in handles]
 
             active_ranks_mask = self._active_ranks_mask()
+            if _ep_device_type() == "xpu":
+                self._connect_xpu_rdma(
+                    remote_handles, active_ranks_mask, collective_device
+                )
+            # On XPU, the Level Zero IPC import.
             self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+        except _XpuRdmaError:
+            raise
         except Exception as exc:
             if bool(self.runtime.ibgda_disabled()):
                 raise RuntimeError(
@@ -967,6 +976,62 @@ class ElasticBuffer:
                 RuntimeWarning,
                 stacklevel=2,
             )
+
+    def _connect_xpu_rdma(
+        self,
+        handles: List[List[int]],
+        active_ranks_mask: List[int],
+        device: Union[str, torch.device],
+    ) -> None:
+        """Connect the ranks on other nodes over RDMA (XPU only).
+
+        As in Buffer._connect_xpu_rdma, a rank is on another node if its IPC
+        handle comes from another host or pid namespace (words 3 and 4 of the
+        handle), or, with MC_EP_RANKS_PER_NODE=n, if rank // n differs. Unlike
+        the Buffer, the ElasticBuffer has no fallback path: if any rank cannot
+        connect, every rank raises.
+        """
+        per_node = int(os.environ.get("MC_EP_RANKS_PER_NODE", "0") or 0)
+        if per_node > 0:
+            nodes = [r // per_node for r in range(self.num_ranks)]
+        else:
+            nodes = [tuple(h[3:5]) for h in handles]
+        remote = [int(node != nodes[self.rank_idx]) for node in nodes]
+        # Every rank sees the same nodes, so all of them return here or none.
+        if not any(remote):
+            return
+
+        def agree(error: str) -> None:
+            ok = torch.tensor([int(not error)], dtype=torch.int32, device=device)
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=self.group)
+            if not ok.item():
+                raise _XpuRdmaError(
+                    f"[Rank {self.rank_idx}] ElasticBuffer ranks span several "
+                    "nodes, which XPU reaches over RDMA, and "
+                    + (error or "another rank could not connect")
+                )
+
+        info: List[int] = []
+        error = ""
+        if not self.runtime.rdma_available():
+            error = (
+                "this build lacks the XPU verbs path (rdma-core with "
+                "ibv_reg_dmabuf_mr)"
+            )
+        else:
+            try:
+                info = list(self.runtime.init_rdma(remote))
+            except Exception as e:
+                error = f"its setup failed: {e}"
+        agree(error)
+        local = torch.tensor(info, dtype=torch.int32, device=device)
+        infos = [torch.empty_like(local) for _ in range(self.num_ranks)]
+        dist.all_gather(infos, local, group=self.group)
+        try:
+            self.runtime.connect_rdma([t.tolist() for t in infos], active_ranks_mask)
+        except Exception as e:
+            error = f"connecting failed: {e}"
+        agree(error)
 
     def _exchange_nccl_unique_id(self, ep: Any) -> List[int]:
         create_unique_id = getattr(ep, "create_nccl_unique_id", None)
@@ -1183,6 +1248,13 @@ class ElasticBuffer:
         allow_multiple_reduction: bool = True,
     ) -> int:
         num_ranks = group if isinstance(group, int) else group.size()
+        if _ep_device_type() == "xpu":
+            # On XPU, remote ranks need room of their own in the buffer even
+            # though dispatch stays flat. Reserve it whenever the ranks span
+            # nodes, so that allow_hybrid_mode=False works there as on CUDA.
+            allow_hybrid_mode = (
+                allow_hybrid_mode or ElasticBuffer._xpu_ranks_span_nodes(group)
+            )
         try:
             from mooncake import ep
 
@@ -1242,6 +1314,17 @@ class ElasticBuffer:
         group: dist.ProcessGroup, num_max_session_bytes: int
     ) -> int:
         return num_max_session_bytes
+
+    @staticmethod
+    def _xpu_ranks_span_nodes(group: Union[dist.ProcessGroup, int]) -> bool:
+        """Whether XPU ranks span nodes, as far as is known before the buffer
+        exists: from MC_EP_RANKS_PER_NODE as in _connect_xpu_rdma, else from
+        the physical domain size. Ranks found remote only from the host words
+        of their IPC handles are not seen here."""
+        per_node = int(os.environ.get("MC_EP_RANKS_PER_NODE", "0") or 0)
+        if per_node > 0:
+            return per_node < (group if isinstance(group, int) else group.size())
+        return ElasticBuffer._calculate_physical_domain_size(group)[0] > 1
 
     @staticmethod
     def _calculate_physical_domain_size(
