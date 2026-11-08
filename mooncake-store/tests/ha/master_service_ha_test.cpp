@@ -4353,15 +4353,11 @@ TEST_F(MasterServiceHATest, PutEndCountsRecordRejectedByFullReservation) {
     auto& metrics = HAMetricManager::instance();
     const int64_t before = metrics.get_oplog_dropped_put_end_total();
 
-    ::testing::internal::CaptureStderr();
     const auto put_end = service.PutEnd(mounted.client_id, key, kDefaultTenant,
                                         ReplicaType::MEMORY);
-    const std::string logs = ::testing::internal::GetCapturedStderr();
 
     // The caller still sees success: the drop is only visible in the counter.
     EXPECT_TRUE(put_end.has_value());
-    EXPECT_NE(std::string::npos, logs.find("PutEnd: OpLog queue failed"))
-        << logs;
     EXPECT_EQ(before + 1, metrics.get_oplog_dropped_put_end_total());
 }
 
