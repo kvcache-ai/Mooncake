@@ -21,6 +21,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <numeric>
 #include <shared_mutex>
 #include <mutex>
 
@@ -31,6 +32,53 @@ namespace mooncake {
 namespace tent {
 
 class SharedSlotManager;
+
+// Splits num_slices among candidates in proportion to their weights, by the
+// largest-remainder method: each candidate first gets the whole part of its
+// exact share, then the slices that flooring left over go one each to the
+// largest fractional parts, the earlier candidate first on a tie. Every count
+// is within one slice of its exact share and the counts sum to num_slices.
+// Flooring every share and giving all the leftovers to one candidate instead
+// splits 32 slices over two equal NICs 17/15 whenever their scores differ by
+// as little as the selection jitter, and over four NICs typically 10/8/7/7.
+// A weight that is not positive and finite counts as zero; with no such
+// weight every count is zero.
+inline std::vector<uint32_t> apportionSlices(const std::vector<double> &weights,
+                                             uint32_t num_slices) {
+    std::vector<uint32_t> counts(weights.size(), 0);
+    auto usable = [](double w) { return std::isfinite(w) && w > 0.0; };
+    double total = 0.0;
+    for (double w : weights)
+        if (usable(w)) total += w;
+    if (num_slices == 0 || !std::isfinite(total) || total <= 0.0) return counts;
+
+    // What flooring left of each share; -1 marks a weight that counts as
+    // zero, which never takes a leftover slice.
+    std::vector<double> fraction(weights.size(), -1.0);
+    uint32_t assigned = 0;
+    for (size_t i = 0; i < weights.size(); ++i) {
+        if (!usable(weights[i])) continue;
+        const double exact = weights[i] / total * num_slices;
+        const double whole = std::floor(exact);
+        counts[i] = static_cast<uint32_t>(
+            std::min<double>(whole, num_slices - assigned));
+        assigned += counts[i];
+        fraction[i] = exact - whole;
+    }
+    std::vector<size_t> order(weights.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return fraction[a] > fraction[b];
+    });
+    // Fewer slices are left over than there are usable weights, unless
+    // rounding in the shares says otherwise; the wrap-around covers that.
+    for (size_t k = 0; assigned < num_slices; k = (k + 1) % order.size()) {
+        if (fraction[order[k]] < 0.0) continue;
+        ++counts[order[k]];
+        ++assigned;
+    }
+    return counts;
+}
 
 /**
  * @brief DeviceSelector implements NIC selection with two modes:
