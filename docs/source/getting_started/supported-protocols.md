@@ -332,7 +332,6 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 
 **Description:** GPU-to-GPU copies within a single node through CUDA IPC. Despite the name, the copy
 uses whatever peer-to-peer path the driver provides: NVLink when present, otherwise PCIe P2P.
-On CUDA 13.0 and newer the copies run through `cudaMemcpyBatchAsync`.
 
 **Use When:**
 - Local GPU-to-GPU transfers are needed
@@ -343,7 +342,7 @@ On CUDA 13.0 and newer the copies run through `cudaMemcpyBatchAsync`.
 - GPU peer-to-peer access between the GPUs involved: NVLink, or PCIe P2P on PCIe-only systems.
   Check with `nvidia-smi topo -p2p r`; only a pair reported as `OK` can use this transport
   (`NS`, `CNS`, `GNS`, `TNS`, or `U` all indicate P2P is unavailable).
-- Compiled with `USE_INTRA_NVLINK=ON` (enabled in recent prebuilt `x86_64` CUDA wheels: present in 0.3.14, absent in 0.3.12; other variants must be built from source)
+- Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
 - Registered buffers must be legacy device allocations (`cudaMalloc` / `cuMemAlloc`), because the transport shares them with `cudaIpcGetMemHandle`. Virtual-memory allocations (`cuMemCreate`) have no such handle. In particular, PyTorch tensors allocated with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` cannot be registered: allocate the transfer buffers separately, or disable `expandable_segments` for them.
 - Peers in containers must share the IPC **and** PID namespaces, e.g. `docker run --ipc=host --pid=host` (Kubernetes: `hostIPC` plus `hostPID` or `shareProcessNamespace`). A CUDA IPC handle carries the exporting process's PID. Two containers with separate PID namespaces can hand out the same PID, and the importer then rejects the peer's handle as its own: `cudaIpcOpenMemHandle failed: invalid device context`. A typical symptom is that only the peer pairs with the same worker index fail.
 
