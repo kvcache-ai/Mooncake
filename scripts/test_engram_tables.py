@@ -73,6 +73,41 @@ def test_host_lookup_and_reopen(tmp_path, width, head_major):
         np.testing.assert_array_equal(output[0, 0], output[0, 1])
 
 
+@pytest.mark.parametrize("head_major", [False, True])
+def test_full_host_lookup_does_not_gather(tmp_path, head_major, monkeypatch):
+    rows = np.arange(256 * 17, dtype=np.uint8).reshape(256, 17)
+    store = EngramStore(
+        tables={"a": {"num_rows": 256, "row_bytes": 17}},
+        namespace="test/v1",
+        local_dir=tmp_path,
+    )
+    store.populate("a", rows)
+
+    class SliceOnlyTable(np.ndarray):
+        def __getitem__(self, item):
+            if not isinstance(item, slice):
+                raise AssertionError("full lookup allocated an index gather")
+            return super().__getitem__(item)
+
+    monkeypatch.setattr(store, "_open", lambda _: rows.view(SliceOnlyTable))
+    ids = np.arange(3, 131, dtype=np.int64).reshape(-1, 1)
+    ids[[0, 1]] = ids[[1, 0]]
+    output = np.full(
+        (1, len(ids), 17) if head_major else (len(ids), 1, 17), 221, np.uint8
+    )
+    if head_major:
+        output = output.transpose(1, 0, 2)
+    store.lookup(["a"], ids, output, offsets=[3])
+    np.testing.assert_array_equal(output[:, 0, :], rows[ids[:, 0] - 3])
+
+
+def test_noncontiguous_output_preserves_gather_semantics(tmp_path):
+    store, rows, _ = make_store(tmp_path)
+    output = np.full((4, 2, 17), 221, np.uint8)[:, ::2, :]
+    store.lookup(["a"], np.array([[3], [4], [5], [6]], np.int64), output, offsets=[3])
+    np.testing.assert_array_equal(output[:, 0, :], rows[:4])
+
+
 def test_validation_is_before_writes(tmp_path):
     store, _, _ = make_store(tmp_path)
     output = np.full((1, 2, 17), 201, np.uint8)

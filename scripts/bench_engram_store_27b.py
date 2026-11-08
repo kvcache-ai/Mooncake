@@ -22,6 +22,11 @@ ROW_BYTES = 64
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--local-dir", default="/dev/shm/engram-bench")
+    parser.add_argument(
+        "--contiguous",
+        action="store_true",
+        help="Use consecutive row IDs to measure the direct-copy path.",
+    )
     args = parser.parse_args()
     specs = {
         f"head/{head}": {"num_rows": count, "row_bytes": ROW_BYTES}
@@ -43,9 +48,18 @@ def main():
             store.populate(name, table)
         print("Batch   Mean(ms)    P50(ms)    P99(ms)       Tok/s       GB/s")
         for batch in BATCH_SIZES:
-            ids = np.column_stack(
-                [rng.integers(count, size=batch) for count in TABLE_VOCAB_SIZES]
-            )
+            if args.contiguous:
+                ids = np.column_stack(
+                    [
+                        np.arange(start, start + batch)
+                        for count in TABLE_VOCAB_SIZES
+                        for start in [int(rng.integers(0, count - batch))]
+                    ]
+                )
+            else:
+                ids = np.column_stack(
+                    [rng.integers(count, size=batch) for count in TABLE_VOCAB_SIZES]
+                )
             out = np.empty((batch, len(names), ROW_BYTES), np.uint8)
             store.lookup(names, ids, out)
             for head, table in enumerate(rows):

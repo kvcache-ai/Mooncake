@@ -234,7 +234,15 @@ class EngramStore:
                 columns.append((live, values - offset))
             tables = [self._open(name) for name in table_ids]
             for k, (table, (live, values)) in enumerate(zip(tables, columns)):
-                out[live, k, :] = table[values]
+                if (
+                    len(values) >= 128
+                    and live.all()
+                    and not np.shares_memory(table, out)
+                ):
+                    # Avoid a large gather temporary once direct writes pay off.
+                    np.take(table, values, axis=0, out=out[:, k, :])
+                else:
+                    out[live, k, :] = table[values]
 
     @staticmethod
     def _validate_strides(out):
