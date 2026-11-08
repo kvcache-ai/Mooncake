@@ -85,6 +85,9 @@ add_store_test(local_shm_conflict_test local_shm_conflict_test.cpp)
 add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
+set_tests_properties(
+  egm_store_pool_test
+  PROPERTIES ENVIRONMENT "MC_USE_TENT=0;MOONCAKE_STORE_CHECKSUM=0" TIMEOUT 60)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
 add_store_test(client_session_registry_test client_session_registry_test.cpp)

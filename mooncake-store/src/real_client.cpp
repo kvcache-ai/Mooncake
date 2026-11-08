@@ -1215,10 +1215,23 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
-    if (egm_config.enabled && !client_->HasClassicTransport("nvlink")) {
-        LOG(ERROR) << "EGM Store requires the classic NVLink transport; "
-                      "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    if (egm_config.enabled) {
+        // Strict Store EGM runs on TENT MNNVL, which never exposes the
+        // classic NVLink transport; classic NVLink pools still require it.
+        const bool strict_mnnvl = client_->GetProtocol() == "mnnvl";
+        const bool transport_ready =
+            strict_mnnvl ? client_->GetTransferEngine() &&
+                               client_->GetTransferEngine()->isStrictMnnvlEgm()
+                         : client_->HasClassicTransport("nvlink");
+        if (!transport_ready) {
+            LOG(ERROR)
+                << (strict_mnnvl
+                        ? "MNNVL EGM Store requires a strict TENT MNNVL/Fabric "
+                          "engine"
+                        : "EGM Store requires the classic NVLink transport; "
+                          "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL");
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     // Local_buffer_size is allowed to be 0, but we only register memory when
@@ -1271,9 +1284,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
-    // If global_segment_size is 0, skip mount segment. Transports with a
-    // registration limit split it into balanced chunks; other transports use
-    // one segment.
+    // If global_segment_size is 0, skip mount segment and its EGM capacity
+    // planning. Transports with a registration limit split it into balanced
+    // chunks; other transports use one segment.
     if (protocol == "cxl") {
         const auto cxl_config = CxlSegmentConfig::FromEnvironment();
         if (!cxl_config.device_size.has_value()) {
@@ -1301,7 +1314,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         std::vector<int> egm_numa_nodes;
         std::vector<size_t> egm_node_sizes;
         size_t egm_node_index = 0;
-        if (egm_config.enabled) {
+        if (egm_config.enabled && global_segment_size > 0) {
             if (egm_config.auto_numa_nodes) {
                 auto status = NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
                     egm_numa_nodes);
@@ -1430,6 +1443,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 }
                 ptr = egm_owner->base();
                 mapped_size = egm_owner->length();
+                if (client_->GetProtocol() == "mnnvl") {
+                    // Strict segments derive their placement (and the
+                    // ".../numaN" suffix) from this location; kWildcardLocation
+                    // would leave numa_node at -1 for every chunk.
+                    seg_location =
+                        "cpu:" + std::to_string(egm_numa_nodes[egm_node_index]);
+                }
             } else if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
                 segment_numa_nodes =

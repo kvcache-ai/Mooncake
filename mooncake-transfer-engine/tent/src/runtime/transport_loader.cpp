@@ -114,8 +114,10 @@ Status TransferEngineImpl::loadTransports() {
 #endif
 
 #ifdef USE_CUDA
-    bool enable_mnnvl =
-        mnnvl_config_.require_fabric || getenv("MC_ENABLE_MNNVL") != nullptr;
+    bool enable_mnnvl = mnnvl_config_.require_fabric ||
+                        (conf_->contains("transports/mnnvl/enable")
+                             ? conf_->get("transports/mnnvl/enable", false)
+                             : getenv("MC_ENABLE_MNNVL") != nullptr);
     if (enable_mnnvl) {
         if (conf_->get("transports/mnnvl/enable", true))
             transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
@@ -179,6 +181,10 @@ Status TransferEngineImpl::loadTransports() {
         transport_list_[MEMFABRIC] = std::make_shared<MemFabricTransport>();
 #endif
 
+    if (conf_->get("transports/mnnvl/store_egm", false) &&
+        !transport_list_[MNNVL])
+        return Status::InvalidArgument(
+            "Store EGM requires CUDA MNNVL support" LOC_MARK);
     return Status::OK();
 }
 

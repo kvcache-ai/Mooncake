@@ -25,6 +25,7 @@
 #endif
 #include "error.h"
 #include "batch_submit.h"
+#include "integer_parser.h"
 
 namespace mooncake {
 namespace {
@@ -157,6 +158,8 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
+    if (protocol == "mnnvl" || protocol == "nvlink_host")
+        return ERR_NOT_IMPLEMENTED;
     impl_->applyProtocolHint(protocol);
     return init(metadata_conn_string, local_server_name, ip_or_host_name,
                 rpc_port);
@@ -731,6 +734,13 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
+    const bool store_egm = protocol == "mnnvl" || protocol == "nvlink_host";
+    if (store_egm && !use_tent_) {
+        LOG(ERROR) << "protocol=" << protocol
+                   << " requires MC_USE_TENT=1 (strict TENT MNNVL/Fabric "
+                      "engine)";
+        return ERR_NOT_IMPLEMENTED;
+    }
     if (!use_tent_) {
         impl_->applyProtocolHint(protocol);
         const int result = impl_->init(metadata_conn_string, local_server_name,
@@ -739,6 +749,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         return result;
     } else {
         auto config = buildTentConfig(metadata_conn_string, local_server_name);
+        if (store_egm) mooncake::tent::ConfigHelper::forceMnnvlEgm(*config);
         if (protocol == "tcp") {
             mooncake::tent::ConfigHelper::forceTcp(*config);
             if (!std::getenv("MC_FORCE_TCP")) {
@@ -912,7 +923,9 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         bool remote_accessible,
                                         bool update_metadata) {
     if (use_tent_) {
+        if (!impl_tent_ || !impl_tent_->available()) return ERR_CONTEXT;
         mooncake::tent::MemoryOptions option;
+        if (isStrictMnnvlEgm()) option.type = mooncake::tent::MNNVL;
         option.perm = remote_accessible ? mooncake::tent::kGlobalReadWrite
                                         : mooncake::tent::kLocalReadWrite;
         if (!location.empty() && location != kWildcardLocation)
@@ -2217,6 +2230,82 @@ Status TransferEngine::transferScatter(
     const std::vector<ScatterTransferRange>& ranges) {
     auto operation = submitScatter(ranges);
     return operation.wait();
+}
+
+bool TransferEngine::isStrictMnnvlEgm() const {
+#ifdef USE_TENT
+    return use_tent_ && impl_tent_ && impl_tent_->isStrictMnnvlEgm();
+#else
+    return false;
+#endif
+}
+
+int TransferEngine::allocateLocalMemory(void** addr, size_t length,
+                                        const std::string& location) {
+    if (!addr) return ERR_INVALID_ARGUMENT;
+    *addr = nullptr;
+#ifdef USE_TENT
+    if (isStrictMnnvlEgm()) {
+        if (!length || (location != kWildcardLocation && location != "cpu" &&
+                        location.rfind("cpu:", 0) != 0))
+            return ERR_INVALID_ARGUMENT;
+        if (location.rfind("cpu:", 0) == 0) {
+            auto node =
+                TryParseInteger<int>(std::string_view(location).substr(4));
+            if (!node || *node < 0) return ERR_INVALID_ARGUMENT;
+        }
+        mooncake::tent::MemoryOptions options;
+        options.type = mooncake::tent::MNNVL;
+        options.location = location;
+        return tentToClassicError(
+            impl_tent_->allocateLocalMemory(addr, length, options).code());
+    }
+#endif
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int TransferEngine::freeLocalMemory(void* addr) {
+#ifdef USE_TENT
+    if (isStrictMnnvlEgm())
+        return tentToClassicError(impl_tent_->freeLocalMemory(addr).code());
+#endif
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int TransferEngine::getEgmNumaNodes(std::vector<int>& nodes, bool nearest) {
+    nodes.clear();
+#ifdef USE_TENT
+    if (isStrictMnnvlEgm())
+        return tentToClassicError(
+            impl_tent_->getEgmNumaNodes(nodes, nearest).code());
+#endif
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int TransferEngine::getEgmGranularity(int node, size_t& granularity) {
+    granularity = 0;
+#ifdef USE_TENT
+    if (isStrictMnnvlEgm())
+        return tentToClassicError(
+            impl_tent_->getEgmGranularity(node, granularity).code());
+#endif
+    return ERR_NOT_IMPLEMENTED;
+}
+
+bool TransferEngine::isMnnvlExported(void* addr, size_t length) const {
+#ifdef USE_TENT
+    return isStrictMnnvlEgm() && impl_tent_->isMnnvlExported(addr, length);
+#else
+    return false;
+#endif
+}
+
+int TransferEngine::quiesce() {
+#ifdef USE_TENT
+    if (use_tent_ && impl_tent_ && impl_tent_->available())
+        return tentToClassicError(impl_tent_->quiesce().code());
+#endif
+    return ERR_NOT_IMPLEMENTED;
 }
 
 }  // namespace mooncake

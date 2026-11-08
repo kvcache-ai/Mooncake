@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -55,6 +56,14 @@ class TransferEngineImplTestPeer {
     }
     static bool hasActiveRuntimeQueue(tent::TransferEngineImpl& engine) {
         return engine.hasActiveRuntimeQueue();
+    }
+    static std::vector<tent::BufferDesc> localBuffers(
+        tent::TransferEngineImpl& engine) {
+        auto snapshot = engine.metadata_->segmentManager().getLocal();
+        return std::get<tent::MemorySegmentDesc>(snapshot->detail).buffers;
+    }
+    static size_t pendingUnregisters(tent::TransferEngineImpl& engine) {
+        return engine.pending_mnnvl_unregister_.size();
     }
     static bool eventHonored(tent::TransferEngineImpl& engine,
                              const tent::Request& request,
@@ -109,6 +118,13 @@ class FakeTransport : public Transport {
     std::atomic<int> cancel_calls{0};
     bool cancellation_supported{true};
     bool producer_event_supported{false};
+    bool fail_register{false};
+    bool fail_unregister{false};
+    bool fail_drain{false};
+    int unregister_calls{0};
+    int free_calls{0};
+    TransportType allocation_type{UNSPEC};
+    std::string allocation_location;
 
     Status install(std::string&, std::shared_ptr<ControlService>,
                    std::shared_ptr<Topology>,
@@ -195,6 +211,11 @@ class FakeTransport : public Transport {
     }
 
     Status addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) override {
+        registered_buffers_.insert(desc.addr);
+        // Simulate failed registration whose defensive rollback also needs
+        // retry, without advertising an unsuccessful transport registration.
+        if (fail_register)
+            return Status::InternalError("injected registration failure");
         desc.transports.push_back(self_type_);
         return Status::OK();
     }
@@ -208,16 +229,32 @@ class FakeTransport : public Transport {
         return Status::OK();
     }
 
-    Status removeMemoryBuffer(BufferDesc&) override { return Status::OK(); }
+    Status removeMemoryBuffer(BufferDesc& desc) override {
+        ++unregister_calls;
+        if (fail_unregister)
+            return Status::InternalError("injected unregister failure");
+        registered_buffers_.erase(desc.addr);
+        return Status::OK();
+    }
+    bool tracksLocalBuffer(const BufferDesc& desc) const override {
+        return registered_buffers_.count(desc.addr) != 0;
+    }
+    Status quiesce() override {
+        return fail_drain ? Status::InternalError("injected drain failure")
+                          : Status::OK();
+    }
 
     Status allocateLocalMemory(void** addr, size_t size,
-                               MemoryOptions&) override {
+                               MemoryOptions& options) override {
+        allocation_type = options.type;
+        allocation_location = options.location;
         *addr = std::malloc(size);
         return *addr ? Status::OK()
                      : Status::InternalError("malloc failed" LOC_MARK);
     }
 
     Status freeLocalMemory(void* addr, size_t) override {
+        ++free_calls;
         std::free(addr);
         return Status::OK();
     }
@@ -230,6 +267,7 @@ class FakeTransport : public Transport {
     TransportType self_type_;
     PollStatusFactory poll_status_factory_;
     bool notify_on_submit_;
+    std::unordered_set<uint64_t> registered_buffers_;
     SubBatchRef last_batch_{nullptr};
 };
 
@@ -279,6 +317,154 @@ Request makeLocalWrite(uint8_t* ptr, size_t length) {
     request.length = length;
     request.transport_hint = RDMA;
     return request;
+}
+
+TEST(StrictMnnvlLifecycle,
+     ExplicitAllocationAndUnregisterFailureRetainOwnership) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake = std::make_shared<FakeTransport>(MNNVL);
+    engine.swapTransportForTest(MNNVL, fake);
+    // Activate only the cleanup policy after construction; this fake does not
+    // claim to satisfy real CUDA/Fabric installation requirements.
+    cfg->set("transports/mnnvl/store_egm", true);
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cpu:3";
+    void* base = nullptr;
+    ASSERT_TRUE(engine.allocateLocalMemory(&base, 4096, options).ok());
+    EXPECT_EQ(fake->allocation_type, MNNVL);
+    EXPECT_EQ(fake->allocation_location, "cpu:3");
+    ASSERT_TRUE(engine.registerLocalMemory({base}, {4096}, options).ok());
+    EXPECT_FALSE(engine.freeLocalMemory(base).ok());
+    fake->fail_unregister = true;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        EXPECT_FALSE(engine.unregisterLocalMemory(base).ok());
+        auto buffers = TransferEngineImplTestPeer::localBuffers(engine);
+        ASSERT_EQ(buffers.size(), 1);
+        EXPECT_EQ(buffers.front().ref_count, 1);
+        EXPECT_EQ(buffers.front().transports,
+                  (std::vector<TransportType>{MNNVL}));
+        EXPECT_EQ(TransferEngineImplTestPeer::pendingUnregisters(engine), 0);
+        EXPECT_FALSE(engine.freeLocalMemory(base).ok());
+        EXPECT_EQ(fake->free_calls, 0);
+    }
+    fake->fail_unregister = false;
+    ASSERT_TRUE(engine.unregisterLocalMemory(base).ok());
+    EXPECT_EQ(fake->unregister_calls, 3);
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingUnregisters(engine), 0);
+    ASSERT_TRUE(engine.freeLocalMemory(base).ok());
+    EXPECT_EQ(fake->free_calls, 1);
+}
+
+TEST(StrictMnnvlLifecycle, UnregisterRetryPreservesCompletedTransportCleanup) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto mnnvl = std::make_shared<FakeTransport>(MNNVL);
+    auto rdma = std::make_shared<FakeTransport>(RDMA);
+    engine.swapTransportForTest(MNNVL, mnnvl);
+    engine.swapTransportForTest(RDMA, rdma);
+    cfg->set("transports/mnnvl/store_egm", true);
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cpu:0";
+    void* base = nullptr;
+    ASSERT_TRUE(engine.allocateLocalMemory(&base, 4096, options).ok());
+    // Allocation resolves the transport in-place; request both fake transports
+    // explicitly for registration after allocating through MNNVL.
+    options.type = UNSPEC;
+    ASSERT_TRUE(engine.registerLocalMemory({base}, {4096}, options).ok());
+    ASSERT_TRUE(engine.registerLocalMemory({base}, {4096}, options).ok());
+    ASSERT_TRUE(engine.unregisterLocalMemory(base).ok());
+    EXPECT_EQ(mnnvl->unregister_calls, 0);
+    EXPECT_EQ(rdma->unregister_calls, 0);
+    EXPECT_FALSE(engine.freeLocalMemory(base).ok());
+
+    rdma->fail_unregister = true;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        EXPECT_FALSE(engine.unregisterLocalMemory(base).ok());
+        auto buffers = TransferEngineImplTestPeer::localBuffers(engine);
+        ASSERT_EQ(buffers.size(), 1);
+        EXPECT_EQ(buffers.front().ref_count, 1);
+        EXPECT_EQ(buffers.front().transports,
+                  (std::vector<TransportType>{RDMA}));
+        EXPECT_EQ(mnnvl->unregister_calls, 1);
+        EXPECT_EQ(rdma->unregister_calls, attempt + 1);
+        EXPECT_EQ(TransferEngineImplTestPeer::pendingUnregisters(engine), 0);
+        EXPECT_FALSE(engine.freeLocalMemory(base).ok());
+    }
+    rdma->fail_unregister = false;
+    ASSERT_TRUE(engine.unregisterLocalMemory(base).ok());
+    EXPECT_EQ(mnnvl->unregister_calls, 1);
+    EXPECT_EQ(rdma->unregister_calls, 3);
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+    ASSERT_TRUE(engine.freeLocalMemory(base).ok());
+    EXPECT_EQ(mnnvl->free_calls, 1);
+}
+
+TEST(StrictMnnvlLifecycle, UnpublishedRegistrationCleanupRemainsRetryable) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake = std::make_shared<FakeTransport>(MNNVL);
+    engine.swapTransportForTest(MNNVL, fake);
+    cfg->set("transports/mnnvl/store_egm", true);
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cpu:0";
+    void* base = nullptr;
+    ASSERT_TRUE(engine.allocateLocalMemory(&base, 4096, options).ok());
+    fake->fail_register = true;
+    fake->fail_unregister = true;
+    EXPECT_FALSE(engine.registerLocalMemory({base}, {4096}, options).ok());
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingUnregisters(engine), 1);
+    EXPECT_FALSE(engine.freeLocalMemory(base).ok());
+    EXPECT_FALSE(engine.unregisterLocalMemory(base).ok());
+    EXPECT_EQ(fake->unregister_calls, 2);
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingUnregisters(engine), 1);
+    EXPECT_EQ(fake->free_calls, 0);
+
+    fake->fail_unregister = false;
+    ASSERT_TRUE(engine.unregisterLocalMemory(base).ok());
+    EXPECT_EQ(fake->unregister_calls, 3);
+    EXPECT_TRUE(TransferEngineImplTestPeer::localBuffers(engine).empty());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingUnregisters(engine), 0);
+    ASSERT_TRUE(engine.freeLocalMemory(base).ok());
+    EXPECT_EQ(fake->free_calls, 1);
+}
+
+TEST(StrictMnnvlLifecycle, DrainFailureAndDuplicateRegistrationsPreventFree) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+    auto fake = std::make_shared<FakeTransport>(MNNVL);
+    engine.swapTransportForTest(MNNVL, fake);
+    cfg->set("transports/mnnvl/store_egm", true);
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cpu:0";
+    options.perm = kLocalReadWrite;
+    void* base = nullptr;
+    ASSERT_TRUE(engine.allocateLocalMemory(&base, 4096, options).ok());
+    ASSERT_TRUE(engine.registerLocalMemory({base}, {4096}, options).ok());
+    ASSERT_TRUE(engine.registerLocalMemory({base}, {4096}, options).ok());
+    fake->fail_drain = true;
+    EXPECT_FALSE(engine.unregisterLocalMemory(base).ok());
+    EXPECT_EQ(fake->unregister_calls, 0);
+    fake->fail_drain = false;
+    ASSERT_TRUE(engine.unregisterLocalMemory(base).ok());
+    EXPECT_FALSE(engine.freeLocalMemory(base).ok());
+    ASSERT_TRUE(engine.unregisterLocalMemory(base).ok());
+    EXPECT_EQ(fake->unregister_calls, 1);
+    EXPECT_TRUE(engine.freeLocalMemory(base).ok());
 }
 
 TEST(RuntimeQueueDispatch, RejectsUnsupportedProducerEventBeforeSubmission) {

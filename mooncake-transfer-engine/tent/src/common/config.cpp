@@ -237,6 +237,31 @@ void ConfigHelper::forceFabric(Config& config, const std::string& provider) {
     config.set("transports/fabric/provider", provider);
 }
 
+void ConfigHelper::forceMnnvlEgm(Config& config) {
+    // Store policy: store_egm is the Store EGM transport contract.
+    // transports/mnnvl/require_fabric stays an independent TENT policy: it
+    // also makes every MNNVL registration strict (exportable EGM with a
+    // FABRIC handle) and disables MNNVL failover, which an engine that still
+    // registers plain host buffers would fail. Store verifies its own exports
+    // after registration and treats store_egm install failures as fatal.
+    config.set("transports/mnnvl/store_egm", true);
+    config.set("transports/mnnvl/enable", true);
+    config.set("transports/mnnvl/egm", true);
+    config.set("transports/mnnvl/egm_strict", true);
+    config.set("transports/nvlink/handle_type", "fabric");
+    config.set("transports/nvlink/host_register", true);
+    for (const char* name : {"tcp", "hp_tcp", "rdma", "shm", "nvlink", "ub",
+                             "fabric", "ascend_direct", "sunrise_link", "tpu",
+                             "mlu", "xpu", "mpcomm", "hylink", "memfabric"}) {
+        config.set(std::string("transports/") + name + "/enable", false);
+    }
+    config.set("max_failover_attempts", 0);
+    config.set("enable_auto_failover_on_poll", false);
+    // A stream drain cannot fence requests still waiting in an admission queue.
+    config.set("enable_runtime_queue", false);
+    config.set("enable_progress_worker", false);
+}
+
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
     Status status = Status::OK();
