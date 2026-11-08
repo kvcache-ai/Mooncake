@@ -1832,6 +1832,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             ts = std::chrono::steady_clock::now().time_since_epoch().count();
             bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
         }
+        bucket->offload_notification_pending_ = complete_handler != nullptr;
         buckets_.emplace(bucket_id, std::move(bucket));
         disk.fifo_index.insert(bucket_id);
         disk.lru_index.emplace(ts, bucket_id);
@@ -1844,7 +1845,14 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // complete_handler before the RPC); int64_t fields carry the metadata
     // from BuildBucket unchanged.
     if (complete_handler != nullptr) {
-        auto error_code = complete_handler(committed_keys, committed_metadatas);
+        ErrorCode error_code = ErrorCode::INTERNAL_ERROR;
+        try {
+            error_code = complete_handler(committed_keys, committed_metadatas);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "Offload complete handler threw: " << error.what();
+        } catch (...) {
+            LOG(ERROR) << "Offload complete handler threw an unknown exception";
+        }
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Complete handler failed: " << error_code
                        << ", Key count: " << committed_keys.size()
@@ -1859,6 +1867,13 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
 
+    if (complete_handler != nullptr) {
+        SharedMutexLocker lock(&mutex_);
+        auto it = buckets_.find(bucket_id);
+        if (it != buckets_.end()) {
+            it->second->offload_notification_pending_ = false;
+        }
+    }
     return bucket_id;
 }
 
@@ -3404,12 +3419,17 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
             // otherwise make this return buckets_.end() forever, which the
             // caller reads as "nothing to evict" and turns into a permanent
             // write rejection for this disk. LRU below self-heals the same way.
-            while (!disk.fifo_index.empty()) {
-                auto bucket_it = buckets_.find(*disk.fifo_index.begin());
+            auto pos = disk.fifo_index.begin();
+            while (pos != disk.fifo_index.end()) {
+                auto bucket_it = buckets_.find(*pos);
                 if (bucket_it != buckets_.end()) {
+                    if (bucket_it->second->offload_notification_pending_) {
+                        ++pos;
+                        continue;
+                    }
                     return bucket_it;
                 }
-                disk.fifo_index.erase(disk.fifo_index.begin());
+                pos = disk.fifo_index.erase(pos);
             }
             return buckets_.end();
         }
@@ -3426,12 +3446,16 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
             //   - If stale, re-insert with the correct timestamp and retry.
             //   - If the bucket no longer exists, discard the entry.
             auto& lru_index = disk.lru_index;
-            while (!lru_index.empty()) {
-                auto top_it = lru_index.begin();
+            auto top_it = lru_index.begin();
+            while (top_it != lru_index.end()) {
                 auto [ts, id] = *top_it;
                 auto bucket_it = buckets_.find(id);
                 if (bucket_it == buckets_.end()) {
-                    lru_index.erase(top_it);
+                    top_it = lru_index.erase(top_it);
+                    continue;
+                }
+                if (bucket_it->second->offload_notification_pending_) {
+                    ++top_it;
                     continue;
                 }
                 int64_t actual_ts = bucket_it->second->last_access_ns_.load(
@@ -3442,6 +3466,7 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
                 // Stale: repair and retry to find the true minimum.
                 lru_index.erase(top_it);
                 lru_index.emplace(actual_ts, id);
+                top_it = lru_index.begin();
             }
             return buckets_.end();
         }
