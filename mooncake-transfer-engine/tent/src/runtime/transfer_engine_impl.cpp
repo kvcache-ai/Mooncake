@@ -1727,6 +1727,18 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
     return Status::OK();
 }
 
+bool TransferEngineImpl::producerEventHonored(const Request& req,
+                                              TransportType type,
+                                              bool staging) const {
+    if (!req.producer_event) return true;
+    // Staging re-issues fresh chunk requests that do not carry the event.
+    if (staging || type == UNSPEC || type < 0 ||
+        type >= static_cast<TransportType>(kSupportedTransportTypes))
+        return false;
+    return transport_list_[type] &&
+           transport_list_[type]->supportsProducerEvent();
+}
+
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
     bool device_direct = false;
@@ -2127,6 +2139,9 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
             last.req.intent_type != curr.req.intent_type) {
             return false;
         }
+        // A merged request carries one producer dependency; mixing events
+        // would drop the ordering of the other half.
+        if (last.req.producer_event != curr.req.producer_event) return false;
         if (!last.boundary.source_key || !curr.boundary.source_key ||
             !last.boundary.target_key || !curr.boundary.target_key) {
             return false;
@@ -2571,6 +2586,13 @@ Status TransferEngineImpl::prepareSubmit(
             return Status::NotImplemented(
                 "scatter transfer does not support staged TENT "
                 "routes" LOC_MARK);
+        }
+        if (owner.route.transport != UNSPEC &&
+            !producerEventHonored(owner.request, owner.route.transport,
+                                  owner.staging)) {
+            return Status::InvalidArgument(
+                "producer_event is not supported by the selected "
+                "transport route" LOC_MARK);
         }
         prepared.owners.push_back(std::move(owner));
     }
@@ -3085,6 +3107,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         if (staging_params.empty())
             findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
+            if (!producerEventHonored(task.request, task.type, true))
+                return finishQueuedOwner(owner_id, FAILED);
             task.staging = true;
             // Orchestration only; the real transport submissions issued by
             // ProxyManager are counted where they recurse through the
@@ -3108,6 +3132,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
 
     auto& transport = transport_list_[task.type];
     if (!transport) return finishQueuedOwner(owner_id, FAILED);
+    if (!producerEventHonored(task.request, task.type, false))
+        return finishQueuedOwner(owner_id, FAILED);
     auto& sub_batch = batch->sub_batch[task.type];
     if (task.type == RDMA || task.type == UB) {
         sub_batch->device_mask = task.device_mask;
@@ -3460,6 +3486,12 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         LOG_EVERY_N(WARNING, 100) << "No more transports available after "
                                   << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
+    }
+    // Never fail over to a route that would drop the producer dependency.
+    if (!producerEventHonored(task.request, type,
+                              !result.staging_params.empty())) {
+        return Status::InvalidEntry(
+            "fallback transport cannot honor producer_event" LOC_MARK);
     }
 
     LOG_EVERY_N(INFO, 1000)

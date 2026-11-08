@@ -572,6 +572,11 @@ class TransferEngineImpl {
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);
 
+    // False when req carries a producer_event that the route (a concrete
+    // transport, or a staged route) would not order the copy after.
+    bool producerEventHonored(const Request& req, TransportType type,
+                              bool staging) const;
+
     Status loadTransports();
 
     // Control-plane delivery used by sendNotification() once every loaded
