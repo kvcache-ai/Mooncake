@@ -10,24 +10,70 @@ set -x
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
-# CMake build directory (default: build).  EP/PG device extensions are staged
-# under ${BUILD_DIR}/ep_pg_staging. Host extensions are copied directly from
-# their normal CMake output paths before auditwheel, like the PG core library.
+# CMake build directory (default: build). EP and PG device extensions share
+# the existing staging directory and are selected from the CMake cache below.
 BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+BUILD_ROOT="$(pwd)"
+CMAKE_CACHE="${BUILD_DIR_ABS}/CMakeCache.txt"
+
+if [ ! -f "$CMAKE_CACHE" ]; then
+    echo "Error: CMake cache not found at ${CMAKE_CACHE}; configure the build before packaging"
+    exit 1
+fi
+
+cmake_option_enabled() {
+    local option_name="$1"
+    local option_value
+    option_value=$(sed -n "s/^${option_name}:[^=]*=//p" "$CMAKE_CACHE" | tail -n 1)
+    # Match CMake's case-insensitive false constants; NOTFOUND suffix matching is case-sensitive.
+    case "${option_value^^}" in
+        ""|0|OFF|NO|FALSE|N|IGNORE) return 1 ;;
+    esac
+    [[ "$option_value" != NOTFOUND && "$option_value" != *-NOTFOUND ]]
+}
+
+if ! grep -q '^WITH_EP:' "$CMAKE_CACHE"; then
+    echo "Error: WITH_EP is missing from ${CMAKE_CACHE}; configure with the current CMake files"
+    exit 1
+fi
+WITH_EP_BUILD=0
+if cmake_option_enabled WITH_EP; then WITH_EP_BUILD=1; fi
+USE_XPU_BUILD=0
+if cmake_option_enabled USE_XPU; then USE_XPU_BUILD=1; fi
+if grep -q '^WITH_PG:' "$CMAKE_CACHE"; then
+    WITH_PG_BUILD=0
+    if cmake_option_enabled WITH_PG; then WITH_PG_BUILD=1; fi
+else
+    # Before WITH_PG existed, non-XPU WITH_EP builds always included PG.
+    WITH_PG_BUILD="$WITH_EP_BUILD"
+    if [ "$USE_XPU_BUILD" = "1" ]; then WITH_PG_BUILD=0; fi
+fi
+
+DEVICE_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
+PG_JIT_STAGING_DIR="${DEVICE_STAGING_DIR}/_pg_jit"
+DEVICE_LIBRARY_BASENAMES=()
+if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ]; then
+    DEVICE_LIBRARY_BASENAMES+=(libmooncake_ep_device.so)
+fi
+if [ "$WITH_PG_BUILD" = "1" ]; then
+    DEVICE_LIBRARY_BASENAMES+=(libmooncake_pg_device.so)
+fi
+
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
+echo "CMake components: WITH_EP=${WITH_EP_BUILD}, WITH_PG=${WITH_PG_BUILD}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD_DIR_ABS}/mooncake-common/etcd:${BUILD_DIR_ABS}/mooncake-common/k8s-lease:${BUILD_DIR_ABS}/ep_pg_staging:/usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD_DIR_ABS}/mooncake-common/etcd:${BUILD_DIR_ABS}/mooncake-common/k8s-lease:${DEVICE_STAGING_DIR}:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
+rm -rf mooncake-wheel/mooncake/_pg_jit
 
-if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
-    rm -rf mooncake-wheel/mooncake/_pg_jit
-    cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
+if [ "$WITH_PG_BUILD" = "1" ] && [ -d "$PG_JIT_STAGING_DIR" ]; then
+    cp -R "$PG_JIT_STAGING_DIR" mooncake-wheel/mooncake/
 fi
 
 echo "Creating directory structure..."
@@ -38,16 +84,18 @@ cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
-# Copy the host-only PG core to mooncake directory
-if [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
+# Copy the host-only PG core to mooncake directory only for a PG build.
+if [ "$WITH_PG_BUILD" = "1" ] && [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
     echo "Copying libmooncake_pg.so..."
     cp "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" mooncake-wheel/mooncake/libmooncake_pg.so
 fi
 
 # Copy the native EP host binding to mooncake directory before auditwheel.
-# CUDA EP device libraries remain in the shared EP/PG staging directory and
-# are injected after auditwheel, matching the existing PG packaging flow.
-EP_HOST_SO=$(compgen -G "${BUILD_DIR}/mooncake-ep/src/_ep.*.so" | head -1 || true)
+# CUDA EP device libraries remain in EP staging and are injected after auditwheel.
+EP_HOST_SO=""
+if [ "$WITH_EP_BUILD" = "1" ]; then
+    EP_HOST_SO=$(compgen -G "${BUILD_DIR}/mooncake-ep/src/_ep.*.so" | head -1 || true)
+fi
 if [ -n "$EP_HOST_SO" ]; then
     echo "Copying native EP host extension..."
     cp "$EP_HOST_SO" mooncake-wheel/mooncake/
@@ -155,38 +203,37 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
-# EP/PG extensions are built during the cmake/make process when the project is
-# configured with -DWITH_EP=ON. Host extensions are repaired by auditwheel;
-# CUDA device libraries and PG extensions remain in the post-repair staging
-# directory so patchelf never touches CUDA fatbins.
+# EP/PG extensions are built during the CMake build according to the cached
+# component options. Host extensions are repaired by auditwheel; device
+# libraries remain in post-repair staging so patchelf never touches CUDA fatbins.
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
-CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
-
 # Kernel header tree the CUDA EP JIT compiles against at runtime.
 CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
 
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
-# If EP/PG .so files were staged inside the build directory, preserve them in a
-# temporary location so they survive the cleanup.
-CUDA_EP_STAGING_TEMP=""
+# Preserve selected component libraries and EP JIT headers if the build
+# directory is removed before auditwheel injection.
+DEVICE_STAGING_TEMP=""
 if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
-    if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
-        CUDA_EP_STAGING_TEMP=$(mktemp -d)
-        cp "$CUDA_EP_STAGING_DIR"/*.so "$CUDA_EP_STAGING_TEMP/"
-        echo "Preserved EP/PG .so files to ${CUDA_EP_STAGING_TEMP} before build-dir cleanup"
-        if [ -d "$CUDA_EP_JIT_DIR" ]; then
-            cp -r "$CUDA_EP_JIT_DIR" "$CUDA_EP_STAGING_TEMP/"
-            CUDA_EP_JIT_DIR="${CUDA_EP_STAGING_TEMP}/mooncake_ep_jit"
+    for device_library in "${DEVICE_LIBRARY_BASENAMES[@]}"; do
+        if [ -f "${DEVICE_STAGING_DIR}/${device_library}" ]; then
+            if [ -z "$DEVICE_STAGING_TEMP" ]; then
+                DEVICE_STAGING_TEMP=$(mktemp -d)
+            fi
+            cp "${DEVICE_STAGING_DIR}/${device_library}" "$DEVICE_STAGING_TEMP/"
+        fi
+    done
+    if [ -n "$DEVICE_STAGING_TEMP" ]; then
+        echo "Preserved selected EP/PG device libraries to ${DEVICE_STAGING_TEMP} before build-dir cleanup"
+        if [ "$WITH_EP_BUILD" = "1" ] && [ "$USE_XPU_BUILD" != "1" ] && [ -d "$CUDA_EP_JIT_DIR" ]; then
+            cp -r "$CUDA_EP_JIT_DIR" "$DEVICE_STAGING_TEMP/"
+            CUDA_EP_JIT_DIR="${DEVICE_STAGING_TEMP}/mooncake_ep_jit"
             echo "Preserved EP JIT headers to ${CUDA_EP_JIT_DIR} before build-dir cleanup"
         fi
     fi
     echo "Freeing disk space: removing build directory (artifacts already copied)"
     rm -rf "${BUILD_DIR}/"
-    # Point the injection step to the preserved copy (if any).
-    if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
-        CUDA_EP_STAGING_DIR="$CUDA_EP_STAGING_TEMP"
-    fi
 fi
 
 # Release builds still compile with -g (ENABLE_DEBUG_SYMBOLS defaults to ON),
@@ -228,7 +275,7 @@ fi
 
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
-export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${DEVICE_STAGING_DIR}:${DEVICE_STAGING_TEMP}:${LD_LIBRARY_PATH}"
 
 echo "Building wheel package..."
 # Stage migrated root Python modules and the legacy Reshard package for the
@@ -255,6 +302,7 @@ MIGRATED_PYTHON_MODULES=(
     mooncake_config.py
     ep.py
     mooncake_ep_buffer.py
+    mooncake_ep_tcpstore.py
     mooncake_elastic_buffer.py
     _administration.py
     mooncake_ssd_register.py
@@ -263,6 +311,8 @@ MIGRATED_PYTHON_MODULES=(
 )
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
+PG_MODULE_SOURCE="${BUILD_ROOT}/mooncake-wheel/mooncake/pg.py"
+PG_MODULE_BACKUP=""
 cleanup_migrated_python_staging() {
     for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
         if [ "${module}" = "__init__.py" ]; then
@@ -275,11 +325,19 @@ cleanup_migrated_python_staging() {
         rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
         MIGRATED_PYTHON_INIT_BACKUP=""
     fi
+    if [ -n "${PG_MODULE_BACKUP}" ] && [ -f "${PG_MODULE_BACKUP}" ]; then
+        mv "${PG_MODULE_BACKUP}" "${PG_MODULE_SOURCE}"
+        PG_MODULE_BACKUP=""
+    fi
     rm -rf "${STORE_FACADE_STAGING_DIR}"
     rm -rf "${RESHARD_STAGING_DIR}"
 }
 trap cleanup_migrated_python_staging EXIT
 cleanup_migrated_python_staging
+if [ "$WITH_PG_BUILD" != "1" ] && [ -f "$PG_MODULE_SOURCE" ]; then
+    PG_MODULE_BACKUP=$(mktemp)
+    mv "$PG_MODULE_SOURCE" "$PG_MODULE_BACKUP"
+fi
 MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
 cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
 for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
@@ -673,24 +731,34 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libmpcomm.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
-# Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
-# can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
-# files are kept out of auditwheel and added here with RPATH=$ORIGIN intact.
-if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
+# Inject only the selected EP and PG device libraries after auditwheel.
+# patchelf can corrupt CUDA fatbins, so these .so files stay out of repair.
+DEVICE_LIBRARY_SOURCE_DIR="$DEVICE_STAGING_DIR"
+if [ -n "$DEVICE_STAGING_TEMP" ]; then
+    DEVICE_LIBRARY_SOURCE_DIR="$DEVICE_STAGING_TEMP"
+fi
+HAS_SELECTED_DEVICE_LIBRARY=0
+for device_library in "${DEVICE_LIBRARY_BASENAMES[@]}"; do
+    if [ -f "${DEVICE_LIBRARY_SOURCE_DIR}/${device_library}" ]; then
+        HAS_SELECTED_DEVICE_LIBRARY=1
+    fi
+done
+if [ "$HAS_SELECTED_DEVICE_LIBRARY" = "1" ]; then
     REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
     if [ -n "$REPAIRED_WHEEL" ]; then
-        echo "Injecting CUDA extension .so files into repaired wheel..."
+        echo "Injecting selected EP/PG device libraries into repaired wheel..."
         WHEEL_UNPACK_DIR=$(mktemp -d)
         python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
-        for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
-            if [ -f "$so_file" ]; then
-                echo "  Adding $(basename "$so_file")"
-                cp "$so_file" "$UNPACKED_PKG_DIR/mooncake/$(basename "$so_file")"
+        for device_library in "${DEVICE_LIBRARY_BASENAMES[@]}"; do
+            if [ -f "${DEVICE_LIBRARY_SOURCE_DIR}/${device_library}" ]; then
+                echo "  Adding ${device_library}"
+                cp "${DEVICE_LIBRARY_SOURCE_DIR}/${device_library}" \
+                   "$UNPACKED_PKG_DIR/mooncake/${device_library}"
             fi
         done
         # Kernel headers for the EP JIT (runtime nvcc).
-        if [ -d "$CUDA_EP_JIT_DIR" ]; then
+        if [ "$WITH_EP_BUILD" = "1" ] && [ -d "$CUDA_EP_JIT_DIR" ]; then
             echo "  Adding EP JIT header tree"
             cp -r "$CUDA_EP_JIT_DIR" "$UNPACKED_PKG_DIR/mooncake/"
         fi
@@ -708,12 +776,12 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
         rm -rf "$WHEEL_UNPACK_DIR"
     fi
 else
-    echo "No EP/PG staging directory found (${CUDA_EP_STAGING_DIR}); skipping CUDA extension injection"
+    echo "No selected EP/PG device libraries found; skipping device-library injection"
 fi
 
-# Clean up the temporary EP/PG staging copy (used when FREE_BUILD_DIR or CI wiped the build dir).
-if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
-    rm -rf "$CUDA_EP_STAGING_TEMP"
+# Clean up the temporary device staging copy (used when FREE_BUILD_DIR or CI wiped the build dir).
+if [ -n "$DEVICE_STAGING_TEMP" ]; then
+    rm -rf "$DEVICE_STAGING_TEMP"
 fi
 # NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
 # on all ELF files so everything resolves from a single directory.
