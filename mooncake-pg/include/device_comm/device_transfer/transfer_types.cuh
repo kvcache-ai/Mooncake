@@ -25,6 +25,7 @@ enum class DeviceRouteType : uint32_t {
     P2p = 1,
     HostProxy = 2,
     Rdma = 3,
+    NcclDevice = 4,
 };
 
 // Terminal outcomes visible to a transfer-service caller.
@@ -46,6 +47,13 @@ struct DeviceRdmaRoute {
     uint32_t qp_offset;
 };
 
+struct DeviceNcclRoute {
+    // Rank within the NCCL communicator, not GlobalRank or InGroupRank.
+    int32_t nccl_rank;
+    // LSA mapping owned by the nccl communicator, or zero for a GIN peer.
+    uint64_t mapped_region_address;
+};
+
 struct DeviceHostProxyRoute {
     // Address published by the peer and consumed by the host proxy through TE.
     uint64_t remote_region_address;
@@ -58,6 +66,7 @@ struct DeviceTransferRoute {
     union {
         DeviceP2pRoute p2p = {};
         DeviceRdmaRoute rdma;
+        DeviceNcclRoute nccl;
         DeviceHostProxyRoute host_proxy;
     };
 
@@ -67,6 +76,8 @@ struct DeviceTransferRoute {
         switch (type) {
             case DeviceRouteType::P2p:
                 return p2p.mapped_region_address;
+            case DeviceRouteType::NcclDevice:
+                return nccl.mapped_region_address;
             default:
                 return 0;
         }
@@ -107,6 +118,16 @@ struct DeviceRdmaContext {
     uint32_t atomic_sink_lkey = 0;
 };
 
+namespace device {
+class NcclDeviceContext;
+}
+
+struct DeviceNcclContext {
+    const device::NcclDeviceContext* peer_accessible_ctx = nullptr;
+    const device::NcclDeviceContext* local_staging_ctx = nullptr;
+    DeviceLocalRegion peer_accessible_region;
+};
+
 struct DeviceHostProxyContext {
     HostProxyCommandSlot* command_slots = nullptr;
 };
@@ -114,6 +135,7 @@ struct DeviceHostProxyContext {
 // Non-owning route-specific device state shared by all peer routes.
 struct DeviceRouteContext {
     DeviceRdmaContext rdma;
+    DeviceNcclContext nccl;
     DeviceHostProxyContext host_proxy;
 };
 
