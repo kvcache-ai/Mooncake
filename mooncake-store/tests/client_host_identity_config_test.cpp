@@ -105,6 +105,83 @@ TEST_F(ClientHostIdentityConfigTest, RejectsInvalidOverrideWithoutFallback) {
     }
 }
 
+class PhysicalEnvGuard {
+   public:
+    PhysicalEnvGuard() {
+        for (const auto* name : {"MOONCAKE_FABRIC_DOMAIN", "MC_RACK", "MC_TRAY",
+                                 "MC_PHYSICAL_GPU", "CUDA_VISIBLE_DEVICES"}) {
+            const auto* value = std::getenv(name);
+            saved_.emplace_back(
+                name, value ? std::optional<std::string>(value) : std::nullopt);
+            unsetenv(name);
+        }
+    }
+    ~PhysicalEnvGuard() {
+        for (const auto& [name, value] : saved_) {
+            if (value)
+                setenv(name.c_str(), value->c_str(), 1);
+            else
+                unsetenv(name.c_str());
+        }
+    }
+
+   private:
+    std::vector<std::pair<std::string, std::optional<std::string>>> saved_;
+};
+
+TEST_F(ClientHostIdentityConfigTest, PhysicalDomainIsNotInferredFromRack) {
+    PhysicalEnvGuard env;
+    ASSERT_EQ(setenv("MC_RACK", "rack1", 1), 0);
+    ASSERT_EQ(setenv("MC_PHYSICAL_GPU", "3", 1), 0);
+    EXPECT_FALSE(
+        ClientHostIdentityConfig::PhysicalFromEnvironment("host:5000"));
+    ASSERT_EQ(setenv("MOONCAKE_FABRIC_DOMAIN", " fabric1 ", 1), 0);
+    auto placement =
+        ClientHostIdentityConfig::PhysicalFromEnvironment("host:5000");
+    ASSERT_TRUE(placement);
+    EXPECT_TRUE(placement->Valid());
+    EXPECT_EQ(placement->fabric_domain, "fabric1");
+    EXPECT_EQ(placement->tray, "host");
+    EXPECT_EQ(placement->physical_gpu, 3);
+}
+
+TEST_F(ClientHostIdentityConfigTest, PhysicalGpuDoesNotUseLogicalCudaZero) {
+    PhysicalEnvGuard env;
+    ASSERT_EQ(setenv("MOONCAKE_FABRIC_DOMAIN", "fabric1", 1), 0);
+    ASSERT_EQ(setenv("MC_RACK", "rack1", 1), 0);
+    ASSERT_EQ(setenv("CUDA_VISIBLE_DEVICES", "7", 1), 0);
+    Set("host-override:5000");
+    auto placement =
+        ClientHostIdentityConfig::PhysicalFromEnvironment("fallback");
+    ASSERT_TRUE(placement);
+    EXPECT_TRUE(placement->Valid());
+    EXPECT_EQ(placement->physical_gpu, 7);
+    EXPECT_EQ(placement->tray, "host-override");
+    ASSERT_EQ(setenv("MC_PHYSICAL_GPU", " 3 ", 1), 0);
+    ASSERT_EQ(setenv("MC_TRAY", " tray1 ", 1), 0);
+    placement = ClientHostIdentityConfig::PhysicalFromEnvironment("fallback");
+    ASSERT_TRUE(placement);
+    EXPECT_EQ(placement->physical_gpu, 3);
+    EXPECT_EQ(placement->tray, "tray1");
+}
+
+TEST_F(ClientHostIdentityConfigTest, AmbiguousGpuRequiresExplicitPhysicalId) {
+    PhysicalEnvGuard env;
+    ASSERT_EQ(setenv("MOONCAKE_FABRIC_DOMAIN", "fabric1", 1), 0);
+    ASSERT_EQ(setenv("MC_RACK", "rack1", 1), 0);
+    for (const auto* gpu : {"", "0,1", "GPU-uuid", "-1", "3x", "2147483648"}) {
+        ASSERT_EQ(setenv("CUDA_VISIBLE_DEVICES", gpu, 1), 0);
+        auto placement =
+            ClientHostIdentityConfig::PhysicalFromEnvironment("host");
+        ASSERT_TRUE(placement);
+        EXPECT_FALSE(placement->Valid()) << gpu;
+    }
+    ASSERT_EQ(setenv("MC_PHYSICAL_GPU", "3", 1), 0);
+    auto placement = ClientHostIdentityConfig::PhysicalFromEnvironment("host");
+    ASSERT_TRUE(placement);
+    EXPECT_TRUE(placement->Valid());
+}
+
 TEST_F(ClientHostIdentityConfigTest, NewConfigsReadCurrentEnvironment) {
     Set("host-a");
     const auto first =

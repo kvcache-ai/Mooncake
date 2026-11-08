@@ -2270,6 +2270,14 @@ PYBIND11_MODULE(_store, m) {
         .value("ENABLE", SoftPinAction::ENABLE)
         .value("DISABLE", SoftPinAction::DISABLE);
 
+    py::class_<PhysicalPlacement>(m, "PhysicalPlacement")
+        .def(py::init<>())
+        .def_readwrite("fabric_domain", &PhysicalPlacement::fabric_domain)
+        .def_readwrite("rack", &PhysicalPlacement::rack)
+        .def_readwrite("tray", &PhysicalPlacement::tray)
+        .def_readwrite("physical_gpu", &PhysicalPlacement::physical_gpu)
+        .def_readwrite("numa_node", &PhysicalPlacement::numa_node);
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -2288,6 +2296,35 @@ PYBIND11_MODULE(_store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_property(
+            "requester_self_id",
+            [](const ReplicateConfig &c) {
+                return c.requester_self_id ? *c.requester_self_id
+                                           : std::string{};
+            },
+            [](ReplicateConfig &c, const std::string &id) {
+                c.requester_self_id.reset();
+                if (!id.empty()) c.requester_self_id = id;
+            })
+        .def_property(
+            "fabric_domain",
+            [](const ReplicateConfig &c) {
+                return c.fabric_domain ? *c.fabric_domain : std::string{};
+            },
+            [](ReplicateConfig &c, const std::string &id) {
+                c.fabric_domain.reset();
+                if (!id.empty()) c.fabric_domain = id;
+            })
+        .def_property(
+            "requester_placement",
+            [](const ReplicateConfig &c) -> std::optional<PhysicalPlacement> {
+                if (!c.requester_placement) return std::nullopt;
+                return *c.requester_placement;
+            },
+            [](ReplicateConfig &c, std::optional<PhysicalPlacement> p) {
+                c.requester_placement.reset();
+                if (p) c.requester_placement = std::move(*p);
+            })
         .def_property(
             "session_ids",
             [](const ReplicateConfig &config)
