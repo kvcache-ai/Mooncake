@@ -1,0 +1,8 @@
+#pragma once
+
+// All Store targets and their consumers use this generated configuration.
+// Select it with CMake, never with a per-target compiler definition.
+#ifdef MOONCAKE_ENABLE_CUSTOM_EVICTION
+#error "Set MOONCAKE_ENABLE_CUSTOM_EVICTION through CMake."
+#endif
+#cmakedefine01 MOONCAKE_ENABLE_CUSTOM_EVICTION

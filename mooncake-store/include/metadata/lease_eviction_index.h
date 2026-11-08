@@ -43,6 +43,7 @@
 #include "lease.h"
 #include "metadata/eviction_index.h"
 #include "metadata/object_route.h"
+#include "mooncake_custom_eviction_config.h"
 #include "mutex.h"
 #include "object_metadata.h"
 
@@ -117,6 +118,17 @@ class LeaseEvictionIndex final : public EvictionIndex {
             keys_.clear();
             entries_.clear();
         }
+
+#if MOONCAKE_ENABLE_CUSTOM_EVICTION
+        void Release() noexcept {
+            // Assigning an empty string may retain its heap buffer.
+            Copy empty;
+            bytes_.swap(empty.bytes_);
+            key_ends_.swap(empty.key_ends_);
+            keys_.swap(empty.keys_);
+            entries_.swap(empty.entries_);
+        }
+#endif
 
         // Starts an entry; the keys added until the next one are its.
         void StartEntry(Rank rank, uint64_t group) {
@@ -292,6 +304,26 @@ class LeaseEvictionIndex final : public EvictionIndex {
               total_(index.size_.load(std::memory_order_relaxed)) {}
 
         std::optional<Entry> Next() override {
+#if MOONCAKE_ENABLE_CUSTOM_EVICTION
+            if (pos_ >= copy_.size()) {
+                if (pos_ == kDone) {
+                    return std::nullopt;
+                }
+                pos_ = 0;
+                try {
+                    next_ = index_.ReadBucket(next_, last_, copy_);
+                } catch (...) {
+                    // ReadBucket's lock has unwound. A failed copy or Seal
+                    // must never expose an incomplete entry on another Next.
+                    Finish();
+                    throw;
+                }
+                if (copy_.size() == 0) {
+                    Finish();
+                    return std::nullopt;
+                }
+            }
+#else
             if (pos_ == copy_.size()) {
                 pos_ = 0;
                 next_ = index_.ReadBucket(next_, last_, copy_);
@@ -299,6 +331,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
             if (pos_ == copy_.size()) {
                 return std::nullopt;
             }
+#endif
             return copy_[pos_++];
         }
 
@@ -318,6 +351,17 @@ class LeaseEvictionIndex final : public EvictionIndex {
         size_t Total() const override { return total_; }
 
        private:
+#if MOONCAKE_ENABLE_CUSTOM_EVICTION
+        void Finish() noexcept {
+            copy_.Release();
+            pos_ = kDone;
+        }
+
+        // No Copy can contain this many entries. Check only when refilling,
+        // so terminal state needs neither a field nor a per-entry check.
+        static constexpr size_t kDone = std::numeric_limits<size_t>::max();
+#endif
+
         const LeaseEvictionIndex& index_;
         // The last bucket the walk reads.
         const Rank last_;

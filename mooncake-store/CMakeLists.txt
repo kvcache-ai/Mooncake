@@ -35,6 +35,13 @@ set(MOONCAKE_DISPLAY_VERSION "${MOONCAKE_DISPLAY_VERSION_BASE} (git: ${GIT_SHORT
 
 configure_file(include/version.h.in include/version.h @ONLY)
 
+# Shared opt-in for the incremental custom eviction implementation. Keep this
+# here so embedders that add mooncake-store directly get the same configuration.
+option(MOONCAKE_ENABLE_CUSTOM_EVICTION "Enable experimental custom eviction"
+       OFF)
+configure_file(include/mooncake_custom_eviction_config.h.in
+               include/mooncake_custom_eviction_config.h @ONLY)
+
 if (STORE_USE_ETCD)
     set(ETCD_WRAPPER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/)
     set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/libetcd_wrapper.so)
