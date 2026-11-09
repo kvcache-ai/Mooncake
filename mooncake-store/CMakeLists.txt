@@ -33,9 +33,10 @@ configure_file(include/version.h.in include/version.h @ONLY)
 # Add subdirectories
 add_subdirectory(src)
 
-# TODO(F01-2.5): Split Store UT/benchmark build gates and verify each
-# architecture's test/benchmark consumers and artifacts.
 if (BUILD_UNIT_TESTS)
     add_subdirectory(tests)
+endif()
+
+if (BUILD_BENCHMARK)
     add_subdirectory(benchmarks)
 endif()
