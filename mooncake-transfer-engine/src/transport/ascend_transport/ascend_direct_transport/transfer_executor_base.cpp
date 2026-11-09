@@ -482,18 +482,17 @@ int TransferExecutorBase::disconnect(size_t engine_idx,
 }
 
 int TransferExecutorBase::disconnectAllPeers() {
-    if (params_.use_async_transfer) {
-        LOG(ERROR) << "disconnectAllPeers does not support "
-                      "ASCEND_USE_ASYNC_TRANSFER";
-        return -1;
-    }
-
     {
         std::unique_lock<std::mutex> lock(transfer_lifecycle_mutex_);
         peers_quiesced_ = true;
         transfer_lifecycle_cv_.wait(
             lock, [this] { return active_sync_transfers_ == 0; });
     }
+
+    // Query-thread Disconnect runs before active_async_tasks_ drops to 0, so
+    // this returns only after those Adxl calls have finished. Do not hold
+    // connection_mutex_ across the wait: the query thread needs it.
+    drainInFlightTransfers();
 
     int result = 0;
     {

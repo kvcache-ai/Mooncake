@@ -140,6 +140,11 @@ class TransferExecutorBase {
         const std::vector<Transport::Slice*>& slice_list,
         std::vector<void*>& dest_addrs);
 
+    // Async executor waits until every submitted task has finished and the
+    // query thread has returned from its follow-up Disconnect. The sync
+    // executor has no such work left once active_sync_transfers_ reaches 0.
+    virtual void drainInFlightTransfers() {}
+
     InitParams params_;
     // One instance per local engine: it owns that engine's ACL context, copy
     // streams and in-flight groups, so Copy()/Poll() need no device lookup.
