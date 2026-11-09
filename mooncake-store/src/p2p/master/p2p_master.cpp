@@ -543,7 +543,7 @@ int P2PMaster::RunWithHA() {
             HAStatusManager::instance().SetOpLogProgress(latest_sequence_id,
                                                          latest_sequence_id);
             HAStatusManager::instance().SetRoleState("primary", "RUNNING");
-            {
+            if (master_registry_heartbeat) {
                 master_registry_heartbeat->SetAppliedSequenceProvider(
                     [primary_service, latest_sequence_id] {
                         const uint64_t sequence_id =
