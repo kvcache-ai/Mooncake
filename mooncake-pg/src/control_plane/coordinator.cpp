@@ -29,12 +29,37 @@ bool memberSupportsGpuCollectiveBackend(const GroupMember& member,
            member.endpoint->device_collective.supportsBackend(backend);
 }
 
+bool groupSupportsOneShot(const GroupView& view) {
+    std::vector<const LLEndpoint*> endpoints;
+    for (const auto& member : view.members) {
+        if (!member.isActive()) continue;
+        if (!member.endpoint) return false;
+        const auto& endpoint = member.endpoint->device_collective;
+        if (!endpoint.ll || !endpoint.one_shot) return false;
+        endpoints.push_back(&*endpoint.ll);
+    }
+    // One-shot needs every directed edge, not just a connected topology.
+    for (const auto* source : endpoints) {
+        for (const auto* destination : endpoints) {
+            if (source == destination) continue;
+            const auto& peers = source->native_atomic_peer_uuids;
+            if (std::find(peers.begin(), peers.end(),
+                          destination->device_uuid) == peers.end()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
-    int max_world_size, std::chrono::microseconds fault_reconciliation_window)
+    int max_world_size, std::chrono::microseconds fault_reconciliation_window,
+    std::optional<DeviceAllReduceAlgorithm> all_reduce_algorithm)
     : max_world_size_(max_world_size),
-      fault_reconciliation_window_(fault_reconciliation_window) {
+      fault_reconciliation_window_(fault_reconciliation_window),
+      all_reduce_algorithm_(all_reduce_algorithm) {
     PG_ASSERT(max_world_size_ > 0 && max_world_size_ <= kMaxNumRanks,
               "invalid max_world_size: ", max_world_size_);
     ranks_.resize(max_world_size_);
@@ -1292,6 +1317,32 @@ void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
                   << " group=" << view.group_id
                   << " backend=" << gpuCollectiveBackendName(selected)
                   << " active_rank_count=" << active_rank_count;
+    }
+
+    view.all_reduce_algorithm_choices.clear();
+    if (selected != GpuCollectiveBackend::New) return;
+
+    const bool use_one_shot =
+        all_reduce_algorithm_ != DeviceAllReduceAlgorithm::Ring &&
+        groupSupportsOneShot(view);
+    if (use_one_shot) {
+        const uint64_t max_bytes =
+            all_reduce_algorithm_ == DeviceAllReduceAlgorithm::OneShot
+                ? std::numeric_limits<uint64_t>::max()
+                : 512 * 1024;
+        view.all_reduce_algorithm_choices.push_back(
+            {max_bytes, DeviceAllReduceAlgorithm::OneShot});
+    }
+    if (all_reduce_algorithm_.has_value()) {
+        LOG(INFO) << "[PG] Coordinator selected AllReduce algorithm="
+                  << (use_one_shot ? "oneshot" : "ring")
+                  << " group=" << view.group_id;
+        if (all_reduce_algorithm_ == DeviceAllReduceAlgorithm::OneShot &&
+            !use_one_shot) {
+            LOG(WARNING) << "[PG] OneShot is unavailable on this group; "
+                            "falling back to Ring"
+                         << " group=" << view.group_id;
+        }
     }
 }
 

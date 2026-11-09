@@ -25,6 +25,7 @@
 #ifdef WITH_METRICS
 #include <iomanip>
 #include <sstream>
+#include "transfer_engine_metrics.h"
 #endif
 
 #include "transfer_metadata_plugin.h"
@@ -323,7 +324,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using custom topology from: " << path;
             auto topo_json = loadTopologyJsonFile(path);
             if (!topo_json.empty()) {
-                local_topology_->parse(topo_json);
+                ret = local_topology_->parse(topo_json, filter_);
+                if (ret == 0 && !filter_.empty() &&
+                    local_topology_->getHcaList().empty()) {
+                    std::string names;
+                    for (const auto& name : filter_)
+                        names += (names.empty() ? "" : ",") + name;
+                    LOG(ERROR) << "No HCA in " << path
+                               << " matches device filter [" << names << "]";
+                    return ERR_DEVICE_NOT_FOUND;
+                }
             } else {
                 LOG(WARNING) << "Failed to load custom topology from " << path
                              << ", falling back to auto-detect.";
@@ -1160,6 +1170,11 @@ void TransferEngineImpl::InitializeMetricsConfig() {
                          << interval_env
                          << ", using default: " << metrics_interval_seconds_;
         }
+    }
+
+    if (metrics_enabled_) {
+        TransferEngineMetrics::enable();
+        TransferEngineMetrics::instance().initializeFromEnv();
     }
 }
 

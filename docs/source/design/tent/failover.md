@@ -79,8 +79,8 @@ Submit-stage failures (`submitTransferTasks` returning non-OK) are **not** retri
 
 Inside `RdmaTransport`, each completion drives the rail monitor:
 
-* Bad completion → `rail.markFailed(local_nic, remote_nic)`
-* Good completion → `rail.markRecovered(local_nic, remote_nic)`
+* Bad completion → `rail.markFailed(local_nic, remote_nic, probe_token)`
+* Good completion → `rail.markRecovered(local_nic, remote_nic, probe_token)`
 
 `markFailed` bumps `error_count` inside `error_window_`. Once the count hits `error_threshold_` the rail is paused until `now + cooldown_`; the cooldown escalates only when a *fresh* pause arms (`was_paused == false`), never within one burst — a single outage of N error WQEs in one window is one trip, not N. On a repeat failure across recovery cycles it doubles up to `kMaxCooldown` (300 s).
 
@@ -89,7 +89,7 @@ Inside `RdmaTransport`, each completion drives the rail monitor:
 The admission gate is split into a pure predicate and a mutating admit:
 
 * `isAvailable(local, remote) const` returns true only for a Closed/healthy rail. It never mutates state and never calls `updateBestMapping`, so it is safe to call from `updateBestMapping` (the mapping rebuild) without the recursion the old single `available()` had.
-* `admit(local, remote)` is the only path that arms a probe/trial. For a Closed rail it returns true with no mutation. While a rail is Open (cooldown running) it admits one exploratory probe every `probe_interval_`; a probe success closes the rail early (transient-fault recovery in seconds rather than the full cooldown), a probe failure is a no-op for escalation (the rail was already paused, so defect A holds). When the cooldown expires without a probe proving the rail healthy, `admit` transitions to Half-Open and admits exactly ONE trial — it does not fully reopen. Escalation happens only if that trial fails (`markFailed` doubles the cooldown and re-arms); a trial success closes the rail. Elapsed time alone never proves the path is healthy, so clock expiry alone never escalates and never floods a still-dead peer with every slice. `probe_in_flight` gates a second probe/trial from racing the first while it is on the wire (single-threaded per-worker ownership makes a bool sufficient); a pre-wire failure that armed a probe but never reached the wire calls `cancelProbe` to roll the admission back.
+* `admit(local, remote, probe_token)` is the only path that arms a probe/trial and always writes the token output. A healthy rail returns true with token `0`; a paused rail returns a nonzero token when admitting a probe/trial. The owner must pass that token to `markFailed`, `markRecovered`, or `cancelProbe`; ordinary completions pass `0`. While a rail is Open (cooldown running) it admits one exploratory probe every `probe_interval_`; a probe success closes the rail early (transient-fault recovery in seconds rather than the full cooldown), a probe failure is a no-op for escalation (the rail was already paused, so defect A holds). When the cooldown expires without a probe proving the rail healthy, `admit` transitions to Half-Open and admits exactly ONE trial — it does not fully reopen. Escalation happens only if that trial fails (`markFailed` doubles the cooldown and re-arms); a trial success closes the rail. Elapsed time alone never proves the path is healthy, so clock expiry alone never escalates and never floods a still-dead peer with every slice. `probe_in_flight` gates a second probe/trial from racing the first while it is on the wire; a pre-wire failure that armed a probe but never reached the wire calls `cancelProbe` to roll the admission back.
 
 This produces two recovery signals — a probe/trial result, and a live success on a posted transfer — so a flaky rail returns to service at the first good completion instead of waiting for the full cooldown, and a still-dead peer is probed at one trial per `probe_interval_` rather than slammed every cycle.
 

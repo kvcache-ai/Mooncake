@@ -109,6 +109,23 @@ class MultiTransport {
     Status selectTransports(const std::vector<TransferRequest> &entries,
                             std::vector<Transport *> &transports);
 
+    // Stamp a task's submission time and direction for the metrics, before it
+    // is posted to its transport.
+    static void recordTaskStart(Transport::TransferTask &task,
+                                const TransferRequest &request);
+
+    // Record `task` in the metrics once, on the first poll or batch free that
+    // observes a terminal `status` (COMPLETED, FAILED, CANCELED or TIMEOUT).
+    static void recordTaskEnd(Transport::TransferTask &task,
+                              const TransferStatus &status);
+
+    // Record a finished `task` from the outcome the event-driven completion
+    // callback saved, or else from its slice counters.
+    static void recordFinishedTask(Transport::TransferTask &task);
+
+    // True while the metrics record tasks.
+    static bool metricsEnabled();
+
     // If `allows_reuse` is non-null it is written on every return. True means
     // this segment's transport is a function of `target_id` only, so the
     // caller may reuse the returned pointer for later requests with the same

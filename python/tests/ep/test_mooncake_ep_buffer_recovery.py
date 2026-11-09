@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -5,11 +6,18 @@ from mooncake.mooncake_ep_buffer import Buffer
 
 
 class _Runtime:
+    def __init__(self, disabled=False, fail_update=False):
+        self.disabled = disabled
+        self.fail_update = fail_update
+        self.updates = 0
+
     def update_local_qpns(self):
-        pass
+        self.updates += 1
+        if self.fail_update:
+            self.disabled = True
 
     def ibgda_disabled(self):
-        return False
+        return self.disabled
 
     def p2p_enabled(self):
         return True
@@ -24,19 +32,45 @@ class _Runtime:
         return True
 
 
-def test_coordinated_ibgda_failure_keeps_all_ranks_on_fallback(monkeypatch):
+@pytest.mark.parametrize(
+    "already_fallback,disabled,fail_update,peer_failure_phase,expected_updates",
+    [
+        (False, False, False, 1, 1),  # Peer fails after QP update.
+        (False, False, True, None, 1),  # Local QP update fails.
+        (False, False, False, 0, 0),  # Peer is disabled before QP update.
+        (True, False, False, None, 0),  # Earlier fallback stays coordinated.
+        (False, True, False, None, 0),  # Local IBGDA is already disabled.
+    ],
+)
+def test_coordinated_ibgda_failure_keeps_all_ranks_on_fallback(
+    monkeypatch,
+    already_fallback,
+    disabled,
+    fail_update,
+    peer_failure_phase,
+    expected_updates,
+):
     buffer = object.__new__(Buffer)
     buffer.device_type = "cuda"
-    buffer._use_fallback = False
+    buffer._use_fallback = already_fallback
     buffer.group = object()
     buffer.group_size = 2
     buffer.rank = 0
-    buffer.runtime = _Runtime()
+    buffer.runtime = _Runtime(disabled=disabled, fail_update=fail_update)
     buffer._bootstrap_device = lambda: torch.device("cpu")
     buffer._active_ranks_list = lambda device: [1, 1]
 
-    # Simulate another rank reporting a QP-update failure in the group MAX.
-    monkeypatch.setattr(dist, "all_reduce", lambda tensor, **kwargs: tensor.fill_(1))
+    reductions = []
+
+    def all_reduce(tensor, *, op, group):
+        assert op == dist.ReduceOp.MIN
+        assert group is buffer.group
+        phase = len(reductions)
+        reductions.append(tensor.item())
+        if phase == peer_failure_phase:
+            tensor.fill_(0)
+
+    monkeypatch.setattr(dist, "all_reduce", all_reduce)
     monkeypatch.setattr(
         dist,
         "all_gather",
@@ -46,3 +80,7 @@ def test_coordinated_ibgda_failure_keeps_all_ranks_on_fallback(monkeypatch):
     buffer.connect(is_update=True)
 
     assert buffer._use_fallback is True
+    assert buffer.runtime.updates == expected_updates
+    # IPC still advertises a fast path; coordinated failure must veto it.
+    assert reductions[-1] == 0
+    assert len(reductions) == (3 if expected_updates else 2)
