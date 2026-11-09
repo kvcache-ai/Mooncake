@@ -89,6 +89,56 @@ inline RdmaSlicePlan planRdmaSlices(uint64_t length, uint64_t base_block,
     return {block_size, count};
 }
 
+// Picks the worker lane for each slice a submission cuts. A worker posts on
+// the queue pair with its own index at the slice's endpoint, so the lane also
+// picks the slice's queue pair. A shared cursor moves one lane per slice; a
+// slice whose source NIC was chosen up front takes its lane from that NIC's
+// own cursor instead.
+//
+// With the shared cursor alone a slice's lane follows from its position in
+// the submission. When the allocator alternates NICs slice by slice -- the
+// round-robin mode, and the smart selector's probe calls -- each of D NICs
+// then only ever reaches num_lanes / gcd(num_lanes, D) of its queue pairs:
+// 3 of 6 with two NICs. A NIC shares its bandwidth among the queue pairs
+// that have work, so such a request gets a third of a busy NIC, not half,
+// against a flow that keeps all six queue pairs busy.
+//
+// A NIC's cursor starts where the shared one stands at that NIC's first
+// slice of the request, so a NIC whose slices form one contiguous run keeps
+// exactly the lanes the shared cursor gives it. Slices with no NIC chosen up
+// front pick theirs on the worker and keep the shared cursor.
+class RdmaLaneCursor {
+   public:
+    // Device masks are 64 bits wide, so NIC ids are below 64.
+    static constexpr int kMaxDevices = 64;
+
+    RdmaLaneCursor(int num_lanes, int start)
+        : num_lanes_(num_lanes > 0 ? num_lanes : 1), shared_(start) {}
+
+    // Per-NIC cursors last one request; the shared cursor runs on.
+    void beginRequest() { started_ = 0; }
+
+    // `source_dev_id` is the NIC chosen up front, or -1 for none.
+    int next(int source_dev_id) {
+        int cursor = shared_++;
+        if (source_dev_id >= 0 && source_dev_id < kMaxDevices) {
+            const uint64_t bit = 1ULL << source_dev_id;
+            if ((started_ & bit) == 0) {
+                started_ |= bit;
+                per_device_[source_dev_id] = cursor;
+            }
+            cursor = per_device_[source_dev_id]++;
+        }
+        return cursor % num_lanes_;
+    }
+
+   private:
+    int num_lanes_;
+    int shared_;
+    uint64_t started_ = 0;
+    int per_device_[kMaxDevices] = {};
+};
+
 // Forward declarations
 class RdmaEndPoint;
 struct RdmaTask;
