@@ -322,35 +322,30 @@ endif()
 if(WITH_EP)
   install(TARGETS _ep LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                               COMPONENT python)
-  # XPU builds no Mooncake PG, so EP_PG_STAGING_DIR is unset there.
-  if(NOT USE_XPU)
+  if(USE_CUDA)
     install(
-      DIRECTORY "${EP_PG_STAGING_DIR}/"
+      FILES "${EP_PG_STAGING_DIR}/libmooncake_ep_device.so"
       DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
-      COMPONENT python
-      FILES_MATCHING
-      PATTERN "*.so")
+      COMPONENT python)
 
     # The CUDA EP JIT runs nvcc on the user's machine, so nvcc needs the kernel
     # headers there too. Put them in the wheel, in a mooncake_ep_jit/ directory
     # next to libmooncake_ep_device.so.
-    if(USE_CUDA)
-      install(
-        DIRECTORY "${CMAKE_BINARY_DIR}/mooncake_ep_jit/"
-        DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/mooncake_ep_jit"
-        COMPONENT python)
-    endif()
+    install(
+      DIRECTORY "${CMAKE_BINARY_DIR}/mooncake_ep_jit/"
+      DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/mooncake_ep_jit"
+      COMPONENT python)
   endif()
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/ep.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ep_buffer.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ep_tcpstore.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_elastic_buffer.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
-  # ep.so / pg.so link against engine.so by that exact bare name. Create a
-  # engine.so -> engine<EXT_SUFFIX> symlink so they can find it.
+  # The EP host extension links against engine.so by that exact bare name.
+  # Create a compatibility symlink next to the ABI-tagged engine extension.
   if(SKBUILD)
     set(_mooncake_engine_compat_path
         "${CMAKE_INSTALL_PREFIX}/${MOONCAKE_PYTHON_INSTALL_DIR}/engine.so")
@@ -364,6 +359,17 @@ if(WITH_EP)
             \"${_mooncake_engine_compat_path}\"
         )
     "
+    COMPONENT python)
+endif()
+
+if(WITH_PG)
+  install(
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
+    DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+    COMPONENT python)
+  install(
+    FILES "${EP_PG_STAGING_DIR}/libmooncake_pg_device.so"
+    DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
     COMPONENT python)
 endif()
 
@@ -407,7 +413,7 @@ if(SKBUILD)
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 
-  if(WITH_EP AND NOT USE_XPU)
+  if(WITH_PG)
     install(TARGETS mooncake_pg
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()

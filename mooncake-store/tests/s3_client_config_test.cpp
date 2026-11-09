@@ -141,6 +141,19 @@ TEST_F(S3ClientConfigTest, InvalidTypedValuesUseExistingDefaultsAndWarn) {
               std::string::npos);
 }
 
+TEST_F(S3ClientConfigTest, UsesStaticCredentialsOnlyWithBothKeys) {
+    EXPECT_FALSE(S3ClientConfig::FromEnvironment().UsesStaticCredentials());
+
+    Set("MOONCAKE_AWS_ACCESS_KEY_ID", "access");
+    EXPECT_FALSE(S3ClientConfig::FromEnvironment().UsesStaticCredentials());
+
+    Set("MOONCAKE_AWS_SECRET_ACCESS_KEY", "secret");
+    EXPECT_TRUE(S3ClientConfig::FromEnvironment().UsesStaticCredentials());
+
+    Set("MOONCAKE_AWS_ACCESS_KEY_ID", "");
+    EXPECT_FALSE(S3ClientConfig::FromEnvironment().UsesStaticCredentials());
+}
+
 TEST_F(S3ClientConfigTest, NewConfigsReadCurrentEnvironment) {
     Set("MOONCAKE_AWS_REGION", "first");
     const auto first = S3ClientConfig::FromEnvironment();
