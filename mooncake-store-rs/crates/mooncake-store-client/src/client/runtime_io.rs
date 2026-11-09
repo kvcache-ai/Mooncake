@@ -2676,6 +2676,352 @@ impl StoreClient {
             .collect()
     }
 
+    /// Direct multi-buffer read fast path: one transfer batch reads object
+    /// bytes straight into the caller's registered buffers, without the
+    /// per-object payload allocation and extra copies of the payload path.
+    ///
+    /// Returns `Err` when its preconditions are not met (unresolved routes,
+    /// unregistered destination buffers, cold backing, non-exact capacities);
+    /// the caller then falls back to the payload-based implementation.
+    pub(crate) fn batch_get_into_multi_buffers_direct(
+        &self,
+        requests: &mut [MultiBufferGetRequest<'_>],
+    ) -> Result<Vec<usize>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let timing = std::env::var_os("MC_STORE_RS_TIMING").is_some();
+        let call_started = std::time::Instant::now();
+        let _span = info_span!(
+            "store.batch_get_into_multi_buffers_direct",
+            runtime = %self.lease.runtime,
+            items = requests.len()
+        )
+        .entered();
+
+        let objects = requests
+            .iter()
+            .map(|request| {
+                let mut object = ObjectRef::new(request.key);
+                if let Some(tenant) = request.tenant {
+                    object = object.tenant(tenant);
+                }
+                if let Some(domain) = request.domain {
+                    object = object.domain(domain);
+                }
+                if let Some(object_set) = request.object_set {
+                    object = object.object_set(object_set);
+                }
+                if let Some(qos_tier) = request.qos_tier {
+                    object = object.qos_tier(qos_tier);
+                }
+                object
+            })
+            .collect::<Vec<_>>();
+        let resolve_started = std::time::Instant::now();
+        let (resolved, resolved_indices) = self.resolve_objects(&objects)?;
+        let resolve_elapsed = resolve_started.elapsed();
+        if resolved.len() != requests.len()
+            || resolved_indices.len() != requests.len()
+            || resolved_indices
+                .iter()
+                .enumerate()
+                .any(|(index, resolved_index)| *resolved_index != index)
+        {
+            return Err(StoreError::NotFound(
+                "multi-buffer direct read requires every key to resolve".to_string(),
+            ));
+        }
+        if resolved.iter().any(cold_tier::resolved_uses_cold_backing) {
+            return Err(StoreError::Unsupported(
+                "multi-buffer direct read does not support cold backing".to_string(),
+            ));
+        }
+        for (request, entry) in requests.iter().zip(resolved.iter()) {
+            let total = request
+                .buffers
+                .iter()
+                .map(|buffer| buffer.len())
+                .sum::<usize>();
+            if total as u64 != entry.replica.length {
+                return Err(StoreError::Allocator(format!(
+                    "multi-buffer direct read requires exact capacity for key {}: have={} need={}",
+                    request.key, total, entry.replica.length
+                )));
+            }
+        }
+        {
+            let state = self.state.lock();
+            for request in requests.iter() {
+                for buffer in request.buffers.iter() {
+                    if buffer.is_empty() {
+                        continue;
+                    }
+                    if !state.buffer_is_registered(buffer.as_ptr() as *mut c_void, buffer.len()) {
+                        return Err(StoreError::InvalidState(format!(
+                            "buffer at {:p} (size={}) is not registered for direct multi-buffer read",
+                            buffer.as_ptr(),
+                            buffer.len()
+                        )));
+                    }
+                }
+            }
+        }
+
+        struct DirectRun {
+            src_offset: u64,
+            dest: usize,
+            length: usize,
+        }
+
+        // Merge adjacent destination buffers into single runs: the mc_tests /
+        // vLLM page layout has K and V contiguous inside one 144 KiB page.
+        let mut runs_per_request: Vec<Vec<DirectRun>> = Vec::with_capacity(requests.len());
+        for request in requests.iter() {
+            let mut runs: Vec<DirectRun> = Vec::with_capacity(request.buffers.len());
+            let mut src_offset = 0u64;
+            for buffer in request.buffers.iter() {
+                let length = buffer.len();
+                if length == 0 {
+                    continue;
+                }
+                let dest = buffer.as_ptr() as usize;
+                if let Some(last) = runs.last_mut() {
+                    if last.dest + last.length == dest {
+                        last.length += length;
+                        src_offset += length as u64;
+                        continue;
+                    }
+                }
+                runs.push(DirectRun {
+                    src_offset,
+                    dest,
+                    length,
+                });
+                src_offset += length as u64;
+            }
+            runs_per_request.push(runs);
+        }
+
+        let plan_started = std::time::Instant::now();
+        let transport = self.transport()?;
+        let max_registration_bytes = transport.max_registration_bytes();
+        let local_segments = self.local_storage_segments();
+        let mut copy_instructions: Vec<(PreparedCopy, *mut u8, Option<Vec<u8>>)> = Vec::new();
+        let mut remote_requests: Vec<TransferRequest> = Vec::new();
+        let mut bytes_out: u64 = 0;
+        let mut tenant = resolved[0].tenant.clone();
+
+        for (index, entry) in resolved.iter().enumerate() {
+            bytes_out += entry.replica.length;
+            tenant = entry.tenant.clone();
+            let is_local = entry.replica.owner == self.lease.runtime
+                && local_segments.contains(&entry.replica.segment_name);
+            // NPU device destinations of *local* replicas: read through the
+            // transfer engine as well (same request shape as remote reads).
+            // TE turns a local-segment read into a local copy (D2H chosen by
+            // the local copy engine), so the store does not have to stage the
+            // object through host memory with a CPU copy followed by an ACL
+            // H2D copy -- that is what the C++ Store does for every replica.
+            let local_device_destination = if is_local {
+                runs_per_request[index].first().is_some_and(|run| {
+                    mooncake_store_rs_transport::ascend_pointer_is_device(
+                        run.dest as *mut c_void,
+                    ) == Some(true)
+                })
+            } else {
+                false
+            };
+            if is_local && !local_device_destination {
+                let open_segment_name =
+                    self.local_transport_open_segment_name(&entry.replica.segment_name);
+                let info = {
+                    let mut state = self.state.lock();
+                    let (_, info) = state.open_segment_with_info(transport, &open_segment_name)?;
+                    info
+                };
+                let chunks = self.replica_target_chunks(&entry.replica)?;
+                let target_offset =
+                    Self::replica_storage_target_offset(&info, &chunks, &entry.replica)?;
+                let state = self.state.lock();
+                let memory = state.memory_ref()?;
+                for run in &runs_per_request[index] {
+                    let instructions = memory.prepare_storage_copy_instructions(
+                        &entry.replica.segment_name,
+                        &info,
+                        target_offset + run.src_offset,
+                        run.length,
+                        max_registration_bytes,
+                    )?;
+                    copy_instructions.push((instructions, run.dest as *mut u8, None));
+                }
+            } else if is_local {
+                let open_segment_name =
+                    self.local_transport_open_segment_name(&entry.replica.segment_name);
+                let (segment, info) = {
+                    let mut state = self.state.lock();
+                    let (segment, mut info) =
+                        state.open_segment_with_info(transport, &open_segment_name)?;
+                    state.augment_segment_info_from_target_metadata(
+                        &mut info,
+                        &entry.replica.owner,
+                        &entry.replica.segment_name,
+                    );
+                    (segment, info)
+                };
+                let chunks = self.replica_target_chunks(&entry.replica)?;
+                let target_offset =
+                    Self::replica_storage_target_offset(&info, &chunks, &entry.replica)?;
+                for run in &runs_per_request[index] {
+                    remote_requests.extend(Self::target_buffer_transfer_requests(
+                        Opcode::Read,
+                        segment,
+                        target_offset + run.src_offset,
+                        run.dest as *mut c_void,
+                        run.length as u64,
+                        &info,
+                        max_registration_bytes,
+                    )?);
+                }
+            } else {
+                let open_segment_name =
+                    self.replica_transport_open_segment_name(&entry.replica)?;
+                let (segment, info) = {
+                    let mut state = self.state.lock();
+                    let (segment, mut info) =
+                        state.open_segment_with_info(transport, &open_segment_name)?;
+                    state.augment_segment_info_from_target_metadata(
+                        &mut info,
+                        &entry.replica.owner,
+                        &entry.replica.segment_name,
+                    );
+                    (segment, info)
+                };
+                let chunks = self.replica_target_chunks(&entry.replica)?;
+                let target_offset =
+                    Self::replica_storage_target_offset(&info, &chunks, &entry.replica)?;
+                for run in &runs_per_request[index] {
+                    remote_requests.extend(Self::target_buffer_transfer_requests(
+                        Opcode::Read,
+                        segment,
+                        target_offset + run.src_offset,
+                        run.dest as *mut c_void,
+                        run.length as u64,
+                        &info,
+                        max_registration_bytes,
+                    )?);
+                }
+            }
+        }
+
+        let plan_elapsed = plan_started.elapsed();
+        let copy_started = std::time::Instant::now();
+        for (instructions, destination, staged) in &mut copy_instructions {
+            if let Some(staging) = staged {
+                execute_copy_instructions(instructions, staging.as_mut_ptr());
+                mooncake_store_rs_transport::ascend_copy_h2d(
+                    (*destination).cast::<c_void>(),
+                    staging.as_ptr().cast::<c_void>(),
+                    staging.len(),
+                )
+                .map_err(StoreError::Transport)?;
+            } else {
+                execute_copy_instructions(instructions, *destination);
+            }
+        }
+        let copy_elapsed = copy_started.elapsed();
+        let transfer_started = std::time::Instant::now();
+        if !remote_requests.is_empty() {
+            // C++ Store groups reads by target endpoint and submits one batch
+            // per endpoint asynchronously (TransferSubmitter::submit_batch),
+            // then waits for all of them. A single global batch serializes the
+            // per-owner transfer slots and caps throughput at ~one stream.
+            let mut requests_by_target: BTreeMap<u64, Vec<TransferRequest>> = BTreeMap::new();
+            let request_count = remote_requests.len();
+            for request in remote_requests {
+                requests_by_target
+                    .entry(request.target_id)
+                    .or_default()
+                    .push(request);
+            }
+            let request_deadline = self.request_deadline_for_transfer(bytes_out, 1);
+            let hints = self.remote_batch_hints(
+                &tenant,
+                bytes_out,
+                TransferPacingMode::ThroughputOptimized,
+            );
+            let mut batches: Vec<u64> = Vec::with_capacity(requests_by_target.len());
+            let mut submit_error: Option<StoreError> = None;
+            let submit_started = std::time::Instant::now();
+            for requests in requests_by_target.values() {
+                let batch_id = match transport.allocate_batch(requests.len()) {
+                    Ok(batch_id) => batch_id,
+                    Err(error) => {
+                        submit_error = Some(error);
+                        break;
+                    }
+                };
+                if let Err(error) = transport.submit_with_hints(batch_id, requests, &hints) {
+                    let _ = transport.free_batch(batch_id);
+                    submit_error = Some(error);
+                    break;
+                }
+                batches.push(batch_id);
+            }
+            let submit_elapsed = submit_started.elapsed();
+            let wait_started = std::time::Instant::now();
+            let mut wait_error: Option<StoreError> = submit_error;
+            for batch_id in &batches {
+                let wait_result = wait_for_batch_completion_detailed(
+                    transport,
+                    *batch_id,
+                    self.transfer_stall_timeout,
+                    request_deadline.instant(),
+                );
+                let free_result = transport.free_batch(*batch_id);
+                if wait_error.is_none() {
+                    if let Err(error) = wait_result {
+                        wait_error = Some(StoreError::from(error.clone()));
+                    } else if let Err(error) = free_result {
+                        wait_error = Some(error);
+                    }
+                }
+            }
+            if let Some(error) = wait_error {
+                return Err(error);
+            }
+            if std::env::var_os("MC_STORE_RS_TIMING").is_some() {
+                eprintln!(
+                    "[mc-rs-direct] items={} bytes={} targets={} submit_ms={:.2} wait_ms={:.2}",
+                    request_count,
+                    bytes_out,
+                    batches.len(),
+                    submit_elapsed.as_secs_f64() * 1e3,
+                    wait_started.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            registry::record_transport_operation("read", "storage", "ok");
+            registry::record_transport_bytes("read", "storage", bytes_out);
+        }
+        if timing {
+            eprintln!(
+                "[mc-rs-timing] items={} bytes={} resolve_ms={:.2} plan_ms={:.2} copy_ms={:.2} transfer_ms={:.2} total_ms={:.2}",
+                requests.len(),
+                bytes_out,
+                resolve_elapsed.as_secs_f64() * 1e3,
+                plan_elapsed.as_secs_f64() * 1e3,
+                copy_elapsed.as_secs_f64() * 1e3,
+                transfer_started.elapsed().as_secs_f64() * 1e3,
+                call_started.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+
+        Ok(resolved
+            .iter()
+            .map(|entry| entry.replica.length as usize)
+            .collect())
+    }
+
     fn execute_batch_get_into(
         &self,
         resolved: &mut [ResolvedObject],
