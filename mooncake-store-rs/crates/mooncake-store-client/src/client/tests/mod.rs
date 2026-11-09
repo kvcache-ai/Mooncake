@@ -15773,7 +15773,7 @@ fn true_client_shrink_evacuates_live_routes_and_retires_segments() {
 }
 
 #[test]
-fn true_client_shrink_ignores_unreachable_route_authority() {
+fn true_client_shrink_retries_after_unreachable_route_authority() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("shrink-dead-auth-a-segment"));
     let store_b_transport = Arc::new(store_a_transport.peer("shrink-dead-auth-b-segment"));
@@ -15860,6 +15860,17 @@ fn true_client_shrink_ignores_unreachable_route_authority() {
         "expected at least one object to land on store-a"
     );
 
+    let routes_before = owned_keys
+        .iter()
+        .map(|key| {
+            let route = router
+                .query_route(key)
+                .expect("seed route query should succeed")
+                .expect("seed route should exist");
+            (key.clone(), route)
+        })
+        .collect::<BTreeMap<_, _>>();
+
     let mut endpoints = ClientEndpointSet {
         rpc_address: "127.0.0.1:1".to_string(),
         segment_name: Some(SegmentName::new("shrink-dead-auth-dead-segment")),
@@ -15892,10 +15903,68 @@ fn true_client_shrink_ignores_unreachable_route_authority() {
         })
         .expect("dead authority lease should publish");
 
+    let dead_runtime = ClientRuntimeId::new("shrink-dead-auth-dead", ClientEpoch(1));
+    wait_for_runtime_visibility(&store_a, &dead_runtime);
+    let allocations_before = store_a
+        .list_segments()
+        .expect("source segments should be available")
+        .into_iter()
+        .map(|segment| (segment.segment_name, segment.used_bytes))
+        .collect::<BTreeMap<_, _>>();
+    assert!(allocations_before.values().sum::<u64>() > 0);
+
+    // An incomplete owner-route scan must not release unobserved allocations.
+    let error = store_a
+        .evacuate_owned_replicas()
+        .expect_err("shrink must stop when an authority cannot be scanned");
+    assert!(matches!(error, StoreError::Transport(message) if message.contains("127.0.0.1:1")));
+    assert_eq!(store_a.lease().state, ClientLifecycleState::Draining);
+    assert_eq!(
+        store_a
+            .list_segments()
+            .expect("failed shrink should retain source segments")
+            .into_iter()
+            .map(|segment| (segment.segment_name, segment.used_bytes))
+            .collect::<BTreeMap<_, _>>(),
+        allocations_before
+    );
+
+    let mut dead_lease = metadata
+        .list_live_clients()
+        .expect("membership should be readable")
+        .into_iter()
+        .find(|lease| lease.runtime == dead_runtime)
+        .expect("dead authority lease should still exist");
+    dead_lease.state = ClientLifecycleState::Standby;
+    metadata
+        .upsert_client_lease(&dead_lease)
+        .expect("dead authority should leave the active candidate set");
+    store_a
+        .available_compatible_live_clients(true)
+        .expect("source membership should refresh before retry");
+    for key in &owned_keys {
+        assert_eq!(
+            router
+                .query_route(key)
+                .expect("failed shrink should retain the route"),
+            Some(routes_before[key].clone())
+        );
+        assert_eq!(
+            reader
+                .get(key)
+                .expect("source bytes should remain readable"),
+            expected[key]
+        );
+    }
+
     let migrated = store_a
         .evacuate_owned_replicas()
-        .expect("true client shrink should ignore unreachable mirrored authorities");
+        .expect("shrink should succeed after removing the unreachable authority");
     assert_eq!(migrated, owned_keys.len());
+    assert!(store_a
+        .list_segments()
+        .expect("source segments should retire after retry")
+        .is_empty());
 
     for key in owned_keys {
         let route = router
