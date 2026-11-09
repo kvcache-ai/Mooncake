@@ -124,14 +124,20 @@ On Intel XPU the native buffer is a SYCL implementation
 Python wrapper and the `ep_py.cpp` bindings are shared with CUDA, as is the
 host bookkeeping that pairs each combine with its dispatch
 (`mooncake_ep_dispatch_slots.h`); the kernels and transport are XPU-specific.
-It provides the P2P / IPC fast path only:
+Peers on the node are reached over IPC by default, and ranks on other nodes
+over RDMA when the build has the verbs path. Peers on the node can also be
+reached over RDMA instead (see `MC_EP_RANKS_PER_NODE` below):
 
 - Peers share one device buffer through Level Zero IPC handles, exchanged over
   the process group like the CUDA IPC handles. Ranks must be on one host and in
   one PID namespace, their devices need peer access to each other, and each rank
   must be allowed to `pidfd_getfd` the others: Yama `ptrace_scope` 0 or 1, or 2
-  with `CAP_SYS_PTRACE`. Otherwise, and for multi-node groups, the Python
-  fallback is used.
+  with `CAP_SYS_PTRACE`. Otherwise the Python fallback is used.
+- Ranks on other hosts or PID namespaces are reached over RDMA: a host thread
+  per rank writes what the send kernel staged into the receiver's buffer,
+  registered with the NIC through dma_buf. This needs an rdma-core with
+  `ibv_reg_dmabuf_mr` at build time; without it, or if any rank fails to
+  connect, groups that span nodes use the Python fallback.
 - Data is pulled rather than pushed: each rank stages what it sends in its own
   half of the buffer and only writes small ready flags to peers. On PCIe a GPU
   writing to several peers at once is far slower than one reading from several.
@@ -142,6 +148,13 @@ It provides the P2P / IPC fast path only:
   to BF16 once.
 - Kernels run on the caller's `torch.xpu` stream. Zero-copy combine and the
   elastic buffer are not supported.
+
+Ranks count as on another node when they are on another host or in another
+PID namespace. `MC_EP_RANKS_PER_NODE=n` instead places rank `r` on node
+`r // n`, which decides for each pair of ranks on a host whether they use IPC
+or RDMA: with `n=1` every peer is reached over RDMA, with `n=4` on 8 XPUs
+pairs within each group of four use IPC and pairs across them RDMA. RDMA
+between peers on the node needs an RDMA NIC per XPU.
 
 ## JIT kernel compilation
 

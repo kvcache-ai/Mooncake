@@ -358,11 +358,35 @@ Status MemFabricTransport::allocateSubBatch(SubBatchRef& batch,
 }
 
 Status MemFabricTransport::freeSubBatch(SubBatchRef& batch) {
-    std::lock_guard<std::mutex> lock(inflight_mu_);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(transfer_timeout_ms_);
+    std::unique_lock<std::mutex> lock(inflight_mu_);
     auto* mf_batch = dynamic_cast<MemFabricSubBatch*>(batch);
     if (!mf_batch) {
         LOG(ERROR) << "Invalid sub-batch type in freeSubBatch";
         return Status::InvalidArgument("invalid sub-batch" LOC_MARK);
+    }
+    while (mf_batch->pending_batch_count > 0) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            LOG(WARNING) << "MemFabricTransport freeSubBatch timed out with "
+                         << mf_batch->pending_batch_count
+                         << " pending native batches";
+            return Status::InternalError(
+                "MemFabric sub-batch free timed out" LOC_MARK);
+        }
+        for (size_t i = 0; i < mf_batch->task_list.size(); ++i) {
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            if (mf_batch->task_list[i].status_word !=
+                TransferStatusEnum::PENDING)
+                continue;
+            TransferStatus status{};
+            // Query errors leave the task pending; retry until the deadline.
+            (void)getTransferStatusLocked(batch, static_cast<int>(i), status);
+        }
+        if (mf_batch->pending_batch_count == 0) break;
+        inflight_cv_.wait_until(
+            lock, std::min(deadline, std::chrono::steady_clock::now() +
+                                         std::chrono::milliseconds(1)));
     }
     batches_.erase(mf_batch);
     delete mf_batch;
