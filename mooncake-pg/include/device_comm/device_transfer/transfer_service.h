@@ -56,6 +56,9 @@ class DeviceTransferService {
     [[nodiscard]] int deviceIndex() const noexcept;
     [[nodiscard]] const DeviceTransferEndpoint& localEndpoint() const noexcept;
 
+    // Borrow the initialized P2P route, or nullptr when it is unavailable.
+    [[nodiscard]] const P2pRoute* p2pRoute() const noexcept;
+
     // Device address of the stable kernel-facing service handle.
     const DeviceTransferHandle* deviceHandle();
 

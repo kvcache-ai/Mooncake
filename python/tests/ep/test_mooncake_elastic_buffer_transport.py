@@ -35,7 +35,9 @@ def test_legacy_buffer_requires_explicit_size() -> None:
         (-1, 1, 4096, "invalid EP rank or world size"),
         (1, 1, 4096, "invalid EP rank or world size"),
         (0, 0, 4096, "invalid EP rank or world size"),
+        # One past CUDA's MAX_QP_COUNT; XPU allows more ranks.
         (0, 257, 4096, "invalid EP rank or world size"),
+        (0, 1 << 16, 4096, "invalid EP rank or world size"),
         (0, 1, -1, "EP buffer size must be positive"),
         (0, 1, 0, "EP buffer size must be positive"),
     ],
@@ -45,6 +47,11 @@ def test_legacy_buffer_rejects_invalid_constructor_arguments(
 ) -> None:
     if importlib.util.find_spec("mooncake._ep") is None:
         pytest.skip("requires Mooncake EP native extension")
+    if num_ranks == 257:
+        from mooncake import _ep
+
+        if _ep.DEVICE_TYPE == "xpu":
+            pytest.skip("257 ranks is within the XPU limit")
 
     script = f"""
 from mooncake._ep import Buffer

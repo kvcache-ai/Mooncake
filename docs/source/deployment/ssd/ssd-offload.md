@@ -157,11 +157,51 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 |---|---|---|
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
+| `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` | `0` | Write mode: `0`/`false` keeps buffered writes; `packed` enables packed O_DIRECT/io_uring writes (`true`/`1` are aliases). Packed writes require a build with io_uring support and `MOONCAKE_OFFLOAD_USE_URING=true`; otherwise writes remain buffered. `aligned` enables aligned O_DIRECT writes, which do not need io_uring (see below). Unknown values fail backend initialization. `.meta` writes stay buffered with their exact protobuf length. |
+| `MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS` | `1` | Threads used only by `packed` direct writes, clamped to 1–8; invalid values use 1. Buckets smaller than 16 MiB always use one thread. |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes, applied **per disk**. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST` | empty | Per-disk eviction thresholds as a comma-separated list, positionally aligned with the paths in `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; when set, it needs exactly one entry per path. Empty applies `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` to every disk. See {ref}`Multiple disks <ssd-offload-multiple-disks>` |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+
+For `packed` direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
+that grows to fit its largest bucket and is released when the thread exits.
+Only the end of the data file is zero-padded to a 4096-byte boundary; key order,
+metadata offsets, and logical lengths keep the existing format. Data writes and
+`datasync` finish before metadata is written and the local index is committed.
+
+To enable direct writes with parallel packing, set these variables before
+starting the offload owner:
+
+```bash
+export MOONCAKE_OFFLOAD_USE_URING=true
+export MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=packed
+export MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS=8
+```
+
+Unset `MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE` or set it to `0`/`false` and restart the
+owner to return to buffered writes. Set `MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS=1`
+to retain direct writes with serial packing. Previously written buckets remain
+readable with either configuration.
+
+Parallel packing competes for CPU and memory bandwidth and creates up to seven
+helper threads per bucket. All copies finish before I/O submission. If a helper
+thread cannot be created, existing copies finish before the whole bucket is
+copied serially. The retained buffer increases resident memory per writer.
+Filesystems that do not support O_DIRECT have no automatic buffered fallback;
+disable the direct-write option on those filesystems.
+
+`aligned` writes bucket data files with `O_DIRECT` instead of through the page
+cache, each value at a 4 KiB-aligned file offset. Values in 4 KiB-aligned
+buffers are written from those buffers; other values are copied into a
+per-thread buffer that can grow to the bucket size. Each object takes up to
+about 8 KiB more disk space (measured: 3% with 128 KiB values; about 12% with
+64 KiB + 100 B values by the layout), and the bucket size limit and the total
+size of written buckets count only keys and values, so it suits large values.
+Offloaded data is not left in the page cache. Where the filesystem refuses
+`O_DIRECT`, the same aligned writes go through the page cache. Buckets written
+this way remain readable with the option off.
 
 (ssd-offload-multiple-disks)=
 
@@ -442,3 +482,15 @@ To raise it permanently, add the following to `/etc/security/limits.conf`:
 ```
 
 Alternatively, reduce `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` to a value within the existing limit. Note that the warning does not abort startup — the client falls back to non-fixed-buffer I/O — but performance may be lower than expected.
+
+### `action=disk_fence` in the logs: the SSD tier stopped on a disk error
+
+A client fences its SSD tier when a disk call fails in a way that retrying cannot fix. It decides on the first failure, from the errno of the failed call:
+
+- `ENODEV`, `ENXIO`, `EROFS`, `ESHUTDOWN`: fence at once.
+- `EIO` and similar device errors: check the filesystem first (`syncfs` unless the failed call was a read, then `fstat` on each offload directory), and fence only if the check also fails. A single bad file on a healthy filesystem does not fence.
+- Anything else, including `ENOSPC`: no fence.
+
+After a fence, the client stops reading from and offloading to that disk, hands its queued offload tasks back to the master, and unmounts its `LOCAL_DISK` segment so the master stops handing out its disk replicas. The memory segment and other clients keep working. The fence lasts until the client restarts; the gauge `mooncake_ssd_disk_fenced` is `1` while it holds. Fix or replace the disk, then restart the client. With several disks in `storage_filepath`, the filesystem check covers every disk, and one dead disk fences the whole SSD tier of that client.
+
+Only `bucket_storage_backend` (the default) reports disk errors; with the other backends the fence never triggers.

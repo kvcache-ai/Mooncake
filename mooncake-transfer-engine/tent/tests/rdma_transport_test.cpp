@@ -38,10 +38,13 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
+#include <unordered_set>
 #include <vector>
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/common/utils/string_builder.h"
 #include "tent/transfer_engine.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -164,7 +167,7 @@ class RdmaTransportTestPeer {
         transport.workers_ = std::make_unique<Workers>(&transport);
         auto& workers = *transport.workers_;
         workers.rail_topo_json_ = rails;
-        makeWorkerContexts(workers, 1);
+        makeWorkerContexts(workers, 1, /*accept_submits=*/true);
         workers.getDeviceSelector()->setSmartSelection(false);
         return workers;
     }
@@ -180,7 +183,7 @@ class RdmaTransportTestPeer {
                              kGdrFailureThreshold);
         transport.workers_ = std::make_unique<Workers>(&transport);
         auto& workers = *transport.workers_;
-        makeWorkerContexts(workers, 1);
+        makeWorkerContexts(workers, 1, /*accept_submits=*/true);
         workers.getDeviceSelector()->setSmartSelection(false);
         return workers;
     }
@@ -278,17 +281,24 @@ class RdmaTransportTestPeer {
     using WorkerContext = Workers::WorkerContext;
 
     // Stands in for start(): the lane array without any threads.
-    static void makeWorkerContexts(Workers& workers, size_t n) {
+    static void makeWorkerContexts(Workers& workers, size_t n,
+                                   bool accept_submits = false) {
         workers.worker_context_ = new WorkerContext[n];
         workers.num_workers_ = n;
+        workers.running_ = accept_submits;
     }
     static void destroyWorkerContexts(Workers& workers) {
+        workers.running_ = false;  // These contexts have no worker threads.
         delete[] workers.worker_context_;
         workers.worker_context_ = nullptr;
         workers.num_workers_ = 0;
     }
     static WorkerContext& workerContext(Workers& workers, size_t i) {
         return workers.worker_context_[i];
+    }
+
+    static void stopAcceptingSubmits(Workers& workers) {
+        workers.accepting_submits_.store(false, std::memory_order_release);
     }
 
     static const Topology* railLocalTopology(Workers& workers,
@@ -554,11 +564,14 @@ std::shared_ptr<Topology> topologyWithRdmaNics(size_t count) {
 
 class RdmaSliceMetadataLifetimeTest : public ::testing::Test {
    protected:
+    virtual const char* gpuLocation() const { return "cuda:0"; }
+
     void SetUp() override {
         topology_ = topologyWithRdmaNics(2);
         Topology::MemEntry gpu_memory;
-        gpu_memory.name = "cuda:0";
-        gpu_memory.type = Topology::MEM_CUDA;
+        gpu_memory.name = gpuLocation();
+        gpu_memory.type =
+            gpu_memory.name == "mlu:0" ? Topology::MEM_MLU : Topology::MEM_CUDA;
         gpu_memory.numa_node = 0;
         gpu_memory.device_list[0] = {0, 1};
         topology_->mem_list_.push_back(std::move(gpu_memory));
@@ -580,7 +593,7 @@ class RdmaSliceMetadataLifetimeTest : public ::testing::Test {
                             buffer.addr =
                                 reinterpret_cast<uint64_t>(buffer_.data());
                             buffer.length = buffer_.size();
-                            buffer.location = "cuda:0";
+                            buffer.location = gpuLocation();
                             buffer.lkey = {101, 102};
                             buffer.rkey = {201, 202};
                             memory.buffers = {buffer};
@@ -647,6 +660,311 @@ class RdmaSliceMetadataLifetimeTest : public ::testing::Test {
     Request request_{};
     std::vector<char> buffer_ = std::vector<char>(kMetadataLifetimeBlockSize);
 };
+
+class RdmaMluSliceMetadataLifetimeTest : public RdmaSliceMetadataLifetimeTest {
+   protected:
+    const char* gpuLocation() const override { return "mlu:0"; }
+
+    void TearDown() override {
+        auto& gdr = GdrReachability::instance();
+        gdr.reportLocalSuccess("mlx5_0", 0);
+        gdr.reportRemoteSuccess("different-machine", "mlx5_0", 0);
+        RdmaSliceMetadataLifetimeTest::TearDown();
+    }
+};
+
+TEST_F(RdmaMluSliceMetadataLifetimeTest,
+       FailedRailIsExcludedFromAllocationAndRetry) {
+    batch_->device_mask = 1ULL << 0;
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* first = static_cast<RdmaSubBatch*>(batch_)->slice_chain[0];
+    ASSERT_NE(first, nullptr);
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, first).ok());
+    EXPECT_EQ(first->source_gpu_ordinal, 0);
+    EXPECT_EQ(first->target_gpu_ordinal, 0);
+    EXPECT_EQ(first->source_nic_name, "mlx5_0");
+    ASSERT_EQ(first->target_nic_name, "mlx5_0");
+
+    // The completion path reports failures using the ordinals cached above.
+    auto& gdr = GdrReachability::instance();
+    for (int i = 0; i < kGdrFailureThreshold; ++i) {
+        gdr.reportLocalFailure(first->source_nic_name,
+                               first->source_gpu_ordinal);
+        gdr.reportRemoteFailure(first->target_machine_id,
+                                first->target_nic_name,
+                                first->target_gpu_ordinal);
+    }
+    EXPECT_FALSE(gdr.localReachable("mlx5_0", 0));
+    EXPECT_FALSE(gdr.remoteReachable("different-machine", "mlx5_0", 0));
+
+    int selected = -1;
+    ASSERT_TRUE(workers_->getDeviceSelector()
+                    ->allocate(request_.length, "mlu:0", selected)
+                    .ok());
+    EXPECT_EQ(selected, 1);
+    ASSERT_TRUE(workers_->getDeviceSelector()
+                    ->release(selected, request_.length, 0.0)
+                    .ok());
+
+    // With only the remote side excluded, optimal selection must reject its
+    // initial pair and find a different target NIC.
+    gdr.reportLocalSuccess("mlx5_0", 0);
+    RdmaTask task;
+    task.request = request_;
+    task.device_mask = ~0ULL;
+    RdmaSlice next;
+    next.task = &task;
+    next.source_addr = request_.source;
+    next.target_addr = request_.target_offset;
+    next.length = request_.length;
+    next.source_dev_id = 0;
+    next.target_dev_id = 0;
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, &next).ok());
+    EXPECT_EQ(next.source_dev_id, 0);
+    EXPECT_EQ(next.target_dev_id, 1);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &next, 0, 0);
+
+    // A retry must also skip the excluded pair when scanning fallback NICs.
+    next.source_dev_id = -1;
+    next.target_dev_id = -1;
+    next.retry_count = 1;
+    ASSERT_TRUE(RdmaTransportTestPeer::generatePostPath(*workers_, &next).ok());
+    EXPECT_EQ(next.target_dev_id, 1);
+    RdmaTransportTestPeer::releaseSliceQuota(*workers_, &next, 0, 0);
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       CallerPublishesPerLaneStartupSteadyAndTailChunks) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    auto& params = RdmaTransportTestPeer::params(transport_);
+    params->endpoint.max_qp_wr = 8;
+    for (const int lanes : {2, 4, 8}) {
+        SCOPED_TRACE(lanes);
+        RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+        params->workers.num_workers = lanes;
+        RdmaTransportTestPeer::makeWorkerContexts(*workers_, lanes, true);
+        ASSERT_TRUE(transport_.allocateSubBatch(batch_, 64).ok());
+        ASSERT_TRUE(
+            transport_
+                .submitTransferTasks(batch_, std::vector<Request>(64, request_))
+                .ok());
+        auto* batch = static_cast<RdmaSubBatch*>(batch_);
+        std::unordered_set<RdmaSlice*> seen;
+        size_t heads = 0;
+        for (int lane = 0; lane < lanes; ++lane) {
+            auto& worker =
+                RdmaTransportTestPeer::workerContext(*workers_, lane);
+            std::vector<RdmaSliceList> chunks;
+            worker.queues[PRIO_HIGH].pop(chunks);
+            const size_t expected_chunks = lanes == 2 ? 5 : lanes == 4 ? 3 : 2;
+            ASSERT_EQ(chunks.size(), expected_chunks);
+            EXPECT_EQ(chunks.front().num_slices, 8 / lanes);
+            EXPECT_EQ(chunks.back().num_slices, 8 - 8 / lanes);
+            int count = 0;
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                if (i > 0 && i + 1 < chunks.size()) {
+                    EXPECT_EQ(chunks[i].num_slices, 8);
+                }
+                auto* slice = chunks[i].first;
+                for (int j = 0; j < chunks[i].num_slices; ++j) {
+                    ASSERT_NE(slice, nullptr);
+                    ASSERT_TRUE(seen.insert(slice).second);
+                    EXPECT_EQ(slice->owner_worker.load(), lane);
+                    EXPECT_EQ(slice->task->num_slices, 1);
+                    EXPECT_EQ(slice->task->ref_count.load(), 2);
+                    auto* next = slice->next;
+                    RdmaTransportTestPeer::discountFromOwner(*workers_, worker,
+                                                             slice);
+                    RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice,
+                                                             0, 0);
+                    updateSliceStatus(slice, COMPLETED);
+                    slice = next;
+                    ++count;
+                }
+                EXPECT_EQ(slice, nullptr)
+                    << "Published chains must stay separate";
+                ++heads;
+            }
+            EXPECT_EQ(count, 64 / lanes);
+            EXPECT_EQ(worker.inflight_slices.load(), 0);
+        }
+        EXPECT_EQ(seen.size(), 64u);
+        EXPECT_EQ(batch->slice_chain.size(), heads);
+        for (auto* task : batch->task_list) {
+            EXPECT_EQ(task->status_word, COMPLETED);
+            EXPECT_EQ(task->transferred_bytes, request_.length);
+            EXPECT_EQ(task->ref_count.load(), 1);
+        }
+        ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    }
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       CompleteTaskPrecedesPublicationAndRejectedChunksResolve) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+    auto& params = RdmaTransportTestPeer::params(transport_);
+    params->workers.num_workers = 2;
+    params->workers.block_size = 256;
+    params->endpoint.max_qp_wr = 4;
+    RdmaTransportTestPeer::makeWorkerContexts(*workers_, 2, true);
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    auto* task = static_cast<RdmaSubBatch*>(batch_)->task_list.front();
+    ASSERT_EQ(task->num_slices, 16);
+    EXPECT_EQ(task->ref_count.load(), 17);
+    int resolved = 0;
+    for (int lane = 0; lane < 2; ++lane) {
+        auto& worker = RdmaTransportTestPeer::workerContext(*workers_, lane);
+        auto chunk = worker.queues[PRIO_HIGH].pop();
+        // A whole task may overshoot the watermark; its count must be final.
+        ASSERT_EQ(chunk.num_slices, 8);
+        EXPECT_EQ(worker.queues[PRIO_HIGH].pop().num_slices, 0);
+        for (auto* slice = chunk.first; slice; slice = slice->next) {
+            EXPECT_EQ(slice->task, task);
+            RdmaTransportTestPeer::discountFromOwner(*workers_, worker, slice);
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+            updateSliceStatus(slice, COMPLETED);
+            EXPECT_EQ(task->status_word,
+                      ++resolved == 16 ? COMPLETED : PENDING);
+        }
+    }
+    EXPECT_EQ(task->transferred_bytes, request_.length);
+    EXPECT_EQ(task->ref_count.load(), 1);
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+
+    // Quiesce can reject a later publication. No rejected slice may remain
+    // pending or keep the aggregated device allocation charged.
+    ASSERT_TRUE(workers_->quiesce().ok());
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 1).ok());
+    ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request_}).ok());
+    task = static_cast<RdmaSubBatch*>(batch_)->task_list.front();
+    EXPECT_EQ(task->status_word, FAILED);
+    EXPECT_EQ(task->resolved_slices.load(), 16);
+    EXPECT_EQ(task->transferred_bytes, 0u);
+    EXPECT_EQ(task->ref_count.load(), 1);
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+}
+
+TEST_F(RdmaSliceMetadataLifetimeTest,
+       AcceptedPrefixIsNotReplayedWhenLaterChunkIsRejected) {
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    auto& params = RdmaTransportTestPeer::params(transport_);
+    params->workers.block_size = 256;
+    params->endpoint.max_qp_wr = 4;
+    ASSERT_TRUE(transport_.allocateSubBatch(batch_, 2).ok());
+    batch_->device_mask = 1ULL << 0;
+    auto* batch = static_cast<RdmaSubBatch*>(batch_);
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    auto* selector = workers_->getDeviceSelector();
+    // The fixture defaults to round-robin mode, which skips byte accounting.
+    selector->setSmartSelection(true);
+
+    // The first submit publishes its chunk before taking the wakeup mutex.
+    // Hold it there so the second request cannot be submitted yet.
+    std::unique_lock<std::mutex> gate(worker.mutex);
+    Status submit_status;
+    std::thread caller([&] {
+        submit_status =
+            transport_.submitTransferTasks(batch_, {request_, request_});
+    });
+    RdmaSliceList accepted;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!accepted.first && std::chrono::steady_clock::now() < deadline) {
+        accepted = worker.queues[PRIO_HIGH].pop();
+        if (!accepted.first) std::this_thread::yield();
+    }
+    // This is the accepting-state transition in quiesce(); calling quiesce
+    // while holding the wakeup mutex would deadlock.
+    RdmaTransportTestPeer::stopAcceptingSubmits(*workers_);
+    gate.unlock();
+    caller.join();
+
+    // Keep cleanup outside the assertions so a failed check cannot leave
+    // resolved slices for the fixture's pending-slice teardown.
+    [&] {
+        ASSERT_NE(accepted.first, nullptr) << "first chunk was never published";
+        EXPECT_TRUE(submit_status.ok())
+            << "A group failure would make runtime replay the accepted prefix";
+        ASSERT_EQ(batch->task_list.size(), 2u);
+        ASSERT_EQ(batch->slice_chain.size(), 2u);
+        EXPECT_EQ(batch->slice_chain[0], accepted.first);
+        EXPECT_EQ(accepted.num_slices, 16);
+        EXPECT_EQ(worker.queues[PRIO_HIGH].pop().num_slices, 0)
+            << "Only the accepted prefix may be published, exactly once";
+        EXPECT_EQ(worker.inflight_slices.load(), 16);
+        EXPECT_EQ(selector->getInflightBytes(0), request_.length);
+
+        auto* prefix = batch->task_list[0];
+        auto* rejected = batch->task_list[1];
+        EXPECT_EQ(prefix->num_slices, 16);
+        EXPECT_EQ(prefix->status_word, PENDING);
+        EXPECT_EQ(prefix->resolved_slices.load(), 0);
+        EXPECT_EQ(prefix->ref_count.load(), 17);
+        EXPECT_EQ(rejected->num_slices, 16);
+        EXPECT_EQ(rejected->status_word, FAILED);
+        EXPECT_EQ(rejected->resolved_slices.load(), 16);
+        EXPECT_EQ(rejected->transferred_bytes, 0u);
+        EXPECT_EQ(rejected->ref_count.load(), 1);
+
+        std::unordered_set<RdmaSlice*> seen;
+        auto* slice = batch->slice_chain[1];
+        for (int i = 0; i < 16; ++i) {
+            ASSERT_NE(slice, nullptr);
+            ASSERT_TRUE(seen.insert(slice).second);
+            EXPECT_EQ(slice->task, rejected);
+            EXPECT_EQ(slice->word, FAILED);
+            // source_dev_id proves allocation happened before rejection;
+            // charged_dev proves that the rejected charge was returned.
+            EXPECT_EQ(slice->source_dev_id, 0);
+            EXPECT_EQ(slice->charged_dev.load(), -1);
+            EXPECT_EQ(slice->counted_lane.load(), -1);
+            slice = slice->next;
+        }
+        EXPECT_EQ(slice, nullptr);
+
+        slice = accepted.first;
+        for (int i = 0; i < 16; ++i) {
+            ASSERT_NE(slice, nullptr);
+            ASSERT_TRUE(seen.insert(slice).second)
+                << "An accepted slice must be consumed only once";
+            EXPECT_EQ(slice->task, prefix);
+            EXPECT_EQ(slice->word, PENDING);
+            EXPECT_EQ(slice->charged_dev.load(), 0);
+            EXPECT_EQ(slice->counted_lane.load(), 0);
+            RdmaTransportTestPeer::discountFromOwner(*workers_, worker, slice);
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+            updateSliceStatus(slice, COMPLETED);
+            slice = slice->next;
+        }
+        EXPECT_EQ(slice, nullptr);
+        EXPECT_EQ(seen.size(), 32u);
+        EXPECT_EQ(prefix->status_word, COMPLETED);
+        EXPECT_EQ(prefix->transferred_bytes, request_.length);
+        EXPECT_EQ(prefix->resolved_slices.load(), 16);
+        EXPECT_EQ(prefix->ref_count.load(), 1);
+        EXPECT_EQ(worker.inflight_slices.load(), 0);
+        EXPECT_EQ(selector->getInflightBytes(0), 0u);
+        EXPECT_EQ(worker.queues[PRIO_HIGH].pop().num_slices, 0);
+    }();
+
+    // Resolve any pending slices after a failed assertion before freeing.
+    for (auto* first : batch->slice_chain) {
+        for (auto* slice = first; slice; slice = slice->next) {
+            RdmaTransportTestPeer::discountFromOwner(*workers_, worker, slice);
+            RdmaTransportTestPeer::releaseSliceQuota(*workers_, slice, 0, 0);
+            updateSliceStatus(slice, CANCELED);
+        }
+    }
+    for (auto* task : batch->task_list) EXPECT_EQ(task->ref_count.load(), 1);
+    EXPECT_EQ(worker.inflight_slices.load(), 0);
+    std::vector<NicLoadStats> stats;
+    EXPECT_TRUE(selector->getNicLoadStats(stats).ok());
+    for (const auto& nic : stats) EXPECT_EQ(nic.inflight_bytes, 0u);
+    ASSERT_TRUE(transport_.freeSubBatch(batch_).ok());
+    EXPECT_EQ(batch_, nullptr);
+}
 
 TEST_F(RdmaSliceMetadataLifetimeTest,
        GdrCompletionUsesSliceMetadataAfterTopologyRefresh) {
@@ -2320,6 +2638,37 @@ TEST_F(RdmaContextDmabufTest, ExportableMemoryUsesDmabufRegistration) {
     close(fd);
 }
 
+TEST_F(RdmaContextDmabufTest, CallerOwnedExportIsClosedAfterRegistration) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out.fd = fd;
+        out.offset = 128;
+        out.close_fd = true;
+        return Status::OK();
+    });
+    auto mr = context_->registerMemReg(host_buffer_.data(), 1024,
+                                       IBV_ACCESS_LOCAL_WRITE);
+    ASSERT_EQ(mr, &fake_mr.dmabuf_mr);
+    EXPECT_EQ(fake_mr.last_fd, fd);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, CallerOwnedExportIsClosedOnRegistrationFailure) {
+    int fd = openFd();
+    context_->setDmabufExporter([&](void*, size_t, DmabufExport& out) {
+        out.fd = fd;
+        out.close_fd = true;
+        return Status::OK();
+    });
+    fake_mr.fail_dmabuf_reg = true;
+    EXPECT_EQ(context_->registerMemReg(host_buffer_.data(), 1024,
+                                       IBV_ACCESS_LOCAL_WRITE),
+              nullptr);
+    EXPECT_FALSE(fdOpen(fd));
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+}
+
 TEST_F(RdmaContextDmabufTest, HostMemoryTakesThePlainPath) {
     int exporter_calls = 0;
     context_->setDmabufExporter([&](void*, size_t, DmabufExport&) {
@@ -2419,6 +2768,20 @@ TEST_F(RdmaContextDmabufTest, VerbsWithoutDmabufNeverConsultTheExporter) {
     EXPECT_EQ(exporter_calls, 0);
     EXPECT_EQ(fake_mr.reg_mr_calls, 1);
     EXPECT_EQ(context_->unregisterMemReg(mr), 0);
+}
+
+TEST_F(RdmaContextDmabufTest, SharedExportWithoutDmabufVerbsFails) {
+    RdmaContextTestPeer::verbs(*context_).ibv_reg_dmabuf_mr = nullptr;
+    DmabufExport shared;
+    shared.fd = openFd();
+    shared.close_fd = true;
+    EXPECT_EQ(context_->registerMemReg(host_buffer_.data(), 4096,
+                                       IBV_ACCESS_LOCAL_WRITE, &shared),
+              nullptr);
+    EXPECT_EQ(fake_mr.reg_mr_calls, 0);
+    // This context must not close the caller's shared export on failure.
+    EXPECT_TRUE(fdOpen(shared.fd));
+    close(shared.fd);
 }
 
 TEST(RdmaContextDmabufSymbolTest, LoaderExposesOptionalDmabufVerb) {
@@ -3856,6 +4219,111 @@ TEST_F(RdmaWorkersSharedQpTest,
            "not escalate the cooldown as a failed on-wire probe";
     EXPECT_NE(retry_token, probe_token);
     rail->cancelProbe(kDev, kDev, retry_token);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       BoundedPreparationPostsFullCreditAndKeepsTheTail) {
+    constexpr int kBudget = 4;
+    params_->endpoint.max_qp_wr = kBudget;
+    RdmaTransportTestPeer::params(transport_)->endpoint.max_qp_wr = kBudget;
+    RdmaTransportTestPeer::setSliceTimeout(*workers_, UINT64_MAX);
+    selector_->setSmartSelection(false);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    std::vector<char> buffer(4096);
+    ASSERT_TRUE(metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.type = SegmentType::Memory;
+                        segment.name = "pipeline-local";
+                        segment.machine_id = "pipeline-host";
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        auto status = memory.topology.parse(
+                            R"({"nics":[{"name":"mc-tcp-0","type":1},
+                            {"name":"mc-absent-rnic-1","type":0}],
+                            "mems":[{"name":"cpu:0","type":0,
+                            "device_list":{"rank0":[1]}}]})");
+                        if (!status.ok()) return status;
+                        BufferDesc desc;
+                        desc.addr = reinterpret_cast<uint64_t>(buffer.data());
+                        desc.length = buffer.size();
+                        desc.location = "cpu:0";
+                        desc.lkey = {0, 101};
+                        desc.rkey = {0, 201};
+                        memory.buffers = {desc};
+                        return Status::OK();
+                    })
+                    .ok());
+    auto endpoint = context_->endpointStore()->getOrInsert(
+        MakeNicPath("pipeline-local", "mc-absent-rnic-1"));
+    ASSERT_NE(endpoint, nullptr);
+    RdmaEndPointTestPeer::markReady(endpoint);
+    auto& worker = RdmaTransportTestPeer::workerContext(*workers_, 0);
+    for (int i = 0; i < 2 * kBudget + 1; ++i) {
+        auto* slice = makeSlice();
+        slice->source_addr = buffer.data();
+        slice->target_addr = reinterpret_cast<uint64_t>(buffer.data());
+        slice->length = buffer.size();
+        slice->task->request.target_id = LOCAL_SEGMENT_ID;
+        slice->owner_worker = 0;
+        slice->counted_lane = 0;
+        slice->enqueue_ts = getCurrentTimeInNano();
+        worker.inflight_slices.fetch_add(1);
+        RdmaSliceList list{slice, 1};
+        worker.queues[PRIO_HIGH].push(list);
+    }
+
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+    ASSERT_EQ(post_order.size(), kBudget);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint, 0), kBudget);
+    EXPECT_EQ(worker.queues[PRIO_HIGH].tail.load() -
+                  worker.queues[PRIO_HIGH].head.load(),
+              kBudget + 1);
+    // Prepare another window while the QP is full. Its ready tail must stay
+    // pending, and a later CQ poll must make it postable without re-enqueue.
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+    ASSERT_EQ(post_order.size(), kBudget);
+    EXPECT_EQ(worker.queues[PRIO_HIGH].tail.load() -
+                  worker.queues[PRIO_HIGH].head.load(),
+              1u);
+    for (int i = 0; i < kBudget; ++i) {
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(post_order[i]);
+        wc.status = IBV_WC_SUCCESS;
+        cq_completions.push_back(wc);
+    }
+    RdmaTransportTestPeer::pollCompletions(*workers_, 0);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint, 0), 0);
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+    ASSERT_EQ(post_order.size(), 2 * kBudget);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint, 0), kBudget);
+    for (int i = kBudget; i < 2 * kBudget; ++i) {
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(post_order[i]);
+        wc.status = IBV_WC_SUCCESS;
+        cq_completions.push_back(wc);
+    }
+    RdmaTransportTestPeer::pollCompletions(*workers_, 0);
+    // Queue empty, one ready slice: post it now instead of waiting to fill Q.
+    RdmaTransportTestPeer::postSend(*workers_, 0);
+    ASSERT_EQ(post_order.size(), 2 * kBudget + 1);
+    ibv_wc wc{};
+    wc.wr_id = reinterpret_cast<uint64_t>(post_order.back());
+    wc.status = IBV_WC_SUCCESS;
+    cq_completions.push_back(wc);
+    RdmaTransportTestPeer::pollCompletions(*workers_, 0);
+    EXPECT_EQ(worker.inflight_slices.load(), 0);
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint, 0), 0);
+    EXPECT_EQ(cq_.getQuota(), 0);
+    EXPECT_EQ(
+        std::unordered_set<RdmaSlice*>(post_order.begin(), post_order.end())
+            .size(),
+        2 * kBudget + 1);
+    for (auto* task : tasks_) {
+        EXPECT_EQ(task->status_word, COMPLETED);
+        EXPECT_EQ(task->transferred_bytes, buffer.size());
+        EXPECT_EQ(task->ref_count.load(), 1);
+    }
 }
 
 TEST_F(RdmaWorkersSharedQpTest,
@@ -5570,6 +6038,7 @@ struct FakeMrVerbs {
     std::atomic<int> next_slot[kNics]{};
     std::atomic<int> reg_calls[kNics]{};
     std::atomic<int> dereg_calls[kNics]{};
+    int dmabuf_fd[kNics][kSlots]{};
     // Registrations the fake refuses: NIC index, and either any address
     // (nullptr) or one specific buffer.
     std::atomic<int> fail_nic{-1};
@@ -5598,6 +6067,22 @@ ibv_mr* fakeRegMr(ibv_pd* pd, void* addr, size_t length, int) {
     mr->length = length;
     mr->lkey = 0x100 * (nic + 1) + slot;
     mr->rkey = 0x1000 * (nic + 1) + slot;
+    return mr;
+}
+
+ibv_mr* fakeRegDmabufMr(ibv_pd* pd, uint64_t offset, size_t length,
+                        uint64_t iova, int fd, int access) {
+    // Check during every import, including a failing NIC and the second NIC
+    // in the sequential batch path: a borrowed fd must remain open for both.
+    EXPECT_NE(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(offset, 17u);
+    auto* mr = fakeRegMr(pd, reinterpret_cast<void*>(iova), length, access);
+    if (mr) {
+        const int nic = fake_mr.nicOf(pd);
+        const auto slot = mr - &fake_mr.mr[nic][0];
+        fake_mr.dmabuf_fd[nic][slot] = fd;
+        mr->addr = reinterpret_cast<void*>(offset);
+    }
     return mr;
 }
 
@@ -5689,6 +6174,94 @@ TEST_F(RdmaBufferRegistrationTest, EveryNicRegistersAndKeysAreNicIndexed) {
     EXPECT_EQ(fake_mr.dereg_calls[1].load(), 1);
     EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[0]), 0u);
     EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[1]), 0u);
+}
+
+// Single-buffer registration runs NICs in parallel; a batch registers each
+// buffer's NICs sequentially. Exercise both with owned and borrowed exports,
+// including rollback when the second NIC refuses an import.
+class RdmaSharedDmabufTest
+    : public RdmaBufferRegistrationTest,
+      public ::testing::WithParamInterface<std::tuple<bool, bool, bool>> {
+   protected:
+    void TearDown() override {
+        RdmaBufferRegistrationTest::TearDown();
+        for (const auto& entry : exports_) {
+            if (fcntl(entry.second, F_GETFD) != -1) close(entry.second);
+        }
+    }
+
+    std::mutex exports_mutex_;
+    std::vector<std::pair<void*, int>> exports_;
+};
+
+TEST_P(RdmaSharedDmabufTest,
+       ExportsOncePerBufferAndSharesUntilAllImportsFinish) {
+    const auto [batch, owned, fail] = GetParam();
+    for (auto& context : contexts_) {
+        RdmaContextTestPeer::verbs(*context).ibv_reg_dmabuf_mr =
+            fakeRegDmabufMr;
+        context->setDmabufExporter([&](void* addr, size_t, DmabufExport& out) {
+            out.fd = open("/dev/null", O_RDONLY);
+            EXPECT_GE(out.fd, 0);
+            out.offset = 17;
+            out.close_fd = owned;
+            std::lock_guard<std::mutex> lock(exports_mutex_);
+            exports_.emplace_back(addr, out.fd);
+            return Status::OK();
+        });
+    }
+    if (fail) {
+        fake_mr.fail_nic = 1;
+        fake_mr.fail_addr = buffer_a_;
+    }
+    std::vector<BufferDesc> descs{describe(buffer_a_, sizeof(buffer_a_))};
+    if (batch) descs.push_back(describe(buffer_b_, sizeof(buffer_b_)));
+    auto status = batch ? manager_.addBuffer(descs, options_)
+                        : manager_.addBuffer(descs.front(), options_);
+    EXPECT_EQ(status.ok(), !fail) << status;
+    ASSERT_EQ(exports_.size(), descs.size());
+    for (const auto& entry : exports_) {
+        EXPECT_EQ(fcntl(entry.second, F_GETFD) != -1, !owned);
+        for (int nic = 0; nic < FakeMrVerbs::kNics; ++nic) {
+            bool found = false;
+            for (int slot = 0; slot < fake_mr.next_slot[nic].load(); ++slot) {
+                if (fake_mr.dmabuf_fd[nic][slot] == entry.second) found = true;
+            }
+            if (fail && nic == 1 && entry.first == buffer_a_) continue;
+            EXPECT_TRUE(found);
+        }
+    }
+    for (int nic = 0; nic < FakeMrVerbs::kNics; ++nic) {
+        EXPECT_EQ(fake_mr.reg_calls[nic].load(), descs.size());
+        EXPECT_EQ(RdmaContextTestPeer::mrCount(*contexts_[nic]),
+                  fail ? 0u : descs.size());
+        if (fail)
+            EXPECT_EQ(fake_mr.dereg_calls[nic].load(),
+                      descs.size() - (nic == 1 ? 1 : 0));
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(ParallelAndSequential, RdmaSharedDmabufTest,
+                         ::testing::Combine(::testing::Bool(),
+                                            ::testing::Bool(),
+                                            ::testing::Bool()));
+
+TEST_F(RdmaBufferRegistrationTest, ExportFailureDoesNotRegisterAnyNic) {
+    int export_calls = 0;
+    for (auto& context : contexts_) {
+        RdmaContextTestPeer::verbs(*context).ibv_reg_dmabuf_mr =
+            fakeRegDmabufMr;
+        context->setDmabufExporter([&](void*, size_t, DmabufExport&) {
+            ++export_calls;
+            return Status::InternalError("dma-buf export failed");
+        });
+    }
+    auto desc = describe(buffer_a_, sizeof(buffer_a_));
+    EXPECT_FALSE(manager_.addBuffer(desc, options_).ok());
+    EXPECT_EQ(export_calls, 1);
+    EXPECT_EQ(fake_mr.reg_calls[0].load(), 0);
+    EXPECT_EQ(fake_mr.reg_calls[1].load(), 0);
+    EXPECT_TRUE(desc.rkey.empty());
 }
 
 TEST_F(RdmaBufferRegistrationTest,

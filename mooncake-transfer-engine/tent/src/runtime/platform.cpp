@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
@@ -41,6 +42,14 @@
 
 namespace mooncake {
 namespace tent {
+
+void DmabufExport::close() {
+    if (!close_fd || fd < 0) return;
+    const int owned_fd = fd;
+    fd = -1;
+    close_fd = false;
+    if (::close(owned_fd) != 0) PLOG(WARNING) << "Failed to close dma-buf fd";
+}
 
 Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
     static std::shared_ptr<Platform> g_instance;

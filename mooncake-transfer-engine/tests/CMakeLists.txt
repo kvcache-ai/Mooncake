@@ -76,6 +76,15 @@ if(USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+# The timeout decision is stateful but independent of RDMA hardware; keep its
+# timing behavior covered by a deterministic unit test.
+add_executable(cq_timeout_diagnostic_test
+               ${WORKSPACE}/cq_timeout_diagnostic_test.cpp)
+target_include_directories(cq_timeout_diagnostic_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(cq_timeout_diagnostic_test PRIVATE gtest gtest_main)
+add_test(NAME cq_timeout_diagnostic_test COMMAND cq_timeout_diagnostic_test)
+
 # Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
 # the device's advertised limits; no RDMA device required.
 add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
