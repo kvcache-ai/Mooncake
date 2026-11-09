@@ -690,6 +690,17 @@ class FileStorageTest : public ::testing::Test {
         return FileStorage::IsPerBucketSoftOffloadError(error);
     }
 
+    // Static funnel to the private FileStorage::AggregateBucketOutcomes.
+    static ErrorCode CallAggregateBucketOutcomes(
+        const std::vector<ErrorCode>& statuses) {
+        std::vector<FileStorage::BucketOffloadOutcome> outcomes;
+        outcomes.reserve(statuses.size());
+        for (ErrorCode status : statuses) {
+            outcomes.push_back(FileStorage::BucketOffloadOutcome{status, {}});
+        }
+        return FileStorage::AggregateBucketOutcomes(outcomes);
+    }
+
     // Funnel to the private FileStorage::Heartbeat, for the drain tests.
     static tl::expected<void, ErrorCode> FileStorageHeartbeat(
         FileStorage& fileStorage) {
@@ -1883,6 +1894,34 @@ TEST_F(FileStorageTest, DuplicateOffloadErrorIsPerBucketSoftError) {
     EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::INTERNAL_ERROR));
     EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::INVALID_KEY));
     EXPECT_FALSE(CallIsPerBucketSoftOffloadError(ErrorCode::OK));
+}
+
+// Fanning the buckets of one round out over the write pool removes the serial
+// loop's early break, so the round's verdict is reduced from every bucket's
+// status instead of being whatever stopped the loop. KEYS_ULTRA_LIMIT outranks
+// the other hard errors because it is the only one that also disables
+// offloading, and soft errors never decide the round.
+TEST_F(FileStorageTest, AggregateBucketOutcomesReducesTheRoundVerdict) {
+    EXPECT_EQ(CallAggregateBucketOutcomes({}), ErrorCode::OK);
+    EXPECT_EQ(CallAggregateBucketOutcomes({ErrorCode::OK, ErrorCode::OK}),
+              ErrorCode::OK);
+
+    EXPECT_EQ(CallAggregateBucketOutcomes(
+                  {ErrorCode::INVALID_READ, ErrorCode::OBJECT_ALREADY_EXISTS}),
+              ErrorCode::OK);
+
+    EXPECT_EQ(
+        CallAggregateBucketOutcomes(
+            {ErrorCode::OK, ErrorCode::INTERNAL_ERROR, ErrorCode::INVALID_KEY}),
+        ErrorCode::INTERNAL_ERROR);
+
+    EXPECT_EQ(CallAggregateBucketOutcomes(
+                  {ErrorCode::INVALID_READ, ErrorCode::INVALID_KEY}),
+              ErrorCode::INVALID_KEY);
+
+    EXPECT_EQ(CallAggregateBucketOutcomes(
+                  {ErrorCode::INTERNAL_ERROR, ErrorCode::KEYS_ULTRA_LIMIT}),
+              ErrorCode::KEYS_ULTRA_LIMIT);
 }
 
 TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
