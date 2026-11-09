@@ -28,15 +28,15 @@
 namespace mooncake::adaptive_congestion_control {
 
 struct TaskCongestionEvidence {
-    std::optional<TaskCongestionReason> reason;
-    std::optional<TaskCongestionFailureScope> failure_scope;
+    TaskCongestionObserved<TaskCongestionReason> reason;
+    TaskCongestionObserved<TaskCongestionFailureScope> failure_scope;
     std::optional<std::string> path;
-    std::optional<uint64_t> observed_at_ns;
-    std::optional<TaskCongestionControllerMode> controller_mode;
-    std::optional<uint32_t> controller_generation;
-    std::optional<uint64_t> window_bytes;
-    std::optional<uint64_t> inflight_bytes;
-    std::optional<uint64_t> retry_after_ns;
+    TaskCongestionObserved<uint64_t> observed_at_ns;
+    TaskCongestionObserved<TaskCongestionControllerMode> controller_mode;
+    TaskCongestionObserved<uint32_t> controller_generation;
+    TaskCongestionObserved<uint64_t> window_bytes;
+    TaskCongestionObserved<uint64_t> inflight_bytes;
+    TaskCongestionObserved<uint64_t> retry_after_ns;
 
     // Only immutable strings from the process-lifetime NIC path pool qualify.
     const std::string* interned_path = nullptr;

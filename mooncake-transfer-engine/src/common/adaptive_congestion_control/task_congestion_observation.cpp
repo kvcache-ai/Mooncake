@@ -124,9 +124,11 @@ TaskCongestionDetail TaskCongestionObservation::detail() const {
         if (selected_active && !active) continue;
         const auto& timestamp = slice.evidence.observed_at_ns;
         if (!selected || (active && !selected_active) ||
-            (timestamp && (!selected->evidence.observed_at_ns ||
-                           *timestamp >= *selected->evidence.observed_at_ns)) ||
-            (!timestamp && !selected->evidence.observed_at_ns)) {
+            (timestamp.observed &&
+             (!selected->evidence.observed_at_ns.observed ||
+              timestamp.value >= selected->evidence.observed_at_ns.value)) ||
+            (!timestamp.observed &&
+             !selected->evidence.observed_at_ns.observed)) {
             selected = &slice;
             selected_id = slice_id;
             selected_active = active;
@@ -134,27 +136,18 @@ TaskCongestionDetail TaskCongestionObservation::detail() const {
     }
     if (!selected) return detail;
 
-    if (selected->evidence.reason)
-        detail.reason = {true, *selected->evidence.reason};
+    detail.reason = selected->evidence.reason;
     detail.slice_id = {true, static_cast<uint64_t>(selected_id)};
     detail.resolved = selected->state == TaskCongestionState::kNormal;
-    if (selected->evidence.failure_scope)
-        detail.failure_scope = {true, *selected->evidence.failure_scope};
+    detail.failure_scope = selected->evidence.failure_scope;
     if (const auto path = selected->evidence.effectivePath())
         detail.affected_path = {true, std::string(*path)};
-    if (selected->evidence.observed_at_ns)
-        detail.observed_at_ns = {true, *selected->evidence.observed_at_ns};
-    if (selected->evidence.controller_mode)
-        detail.controller_mode = {true, *selected->evidence.controller_mode};
-    if (selected->evidence.controller_generation)
-        detail.controller_generation = {
-            true, *selected->evidence.controller_generation};
-    if (selected->evidence.window_bytes)
-        detail.window_bytes = {true, *selected->evidence.window_bytes};
-    if (selected->evidence.inflight_bytes)
-        detail.inflight_bytes = {true, *selected->evidence.inflight_bytes};
-    if (selected->evidence.retry_after_ns)
-        detail.retry_after_ns = {true, *selected->evidence.retry_after_ns};
+    detail.observed_at_ns = selected->evidence.observed_at_ns;
+    detail.controller_mode = selected->evidence.controller_mode;
+    detail.controller_generation = selected->evidence.controller_generation;
+    detail.window_bytes = selected->evidence.window_bytes;
+    detail.inflight_bytes = selected->evidence.inflight_bytes;
+    detail.retry_after_ns = selected->evidence.retry_after_ns;
     return detail;
 }
 

@@ -277,11 +277,7 @@ RdmaTransport::RdmaTransport() {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 void RdmaTransport::recordClassicCongestionControlMode(
     adaptive_congestion_control::Mode mode) {
-    const auto next_mode = mode == adaptive_congestion_control::Mode::kOff
-                               ? ClassicCongestionControlMode::kOff
-                           : mode == adaptive_congestion_control::Mode::kObserve
-                               ? ClassicCongestionControlMode::kObserve
-                               : ClassicCongestionControlMode::kEnforce;
+    const auto next_mode = static_cast<ClassicCongestionControlMode>(mode);
     auto current =
         classic_congestion_control_mode_.load(std::memory_order_acquire);
     while (current == ClassicCongestionControlMode::kUninitialized) {

@@ -23,63 +23,6 @@
 
 namespace mooncake {
 
-static_assert(static_cast<int>(TaskCongestionState::kNormal) ==
-              TASK_CONGESTION_NORMAL);
-static_assert(static_cast<int>(TaskCongestionState::kCongested) ==
-              TASK_CONGESTION_CONGESTED);
-static_assert(static_cast<int>(TaskCongestionState::kLongUnavailable) ==
-              TASK_CONGESTION_LONG_UNAVAILABLE);
-static_assert(static_cast<int>(TaskCongestionState::kUnknown) ==
-              TASK_CONGESTION_UNKNOWN);
-static_assert(static_cast<int>(TaskCongestionAttemptKind::kUnknown) ==
-              TASK_CONGESTION_ATTEMPT_UNKNOWN);
-static_assert(static_cast<int>(TaskCongestionAttemptKind::kRdma) ==
-              TASK_CONGESTION_ATTEMPT_RDMA);
-static_assert(static_cast<int>(TaskCongestionAttemptKind::kOther) ==
-              TASK_CONGESTION_ATTEMPT_OTHER);
-static_assert(static_cast<int>(TaskCongestionReason::kUnknown) ==
-              TASK_CONGESTION_REASON_UNKNOWN);
-static_assert(static_cast<int>(TaskCongestionReason::kByteWindow) ==
-              TASK_CONGESTION_REASON_BYTE_WINDOW);
-static_assert(static_cast<int>(TaskCongestionReason::kReceiverPressure) ==
-              TASK_CONGESTION_REASON_RECEIVER_PRESSURE);
-static_assert(static_cast<int>(TaskCongestionReason::kPathQuarantined) ==
-              TASK_CONGESTION_REASON_PATH_QUARANTINED);
-static_assert(static_cast<int>(TaskCongestionReason::kProbeFailed) ==
-              TASK_CONGESTION_REASON_PROBE_FAILED);
-static_assert(static_cast<int>(TaskCongestionReason::kNoUsablePath) ==
-              TASK_CONGESTION_REASON_NO_USABLE_PATH);
-static_assert(static_cast<int>(TaskCongestionReason::kCongestionFeedback) ==
-              TASK_CONGESTION_REASON_FEEDBACK);
-static_assert(static_cast<int>(TaskCongestionReason::kRouteTimeout) ==
-              TASK_CONGESTION_REASON_ROUTE_TIMEOUT);
-static_assert(static_cast<int>(TaskCongestionReason::kLocalConfiguration) ==
-              TASK_CONGESTION_REASON_LOCAL_CONFIGURATION);
-static_assert(static_cast<int>(TaskCongestionReason::kRemoteMetadata) ==
-              TASK_CONGESTION_REASON_REMOTE_METADATA);
-static_assert(static_cast<int>(TaskCongestionReason::kDerivedFlush) ==
-              TASK_CONGESTION_REASON_DERIVED_FLUSH);
-static_assert(static_cast<int>(TaskCongestionReason::kFatal) ==
-              TASK_CONGESTION_REASON_FATAL);
-static_assert(static_cast<int>(TaskCongestionFailureScope::kOperation) ==
-              TASK_CONGESTION_SCOPE_OPERATION);
-static_assert(static_cast<int>(TaskCongestionFailureScope::kQp) ==
-              TASK_CONGESTION_SCOPE_QP);
-static_assert(static_cast<int>(TaskCongestionFailureScope::kCq) ==
-              TASK_CONGESTION_SCOPE_CQ);
-static_assert(static_cast<int>(TaskCongestionFailureScope::kRoute) ==
-              TASK_CONGESTION_SCOPE_ROUTE);
-static_assert(static_cast<int>(TaskCongestionFailureScope::kPort) ==
-              TASK_CONGESTION_SCOPE_PORT);
-static_assert(static_cast<int>(TaskCongestionFailureScope::kDevice) ==
-              TASK_CONGESTION_SCOPE_DEVICE);
-static_assert(static_cast<int>(TaskCongestionControllerMode::kOff) ==
-              TASK_CONGESTION_MODE_OFF);
-static_assert(static_cast<int>(TaskCongestionControllerMode::kObserve) ==
-              TASK_CONGESTION_MODE_OBSERVE);
-static_assert(static_cast<int>(TaskCongestionControllerMode::kEnforce) ==
-              TASK_CONGESTION_MODE_ENFORCE);
-
 inline int taskCongestionCState(TaskCongestionState state) {
     return static_cast<int>(state);
 }

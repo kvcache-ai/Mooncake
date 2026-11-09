@@ -96,13 +96,21 @@ void resolveCongestion(Transport::Slice *slice) {
     if (slice_id) observation->resolve(*slice_id);
 }
 
-void setCongestionEvidencePath(
+void stampEvidence(
     adaptive_congestion_control::TaskCongestionEvidence &evidence,
-    Transport::Slice *slice, const std::string &path) {
+    Transport::Slice *slice, const std::string &path,
+    TaskCongestionReason reason, adaptive_congestion_control::Mode mode) {
+    evidence.reason = {true, reason};
     if (slice->interned_peer_nic_path && *slice->interned_peer_nic_path == path)
         evidence.interned_path = slice->interned_peer_nic_path;
     else
         evidence.path = path;
+    evidence.observed_at_ns = {true,
+                               static_cast<uint64_t>(getCurrentTimeInNano())};
+    evidence.controller_mode = {
+        true, mode == adaptive_congestion_control::Mode::kEnforce
+                  ? TaskCongestionControllerMode::kEnforce
+                  : TaskCongestionControllerMode::kObserve};
 }
 
 adaptive_congestion_control::TaskCongestionEvidence congestionEvidence(
@@ -110,16 +118,10 @@ adaptive_congestion_control::TaskCongestionEvidence congestionEvidence(
     adaptive_congestion_control::Snapshot snapshot,
     TaskCongestionReason reason) {
     adaptive_congestion_control::TaskCongestionEvidence evidence;
-    evidence.reason = reason;
-    setCongestionEvidencePath(evidence, slice, path);
-    evidence.observed_at_ns = getCurrentTimeInNano();
-    evidence.controller_mode =
-        snapshot.mode == adaptive_congestion_control::Mode::kEnforce
-            ? TaskCongestionControllerMode::kEnforce
-            : TaskCongestionControllerMode::kObserve;
-    evidence.controller_generation = snapshot.generation;
-    evidence.window_bytes = snapshot.window_bytes;
-    evidence.inflight_bytes = snapshot.inflight_bytes;
+    stampEvidence(evidence, slice, path, reason, snapshot.mode);
+    evidence.controller_generation = {true, snapshot.generation};
+    evidence.window_bytes = {true, snapshot.window_bytes};
+    evidence.inflight_bytes = {true, snapshot.inflight_bytes};
     return evidence;
 }
 
@@ -145,7 +147,7 @@ void recordCongestion(
     slice->rdma_congestion_control_window_episode = 0;
     auto observation = congestionObservation(slice->task);
     auto evidence = congestionEvidence(slice, path, snapshot, reason);
-    evidence.failure_scope = scope;
+    if (scope) evidence.failure_scope = {true, *scope};
     // Refresh the lazy publisher's extent and record under the same lock.
     if (observation->defer(
             *slice_id, std::move(evidence),
@@ -202,7 +204,13 @@ void ClassicRdmaCongestionControl::prepare(Transport::Slice *slice,
         current_route->peer_nic_path == peer_nic_path) {
         return;
     }
-    RouteState *next_route = route(peer_nic_path);
+    rebind(slice, route(peer_nic_path));
+}
+
+void ClassicRdmaCongestionControl::rebind(Transport::Slice *slice,
+                                          RouteState *next_route) {
+    auto *current_route =
+        static_cast<RouteState *>(slice->rdma_congestion_control_route);
     if (current_route != next_route) {
         releaseUnposted(slice);
         slice->rdma_congestion_control_window_episode = 0;
@@ -220,13 +228,7 @@ void ClassicRdmaCongestionControl::prepare(SliceList &slices,
         next_route = route(peer_nic_path);
     }
     for (auto *slice : slices) {
-        auto *current_route =
-            static_cast<RouteState *>(slice->rdma_congestion_control_route);
-        if (current_route != next_route) {
-            releaseUnposted(slice);
-            slice->rdma_congestion_control_window_episode = 0;
-        }
-        slice->rdma_congestion_control_route = next_route;
+        rebind(slice, next_route);
     }
 }
 
@@ -356,15 +358,9 @@ void ClassicRdmaCongestionControl::observeUnavailable(
     if (!slice_id) return;
     slice->rdma_congestion_control_window_episode = 0;
     adaptive_congestion_control::TaskCongestionEvidence evidence;
-    evidence.reason = reason;
-    setCongestionEvidencePath(evidence, slice, peer_nic_path);
-    evidence.observed_at_ns = getCurrentTimeInNano();
-    evidence.controller_mode =
-        mode_ == adaptive_congestion_control::Mode::kEnforce
-            ? TaskCongestionControllerMode::kEnforce
-            : TaskCongestionControllerMode::kObserve;
-    evidence.failure_scope = scope;
-    evidence.retry_after_ns = retry_after_ns;
+    stampEvidence(evidence, slice, peer_nic_path, reason, mode_);
+    evidence.failure_scope = {true, scope};
+    if (retry_after_ns) evidence.retry_after_ns = {true, *retry_after_ns};
     auto observation = congestionObservation(slice->task);
     if (observation->avoid(
             *slice_id, std::move(evidence),

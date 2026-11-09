@@ -183,11 +183,13 @@ class RdmaTransport : public Transport {
     std::thread notify_worker_;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     enum class ClassicCongestionControlMode {
-        kUninitialized,
-        kOff,
-        kObserve,
-        kEnforce,
-        kConflict,
+        kUninitialized = -1,
+        kOff = static_cast<int>(adaptive_congestion_control::Mode::kOff),
+        kObserve =
+            static_cast<int>(adaptive_congestion_control::Mode::kObserve),
+        kEnforce =
+            static_cast<int>(adaptive_congestion_control::Mode::kEnforce),
+        kConflict = -2,
     };
     std::atomic<ClassicCongestionControlMode> classic_congestion_control_mode_{
         ClassicCongestionControlMode::kUninitialized};

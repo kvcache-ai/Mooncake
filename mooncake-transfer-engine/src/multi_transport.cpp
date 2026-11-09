@@ -586,6 +586,17 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+static Status lookupTask(BatchID batch_id, size_t task_id,
+                         const Transport::TransferTask*& task) {
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("Invalid Batch ID");
+    const auto& batch_desc = Transport::toBatchDesc(batch_id);
+    if (task_id >= batch_desc.task_list.size())
+        return Status::InvalidArgument("Task ID out of range");
+    task = &batch_desc.task_list[task_id];
+    return Status::OK();
+}
+
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 static TaskCongestionState stateWithTaskFailure(
     const Transport::TransferTask& task, TaskCongestionState state) {
@@ -599,14 +610,12 @@ static TaskCongestionState stateWithTaskFailure(
 
 Status MultiTransport::getTaskCongestionState(
     BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
-    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
-        return Status::InvalidArgument("Invalid Batch ID");
-    const auto& batch_desc = Transport::toBatchDesc(batch_id);
-    if (task_id >= batch_desc.task_list.size())
-        return Status::InvalidArgument("Task ID out of range");
+    const Transport::TransferTask* task_ptr;
+    auto status = lookupTask(batch_id, task_id, task_ptr);
+    if (!status.ok()) return status;
     state = TaskCongestionState::kUnknown;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-    const auto& task = batch_desc.task_list[task_id];
+    const auto& task = *task_ptr;
     auto observation = std::atomic_load_explicit(&task.congestion_observation,
                                                  std::memory_order_acquire);
     if (observation) {
@@ -624,12 +633,10 @@ Status MultiTransport::getTaskCongestionState(
 
 Status MultiTransport::getTaskCongestionDetail(
     BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
-    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
-        return Status::InvalidArgument("Invalid Batch ID");
-    const auto& batch_desc = Transport::toBatchDesc(batch_id);
-    if (task_id >= batch_desc.task_list.size())
-        return Status::InvalidArgument("Task ID out of range");
-    const auto& task = batch_desc.task_list[task_id];
+    const Transport::TransferTask* task_ptr;
+    auto status = lookupTask(batch_id, task_id, task_ptr);
+    if (!status.ok()) return status;
+    const auto& task = *task_ptr;
     detail = TaskCongestionDetail{};
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     auto observation = std::atomic_load_explicit(&task.congestion_observation,

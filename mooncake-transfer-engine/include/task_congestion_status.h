@@ -18,45 +18,51 @@
 #include <cstdint>
 #include <string>
 
+#include "task_congestion_status_c.h"
+
 namespace mooncake {
 
 enum class TaskCongestionState : uint8_t {
-    kNormal,
-    kCongested,
-    kLongUnavailable,
-    kUnknown,
+    kNormal = TASK_CONGESTION_NORMAL,
+    kCongested = TASK_CONGESTION_CONGESTED,
+    kLongUnavailable = TASK_CONGESTION_LONG_UNAVAILABLE,
+    kUnknown = TASK_CONGESTION_UNKNOWN,
 };
 
-enum class TaskCongestionAttemptKind : uint8_t { kUnknown, kRdma, kOther };
+enum class TaskCongestionAttemptKind : uint8_t {
+    kUnknown = TASK_CONGESTION_ATTEMPT_UNKNOWN,
+    kRdma = TASK_CONGESTION_ATTEMPT_RDMA,
+    kOther = TASK_CONGESTION_ATTEMPT_OTHER,
+};
 
 enum class TaskCongestionReason : uint8_t {
-    kUnknown,
-    kByteWindow,
-    kReceiverPressure,
-    kPathQuarantined,
-    kProbeFailed,
-    kNoUsablePath,
-    kCongestionFeedback,
-    kRouteTimeout,
-    kLocalConfiguration,
-    kRemoteMetadata,
-    kDerivedFlush,
-    kFatal,
+    kUnknown = TASK_CONGESTION_REASON_UNKNOWN,
+    kByteWindow = TASK_CONGESTION_REASON_BYTE_WINDOW,
+    kReceiverPressure = TASK_CONGESTION_REASON_RECEIVER_PRESSURE,
+    kPathQuarantined = TASK_CONGESTION_REASON_PATH_QUARANTINED,
+    kProbeFailed = TASK_CONGESTION_REASON_PROBE_FAILED,
+    kNoUsablePath = TASK_CONGESTION_REASON_NO_USABLE_PATH,
+    kCongestionFeedback = TASK_CONGESTION_REASON_FEEDBACK,
+    kRouteTimeout = TASK_CONGESTION_REASON_ROUTE_TIMEOUT,
+    kLocalConfiguration = TASK_CONGESTION_REASON_LOCAL_CONFIGURATION,
+    kRemoteMetadata = TASK_CONGESTION_REASON_REMOTE_METADATA,
+    kDerivedFlush = TASK_CONGESTION_REASON_DERIVED_FLUSH,
+    kFatal = TASK_CONGESTION_REASON_FATAL,
 };
 
 enum class TaskCongestionFailureScope : uint8_t {
-    kOperation,
-    kQp,
-    kCq,
-    kRoute,
-    kPort,
-    kDevice,
+    kOperation = TASK_CONGESTION_SCOPE_OPERATION,
+    kQp = TASK_CONGESTION_SCOPE_QP,
+    kCq = TASK_CONGESTION_SCOPE_CQ,
+    kRoute = TASK_CONGESTION_SCOPE_ROUTE,
+    kPort = TASK_CONGESTION_SCOPE_PORT,
+    kDevice = TASK_CONGESTION_SCOPE_DEVICE,
 };
 
 enum class TaskCongestionControllerMode : uint8_t {
-    kOff,
-    kObserve,
-    kEnforce,
+    kOff = TASK_CONGESTION_MODE_OFF,
+    kObserve = TASK_CONGESTION_MODE_OBSERVE,
+    kEnforce = TASK_CONGESTION_MODE_ENFORCE,
 };
 
 template <typename T>

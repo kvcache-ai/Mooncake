@@ -18,6 +18,8 @@
 #include <atomic>
 #include <cstdint>
 
+#include "task_congestion_status_c.h"
+
 namespace mooncake::adaptive_congestion_control {
 
 struct CoreAccess;
@@ -45,12 +47,12 @@ enum class OutcomeClass : uint8_t {
     kFatal,
 };
 enum class FailureScope : uint8_t {
-    kOperation,
-    kQp,
-    kCq,
-    kRoute,
-    kPort,
-    kDevice,
+    kOperation = TASK_CONGESTION_SCOPE_OPERATION,
+    kQp = TASK_CONGESTION_SCOPE_QP,
+    kCq = TASK_CONGESTION_SCOPE_CQ,
+    kRoute = TASK_CONGESTION_SCOPE_ROUTE,
+    kPort = TASK_CONGESTION_SCOPE_PORT,
+    kDevice = TASK_CONGESTION_SCOPE_DEVICE,
 };
 
 struct Config {
