@@ -8,6 +8,11 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
+# TODO(F01-T112, replace-in=F01-3.2): Complete U's legacy-wheel collection,
+# metadata/staging recovery, and runtime-library layout for enabled components,
+# then verify the Store architecture of master, client, and the extension.
+# Owner: F01-3.2. Record remaining feature/platform/UPG2 differences before
+# removing this marker; completion does not imply whole-file equality with U.
 BUILD_DIR=${BUILD_DIR:-build}
 # Get Python version from environment variable or argument
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
@@ -37,19 +42,17 @@ echo "Creating directory structure..."
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp "${BUILD_DIR}"/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
-# Copy store.so to mooncake directory
-if [ -f "${BUILD_DIR}"/mooncake-integration/store.*.so ]; then
-    echo "Copying store.so..."
-    cp "${BUILD_DIR}"/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+# Copy the private C++ Store extension to the mooncake package.
+if compgen -G "${BUILD_DIR}/mooncake-integration/_store.*.so" >/dev/null; then
+    echo "Copying _store extension..."
+    cp "${BUILD_DIR}"/mooncake-integration/_store.*.so mooncake-wheel/mooncake/
     echo "Copying master binary..."
     # Copy master binary
     cp "${BUILD_DIR}/mooncake-store/src/mooncake_master" mooncake-wheel/mooncake/
     # Copy client binary
     cp "${BUILD_DIR}/mooncake-store/src/mooncake_client" mooncake-wheel/mooncake/
-    # Copy async_store.py
-    cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
 else
-    echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
+    echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -58,6 +61,7 @@ if [ -f "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" ]; then
     cp "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" mooncake-wheel/mooncake/libmooncake_store.so
 fi
 
+# F01-T117 adds the K8s lease runtime alongside its actual enabled backend.
 # Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
 if [ -f "${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so" ]; then
     echo "Copying libetcd_wrapper.so..."
@@ -103,6 +107,7 @@ else
 fi
 
 if [ "$BUILD_WITH_EP" = "1" ]; then
+    # F01-T113 replaces this legacy EP/PG build with U's real CMake/JIT staging.
     echo "Building Mooncake EP"
     cd mooncake-ep
     if [ -z "$EP_TORCH_VERSIONS" ]; then
@@ -145,33 +150,98 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
 fi
 
 echo "Building wheel package..."
+# Stage migrated Python modules from their canonical source tree.
+MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
+MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+STORE_FACADE_SOURCE_DIR="python/mooncake/store"
+STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
+MIGRATED_PYTHON_INIT_BACKUP=""
+# Pending sources: F01-T110 (pools), F01-T114 (structured/ranges/fast-copy),
+# F01-T115 (CLI/config), F01-T116 (NoF), and F01-T113 (TE/EP/Reshard).
+MIGRATED_PYTHON_MODULES=(
+    __init__.py
+    py.typed
+    async_store.py
+)
+cleanup_migrated_python_staging() {
+    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        if [ "${module}" = "__init__.py" ]; then
+            continue
+        fi
+        rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+    done
+    if [ -n "${MIGRATED_PYTHON_INIT_BACKUP}" ]; then
+        cp "${MIGRATED_PYTHON_INIT_BACKUP}" "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py"
+        rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
+        MIGRATED_PYTHON_INIT_BACKUP=""
+    fi
+    rm -rf "${STORE_FACADE_STAGING_DIR}"
+}
+trap cleanup_migrated_python_staging EXIT
+cleanup_migrated_python_staging
+MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
+cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
+for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+    cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
+       "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+done
+cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
+
 # Build the wheel package
 cd mooncake-wheel
 
-# Handle package name modification for non-CUDA builds
+# Materialize the root README inside the legacy build directory.
+cp ../README.md README.md
+
+WHEEL_DIR="$(pwd)"
+cleanup_wheel_metadata_state() {
+    [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
+    rm -f "${WHEEL_DIR}/README.md"
+    cleanup_migrated_python_staging
+}
+trap cleanup_wheel_metadata_state EXIT
+
+# TODO(F01-T118, replace-in=UPG1-F22-B02): Receive U's release variants and
+# platform-specific tool invocation, external-library exclusions, and NPU ELF
+# repair with supported providers. Owner: F22-B02; resolve Python-floor policy
+# explicitly and validate each approved platform instead of copying flags.
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD"
+BUILD_VARIANT_COUNT=0
+for build_variant in $BUILD_VARIANTS; do
+    if [ "${!build_variant}" = "1" ]; then
+        BUILD_VARIANT_COUNT=$((BUILD_VARIANT_COUNT + 1))
+    fi
+done
+if [ "$BUILD_VARIANT_COUNT" -gt 1 ]; then
+    echo "Error: only one of $BUILD_VARIANTS can be set"
+    exit 1
+fi
+
+if [ -f pyproject.toml.backup ]; then
+    echo "Restoring pyproject.toml from leftover backup of a previous run"
+    mv pyproject.toml.backup pyproject.toml
+fi
+
+# Handle package name modification for release build variants
 if [ "$NON_CUDA_BUILD" = "1" ]; then
     echo "Modifying package name for non-CUDA build"
     # Backup original pyproject.toml
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-non-cuda"/' pyproject.toml
-    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Non-CUDA version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "non-cuda"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Non-CUDA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "non-cuda"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA", ||' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-non-cuda"
-else
-    echo "Using standard package name: mooncake-transfer-engine"
-fi
-
-# Handle package name modification for CU13 builds
-if [ "$CU13_BUILD" = "1" ]; then
+elif [ "$CU13_BUILD" = "1" ]; then
     echo "Modifying package name for CU13 build"
     # Backup original pyproject.toml
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cu13"/' pyproject.toml
-    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (CUDA 13 version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cu13"]/' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-cu13"
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cuda13"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (CUDA 13 version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "cuda13"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-cuda13"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
