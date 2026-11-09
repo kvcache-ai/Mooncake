@@ -460,7 +460,8 @@ NCCL Device API and the inferred EP topology is supported by the compiled NCCL
 kernels. Existing constructor calls require no changes. If NCCL cannot be
 used, auto mode falls back to IPC + IBGDA and retains the previous backend
 behavior. As before, the requested workload must have a compiled elastic kernel
-shape.
+shape. On Intel XPU, `ElasticBuffer` runs on one node over Level Zero IPC
+instead; see {ref}`ElasticBuffer on Intel XPU <mooncake-ep-intel-xpu-elastic>`.
 
 NCCL support is opt-in. Build with
 `-DWITH_EP=ON -DUSE_CUDA=ON -DUSE_NCCL_DEVICE=ON`; the option defaults to
