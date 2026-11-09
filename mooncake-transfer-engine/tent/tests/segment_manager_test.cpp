@@ -108,6 +108,41 @@ TEST(SegmentManagerTest, UpdateLocalFailureDoesNotPublish) {
     EXPECT_FALSE(status.ok());
     EXPECT_EQ(manager->getLocal().get(), before.get());
     EXPECT_EQ(manager->getLocal()->name, "local_test_segment");
+    EXPECT_EQ(manager->getLocal()->snapshot_generation,
+              before->snapshot_generation);
+}
+
+TEST(SegmentManagerTest, SnapshotGenerationAdvancesWhenNewestBufferRemoved) {
+    auto manager = makeManager();
+    auto before = manager->getLocal();
+    ASSERT_GT(before->snapshot_generation, 0u);
+    ASSERT_TRUE(manager
+                    ->updateLocal([](SegmentDesc& desc) -> Status {
+                        auto& buffers =
+                            std::get<MemorySegmentDesc>(desc.detail).buffers;
+                        buffers.push_back(makeBuffer(0x1000, 0x1000));
+                        return Status::OK();
+                    })
+                    .ok());
+    auto added = manager->getLocal();
+    EXPECT_GT(added->snapshot_generation, before->snapshot_generation);
+    ASSERT_TRUE(
+        manager
+            ->updateLocal([](SegmentDesc& desc) -> Status {
+                std::get<MemorySegmentDesc>(desc.detail).buffers.clear();
+                return Status::OK();
+            })
+            .ok());
+    auto removed = manager->getLocal();
+    EXPECT_TRUE(removed->getMemory().buffers.empty());
+    EXPECT_GT(removed->snapshot_generation, added->snapshot_generation);
+
+    auto decoded =
+        json::parse(*manager->getLocalDumpedJson()).get<SegmentDesc>();
+    EXPECT_EQ(decoded.snapshot_generation, removed->snapshot_generation);
+    auto legacy = json::parse(*manager->getLocalDumpedJson());
+    legacy.erase("snapshot_generation");
+    EXPECT_EQ(legacy.get<SegmentDesc>().snapshot_generation, 0u);
 }
 
 TEST(SegmentManagerTest, JsonCacheInvalidatedOnPublication) {

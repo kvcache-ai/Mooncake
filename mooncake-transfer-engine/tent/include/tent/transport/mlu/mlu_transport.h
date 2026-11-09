@@ -33,6 +33,21 @@
 namespace mooncake {
 namespace tent {
 
+namespace mlu_detail {
+struct ImportEntry {
+    std::string attr;
+    uint64_t base = 0;
+    uint64_t size = 0;
+    uint64_t snapshot_generation = 0;
+    std::shared_ptr<void> mapping;
+};
+
+// Caller synchronizes access to entries and reconciled_snapshot.
+void reconcileImports(std::vector<ImportEntry> &entries,
+                      uint64_t &reconciled_snapshot, const SegmentDesc &segment,
+                      std::vector<std::shared_ptr<void>> &dropped);
+}  // namespace mlu_detail
+
 struct MluCopyQueue {
     CNcontext context = nullptr;
     CNqueue handle = nullptr;
@@ -113,18 +128,11 @@ class MluTransport : public Transport {
     std::shared_ptr<void> relocate(SegmentID target_id, uint64_t &addr,
                                    size_t length);
 
-    struct ImportEntry {
-        std::string attr;
-        uint64_t base = 0;
-        uint64_t size = 0;
-        uint64_t generation = 0;
-        std::shared_ptr<void> mapping;
-    };
-
     std::mutex mutex_;
     std::map<CNcontext, std::array<std::shared_ptr<MluCopyQueue>, 3>> queues_;
     std::unordered_set<MluSubBatch *> batches_;
-    std::map<SegmentID, std::vector<ImportEntry>> imports_;
+    std::map<SegmentID, std::vector<mlu_detail::ImportEntry>> imports_;
+    std::map<SegmentID, uint64_t> reconciled_snapshots_;
     std::string machine_id_;
     std::atomic<uint64_t> ipc_generation_{0};
     bool installed_ = false;

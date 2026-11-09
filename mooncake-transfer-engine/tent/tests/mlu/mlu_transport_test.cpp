@@ -19,6 +19,7 @@
 #include <numa.h>
 #include <sched.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <chrono>
 #include <condition_variable>
@@ -148,6 +149,81 @@ namespace {
 
 constexpr size_t kChunk = 64ul << 10;  // 64 KiB
 constexpr size_t kBufSize = 3 * kChunk;
+
+SegmentDesc ipcSnapshot(uint64_t generation,
+                        const std::vector<std::string> &attrs) {
+    SegmentDesc segment{};
+    segment.type = SegmentType::Memory;
+    segment.snapshot_generation = generation;
+    segment.detail = MemorySegmentDesc{};
+    for (const auto &attr : attrs) {
+        BufferDesc buffer{};
+        buffer.transport_attrs[MLU] = attr;
+        std::get<MemorySegmentDesc>(segment.detail)
+            .buffers.push_back(std::move(buffer));
+    }
+    return segment;
+}
+
+bool containsImport(const std::vector<mlu_detail::ImportEntry> &entries,
+                    const std::string &attr) {
+    return std::any_of(entries.begin(), entries.end(),
+                       [&](const auto &entry) { return entry.attr == attr; });
+}
+
+TEST(MluImportCacheTest, RemovalRetiresMappingEvenWhenHighestBufferIsGone) {
+    int released = 0;
+    std::vector<mlu_detail::ImportEntry> entries;
+    uint64_t reconciled = 0;
+    auto mapping = [&](int *value) {
+        return std::shared_ptr<void>(value, [&](void *ptr) {
+            delete static_cast<int *>(ptr);
+            ++released;
+        });
+    };
+    entries.push_back({"A", 0, 0, 10, mapping(new int(1))});
+    entries.push_back({"B", 0, 0, 10, mapping(new int(2))});
+
+    std::vector<std::shared_ptr<void>> dropped;
+    mlu_detail::reconcileImports(entries, reconciled,
+                                 ipcSnapshot(10, {"A", "B"}), dropped);
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(reconciled, 10u);
+    mlu_detail::reconcileImports(entries, reconciled, ipcSnapshot(11, {"A"}),
+                                 dropped);
+    ASSERT_EQ(dropped.size(), 1u);
+    EXPECT_EQ(reconciled, 11u);
+    EXPECT_TRUE(containsImport(entries, "A"));
+    EXPECT_FALSE(containsImport(entries, "B"));
+    EXPECT_EQ(released, 0);
+    dropped.clear();
+    EXPECT_EQ(released, 1);
+}
+
+TEST(MluImportCacheTest, OlderSnapshotCannotRetireNewerImport) {
+    std::vector<mlu_detail::ImportEntry> entries;
+    uint64_t reconciled = 0;
+    std::vector<std::shared_ptr<void>> dropped;
+    entries.push_back({"A", 0, 0, 12, std::make_shared<int>(1)});
+    entries.push_back({"C", 0, 0, 12, std::make_shared<int>(3)});
+    auto current = ipcSnapshot(12, {"A", "C"});
+    mlu_detail::reconcileImports(entries, reconciled, current, dropped);
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(reconciled, 12u);
+
+    auto older = ipcSnapshot(11, {"A", "B"});
+    mlu_detail::reconcileImports(entries, reconciled, older, dropped);
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(reconciled, 11u);
+    EXPECT_TRUE(containsImport(entries, "C"));
+    entries.push_back({"B", 0, 0, 11, std::make_shared<int>(2)});
+
+    mlu_detail::reconcileImports(entries, reconciled, current, dropped);
+    ASSERT_EQ(dropped.size(), 1u);
+    EXPECT_EQ(reconciled, 12u);
+    EXPECT_FALSE(containsImport(entries, "B"));
+    EXPECT_TRUE(containsImport(entries, "C"));
+}
 
 class MluTransportTest : public ::testing::Test {
    protected:

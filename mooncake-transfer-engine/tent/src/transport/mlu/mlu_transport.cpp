@@ -22,6 +22,7 @@
 #include <charconv>
 #include <sstream>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 #include "tent/common/status.h"
@@ -188,6 +189,7 @@ Status MluTransport::uninstall() {
     std::lock_guard<std::mutex> lock(mutex_);
     CHECK_STATUS(quiesceLocked());
     imports_.clear();
+    reconciled_snapshots_.clear();
     queues_.clear();
     metadata_.reset();
     platform_ = nullptr;
@@ -804,34 +806,13 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
         if (result != cnrtSuccess || !accessible) return false;
     }
 
+    // Keep removed mappings alive until after releasing mutex_: unmapping may
+    // call into the driver and must not stall submission or status polling.
+    std::vector<std::shared_ptr<void>> dropped;
     std::lock_guard<std::mutex> lock(mutex_);
     auto &entries = imports_[target_id];
-    uint64_t newest_generation = 0;
-    for (const auto &buffer : segment.getMemory().buffers) {
-        auto it = buffer.transport_attrs.find(MLU);
-        if (it == buffer.transport_attrs.end()) continue;
-        IpcAttr published;
-        if (parseIpcAttr(it->second, published))
-            newest_generation =
-                std::max(newest_generation, published.generation);
-    }
-    // An older snapshot cannot retire a mapping published after it.
-    // In-flight tasks retain their own shared reference until the copy drains.
-    entries.erase(
-        std::remove_if(entries.begin(), entries.end(),
-                       [&](const ImportEntry &imported) {
-                           if (imported.generation > newest_generation)
-                               return false;
-                           for (const auto &buffer :
-                                segment.getMemory().buffers) {
-                               auto it = buffer.transport_attrs.find(MLU);
-                               if (it != buffer.transport_attrs.end() &&
-                                   it->second == imported.attr)
-                                   return false;
-                           }
-                           return true;
-                       }),
-        entries.end());
+    auto &reconciled = reconciled_snapshots_[target_id];
+    mlu_detail::reconcileImports(entries, reconciled, segment, dropped);
     for (const auto &imported : entries)
         if (imported.attr == attr_text) return true;
 
@@ -864,11 +845,49 @@ bool MluTransport::prepareRemoteBuffer(SegmentID target_id,
         }
         logError(status);
     });
-    entries.push_back(
-        {attr_text, attr.base, attr.size, attr.generation, std::move(mapping)});
+    entries.push_back({attr_text, attr.base, attr.size,
+                       segment.snapshot_generation, std::move(mapping)});
+    // An unversioned snapshot cannot be ordered against a versioned one.
+    // Force the next versioned look to check any mapping it just introduced.
+    if (!segment.snapshot_generation) reconciled = 0;
     LOG(INFO) << "MLU IPC mapped peer buffer " << (void *)attr.base << " of "
               << segment.name << " at " << mapped << " on mlu:" << attr.device;
     return true;
+}
+
+void mlu_detail::reconcileImports(std::vector<mlu_detail::ImportEntry> &entries,
+                                  uint64_t &reconciled,
+                                  const SegmentDesc &segment,
+                                  std::vector<std::shared_ptr<void>> &dropped) {
+    // Buffer registration generations do not describe a snapshot: removing
+    // the newest buffer makes their maximum go backwards. The publication
+    // generation also advances on removals, and orders snapshots across
+    // threads. Older snapshots cannot retire mappings imported from newer ones.
+    // A legacy descriptor has no publication generation (zero); its age
+    // cannot be established, so retain mappings until a versioned snapshot
+    // or closeRemoteSegment arrives.
+    if (segment.snapshot_generation &&
+        reconciled != segment.snapshot_generation) {
+        std::unordered_set<std::string_view> published;
+        published.reserve(segment.getMemory().buffers.size());
+        for (const auto &buffer : segment.getMemory().buffers) {
+            auto it = buffer.transport_attrs.find(MLU);
+            if (it != buffer.transport_attrs.end())
+                published.insert(it->second);
+        }
+        entries.erase(
+            std::remove_if(entries.begin(), entries.end(),
+                           [&](const mlu_detail::ImportEntry &imported) {
+                               const bool retired =
+                                   imported.snapshot_generation <=
+                                       segment.snapshot_generation &&
+                                   !published.count(imported.attr);
+                               if (retired) dropped.push_back(imported.mapping);
+                               return retired;
+                           }),
+            entries.end());
+        reconciled = segment.snapshot_generation;
+    }
 }
 
 std::shared_ptr<void> MluTransport::relocate(SegmentID target_id,
@@ -887,6 +906,7 @@ std::shared_ptr<void> MluTransport::relocate(SegmentID target_id,
 void MluTransport::closeRemoteSegment(SegmentID target_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     imports_.erase(target_id);
+    reconciled_snapshots_.erase(target_id);
 }
 
 }  // namespace tent
