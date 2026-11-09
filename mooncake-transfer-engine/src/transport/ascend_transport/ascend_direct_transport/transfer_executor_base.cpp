@@ -515,11 +515,11 @@ int TransferExecutorBase::disconnectAllPeers() {
             for (auto peer_it = peers.begin(); peer_it != peers.end();) {
                 const auto status = adxl_engines_[engine_idx]->Disconnect(
                     peer_it->c_str(), params_.connect_timeout);
-                if (status != adxl::SUCCESS &&
-                    status != adxl::NOT_CONNECTED) {
-                    LOG(ERROR) << "Failed to disconnect AdxlEngine: "
-                               << *peer_it << ", status: " << status
-                               << ", errmsg: " << aclGetRecentErrMsg();
+                if (status != adxl::SUCCESS && status != adxl::NOT_CONNECTED) {
+                    LOG(ERROR)
+                        << "Failed to disconnect AdxlEngine: " << *peer_it
+                        << ", status: " << status
+                        << ", errmsg: " << aclGetRecentErrMsg();
                     result = -1;
                     ++peer_it;
                 } else {

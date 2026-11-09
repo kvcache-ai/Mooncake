@@ -666,9 +666,8 @@ void release_transfer_sync_block() {
 
 bool wait_transfer_sync_entered() {
     std::unique_lock<std::mutex> lock(g_mutex);
-    return g_adxl_cv.wait_for(lock, std::chrono::seconds(5), [] {
-        return g_transfer_sync_entered;
-    });
+    return g_adxl_cv.wait_for(lock, std::chrono::seconds(5),
+                              [] { return g_transfer_sync_entered; });
 }
 
 void arm_get_status_block() {
@@ -2922,13 +2921,13 @@ TEST_F(AscendDirectTransportTest,
 
     std::atomic<bool> inflight_failed{false};
     std::atomic<bool> inflight_finished{false};
-    inflight = std::thread([this, &transport, &inflight_failed,
-                            &inflight_finished] {
-        auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
-                                        0x10000, kTransferBufSize);
-        inflight_finished = result.finished;
-        inflight_failed = result.failed;
-    });
+    inflight =
+        std::thread([this, &transport, &inflight_failed, &inflight_finished] {
+            auto result = runRemoteTransfer(transport.get(), test_buffer_src_,
+                                            1, 0x10000, kTransferBufSize);
+            inflight_finished = result.finished;
+            inflight_failed = result.failed;
+        });
     ASSERT_TRUE(adxl_mock::wait_transfer_sync_entered());
 
     std::atomic<int> disconnect_rc{kDisconnectPending};
@@ -2977,13 +2976,13 @@ TEST_F(AscendDirectTransportTest,
 
     std::atomic<bool> inflight_failed{true};
     std::atomic<bool> inflight_finished{false};
-    inflight = std::thread([this, &transport, &inflight_failed,
-                            &inflight_finished] {
-        auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
-                                        0x10000, kTransferBufSize);
-        inflight_finished = result.finished;
-        inflight_failed = result.failed;
-    });
+    inflight =
+        std::thread([this, &transport, &inflight_failed, &inflight_finished] {
+            auto result = runRemoteTransfer(transport.get(), test_buffer_src_,
+                                            1, 0x10000, kTransferBufSize);
+            inflight_finished = result.finished;
+            inflight_failed = result.failed;
+        });
     ASSERT_TRUE(adxl_mock::wait_get_status_entered());
 
     std::atomic<int> disconnect_rc{kDisconnectPending};

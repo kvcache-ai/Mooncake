@@ -164,7 +164,8 @@ class TransferExecutorBase {
     std::mutex connection_mutex_;
 
     // Held only for the duration of disconnectAllPeers(). New execute() calls
-    // fail while it is set, and it is cleared before disconnectAllPeers returns.
+    // fail while it is set, and it is cleared before disconnectAllPeers
+    // returns.
     std::mutex transfer_lifecycle_mutex_;
     std::condition_variable transfer_lifecycle_cv_;
     size_t active_sync_transfers_{0};
