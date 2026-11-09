@@ -375,8 +375,11 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
         priority = slice_list.first->priority;
     }
 
+    // A worker may finish immediately after queue publication.
+    const auto previous =
+        worker.inflight_slices.fetch_add(slice_list.num_slices);
     worker.queues[priority].push(slice_list);
-    if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
+    if (!previous) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
     }
@@ -703,6 +706,8 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
 void Workers::asyncPostSend() {
     auto& worker = worker_context_[tl_wid];
     std::vector<RdmaSliceList> result;
+    const size_t slice_budget = transport_->params_->endpoint.max_qp_wr;
+    size_t new_slices = 0;
 
     auto shared_quota =
         device_selector_ ? device_selector_->getSharedSlotManager() : nullptr;
@@ -716,8 +721,11 @@ void Workers::asyncPostSend() {
     auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
         if (shared_quota && !shared_quota->canSend(prio)) continue;
-        for (auto it = overflow.begin(); it != overflow.end();) {
+        for (auto it = overflow.begin();
+             it != overflow.end() &&
+             (deadline_bw_arbitration_ || new_slices < slice_budget);) {
             if (it->first == prio) {
+                new_slices += it->second.num_slices;
                 result.push_back(it->second);
                 it = overflow.erase(it);
             } else {
@@ -725,7 +733,18 @@ void Workers::asyncPostSend() {
             }
         }
         if (!result.empty()) break;
-        worker.queues[prio].pop(result);
+        if (deadline_bw_arbitration_) {
+            worker.queues[prio].pop(result);
+        } else {
+            // Prepare one QP window, then post and return to CQ polling. Do
+            // not wait for a full window when the producer has less ready.
+            while (new_slices < slice_budget) {
+                auto list = worker.queues[prio].pop();
+                if (!list.num_slices) break;
+                new_slices += list.num_slices;
+                result.push_back(list);
+            }
+        }
         if (!result.empty()) break;
     }
 
