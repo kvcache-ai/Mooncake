@@ -30,11 +30,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <future>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -5759,6 +5764,235 @@ TEST(RdmaPausedContextRecoveryTest, PollActivatesPausedContextWithLivePort) {
 
     EXPECT_EQ(context.status(), RdmaContext::DEVICE_ENABLED);
     EXPECT_TRUE(selector->isDeviceAvailable(0));
+}
+
+std::vector<std::string> splitCommaSeparated(const char* value) {
+    std::vector<std::string> result;
+    if (!value) return result;
+    std::stringstream stream(value);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        if (!item.empty()) result.push_back(std::move(item));
+    }
+    return result;
+}
+
+bool waitForPath(const std::string& path, std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (access(path.c_str(), F_OK) == 0) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+bool createMarker(const std::string& path) {
+    std::ofstream marker(path);
+    return marker.good();
+}
+
+int parsePositiveEnvironment(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (*end != '\0' || parsed <= 0 || parsed > std::numeric_limits<int>::max())
+        return fallback;
+    return static_cast<int>(parsed);
+}
+
+bool waitFullMeshBatch(TransferEngine& engine, BatchID batch,
+                       std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        TransferStatus status;
+        auto result = engine.getTransferStatus(batch, status);
+        if (!result.ok() || status.s == TransferStatusEnum::FAILED)
+            return false;
+        if (status.s == TransferStatusEnum::COMPLETED) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+// Hardware regression participant for a synchronized 60-peer RDMA connection
+// storm. The companion run_rdma_full_mesh.py process starts one instance per
+// peer and releases the start/finish barriers. It is opt-in so ordinary CTest
+// runs do not require multiple RDMA hosts.
+TEST(RdmaTransportIntegrationTest, FullMeshBootstrapStorm) {
+    const char* local_segment_env =
+        std::getenv("MOONCAKE_RDMA_FULL_MESH_LOCAL_SEGMENT");
+    const char* peer_list_env = std::getenv("MOONCAKE_RDMA_FULL_MESH_PEERS");
+    const char* peer_index_env =
+        std::getenv("MOONCAKE_RDMA_FULL_MESH_PEER_INDEX");
+    const char* ready_file = std::getenv("MOONCAKE_RDMA_FULL_MESH_READY_FILE");
+    const char* start_file = std::getenv("MOONCAKE_RDMA_FULL_MESH_START_FILE");
+    const char* finish_ready_file =
+        std::getenv("MOONCAKE_RDMA_FULL_MESH_FINISH_READY_FILE");
+    const char* finish_release_file =
+        std::getenv("MOONCAKE_RDMA_FULL_MESH_FINISH_RELEASE_FILE");
+    if (!local_segment_env || !peer_list_env || !peer_index_env ||
+        !ready_file || !start_file || !finish_ready_file ||
+        !finish_release_file) {
+        GTEST_SKIP()
+            << "set the MOONCAKE_RDMA_FULL_MESH_* environment variables "
+               "with run_rdma_full_mesh.py";
+    }
+    if (!hasRdmaDevice()) GTEST_SKIP() << "no RDMA device detected";
+
+    const std::string local_segment(local_segment_env);
+    const auto separator = local_segment.rfind(':');
+    ASSERT_NE(separator, std::string::npos) << local_segment;
+    const int rpc_port = std::stoi(local_segment.substr(separator + 1));
+    const int peer_index = std::stoi(peer_index_env);
+    const auto peers = splitCommaSeparated(peer_list_env);
+    ASSERT_GE(peer_index, 0);
+    ASSERT_LT(static_cast<size_t>(peer_index), peers.size());
+    ASSERT_EQ(peers[peer_index], local_segment);
+
+    auto config = std::make_shared<Config>();
+    config->set("local_segment_name", local_segment);
+    config->set("metadata_type", "p2p");
+    config->set("metadata_servers", "P2PHANDSHAKE");
+    config->set("rpc_server_port", rpc_port);
+    config->set(
+        "rpc_server_threads",
+        parsePositiveEnvironment("MOONCAKE_RDMA_FULL_MESH_RPC_THREADS", 16));
+    config->set("transports/rdma/enable", true);
+    // Keep every participant on the same RoCE path MTU. The test topology may
+    // contain hosts whose active MTU differs; asymmetric QP path MTUs make the
+    // data-plane control invalid before bootstrap concurrency is exercised.
+    config->set(
+        "transports/rdma/endpoint/path_mtu",
+        parsePositiveEnvironment("MOONCAKE_RDMA_FULL_MESH_PATH_MTU", 1024));
+    config->set("transports/tcp/enable", false);
+    config->set("transports/shm/enable", false);
+
+    TransferEngine engine(config);
+    ASSERT_TRUE(engine.available());
+    constexpr size_t kBufferSize = 32ull * 1024 * 1024;
+    constexpr size_t kBlockSize = 4ull * 1024;
+    constexpr size_t kRangeSize = 256ull * 1024;
+    constexpr size_t kWorkerCount = 4;
+    std::vector<uint8_t> buffer(kBufferSize, 0x5a);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    ASSERT_TRUE(createMarker(ready_file));
+    std::cout << "MOONCAKE_RDMA_FULL_MESH_READY peer=" << peer_index
+              << " segment=" << local_segment << std::endl;
+    const auto barrier_timeout = std::chrono::seconds(parsePositiveEnvironment(
+        "MOONCAKE_RDMA_FULL_MESH_TIMEOUT_SECONDS", 300));
+    const auto transfer_timeout = std::chrono::seconds(parsePositiveEnvironment(
+        "MOONCAKE_RDMA_FULL_MESH_TRANSFER_TIMEOUT_SECONDS", 30));
+    ASSERT_TRUE(waitForPath(start_file, barrier_timeout));
+
+    struct RemoteBuffer {
+        SegmentID segment;
+        uint64_t base;
+        std::string name;
+    };
+    std::vector<RemoteBuffer> remotes;
+    remotes.reserve(peers.size() - 1);
+    for (const auto& peer : peers) {
+        if (peer == local_segment) continue;
+        SegmentID segment = 0;
+        Status status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + barrier_timeout;
+        do {
+            status = engine.openSegment(segment, peer);
+            if (status.ok()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        } while (std::chrono::steady_clock::now() < deadline);
+        ASSERT_TRUE(status.ok()) << peer << ": " << status.ToString();
+        SegmentInfo info;
+        ASSERT_TRUE(engine.getSegmentInfo(segment, info).ok()) << peer;
+        ASSERT_FALSE(info.buffers.empty()) << peer;
+        remotes.push_back({segment, info.buffers.front().base, peer});
+    }
+    ASSERT_FALSE(remotes.empty());
+
+    std::atomic<int> failures{0};
+    std::atomic<size_t> workers_ready{0};
+    std::atomic<bool> workers_start{false};
+    std::mutex failure_mutex;
+    std::string first_failure;
+    auto recordFailure = [&](const std::string& message) {
+        if (failures.fetch_add(1, std::memory_order_relaxed) == 0) {
+            std::lock_guard<std::mutex> lock(failure_mutex);
+            first_failure = message;
+        }
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(kWorkerCount);
+    const size_t iterations_per_worker =
+        static_cast<size_t>(parsePositiveEnvironment(
+            "MOONCAKE_RDMA_FULL_MESH_ITERATIONS_PER_WORKER",
+            static_cast<int>(remotes.size())));
+    const auto warmup_duration = std::chrono::seconds(
+        parsePositiveEnvironment("MOONCAKE_RDMA_FULL_MESH_WARMUP_SECONDS", 1));
+    for (size_t worker = 0; worker < kWorkerCount; ++worker) {
+        workers.emplace_back([&, worker]() {
+            workers_ready.fetch_add(1, std::memory_order_release);
+            while (!workers_start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+
+            auto transfer = [&](size_t iteration) {
+                const size_t i =
+                    (iteration * kWorkerCount + worker) % remotes.size();
+                Request request{};
+                request.opcode = Request::WRITE;
+                request.source = buffer.data() + worker * kBlockSize;
+                request.target_id = remotes[i].segment;
+                request.target_offset =
+                    remotes[i].base +
+                    static_cast<uint64_t>(peer_index + 1) * kRangeSize +
+                    worker * kBlockSize;
+                request.length = kBlockSize;
+                request.transport_hint = RDMA;
+
+                const BatchID batch = engine.allocateBatch(1);
+                auto status = engine.submitTransfer(batch, {request});
+                const bool completed =
+                    status.ok() &&
+                    waitFullMeshBatch(engine, batch, transfer_timeout);
+                (void)engine.freeBatch(batch);
+                if (!completed) {
+                    recordFailure("transfer to " + remotes[i].name +
+                                  (status.ok() ? " did not complete"
+                                               : ": " + status.ToString()));
+                    return false;
+                }
+                return true;
+            };
+
+            size_t warmup_iteration = 0;
+            const auto warmup_deadline =
+                std::chrono::steady_clock::now() + warmup_duration;
+            while (std::chrono::steady_clock::now() < warmup_deadline) {
+                if (!transfer(warmup_iteration++)) return;
+            }
+            for (size_t iteration = 0; iteration < iterations_per_worker;
+                 ++iteration) {
+                if (!transfer(iteration)) return;
+            }
+        });
+    }
+    while (workers_ready.load(std::memory_order_acquire) < kWorkerCount)
+        std::this_thread::yield();
+    workers_start.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+
+    ASSERT_TRUE(createMarker(finish_ready_file));
+    std::cout << "MOONCAKE_RDMA_FULL_MESH_RESULT peer=" << peer_index
+              << " targets=" << remotes.size()
+              << " iterations_per_worker=" << iterations_per_worker
+              << " failures=" << failures.load(std::memory_order_relaxed)
+              << std::endl;
+    ASSERT_TRUE(waitForPath(finish_release_file, barrier_timeout));
+    EXPECT_EQ(failures.load(std::memory_order_relaxed), 0) << first_failure;
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
