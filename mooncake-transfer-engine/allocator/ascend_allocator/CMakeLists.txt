@@ -11,9 +11,10 @@ set_target_properties(ascend_allocator PROPERTIES PREFIX ""
                                                  POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
   ascend_allocator
-  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../../../include>
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../include>
          $<INSTALL_INTERFACE:include>
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../tent/include)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../tent/include)
 target_link_libraries(ascend_allocator PRIVATE glog::glog ${CMAKE_DL_LIBS}
                                                  pthread ascendcl)
 

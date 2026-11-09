@@ -1,18 +1,12 @@
-if (USE_ASCEND_DIRECT OR USE_UBSHMEM)
-    # Shared allocator/affinity library, linked by the classic transport and TENT.
-    add_subdirectory(ascend_allocator)
-endif ()
-
-if (USE_ASCEND)
-    file(GLOB ASCEND_SOURCES "hccl_transport/*.cpp")
-    add_subdirectory(hccl_transport/ascend_transport_c)
-elseif (USE_ASCEND_HETEROGENEOUS)
+if (USE_ASCEND_HETEROGENEOUS)
 	file(GLOB ASCEND_SOURCES "heterogeneous_rdma_transport/*.cpp")
 elseif (USE_UBSHMEM)
     # utils.cpp holds the protocol_desc parser the host allocator calls.
     file(GLOB ASCEND_SOURCES "ubshmem_transport/*.cpp" "*.cpp"
          "ascend_direct_transport/utils.cpp")
 else ()
+    # Ascend Direct transport. USE_ASCEND selects the same transport (see
+    # mooncake-common/common.cmake); the HCCL transport is no longer built.
     file(GLOB ASCEND_SOURCES "ascend_direct_transport/*.cpp" "*.cpp")
 endif ()
 
@@ -57,10 +51,6 @@ else()
 endif()
 
 target_link_libraries(ascend_transport PRIVATE glog::glog)
-
-if (USE_ASCEND)
-    target_link_libraries(ascend_transport PRIVATE ascend_transport_mem)
-endif()
 
 if (USE_UBSHMEM)
     target_link_libraries(ascend_transport PRIVATE ascendcl)

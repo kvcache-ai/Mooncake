@@ -408,11 +408,6 @@ if(SKBUILD)
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 
-  if(USE_ASCEND)
-    install(TARGETS ascend_transport_mem
-            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
-  endif()
-
   if(WITH_PG)
     install(TARGETS mooncake_pg
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)

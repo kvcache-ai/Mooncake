@@ -23,8 +23,8 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT)
     target_sources(
       tent_xport_ascend_direct
       PRIVATE
-        ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_allocator/ascend_affinity.cpp
-        ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_allocator/allocation_affinity_pools.cpp
+        ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator/ascend_affinity.cpp
+        ${TENT_REPOSITORY_ROOT}/mooncake-transfer-engine/allocator/ascend_allocator/allocation_affinity_pools.cpp
     )
     target_include_directories(
       tent_xport_ascend_direct PRIVATE

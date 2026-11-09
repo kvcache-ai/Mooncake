@@ -52,13 +52,10 @@ class TransferEngineImplTestPeer;
 // Whether an Ascend build installs the Ascend transport for a protocol hint.
 // Hints that name no protocol or name Ascend install it; a hint naming a host
 // transport (e.g. "rdma") leaves the classic host-transport selection in
-// charge. HCCL builds (USE_ASCEND without USE_ASCEND_DIRECT) return true here
-// whatever the hint says, so they install Ascend and never reach that block.
+// charge. USE_ASCEND and USE_ASCEND_DIRECT both build the Ascend Direct
+// transport, so they behave identically here.
 static inline bool shouldInstallAscendTransport(const std::string& protocol) {
-#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
-    (void)protocol;
-    return true;
-#elif defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     return protocol.empty() || protocol == "ascend" ||
            protocol == "ascend_direct";
 #else
