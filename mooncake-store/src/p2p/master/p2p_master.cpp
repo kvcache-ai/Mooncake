@@ -20,6 +20,7 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
 #include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/ha/oplog/p2p_hot_standby_service.h"
@@ -85,15 +86,27 @@ std::string BuildSnapshotEndpoint(const std::string& master_endpoint,
     return host + ":" + std::to_string(snapshot_port);
 }
 
+uint64_t NonNegativeSequenceMetric(int64_t value) {
+    return value > 0 ? static_cast<uint64_t>(value) : 0;
+}
+
+void UpdateHAOpLogProgress(uint64_t applied_sequence_id,
+                           std::optional<uint64_t> latest_sequence_id) {
+    auto& metrics = HAMetricManager::instance();
+    HAStatusManager::instance().SetOpLogProgress(
+        applied_sequence_id, latest_sequence_id,
+        NonNegativeSequenceMetric(metrics.get_oplog_trimmed_sequence_id()),
+        NonNegativeSequenceMetric(metrics.get_oplog_gc_cursor_sequence_id()));
+}
+
 void UpdateHAStatusFromStandby(P2PHotStandbyService& standby) {
     const auto status = standby.GetSyncStatus();
     auto& ha_status = HAStatusManager::instance();
     ha_status.SetRoleState("standby", StandbyStateToString(status.state));
-    ha_status.SetOpLogProgress(
-        status.applied_seq_id,
-        status.primary_seq_id_known
-            ? std::optional<uint64_t>(status.primary_seq_id)
-            : std::nullopt);
+    UpdateHAOpLogProgress(status.applied_seq_id,
+                          status.primary_seq_id_known
+                              ? std::optional<uint64_t>(status.primary_seq_id)
+                              : std::nullopt);
     ha_status.SetSnapshotReady(standby.IsReadyForSnapshot());
     ha_status.SetDoctorIssue(
         "OPLOG_APPLY_FAILED",
@@ -406,8 +419,7 @@ int P2PMaster::RunWithHA() {
             }
             promoted_sequence_id = standby->GetLatestAppliedSequenceId();
             promoted_metadata = standby->ExportMetadata();
-            HAStatusManager::instance().SetOpLogProgress(promoted_sequence_id,
-                                                         promoted_sequence_id);
+            UpdateHAOpLogProgress(promoted_sequence_id, promoted_sequence_id);
 #ifdef STORE_USE_REDIS
             standby_registry_providers.reset();
 #endif
@@ -550,16 +562,14 @@ int P2PMaster::RunWithHA() {
                                  &active_service->GetMasterService()] {
             const uint64_t latest_sequence_id =
                 primary_service->GetLatestOpLogSequenceId();
-            HAStatusManager::instance().SetOpLogProgress(latest_sequence_id,
-                                                         latest_sequence_id);
+            UpdateHAOpLogProgress(latest_sequence_id, latest_sequence_id);
             HAStatusManager::instance().SetRoleState("primary", "RUNNING");
             if (master_registry_heartbeat) {
                 master_registry_heartbeat->SetAppliedSequenceProvider(
                     [primary_service, latest_sequence_id] {
                         const uint64_t sequence_id =
                             primary_service->GetLatestOpLogSequenceId();
-                        HAStatusManager::instance().SetOpLogProgress(
-                            sequence_id, sequence_id);
+                        UpdateHAOpLogProgress(sequence_id, sequence_id);
                         return sequence_id;
                     });
                 master_registry_heartbeat->SetSnapshotReadyProvider({});
