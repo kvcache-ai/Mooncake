@@ -94,7 +94,6 @@ enum class AdmissionReason : uint8_t { kNone, kWindow, kStaleGeneration };
 struct AdmissionEvidence {
     AdmissionDomain domain = AdmissionDomain::kNone;
     AdmissionReason reason = AdmissionReason::kNone;
-    Snapshot snapshot;
 };
 
 class DomainState {
@@ -172,7 +171,8 @@ class Permit {
 // A domain with no inflight bytes admits one indivisible slice even when it
 // exceeds the window. The full byte count is reserved;
 // transport-level static limits must still be enforced by the caller.
-// Evidence is written only on rejection, with the device checked first.
+// Evidence contains rejection metadata only, with the device checked first.
+// Call snapshot() separately when full domain statistics are needed.
 Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
                     AdmissionEvidence* evidence = nullptr);
 bool isCurrentGeneration(const Permit& permit);
