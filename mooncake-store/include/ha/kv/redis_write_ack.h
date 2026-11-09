@@ -49,7 +49,8 @@ inline KvWriteResult ExecuteRedisWriteWithAck(
     if (ack) {
         result.replicas_acked = *ack;
         // N is the configured total replica membership, not a quorum. An
-        // excess count also requires reconciliation of the configured policy.
+        // excess count is a valid WAIT reply, but mismatches this policy.
+        // Count equality alone does not validate the deployment's membership.
         if (*ack == policy.replicas_required) {
             return result;
         }

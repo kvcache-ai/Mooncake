@@ -216,7 +216,7 @@ if those checks fail.
 Redis-backed HA is experimental. It still needs further verification and hardening. It is not a Primary-Standby deployment and it is not a strict-durability failover path.
 ```
 
-Redis is an ephemeral coordination store. A successful Redis write means Redis accepted the record. It does not mean the record is durably committed, and failover does not recover cluster metadata from Redis. `appendfsync everysec` can remain the default operational setting because correctness does not depend on replaying acknowledged Redis records after a restart. If the Redis namespace is missing, empty, or fails validation, treat that state as lost and rebuild by starting a new empty cluster so applications can repopulate metadata from the authoritative source. See **Recovery from Unusable HA State**. Primary-Standby OpLog replication, promotion, and batch OpLog snapshots require `ha_backend_type=etcd`.
+Redis is an ephemeral coordination store. A successful Redis write means Redis accepted the record. It does not mean the record is durably committed, and failover does not recover cluster metadata from Redis. `appendfsync everysec` can remain the default operational setting because correctness does not depend on replaying acknowledged Redis records after a restart. If the Redis namespace is missing, empty, or fails validation, treat that state as lost and rebuild by starting a new empty cluster so applications can repopulate metadata from the authoritative source. See **Recovery from Unusable HA State**. Batch OpLog snapshots require `ha_backend_type=etcd`. Redis OpLog remains experimental and uses the replica acknowledgment policy below.
 
 ```bash
 mooncake_master \
@@ -227,6 +227,32 @@ mooncake_master \
 ```
 
 **Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. The build must include `STORE_USE_REDIS`.
+
+**Redis OpLog replica acknowledgments:** with `--enable_oplog=true`, the HA KV
+backend factory uses a fixed policy requiring exactly one replica acknowledgment.
+This changes the earlier behavior that accepted a successful Lua reply without
+waiting for replicas. It applies to `Put`, `Txn`, and `DeleteRange`, including
+their legacy `ErrorCode` interfaces. The supported deployment for this factory
+path is one primary with exactly one replica; Redis leadership without OpLog is
+unaffected by this KV policy.
+
+The count is neither discovered automatically nor interpreted as a minimum.
+With no replica, a write can execute but remains unknown after the confirmation
+timeout. With two or more replicas, `WAIT 1` can return `2` or more, which is a
+valid Redis response but does not match the fixed policy. Such a write returns
+unknown (`ETCD_OPERATION_ERROR` through the legacy interface), even if every
+replica received it. It can instead succeed when only one ACK has arrived, so
+multi-replica deployments through this factory are unsupported and their results
+can depend on ACK timing. An unknown result does not prove that no write occurred;
+the backend does not automatically replay it.
+
+Master configuration cannot yet change this count, and the factory does not
+validate replica membership. Component callers can construct `RedisHaKvBackend`
+with an explicit policy matching their deployment, but this does not configure
+the Master factory path. Explicit replica-count configuration and topology
+validation remain follow-up work. These backend acknowledgments also do not
+establish end-to-end OpLog durability: existing readback reconciliation can still
+report success for a visible batch without proving the replica policy was met.
 
 
 ---

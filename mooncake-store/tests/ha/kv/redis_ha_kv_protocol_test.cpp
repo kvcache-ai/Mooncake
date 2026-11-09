@@ -15,6 +15,8 @@
 #include <tuple>
 #include <utility>
 
+#include "ha/kv/ha_kv_backend_factory.h"
+
 namespace mooncake::test {
 namespace {
 
@@ -174,6 +176,78 @@ TEST_F(RedisHaKvProtocolTest, EveryWriteWaitsOnTheExecutionConnection) {
         EXPECT_EQ("EVAL", peer.commands()[0][0]);
         EXPECT_EQ((std::vector<std::string>{"WAIT", "2", "40"}),
                   peer.commands()[1]);
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest, FactoryDefaultRequiresExactlyOneReplica) {
+    for (size_t acked : {0u, 1u, 2u}) {
+        for (int operation = 0; operation < 3; ++operation) {
+            SCOPED_TRACE(::testing::Message()
+                         << "acked=" << acked << " operation=" << operation);
+            ScriptedRedisPeer peer(
+                {"*1\r\n:1\r\n", ":" + std::to_string(acked) + "\r\n"});
+            auto backend = CreateHaKvBackend({.type = ha::HABackendType::REDIS,
+                                              .connstring = peer.endpoint(),
+                                              .cluster_namespace = "clusterA"});
+            ASSERT_TRUE(backend.has_value());
+            EXPECT_EQ(1u,
+                      (*backend)->GetWriteDurabilityPolicy().replicas_required);
+            const std::string key = "/oplog/clusterA/key";
+            KvWriteResult result;
+            if (operation == 0) {
+                result = (*backend)->PutWithResult(key, "value");
+            } else if (operation == 1) {
+                KvTxn txn;
+                txn.puts.push_back({.key = key, .value = "value"});
+                result = (*backend)->TxnWithResult(txn);
+            } else {
+                result = (*backend)->DeleteRangeWithResult(key, key + "0");
+            }
+            EXPECT_EQ(acked == 1 ? KvWriteStatus::kCommitted
+                                 : KvWriteStatus::kOutcomeUnknown,
+                      result.status);
+            EXPECT_EQ(acked, result.replicas_acked);
+            EXPECT_EQ(1u, result.replicas_required);
+            peer.Join();
+            ASSERT_EQ(2u, peer.commands().size());
+            EXPECT_EQ("EVAL", peer.commands()[0][0]);
+            EXPECT_EQ((std::vector<std::string>{"WAIT", "1", "1000"}),
+                      peer.commands()[1]);
+        }
+    }
+}
+
+TEST_F(RedisHaKvProtocolTest, FactoryLegacyWritesUseTheSameReplicaPolicy) {
+    for (size_t acked : {0u, 1u, 2u}) {
+        for (int operation = 0; operation < 3; ++operation) {
+            SCOPED_TRACE(::testing::Message()
+                         << "acked=" << acked << " operation=" << operation);
+            ScriptedRedisPeer peer(
+                {"*1\r\n:1\r\n", ":" + std::to_string(acked) + "\r\n"});
+            auto backend = CreateHaKvBackend({.type = ha::HABackendType::REDIS,
+                                              .connstring = peer.endpoint(),
+                                              .cluster_namespace = "clusterA"});
+            ASSERT_TRUE(backend.has_value());
+            const std::string key = "/oplog/clusterA/key";
+            ErrorCode error;
+            if (operation == 0) {
+                error = (*backend)->Put(key, "value");
+            } else if (operation == 1) {
+                KvTxn txn;
+                txn.puts.push_back({.key = key, .value = "value"});
+                error = (*backend)->Txn(txn);
+            } else {
+                error = (*backend)->DeleteRange(key, key + "0");
+            }
+            EXPECT_EQ(
+                acked == 1 ? ErrorCode::OK : ErrorCode::ETCD_OPERATION_ERROR,
+                error);
+            peer.Join();
+            ASSERT_EQ(2u, peer.commands().size());
+            EXPECT_EQ("EVAL", peer.commands()[0][0]);
+            EXPECT_EQ((std::vector<std::string>{"WAIT", "1", "1000"}),
+                      peer.commands()[1]);
+        }
     }
 }
 

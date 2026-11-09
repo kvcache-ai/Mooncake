@@ -13,7 +13,12 @@ namespace mooncake {
 // kCreateRevisionEquals is rejected until snapshot fencing is implemented.
 class RedisHaKvBackend : public HaKvBackend {
    public:
-    // Task 2 resolves/checks these requirements against the slot topology.
+    // The default is a fixed one-replica policy, not topology discovery or a
+    // minimum ACK count. All writes, including the legacy methods, require
+    // exactly this count; WAIT 1 returning 2 is an unknown outcome. Callers
+    // supplying a policy must ensure it matches the deployment's membership.
+    // Task 2 adds topology validation; the default factory supports only a
+    // primary with exactly one replica until that integration is available.
     explicit RedisHaKvBackend(
         KvWriteDurabilityPolicy policy = {.replicas_required = 1})
         : write_policy_(policy) {}
