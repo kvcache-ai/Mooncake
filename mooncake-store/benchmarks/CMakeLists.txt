@@ -4,11 +4,8 @@ target_link_libraries(allocator_bench PRIVATE cachelib_memory_allocator mooncake
 
 # These benchmarks exercise centralized Store APIs and storage backends.
 if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
-add_executable(master_bench
-    master_bench.cpp
-    ../src/master_client.cpp
-)
-target_link_libraries(master_bench PRIVATE cachelib_memory_allocator mooncake_master_core)
+add_executable(master_bench master_bench.cpp)
+target_link_libraries(master_bench PRIVATE cachelib_memory_allocator mooncake_store)
 
 # Add storage backend benchmark executable
 # This benchmark tests all storage backends (OffsetAllocator, Bucket, FilePerKey)

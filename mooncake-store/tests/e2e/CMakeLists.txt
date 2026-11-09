@@ -73,6 +73,7 @@ if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
 else()
     if(STORE_USE_REDIS)
         add_executable(redis_chaos_test redis_chaos_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
+        target_link_libraries(redis_chaos_test PRIVATE ${HIREDIS_LIB})
         target_link_libraries(redis_chaos_test PUBLIC
             mooncake_store
             transfer_engine
