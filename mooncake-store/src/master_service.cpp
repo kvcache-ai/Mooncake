@@ -3295,13 +3295,17 @@ std::shared_ptr<ClientLivenessRecord> MasterService::RecordRestoreKnownOwner(
 
 tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
     LegacyRestoreContext& ctx) {
+    std::unordered_set<std::string> duplicate_object_ids;
     for (const auto& entry : ctx.objects) {
         auto [tenant_id, user_key] = ResolveStandbyObject(entry);
         if (!tenant_id.IsValid()) {
             NoteLegacyStandbyRejection(ctx, entry, "invalid_tenant_id");
             continue;
         }
-        if (!ctx.object_ids.insert(tenant_id.MakeScopedKey(user_key)).second) {
+        const auto [object_id, inserted] =
+            ctx.object_ids.insert(tenant_id.MakeScopedKey(user_key));
+        if (!inserted) {
+            duplicate_object_ids.insert(*object_id);
             NoteLegacyStandbyRejection(ctx, entry, "duplicate_object");
             continue;
         }
@@ -3337,6 +3341,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                     std::numeric_limits<uintptr_t>::max() - buffer.size_) {
                 NoteLegacyStandbyRejection(ctx, entry,
                                            "invalid_memory_descriptor");
+                ctx.repair_remove_keys.emplace_back(tenant_id, user_key);
                 valid = false;
                 break;
             }
@@ -3358,6 +3363,13 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                                                      desc_idx);
         }
     }
+
+    // Another entry for the same key may be valid. A structural rejection
+    // alone cannot justify a key-level REMOVE for an ambiguous identity.
+    std::erase_if(ctx.repair_remove_keys, [&](const auto& key) {
+        return duplicate_object_ids.contains(
+            key.first.MakeScopedKey(key.second));
+    });
 
     // Overlap is ambiguity, not recency: the promotion context carries no
     // replay order (the standby snapshot enumerates unordered maps), so an
@@ -4257,7 +4269,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Durable repair for conflict-derived discards: a later promotion must
+    // Durable repair for permanent discards: a later promotion must
     // not replay what this one dropped. The whole repair set goes out as one
     // indivisible batch record (REMOVE for full drops, canonical PUT_END
     // carrying only the survivors for partial ones), and the restore fails
@@ -4272,7 +4284,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     // unrepaired, so the restore fails explicitly instead.
     if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
         enable_oplog_ && !ordered_oplog_writer_) {
-        LOG(ERROR) << "RestoreFromStandbySnapshot: conflict discards need "
+        LOG(ERROR) << "RestoreFromStandbySnapshot: permanent discards need "
                       "durable repair but no OpLog writer is available; "
                       "failing the restore";
         rollback_restored_state();
