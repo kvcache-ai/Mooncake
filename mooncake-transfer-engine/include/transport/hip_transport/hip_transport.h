@@ -67,29 +67,36 @@ class HipTransport : public Transport {
     const char* getName() const override { return "hip"; }
 
    private:
+    friend class HipTransportTestPeer;
+
     struct OpenedShmEntry {
         void* shm_addr;
         uint64_t length;
     };
 
-    struct PendingTransfer {
-        hipEvent_t event;
-        int device_id;
-        Slice* slice;
-    };
+    // Enqueue the copies without waiting for them; getTransferStatus() polls
+    // the recorded events.
+    Status submitTasks(
+        const std::vector<std::pair<TransferTask*, const TransferRequest*>>&
+            tasks);
 
-    // Start async transfer and return pending transfer info
-    Status startAsyncTransfer(const TransferRequest& request,
-                              TransferTask& task, PendingTransfer& pending);
+    // Enqueue one device's copies on one stream, followed by one event.
+    // Slices that could not be enqueued are failed and reported in the
+    // returned status; the others stay tracked by the event.
+    Status submitDeviceCopies(int device_id, const std::vector<Slice*>& slices);
 
-    // Synchronize pending transfers
-    void synchronizePendingTransfers(
-        std::vector<PendingTransfer>& pending_transfers);
+    // With MC_HIP_WAIT_CALLER_STREAM: make stream wait for the null stream
+    // of each device in this process that holds data of slices.
+    bool waitForCallerStreams(int device_id, hipStream_t stream,
+                              hipEvent_t event,
+                              const std::vector<Slice*>& slices);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
     RWSpinlock remap_lock_;
     bool use_fabric_mem_;
+    // MC_HIP_WAIT_CALLER_STREAM: order copies after the caller's null stream.
+    bool wait_caller_stream_;
 
     std::mutex register_mutex_;
     // Registered sub-range address → its hipMalloc base; base → live alias

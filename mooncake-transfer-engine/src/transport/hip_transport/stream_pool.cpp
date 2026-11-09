@@ -18,8 +18,9 @@
 
 namespace mooncake {
 
-StreamPool::StreamPool(int num_streams_per_device)
-    : num_streams_per_device_(num_streams_per_device) {
+StreamPool::StreamPool(int num_streams_per_device, std::string priority)
+    : num_streams_per_device_(num_streams_per_device),
+      priority_(std::move(priority)) {
     if (num_streams_per_device_ == 0) {
         num_streams_per_device_ = 1;
     }
@@ -66,12 +67,24 @@ bool StreamPool::initializeStreamsForDevice(int device_id) {
         return false;
     }
 
+    int least = 0, greatest = 0;
+    err = hipDeviceGetStreamPriorityRange(&least, &greatest);
+    if (err != hipSuccess) {
+        LOG(ERROR) << "StreamPool: Failed to get stream priority range for "
+                   << "device " << device_id << ": " << hipGetErrorString(err);
+        return false;
+    }
+    const int priority = priority_ == "low"    ? least
+                         : priority_ == "high" ? greatest
+                                               : 0;
+
     std::vector<hipStream_t> device_streams;
     device_streams.reserve(num_streams_per_device_);
 
     for (int i = 0; i < num_streams_per_device_; ++i) {
         hipStream_t stream;
-        err = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+        err = hipStreamCreateWithPriority(&stream, hipStreamNonBlocking,
+                                          priority);
         if (err != hipSuccess) {
             LOG(ERROR) << "StreamPool: Failed to create stream for device "
                        << device_id << ": " << hipGetErrorString(err);
