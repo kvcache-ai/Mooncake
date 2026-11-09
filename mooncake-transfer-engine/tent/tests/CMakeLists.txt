@@ -230,6 +230,28 @@ target_include_directories(transfer_engine_config_override_test
 add_test(NAME transfer_engine_config_override_test
          COMMAND transfer_engine_config_override_test)
 
+# Platform::getLoader is a process-wide singleton. Keep this regression in a
+# dedicated CPU-only process so its first call always exercises the null-config
+# initialization path without probing accelerator hardware.
+if(NOT USE_CUDA
+   AND NOT USE_HIP
+   AND NOT USE_SUNRISE
+   AND NOT USE_ASCEND
+   AND NOT USE_ASCEND_DIRECT
+   AND NOT USE_MEMFABRIC
+   AND NOT USE_TPU
+   AND NOT USE_MLU
+   AND NOT USE_XPU)
+  add_executable(tent_platform_default_config_test
+                 platform_default_config_test.cpp)
+  target_link_libraries(tent_platform_default_config_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_platform_default_config_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_platform_default_config_test
+           COMMAND tent_platform_default_config_test)
+endif()
+
 add_executable(tent_tcp_transport_test tcp_transport_test.cpp)
 target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
                                                       tent_link_group)

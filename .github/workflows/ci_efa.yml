@@ -13,8 +13,11 @@ jobs:
         include:
           - variant: cuda
             python-version: "3.12"
+          # Builds the unit tests too, as the release build does, so a test that
+          # only compiles with USE_EFA=ON fails here rather than at release.
           - variant: cuda13
             python-version: "3.12"
+            unit-tests: "ON"
           - variant: non-cuda
             python-version: "3.10"
           - variant: cuda13
@@ -31,7 +34,8 @@ jobs:
       build-profile: ci
       cmake-args: >-
         -DUSE_ETCD=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_METRICS=ON
-        -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=ON -DBUILD_BENCHMARK=ON
+        -DBUILD_UNIT_TESTS=${{ matrix.unit-tests || 'OFF' }} -DBUILD_EXAMPLES=ON
+        -DBUILD_BENCHMARK=ON
         -DENABLE_DEBUG_SYMBOLS=OFF
       torch-cuda-arch-list: '8.0;9.0'
       artifact-prefix: mooncake-wheel-efa-${{ matrix.variant }}-ubuntu

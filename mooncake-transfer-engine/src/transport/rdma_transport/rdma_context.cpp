@@ -20,7 +20,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
-#include <sys/mman.h>
 #include <unistd.h>
 #ifdef USE_CUDA
 #include <dlfcn.h>
@@ -975,22 +974,14 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         memory_region_map_.erase(iter);
         return 0;
     }
-    // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
-    // reading mr->length (or the cached region length) afterwards is a use-
-    // after-free. We restore fork state on the same range to undo the
-    // MADV_DONTFORK applied at register time (see issue #3639).
-    size_t region_length = iter->second.mr->length;
-    void *region_addr = static_cast<char *>(iter->second.addr) -
-                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
-    }
+    // No MADV_DOFORK here (reverted #3660): libibverbs already restores the
+    // fork state of a plain host MR inside ibv_dereg_mr(), while dma-buf and
+    // device ranges never carried MADV_DONTFORK and madvise() on them only
+    // fails with EINVAL/ENOMEM (see issue #3639).
     memory_region_map_.erase(iter);
     return 0;
 }

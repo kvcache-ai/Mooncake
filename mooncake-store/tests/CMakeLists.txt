@@ -171,6 +171,7 @@ endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(variadic_serialization_test variadic_serialization_test.cpp)
 add_test(NAME client_hca_affinity_test
          COMMAND client_integration_test
                  --gtest_filter=HcaAffinityTest.*:ReadAffinityTest.*)
@@ -246,8 +247,14 @@ if(USE_TENT)
       transfer_task_test
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
-  set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+  # Scatter transfers require a cancellable transport; without RDMA the default
+  # TENT config only installs TCP, so swap it for HP_TCP.
+  set_tests_properties(
+    transfer_scatter_tent_test
+    PROPERTIES
+      ENVIRONMENT
+      "MC_USE_TENT=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"hp_tcp\":{\"enable\":true}}}"
+  )
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
@@ -403,12 +410,17 @@ add_store_test(nvme_kv_io_concurrency_config_test
                nvme_kv/io_concurrency_config_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv/storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(bucket_direct_write_test bucket_direct_write_test.cpp)
+if(TARGET Mooncake::liburing)
+  target_compile_definitions(bucket_direct_write_test PRIVATE USE_URING)
+endif()
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
+add_store_test(object_storage_backend_test object_storage_backend_test.cpp)
 add_store_test(kvcs_object_storage_adapter_test
                kvcs_object_storage_adapter_test.cpp)
 if(NOT MOONCAKE_KVCS_SDK_FOUND)
