@@ -8,6 +8,7 @@ public language APIs live under the Rust and Python API references.
 | Topic | Document |
 |-------|----------|
 | Runtime architecture and request paths | [Architecture](architecture) |
+| Allocation publication, eviction and delete | [Allocation lifecycle](allocation-lifecycle) |
 | Crates and module boundaries | [Components](components) |
 | Hot and cold storage design | [Cold tier](cold-tier-design) |
 | NoF integration boundaries | [NoF](nof) |
@@ -19,6 +20,7 @@ public language APIs live under the Rust and Python API references.
 :maxdepth: 1
 
 architecture
+allocation-lifecycle
 components
 cold-tier-design
 nof

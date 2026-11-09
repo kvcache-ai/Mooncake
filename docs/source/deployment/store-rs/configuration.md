@@ -2,6 +2,24 @@
 
 This document collects the main runtime knobs exposed by the current implementation.
 
+## Pending publication limits
+
+Each owner bounds allocations awaiting route publication with
+`StoreClientBuilder::allocation_lifecycle(AllocationLifecycleConfig)`.
+The defaults are 8192 entries and 1073741824 bytes (1 GiB). These limits apply
+to `EmbeddedWrh`, which supports exact allocation-reference recovery.
+
+| Surface | Entry limit | Byte limit |
+| --- | --- | --- |
+| Client / benchmark CLI | `--max-pending-publications` | `--max-pending-publication-bytes` |
+| Python `setup(...)` / config dict | `max_pending_publications` | `max_pending_publication_bytes` |
+| Environment | `MC_STORE_RS_MAX_PENDING_PUBLICATIONS` | `MC_STORE_RS_MAX_PENDING_PUBLICATION_BYTES` |
+
+Explicit CLI or Python values override environment values. Omitted values use
+the environment, then the defaults. Zero is clamped to one; malformed or
+out-of-range environment integers fail setup unless an explicit value overrides
+that variable. These owner-local bounds do not replace tenant quota policy.
+
 ## Tenant Policy Precedence
 
 Tenant-scoped routing and resource policy should be authored through `mooncake-store-rs-admin policy ...`

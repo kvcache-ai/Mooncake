@@ -310,13 +310,15 @@ Local memory supports two backing strategies:
 
 The Python host allocator uses shared `memfd` + `mmap`, and can also request hugepage-backed shm regions when the host kernel is configured for hugepages.
 
-Reclaim is explicit and route-aware.
+Reclaim is explicit, route-aware and generation-fenced. Reservations and replica
+routes carry an allocation ID so cleanup for a prior use of an offset cannot
+release its replacement. Lifecycle-capable storage owners retain pending
+publication and deletion state, confirm unknown outcomes and respect read pins
+and reclaim grace before physical release. Logical route deletion remains
+separate from physical reclamation.
 
-- overwrites schedule release for the old replicas
-- deletes schedule reclaim after route removal
-- `reclaim_grace_ms` controls scheduled delayed release behavior
-- remote release uses batched allocator RPC
-- queued reclaim cleanup is idempotent for duplicate local or remote release, but direct non-cleanup release still surfaces allocator errors
+The [allocation lifecycle](allocation-lifecycle.md) describes the owner protocol,
+authority confirmation, mixed-version behavior and process-local lifetime.
 
 ### Storage-owner CLOCK with route-owner CAS
 
@@ -332,21 +334,19 @@ sequenceDiagram
     Client->>Alloc: reserve local space
     Alloc-->>Client: Allocator error
     Client->>Evict: evict_one(preferred_segment?)
-    Evict->>Evict: stale/orphan pre-pass over tracked local replicas
     Evict->>Evict: pick CLOCK victim
+    Evict->>Evict: claim exact allocation generation
     Evict->>Route: CAS route without victim replica
     Route-->>Evict: applied / current route
-    Evict->>Alloc: release victim bytes after CAS success
+    Evict->>Alloc: exact local commit after applied CAS
     Evict-->>Client: reclaimed or exhausted
     Client->>Alloc: retry reservation
 ```
 
 The important invariants are:
 
-- a stale/orphan pre-pass runs before live CLOCK eviction and can reclaim tracked local allocations whose authoritative route already moved away from this runtime
-- each stale/orphan pre-pass checks only a bounded cursor slice of tracked keys; eligible stale/orphan allocations found in that slice are reclaimed before live CLOCK victims, while later cursor slices are left for subsequent attempts
-- tight eviction retry loops are rate-limited so one allocator miss cannot turn into repeated full route sweeps
-- pending local reservations are still protected until publish or timeout, even during eviction pressure
+- ordinary CLOCK victims remain eligible while compatibility reconciliation is singleflight, rate-limited and processed in bounded batches
+- pending publication identities stay protected until finalize or exact owner recovery resolves them; a deadline alone does not authorize release
 - `reclaim_grace_ms` delays scheduled cleanup, but storage-owner eviction pressure can reclaim stale/orphan local allocations earlier once the authoritative route no longer references them
 - a local replica is never released before the authoritative active route no longer references that local allocation
 - a route-missing lookup is treated as inconclusive for allocator release; reclaiming confirmed-deleted ghost allocations requires a separate confirmed-absent proof path
