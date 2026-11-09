@@ -182,13 +182,6 @@ void PromotionCandidateTracker::ForgetLocked(const TenantId& tenant_id,
     }
 }
 
-void PromotionCandidateTracker::Reset() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    order_.clear();
-    due_.clear();
-    count_.store(0, std::memory_order_relaxed);
-}
-
 // --- Internals --------------------------------------------------------------
 
 std::chrono::milliseconds PromotionCandidateTracker::Backoff(

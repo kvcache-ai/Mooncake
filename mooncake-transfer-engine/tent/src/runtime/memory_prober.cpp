@@ -183,6 +183,8 @@ Status MemoryProber::memcpy(void* dst, void* src, size_t size) {
     for (auto& p : plugins_) {
         if (!p.iface.memcpy_sync) continue;
         int rc = p.iface.memcpy_sync(p.ctx, dst, src, size);
+        if (rc == TENT_DEVICE_PLUGIN_ERROR)
+            return Status::InternalError("Device plugin copy failed");
         if (rc == 0) return Status::OK();
     }
 

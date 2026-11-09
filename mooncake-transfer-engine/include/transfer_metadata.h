@@ -211,6 +211,8 @@ class TransferMetadata {
         // Capability marker. Encoded only by transports that opt into
         // ready_ack; decoded from field presence to detect peer support.
         bool ready_ack_supported = false;
+        // Optional classic-RDMA advisory. Older peers omit this field.
+        std::string auto_gid_reprobe_from;
         // Per-peer RDMA CtrlChannel (notify QP). 0 = not supported / unused.
         // When ctrl_channel is true, this handshake only sets up the control
         // path (qp_num may be empty).
@@ -277,6 +279,13 @@ class TransferMetadata {
     // publish the updated descriptor rather than remove the entry again.
     // ERR_ADDRESS_NOT_REGISTERED means no matching local entry was present.
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+
+    // Removes the buffer at addr only when pred accepts the entry, so
+    // transports sharing an address in the local buffer list remove only
+    // their own entries.
+    int removeLocalMemoryBuffer(
+        void *addr, const std::function<bool(const BufferDesc &)> &pred,
+        bool update_metadata);
 
     // Rebuilds interned NIC paths on `desc` before insert. The caller must
     // exclusively own `desc`; do not pass a live descriptor from the metadata

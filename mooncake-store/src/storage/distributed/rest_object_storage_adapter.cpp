@@ -21,6 +21,7 @@
 #include <glog/logging.h>
 
 #include "random.h"
+#include "storage/distributed/object_storage_http.h"
 #include "storage/distributed/object_storage_signing.h"
 #include "storage/distributed/object_storage_xml.h"
 
@@ -264,6 +265,7 @@ struct RestObjectStorageAdapter::RequestContext {
     CURLM* multi = nullptr;
     curl_slist* headers = nullptr;
     std::string error_body;
+    std::map<std::string, std::string> response_headers;
     IovecUploadContext upload_context;
     DownloadContext download_context;
 };
@@ -410,6 +412,8 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::PrepareRequest(
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, context.headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, DownloadCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context.download_context);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &context.response_headers);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
@@ -442,7 +446,8 @@ RestObjectStorageAdapter::Request(
     const std::string& method, const std::string& physical_key,
     const std::map<std::string, std::string>& query, const char* body,
     size_t body_size, const std::string& range, const iovec* upload_iov,
-    int upload_iovcnt, void* download_buffer, size_t download_capacity) const {
+    int upload_iovcnt, void* download_buffer, size_t download_capacity,
+    bool retry) const {
     if (!initialized_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -465,16 +470,16 @@ RestObjectStorageAdapter::Request(
                           &response.status);
         response.transferred = context.download_context.transferred;
         response.body = std::move(context.error_body);
-        // A 404 error body may exceed the caller's object buffer. Preserve the
-        // HTTP error only for this local abort, not for other transfer
-        // failures.
-        const bool missing_object = method == "GET" && response.status == 404 &&
-                                    result == CURLE_WRITE_ERROR &&
-                                    context.download_context.overflow;
+        // Preserve 404/416 when receiving their oversized bodies was aborted
+        // locally. Other transfer failures must still report a transport error.
+        const bool range_error =
+            method == "GET" &&
+            (response.status == 404 || response.status == 416) &&
+            result == CURLE_WRITE_ERROR && context.download_context.overflow;
         const bool transient =
             IsTransientFailure(result, response.status,
                                context.download_context.overflow, context.curl);
-        if (transient && attempt < kMaxAttempts) {
+        if (retry && transient && attempt < kMaxAttempts) {
             LOG(WARNING) << LogName() << " " << method << " attempt " << attempt
                          << " failed ("
                          << (result != CURLE_OK
@@ -483,7 +488,7 @@ RestObjectStorageAdapter::Request(
                          << "); retrying";
             continue;
         }
-        if (result != CURLE_OK && !missing_object) {
+        if (result != CURLE_OK && !range_error) {
             LOG(ERROR) << LogName() << " " << method
                        << " request failed: " << curl_easy_strerror(result);
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -499,8 +504,19 @@ RestObjectStorageAdapter::Request(
 
 tl::expected<void, ErrorCode> RestObjectStorageAdapter::Put(
     const std::string& logical_key, std::span<const char> data) {
-    auto response = Request("PUT", LogicalToPhysicalKey(logical_key), {},
-                            data.data(), data.size());
+    return PutImpl(logical_key, data, true);
+}
+
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutOnce(
+    const std::string& logical_key, std::span<const char> data) {
+    return PutImpl(logical_key, data, false);
+}
+
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutImpl(
+    const std::string& logical_key, std::span<const char> data, bool retry) {
+    auto response =
+        Request("PUT", LogicalToPhysicalKey(logical_key), {}, data.data(),
+                data.size(), "", nullptr, 0, nullptr, 0, retry);
     if (!response) return tl::make_unexpected(response.error());
     if (!IsSuccess(response->status))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -509,11 +525,22 @@ tl::expected<void, ErrorCode> RestObjectStorageAdapter::Put(
 
 tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutV(
     const std::string& logical_key, const iovec* iov, int iovcnt) {
+    return PutVImpl(logical_key, iov, iovcnt, true);
+}
+
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutVOnce(
+    const std::string& logical_key, const iovec* iov, int iovcnt) {
+    return PutVImpl(logical_key, iov, iovcnt, false);
+}
+
+tl::expected<void, ErrorCode> RestObjectStorageAdapter::PutVImpl(
+    const std::string& logical_key, const iovec* iov, int iovcnt, bool retry) {
     auto total = GetIovecSize(iov, iovcnt);
     if (!total) return tl::make_unexpected(total.error());
-    if (*total == 0) return Put(logical_key, {});
-    auto response = Request("PUT", LogicalToPhysicalKey(logical_key), {},
-                            nullptr, *total, "", iov, iovcnt);
+    if (*total == 0) return PutImpl(logical_key, {}, retry);
+    auto response =
+        Request("PUT", LogicalToPhysicalKey(logical_key), {}, nullptr, *total,
+                "", iov, iovcnt, nullptr, 0, retry);
     if (!response) return tl::make_unexpected(response.error());
     if (!IsSuccess(response->status))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -657,12 +684,13 @@ RestObjectStorageAdapter::RequestBatchOnce(
             long status = 0;
             curl_easy_getinfo(message->easy_handle, CURLINFO_RESPONSE_CODE,
                               &status);
-            if (!context->upload && status == 404 &&
+            if (!context->upload && (status == 404 || status == 416) &&
                 (message->data.result == CURLE_OK ||
                  (message->data.result == CURLE_WRITE_ERROR &&
                   context->download_context.overflow))) {
-                results[context->index] =
-                    tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+                results[context->index] = tl::make_unexpected(
+                    status == 404 ? ErrorCode::FILE_NOT_FOUND
+                                  : ErrorCode::FILE_READ_FAIL);
             } else if (message->data.result != CURLE_OK) {
                 const std::string error =
                     std::string(context->upload ? "PUT" : "GET") +
@@ -681,7 +709,10 @@ RestObjectStorageAdapter::RequestBatchOnce(
                 results[context->index] = context->expected_size;
             } else if (!context->upload && status == 206 &&
                        context->download_context.transferred ==
-                           context->expected_size) {
+                           context->expected_size &&
+                       object_storage_http::MatchesContentRange(
+                           context->response_headers, 0,
+                           context->expected_size)) {
                 results[context->index] = context->download_context.transferred;
             } else {
                 const std::string error =
@@ -803,7 +834,9 @@ tl::expected<size_t, ErrorCode> RestObjectStorageAdapter::GetRange(
     if (!response) return tl::make_unexpected(response.error());
     if (response->status == 404)
         return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
-    if (response->status != 206 || response->transferred != len)
+    if (response->status != 206 || response->transferred != len ||
+        !object_storage_http::MatchesContentRange(response->headers, first,
+                                                  len))
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     return len;
 }

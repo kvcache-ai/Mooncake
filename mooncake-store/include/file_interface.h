@@ -236,6 +236,9 @@ class UringFile : public StorageFile {
     // single thread before I/O threads begin. Other threads lazily pick up
     // the registration on their first I/O call via ensure_buf_registered().
     static bool register_global_buffer(void *buffer, size_t length);
+    // Unpins the buffer: releases the shared registration and every I/O
+    // thread's clone of it. Call after all I/O on the buffer has stopped and
+    // before the buffer is freed.
     static void unregister_global_buffer();
 
     bool register_buffer(void *buffer, size_t length);

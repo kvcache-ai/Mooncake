@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
+use crate::keyspace::{
+    parse_route_policy_domain, parse_tenant_index_entry, parse_tenant_policy_scope,
+};
 use crate::redis_backend::{ClientLeaseLiveness, RedisMetadataCleanupReport};
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
@@ -63,6 +65,7 @@ struct EvictionCandidate {
 pub struct EtcdMetadataBackend {
     runtime: tokio::runtime::Runtime,
     config: EtcdMetadataConfig,
+    tenant_index_keyspace: MetadataKeyspace,
 }
 
 impl Default for EtcdMetadataBackend {
@@ -122,9 +125,20 @@ impl EtcdMetadataBackend {
     }
 
     pub fn from_config(config: EtcdMetadataConfig) -> Result<Self> {
+        Self::from_config_with_tenant_index(config.clone(), config.keyspace.clone())
+    }
+
+    fn from_config_with_tenant_index(
+        config: EtcdMetadataConfig,
+        tenant_index_keyspace: MetadataKeyspace,
+    ) -> Result<Self> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|error| StoreError::Metadata(format!("tokio runtime build: {error}")))?;
-        Ok(Self { runtime, config })
+        Ok(Self {
+            runtime,
+            config,
+            tenant_index_keyspace,
+        })
     }
 
     fn block_on<T>(&self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
@@ -458,14 +472,32 @@ impl MetadataBackend for EtcdMetadataBackend {
         )
     }
 
+    fn bound_tenant(&self) -> Option<&str> {
+        self.config.keyspace.bound_tenant()
+    }
+
     fn backend_kind(&self) -> &'static str {
         "etcd"
     }
 
     fn for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
-        EtcdMetadataBackend::from_config(self.config.clone().tenant(tenant))
-            .ok()
-            .map(|backend| Arc::new(backend) as Arc<dyn MetadataBackend>)
+        if self
+            .bound_tenant()
+            .is_some_and(|bound_tenant| bound_tenant != tenant)
+        {
+            return None;
+        }
+        let config = if self.bound_tenant() == Some(tenant) {
+            self.config.clone()
+        } else {
+            self.config.clone().tenant(tenant)
+        };
+        EtcdMetadataBackend::from_config_with_tenant_index(
+            config,
+            self.tenant_index_keyspace.clone(),
+        )
+        .ok()
+        .map(|backend| Arc::new(backend) as Arc<dyn MetadataBackend>)
     }
 
     fn upsert_client_lease(&self, lease: &ClientLease) -> Result<()> {
@@ -1331,6 +1363,20 @@ impl MetadataBackend for EtcdMetadataBackend {
     }
 
     fn get_tenant_policy(&self, scope: &TenantPolicyScope) -> Result<Option<TenantPolicy>> {
+        if self.bound_tenant().is_none() {
+            let scoped = self
+                .for_tenant(&scope.tenant)
+                .ok_or_else(|| {
+                    StoreError::Unsupported(
+                        "etcd metadata backend does not support tenant binding".to_string(),
+                    )
+                })?
+                .get_tenant_policy(scope)?;
+            if scoped.is_some() {
+                return Ok(scoped);
+            }
+        }
+        self.config.keyspace.validate_tenant(&scope.tenant)?;
         let key = self.config.keyspace.tenant_policy(scope);
         self.block_on(async {
             let mut client = self.client().await?;
@@ -1350,6 +1396,15 @@ impl MetadataBackend for EtcdMetadataBackend {
         &self,
         scopes: &[TenantPolicyScope],
     ) -> Result<Vec<Option<TenantPolicy>>> {
+        if self.bound_tenant().is_none() {
+            return scopes
+                .iter()
+                .map(|scope| self.get_tenant_policy(scope))
+                .collect();
+        }
+        for scope in scopes {
+            self.config.keyspace.validate_tenant(&scope.tenant)?;
+        }
         if scopes.is_empty() {
             return Ok(Vec::new());
         }
@@ -1385,7 +1440,58 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
+    fn list_tenants(&self) -> Result<Vec<String>> {
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(
+                    self.tenant_index_keyspace.tenant_index_prefix(),
+                    Some(GetOptions::new().with_prefix()),
+                )
+                .await
+                .map_err(etcd_error("etcd list tenant index"))?;
+            let mut tenants = response
+                .kvs()
+                .iter()
+                .filter_map(|kv| {
+                    let key = std::str::from_utf8(kv.key()).ok()?;
+                    parse_tenant_index_entry(&self.tenant_index_keyspace, key)
+                })
+                .collect::<Vec<_>>();
+            tenants.sort();
+            tenants.dedup();
+            Ok(tenants)
+        })
+    }
+
     fn list_tenant_policies(&self, tenant: Option<&str>) -> Result<Vec<TenantPolicy>> {
+        let tenant = match (self.bound_tenant(), tenant) {
+            (Some(bound_tenant), None) => Some(bound_tenant),
+            (_, tenant) => tenant,
+        };
+        if let Some(tenant) = tenant {
+            self.config.keyspace.validate_tenant(tenant)?;
+        }
+        if tenant.is_none() {
+            let mut by_scope = std::collections::BTreeMap::<TenantPolicyScope, TenantPolicy>::new();
+            for tenant in self.list_tenants()? {
+                for policy in self.list_tenant_policies(Some(&tenant))? {
+                    by_scope.insert(policy.scope.clone(), policy);
+                }
+            }
+            return Ok(by_scope.into_values().collect());
+        }
+        if self.bound_tenant().is_none() {
+            let tenant = tenant.expect("tenant policy listing without tenant returned above");
+            return self
+                .for_tenant(tenant)
+                .ok_or_else(|| {
+                    StoreError::Unsupported(
+                        "etcd metadata backend does not support tenant binding".to_string(),
+                    )
+                })?
+                .list_tenant_policies(Some(tenant));
+        }
         self.block_on(async {
             let mut client = self.client().await?;
             let mut responses = Vec::new();
@@ -1439,8 +1545,22 @@ impl MetadataBackend for EtcdMetadataBackend {
         policy: &TenantPolicy,
         expected_version: Option<u64>,
     ) -> Result<TenantPolicy> {
+        if self.bound_tenant().is_none() {
+            return self
+                .for_tenant(&policy.scope.tenant)
+                .ok_or_else(|| {
+                    StoreError::Unsupported(
+                        "etcd metadata backend does not support tenant binding".to_string(),
+                    )
+                })?
+                .put_tenant_policy(policy, expected_version);
+        }
+        self.config.keyspace.validate_tenant(&policy.scope.tenant)?;
         policy.validate()?;
         let key = self.config.keyspace.tenant_policy(&policy.scope);
+        let tenant_index_key = self
+            .tenant_index_keyspace
+            .tenant_index_entry(&policy.scope.tenant);
         let payload = serde_json::to_string(policy).map_err(json_error)?;
         self.block_on(async {
             let mut client = self.client().await?;
@@ -1485,11 +1605,17 @@ impl MetadataBackend for EtcdMetadataBackend {
                             CompareOp::Equal,
                             kv.mod_revision(),
                         )])
-                        .and_then([TxnOp::put(key.clone(), payload.clone(), None)])
+                        .and_then([
+                            TxnOp::put(key.clone(), payload.clone(), None),
+                            TxnOp::put(tenant_index_key.clone(), policy.scope.tenant.clone(), None),
+                        ])
                 } else {
                     Txn::new()
                         .when([Compare::version(key.clone(), CompareOp::Equal, 0)])
-                        .and_then([TxnOp::put(key.clone(), payload.clone(), None)])
+                        .and_then([
+                            TxnOp::put(key.clone(), payload.clone(), None),
+                            TxnOp::put(tenant_index_key.clone(), policy.scope.tenant.clone(), None),
+                        ])
                 };
                 let txn_response = client
                     .txn(txn)
@@ -1507,6 +1633,17 @@ impl MetadataBackend for EtcdMetadataBackend {
         scope: &TenantPolicyScope,
         expected_version: Option<u64>,
     ) -> Result<bool> {
+        if self.bound_tenant().is_none() {
+            return self
+                .for_tenant(&scope.tenant)
+                .ok_or_else(|| {
+                    StoreError::Unsupported(
+                        "etcd metadata backend does not support tenant binding".to_string(),
+                    )
+                })?
+                .delete_tenant_policy(scope, expected_version);
+        }
+        self.config.keyspace.validate_tenant(&scope.tenant)?;
         let key = self.config.keyspace.tenant_policy(scope);
         self.block_on(async {
             let mut client = self.client().await?;
@@ -3139,6 +3276,53 @@ mod tests {
                 .get_tenant_policy(&scope)
                 .expect("tenant policy read after delete should succeed"),
             None
+        );
+    }
+
+    #[test]
+    fn etcd_backend_lists_tenant_prefixed_policies_from_root_tenant_index() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()]).keyspace(MetadataKeyspace::new(
+                "test/etcd-tenant-policy-prefixed-list",
+            )),
+        )
+        .expect("etcd backend should initialize");
+        let tenant_backend = backend
+            .for_tenant("tenant-hard")
+            .expect("tenant backend should be available");
+        let scope = TenantPolicyScope::new("tenant-hard", None::<String>, None::<String>);
+        let policy = TenantPolicy {
+            scope,
+            spec: TenantPolicySpec::default(),
+            version: 1,
+            updated_at_ms: 10,
+            updated_by: "admin".to_string(),
+        };
+
+        tenant_backend
+            .put_tenant_policy(&policy, None)
+            .expect("tenant-prefixed policy insert should succeed");
+        let mismatched_policy = TenantPolicy {
+            scope: TenantPolicyScope::new("tenant-other", None::<String>, None::<String>),
+            ..policy.clone()
+        };
+        assert!(matches!(
+            tenant_backend.put_tenant_policy(&mismatched_policy, None),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert!(tenant_backend.for_tenant("tenant-other").is_none());
+        assert_eq!(
+            backend.list_tenants().expect("tenant index should list"),
+            vec!["tenant-hard".to_string()]
+        );
+        assert_eq!(
+            backend
+                .list_tenant_policies(None)
+                .expect("root policy listing should follow tenant index"),
+            vec![policy]
         );
     }
 
