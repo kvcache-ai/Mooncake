@@ -219,6 +219,7 @@ TEST_F(ObjectStorageAdapterTest, ObjectStorageModeInitSkipsDirectories) {
     EXPECT_EQ(backend->GetStorageMode(),
               DistributedStorageMode::kObjectStorage);
     EXPECT_TRUE(backend->UsesObjectStorage());
+    EXPECT_FALSE(backend->SupportsArbitraryHostReadBuffers());
     ASSERT_TRUE(backend->Init());
     EXPECT_TRUE(adapter->initialized);
     EXPECT_EQ(adapter->init_calls, 1);
@@ -558,6 +559,7 @@ TEST_F(ObjectStorageAdapterTest, FileSystemModeKeepsDfsOnlyContract) {
 
     EXPECT_EQ(backend.GetStorageMode(), DistributedStorageMode::kFileSystem);
     EXPECT_FALSE(backend.UsesObjectStorage());
+    EXPECT_FALSE(backend.SupportsArbitraryHostReadBuffers());
 
     std::unordered_map<std::string, std::vector<Slice>> offload_batch;
     auto offload_result = backend.BatchOffload(
