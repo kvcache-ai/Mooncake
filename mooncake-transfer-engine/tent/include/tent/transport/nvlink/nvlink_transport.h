@@ -96,7 +96,7 @@ class NVLinkTransport : public Transport {
     void *createSharedMemory(const std::string &path, size_t size);
 
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
-                                       uint64_t target_id);
+                                       uint64_t target_id, int src_device);
 
     Status setPeerAccess();
 
@@ -115,9 +115,14 @@ class NVLinkTransport : public Transport {
         int cuda_id;
     };
 
-    using HashMap =
-        std::unordered_map<SegmentID,
-                           std::unordered_map<uint64_t, OpenedShmEntry>>;
+    // OpenedShmEntry::shm_addr comes from cudaIpcOpenMemHandle, which is only
+    // valid in the CUDA context of the device it was opened on. The same peer
+    // buffer can therefore need independent mappings when reached from
+    // different source devices, so the per-address map is keyed again by the
+    // opening device (cuda_id).
+    using HashMap = std::unordered_map<
+        SegmentID,
+        std::unordered_map<uint64_t, std::unordered_map<int, OpenedShmEntry>>>;
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;

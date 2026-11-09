@@ -41,8 +41,12 @@ class NVLinkTransportTestPeer {
    public:
     static Status relocate(NVLinkTransport& transport, uint64_t& address,
                            uint64_t length, SegmentID target_id) {
-        return transport.relocateSharedMemoryAddress(address, length,
-                                                     target_id);
+        // Open the mapping on the calling thread's current device, matching
+        // the pre-fix behavior the cache-reuse tests assert.
+        int src_device = 0;
+        cudaGetDevice(&src_device);
+        return transport.relocateSharedMemoryAddress(address, length, target_id,
+                                                     src_device);
     }
 
     static size_t mappingCount(NVLinkTransport& transport,
