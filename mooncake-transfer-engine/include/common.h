@@ -139,10 +139,8 @@ inline bool envFlagEnabled(const char *name) {
 // libnuma fills the cache numa_node_to_cpus() reads lazily and without locking,
 // so concurrent first callers each allocate it and all but one are orphaned --
 // a leak LeakSanitizer fails the build on. Worker pools bind every thread at
-// startup, so they hit that window. numa_node_of_cpu() and numa_run_on_node()
-// fill the same cache, so their callers take this mutex too. An inline
-// function, not a static local: bindToSocket() has internal linkage, so a
-// static local would be per-TU.
+// startup, so they hit that window. An inline function, not a static local:
+// bindToSocket() has internal linkage, so a static local would be per-TU.
 inline std::mutex &numaNodeCpuCacheMutex() {
     static std::mutex mutex;
     return mutex;
