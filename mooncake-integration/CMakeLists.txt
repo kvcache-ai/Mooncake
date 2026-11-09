@@ -122,7 +122,7 @@ if(USE_INTRA_NVLINK)
     message(STATUS "USE_INTRA_NVLINK is enabled, IntraNode nvlink is now activated")
 endif()
 
-install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
 #Install Python scripts from mooncake - wheel / mooncake / directory
 install(FILES
