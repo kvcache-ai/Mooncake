@@ -687,9 +687,18 @@ impl NofTargetManager {
         }
         for index in &selected {
             let counter = &self.state.targets[candidates[*index].target_id].accumulated_write_bytes;
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
-                Some(bytes.saturating_add(write_bytes))
-            });
+            let mut bytes = counter.load(Ordering::Relaxed);
+            loop {
+                match counter.compare_exchange_weak(
+                    bytes,
+                    bytes.saturating_add(write_bytes),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => bytes = current,
+                }
+            }
         }
         Some((candidates, selected))
     }

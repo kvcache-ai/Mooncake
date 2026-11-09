@@ -2591,7 +2591,7 @@ impl StorageOwnerState {
                     return Ok(0);
                 }
             };
-            for (key, current) in candidate_keys.iter().zip(current_routes.into_iter()) {
+            for (key, current) in candidate_keys.iter().zip(current_routes) {
                 released = released.saturating_add(
                     self.reclaim_stale_local_allocations_for_key(key, current.as_ref())?,
                 );
