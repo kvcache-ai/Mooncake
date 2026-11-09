@@ -6880,4 +6880,157 @@ TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
 }
 #endif
 
+TEST_F(StorageBackendTest, OffloadWriteParallelBucketsReadBackAndRollbackOne) {
+    for (bool aligned : {false, true}) {
+        SCOPED_TRACE(aligned);
+        FileStorageConfig config;
+        config.storage_filepath =
+            data_path + (aligned ? "/aligned" : "/buffered");
+        fs::create_directories(config.storage_filepath);
+        BucketBackendConfig bucket_config;
+        bucket_config.aligned_direct_write = aligned;
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::future<tl::expected<int64_t, ErrorCode>>> jobs;
+        std::promise<void> start;
+        auto gate = start.get_future().share();
+        for (int worker = 0; worker < 4; ++worker) {
+            jobs.push_back(std::async(std::launch::async, [&, worker] {
+                std::string value(4096, static_cast<char>('a' + worker));
+                std::unordered_map<std::string, std::vector<Slice>> batch;
+                for (int k = 0; k < 3; ++k) {
+                    batch.emplace(
+                        "w" + std::to_string(worker) + "k" + std::to_string(k),
+                        std::vector<Slice>{{value.data(), value.size()}});
+                }
+                gate.wait();
+                return backend.BatchOffload(batch, [worker](const auto&,
+                                                            auto&) {
+                    return worker == 2 ? ErrorCode::RPC_FAIL : ErrorCode::OK;
+                });
+            }));
+        }
+        start.set_value();
+        for (int w = 0; w < 4; ++w) {
+            auto result = jobs[w].get();
+            EXPECT_EQ(result.has_value(), w != 2);
+            if (w == 2 && !result)
+                EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+        }
+        for (int w = 0; w < 4; ++w) {
+            for (int k = 0; k < 3; ++k) {
+                const auto key =
+                    "w" + std::to_string(w) + "k" + std::to_string(k);
+                EXPECT_EQ(backend.IsExist(key).value(), w != 2);
+                if (w == 2) continue;
+                std::vector<char> output(4096);
+                std::unordered_map<std::string, Slice> reads{
+                    {key, {output.data(), output.size()}}};
+                ASSERT_TRUE(backend.BatchLoad(reads));
+                EXPECT_EQ(std::string(output.begin(), output.end()),
+                          std::string(4096, static_cast<char>('a' + w)));
+            }
+        }
+    }
+}
+
+TEST_F(StorageBackendTest, OffloadWriteNonePolicyRespectsConcurrentLimits) {
+    for (int disk_count : {1, 2}) {
+        for (bool key_limit : {true, false}) {
+            FileStorageConfig config;
+            config.storage_filepath = data_path + "/none_disk0";
+            if (disk_count == 2)
+                config.storage_filepath += "," + data_path + "/none_disk1";
+            config.total_keys_limit = key_limit ? 32 : 256;
+            config.total_size_limit = key_limit ? 64 * 1024 * 1024 : 48 * 1024;
+            BucketBackendConfig bucket_config;
+            bucket_config.bucket_keys_limit = 32;
+            bucket_config.bucket_size_limit = 40 * 1024;
+            bucket_config.eviction_policy = BucketEvictionPolicy::NONE;
+            BucketStorageBackend backend(config, bucket_config);
+            ASSERT_TRUE(backend.Init());
+            std::promise<void> start;
+            auto gate = start.get_future().share();
+            std::vector<std::future<tl::expected<int64_t, ErrorCode>>> jobs;
+            for (int worker = 0; worker < 8; ++worker) {
+                jobs.push_back(std::async(std::launch::async, [&, worker] {
+                    std::string value(1024, 'L');
+                    std::unordered_map<std::string, std::vector<Slice>> batch;
+                    for (int key = 0; key < 32; ++key) {
+                        batch.emplace(
+                            "w" + std::to_string(worker) + "k" +
+                                std::to_string(key),
+                            std::vector<Slice>{{value.data(), value.size()}});
+                    }
+                    gate.wait();
+                    return backend.BatchOffload(batch, nullptr);
+                }));
+            }
+            start.set_value();
+            int succeeded = 0;
+            for (auto& job : jobs) {
+                auto result = job.get();
+                if (result) {
+                    ++succeeded;
+                } else {
+                    EXPECT_EQ(result.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+                }
+            }
+            EXPECT_EQ(succeeded, 1);
+            auto metadata = backend.GetStoreMetadata();
+            ASSERT_TRUE(metadata);
+            EXPECT_EQ(metadata->total_keys, 32);
+            EXPECT_LE(metadata->total_size, config.total_size_limit);
+            backend.RemoveAll();
+        }
+    }
+}
+
+TEST_F(StorageBackendTest, OffloadWritePhysicalCapCountsPendingWriters) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 1;
+    bucket_config.bucket_size_limit = 40 * 1024;
+    bucket_config.max_total_size = 1024 * 1024;
+    bucket_config.max_physical_bytes = 56 * 1024;
+    bucket_config.disk_scan_cache_ms = 0;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    std::string large(32 * 1024, 'A'), small(8 * 1024, 'B');
+    std::unordered_map<std::string, std::vector<Slice>> old{
+        {"old", {{large.data(), large.size()}}}};
+    std::unordered_map<std::string, std::vector<Slice>> first{
+        {"first", {{large.data(), large.size()}}}};
+    std::unordered_map<std::string, std::vector<Slice>> second{
+        {"second", {{small.data(), small.size()}}}};
+    ASSERT_TRUE(backend.BatchOffload(old, nullptr));
+    std::promise<void> entered, release;
+    auto ready = entered.get_future();
+    auto gate = release.get_future().share();
+    auto writing = std::async(std::launch::async, [&] {
+        return backend.BatchOffload(
+            first, nullptr, [&](const auto&) -> tl::expected<void, ErrorCode> {
+                entered.set_value();
+                gate.wait();  // The incoming reservation is still in flight.
+                return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            });
+    });
+    const auto status = ready.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(status, std::future_status::ready);
+    if (status == std::future_status::ready) {
+        auto blocked = backend.BatchOffload(second, nullptr);
+        EXPECT_FALSE(blocked);
+        if (!blocked) EXPECT_EQ(blocked.error(), ErrorCode::FILE_WRITE_FAIL);
+    }
+    release.set_value();
+    auto failed = writing.get();
+    EXPECT_FALSE(failed);
+    if (!failed) EXPECT_EQ(failed.error(), ErrorCode::RPC_FAIL);
+    EXPECT_TRUE(backend.IsExist("old").value());
+    // Failed notification must release the reservation, allowing a small write.
+    EXPECT_TRUE(backend.BatchOffload(second, nullptr));
+}
+
 }  // namespace mooncake::test

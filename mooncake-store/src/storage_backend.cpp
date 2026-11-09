@@ -3583,6 +3583,24 @@ BucketStorageBackend::PrepareEviction(
             result.write_keys.push_back(key);
         }
         if (!result.write_keys.empty()) {
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::NONE) {
+                int64_t reserved_size = 0;
+                for (const auto& entry : disks_) {
+                    reserved_size +=
+                        entry.total_size + entry.pending_write_size;
+                }
+                // IsEnableOffloading() is only an advisory snapshot. Reserve
+                // against committed data and every concurrent writer here.
+                if (object_bucket_map_.size() + pending_write_keys_.size() +
+                            result.write_keys.size() >
+                        static_cast<size_t>(
+                            file_storage_config_.total_keys_limit) ||
+                    reserved_size + required_size >
+                        file_storage_config_.total_size_limit) {
+                    return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+                }
+            }
             result.write_size = required_size;
             disk.pending_write_size += required_size;
             pending_write_keys_.insert(result.write_keys.begin(),
@@ -3615,9 +3633,9 @@ BucketStorageBackend::PrepareEviction(
             // Watermark eviction passes a synthetic required_size to drive
             // quota-based cleanup. It is not a real incoming write, so it
             // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
-                                  ? static_cast<uint64_t>(required_size)
-                                  : 0;
+            // Files of other reserved writes may not be visible to fs::space
+            // yet. Counting a partially written file twice is conservative.
+            uint64_t req_sz = static_cast<uint64_t>(disk.pending_write_size);
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
             if (initial_disk_full) {
                 deficit = req_sz + kMinFreeSpace - actual_available;
@@ -3637,12 +3655,8 @@ BucketStorageBackend::PrepareEviction(
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
         write_keys.empty() ? required_size : 0;
-    // On-disk footprint of the incoming write (~required_size); 0 for
-    // watermark-driven eviction, which has no incoming write. Added to the
-    // physical check below so we free enough room for THIS write, not merely
-    // enough to bring current usage back under the cap.
-    const int64_t incoming_physical_size =
-        write_keys.empty() ? 0 : required_size;
+    // Include every reserved write on this disk, not only this caller.
+    const int64_t incoming_physical_size = disk.pending_write_size;
 
     // Ground-truth physical usage of the offload directory (cached),
     // snapshotted once. As buckets are selected for eviction their files get

@@ -268,6 +268,9 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Bucket-level POSIX offload parallelism; one retains serial execution.
+    uint32_t offload_write_workers = 1;  // Valid range: [1, 16].
+
     // DFS control-plane mode. Enabled for filesystem-mode distributed storage
     // and KVCS; other object stores use the regular offload control plane.
     bool enable_dfs = false;
