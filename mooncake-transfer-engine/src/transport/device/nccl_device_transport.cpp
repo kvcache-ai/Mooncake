@@ -19,10 +19,14 @@
 #include <nccl.h>
 #include <nccl_device.h>
 
+#include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #if NCCL_VERSION_CODE < 23004
 #error "Mooncake NCCL DeviceTransport requires NCCL 2.30.4 or newer"
@@ -116,8 +120,89 @@ bool decodeUniqueId(const std::vector<int32_t>& encoded, ncclUniqueId* id) {
 
 }  // namespace
 
+struct NcclInitPhaseGate::Impl {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool host_ready = false;
+    bool released = false;
+    bool failed = false;
+    std::string error;
+    std::function<bool(bool)> status_callback;
+};
+
+NcclInitPhaseGate::NcclInitPhaseGate() : impl_(std::make_unique<Impl>()) {}
+
+NcclInitPhaseGate::~NcclInitPhaseGate() = default;
+
+void NcclInitPhaseGate::waitForHostReady() {
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    impl_->cv.wait(lock, [this] { return impl_->host_ready || impl_->failed; });
+    if (impl_->failed) {
+        throw std::runtime_error("NCCL candidate initialization failed before "
+                                 "host communicator readiness: " +
+                                 impl_->error);
+    }
+}
+
+void NcclInitPhaseGate::release() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->failed) {
+        throw std::runtime_error("cannot release a failed NCCL init phase gate: " +
+                                 impl_->error);
+    }
+    impl_->released = true;
+    impl_->cv.notify_all();
+}
+
+void NcclInitPhaseGate::fail(const std::string& error) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->failed = true;
+    impl_->error = error;
+    impl_->cv.notify_all();
+}
+
+void NcclInitPhaseGate::hostReadyAndWait() {
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    impl_->host_ready = true;
+    impl_->cv.notify_all();
+    impl_->cv.wait(lock, [this] { return impl_->released || impl_->failed; });
+    if (impl_->failed) {
+        throw std::runtime_error("NCCL candidate initialization failed while "
+                                 "waiting at host/device phase gate: " +
+                                 impl_->error);
+    }
+}
+
+void NcclInitPhaseGate::setStatusCallback(
+    std::function<bool(bool)> callback) {
+    // The callback is installed before the native constructor is submitted and
+    // cleared only after its future has joined.
+    impl_->status_callback = std::move(callback);
+}
+
+void NcclInitPhaseGate::clearStatusCallback() {
+    impl_->status_callback = {};
+}
+
+bool NcclInitPhaseGate::hasStatusCallback() {
+    return static_cast<bool>(impl_->status_callback);
+}
+
+bool NcclInitPhaseGate::agreeStatus(bool local_success) {
+    if (!impl_->status_callback) {
+        throw std::runtime_error("NCCL init status callback is not installed");
+    }
+    return impl_->status_callback(local_success);
+}
+
 class NcclDeviceTransportImpl final : public NcclTransport {
    public:
+    explicit NcclDeviceTransportImpl(
+        std::function<void()> init_hook = {},
+        std::shared_ptr<NcclInitPhaseGate> status_gate = {})
+        : init_hook_(std::move(init_hook)),
+          status_gate_(std::move(status_gate)) {}
+
     ~NcclDeviceTransportImpl() override { abort(); }
 
     std::vector<int32_t> createUniqueId() override {
@@ -186,17 +271,28 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             comm_ = nullptr;
             return -1;
         }
+        if (init_hook_) {
+            auto init_hook = std::move(init_hook_);
+            init_hook();
+        }
 
         // Establish the smallest possible rank-wide status path immediately
         // after communicator creation. While this CUDA/NCCL control path stays
         // healthy, subsequent capability decisions can be made uniformly.
-        if (reportCudaError(cudaStreamCreateWithFlags(&control_stream_,
+        const bool callback_status_path =
+            status_gate_ && status_gate_->hasStatusCallback();
+        const bool control_stream_ready =
+            reportCudaError(cudaStreamCreateWithFlags(&control_stream_,
                                                       cudaStreamNonBlocking),
-                            "cudaStreamCreateWithFlags(control)") != 0 ||
+                            "cudaStreamCreateWithFlags(control)") == 0;
+        const bool status_buffer_ready =
+            control_stream_ready &&
             reportCudaError(
                 cudaMalloc(reinterpret_cast<void**>(&collective_status_),
                            sizeof(int)),
-                "cudaMalloc(collective status)") != 0) {
+                "cudaMalloc(collective status)") == 0;
+        if (!callback_status_path &&
+            (!control_stream_ready || !status_buffer_ready)) {
             abortPartialInitialization();
             return -1;
         }
@@ -204,7 +300,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         ncclCommProperties_t comm_properties = NCCL_COMM_PROPERTIES_INITIALIZER;
         bool local_capabilities_valid =
             reportNcclError(ncclCommQueryProperties(comm_, &comm_properties),
-                            "ncclCommQueryProperties") == 0;
+                            "ncclCommQueryProperties") == 0 &&
+            control_stream_ready && status_buffer_ready;
         if (local_capabilities_valid && !comm_properties.deviceApiSupport) {
             LOG(ERROR) << "[Device NCCL] communicator does not support the "
                           "device API";
@@ -664,6 +761,16 @@ class NcclDeviceTransportImpl final : public NcclTransport {
     };
 
     bool collectiveAllSucceeded(bool local_success) {
+        if (status_gate_ && status_gate_->hasStatusCallback()) {
+            bool callback_local_success = local_success;
+            if (!control_stream_ ||
+                reportCudaError(
+                    cudaStreamSynchronize(control_stream_),
+                    "cudaStreamSynchronize(before CPU status agreement)") != 0) {
+                callback_local_success = false;
+            }
+            return status_gate_->agreeStatus(callback_local_success);
+        }
         int value = local_success ? 1 : 0;
         if (reportCudaError(
                 cudaMemcpyAsync(collective_status_, &value, sizeof(value),
@@ -694,6 +801,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
 
     cudaStream_t control_stream_ = nullptr;
     int* collective_status_ = nullptr;
+    std::function<void()> init_hook_;
+    std::shared_ptr<NcclInitPhaseGate> status_gate_;
 
     uint64_t next_registration_id_ = 1;
     std::unordered_map<uint64_t, WindowRecord> registrations_;
@@ -704,6 +813,13 @@ class NcclDeviceTransportImpl final : public NcclTransport {
 
 std::unique_ptr<NcclTransport> createNcclDeviceTransport() {
     return std::make_unique<NcclDeviceTransportImpl>();
+}
+
+std::unique_ptr<NcclTransport> createNcclDeviceTransportWithInitHook(
+    std::function<void()> init_hook,
+    std::shared_ptr<NcclInitPhaseGate> status_gate) {
+    return std::make_unique<NcclDeviceTransportImpl>(
+        std::move(init_hook), std::move(status_gate));
 }
 
 }  // namespace device

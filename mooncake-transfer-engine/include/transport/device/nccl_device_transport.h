@@ -16,7 +16,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace mooncake {
@@ -95,6 +97,29 @@ struct NcclDeviceContextAccess;
 }  // namespace detail
 
 class NcclDeviceTransportImpl;
+
+// Per-candidate pause between host communicator creation and device setup.
+// Ordinary transport construction does not use this gate.
+class NcclInitPhaseGate {
+   public:
+    NcclInitPhaseGate();
+    ~NcclInitPhaseGate();
+    NcclInitPhaseGate(const NcclInitPhaseGate&) = delete;
+    NcclInitPhaseGate& operator=(const NcclInitPhaseGate&) = delete;
+
+    void waitForHostReady();
+    void release();
+    void fail(const std::string& error);
+    void hostReadyAndWait();
+    void setStatusCallback(std::function<bool(bool)> callback);
+    void clearStatusCallback();
+    bool hasStatusCallback();
+    bool agreeStatus(bool local_success);
+
+   private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 // Opaque token for one collectively registered symmetric buffer. The token
 // does not own the allocation; deregister it before freeing the buffer.
@@ -215,6 +240,9 @@ class NcclTransport {
 
 // Create the CUDA-only NCCL LSA/GIN device transport.
 std::unique_ptr<NcclTransport> createNcclDeviceTransport();
+std::unique_ptr<NcclTransport> createNcclDeviceTransportWithInitHook(
+    std::function<void()> init_hook,
+    std::shared_ptr<NcclInitPhaseGate> status_gate = {});
 
 }  // namespace device
 }  // namespace mooncake

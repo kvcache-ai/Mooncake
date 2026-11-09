@@ -147,6 +147,14 @@ struct MooncakeEpBuffer {
                     const std::vector<int32_t>& lids,
                     const std::vector<int32_t>& ipc_handle);
     void disconnect_ranks(const std::vector<int>& peer_ranks);
+    void connect_peer(int peer_rank, int64_t raddr, int32_t rkey,
+                      int64_t subnet_prefix, int64_t interface_id,
+                      const std::vector<int32_t>& qpns,
+                      const std::vector<int32_t>& lids,
+                      const std::vector<int32_t>& ipc_handle);
+    void disconnect_peer(int peer_rank);
+    void initialize_local_peer();
+    void drain_queue_pairs();
     void update_mask_buffer(int peer_rank, bool masked, uint64_t stream_ptr);
     void query_mask_buffer(uint64_t output_ptr, uint64_t stream_ptr) const;
     void clean_mask_buffer(uint64_t stream_ptr);
