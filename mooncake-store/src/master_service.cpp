@@ -3139,6 +3139,11 @@ struct MasterService::LegacyRestoreContext {
         segments_by_alias;
     std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>&
         allocators;
+    // NoF placeholders and quarantined NoF endpoints, kept apart from the
+    // memory ones for the reason given at invalid_nof_replica_endpoints_.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>&
+        nof_allocators;
+    std::unordered_set<std::string>& invalid_nof_endpoints;
     std::unordered_map<std::string, uint64_t>& accounted_bytes;
     size_t& rejected_count;
     size_t& already_existing_count;
@@ -3351,6 +3356,9 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         // object validates, so a mid-construction rejection never leaves
         // phantom accounting behind for later capacity checks or metrics.
         std::unordered_map<std::string, uint64_t> object_bytes;
+        // Same for the NoF quarantine: a rejected object must not block
+        // mounting its namespace.
+        std::unordered_set<std::string> object_nof_endpoints;
 
         for (size_t desc_idx = 0; desc_idx < standby_meta.replicas.size();
              ++desc_idx) {
@@ -3392,11 +3400,16 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     construction_ok = false;
                     break;
                 }
-                auto& alloc = ctx.allocators[buffer.transport_endpoint_];
+                // Quarantined like the chunked restore path: the placeholder
+                // stays alive so the descriptor keeps its endpoint, and the
+                // endpoint is hidden from reads and refused by
+                // MountNoFSegment until the restored ranges can be imported.
+                auto& alloc = ctx.nof_allocators[buffer.transport_endpoint_];
                 if (!alloc) {
                     alloc = std::make_shared<DummyBufferAllocator>(
                         buffer.transport_endpoint_, buffer.transport_endpoint_);
                 }
+                object_nof_endpoints.insert(buffer.transport_endpoint_);
                 replicas.push_back(Replica(
                     desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
                     desc.status, ReplicaType::NOF_SSD));
@@ -3438,6 +3451,8 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
         for (const auto& [segment_name, bytes] : object_bytes) {
             ctx.accounted_bytes[segment_name] += bytes;
         }
+        ctx.invalid_nof_endpoints.insert(object_nof_endpoints.begin(),
+                                         object_nof_endpoints.end());
         ctx.prepared.push_back(
             {accepted_entry.entry, std::move(accepted_entry.tenant_id),
              std::move(accepted_entry.user_key), std::move(replicas)});
@@ -4081,12 +4096,18 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     };
 
     if (legacy_objects) {
-        LegacyRestoreContext legacy_ctx{
-            *legacy_objects,     memory_segments_by_alias,
-            restored_allocators, restored_accounted_memory_bytes,
-            rejected_count,      already_existing_count,
-            repair_remove_keys,  repair_canonical_keys,
-            installed,           new_known_owner_records};
+        LegacyRestoreContext legacy_ctx{*legacy_objects,
+                                        memory_segments_by_alias,
+                                        restored_allocators,
+                                        restored_nof_allocators,
+                                        restored_invalid_nof_endpoints,
+                                        restored_accounted_memory_bytes,
+                                        rejected_count,
+                                        already_existing_count,
+                                        repair_remove_keys,
+                                        repair_canonical_keys,
+                                        installed,
+                                        new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }
