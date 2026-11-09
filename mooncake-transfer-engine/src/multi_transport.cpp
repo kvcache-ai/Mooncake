@@ -586,6 +586,17 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     return Status::OK();
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+static TaskCongestionState stateWithTaskFailure(
+    const Transport::TransferTask& task, TaskCongestionState state) {
+    return state == TaskCongestionState::kNormal &&
+                   __atomic_load_n(&task.failed_slice_count,
+                                   __ATOMIC_ACQUIRE) != 0
+               ? TaskCongestionState::kUnknown
+               : state;
+}
+#endif
+
 Status MultiTransport::getTaskCongestionState(
     BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
     if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
@@ -599,10 +610,7 @@ Status MultiTransport::getTaskCongestionState(
     auto observation = std::atomic_load_explicit(&task.congestion_observation,
                                                  std::memory_order_acquire);
     if (observation) {
-        state = observation->state();
-        if (state == TaskCongestionState::kNormal &&
-            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) != 0)
-            state = TaskCongestionState::kUnknown;
+        state = stateWithTaskFailure(task, observation->state());
     } else if (task.rdma_congestion_control_mode.observed &&
                task.rdma_congestion_control_mode.value !=
                    TaskCongestionControllerMode::kOff &&
@@ -628,9 +636,7 @@ Status MultiTransport::getTaskCongestionDetail(
                                                  std::memory_order_acquire);
     if (observation) {
         detail = observation->detail();
-        if (detail.state == TaskCongestionState::kNormal &&
-            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) != 0)
-            detail.state = TaskCongestionState::kUnknown;
+        detail.state = stateWithTaskFailure(task, detail.state);
     } else if (task.rdma_congestion_control_mode.observed) {
         detail.attempt_kind = TaskCongestionAttemptKind::kRdma;
         detail.controller_mode = task.rdma_congestion_control_mode;

@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <thread>
+
 #include "task_congestion_status.h"
 #include "task_congestion_observation.h"
 
@@ -31,10 +33,10 @@ TaskCongestionEvidence windowEvidence() {
 
 TEST(TaskCongestionObservationTest,
      WorstUnresolvedSliceWinsAndRecoveryClearsIt) {
-    TaskCongestionObservation task(3, 1);
+    TaskCongestionObservation task(3);
     EXPECT_EQ(task.state(), TaskCongestionState::kNormal);
 
-    EXPECT_TRUE(task.defer(1, 1, windowEvidence()));
+    EXPECT_TRUE(task.defer(1, windowEvidence()));
     EXPECT_EQ(task.state(), TaskCongestionState::kCongested);
 
     TaskCongestionEvidence isolation;
@@ -42,12 +44,12 @@ TEST(TaskCongestionObservationTest,
     isolation.path = "route-b";
     isolation.observed_at_ns = 200;
     isolation.controller_generation = 7;
-    EXPECT_TRUE(task.avoid(2, 1, isolation));
+    EXPECT_TRUE(task.avoid(2, isolation));
     EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
 
-    EXPECT_TRUE(task.resolve(2, 1));
+    EXPECT_TRUE(task.resolve(2));
     EXPECT_EQ(task.state(), TaskCongestionState::kCongested);
-    EXPECT_TRUE(task.resolve(1, 1));
+    EXPECT_TRUE(task.resolve(1));
     EXPECT_EQ(task.state(), TaskCongestionState::kNormal);
 
     const auto detail = task.detail();
@@ -59,7 +61,7 @@ TEST(TaskCongestionObservationTest,
 }
 
 TEST(TaskCongestionObservationTest, HealthyTaskHasNoFailureEvidence) {
-    TaskCongestionObservation task(2, 1);
+    TaskCongestionObservation task(2);
     EXPECT_EQ(task.state(), TaskCongestionState::kNormal);
     const auto detail = task.detail();
     EXPECT_FALSE(detail.reason.observed);
@@ -69,38 +71,37 @@ TEST(TaskCongestionObservationTest, HealthyTaskHasNoFailureEvidence) {
 }
 
 TEST(TaskCongestionObservationTest, RepeatedEventAfterRecoveryIsUnresolved) {
-    TaskCongestionObservation task(1, 1);
+    TaskCongestionObservation task(1);
     const auto evidence = windowEvidence();
-    const auto original = evidence;
-    ASSERT_TRUE(task.defer(0, 1, evidence));
-    ASSERT_TRUE(task.resolve(0, 1));
+    ASSERT_TRUE(task.defer(0, evidence));
+    ASSERT_TRUE(task.resolve(0));
     ASSERT_TRUE(task.detail().resolved);
 
-    ASSERT_TRUE(task.defer(0, 1, evidence));
+    ASSERT_TRUE(task.defer(0, evidence));
     const auto detail = task.detail();
     EXPECT_EQ(task.state(), TaskCongestionState::kCongested);
     EXPECT_FALSE(detail.resolved);
     ASSERT_TRUE(detail.affected_path.observed);
     EXPECT_EQ(detail.affected_path.value, "route-a");
-    EXPECT_EQ(evidence, original);
+    EXPECT_EQ(evidence.path, "route-a");
+    EXPECT_EQ(evidence.observed_at_ns, 100u);
 }
 
 TEST(TaskCongestionObservationTest, NewEvidenceClearsAbsentOptionalFields) {
-    TaskCongestionObservation task(1, 1);
+    TaskCongestionObservation task(1);
     auto previous = windowEvidence();
     previous.failure_scope = TaskCongestionFailureScope::kDevice;
     previous.controller_mode = TaskCongestionControllerMode::kEnforce;
     previous.window_bytes = 128;
     previous.inflight_bytes = 64;
     previous.retry_after_ns = 500;
-    ASSERT_TRUE(task.avoid(0, 1, previous));
-    ASSERT_TRUE(task.resolve(0, 1));
+    ASSERT_TRUE(task.avoid(0, previous));
+    ASSERT_TRUE(task.resolve(0));
 
     TaskCongestionEvidence next;
     next.reason = TaskCongestionReason::kFatal;
     next.path = "x";
-    const auto original = next;
-    ASSERT_TRUE(task.avoid(0, 1, next));
+    ASSERT_TRUE(task.avoid(0, next));
     const auto detail = task.detail();
     EXPECT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
     EXPECT_FALSE(detail.resolved);
@@ -115,10 +116,11 @@ TEST(TaskCongestionObservationTest, NewEvidenceClearsAbsentOptionalFields) {
     EXPECT_FALSE(detail.window_bytes.observed);
     EXPECT_FALSE(detail.inflight_bytes.observed);
     EXPECT_FALSE(detail.retry_after_ns.observed);
-    EXPECT_EQ(next, original);
+    EXPECT_EQ(next.path, "x");
+    EXPECT_EQ(next.reason, TaskCongestionReason::kFatal);
 
-    ASSERT_TRUE(task.resolve(0, 1));
-    ASSERT_TRUE(task.defer(0, 1, TaskCongestionEvidence{}));
+    ASSERT_TRUE(task.resolve(0));
+    ASSERT_TRUE(task.defer(0, TaskCongestionEvidence{}));
     const auto empty = task.detail();
     EXPECT_FALSE(empty.reason.observed);
     EXPECT_FALSE(empty.affected_path.observed);
@@ -126,16 +128,16 @@ TEST(TaskCongestionObservationTest, NewEvidenceClearsAbsentOptionalFields) {
 }
 
 TEST(TaskCongestionObservationTest, DetailNamesTheWorstActiveSlice) {
-    TaskCongestionObservation task(2, 1);
+    TaskCongestionObservation task(2);
     TaskCongestionEvidence isolation;
     isolation.reason = TaskCongestionReason::kPathQuarantined;
     isolation.path = "isolated-route";
     isolation.observed_at_ns = 100;
-    EXPECT_TRUE(task.avoid(0, 1, isolation));
+    EXPECT_TRUE(task.avoid(0, isolation));
 
     auto window = windowEvidence();
     window.observed_at_ns = 200;
-    EXPECT_TRUE(task.defer(1, 1, window));
+    EXPECT_TRUE(task.defer(1, window));
     const auto detail = task.detail();
     EXPECT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
     ASSERT_TRUE(detail.reason.observed);
@@ -143,174 +145,150 @@ TEST(TaskCongestionObservationTest, DetailNamesTheWorstActiveSlice) {
     ASSERT_TRUE(detail.affected_path.observed);
     EXPECT_EQ(detail.affected_path.value, "isolated-route");
 
-    EXPECT_TRUE(task.resolve(0, 1));
+    EXPECT_TRUE(task.resolve(0));
     const auto recovered = task.detail();
     EXPECT_EQ(recovered.state, TaskCongestionState::kCongested);
     ASSERT_TRUE(recovered.reason.observed);
     EXPECT_EQ(recovered.reason.value, TaskCongestionReason::kByteWindow);
 }
 
-TEST(TaskCongestionObservationTest,
-     EffectivePathDeduplicatesOwnedAndReference) {
-    static const std::string path = "route-a";
-    auto owned = windowEvidence();
-    auto referenced = owned;
-    referenced.path.reset();
-    referenced.interned_path = &path;
-    for (bool reference_first : {false, true}) {
-        TaskCongestionObservation task(2, 1);
-        ASSERT_TRUE(task.defer(0, 1, reference_first ? referenced : owned));
-        ASSERT_TRUE(task.defer(1, 1, windowEvidence()));
-        ASSERT_TRUE(task.defer(0, 1, reference_first ? owned : referenced));
-        ASSERT_TRUE(task.resolve(0, 1));
-        ASSERT_TRUE(task.resolve(1, 1));
-        const auto detail = task.detail();
-        ASSERT_TRUE(detail.slice_id.observed);
-        EXPECT_EQ(detail.slice_id.value, 1u);
-        EXPECT_TRUE(detail.resolved);
-    }
+TEST(TaskCongestionObservationTest, EveryEvidenceFieldIsReturned) {
+    TaskCongestionObservation task(1);
+    static const std::string path = "interned-route";
+    auto evidence = windowEvidence();
+    evidence.path.reset();
+    evidence.interned_path = &path;
+    evidence.failure_scope = TaskCongestionFailureScope::kDevice;
+    evidence.controller_mode = TaskCongestionControllerMode::kEnforce;
+    evidence.window_bytes = 128;
+    evidence.inflight_bytes = 64;
+    evidence.retry_after_ns = 500;
+    ASSERT_TRUE(task.defer(0, evidence));
+    const auto detail = task.detail();
+    EXPECT_TRUE(detail.reason.observed);
+    EXPECT_TRUE(detail.failure_scope.observed);
+    EXPECT_TRUE(detail.affected_path.observed);
+    EXPECT_TRUE(detail.observed_at_ns.observed);
+    EXPECT_TRUE(detail.controller_mode.observed);
+    EXPECT_TRUE(detail.controller_generation.observed);
+    EXPECT_TRUE(detail.window_bytes.observed);
+    EXPECT_TRUE(detail.inflight_bytes.observed);
+    EXPECT_TRUE(detail.retry_after_ns.observed);
+    EXPECT_EQ(detail.reason.value, *evidence.reason);
+    EXPECT_EQ(detail.failure_scope.value, *evidence.failure_scope);
+    EXPECT_EQ(detail.affected_path.value, path);
+    EXPECT_EQ(detail.observed_at_ns.value, 100u);
+    EXPECT_EQ(detail.controller_mode.value, *evidence.controller_mode);
+    EXPECT_EQ(detail.controller_generation.value, 7u);
+    EXPECT_EQ(detail.window_bytes.value, 128u);
+    EXPECT_EQ(detail.inflight_bytes.value, 64u);
+    EXPECT_EQ(detail.retry_after_ns.value, 500u);
 }
 
-TEST(TaskCongestionObservationTest, EveryEvidenceFieldChangesTheLastEvent) {
-    auto base = windowEvidence();
-    base.failure_scope = TaskCongestionFailureScope::kDevice;
-    base.controller_mode = TaskCongestionControllerMode::kEnforce;
-    base.window_bytes = 128;
-    base.inflight_bytes = 64;
-    base.retry_after_ns = 500;
-    std::vector<TaskCongestionEvidence> changed(9, base);
-    changed[0].reason.reset();
-    changed[1].failure_scope.reset();
-    changed[2].path.reset();
-    changed[3].observed_at_ns.reset();
-    changed[4].controller_mode.reset();
-    changed[5].controller_generation.reset();
-    changed[6].window_bytes.reset();
-    changed[7].inflight_bytes.reset();
-    changed[8].retry_after_ns.reset();
-    for (size_t field = 0; field < changed.size(); ++field) {
-        SCOPED_TRACE(field);
-        TaskCongestionObservation task(2, 1);
-        ASSERT_TRUE(task.defer(0, 1, base));
-        ASSERT_TRUE(task.defer(1, 1, base));
-        ASSERT_TRUE(task.defer(0, 1, changed[field]));
-        ASSERT_TRUE(task.resolve(0, 1));
-        ASSERT_TRUE(task.resolve(1, 1));
-        const auto detail = task.detail();
-        ASSERT_TRUE(detail.slice_id.observed);
-        EXPECT_EQ(detail.slice_id.value, 0u);
-    }
+TEST(TaskCongestionObservationTest, TimestampOrdersActiveAndRetainedEvidence) {
+    TaskCongestionObservation task(3);
+    auto recent = windowEvidence();
+    recent.observed_at_ns = 200;
+    ASSERT_TRUE(task.defer(0, recent));
+    ASSERT_TRUE(task.defer(1, windowEvidence()));
+    EXPECT_EQ(task.detail().slice_id.value, 0u);
+    ASSERT_TRUE(task.resolve(0));
+    EXPECT_EQ(task.detail().slice_id.value, 1u);
+    ASSERT_TRUE(task.resolve(1));
+    EXPECT_EQ(task.detail().slice_id.value, 0u);
+    EXPECT_TRUE(task.detail().resolved);
+}
+
+TEST(TaskCongestionObservationTest, MissingTimestampsAndTiesUseLargerSliceId) {
+    TaskCongestionObservation task(3);
+    ASSERT_TRUE(task.defer(0, TaskCongestionEvidence{}));
+    ASSERT_TRUE(task.defer(1, TaskCongestionEvidence{}));
+    EXPECT_EQ(task.detail().slice_id.value, 1u);
+    ASSERT_TRUE(task.resolve(1));
+    ASSERT_TRUE(task.resolve(0));
+    EXPECT_EQ(task.detail().slice_id.value, 1u);
+    ASSERT_TRUE(task.defer(0, windowEvidence()));
+    ASSERT_TRUE(task.defer(1, windowEvidence()));
+    EXPECT_EQ(task.detail().slice_id.value, 1u);
+    ASSERT_TRUE(task.resolve(1));
+    ASSERT_TRUE(task.resolve(0));
+    EXPECT_EQ(task.detail().slice_id.value, 1u);
+    EXPECT_TRUE(task.detail().observed_at_ns.observed);
 }
 
 TEST(TaskCongestionObservationTest,
      EmptyPathIsObservedAndConstReferenceIsOwned) {
-    TaskCongestionObservation task(1, 1);
-    ASSERT_TRUE(task.defer(0, 1, TaskCongestionEvidence{}));
+    TaskCongestionObservation task(1);
+    ASSERT_TRUE(task.defer(0, TaskCongestionEvidence{}));
     EXPECT_FALSE(task.detail().affected_path.observed);
     {
         TaskCongestionEvidence empty;
         empty.path = std::string{};
-        ASSERT_TRUE(task.defer(0, 1, empty));
+        ASSERT_TRUE(task.defer(0, empty));
     }
     ASSERT_TRUE(task.detail().affected_path.observed);
     EXPECT_TRUE(task.detail().affected_path.value.empty());
     {
         TaskCongestionEvidence temporary;
         temporary.path = std::string(256, 'a');
-        ASSERT_TRUE(task.defer(0, 1, temporary));
+        ASSERT_TRUE(task.defer(0, temporary));
     }
-    ASSERT_TRUE(task.resolve(0, 1));
+    ASSERT_TRUE(task.resolve(0));
     const auto detail = task.detail();
     ASSERT_TRUE(detail.affected_path.observed);
     EXPECT_EQ(detail.affected_path.value, std::string(256, 'a'));
     EXPECT_TRUE(detail.resolved);
 }
 
-TEST(TaskCongestionObservationTest, OldAttemptCannotOverrideCurrentState) {
-    TaskCongestionObservation task(2, 2);
-    EXPECT_EQ(task.state(), TaskCongestionState::kNormal);
-
-    EXPECT_FALSE(task.defer(0, 1, windowEvidence()));
-    EXPECT_FALSE(task.avoid(0, 1, windowEvidence()));
-    EXPECT_FALSE(task.extendAttempt(1, 3));
-    EXPECT_EQ(task.state(), TaskCongestionState::kNormal);
-
-    EXPECT_TRUE(task.avoid(1, 2, windowEvidence()));
-    EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
-    EXPECT_FALSE(task.resolve(1, 1));
-    EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
-
-    EXPECT_FALSE(task.avoid(2, 2, windowEvidence()));
-    EXPECT_EQ(task.state(), TaskCongestionState::kUnknown);
-}
-
-TEST(TaskCongestionObservationTest, FutureAttemptCannotOverrideCurrentState) {
-    TaskCongestionObservation task(1, 1);
-    EXPECT_TRUE(task.defer(0, 1, windowEvidence()));
-    EXPECT_FALSE(task.extendAttempt(2, 2));
-    EXPECT_FALSE(task.defer(1, 2, windowEvidence()));
-    EXPECT_FALSE(task.avoid(0, 2, windowEvidence()));
-    EXPECT_FALSE(task.resolve(0, 2));
-    EXPECT_EQ(task.state(), TaskCongestionState::kCongested);
-    const auto detail = task.detail();
-    ASSERT_TRUE(detail.slice_id.observed);
-    EXPECT_EQ(detail.slice_id.value, 0);
-    ASSERT_TRUE(detail.attempt_id.observed);
-    EXPECT_EQ(detail.attempt_id.value, 1);
-}
-
-TEST(TaskCongestionObservationTest, PublishedSlicesExtendCurrentAttempt) {
-    TaskCongestionObservation task(1, 1);
-    EXPECT_TRUE(task.defer(0, 1, windowEvidence()));
-    EXPECT_TRUE(task.extendAttempt(1, 3));
-    EXPECT_FALSE(task.extendAttempt(0, 4));
-    EXPECT_FALSE(task.extendAttempt(1, 2));
-
-    TaskCongestionEvidence isolation;
-    isolation.reason = TaskCongestionReason::kPathQuarantined;
-    EXPECT_TRUE(task.avoid(2, 1, isolation));
-    EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
-    EXPECT_TRUE(task.resolve(2, 1));
-    EXPECT_EQ(task.state(), TaskCongestionState::kCongested);
-}
-
-TEST(TaskCongestionObservationTest, OwnedEvidenceExtendsOnlyCurrentAttempt) {
-    TaskCongestionObservation task(1, 2);
-    EXPECT_FALSE(task.defer(2, 1, windowEvidence(), 3));
-    EXPECT_FALSE(task.avoid(2, 3, windowEvidence(), 3));
-    EXPECT_EQ(task.state(), TaskCongestionState::kNormal);
-    EXPECT_FALSE(task.detail().reason.observed);
-
-    ASSERT_TRUE(task.defer(2, 2, windowEvidence(), 3));
-    EXPECT_EQ(task.state(), TaskCongestionState::kCongested);
-    ASSERT_TRUE(task.resolve(2, 2));
-    ASSERT_TRUE(task.avoid(2, 2, windowEvidence(), 1));
-    EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
-    const auto detail = task.detail();
-    ASSERT_TRUE(detail.slice_id.observed);
-    EXPECT_EQ(detail.slice_id.value, 2u);
-    EXPECT_FALSE(detail.resolved);
-    ASSERT_TRUE(task.resolve(2, 2));
+TEST(TaskCongestionObservationTest,
+     ConcurrentSlicesAndQueriesRemainConsistent) {
+    TaskCongestionObservation task(2);
+    auto record = [&task](size_t slice) {
+        for (size_t i = 0; i < 100; ++i) {
+            EXPECT_TRUE(task.defer(slice, windowEvidence()));
+            EXPECT_TRUE(task.resolve(slice));
+            task.detail();
+            task.state();
+        }
+    };
+    std::thread first(record, 0);
+    std::thread second(record, 1);
+    first.join();
+    second.join();
     EXPECT_EQ(task.state(), TaskCongestionState::kNormal);
     EXPECT_TRUE(task.detail().resolved);
 }
 
+TEST(TaskCongestionObservationTest, OwnedEvidenceGrowsSliceExtent) {
+    TaskCongestionObservation task(1);
+    ASSERT_TRUE(task.defer(2, windowEvidence(), 3));
+    EXPECT_EQ(task.state(), TaskCongestionState::kCongested);
+    ASSERT_TRUE(task.resolve(2));
+    ASSERT_TRUE(task.avoid(2, windowEvidence(), 1));
+    EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
+    EXPECT_EQ(task.detail().slice_id.value, 2u);
+    ASSERT_TRUE(task.resolve(2));
+    EXPECT_TRUE(task.detail().resolved);
+    EXPECT_FALSE(task.avoid(3, windowEvidence()));
+    EXPECT_EQ(task.state(), TaskCongestionState::kUnknown);
+}
+
 TEST(TaskCongestionObservationTest,
      SlicesOnDifferentControllerGenerationsShareAttempt) {
-    TaskCongestionObservation task(2, 1);
-    EXPECT_TRUE(task.defer(0, 1, windowEvidence()));
+    TaskCongestionObservation task(2);
+    EXPECT_TRUE(task.defer(0, windowEvidence()));
 
     TaskCongestionEvidence isolation;
     isolation.reason = TaskCongestionReason::kPathQuarantined;
     isolation.path = "other-device";
     isolation.controller_generation = 2;
-    EXPECT_TRUE(task.avoid(1, 1, isolation));
+    EXPECT_TRUE(task.avoid(1, isolation));
     EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
     const auto detail = task.detail();
     ASSERT_TRUE(detail.controller_generation.observed);
     EXPECT_EQ(detail.controller_generation.value, 2);
-    EXPECT_FALSE(task.resolve(1, 0));
-    EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
+    EXPECT_TRUE(task.detail().attempt_id.observed);
+    EXPECT_EQ(task.detail().attempt_id.value, 1u);
 }
 
 }  // namespace

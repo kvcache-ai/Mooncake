@@ -277,17 +277,22 @@ RdmaTransport::RdmaTransport() {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 void RdmaTransport::recordClassicCongestionControlMode(
     adaptive_congestion_control::Mode mode) {
-    const int next_mode = static_cast<int>(mode);
-    int current =
+    const auto next_mode = mode == adaptive_congestion_control::Mode::kOff
+                               ? ClassicCongestionControlMode::kOff
+                           : mode == adaptive_congestion_control::Mode::kObserve
+                               ? ClassicCongestionControlMode::kObserve
+                               : ClassicCongestionControlMode::kEnforce;
+    auto current =
         classic_congestion_control_mode_.load(std::memory_order_acquire);
-    while (current == -1) {
+    while (current == ClassicCongestionControlMode::kUninitialized) {
         if (classic_congestion_control_mode_.compare_exchange_weak(
                 current, next_mode, std::memory_order_acq_rel,
                 std::memory_order_acquire))
             return;
     }
     if (current != next_mode)
-        classic_congestion_control_mode_.store(3, std::memory_order_release);
+        classic_congestion_control_mode_.store(
+            ClassicCongestionControlMode::kConflict, std::memory_order_release);
 }
 #endif
 
@@ -1224,13 +1229,26 @@ Status RdmaTransport::submitTransferTaskWithSeal(
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-    const int congestion_control_mode =
+    const auto congestion_control_mode =
         classic_congestion_control_mode_.load(std::memory_order_acquire);
-    if (congestion_control_mode >= 0 && congestion_control_mode <= 2) {
+    std::optional<TaskCongestionControllerMode> task_mode;
+    switch (congestion_control_mode) {
+        case ClassicCongestionControlMode::kOff:
+            task_mode = TaskCongestionControllerMode::kOff;
+            break;
+        case ClassicCongestionControlMode::kObserve:
+            task_mode = TaskCongestionControllerMode::kObserve;
+            break;
+        case ClassicCongestionControlMode::kEnforce:
+            task_mode = TaskCongestionControllerMode::kEnforce;
+            break;
+        case ClassicCongestionControlMode::kUninitialized:
+        case ClassicCongestionControlMode::kConflict:
+            break;
+    }
+    if (task_mode) {
         for (auto *task : task_list) {
-            task->rdma_congestion_control_mode = {
-                true, static_cast<TaskCongestionControllerMode>(
-                          congestion_control_mode)};
+            task->rdma_congestion_control_mode = {true, *task_mode};
         }
     }
 #endif

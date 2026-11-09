@@ -46,42 +46,27 @@ struct TaskCongestionEvidence {
         if (interned_path) return *interned_path;
         return std::nullopt;
     }
-
-    bool operator==(const TaskCongestionEvidence& other) const {
-        return reason == other.reason && failure_scope == other.failure_scope &&
-               effectivePath() == other.effectivePath() &&
-               observed_at_ns == other.observed_at_ns &&
-               controller_mode == other.controller_mode &&
-               controller_generation == other.controller_generation &&
-               window_bytes == other.window_bytes &&
-               inflight_bytes == other.inflight_bytes &&
-               retry_after_ns == other.retry_after_ns;
-    }
 };
 
 // A logical task owns this record until its batch is freed. Slice state is
-// allocated on the first anomaly and never exceeds this attempt's submitted
+// allocated on the first anomaly and never exceeds the task's submitted
 // slice count. Adapters reject stale controller/endpoint generations before
-// reporting evidence; this class fences stale logical attempts.
+// reporting evidence; the task retains one RDMA attempt.
 class TaskCongestionObservation {
    public:
-    TaskCongestionObservation(size_t submitted_slice_count,
-                              uint64_t attempt_id);
+    explicit TaskCongestionObservation(size_t submitted_slice_count);
 
     TaskCongestionObservation(const TaskCongestionObservation&) = delete;
     TaskCongestionObservation& operator=(const TaskCongestionObservation&) =
         delete;
 
-    bool extendAttempt(uint64_t attempt_id, size_t submitted_slice_count);
-    bool defer(size_t slice_id, uint64_t attempt_id,
-               const TaskCongestionEvidence& evidence);
-    bool avoid(size_t slice_id, uint64_t attempt_id,
-               const TaskCongestionEvidence& evidence);
-    bool defer(size_t slice_id, uint64_t attempt_id,
-               TaskCongestionEvidence&& evidence, size_t submitted_slice_count);
-    bool avoid(size_t slice_id, uint64_t attempt_id,
-               TaskCongestionEvidence&& evidence, size_t submitted_slice_count);
-    bool resolve(size_t slice_id, uint64_t attempt_id);
+    bool defer(size_t slice_id, const TaskCongestionEvidence& evidence);
+    bool avoid(size_t slice_id, const TaskCongestionEvidence& evidence);
+    bool defer(size_t slice_id, TaskCongestionEvidence&& evidence,
+               size_t submitted_slice_count);
+    bool avoid(size_t slice_id, TaskCongestionEvidence&& evidence,
+               size_t submitted_slice_count);
+    bool resolve(size_t slice_id);
 
     TaskCongestionState state() const;
     TaskCongestionDetail detail() const;
@@ -90,29 +75,21 @@ class TaskCongestionObservation {
     struct SliceRecord {
         TaskCongestionState state = TaskCongestionState::kNormal;
         TaskCongestionEvidence evidence;
+        bool observed = false;
     };
-    struct EventRecord {
-        size_t slice_id = 0;
-        TaskCongestionEvidence evidence;
-        bool resolved = false;
-    };
-
-    bool record(size_t slice_id, uint64_t attempt_id, TaskCongestionState state,
+    bool record(size_t slice_id, TaskCongestionState state,
                 const TaskCongestionEvidence& evidence);
-    bool recordOwned(size_t slice_id, uint64_t attempt_id,
-                     TaskCongestionState state, TaskCongestionEvidence evidence,
+    bool recordOwned(size_t slice_id, TaskCongestionState state,
+                     TaskCongestionEvidence evidence,
                      std::optional<size_t> submitted_slice_count);
-    bool currentAttempt(uint64_t attempt_id) const;
     TaskCongestionState stateLocked() const;
 
     size_t slice_count_;
     mutable std::mutex mutex_;
-    uint64_t attempt_id_;
     std::vector<SliceRecord> slices_;
     size_t congested_count_ = 0;
     size_t unavailable_count_ = 0;
     bool invalid_observation_ = false;
-    std::optional<EventRecord> last_event_;
 };
 
 }  // namespace mooncake::adaptive_congestion_control

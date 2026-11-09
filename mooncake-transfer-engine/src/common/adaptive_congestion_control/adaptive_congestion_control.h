@@ -109,8 +109,6 @@ class DomainState {
     friend class Permit;
     friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
                                AdmissionEvidence*);
-    friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
-                               AdmissionEvidence*, bool);
     friend bool complete(Permit&, OutcomeClass, FailureScope);
     friend void recordSignals(DomainState&, uint32_t, const Signals&);
     friend void controlTick(DomainState&, uint64_t);
@@ -156,8 +154,6 @@ class Permit {
    private:
     friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
                                AdmissionEvidence*);
-    friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&,
-                               AdmissionEvidence*, bool);
     friend bool complete(Permit&, OutcomeClass, FailureScope);
     friend bool isCurrentGeneration(const Permit&);
 
@@ -179,10 +175,6 @@ class Permit {
 // Evidence is written only on rejection, with the device checked first.
 Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
                     AdmissionEvidence* evidence = nullptr);
-// Metadata-only rejection writes domain, reason and snapshot.generation;
-// the remaining snapshot fields are left unchanged. Admission writes nothing.
-Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit,
-                    AdmissionEvidence* evidence, bool capture_snapshot);
 bool isCurrentGeneration(const Permit& permit);
 bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope);
 void recordSignals(DomainState& state, uint32_t generation,

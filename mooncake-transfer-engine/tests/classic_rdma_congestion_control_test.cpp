@@ -750,7 +750,7 @@ TEST(ClassicRdmaCongestionControlTest,
     // A worker can construct its lazy observation before the submitter
     // publishes another slice, then win the publication CAS after that flush.
     auto delayed = std::make_shared<
-        adaptive_congestion_control::TaskCongestionObservation>(1, 1);
+        adaptive_congestion_control::TaskCongestionObservation>(1);
     auto *deferred = new Transport::Slice{};
     deferred->task = &task;
     deferred->length = 64;

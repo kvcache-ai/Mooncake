@@ -23,7 +23,14 @@ it does not advance the TENT task to obtain a snapshot.
 
 For multiple slices, unresolved `LONG_UNAVAILABLE` takes precedence over
 `CONGESTED`. Details retain best-effort evidence from an abnormal event, not
-live NIC counters. `resolved` means that retained evidence has been resolved.
+live NIC counters. Among slices in the worst unresolved state, detail selects
+one with the greatest observed timestamp. If no slice is unresolved, it selects
+from retained slice evidence using the same rule. Observed timestamps take
+precedence over missing timestamps; ties (including two missing timestamps)
+select the larger slice index. Untouched slices have no retained evidence.
+Each slice retains only its latest recorded evidence, so this is not an event
+history. `resolved` means that the selected slice has returned to normal.
+The supported RDMA task has one logical attempt, reported as attempt ID 1.
 Fields with `observed=false` in C++, or without their `TASK_CONGESTION_HAS_*`
 bit in C, have no observed value. A zero is not a substitute for missing data.
 

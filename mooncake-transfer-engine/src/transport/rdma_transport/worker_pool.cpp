@@ -72,7 +72,7 @@ congestionObservation(Transport::TransferTask *task) {
     if (!current) {
         auto created = std::make_shared<
             adaptive_congestion_control::TaskCongestionObservation>(
-            __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE), 1);
+            __atomic_load_n(&task->slice_count, __ATOMIC_ACQUIRE));
         if (std::atomic_compare_exchange_strong_explicit(
                 &task->congestion_observation, &current, created,
                 std::memory_order_release, std::memory_order_acquire))
@@ -93,7 +93,16 @@ void resolveCongestion(Transport::Slice *slice) {
         &slice->task->congestion_observation, std::memory_order_acquire);
     if (!observation) return;
     auto slice_id = congestionSliceId(slice);
-    if (slice_id) observation->resolve(*slice_id, 1);
+    if (slice_id) observation->resolve(*slice_id);
+}
+
+void setCongestionEvidencePath(
+    adaptive_congestion_control::TaskCongestionEvidence &evidence,
+    Transport::Slice *slice, const std::string &path) {
+    if (slice->interned_peer_nic_path && *slice->interned_peer_nic_path == path)
+        evidence.interned_path = slice->interned_peer_nic_path;
+    else
+        evidence.path = path;
 }
 
 adaptive_congestion_control::TaskCongestionEvidence congestionEvidence(
@@ -102,10 +111,7 @@ adaptive_congestion_control::TaskCongestionEvidence congestionEvidence(
     TaskCongestionReason reason) {
     adaptive_congestion_control::TaskCongestionEvidence evidence;
     evidence.reason = reason;
-    if (slice->interned_peer_nic_path && *slice->interned_peer_nic_path == path)
-        evidence.interned_path = slice->interned_peer_nic_path;
-    else
-        evidence.path = path;
+    setCongestionEvidencePath(evidence, slice, path);
     evidence.observed_at_ns = getCurrentTimeInNano();
     evidence.controller_mode =
         snapshot.mode == adaptive_congestion_control::Mode::kEnforce
@@ -135,8 +141,6 @@ void recordCongestion(
         (*scope == TaskCongestionFailureScope::kDevice ||
          *scope == TaskCongestionFailureScope::kRoute)) {
         window_episode = windowEpisode(snapshot.generation, *scope);
-        if (slice->rdma_congestion_control_window_episode == window_episode)
-            return;
     }
     slice->rdma_congestion_control_window_episode = 0;
     auto observation = congestionObservation(slice->task);
@@ -144,7 +148,7 @@ void recordCongestion(
     evidence.failure_scope = scope;
     // Refresh the lazy publisher's extent and record under the same lock.
     if (observation->defer(
-            *slice_id, 1, std::move(evidence),
+            *slice_id, std::move(evidence),
             __atomic_load_n(&slice->task->slice_count, __ATOMIC_ACQUIRE))) {
         slice->rdma_congestion_control_window_episode = window_episode;
         slice->rdma_congestion_control_observed_blocked.store(
@@ -286,7 +290,7 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
             adaptive_congestion_control::generation(state->domain)};
         const auto decision = adaptive_congestion_control::tryAcquire(
             path, slice->length, slice->rdma_congestion_control_permit,
-            &evidence, false);
+            &evidence);
         if (decision == adaptive_congestion_control::Decision::kAllow) {
             slice->rdma_congestion_control_endpoint =
                 state->endpoint.load(std::memory_order_acquire);
@@ -301,12 +305,11 @@ size_t ClassicRdmaCongestionControl::gate(SliceList &queued) {
                     adaptive_congestion_control::AdmissionDomain::kDevice;
                 const auto selected_generation =
                     device ? path.device_generation : path.route_generation;
-                if (evidence.snapshot.generation == selected_generation)
-                    recordWindowCongestion(
-                        slice, device ? *device_ : state->domain,
-                        selected_generation, state->peer_nic_path,
-                        device ? TaskCongestionFailureScope::kDevice
-                               : TaskCongestionFailureScope::kRoute);
+                recordWindowCongestion(
+                    slice, device ? *device_ : state->domain,
+                    selected_generation, state->peer_nic_path,
+                    device ? TaskCongestionFailureScope::kDevice
+                           : TaskCongestionFailureScope::kRoute);
             }
             // A generation race is retried on the owner queue. It is not
             // evidence that the legacy health gate considers the path failed.
@@ -354,11 +357,7 @@ void ClassicRdmaCongestionControl::observeUnavailable(
     slice->rdma_congestion_control_window_episode = 0;
     adaptive_congestion_control::TaskCongestionEvidence evidence;
     evidence.reason = reason;
-    if (slice->interned_peer_nic_path &&
-        *slice->interned_peer_nic_path == peer_nic_path)
-        evidence.interned_path = slice->interned_peer_nic_path;
-    else
-        evidence.path = peer_nic_path;
+    setCongestionEvidencePath(evidence, slice, peer_nic_path);
     evidence.observed_at_ns = getCurrentTimeInNano();
     evidence.controller_mode =
         mode_ == adaptive_congestion_control::Mode::kEnforce
@@ -368,7 +367,7 @@ void ClassicRdmaCongestionControl::observeUnavailable(
     evidence.retry_after_ns = retry_after_ns;
     auto observation = congestionObservation(slice->task);
     if (observation->avoid(
-            *slice_id, 1, std::move(evidence),
+            *slice_id, std::move(evidence),
             __atomic_load_n(&slice->task->slice_count, __ATOMIC_ACQUIRE)))
         slice->rdma_congestion_control_observed_blocked.store(
             true, std::memory_order_release);

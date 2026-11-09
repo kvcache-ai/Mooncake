@@ -19,62 +19,43 @@
 namespace mooncake::adaptive_congestion_control {
 
 TaskCongestionObservation::TaskCongestionObservation(
-    size_t submitted_slice_count, uint64_t attempt_id)
-    : slice_count_(submitted_slice_count), attempt_id_(attempt_id) {}
+    size_t submitted_slice_count)
+    : slice_count_(submitted_slice_count) {}
 
-bool TaskCongestionObservation::currentAttempt(uint64_t attempt_id) const {
-    return attempt_id == attempt_id_;
-}
-
-bool TaskCongestionObservation::extendAttempt(uint64_t attempt_id,
-                                              size_t submitted_slice_count) {
-    std::lock_guard lock(mutex_);
-    if (!currentAttempt(attempt_id) || submitted_slice_count < slice_count_)
-        return false;
-    if (!slices_.empty()) slices_.resize(submitted_slice_count);
-    slice_count_ = submitted_slice_count;
-    return true;
-}
-
-bool TaskCongestionObservation::defer(size_t slice_id, uint64_t attempt_id,
+bool TaskCongestionObservation::defer(size_t slice_id,
                                       const TaskCongestionEvidence& evidence) {
-    return record(slice_id, attempt_id, TaskCongestionState::kCongested,
-                  evidence);
+    return record(slice_id, TaskCongestionState::kCongested, evidence);
 }
 
-bool TaskCongestionObservation::avoid(size_t slice_id, uint64_t attempt_id,
+bool TaskCongestionObservation::avoid(size_t slice_id,
                                       const TaskCongestionEvidence& evidence) {
-    return record(slice_id, attempt_id, TaskCongestionState::kLongUnavailable,
-                  evidence);
+    return record(slice_id, TaskCongestionState::kLongUnavailable, evidence);
 }
 
-bool TaskCongestionObservation::record(size_t slice_id, uint64_t attempt_id,
+bool TaskCongestionObservation::record(size_t slice_id,
                                        TaskCongestionState state,
                                        const TaskCongestionEvidence& evidence) {
-    return recordOwned(slice_id, attempt_id, state, evidence, std::nullopt);
+    return recordOwned(slice_id, state, evidence, std::nullopt);
 }
 
-bool TaskCongestionObservation::defer(size_t slice_id, uint64_t attempt_id,
+bool TaskCongestionObservation::defer(size_t slice_id,
                                       TaskCongestionEvidence&& evidence,
                                       size_t submitted_slice_count) {
-    return recordOwned(slice_id, attempt_id, TaskCongestionState::kCongested,
+    return recordOwned(slice_id, TaskCongestionState::kCongested,
                        std::move(evidence), submitted_slice_count);
 }
 
-bool TaskCongestionObservation::avoid(size_t slice_id, uint64_t attempt_id,
+bool TaskCongestionObservation::avoid(size_t slice_id,
                                       TaskCongestionEvidence&& evidence,
                                       size_t submitted_slice_count) {
-    return recordOwned(slice_id, attempt_id,
-                       TaskCongestionState::kLongUnavailable,
+    return recordOwned(slice_id, TaskCongestionState::kLongUnavailable,
                        std::move(evidence), submitted_slice_count);
 }
 
 bool TaskCongestionObservation::recordOwned(
-    size_t slice_id, uint64_t attempt_id, TaskCongestionState state,
-    TaskCongestionEvidence evidence,
+    size_t slice_id, TaskCongestionState state, TaskCongestionEvidence evidence,
     std::optional<size_t> submitted_slice_count) {
     std::lock_guard lock(mutex_);
-    if (!currentAttempt(attempt_id)) return false;
     if (submitted_slice_count && *submitted_slice_count > slice_count_) {
         if (!slices_.empty()) slices_.resize(*submitted_slice_count);
         slice_count_ = *submitted_slice_count;
@@ -85,7 +66,6 @@ bool TaskCongestionObservation::recordOwned(
     }
     if (slices_.empty()) slices_.resize(slice_count_);
     auto& slice = slices_[slice_id];
-    if (slice.state == state && slice.evidence == evidence) return true;
     if (slice.state == TaskCongestionState::kCongested) --congested_count_;
     if (slice.state == TaskCongestionState::kLongUnavailable)
         --unavailable_count_;
@@ -93,16 +73,12 @@ bool TaskCongestionObservation::recordOwned(
     slice.evidence = std::move(evidence);
     if (state == TaskCongestionState::kCongested) ++congested_count_;
     if (state == TaskCongestionState::kLongUnavailable) ++unavailable_count_;
-    if (!last_event_) last_event_.emplace();
-    last_event_->slice_id = slice_id;
-    last_event_->evidence = slice.evidence;
-    last_event_->resolved = false;
+    slice.observed = true;
     return true;
 }
 
-bool TaskCongestionObservation::resolve(size_t slice_id, uint64_t attempt_id) {
+bool TaskCongestionObservation::resolve(size_t slice_id) {
     std::lock_guard lock(mutex_);
-    if (!currentAttempt(attempt_id)) return false;
     if (slice_id >= slice_count_) {
         invalid_observation_ = true;
         return false;
@@ -114,9 +90,7 @@ bool TaskCongestionObservation::resolve(size_t slice_id, uint64_t attempt_id) {
     if (slice.state == TaskCongestionState::kLongUnavailable)
         --unavailable_count_;
     slice.state = TaskCongestionState::kNormal;
-    // Inactive evidence is ignored by detail() and retained until overwrite.
-    if (last_event_ && last_event_->slice_id == slice_id)
-        last_event_->resolved = true;
+    // Retain evidence for historical detail after recovery.
     return true;
 }
 
@@ -137,30 +111,33 @@ TaskCongestionDetail TaskCongestionObservation::detail() const {
     TaskCongestionDetail detail;
     detail.state = stateLocked();
     detail.attempt_kind = TaskCongestionAttemptKind::kRdma;
-    detail.attempt_id = {true, attempt_id_};
+    detail.attempt_id = {true, 1};
 
-    std::optional<EventRecord> selected;
-    if (detail.state == TaskCongestionState::kCongested ||
-        detail.state == TaskCongestionState::kLongUnavailable) {
-        for (size_t slice_id = 0; slice_id < slices_.size(); ++slice_id) {
-            const auto& slice = slices_[slice_id];
-            if (slice.state != detail.state) continue;
-            const auto& observed_at = slice.evidence.observed_at_ns;
-            if (!selected ||
-                (observed_at &&
-                 (!selected->evidence.observed_at_ns ||
-                  *observed_at >= *selected->evidence.observed_at_ns))) {
-                selected = EventRecord{slice_id, slice.evidence, false};
-            }
+    const SliceRecord* selected = nullptr;
+    size_t selected_id = 0;
+    bool selected_active = false;
+    for (size_t slice_id = 0; slice_id < slices_.size(); ++slice_id) {
+        const auto& slice = slices_[slice_id];
+        if (!slice.observed) continue;
+        const bool active = slice.state != TaskCongestionState::kNormal &&
+                            slice.state == detail.state;
+        if (selected_active && !active) continue;
+        const auto& timestamp = slice.evidence.observed_at_ns;
+        if (!selected || (active && !selected_active) ||
+            (timestamp && (!selected->evidence.observed_at_ns ||
+                           *timestamp >= *selected->evidence.observed_at_ns)) ||
+            (!timestamp && !selected->evidence.observed_at_ns)) {
+            selected = &slice;
+            selected_id = slice_id;
+            selected_active = active;
         }
     }
-    if (!selected) selected = last_event_;
     if (!selected) return detail;
 
     if (selected->evidence.reason)
         detail.reason = {true, *selected->evidence.reason};
-    detail.slice_id = {true, static_cast<uint64_t>(selected->slice_id)};
-    detail.resolved = selected->resolved;
+    detail.slice_id = {true, static_cast<uint64_t>(selected_id)};
+    detail.resolved = selected->state == TaskCongestionState::kNormal;
     if (selected->evidence.failure_scope)
         detail.failure_scope = {true, *selected->evidence.failure_scope};
     if (const auto path = selected->evidence.effectivePath())

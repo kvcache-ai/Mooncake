@@ -30,6 +30,13 @@ namespace mooncake {
 
 class RdmaTransportTestPeer {
    public:
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    static void recordCongestionMode(RdmaTransport &transport,
+                                     adaptive_congestion_control::Mode mode) {
+        transport.recordClassicCongestionControlMode(mode);
+    }
+#endif
+
     static void bindMetadata(RdmaTransport &transport,
                              std::shared_ptr<TransferMetadata> metadata,
                              std::string local_server_name) {
