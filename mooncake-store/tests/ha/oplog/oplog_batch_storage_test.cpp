@@ -1003,8 +1003,7 @@ TEST(OpLogBatchStorageDeleteTest, EmptyNamespaceAndInvalidCluster) {
     FakeHaKvBackend backend;
     OpLogBatchStorage storage("clusterA", backend);
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, storage.DeleteBatchesInRange(1, 0));
-    EXPECT_EQ(ErrorCode::OK,
-              storage.DeleteBatchesInRange(1, UINT64_MAX));
+    EXPECT_EQ(ErrorCode::OK, storage.DeleteBatchesInRange(1, UINT64_MAX));
     backend.delete_ranges.clear();
     for (const auto* cluster : {"", "/", "a/b"}) {
         OpLogBatchStorage invalid(cluster, backend);

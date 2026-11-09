@@ -550,8 +550,8 @@ std::string HAMetricManager::serialize_metrics() {
        << "mooncake_ha_batch_oplog_pruner_batch_ids_advanced_total "
        << pruner.batch_ids_advanced_total << "\n"
        << "# TYPE mooncake_ha_batch_oplog_pruner_errors_total counter\n"
-       << "mooncake_ha_batch_oplog_pruner_errors_total "
-       << pruner.errors_total << "\n";
+       << "mooncake_ha_batch_oplog_pruner_errors_total " << pruner.errors_total
+       << "\n";
 
     {
         SnapshotRuntime snapshot;

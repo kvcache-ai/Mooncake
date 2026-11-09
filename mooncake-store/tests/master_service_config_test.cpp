@@ -170,11 +170,10 @@ TEST(MasterServiceConfigTest, OpLogPruningDefaultsPropagateToSupervisor) {
     EXPECT_EQ(10u, service_config.oplog_prune_chunk_batch_count);
     EXPECT_EQ(50u, service_config.oplog_prune_max_batches_per_second);
 
-    const auto built =
-        MasterServiceConfig::builder()
-            .set_oplog_prune_chunk_batch_count(7)
-            .set_oplog_prune_max_batches_per_second(19)
-            .build();
+    const auto built = MasterServiceConfig::builder()
+                           .set_oplog_prune_chunk_batch_count(7)
+                           .set_oplog_prune_max_batches_per_second(19)
+                           .build();
     EXPECT_EQ(7u, built.oplog_prune_chunk_batch_count);
     EXPECT_EQ(19u, built.oplog_prune_max_batches_per_second);
 }

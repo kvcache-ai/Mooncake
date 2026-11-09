@@ -37,8 +37,8 @@ ErrorCode BatchOpLogPruningWorker::Start() {
     HAMetricManager::instance().update_batch_oplog_pruner_state(
         true, cursor_, target_floor_.value_or(0));
     try {
-        worker_thread_ = std::thread(&BatchOpLogPruningWorker::WorkerLoop,
-                                     this);
+        worker_thread_ =
+            std::thread(&BatchOpLogPruningWorker::WorkerLoop, this);
     } catch (const std::exception&) {
         HAMetricManager::instance().update_batch_oplog_pruner_state(
             false, cursor_, target_floor_.value_or(0));
@@ -76,11 +76,12 @@ Clock::duration BatchOpLogPruningWorker::ComputePacingDelay(
     const std::chrono::duration<double> target_seconds(
         static_cast<double>(chunk_batch_count_) /
         static_cast<double>(max_batches_per_second_));
-    if (target_seconds >= std::chrono::duration<double>(Clock::duration::max())) {
+    if (target_seconds >=
+        std::chrono::duration<double>(Clock::duration::max())) {
         return Clock::duration::max();
     }
-    const auto target = std::chrono::duration_cast<Clock::duration>(
-        target_seconds);
+    const auto target =
+        std::chrono::duration_cast<Clock::duration>(target_seconds);
     return delete_duration >= target ? Clock::duration::zero()
                                      : target - delete_duration;
 }
@@ -98,7 +99,8 @@ ErrorCode BatchOpLogPruningWorker::RunOneChunkLocked(
     }
     if (cursor_ >= *target_floor_) return ErrorCode::OK;
 
-    const uint64_t count = std::min(chunk_batch_count_, *target_floor_ - cursor_);
+    const uint64_t count =
+        std::min(chunk_batch_count_, *target_floor_ - cursor_);
     const uint64_t first_id = cursor_ + 1;
     const uint64_t last_id = cursor_ + count;
     const auto started = Clock::now();
@@ -161,8 +163,8 @@ ErrorCode BatchOpLogPruningWorker::RecoverCursor(uint64_t floor) {
     cursor_ = recovered_cursor;
     target_floor_ = floor;
     cursor_initialized_ = true;
-    HAMetricManager::instance().update_batch_oplog_pruner_state(
-        true, cursor_, floor);
+    HAMetricManager::instance().update_batch_oplog_pruner_state(true, cursor_,
+                                                                floor);
     return ErrorCode::OK;
 }
 

@@ -519,8 +519,7 @@ ErrorCode OpLogBatchStorage::FindOldestBatchId(
     std::string expected_prefix = BuildBatchRecordKey(cluster_id_, 0);
     expected_prefix.resize(expected_prefix.size() - kOpLogBatchIdWidth);
     uint64_t parsed_batch_id = 0;
-    if (kvs.front().key.size() !=
-            expected_prefix.size() + kOpLogBatchIdWidth ||
+    if (kvs.front().key.size() != expected_prefix.size() + kOpLogBatchIdWidth ||
         kvs.front().key.compare(0, expected_prefix.size(), expected_prefix) !=
             0 ||
         !TryParseBatchIdFromKey(kvs.front().key, parsed_batch_id) ||

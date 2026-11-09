@@ -1038,10 +1038,8 @@ ErrorCode MasterService::StartBatchOpLogPruningWorker(
         return ErrorCode::INVALID_PARAMS;
     }
     if (!batch_oplog_pruning_worker_) {
-        batch_oplog_pruning_worker_ =
-            std::make_unique<BatchOpLogPruningWorker>(
-                *batch_oplog_storage_, chunk_batch_count,
-                max_batches_per_second);
+        batch_oplog_pruning_worker_ = std::make_unique<BatchOpLogPruningWorker>(
+            *batch_oplog_storage_, chunk_batch_count, max_batches_per_second);
     }
     return batch_oplog_pruning_worker_->Start();
 }

@@ -713,10 +713,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("oplog_prune_chunk_batch_count",
                              &master_config.oplog_prune_chunk_batch_count,
                              FLAGS_oplog_prune_chunk_batch_count);
-    default_config.GetUInt64(
-        "oplog_prune_max_batches_per_second",
-        &master_config.oplog_prune_max_batches_per_second,
-        FLAGS_oplog_prune_max_batches_per_second);
+    default_config.GetUInt64("oplog_prune_max_batches_per_second",
+                             &master_config.oplog_prune_max_batches_per_second,
+                             FLAGS_oplog_prune_max_batches_per_second);
     default_config.GetUInt64("snapshot_interval_seconds",
                              &master_config.snapshot_interval_seconds, 600);
     default_config.GetString("snapshot_object_store_type",

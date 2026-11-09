@@ -35,8 +35,7 @@ class BatchOpLogPruningWorker {
     ErrorCode RefreshFloor();
     ErrorCode RecoverCursor(uint64_t floor);
     bool HasPendingWork() const;
-    bool WaitFor(std::chrono::steady_clock::duration duration,
-                 WaitState state);
+    bool WaitFor(std::chrono::steady_clock::duration duration, WaitState state);
     void WorkerLoop();
 
     OpLogBatchStorage& storage_;

@@ -912,9 +912,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                      worker_pool.get());
 
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
-            *leadership_session, [&server, &admin_server, &serving_state,
-                                  &label_reconciler,
-                                  &wrapped_master_service](auto reason) {
+            *leadership_session,
+            [&server, &admin_server, &serving_state, &label_reconciler,
+             &wrapped_master_service](auto reason) {
                 serving_state.RequestShutdown([&]() {
                     admin_server.SetServiceAvailable(false);
                     label_reconciler.SetLeader(false);

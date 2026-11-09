@@ -403,16 +403,16 @@ TEST_F(PruningTest, FloorPublicationDoesNotPerformPhysicalDeletion) {
     EXPECT_EQ(10u, metrics.get_snapshot_runtime().compaction_floor);
     EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
     EXPECT_EQ(errors, metrics
-                              .get_snapshot_operation(
-                                  HAMetricManager::SnapshotOperation::Prune)
-                              .errors);
+                          .get_snapshot_operation(
+                              HAMetricManager::SnapshotOperation::Prune)
+                          .errors);
     backend.delete_error = ErrorCode::OK;
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ(before + 1, metrics.get_snapshot_runtime().floor_advances_total);
     EXPECT_EQ(errors, metrics
-                              .get_snapshot_operation(
-                                  HAMetricManager::SnapshotOperation::Prune)
-                              .errors);
+                          .get_snapshot_operation(
+                              HAMetricManager::SnapshotOperation::Prune)
+                          .errors);
     EXPECT_EQ(0u, backend.delete_count);
     EXPECT_EQ("10", backend.values[floor_key]);
 }

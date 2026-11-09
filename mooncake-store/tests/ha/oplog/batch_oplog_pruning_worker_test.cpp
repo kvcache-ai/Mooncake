@@ -50,8 +50,7 @@ class FakeHaKvBackend : public HaKvBackend {
         ++delete_calls_;
         if (delete_error_ != ErrorCode::OK) return delete_error_;
         for (auto it = values_.lower_bound(std::string(begin_key));
-             it != values_.end() &&
-             std::string_view(it->first) < end_key;) {
+             it != values_.end() && std::string_view(it->first) < end_key;) {
             it = values_.erase(it);
         }
         return ErrorCode::OK;
@@ -88,14 +87,16 @@ class FakeHaKvBackend : public HaKvBackend {
     size_t delete_calls_{0};
 };
 
-TEST(BatchOpLogPruningWorkerTest, DeletesOnlyBoundedChunksThroughPublishedFloor) {
+TEST(BatchOpLogPruningWorkerTest,
+     DeletesOnlyBoundedChunksThroughPublishedFloor) {
     FakeHaKvBackend backend;
     const std::string cluster = "clusterA";
     ASSERT_EQ(ErrorCode::OK,
               backend.Put("/oplog/clusterA/snapshot/compaction_floor", "15"));
     for (uint64_t batch_id = 1; batch_id <= 15; ++batch_id) {
-        ASSERT_EQ(ErrorCode::OK,
-                  backend.Put(BuildBatchRecordKey(cluster, batch_id), "record"));
+        ASSERT_EQ(
+            ErrorCode::OK,
+            backend.Put(BuildBatchRecordKey(cluster, batch_id), "record"));
     }
 
     OpLogBatchStorage storage(cluster, backend);
@@ -151,8 +152,7 @@ TEST(BatchOpLogPruningWorkerTest, CountsDeleteRangeFailure) {
 TEST(BatchOpLogPruningWorkerTest,
      CountsFloorRefreshFailureOnceAfterSuccessfulChunkDelete) {
     const std::string cluster = "clusterA";
-    const std::string floor_key =
-        "/oplog/clusterA/snapshot/compaction_floor";
+    const std::string floor_key = "/oplog/clusterA/snapshot/compaction_floor";
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK, backend.Put(floor_key, "1"));
     ASSERT_EQ(ErrorCode::OK,
@@ -175,7 +175,8 @@ TEST(BatchOpLogPruningWorkerTest,
         std::istringstream value(
             serialized.substr(position + 1 + metric_name.size()));
         ASSERT_TRUE(value >> errors);
-        if (errors == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (errors == 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     const auto serialized = metrics.serialize_metrics();
@@ -189,11 +190,9 @@ TEST(BatchOpLogPruningWorkerTest,
     EXPECT_EQ(1u, errors);
 }
 
-TEST(BatchOpLogPruningWorkerTest,
-     StartsAndRetriesWhenInitialFloorReadFails) {
+TEST(BatchOpLogPruningWorkerTest, StartsAndRetriesWhenInitialFloorReadFails) {
     const std::string cluster = "clusterA";
-    const std::string floor_key =
-        "/oplog/clusterA/snapshot/compaction_floor";
+    const std::string floor_key = "/oplog/clusterA/snapshot/compaction_floor";
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK, backend.Put(floor_key, "1"));
     ASSERT_EQ(ErrorCode::OK,

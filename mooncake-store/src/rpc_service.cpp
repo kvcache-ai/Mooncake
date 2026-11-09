@@ -127,8 +127,8 @@ void WrappedMasterService::SetBatchOpLogTerminalCallback(
 
 ErrorCode WrappedMasterService::StartBatchOpLogPruningWorker(
     uint64_t chunk_batch_count, uint64_t max_batches_per_second) {
-    return master_service_.StartBatchOpLogPruningWorker(
-        chunk_batch_count, max_batches_per_second);
+    return master_service_.StartBatchOpLogPruningWorker(chunk_batch_count,
+                                                        max_batches_per_second);
 }
 
 void WrappedMasterService::RequestStopBatchOpLogPruningWorker() {
