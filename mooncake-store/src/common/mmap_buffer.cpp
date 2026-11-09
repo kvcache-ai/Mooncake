@@ -317,16 +317,18 @@ bool Contains(const std::vector<int> &nodes, int node) {
     return std::find(nodes.begin(), nodes.end(), node) != nodes.end();
 }
 
-// Anonymous mapping of exactly [ptr, ptr + size) with ptr 2MB-aligned, so
-// every PMD in it can be backed by a THP. Over-reserves by one huge page and
+// Private anonymous mapping of exactly [ptr, ptr + size), advised for THP. ptr
+// is slab-aligned (16MB, a multiple of 2MB), so every PMD in it can be backed
+// by a THP and a cachelib master accepts it. Over-reserves by one slab and
 // trims. Returns MAP_FAILED on failure, like mmap().
-void *mmap_thp_aligned(size_t size, int flags) {
-    const size_t reserve_size = size + SZ_2MB;
-    void *raw =
-        mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE, flags, -1, 0);
+void *mmap_thp_aligned(size_t size) {
+    constexpr size_t kAlign = facebook::cachelib::Slab::kSize;
+    const size_t reserve_size = size + kAlign;
+    void *raw = mmap(nullptr, reserve_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (raw == MAP_FAILED) return MAP_FAILED;
     const uintptr_t raw_addr = reinterpret_cast<uintptr_t>(raw);
-    const uintptr_t addr = align_up(raw_addr, SZ_2MB);
+    const uintptr_t addr = align_up(raw_addr, kAlign);
     if (addr > raw_addr) {
         munmap(raw, addr - raw_addr);
     }
@@ -334,7 +336,37 @@ void *mmap_thp_aligned(size_t size, int flags) {
     if (raw_addr + reserve_size > tail) {
         munmap(reinterpret_cast<void *>(tail), raw_addr + reserve_size - tail);
     }
-    return reinterpret_cast<void *>(addr);
+    void *ptr = reinterpret_cast<void *>(addr);
+
+    // Request THP explicitly instead of relying on the system default or on
+    // GLIBC_TUNABLES=glibc.malloc.hugetlb=1. With THP enabled=madvise a 4KB
+    // backed segment needs 512x more NIC page-table entries: EFA reg_mr runs
+    // out of them (ENOMEM) once several ranks register large segments, and on
+    // ionic a single MR over 2 GiB of 4 KiB pages already fails.
+    if (madvise(ptr, size, MADV_HUGEPAGE) != 0) {
+        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
+                     << strerror(errno) << "); segment may be 4KB backed";
+    }
+    return ptr;
+}
+
+// THP-advised private mapping of total_size bytes, or nullptr.
+void *map_thp_buffer(size_t total_size) {
+    if (total_size == 0 || total_size % SZ_2MB != 0) {
+        LOG(ERROR) << "Invalid THP segment size " << total_size
+                   << ", must be a non-zero multiple of " << SZ_2MB;
+        return nullptr;
+    }
+
+    // The mapping is exactly [ptr, ptr + total_size), which is what
+    // free_buffer_mmap_memory() unmaps.
+    void *ptr = mmap_thp_aligned(total_size);
+    if (ptr == MAP_FAILED) {
+        LOG(ERROR) << "mmap failed, size=" << total_size << ", errno=" << errno
+                   << " (" << strerror(errno) << ")";
+        return nullptr;
+    }
+    return ptr;
 }
 
 }  // namespace
@@ -397,6 +429,13 @@ void *allocate_buffer_numa_segments(size_t total_size,
 
     if (page_size == 0) page_size = getpagesize();
     size_t n = numa_nodes.size();
+    // A THP cannot straddle two regions bound to different nodes.
+    const bool thp = page_size == static_cast<size_t>(getpagesize());
+    if (thp && total_size % (SZ_2MB * n) != 0) {
+        LOG(ERROR) << "Invalid THP segment size " << total_size
+                   << ", must be a multiple of " << SZ_2MB * n;
+        return nullptr;
+    }
     size_t region_size = align_up(total_size / n, page_size);
     size_t map_size = region_size * n;
 
@@ -408,12 +447,11 @@ void *allocate_buffer_numa_segments(size_t total_size,
         flags |= MAP_HUGETLB | MAP_HUGE_512MB;
     } else if (page_size == SZ_1GB) {
         flags |= MAP_HUGETLB | MAP_HUGE_1GB;
-    } else if (page_size != static_cast<size_t>(getpagesize())) {
+    } else if (!thp) {
         flags |= MAP_HUGETLB;
     }
-    const bool thp = !(flags & MAP_HUGETLB);
     void *ptr =
-        thp ? mmap_thp_aligned(map_size, flags)
+        thp ? mmap_thp_aligned(map_size)
             : mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
         LOG(ERROR) << "mmap failed (hugepage="
@@ -421,13 +459,6 @@ void *allocate_buffer_numa_segments(size_t total_size,
                    << "), size=" << map_size << ", errno=" << errno << " ("
                    << strerror(errno) << ")";
         return nullptr;
-    }
-    // Same reason as in allocate_buffer_thp_interleaved(): 4KB-backed, the
-    // segment needs 512x more NIC page-table entries, and ibv_reg_mr fails
-    // (EINVAL/ENOMEM) once a few ranks register hundreds of GB each.
-    if (thp && madvise(ptr, map_size, MADV_HUGEPAGE) != 0) {
-        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
-                     << strerror(errno) << "); segment may be 4KB backed";
     }
 
     // bind each region to its NUMA node
@@ -452,7 +483,8 @@ void *allocate_buffer_numa_segments(size_t total_size,
     // get_user_pages(), whose faults respect the mbind policy.
 
     LOG(INFO) << "Allocated NUMA-segmented buffer: " << map_size << " bytes, "
-              << n << " regions, page_size=" << page_size << ", nodes=[" <<
+              << n << " regions, page_size=" << page_size
+              << (thp ? ", thp=madvise" : "") << ", nodes=[" <<
         [&]() {
             std::string s;
             for (size_t i = 0; i < n; ++i) {
@@ -464,32 +496,18 @@ void *allocate_buffer_numa_segments(size_t total_size,
     return ptr;
 }
 
+void *allocate_buffer_thp(size_t total_size) {
+    void *ptr = map_thp_buffer(total_size);
+    if (ptr) {
+        LOG(INFO) << "Allocated THP buffer: " << total_size << " bytes at "
+                  << ptr;
+    }
+    return ptr;
+}
+
 void *allocate_buffer_thp_interleaved(size_t total_size) {
-    constexpr size_t kThpSize = SZ_2MB;
-    if (total_size == 0 || total_size % kThpSize != 0) {
-        LOG(ERROR) << "Invalid THP segment size " << total_size
-                   << ", must be a non-zero multiple of " << kThpSize;
-        return nullptr;
-    }
-
-    // The mapping is exactly [ptr, ptr + total_size), which is what
-    // free_buffer_mmap_memory() unmaps.
-    void *ptr = mmap_thp_aligned(total_size,
-                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE);
-    if (ptr == MAP_FAILED) {
-        LOG(ERROR) << "mmap failed, size=" << total_size + kThpSize
-                   << ", errno=" << errno << " (" << strerror(errno) << ")";
-        return nullptr;
-    }
-
-    // Request THP explicitly instead of relying on the system default or on
-    // GLIBC_TUNABLES=glibc.malloc.hugetlb=1. With THP enabled=madvise a 4KB
-    // backed segment needs 512x more NIC page-table entries, and EFA reg_mr
-    // runs out of them (ENOMEM) once several ranks register large segments.
-    if (madvise(ptr, total_size, MADV_HUGEPAGE) != 0) {
-        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, errno=" << errno << " ("
-                     << strerror(errno) << "); segment may be 4KB backed";
-    }
+    void *ptr = map_thp_buffer(total_size);
+    if (!ptr) return nullptr;
 
     // Interleave across all allowed NUMA nodes. Under the default local
     // policy one node fills first, and from then on every THP fault runs

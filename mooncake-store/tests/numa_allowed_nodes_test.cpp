@@ -125,12 +125,36 @@ TEST_F(NumaAllowedNodesTest, BasePageSegmentedBufferRequestsThp) {
     if (access("/sys/kernel/mm/transparent_hugepage/enabled", F_OK) != 0) {
         GTEST_SKIP() << "THP is not available";
     }
+    EXPECT_EQ(allocate_buffer_numa_segments(kRegion + getpagesize(),
+                                            {allowed_.front()}, getpagesize()),
+              nullptr);
     const size_t size = 4 * kRegion;
     void* ptr =
         allocate_buffer_numa_segments(size, {allowed_.front()}, getpagesize());
     ASSERT_NE(ptr, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % kRegion, 0u);
     EXPECT_TRUE(VmaHasFlag(ptr, "hg"));
+    munmap(ptr, size);
+}
+
+// Each region starts on a 2MB boundary, and a size that would split a huge
+// page between two bindings is rejected.
+TEST_F(NumaAllowedNodesTest, BasePageRegionsStartOnHugePageBoundaries) {
+    if (allowed_.size() < 2) GTEST_SKIP() << "needs two allowed NUMA nodes";
+    if (access("/sys/kernel/mm/transparent_hugepage/enabled", F_OK) != 0) {
+        GTEST_SKIP() << "THP is not available";
+    }
+    const std::vector<int> nodes = {allowed_[0], allowed_[1]};
+    EXPECT_EQ(allocate_buffer_numa_segments(3 * kRegion, nodes, getpagesize()),
+              nullptr);
+
+    const size_t size = 4 * kRegion;
+    void* ptr = allocate_buffer_numa_segments(size, nodes, getpagesize());
+    ASSERT_NE(ptr, nullptr);
+    char* second = static_cast<char*>(ptr) + size / 2;
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(second) % kRegion, 0u);
+    EXPECT_TRUE(VmaHasFlag(ptr, "hg"));
+    EXPECT_TRUE(VmaHasFlag(second, "hg"));
     munmap(ptr, size);
 }
 
