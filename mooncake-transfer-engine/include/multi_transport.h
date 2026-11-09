@@ -69,11 +69,6 @@ class MultiTransport {
     // cleanup means in-flight transport work may still own transfer buffers.
     Status freeBatchID(BatchID batch_id);
 
-    // Block until batch_id has left the deferred-cleanup set. The handle is
-    // already invalid. Returns when that batch no longer owns its buffers,
-    // or when shutdown stops the cleaner.
-    void waitUntilDeferredCleanupDone(BatchID batch_id);
-
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
 
@@ -103,28 +98,13 @@ class MultiTransport {
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status,
                                   bool walk_tasks = false);
 
-    // Engine-owned counter-mode eventfd. -1 when this platform has no
-    // eventfd, or eventfd() failed. The caller may dup it; this object
-    // closes the original in its destructor.
-    //
-    // A non-negative fd means the engine has a notification facility. It
-    // does not mean a particular batch can finish without polling. Only a
-    // batch that opted in via enableBatchCompletionNotification, then
-    // submitted once on a counter-capable path, writes the fd. See RFC
-    // #5164.
+    // See TransferEngine::completionFd() / RFC #5164.
     int completionFd() const { return completion_fd_; }
 
-    // Opt in before the first submitTransfer. Fails when the facility is
-    // unavailable, when slice timeouts require foreground polling, or when
-    // the batch already has submitted tasks. Success only marks the batch;
-    // submit still rejects unsupported transports before dispatch.
+    // See TransferEngine::enableBatchCompletionNotification().
     Status enableBatchCompletionNotification(BatchID batch_id);
 
-    // Non-blocking. Swaps out every completion freeBatchID has not removed.
-    // One read of the counter, then the whole queue. An empty queue with a
-    // stale counter is discarded. A non-empty queue is returned even when
-    // that read is EAGAIN. Does not free batch handles and does not send
-    // peer notify.
+    // See TransferEngine::drainCompletions().
     Status drainCompletions(std::vector<BatchCompletion> &out);
 
     Transport *installTransport(const std::string &proto,
@@ -191,16 +171,6 @@ class MultiTransport {
     // to invalidating the handle.
     void discardQueuedCompletion(BatchID batch_id);
 
-    // Clears a queued ready entry and terminal_enqueued for demoted or
-    // rejected event paths. No-op when freeBatchID already suppressed the
-    // batch. Not used to start a second terminal wave: event-enabled
-    // batches reject a second submit instead.
-    void clearQueuedTerminal(BatchID batch_id);
-
-    // Install terminal_notify once, before dispatch. The function pointer
-    // stays immutable afterwards; terminal_suppressed hides publication.
-    void syncTerminalNotify(BatchDesc &batch_desc);
-
     void enqueueTerminal(BatchID batch_id, TransferStatus status);
 
     static void onTerminal(void *ctx, BatchID batch_id, TransferStatus status);
@@ -225,7 +195,7 @@ class MultiTransport {
     bool stop_deferred_cleanup_ = false;
     std::thread deferred_cleanup_thread_;
 
-    // completion_mu_ guards ready_ and the two terminal flags on BatchDesc.
+    // completion_mu_ guards ready_ and BatchDesc::terminal_suppressed.
     // The eventfd write stays outside the lock and is not retried.
     std::mutex completion_mu_;
     std::vector<BatchCompletion> ready_;

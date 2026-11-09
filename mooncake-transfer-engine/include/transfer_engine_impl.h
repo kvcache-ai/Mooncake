@@ -225,10 +225,6 @@ class TransferEngineImpl {
         });
     }
 
-    void waitUntilDeferredCleanupDone(BatchID batch_id) {
-        multi_transports_->waitUntilDeferredCleanupDone(batch_id);
-    }
-
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
     int sendNotifyByID(SegmentID target_id,
@@ -351,7 +347,21 @@ class TransferEngineImpl {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            flushPendingNotify(batch_id);
+            // Post a pending submitTransferWithNotify message once. Not
+            // invoked from the eventfd / CQ completion path (RFC #5164).
+            std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
+            {
+                RWSpinlock::WriteGuard guard(send_notifies_lock_);
+                auto notify = notifies_to_send_.find(batch_id);
+                if (notify == notifies_to_send_.end()) return result;
+                value = std::move(notify->second);
+                notifies_to_send_.erase(notify);
+            }
+            auto rc = sendNotifyByID(value.first, std::move(value.second));
+            if (rc) {
+                LOG(ERROR)
+                    << "Failed to send notify message, error code: " << rc;
+            }
         }
         return result;
     }
@@ -481,24 +491,6 @@ class TransferEngineImpl {
     void eraseMemoryRegionLocked(void* addr);
 
     void clearSkipRegistrationLocked(void* addr);
-
-    // Posts a pending submitTransferWithNotify message once. Called from
-    // getBatchTransferStatus when the batch is COMPLETED. Not invoked from
-    // the eventfd / CQ completion path (RFC #5164).
-    void flushPendingNotify(BatchID batch_id) {
-        std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
-        {
-            RWSpinlock::WriteGuard guard(send_notifies_lock_);
-            auto notify = notifies_to_send_.find(batch_id);
-            if (notify == notifies_to_send_.end()) return;
-            value = std::move(notify->second);
-            notifies_to_send_.erase(notify);
-        }
-        auto rc = sendNotifyByID(value.first, std::move(value.second));
-        if (rc) {
-            LOG(ERROR) << "Failed to send notify message, error code: " << rc;
-        }
-    }
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;

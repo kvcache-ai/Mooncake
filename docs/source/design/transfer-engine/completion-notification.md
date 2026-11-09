@@ -3,7 +3,8 @@
 Classic Transfer Engine only. TENT returns `completionFd() == -1`. One
 engine-owned fd is shared by every opted-in batch, so a readable fd may
 belong to some other batch. `drainCompletions` does not free the batch
-handle.
+handle. Full contract text lives on `TransferEngine` in
+`transfer_engine.h`.
 
 ```text
 fd = engine.completionFd()
@@ -45,41 +46,56 @@ while not settled:
 engine.freeBatchID(batch)
 ```
 
-Python, including an asyncio wait:
+Python asyncio should use one dispatcher per engine that routes drained
+rows to per-batch futures. Register the future before submit so a fast
+completion cannot be drained and discarded before `wait()` runs:
 
 ```python
 import asyncio
 
-async def wait_for_batch(engine, batch_id):
-    fd = engine.completion_fd()
-    loop = asyncio.get_running_loop()
-    target = None
-    while target is None:
-        readable = loop.create_future()
-        loop.add_reader(fd, readable.set_result, None)
-        try:
-            await readable
-        finally:
-            loop.remove_reader(fd)
-        for row in engine.drain_completions():
-            if row["batch_id"] == batch_id:
-                target = row
-    return target
+class CompletionDispatcher:
+    def __init__(self, engine, loop):
+        self._engine = engine
+        self._pending = {}  # batch_id -> Future
+        self._early = {}    # batch_id -> row, if drained before wait()
+        loop.add_reader(engine.completion_fd(), self._on_readable)
+
+    def _on_readable(self):
+        for row in self._engine.drain_completions():
+            batch_id = row["batch_id"]
+            fut = self._pending.pop(batch_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result(row)
+            else:
+                self._early[batch_id] = row
+
+    def wait(self, batch_id):
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        if batch_id in self._early:
+            fut.set_result(self._early.pop(batch_id))
+            return fut
+        self._pending[batch_id] = fut
+        return fut
 
 async def run(engine):
+    loop = asyncio.get_running_loop()
+    dispatcher = CompletionDispatcher(engine, loop)
     try:
+        # Prefer registering before submit when the batch id is known in
+        # advance (C++ allocate + enable + submit). The Python helper
+        # allocates inside batch_transfer_async, so register immediately
+        # after it returns and keep early rows in `_early`.
         batch_id = engine.batch_transfer_async(
             target_hostname, buffers, peer_addrs, lengths, opcode,
             enable_completion_notification=True)
     except CompletionNotificationFallback:
         # Poll-driven transport. Use the ordinary submit/poll path.
         return
-    except RuntimeError:
-        # openSegment, a length mismatch, or a failed notification submit.
-        # Buffers may be reused unless the message says they are still in use.
+    if batch_id == 0:
+        # openSegment, a length mismatch, or a failed submit.
         return
-    # `target` means every submitted task has settled. Then:
-    target = await wait_for_batch(engine, batch_id)
+    target = await dispatcher.wait(batch_id)
     engine.free_batch_id(batch_id)
     return target
 ```
