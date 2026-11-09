@@ -218,6 +218,18 @@ endif()
 if(USE_TENT)
   add_compile_definitions(transfer_engine PUBLIC USE_TENT)
   target_link_libraries(transfer_engine PUBLIC tent_link_group)
+  # TENT's HIXL engine includes <hixl/hixl.h>, which pulls in CANN's
+  # external/ge_common/api_error_codes.h. That header defines the inline
+  # ge::StatusFactory error registry, so the TENT Ascend transport archive
+  # carries weak ge::* symbols. If this DSO exports them, CANN libraries loaded
+  # afterwards bind their own GE error registration to this DSO's copy of the
+  # singleton; the interposed instance is torn down out of order and corrupts
+  # the GE heap at process exit ("corrupted size vs. prev_size"). Do not export
+  # the symbols that come from that archive; they are internal to this DSO.
+  if(BUILD_SHARED_LIBS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(transfer_engine PRIVATE
+                        "LINKER:--exclude-libs,libtent_xport_ascend_direct.a")
+  endif()
 endif()
 
 if(USE_MEMFABRIC)
