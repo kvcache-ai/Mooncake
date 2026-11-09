@@ -176,7 +176,7 @@ class LocalHotCacheTest : public ::testing::Test {
     };
 
     // Helper to create client with common parameters
-    std::optional<std::shared_ptr<Client>> CreateTestClient(
+    tl::expected<std::shared_ptr<Client>, ErrorCode> CreateTestClient(
         const std::string& hostname) {
         return Client::Create(hostname,
                               "P2PHANDSHAKE",  // use in-proc metadata server

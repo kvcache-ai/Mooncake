@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -99,6 +100,22 @@ TEST_F(RealClientUninitializedTest, GetIntoRangesDoesNotCrash) {
     auto results = client_->get_into_ranges(range_buffers, all_keys, offsets,
                                             offsets, range_sizes);
     ASSERT_EQ(results.size(), 1u);
+}
+
+TEST_F(RealClientUninitializedTest, FailedSetupReturnsTheCreateError) {
+    setenv("MC_STORE_CLIENT_SETUP_RETRIES", "1", 1);
+    unsetenv("MOONCAKE_ENABLE_EMBEDDED_MASTER");
+    const ConfigDict config = {
+        {CONFIG_KEY_LOCAL_HOSTNAME, "127.0.0.1"},
+        {CONFIG_KEY_METADATA_SERVER, "P2PHANDSHAKE"},
+        {CONFIG_KEY_MASTER_SERVER_ADDR, "127.0.0.1:1"},
+        {CONFIG_KEY_GLOBAL_SEGMENT_SIZE, "0"},
+        {CONFIG_KEY_LOCAL_BUFFER_SIZE, "0"},
+    };
+    const auto result = client_->setup_internal(config);
+    unsetenv("MC_STORE_CLIENT_SETUP_RETRIES");
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
 
 }  // namespace testing

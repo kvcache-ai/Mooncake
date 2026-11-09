@@ -126,10 +126,10 @@ class Client {
      * @param master_server_entry The entry of master server (IP:Port of master
      *        address for non-HA mode, or <backend>://connstring for HA mode,
      *        e.g. etcd://IP:Port;IP:Port;...;IP:Port)
-     * @return std::optional containing a shared_ptr to Client if successful,
-     * std::nullopt otherwise
+     * @return A shared_ptr to Client if successful, otherwise the error of
+     * the step that failed
      */
-    static std::optional<std::shared_ptr<Client>> Create(
+    static tl::expected<std::shared_ptr<Client>, ErrorCode> Create(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names = std::nullopt,
