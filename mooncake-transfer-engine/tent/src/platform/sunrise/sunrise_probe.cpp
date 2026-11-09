@@ -32,9 +32,8 @@
 namespace mooncake {
 namespace tent {
 
-static inline uintptr_t alignPage(uintptr_t address) {
-    const static size_t kPageSize = 4096;
-    return address & ~(kPageSize - 1);
+static inline uintptr_t alignPage(uintptr_t address, size_t page_size) {
+    return address & ~(page_size - 1);
 }
 
 static inline std::string genCpuNodeName(int node) {
@@ -265,18 +264,19 @@ const std::vector<RangeLocation> SunrisePlatform::getLocation(
         return entries;
     }
 
-    const static size_t kPageSize = 4096;
-    uintptr_t aligned_start = alignPage((uintptr_t)start);
+    const size_t page_size = probePageSize(start, len);
+    uintptr_t aligned_start = alignPage((uintptr_t)start, page_size);
     int n =
-        (uintptr_t(start) - aligned_start + len + kPageSize - 1) / kPageSize;
+        (uintptr_t(start) - aligned_start + len + page_size - 1) / page_size;
     std::vector<void*> pages(n);
     std::vector<int> status(n);
     for (int i = 0; i < n; i++) {
-        pages[i] = reinterpret_cast<void*>(aligned_start + i * kPageSize);
+        pages[i] = reinterpret_cast<void*>(aligned_start + i * page_size);
     }
 
     if (!skip_prefault) {
-        prefaultBeforeProbe(pages.data(), n, aligned_start, "SunrisePlatform");
+        prefaultBeforeProbe(pages.data(), n, aligned_start, "SunrisePlatform",
+                            {.page_size = page_size});
     }
 
     int rc = numa_move_pages(0, n, pages.data(), nullptr, status.data(), 0);
@@ -290,7 +290,8 @@ const std::vector<RangeLocation> SunrisePlatform::getLocation(
     uint64_t new_start_addr;
     for (int i = 1; i < n; i++) {
         if (status[i] != node) {
-            new_start_addr = alignPage((uint64_t)start) + i * kPageSize;
+            new_start_addr =
+                alignPage((uint64_t)start, page_size) + i * page_size;
             entries.push_back({start_addr, size_t(new_start_addr - start_addr),
                                genCpuNodeName(node)});
             start_addr = new_start_addr;
