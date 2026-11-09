@@ -172,6 +172,11 @@ class FaultProxyTransport : public Transport {
         return real_->sendNotification(target_id, notify);
     }
 
+    Status sendNotificationIfConnected(SegmentID target_id,
+                                       const Notification& notify) override {
+        return real_->sendNotificationIfConnected(target_id, notify);
+    }
+
     Status receiveNotification(
         std::vector<Notification>& notify_list) override {
         return real_->receiveNotification(notify_list);

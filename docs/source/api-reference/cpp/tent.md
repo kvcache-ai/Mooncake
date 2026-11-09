@@ -526,6 +526,7 @@ Status submitTransfer(BatchID batch_id,
 Submits transfers and sends a notification upon completion.
 
 - `notifi`: A `{name, msg}` payload delivered to the receiver when the transfer completes.
+- Delivery: the notification is due once a status poll sees every request of this call complete, and none if any of them failed or was canceled. With the RDMA transport loaded, the poll does not wait on the peer's control plane (at most 1 s for a notify QP send slot); without it, the poll makes the Notify RPC itself. What the poll cannot send is retried in the background for up to `notification/outbox_deadline_ms` (120 s by default), so it may arrive after notifications sent later. See [TENT Notifications](../../design/tent/notifications.md).
 - Typical use: Signal that transferred data is ready for consumption.
 
 #### TransferEngine::sendNotification

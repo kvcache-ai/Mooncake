@@ -308,7 +308,7 @@ class Workers {
         }
     };
 
-    std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path);
+    std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path, Status* failure);
 
     void disableEndpoint(RdmaSlice* slice);
 

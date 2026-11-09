@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -43,7 +44,9 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/common/utils/string_builder.h"
 #include "tent/transfer_engine.h"
+#include "tent/rpc/rpc.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/buffers.h"
@@ -329,6 +332,78 @@ class RdmaTransportTestPeer {
     static Status notifyStatusForEndpointFailure(const Status& failure) {
         return RdmaTransport::notifyStatusForEndpointFailure(failure);
     }
+
+    static constexpr int kMaxNotifyResendAttempts =
+        RdmaTransport::kMaxNotifyResendAttempts;
+
+    static bool resendOne(RdmaTransport& transport, PendingNotify& pending,
+                          std::chrono::steady_clock::time_point now) {
+        return transport.resendOne(pending, now);
+    }
+
+    static bool holdsResend(const Status& status) {
+        return RdmaTransport::holdsResend(status);
+    }
+
+    static std::vector<PendingNotify> resendQueue(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> lock(transport.notify_resend_mutex_);
+        return {transport.notify_resend_queue_.begin(),
+                transport.notify_resend_queue_.end()};
+    }
+
+    static void setRpcFallback(RdmaTransport& transport, bool on) {
+        transport.notify_rpc_fallback_ = on;
+    }
+    static bool rpcFallback(const RdmaTransport& transport) {
+        return transport.notify_rpc_fallback_;
+    }
+    static void setPathProbe(RdmaTransport& transport, bool on) {
+        transport.notify_path_probe_ = on;
+    }
+    static void setResendDeadline(RdmaTransport& transport,
+                                  std::chrono::milliseconds deadline) {
+        transport.notify_resend_deadline_ = deadline;
+    }
+    using NotifyConfig = RdmaTransport::NotifyConfig;
+    static NotifyConfig readNotifyConfig(const Config& conf) {
+        return RdmaTransport::readNotifyConfig(conf);
+    }
+    static size_t heldResends(RdmaTransport& transport) {
+        std::lock_guard<std::mutex> lock(transport.notify_resend_mutex_);
+        size_t held = 0;
+        for (const auto& peer : transport.notify_resend_held_)
+            held += peer.second.resends.size();
+        return held;
+    }
+    static uint64_t droppedResends(const RdmaTransport& transport) {
+        return transport.notify_resend_dropped_.load();
+    }
+    // Started and serving: the thread returns only once running is false.
+    static bool resendThreadStarted(const RdmaTransport& transport) {
+        return transport.notify_resend_running_ &&
+               transport.notify_resend_worker_.joinable();
+    }
+
+    static void requeue(RdmaTransport& transport, PendingNotify pending) {
+        transport.requeueNotifications({std::move(pending)});
+    }
+
+    // What install() starts; quiesce() stops and joins it.
+    static void startResendThread(RdmaTransport& transport) {
+        transport.notify_resend_running_ = true;
+        transport.notify_resend_worker_ =
+            std::thread(&RdmaTransport::notifyResendThread, &transport);
+    }
+
+    // Stops the thread without quiesce(), so a test that is not about
+    // quiesce() cannot hang on it.
+    static void wakeResendThread(RdmaTransport& transport) {
+        {
+            std::lock_guard<std::mutex> lock(transport.notify_resend_mutex_);
+            transport.notify_resend_running_ = false;
+        }
+        transport.notify_resend_cv_.notify_all();
+    }
 };
 
 // Friend accessor for RdmaContext: TENT reaches libibverbs through a table of
@@ -428,6 +503,9 @@ class TicketLockTestPeer {
 
 class RdmaEndPointTestPeer {
    public:
+    static constexpr size_t kNotifyMaxPendingSends =
+        RdmaEndPoint::kNotifyMaxPendingSends;
+
     static RdmaAddressSnapshot localAddress(const RdmaEndPoint& endpoint) {
         return endpoint.local_address_;
     }
@@ -475,9 +553,171 @@ class RdmaEndPointTestPeer {
         const std::shared_ptr<RdmaEndPoint>& endpoint) {
         return endpoint->notify_send_wr_id_;
     }
+    static void connectTypedNotify(
+        const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        std::lock_guard<std::mutex> lock(endpoint->notify_send_mutex_);
+        endpoint->notify_connected_.store(true);
+        endpoint->peer_notify_proto_ = 1;
+    }
+    static size_t resendable(const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        std::lock_guard<std::mutex> lock(endpoint->notify_send_mutex_);
+        return endpoint->notify_resendable_.size();
+    }
 };
 
 namespace {
+
+// Runs `fn` on a new thread, i.e. with its own RPC connection pool and
+// segment cache, so a port an earlier test used cannot hand it a stale one.
+template <typename Fn>
+auto onFreshThread(Fn fn) {
+    decltype(fn()) result{};
+    std::thread([&] { result = fn(); }).join();
+    return result;
+}
+
+// A peer control plane serving one memory segment at its own RPC address.
+// Bootstraps are refused with a reply, as ControlService refuses them; lookups
+// and bootstraps can be made to fail as RPC errors instead, and bootstraps to
+// be held or accepted.
+class FakePeer {
+   public:
+    explicit FakePeer(std::string nics = "[]", int failed_lookups = 0,
+                      std::shared_future<void> gate = {})
+        : nics_(std::move(nics)), failed_(failed_lookups), gate_(gate) {
+        // A host may divert a port elsewhere: move on until one answers.
+        bool up = false;
+        for (int attempt = 0; attempt < 5 && !up; ++attempt) up = serve();
+        EXPECT_TRUE(up) << "no port reached the fake peer";
+        PeerHealth::instance().clear();
+    }
+
+    const std::string& addr() const { return addr_; }
+    // Bootstraps past the first `refused` fail as RPC errors.
+    void failBootstraps(int refused = 0) { refused_bootstraps_ = refused; }
+    // Bootstraps are answered only once `release` is set.
+    void holdBootstraps(std::shared_future<void> release) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        hold_ = std::move(release);
+    }
+    // Bootstraps are accepted once `ready` has readied the dialing side, as
+    // the passive half of a simultaneous open does: the fake verbs cannot
+    // connect a notify queue pair.
+    void acceptBootstraps(std::function<void()> ready) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ready_ = std::move(ready);
+    }
+    int lookups() const { return lookups_; }
+    std::vector<std::string> bootstraps() { return copy(bootstraps_); }
+    std::vector<std::string> notified() { return copy(notified_); }
+    // The first `refused` notifies are answered the way a receiver without
+    // its callback answers them; the rest are taken.
+    void refuseNotifies(int refused) { refused_notifies_ = refused; }
+
+   private:
+    bool serve() {
+        server_ = std::make_unique<CoroRpcAgent>();
+        server_->registerFunction(GetSegmentDesc,
+                                  [this](auto&, auto& out) { lookup(out); });
+        server_->registerFunction(BootstrapRdma, [this](auto& in, auto& out) {
+            note(bootstraps_, json::parse(in)["peer_nic_path"].dump());
+            std::shared_future<void> hold;
+            std::function<void()> ready;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                hold = hold_;
+                ready = ready_;
+            }
+            if (hold.valid()) hold.wait();
+            if (++bootstrap_calls_ > refused_bootstraps_)
+                throw std::runtime_error("bootstrap failed");
+            BootstrapDesc reply;
+            if (ready) {
+                ready();
+                reply.local_gid = "fake-peer-gid";
+            } else {
+                reply.reply_msg = "NOT_READY: fake peer";
+            }
+            out = json(reply).dump();
+        });
+        server_->registerFunction(Probe, [](auto&, auto&) {});
+        server_->registerFunction(Notify, [this](auto& in, auto& out) {
+            if (++notify_calls_ <= refused_notifies_) {
+                out = "notify callback not registered";
+                return;
+            }
+            const auto j = json::parse(in);
+            note(notified_, j["session"].dump() + "/" + j["seq"].dump());
+        });
+        uint16_t port = 0;
+        if (!server_->start(port).ok()) return false;
+        addr_ = "127.0.0.1:" + std::to_string(port);
+        for (int i = 0; i < 5; ++i) {
+            if (onFreshThread([&] {
+                    return ControlClient::probe(addr_,
+                                                std::chrono::milliseconds(200))
+                        .ok();
+                }))
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+    void lookup(std::string& out) {
+        const int n = ++lookups_;
+        if (n == 1 && gate_.valid()) gate_.wait();
+        if (n <= failed_) throw std::runtime_error("lookup refused");
+        SegmentDesc desc{addr_, SegmentType::Memory, "fake-peer",
+                         addr_, MemorySegmentDesc{}, /*rdma_server_name=*/""};
+        (void)std::get<MemorySegmentDesc>(desc.detail)
+            .topology.parse(R"({"nics":)" + nics_ + "}");
+        out = json(desc).dump();
+    }
+    void note(std::vector<std::string>& to, std::string value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        to.push_back(std::move(value));
+    }
+    std::vector<std::string> copy(const std::vector<std::string>& from) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return from;
+    }
+
+    const std::string nics_;
+    const int failed_;
+    const std::shared_future<void> gate_;
+    std::string addr_;
+    std::atomic<int> refused_bootstraps_{std::numeric_limits<int>::max()};
+    std::atomic<int> bootstrap_calls_{0};
+    std::atomic<int> lookups_{0};
+    std::atomic<int> refused_notifies_{0};
+    std::atomic<int> notify_calls_{0};
+    std::mutex mutex_;
+    std::vector<std::string> bootstraps_, notified_;
+    std::shared_future<void> hold_;
+    std::function<void()> ready_;
+    // Last: stopped before what its handlers touch.
+    std::unique_ptr<CoroRpcAgent> server_;
+};
+
+// resendOne() on a fresh thread (see onFreshThread).
+bool resendOnFreshThread(RdmaTransport& transport, PendingNotify& pending,
+                         std::chrono::steady_clock::time_point now = {}) {
+    return onFreshThread([&] {
+        return RdmaTransportTestPeer::resendOne(transport, pending, now);
+    });
+}
+
+// Binds a p2p control plane to `transport` and opens each of `names` on it.
+std::vector<SegmentID> openPeers(RdmaTransport& transport,
+                                 const std::vector<std::string>& names) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport, metadata);
+    std::vector<SegmentID> ids(names.size());
+    for (size_t i = 0; i < names.size(); ++i)
+        EXPECT_TRUE(
+            metadata->segmentManager().openRemote(ids[i], names[i]).ok());
+    return ids;
+}
 
 bool hasRdmaDevice() {
     int count = 0;
@@ -1294,6 +1534,428 @@ TEST(RdmaNotifyFaultTriageTest, OtherEndpointFailuresStayEligible) {
         EXPECT_TRUE(mapped.IsDeviceNotFound())
             << failure.ToString() << " -> " << mapped.ToString();
     }
+}
+
+// Past the attempt budget only the RPC leg is tried, with the stamp intact;
+// without a control plane or with the RPC fallback off, a drop.
+TEST(RdmaNotifyPathTest, ResendBudgetGoesStraightToTheFallback) {
+    FakePeer peer;
+    RdmaTransport transport;
+    const int spent = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+    PendingNotify pending{9, {"n", "m", 0x5150, 7}, spent, 0};
+    EXPECT_FALSE(resendOnFreshThread(transport, pending));
+    EXPECT_EQ(pending.attempts, spent + 1);
+
+    pending.target = openPeers(transport, {peer.addr()})[0];
+    pending.attempts = spent;
+    EXPECT_TRUE(resendOnFreshThread(transport, pending));
+    RdmaTransportTestPeer::setRpcFallback(transport, false);
+    pending.attempts = spent;
+    EXPECT_FALSE(resendOnFreshThread(transport, pending));
+    EXPECT_EQ(peer.notified(), std::vector<std::string>{"20816/7"});
+}
+
+// A control plane that fails the lookup with an RPC error, or does not answer,
+// ends a resend round without the RPC leg; a spent budget goes straight to it.
+TEST(RdmaNotifyPathTest, DeadControlPlaneEndsTheResendWithoutFallback) {
+    FakePeer peer("[]", /*failed_lookups=*/2);  // the lookup and its retry
+    RdmaTransport transport;
+    const auto ids = openPeers(transport, {peer.addr(), "127.0.0.1:1"});
+    const SegmentID target = ids[0], dead = ids[1];
+    const int budget = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+
+    PendingNotify failed{target, {"n", "m", 1, 1}, budget - 1, 0};
+    EXPECT_FALSE(resendOnFreshThread(transport, failed));
+    EXPECT_TRUE(peer.notified().empty());
+    PendingNotify to_dead{dead, {"n", "m", 1, 2}, budget - 1, 0};
+    EXPECT_FALSE(resendOnFreshThread(transport, to_dead));
+    EXPECT_FALSE(PeerHealth::instance().shouldFailFast("127.0.0.1:1"));
+
+    PendingNotify spent{target, {"n", "m", 1, 3}, budget, 0};
+    EXPECT_TRUE(resendOnFreshThread(transport, spent));
+    EXPECT_EQ(peer.notified(), std::vector<std::string>{"1/3"});
+    PeerHealth::instance().clear();
+}
+
+// Held past the deadline from the first silence, a resend is dropped.
+TEST(RdmaNotifyPathTest, AResendGivesUpAfterTheDeadline) {
+    using std::chrono::seconds;
+    RdmaTransport transport;
+    const SegmentID dead = openPeers(transport, {"127.0.0.1:1"})[0];
+    RdmaTransportTestPeer::setResendDeadline(transport, seconds(10));
+    const auto t0 = std::chrono::steady_clock::now();
+    PendingNotify pending{dead, {"n", "m", 1, 1}, 0, 0};
+
+    EXPECT_FALSE(resendOnFreshThread(transport, pending, t0));
+    EXPECT_EQ(pending.attempts, 0);
+    EXPECT_EQ(pending.first_failed, t0);
+    EXPECT_EQ(pending.next_try, t0 + seconds(2));
+    EXPECT_FALSE(resendOnFreshThread(transport, pending, t0 + seconds(9)));
+    EXPECT_EQ(pending.next_try, t0 + seconds(10));
+    EXPECT_FALSE(resendOnFreshThread(transport, pending, t0 + seconds(10)));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 0u);
+
+    const auto late = t0 + seconds(10) + std::chrono::milliseconds(1);
+    EXPECT_FALSE(resendOnFreshThread(transport, pending, late));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 1u);
+    EXPECT_EQ(pending.next_try, std::chrono::steady_clock::time_point{});
+    PeerHealth::instance().clear();
+}
+
+// Past the RDMA rounds, a failed RPC leg is held the same way.
+TEST(RdmaNotifyPathTest, AFailedRpcLegIsHeldWithoutSpendingARound) {
+    RdmaTransport transport;
+    const SegmentID dead = openPeers(transport, {"127.0.0.1:1"})[0];
+    const int spent = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+    const auto t0 = std::chrono::steady_clock::now();
+    PendingNotify pending{dead, {"n", "m", 1, 1}, spent, 0};
+
+    EXPECT_FALSE(resendOnFreshThread(transport, pending, t0));
+    EXPECT_EQ(pending.attempts, spent);
+    EXPECT_EQ(pending.first_failed, t0);
+    EXPECT_EQ(pending.next_try, t0 + std::chrono::seconds(2));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 0u);
+    PeerHealth::instance().clear();
+}
+
+// An internal error from the RPC leg, a receiver that answered without taking
+// the notification, is held like a silent control plane; an invalid one, or
+// an RDMA failure with no RPC leg after it, is dropped.
+TEST(RdmaNotifyPathTest, AResendIsHeldWhenThePeerAnswersInternalError) {
+    const auto holds = &RdmaTransportTestPeer::holdsResend;
+    EXPECT_TRUE(holds(Status::RpcServiceError("no answer")));
+    EXPECT_TRUE(holds(Status::RpcConnectionError("marked unreachable")));
+    EXPECT_TRUE(holds(Status::InternalError("notify callback not registered")));
+    EXPECT_FALSE(holds(Status::InvalidArgument("malformed notification: x")));
+    EXPECT_FALSE(holds(Status::DeviceNotFound("no RDMA notification path")));
+    EXPECT_FALSE(holds(Status::RdmaError("resend budget spent")));
+}
+
+// A round that blocked on a silent peer dates its hold from when it ended.
+TEST(RdmaNotifyPathTest, AHoldIsDatedFromTheEndOfTheRound) {
+    std::promise<void> release;
+    FakePeer peer("[]", 0, release.get_future().share());
+    RdmaTransport transport;
+    const SegmentID target = openPeers(transport, {peer.addr()})[0];
+    const auto timeout = ControlClient::requestTimeout();
+    ControlClient::setRequestTimeout(std::chrono::milliseconds(200));
+    const auto start = std::chrono::steady_clock::now();
+    PendingNotify pending{target, {"n", "m", 1, 1}, 0, 0};
+
+    EXPECT_FALSE(resendOnFreshThread(transport, pending));
+    release.set_value();
+    ControlClient::setRequestTimeout(timeout);
+    EXPECT_GE(pending.first_failed - start, std::chrono::milliseconds(200));
+    EXPECT_EQ(pending.next_try, pending.first_failed + std::chrono::seconds(2));
+    PeerHealth::instance().clear();
+}
+
+// quiesce() wakes an idle resend thread and stops it.
+TEST(RdmaNotifyPathTest, QuiesceStopsAnIdleResendThread) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::startResendThread(transport);
+    auto quiesced =
+        std::async(std::launch::async, [&] { (void)transport.quiesce(); });
+    EXPECT_EQ(quiesced.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    quiesced.get();
+}
+
+// A hand-back wakes the idle resend thread; quiesce() waits out the resend
+// in flight and leaves the rest queued.
+TEST(RdmaNotifyPathTest, QuiesceWaitsForTheResendInFlightOnly) {
+    std::promise<void> release;
+    FakePeer held("[]", 0, release.get_future().share());
+    FakePeer queued;
+    RdmaTransport transport;
+    const auto ids = openPeers(transport, {held.addr(), queued.addr()});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));  // idle
+    RdmaTransportTestPeer::requeue(transport, {ids[0], {"n", "m", 1, 1}, 0, 0});
+    for (int i = 0; i < 500 && held.lookups() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    RdmaTransportTestPeer::requeue(transport, {ids[1], {"n", "m", 1, 2}, 0, 0});
+
+    auto quiesced =
+        std::async(std::launch::async, [&] { (void)transport.quiesce(); });
+    EXPECT_EQ(quiesced.wait_for(std::chrono::milliseconds(300)),
+              std::future_status::timeout);
+    release.set_value();
+    RdmaTransportTestPeer::wakeResendThread(transport);  // bounded if broken
+    quiesced.get();
+    EXPECT_EQ(held.notified(), std::vector<std::string>{"1/1"});
+    EXPECT_EQ(queued.lookups(), 0);
+    EXPECT_EQ(RdmaTransportTestPeer::resendQueue(transport).size(), 1u);
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 1u);
+}
+
+// What the resend thread still holds or queues when it stops is never sent,
+// so it counts as dropped.
+TEST(RdmaNotifyPathTest, ResendsLeftAtQuiesceCountAsDropped) {
+    RdmaTransport transport;
+    const SegmentID dead = openPeers(transport, {"127.0.0.1:1"})[0];
+    RdmaTransportTestPeer::startResendThread(transport);
+    RdmaTransportTestPeer::requeue(transport, {dead, {"n", "m", 1, 1}, 0, 0});
+    for (int i = 0;
+         i < 500 && RdmaTransportTestPeer::heldResends(transport) == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 0u);
+
+    (void)transport.quiesce();
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 1u);
+    PeerHealth::instance().clear();
+}
+
+// A dropped resend is done with: the thread does not hold it again.
+TEST(RdmaNotifyPathTest, ADroppedResendLeavesTheThread) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::setRpcFallback(transport, false);
+    const int spent = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+    RdmaTransportTestPeer::requeue(transport, {9, {"n", "m", 1, 1}, spent, 0});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 1u);
+    EXPECT_EQ(RdmaTransportTestPeer::heldResends(transport), 0u);
+}
+
+// The resend thread takes the oldest first, and a resend that throws (here a
+// msg the RPC leg cannot encode) costs that one only.
+TEST(RdmaNotifyPathTest, ResendThreadOutlivesAThrowingResend) {
+    FakePeer peer;
+    RdmaTransport transport;
+    const SegmentID target = openPeers(transport, {peer.addr()})[0];
+    const int spent = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+    RdmaTransportTestPeer::requeue(transport,
+                                   {target, {"n", "\xff", 1, 1}, spent, 0});
+    for (uint64_t seq = 2; seq <= 3; ++seq)
+        RdmaTransportTestPeer::requeue(transport,
+                                       {target, {"n", "m", 1, seq}, spent, 0});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    for (int i = 0; i < 500 && peer.notified().size() < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    EXPECT_EQ(peer.notified(), (std::vector<std::string>{"1/2", "1/3"}));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 1u);
+}
+
+// A peer whose control plane times out is waited out, not given up on.
+TEST(RdmaNotifyPathTest, AResendWaitsOutASilentPeer) {
+    std::promise<void> release;
+    FakePeer peer("[]", 0, release.get_future().share());
+    RdmaTransport transport;
+    const SegmentID target = openPeers(transport, {peer.addr()})[0];
+    const auto timeout = ControlClient::requestTimeout();
+    ControlClient::setRequestTimeout(std::chrono::milliseconds(200));
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    RdmaTransportTestPeer::requeue(transport, {target, {"n", "m", 1, 1}, 0, 0});
+    for (int i = 0;
+         i < 500 && RdmaTransportTestPeer::heldResends(transport) == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(RdmaTransportTestPeer::heldResends(transport), 1u);
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 0u);
+    EXPECT_TRUE(peer.notified().empty());
+
+    release.set_value();
+    PeerHealth::instance().clear();
+    for (int i = 0; i < 500 && peer.notified().empty(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    ControlClient::setRequestTimeout(timeout);
+    EXPECT_EQ(peer.notified(), std::vector<std::string>{"1/1"});
+    EXPECT_EQ(RdmaTransportTestPeer::heldResends(transport), 0u);
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 0u);
+}
+
+// A peer that answers it cannot take the notification yet is held like a
+// silent one and delivered on the next dial once it takes it.
+TEST(RdmaNotifyPathTest, AResendTheReceiverCannotTakeYetIsHeldThenDelivered) {
+    FakePeer peer;
+    // Refuse until the hold has been seen, so a slow test thread cannot miss
+    // it; then let the next dial through.
+    peer.refuseNotifies(std::numeric_limits<int>::max());
+    RdmaTransport transport;
+    const SegmentID target = openPeers(transport, {peer.addr()})[0];
+    const int spent = RdmaTransportTestPeer::kMaxNotifyResendAttempts;
+    RdmaTransportTestPeer::requeue(transport,
+                                   {target, {"n", "m", 1, 1}, spent, 0});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    bool held = false;
+    for (int i = 0; i < 500 && !held; ++i) {
+        held = RdmaTransportTestPeer::heldResends(transport) == 1;
+        if (!held) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(held);
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 0u);
+    EXPECT_TRUE(peer.notified().empty());
+
+    peer.refuseNotifies(0);
+    for (int i = 0; i < 1000 && peer.notified().empty(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    EXPECT_EQ(peer.notified(), std::vector<std::string>{"1/1"});
+    EXPECT_EQ(RdmaTransportTestPeer::heldResends(transport), 0u);
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 0u);
+    PeerHealth::instance().clear();
+}
+
+// Resends queued behind a held one go out at once; it is not redialed early.
+TEST(RdmaNotifyPathTest, AHeldResendDoesNotBlockAnotherPeer) {
+    FakePeer refusing("[]", /*failed_lookups=*/1000), peer;
+    RdmaTransport transport;
+    const auto ids = openPeers(transport, {refusing.addr(), peer.addr()});
+    RdmaTransportTestPeer::requeue(transport, {ids[0], {"n", "m", 1, 1}, 0, 0});
+    RdmaTransportTestPeer::requeue(transport, {ids[1], {"n", "m", 1, 2}, 0, 0});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    for (int i = 0; i < 300 && peer.notified().empty(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(peer.notified(), std::vector<std::string>{"1/2"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(refusing.lookups(), 2);  // the lookup and its retry
+    EXPECT_EQ(RdmaTransportTestPeer::heldResends(transport), 1u);
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+}
+
+// Resends held for one silent peer redial it once a round, with the oldest:
+// each dial may wait out a request timeout, and no other resend moves then.
+// Once the oldest gets through, the rest follow at once, in order.
+TEST(RdmaNotifyPathTest, HeldResendsDialASilentPeerOnceARound) {
+    const auto health = PeerHealth::instance().config();
+    auto off = health;
+    off.enabled = false;
+    PeerHealth::instance().configure(off);
+    FakePeer peer("[]", /*failed_lookups=*/4);  // two rounds
+    RdmaTransport transport;
+    const SegmentID id = openPeers(transport, {peer.addr()})[0];
+    for (uint64_t seq = 1; seq <= 4; ++seq)
+        RdmaTransportTestPeer::requeue(transport, {id, {"n", "m", 1, seq}});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    for (int i = 0;
+         i < 300 && RdmaTransportTestPeer::heldResends(transport) < 4; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(RdmaTransportTestPeer::heldResends(transport), 4u);
+    EXPECT_EQ(peer.lookups(), 2);  // the oldest's lookup and its retry
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    EXPECT_EQ(peer.lookups(), 4);  // one more round, the oldest again
+    for (int i = 0; i < 500 && peer.notified().size() < 4; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    EXPECT_EQ(peer.notified(),
+              (std::vector<std::string>{"1/1", "1/2", "1/3", "1/4"}));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 0u);
+    PeerHealth::instance().configure(health);
+    PeerHealth::instance().clear();
+}
+
+// When the oldest held resend runs out of time, those behind it that ran out
+// as well are dropped without dialing the silent peer once more each.
+TEST(RdmaNotifyPathTest, HeldResendsPastTheDeadlineAreDroppedWithoutADial) {
+    FakePeer refusing("[]", /*failed_lookups=*/1000);
+    RdmaTransport transport;
+    const SegmentID id = openPeers(transport, {refusing.addr()})[0];
+    RdmaTransportTestPeer::setResendDeadline(transport,
+                                             std::chrono::milliseconds(300));
+    for (uint64_t seq = 1; seq <= 3; ++seq)
+        RdmaTransportTestPeer::requeue(transport, {id, {"n", "m", 1, seq}});
+
+    RdmaTransportTestPeer::startResendThread(transport);
+    for (int i = 0;
+         i < 300 && RdmaTransportTestPeer::droppedResends(transport) < 3; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 3u);
+    EXPECT_EQ(refusing.lookups(), 4);  // two rounds of the oldest
+    EXPECT_EQ(RdmaTransportTestPeer::heldResends(transport), 0u);
+    RdmaTransportTestPeer::wakeResendThread(transport);
+    (void)transport.quiesce();
+    PeerHealth::instance().clear();
+}
+
+// A hand-back after quiesce(), e.g. from an endpoint uninstall() retires,
+// would never be sent: it is counted as dropped instead of queued.
+TEST(RdmaNotifyPathTest, AHandBackAfterQuiesceIsDropped) {
+    RdmaTransport transport;
+    RdmaTransportTestPeer::startResendThread(transport);
+    (void)transport.quiesce();
+    RdmaTransportTestPeer::requeue(transport, {9, {"n", "m", 1, 1}});
+    EXPECT_TRUE(RdmaTransportTestPeer::resendQueue(transport).empty());
+    EXPECT_EQ(RdmaTransportTestPeer::droppedResends(transport), 1u);
+}
+
+// install() starts the resend thread and takes the RPC leg's switch from the
+// key the engine reads, with the same default.
+TEST(RdmaNotifyPathTest, InstallReadsTheRpcFallbackSwitch) {
+    int count = 0;
+    ibv_device** devices = ibv_get_device_list(&count);
+    const std::string device =
+        devices && count > 0 ? ibv_get_device_name(devices[0]) : "";
+    if (devices) ibv_free_device_list(devices);
+    if (device.empty()) GTEST_SKIP() << "no RDMA device detected";
+    for (const int key : {-1, 0, 1}) {  // unset, false, true
+        auto conf = std::make_shared<Config>();
+        if (key >= 0) conf->set("notification/rpc_fallback", key == 1);
+        auto topology = topologyWithRdmaNics(1);
+        topology->nic_list_[0].name = device;
+        RdmaTransport transport;
+        std::string name = "127.0.0.1:1";
+        const Status installed = transport.install(
+            name, std::make_shared<ControlService>("p2p", "", nullptr),
+            topology, conf);
+        if (!installed.ok()) GTEST_SKIP() << installed.ToString();
+        EXPECT_EQ(RdmaTransportTestPeer::rpcFallback(transport), key != 0);
+        EXPECT_TRUE(RdmaTransportTestPeer::resendThreadStarted(transport));
+        RdmaTransportTestPeer::wakeResendThread(transport);
+        (void)transport.uninstall();
+    }
+}
+
+// The notification keys, read without a device: unset or <= 0 keeps the
+// default, and a resend deadline past 24 h is clamped, so that the hold's
+// deadline arithmetic cannot overflow.
+TEST(RdmaNotifyPathTest, NotifyKeysKeepTheirDefaultsAndBounds) {
+    using std::chrono::milliseconds;
+    auto read = [](const std::function<void(Config&)>& set) {
+        Config conf;
+        set(conf);
+        return RdmaTransportTestPeer::readNotifyConfig(conf);
+    };
+    auto config = read([](Config&) {});
+    EXPECT_TRUE(config.rpc_fallback);
+    EXPECT_TRUE(config.path_probe);
+    EXPECT_EQ(config.resend_deadline, milliseconds(120000));
+    for (const int64_t ms : {int64_t{0}, int64_t{-5}}) {
+        config = read([ms](Config& conf) {
+            conf.set("notification/resend_deadline_ms", ms);
+        });
+        EXPECT_EQ(config.resend_deadline, milliseconds(120000)) << ms;
+    }
+    config = read([](Config& conf) {
+        conf.set("notification/rpc_fallback", false);
+        conf.set("notification/path_probe", false);
+        conf.set("notification/resend_deadline_ms", 5000);
+    });
+    EXPECT_FALSE(config.rpc_fallback);
+    EXPECT_FALSE(config.path_probe);
+    EXPECT_EQ(config.resend_deadline, milliseconds(5000));
+    const int64_t huge = std::numeric_limits<int64_t>::max() / 1000000 + 1;
+    config = read([huge](Config& conf) {
+        conf.set("notification/resend_deadline_ms", huge);
+    });
+    EXPECT_EQ(config.resend_deadline, std::chrono::hours(24));
 }
 
 TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {
@@ -3620,11 +4282,12 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
 
     // Verbs stand-ins: enough for a context to hand out a protection domain
     // and a completion queue, and for an endpoint to create its queue pairs.
+    static constexpr int kQps = 16;
     struct FakeState {
         ibv_context native{};
         ibv_pd pd{};
         ibv_cq cq{};
-        ibv_qp qp[8]{};
+        ibv_qp qp[kQps]{};
         int next_qp = 0;
         int post_send_rc = 0;
         int post_send_bad_wr_index = -1;
@@ -3643,6 +4306,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     }
     static int destroyCq(ibv_cq*) { return 0; }
     static ibv_qp* createQp(ibv_pd*, ibv_qp_init_attr*) {
+        if (fake.next_qp == kQps) return nullptr;
         return &fake.qp[fake.next_qp++];
     }
     static int destroyQp(ibv_qp*) { return 0; }
@@ -3679,6 +4343,17 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         }
         *bad_wr = nullptr;
         return 0;
+    }
+
+    static void useFakeVerbs(RdmaContext& context) {
+        auto& verbs = RdmaContextTestPeer::verbs(context);
+        verbs.ibv_create_cq = createCq;
+        verbs.ibv_destroy_cq = destroyCq;
+        verbs.ibv_create_qp = createQp;
+        verbs.ibv_destroy_qp = destroyQp;
+        verbs.ibv_modify_qp = modifyQp;
+        verbs.ibv_reg_mr_default = regMr;
+        verbs.ibv_dereg_mr = deregMr;
     }
 
     void SetUp() override {
@@ -3721,14 +4396,7 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         params_->endpoint.qp_mul_factor = 1;
 
         context_ = RdmaTransportTestPeer::contextSet(transport_)[kDev];
-        auto& verbs = RdmaContextTestPeer::verbs(*context_);
-        verbs.ibv_create_cq = createCq;
-        verbs.ibv_destroy_cq = destroyCq;
-        verbs.ibv_create_qp = createQp;
-        verbs.ibv_destroy_qp = destroyQp;
-        verbs.ibv_modify_qp = modifyQp;
-        verbs.ibv_reg_mr_default = regMr;
-        verbs.ibv_dereg_mr = deregMr;
+        useFakeVerbs(*context_);
         RdmaContextTestPeer::bindDevice(*context_, &fake.native, params_);
         ASSERT_EQ(cq_.construct(context_.get(), 4096, 0), 0);
         ASSERT_EQ(notify_cq_.construct(context_.get(), 4096, 0), 0);
@@ -3756,6 +4424,10 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         for (auto* slice : slices_) RdmaSliceStorage::Get().deallocate(slice);
         for (auto* task : tasks_) task->deref();
         if (workers_) RdmaTransportTestPeer::destroyWorkerContexts(*workers_);
+        if (second_) {
+            ASSERT_EQ(RdmaContextTestPeer::unbindResources(*second_), 0);
+            RdmaContextTestPeer::unbindDevice(*second_);
+        }
         if (context_) {
             ASSERT_EQ(RdmaContextTestPeer::unbindResources(*context_), 0);
             RdmaContextTestPeer::unbindDevice(*context_);
@@ -3859,6 +4531,40 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         return slice;
     }
 
+    // An endpoint to the peer's `nic` that is up, typed notify included, from
+    // `local` or else the first NIC.
+    std::shared_ptr<RdmaEndPoint> readyPair(const std::string& peer,
+                                            const std::string& nic,
+                                            RdmaContext* local = nullptr) {
+        if (!local) local = context_.get();
+        auto endpoint =
+            local->endpointStore()->getOrInsert(MakeNicPath(peer, nic));
+        RdmaEndPointTestPeer::markReady(endpoint);
+        RdmaEndPointTestPeer::connectTypedNotify(endpoint);
+        return endpoint;
+    }
+
+    // A second local NIC on the same fake verbs. Pairs are numbered local NIC
+    // first, so with a two-NIC peer pair 2 is this NIC to the peer's NIC 0.
+    RdmaContext* enableSecondNic() {
+        second_ = std::make_shared<RdmaContext>(transport_);
+        useFakeVerbs(*second_);
+        RdmaContextTestPeer::bindDevice(*second_, &fake.native, params_);
+        EXPECT_EQ(second_cq_.construct(second_.get(), 4096, 0), 0);
+        EXPECT_EQ(second_notify_cq_.construct(second_.get(), 4096, 0), 0);
+        RdmaContextTestPeer::bindResources(*second_, &fake.pd, {&second_cq_},
+                                           &second_notify_cq_);
+        ibv_gid local_gid{};
+        local_gid.raw[15] = 0x12;
+        RdmaContextTestPeer::seedAddress(*second_, "mc-absent-rnic-2",
+                                         /*lid=*/8, /*gid_index=*/3, local_gid,
+                                         RdmaContext::DEVICE_ENABLED);
+        auto contexts = RdmaTransportTestPeer::contextSet(transport_);
+        contexts.push_back(second_);
+        RdmaTransportTestPeer::bindContexts(transport_, std::move(contexts));
+        return second_.get();
+    }
+
     // Drive one completion for `slice` through lane 0's poll path.
     void completeWith(RdmaSlice* slice, ibv_wc_status status,
                       uint64_t poll_ts = 1'000'000,
@@ -3892,6 +4598,9 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     std::shared_ptr<RdmaContext> context_;
     RdmaCQ cq_;
     RdmaCQ notify_cq_;
+    std::shared_ptr<RdmaContext> second_;
+    RdmaCQ second_cq_;
+    RdmaCQ second_notify_cq_;
     std::shared_ptr<RdmaEndPoint> endpoint_;
     std::unique_ptr<Workers> workers_;
     DeviceSelector* selector_ = nullptr;
@@ -3977,6 +4686,73 @@ TEST_F(RdmaWorkersSharedQpTest,
            "not escalate the cooldown as a failed on-wire probe";
     EXPECT_NE(retry_token, probe_token);
     rail->cancelProbe(kDev, kDev, retry_token);
+}
+
+TEST_F(RdmaWorkersSharedQpTest,
+       RefusedBootstrapFailsTheSliceButLeavesRailAndEndpointAlone) {
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto target_topology = std::make_shared<Topology>();
+    ASSERT_TRUE(target_topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-1","type":0,"numa_node":0}]})")
+                    .ok());
+    // The peer serves its segment, but its bootstrap address is a closed
+    // port: the endpoint lookup fails on the control plane, not the NIC.
+    auto peer = std::make_shared<ControlService>("p2p", "", nullptr);
+    uint16_t peer_port = 0;
+    ASSERT_TRUE(peer->start(peer_port).ok());
+    ASSERT_TRUE(peer->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.type = SegmentType::Memory;
+                        segment.name = "refused-bootstrap";
+                        segment.machine_id = "refused-bootstrap";
+                        segment.rpc_server_addr = "127.0.0.1:1";
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.topology = *target_topology;
+                        return Status::OK();
+                    })
+                    .ok());
+    SegmentID target_id = 0;
+    ASSERT_TRUE(
+        metadata->segmentManager()
+            .openRemote(target_id, "127.0.0.1:" + std::to_string(peer_port))
+            .ok());
+
+    RdmaTransportTestPeer::params(transport_)->workers.max_retry_count = 1;
+
+    auto rail = std::make_shared<RailMonitor>();
+    loadRailMonitor(*rail, /*cooldown_secs=*/30, /*error_threshold=*/1);
+    uint64_t probe_token = 0;
+    ASSERT_TRUE(rail->admit(kDev, kDev, probe_token));
+    ASSERT_EQ(probe_token, 0u);
+
+    // The slice was last posted on endpoint_, as a retried slice would be.
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    auto* slice = makeSlice();
+    slice->source_dev_id = kDev;
+    slice->target_dev_id = kDev;
+    slice->task->request.target_id = target_id;
+    slice->rail_monitor = rail;
+    slice->rail_probe_token.store(0, std::memory_order_release);
+    slice->ep_weak_ptr = endpoint_;
+    RdmaTransportTestPeer::queuePostPath(*workers_, /*worker_id=*/0,
+                                         /*local_device_id=*/kDev,
+                                         /*remote_segment_id=*/target_id,
+                                         /*remote_device_id=*/kDev, slice);
+
+    RdmaTransportTestPeer::postSend(*workers_, /*worker_id=*/0);
+
+    EXPECT_EQ(slice->word, FAILED);
+    uint64_t retry_token = 0;
+    EXPECT_TRUE(rail->admit(kDev, kDev, retry_token))
+        << "A refused control-plane dial is no fault of the NIC pair: the "
+           "rail must stay closed, not be paused as a failed transfer";
+    EXPECT_EQ(retry_token, 0u) << "The rail must not have to probe itself";
+    EXPECT_EQ(endpoint_->status(), RdmaEndPoint::EP_READY)
+        << "The endpoint the slice last used must not be reset";
 }
 
 TEST_F(RdmaWorkersSharedQpTest,
@@ -4089,6 +4865,563 @@ TEST_F(RdmaWorkersSharedQpTest,
         EXPECT_EQ(slice->word, PENDING);
         EXPECT_EQ(slice->completions_owed.fetch_sub(1), 1);
     }
+}
+
+// Only tracked typed sends are kept, and a disabled notify QP hands them back.
+TEST_F(RdmaWorkersSharedQpTest, OnlyTrackedTypedNotifySendsAreHandedBack) {
+    RdmaEndPointTestPeer::connectTypedNotify(endpoint_);
+    Notification notifi{"n", "m", 9, 1};
+    const auto since = std::chrono::steady_clock::now();
+    const PendingNotify track{5, {}, 2, 1, since};
+    ASSERT_TRUE(endpoint_->sendNotification(notifi, &track));  // wr_id 0
+    ASSERT_TRUE(endpoint_->sendNotification(notifi));          // untracked
+    const Notification raw{"n", "m", 0, 0};
+    ASSERT_TRUE(endpoint_->sendNotification(raw, &track));  // not stamped
+    notifi.seq = 2;
+    ASSERT_TRUE(endpoint_->sendNotification(notifi, &track));
+    const Notification big{"n", std::string(65500, 'x'), 9, 3};
+    ASSERT_TRUE(endpoint_->sendNotification(big, &track));  // raw: too big
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint_), 2u);
+
+    endpoint_->handleNotifySendComplete(0);
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint_), 1u);
+    endpoint_->disableNotification("test");
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint_), 0u);
+    const auto queued = RdmaTransportTestPeer::resendQueue(transport_);
+    ASSERT_EQ(queued.size(), 1u);
+    EXPECT_EQ(queued[0].target, 5);
+    EXPECT_EQ(queued[0].notifi.seq, 2u);
+    EXPECT_EQ(queued[0].attempts, 2);
+    EXPECT_EQ(queued[0].last_path, 1);
+    EXPECT_EQ(queued[0].first_failed, since);
+}
+
+// A resend round walks the pairs after the failed one, skipping the peer's
+// other NIC types, and ends on the failed pair; only when no pair posts does
+// the RPC leg deliver. A refused bootstrap is an answer, so the round goes
+// on; an RPC error ends it there.
+TEST_F(RdmaWorkersSharedQpTest, ResendWalksThePairsAfterTheFailedOne) {
+    const std::string nics = R"([{"name":"peer-rnic-0","type":0,"numa_node":0},
+                      {"name":"peer-tcp-1","type":1,"numa_node":0},
+                      {"name":"peer-rnic-2","type":0,"numa_node":0},
+                      {"name":"peer-rnic-3","type":0,"numa_node":0}])";
+    FakePeer peer(nics), silent(nics);
+    silent.failBootstraps();
+    const auto ids = openPeers(transport_, {peer.addr(), silent.addr()});
+    auto ready = [&](const std::string& nic) {
+        auto endpoint = context_->endpointStore()->getOrInsert(
+            MakeNicPath(peer.addr(), nic));
+        RdmaEndPointTestPeer::markReady(endpoint);
+        RdmaEndPointTestPeer::connectTypedNotify(endpoint);
+        return endpoint;
+    };
+    auto pair0 = ready("peer-rnic-0"), pair3 = ready("peer-rnic-3");
+
+    ASSERT_TRUE(onFreshThread([&] {
+                    return transport_.sendNotification(ids[0],
+                                                       {"n", "m", 9, 1});
+                }).ok());
+    pair0->disableNotification("test");
+    auto queued = RdmaTransportTestPeer::resendQueue(transport_);
+    ASSERT_EQ(queued.size(), 1u);
+    PendingNotify pending = queued.back();
+    EXPECT_EQ(pending.target, ids[0]);
+    EXPECT_EQ(pending.attempts, 0);
+    EXPECT_EQ(pending.last_path, 0);
+
+    EXPECT_TRUE(resendOnFreshThread(transport_, pending));  // posts on pair 3
+    // A third hand-back still walks, and ends on pair 3.
+    const auto since = std::chrono::steady_clock::now();
+    PendingNotify again{ids[0], {"n", "m", 9, 4}, 2, /*last_path=*/3, since};
+    EXPECT_TRUE(resendOnFreshThread(transport_, again));
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair3), 2u);
+    pair3->disableNotification("test");
+    queued = RdmaTransportTestPeer::resendQueue(transport_);
+    ASSERT_EQ(queued.size(), 3u);
+    pending = queued[1];
+    EXPECT_EQ(pending.notifi.seq, 1u);
+    EXPECT_EQ(pending.attempts, 1);
+    EXPECT_EQ(pending.last_path, 3);
+    EXPECT_EQ(queued[2].first_failed, since);
+    EXPECT_TRUE(resendOnFreshThread(transport_, pending));  // RPC leg
+    for (const auto& bootstrap : peer.bootstraps())
+        EXPECT_NE(bootstrap.find("peer-rnic-2"), std::string::npos);
+    EXPECT_EQ(peer.bootstraps().size(), 3u);
+    EXPECT_EQ(peer.notified(), std::vector<std::string>{"9/1"});
+
+    PendingNotify cut{ids[1], {"n", "m", 9, 2}, 0, /*last_path=*/2};
+    EXPECT_FALSE(resendOnFreshThread(transport_, cut));
+    ASSERT_EQ(silent.bootstraps().size(), 1u);
+    EXPECT_NE(silent.bootstraps()[0].find("peer-rnic-3"), std::string::npos);
+    // A fourth goes straight to the RPC leg.
+    PendingNotify spent{ids[1], {"n", "m", 9, 3}, 3, 0};
+    EXPECT_TRUE(resendOnFreshThread(transport_, spent));
+    EXPECT_EQ(silent.bootstraps().size(), 1u);
+    EXPECT_EQ(silent.notified(), std::vector<std::string>{"9/3"});
+}
+
+// The no-dial send takes pair 0 once it is up, on any thread. No desc yet, no
+// endpoint or one not yet ready is "not connected", and none of them sends the
+// peer a lookup or a bootstrap.
+TEST_F(RdmaWorkersSharedQpTest, SendIfConnectedNeverDials) {
+    FakePeer peer(R"([{"name":"peer-rnic-0","type":0,"numa_node":0}])");
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto& segments = metadata->segmentManager();
+    SegmentID id = 0;
+    ASSERT_TRUE(segments.openRemote(id, peer.addr()).ok());
+    auto send = [&] {
+        return onFreshThread([&] {
+            return transport_.sendNotificationIfConnected(id, {"n", "m", 9, 1});
+        });
+    };
+
+    EXPECT_TRUE(send().IsDeviceNotFound());
+    EXPECT_EQ(peer.lookups(), 0);
+    std::weak_ptr<SegmentDesc> fetched;
+    EXPECT_TRUE(onFreshThread([&] {
+                    SegmentDescRef desc;
+                    auto status = segments.getRemoteCached(desc, id);
+                    fetched = desc;
+                    return status;
+                }).ok());
+    EXPECT_TRUE(send().IsDeviceNotFound());
+    auto endpoint = context_->endpointStore()->getOrInsert(
+        MakeNicPath(peer.addr(), "peer-rnic-0"));
+    ASSERT_TRUE(endpoint);
+    EXPECT_TRUE(send().IsDeviceNotFound());
+    RdmaEndPointTestPeer::markReady(endpoint);
+    RdmaEndPointTestPeer::connectTypedNotify(endpoint);
+    EXPECT_TRUE(send().ok());
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint), 1u);
+
+    // Opening another segment leaves this one's desc in use.
+    SegmentID other = 0;
+    ASSERT_TRUE(segments.openRemote(other, "127.0.0.1:1").ok());
+    EXPECT_TRUE(send().ok());
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint), 2u);
+    EXPECT_EQ(peer.lookups(), 1);  // the test's own
+    EXPECT_TRUE(peer.bootstraps().empty());
+    // Closing the segment lets go of its desc.
+    EXPECT_FALSE(fetched.expired());
+    ASSERT_TRUE(segments.closeRemote(id).ok());
+    EXPECT_TRUE(fetched.expired());
+    EXPECT_TRUE(send().IsDeviceNotFound());
+}
+
+// A fetch still in flight when its segment closes leaves no desc behind for
+// the no-dial send to use.
+TEST_F(RdmaWorkersSharedQpTest, SendIfConnectedNeverUsesAClosedSegment) {
+    std::promise<void> release;
+    FakePeer peer(R"([{"name":"peer-rnic-0","type":0,"numa_node":0}])", 0,
+                  release.get_future().share());
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto& segments = metadata->segmentManager();
+    SegmentID id = 0;
+    ASSERT_TRUE(segments.openRemote(id, peer.addr()).ok());
+    auto endpoint = context_->endpointStore()->getOrInsert(
+        MakeNicPath(peer.addr(), "peer-rnic-0"));
+    RdmaEndPointTestPeer::markReady(endpoint);
+    RdmaEndPointTestPeer::connectTypedNotify(endpoint);
+
+    auto fetch = std::async(std::launch::async, [&] {
+        SegmentDescRef desc;
+        return segments.getRemoteCached(desc, id);
+    });
+    for (int i = 0; i < 500 && peer.lookups() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_TRUE(segments.closeRemote(id).ok());
+    release.set_value();
+    EXPECT_TRUE(fetch.get().ok());
+    const Status status = onFreshThread([&] {
+        return transport_.sendNotificationIfConnected(id, {"n", "m", 9, 1});
+    });
+    EXPECT_TRUE(status.IsDeviceNotFound()) << status.ToString();
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(endpoint), 0u);
+}
+
+// A peer with two RDMA NICs: pairs 0 and 1 from the one enabled context.
+const char* const kTwoRdmaNics =
+    R"([{"name":"peer-rnic-0","type":0,"numa_node":0},
+        {"name":"peer-rnic-1","type":0,"numa_node":0}])";
+
+// A new notification whose pair 0 is refused goes out on another pair that is
+// up, as a first send there (attempts 0). Pair 0 is never dialed twice for one
+// notification, and with the probe off the refusal is what the caller sees.
+TEST_F(RdmaWorkersSharedQpTest,
+       ANewNotificationTakesAnotherPairWhenTheFirstIsRefused) {
+    FakePeer peer(kTwoRdmaNics);
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+    auto pair1 = readyPair(peer.addr(), "peer-rnic-1");
+    auto send = [&](uint64_t seq) {
+        return onFreshThread([&] {
+            return transport_.sendNotification(id, {"n", "m", 9, seq});
+        });
+    };
+
+    EXPECT_TRUE(send(1).ok());
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair1), 1u);
+    ASSERT_EQ(peer.bootstraps().size(), 1u);
+    EXPECT_NE(peer.bootstraps()[0].find("peer-rnic-0"), std::string::npos);
+
+    RdmaTransportTestPeer::setPathProbe(transport_, false);
+    EXPECT_TRUE(send(2).IsDeviceNotFound());
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair1), 1u);
+    pair1->disableNotification("test");
+    const auto queued = RdmaTransportTestPeer::resendQueue(transport_);
+    ASSERT_EQ(queued.size(), 1u);
+    EXPECT_EQ(queued[0].notifi.seq, 1u);
+    EXPECT_EQ(queued[0].attempts, 0);
+    EXPECT_EQ(queued[0].last_path, 1);
+
+    RdmaTransportTestPeer::setPathProbe(transport_, true);
+    EXPECT_TRUE(send(3).IsDeviceNotFound());  // pair 1 cannot take it either
+    EXPECT_EQ(peer.bootstraps().size(), 3u);
+}
+
+// Takes every send slot of `pair`, so its next send waits out the stall.
+void fillSendQueue(const std::shared_ptr<RdmaEndPoint>& pair) {
+    for (size_t i = 0; i < RdmaEndPointTestPeer::kNotifyMaxPendingSends; ++i)
+        ASSERT_TRUE(pair->sendNotification({"n", "m", 9, 0}));
+}
+
+// A stalled pair 0 leaves the peer's NIC 0 suspect: pair 2 goes there too, so
+// it is not taken although it is up. With no other pair up, the full path
+// dials pair 1, to the peer's other NIC, and the notification goes out there.
+TEST_F(RdmaWorkersSharedQpTest, AStalledPairDialsOnlyThePeersOtherNics) {
+    FakePeer peer(kTwoRdmaNics);
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+    RdmaContext* second = enableSecondNic();
+    auto pair0 = readyPair(peer.addr(), "peer-rnic-0");
+    ASSERT_NO_FATAL_FAILURE(fillSendQueue(pair0));
+    auto pair2 = readyPair(peer.addr(), "peer-rnic-0", second);
+    peer.acceptBootstraps([&] { readyPair(peer.addr(), "peer-rnic-1"); });
+
+    const Status status = onFreshThread(
+        [&] { return transport_.sendNotification(id, {"n", "m", 9, 1}); });
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair2), 0u);
+    ASSERT_EQ(peer.bootstraps().size(), 1u);
+    EXPECT_NE(peer.bootstraps()[0].find("peer-rnic-1"), std::string::npos);
+    auto pair1 =
+        context_->endpointStore()->get(MakeNicPath(peer.addr(), "peer-rnic-1"));
+    ASSERT_TRUE(pair1);
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair1), 1u);
+}
+
+// After a stall a pair already up to the peer's other NIC goes before any
+// dial: a bootstrap may wait on a frozen peer.
+TEST_F(RdmaWorkersSharedQpTest, AStalledPairTakesAPairUpBeforeDialing) {
+    FakePeer peer(kTwoRdmaNics);
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+    RdmaContext* second = enableSecondNic();
+    auto pair0 = readyPair(peer.addr(), "peer-rnic-0");
+    ASSERT_NO_FATAL_FAILURE(fillSendQueue(pair0));
+    auto pair3 = readyPair(peer.addr(), "peer-rnic-1", second);
+    peer.acceptBootstraps([&] { readyPair(peer.addr(), "peer-rnic-1"); });
+
+    const Status status = onFreshThread(
+        [&] { return transport_.sendNotification(id, {"n", "m", 9, 1}); });
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair3), 1u);
+    EXPECT_TRUE(peer.bootstraps().empty());
+}
+
+// A peer with one RDMA NIC has no other to go to: after a stall no pair is
+// tried, not even one up from another local NIC, and none is dialed.
+TEST_F(RdmaWorkersSharedQpTest, AStalledPairToAOneNicPeerTakesNoOtherPair) {
+    FakePeer peer(R"([{"name":"peer-rnic-0","type":0,"numa_node":0}])");
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+    RdmaContext* second = enableSecondNic();
+    auto pair0 = readyPair(peer.addr(), "peer-rnic-0");
+    ASSERT_NO_FATAL_FAILURE(fillSendQueue(pair0));
+    peer.acceptBootstraps(
+        [&] { readyPair(peer.addr(), "peer-rnic-0", second); });
+    auto send = [&](uint64_t seq) {
+        return onFreshThread([&] {
+            return transport_.sendNotification(id, {"n", "m", 9, seq});
+        });
+    };
+
+    const Status status = send(1);
+    EXPECT_TRUE(status.IsRdmaError()) << status.ToString();
+    EXPECT_TRUE(peer.bootstraps().empty());
+    auto pair1 = readyPair(peer.addr(), "peer-rnic-0", second);
+    const Status again = send(2);
+    EXPECT_TRUE(again.IsRdmaError()) << again.ToString();
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair1), 0u);
+    EXPECT_TRUE(peer.bootstraps().empty());
+}
+
+// The no-dial send skips the stalled pair's peer NIC the same way and dials
+// nothing: only once a pair to the peer's other NIC is up does it go out.
+TEST_F(RdmaWorkersSharedQpTest, TheNoDialSendNeverDialsOnAStall) {
+    FakePeer peer(kTwoRdmaNics);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto& segments = metadata->segmentManager();
+    SegmentID id = 0;
+    ASSERT_TRUE(segments.openRemote(id, peer.addr()).ok());
+    ASSERT_TRUE(onFreshThread([&] {
+                    SegmentDescRef desc;
+                    return segments.getRemoteCached(desc, id);
+                }).ok());
+    RdmaContext* second = enableSecondNic();
+    auto pair0 = readyPair(peer.addr(), "peer-rnic-0");
+    ASSERT_NO_FATAL_FAILURE(fillSendQueue(pair0));
+    auto pair2 = readyPair(peer.addr(), "peer-rnic-0", second);
+    peer.acceptBootstraps([&] { readyPair(peer.addr(), "peer-rnic-1"); });
+    auto send = [&](uint64_t seq) {
+        return onFreshThread([&] {
+            return transport_.sendNotificationIfConnected(id,
+                                                          {"n", "m", 9, seq});
+        });
+    };
+
+    const Status status = send(1);
+    EXPECT_TRUE(status.IsRdmaError()) << status.ToString();
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair2), 0u);
+    EXPECT_TRUE(peer.bootstraps().empty());
+    auto pair3 = readyPair(peer.addr(), "peer-rnic-1", second);
+    EXPECT_TRUE(send(2).ok());
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair3), 1u);
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair2), 0u);
+    EXPECT_TRUE(peer.bootstraps().empty());
+}
+
+// After a stall, a dial the peer's control plane does not answer ends the
+// send with that RPC error: the caller waits one stall and one request timeout,
+// as the RPC fallback would only wait on the same control plane again.
+TEST_F(RdmaWorkersSharedQpTest, AStalledPairWithAFrozenPeerReturnsTheRpcError) {
+    std::promise<void> release;
+    FakePeer peer(kTwoRdmaNics);
+    peer.holdBootstraps(release.get_future().share());
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+    enableSecondNic();
+    auto pair0 = readyPair(peer.addr(), "peer-rnic-0");
+    ASSERT_NO_FATAL_FAILURE(fillSendQueue(pair0));
+    // Peer health off, so a second dial would show as a second bootstrap.
+    const auto health = PeerHealth::instance().config();
+    auto off = health;
+    off.enabled = false;
+    PeerHealth::instance().configure(off);
+    const auto timeout = ControlClient::requestTimeout();
+    ControlClient::setRequestTimeout(std::chrono::milliseconds(300));
+
+    const auto begin = std::chrono::steady_clock::now();
+    const Status status = onFreshThread(
+        [&] { return transport_.sendNotification(id, {"n", "m", 9, 1}); });
+    const auto took = std::chrono::steady_clock::now() - begin;
+    release.set_value();
+    ControlClient::setRequestTimeout(timeout);
+    PeerHealth::instance().configure(health);
+    EXPECT_TRUE(status.IsRpcServiceError()) << status.ToString();
+    EXPECT_GE(took, std::chrono::milliseconds(1300));
+    EXPECT_LT(took, std::chrono::milliseconds(1600));
+    EXPECT_EQ(peer.bootstraps().size(), 1u);
+    PeerHealth::instance().clear();
+}
+
+// A pair 0 whose notify queue pair never connected, as with a peer that has
+// none, is not a stall: either send still takes a pair up to the peer's NIC 0
+// and dials none of its other NICs.
+TEST_F(RdmaWorkersSharedQpTest, APairWithoutANotifyChannelIsNotAStall) {
+    FakePeer peer(kTwoRdmaNics);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto& segments = metadata->segmentManager();
+    SegmentID id = 0;
+    ASSERT_TRUE(segments.openRemote(id, peer.addr()).ok());
+    ASSERT_TRUE(onFreshThread([&] {
+                    SegmentDescRef desc;
+                    return segments.getRemoteCached(desc, id);
+                }).ok());
+    RdmaContext* second = enableSecondNic();
+    RdmaEndPointTestPeer::markReady(context_->endpointStore()->getOrInsert(
+        MakeNicPath(peer.addr(), "peer-rnic-0")));
+    auto pair2 = readyPair(peer.addr(), "peer-rnic-0", second);
+    peer.acceptBootstraps([&] { readyPair(peer.addr(), "peer-rnic-1"); });
+
+    const Status hook = onFreshThread([&] {
+        return transport_.sendNotificationIfConnected(id, {"n", "m", 9, 1});
+    });
+    EXPECT_TRUE(hook.ok()) << hook.ToString();
+    const Status full = onFreshThread(
+        [&] { return transport_.sendNotification(id, {"n", "m", 9, 2}); });
+    EXPECT_TRUE(full.ok()) << full.ToString();
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair2), 2u);
+    EXPECT_TRUE(peer.bootstraps().empty());
+}
+
+// After a stall the full path does not wait on another full pair either, so
+// a peer whose every pair is full holds a caller one stall timeout.
+TEST_F(RdmaWorkersSharedQpTest, AStalledPairNeverWaitsOnAnotherFullPair) {
+    FakePeer peer(kTwoRdmaNics);
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+    for (const char* nic : {"peer-rnic-0", "peer-rnic-1"})
+        ASSERT_NO_FATAL_FAILURE(fillSendQueue(readyPair(peer.addr(), nic)));
+
+    const auto begin = std::chrono::steady_clock::now();
+    const Status status = onFreshThread(
+        [&] { return transport_.sendNotification(id, {"n", "m", 9, 1}); });
+    const auto took = std::chrono::steady_clock::now() - begin;
+    EXPECT_TRUE(status.IsRdmaError()) << status.ToString();
+    EXPECT_LT(took, std::chrono::milliseconds(1500));  // one stall is 1000
+    EXPECT_TRUE(peer.bootstraps().empty());
+}
+
+// A probe that fails leaves pair 0's status: the probe's RPC error would keep
+// the engine from the RPC fallback that pair 0's refusal leaves open.
+TEST_F(RdmaWorkersSharedQpTest, ProbeFailureReportsThePrimaryStatus) {
+    FakePeer peer(kTwoRdmaNics);
+    peer.failBootstraps(/*refused=*/1);
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+
+    const Status status = onFreshThread(
+        [&] { return transport_.sendNotification(id, {"n", "m", 9, 1}); });
+    EXPECT_TRUE(status.IsDeviceNotFound()) << status.ToString();
+    ASSERT_EQ(peer.bootstraps().size(), 2u);
+    EXPECT_NE(peer.bootstraps()[1].find("peer-rnic-1"), std::string::npos);
+    PeerHealth::instance().clear();
+}
+
+// Every pair of a frozen peer may have a full send queue: only pair 0's is
+// waited on, so a poller is held one stall timeout however many pairs it has.
+TEST_F(RdmaWorkersSharedQpTest, AProbeNeverWaitsOnAFullPair) {
+    FakePeer peer(kTwoRdmaNics);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto& segments = metadata->segmentManager();
+    SegmentID id = 0;
+    ASSERT_TRUE(segments.openRemote(id, peer.addr()).ok());
+    ASSERT_TRUE(onFreshThread([&] {
+                    SegmentDescRef desc;
+                    return segments.getRemoteCached(desc, id);
+                }).ok());
+    for (const char* nic : {"peer-rnic-0", "peer-rnic-1"}) {
+        auto pair = readyPair(peer.addr(), nic);
+        for (size_t i = 0; i < RdmaEndPointTestPeer::kNotifyMaxPendingSends;
+             ++i)
+            ASSERT_TRUE(pair->sendNotification({"n", "m", 9, 0}));
+    }
+
+    const auto begin = std::chrono::steady_clock::now();
+    const Status status = onFreshThread([&] {
+        return transport_.sendNotificationIfConnected(id, {"n", "m", 9, 1});
+    });
+    const auto took_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - begin)
+                             .count();
+    EXPECT_TRUE(status.IsRdmaError()) << status.ToString();
+    EXPECT_LT(took_ms, 1500);  // one stall timeout is 1000
+    EXPECT_TRUE(peer.bootstraps().empty());
+}
+
+// With no other pair to try (the peer has no RDMA NIC, or only one), a new
+// notification reports pair 0's status, and pair 0 is not dialed again.
+TEST_F(RdmaWorkersSharedQpTest, NoProbeWithoutAnotherPair) {
+    FakePeer none("[]");
+    FakePeer one(R"([{"name":"peer-rnic-0","type":0,"numa_node":0}])");
+    const auto ids = openPeers(transport_, {none.addr(), one.addr()});
+    for (size_t i = 0; i < ids.size(); ++i) {
+        SCOPED_TRACE(i);
+        const Status status = onFreshThread([&] {
+            return transport_.sendNotification(ids[i], {"n", "m", 9, 1});
+        });
+        EXPECT_FALSE(status.ok()) << status.ToString();
+        EXPECT_FALSE(status.IsRpcServiceError()) << status.ToString();
+    }
+    EXPECT_TRUE(none.bootstraps().empty());
+    EXPECT_EQ(one.bootstraps().size(), 1u);
+    PeerHealth::instance().clear();
+}
+
+// A pair 0 that failed on the peer's control plane ends it there: every other
+// pair would wait on that same control plane.
+TEST_F(RdmaWorkersSharedQpTest, NoProbeAfterAControlPlaneError) {
+    FakePeer peer(kTwoRdmaNics);
+    peer.failBootstraps();
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+
+    const Status status = onFreshThread(
+        [&] { return transport_.sendNotification(id, {"n", "m", 9, 1}); });
+    EXPECT_TRUE(status.IsRpcServiceError()) << status.ToString();
+    EXPECT_EQ(peer.bootstraps().size(), 1u);
+    PeerHealth::instance().clear();
+}
+
+// With no local NIC enabled there is no pair to probe, so the peer is not
+// even looked up for one.
+TEST_F(RdmaWorkersSharedQpTest, NoProbeWithoutAnEnabledLocalNic) {
+    FakePeer peer(kTwoRdmaNics);
+    const SegmentID id = openPeers(transport_, {peer.addr()})[0];
+    ibv_gid local_gid{};
+    local_gid.raw[15] = 0x11;
+    RdmaContextTestPeer::seedAddress(*context_, "mc-absent-rnic-1", /*lid=*/7,
+                                     /*gid_index=*/3, local_gid,
+                                     RdmaContext::DEVICE_DISABLED);
+
+    const Status status = onFreshThread(
+        [&] { return transport_.sendNotification(id, {"n", "m", 9, 1}); });
+    EXPECT_TRUE(status.IsDeviceNotFound()) << status.ToString();
+    EXPECT_EQ(peer.lookups(), 0);
+}
+
+// The no-dial send takes another pair once it is up when pair 0 is not,
+// still without a lookup or a bootstrap.
+TEST_F(RdmaWorkersSharedQpTest, SendIfConnectedTakesAnotherPairThatIsUp) {
+    FakePeer peer(kTwoRdmaNics);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport_, metadata);
+    auto& segments = metadata->segmentManager();
+    SegmentID id = 0;
+    ASSERT_TRUE(segments.openRemote(id, peer.addr()).ok());
+    ASSERT_TRUE(onFreshThread([&] {
+                    SegmentDescRef desc;
+                    return segments.getRemoteCached(desc, id);
+                }).ok());
+    auto pair1 = context_->endpointStore()->getOrInsert(
+        MakeNicPath(peer.addr(), "peer-rnic-1"));
+    RdmaEndPointTestPeer::connectTypedNotify(pair1);
+    auto send = [&] {
+        return onFreshThread([&] {
+            return transport_.sendNotificationIfConnected(id, {"n", "m", 9, 1});
+        });
+    };
+
+    EXPECT_TRUE(send().IsDeviceNotFound());
+    RdmaEndPointTestPeer::markReady(pair1);
+    EXPECT_TRUE(send().ok());
+    EXPECT_EQ(RdmaEndPointTestPeer::resendable(pair1), 1u);
+    EXPECT_EQ(peer.lookups(), 1);  // the test's own
+    EXPECT_TRUE(peer.bootstraps().empty());
+}
+
+// A hand-back keeps posting order, so resends go out oldest first.
+TEST_F(RdmaWorkersSharedQpTest, HandBackKeepsPostingOrder) {
+    RdmaEndPointTestPeer::connectTypedNotify(endpoint_);
+    const PendingNotify track{5};
+    for (uint64_t seq = 1; seq <= 8; ++seq)
+        ASSERT_TRUE(endpoint_->sendNotification({"n", "m", 9, seq}, &track));
+    endpoint_->disableNotification("test");
+    std::vector<uint64_t> seqs;
+    for (auto& pending : RdmaTransportTestPeer::resendQueue(transport_))
+        seqs.push_back(pending.notifi.seq);
+    EXPECT_EQ(seqs, (std::vector<uint64_t>{1, 2, 3, 4, 5, 6, 7, 8}));
+}
+
+// Retiring the endpoint hands back what it still had in flight, once.
+TEST_F(RdmaWorkersSharedQpTest, RetiringTheEndpointHandsBackPendingSends) {
+    RdmaEndPointTestPeer::connectTypedNotify(endpoint_);
+    const Notification notifi{"n", "m", 9, 1};
+    const PendingNotify track{5};
+    ASSERT_TRUE(endpoint_->sendNotification(notifi, &track));
+    ASSERT_TRUE(endpoint_->sendNotification(notifi, &track));
+    endpoint_->beginDestroy();
+    EXPECT_EQ(RdmaTransportTestPeer::resendQueue(transport_).size(), 2u);
+    endpoint_->disableNotification("after retire");
+    EXPECT_EQ(RdmaTransportTestPeer::resendQueue(transport_).size(), 2u);
 }
 
 TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
