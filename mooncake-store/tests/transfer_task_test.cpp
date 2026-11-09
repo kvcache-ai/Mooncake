@@ -5,7 +5,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstring>
+#include <future>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -14,10 +17,16 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "types.h"
 #include "pinned_buffer_pool.h"
+#include "config.h"
+#include "../../mooncake-transfer-engine/tests/rdma_test_peers.h"
+#include "transfer_engine_impl.h"
+#include "transport/rdma_transport/endpoint_store.h"
+#include "transport/rdma_transport/worker_pool.h"
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif
@@ -750,6 +759,222 @@ TEST_F(TransferTaskTest, TransferStrategyEnum) {
     oss << TransferStrategy::EMPTY;
     EXPECT_EQ(oss.str(), "EMPTY");
 }
+
+class TransferEngineImplTestPeer {
+   public:
+    static void installRdma(TransferEngine& engine,
+                            std::shared_ptr<Transport> transport) {
+        auto& multi = *engine.impl_->multi_transports_;
+        multi.transport_map_.clear();
+        multi.transport_map_.emplace("rdma", std::move(transport));
+    }
+};
+
+class WorkerPoolTestPeer {
+   public:
+    static void stopWorkers(WorkerPool& pool) {
+        pool.workers_running_.store(false);
+        pool.cond_var_.notify_all();
+        for (auto& thread : pool.worker_thread_) thread.join();
+    }
+
+    static std::vector<Transport::Slice*> takeQueuedSlices(WorkerPool& pool) {
+        std::vector<Transport::Slice*> slices;
+        for (auto& queues : pool.worker_slice_queue_) {
+            for (auto& entry : queues) {
+                slices.insert(slices.end(), entry.second.begin(),
+                              entry.second.end());
+            }
+            queues.clear();
+        }
+        return slices;
+    }
+};
+
+namespace {
+
+using namespace std::chrono_literals;
+
+// Only completion timing is controlled: Store submission, routing, MR lookup,
+// RDMA preparation and worker enqueue all run their production implementations.
+class SignaledRdmaTransport : public RdmaTransport {
+   public:
+    std::promise<BatchID> submitted;
+    bool hold_callback_pin = false;
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        auto status = RdmaTransport::submitTransferTask(tasks);
+        if (hold_callback_pin) {
+            Transport::toBatchDesc(tasks.front()->batch_id)
+                .active_completion_callbacks.fetch_add(
+                    1, std::memory_order_acq_rel);
+        }
+        submitted.set_value(tasks.front()->batch_id);
+        return status;
+    }
+};
+
+class PartialSubmitTest : public ::testing::Test {
+   protected:
+    ScopedEnvVar memcpy_disabled_{"MC_STORE_MEMCPY", "0"};
+    ScopedEnvVar tent_disabled_{"MC_USE_TENT", "0"};
+    ScopedEnvVar tev1_disabled_{"MC_USE_TEV1", "0"};
+    struct RestoreConfig {
+        size_t max_wr = globalConfig().max_wr;
+        size_t num_qp = globalConfig().num_qp_per_ep;
+        ~RestoreConfig() {
+            globalConfig().max_wr = max_wr;
+            globalConfig().num_qp_per_ep = num_qp;
+        }
+    } restore_;
+
+    TransferEngine engine_{false};
+    std::shared_ptr<SignaledRdmaTransport> transport_;
+    std::shared_ptr<WorkerPool> pool_;
+    std::vector<char> source_, destination_;
+    Replica::Descriptor replica_;
+
+    void SetUp() override {
+        ASSERT_FALSE(engine_.isUsingTent());
+        ASSERT_EQ(engine_.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0), 0);
+        globalConfig().max_wr = 2;
+        globalConfig().num_qp_per_ep = 1;
+        const auto block = globalConfig().slice_size;
+        source_.assign(4 * block, 'A');
+        destination_.assign(source_.size(), 0);
+
+        auto metadata = engine_.getMetadata();
+        const auto endpoint = engine_.getLocalIpAndPort();
+        transport_ = std::make_shared<SignaledRdmaTransport>();
+        RdmaTransportTestPeer::bindMetadata(*transport_, metadata, endpoint);
+        auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+        desc->name = endpoint;
+        desc->protocol = "rdma";
+        ASSERT_EQ(desc->topology.parse(R"({"cpu:0": [["test-nic"], []]})"), 0);
+        TransferMetadata::BufferDesc buffer;
+        buffer.name = "cpu:0";
+        buffer.addr = reinterpret_cast<uintptr_t>(source_.data());
+        buffer.length = 3 * block;  // The fourth slice is outside the MR.
+        buffer.lkey = {1};
+        buffer.rkey = {1};
+        desc->buffers.push_back(std::move(buffer));
+        auto destination_buffer = desc->buffers.front();
+        destination_buffer.addr =
+            reinterpret_cast<uintptr_t>(destination_.data());
+        destination_buffer.length = destination_.size();
+        desc->buffers.push_back(std::move(destination_buffer));
+        desc->devices.emplace_back();
+        desc->devices.back().name = "test-nic";
+        metadata->addLocalSegment(LOCAL_SEGMENT_ID, endpoint, std::move(desc));
+
+        // Bare context: no RDMA device is opened. Join the actual worker
+        // before submission and explicitly complete the queued slices below.
+        auto context = std::make_shared<RdmaContext>(*transport_, "test-nic");
+        RdmaTransportTestPeer::addContext(*transport_, context);
+        RdmaContextTestPeer::setTransferWorkerCount(*context, 1);
+        RdmaContextTestPeer::bindEndpointStore(
+            *context, std::make_shared<SIEVEEndpointStore>(8));
+        pool_ = std::make_shared<WorkerPool>(*context);
+        WorkerPoolTestPeer::stopWorkers(*pool_);
+        RdmaContextTestPeer::bindWorkerPool(*context, pool_);
+        TransferEngineImplTestPeer::installRdma(engine_, transport_);
+
+        MemoryDescriptor memory;
+        memory.buffer_descriptor.buffer_address_ =
+            reinterpret_cast<uintptr_t>(destination_.data());
+        memory.buffer_descriptor.size_ = destination_.size();
+        memory.buffer_descriptor.transport_endpoint_ = endpoint;
+        memory.buffer_descriptor.protocol_ = "rdma";
+        replica_.descriptor_variant = memory;
+        replica_.status = ReplicaStatus::PROCESSING;
+    }
+};
+
+class PartialSubmitPrefixTest : public PartialSubmitTest,
+                                public ::testing::WithParamInterface<bool> {};
+
+TEST_P(PartialSubmitPrefixTest, FailureWaitsForAcceptedPrefixAndCallbacks) {
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine_, backend, engine_.getLocalIpAndPort());
+    const auto block = globalConfig().slice_size;
+    transport_->hold_callback_pin = true;
+    std::vector<Slice> slices;
+    if (GetParam()) {
+        slices.push_back({source_.data(), source_.size()});
+    } else {
+        for (size_t i = 0; i < 4; ++i) {
+            slices.push_back({source_.data() + i * block, block});
+        }
+    }
+    auto submitted = transport_->submitted.get_future();
+    auto result = std::async(std::launch::async, [&] {
+        return submitter.submit(replica_, slices, TransferRequest::WRITE);
+    });
+    ASSERT_EQ(submitted.wait_for(5s), std::future_status::ready);
+    auto& batch = Transport::toBatchDesc(submitted.get());
+    // The transport holds a modeled callback-tail pin before signaling, so
+    // even an unexpectedly empty prefix cannot leave this test a dangling
+    // BatchDesc. Queued slices still complete via the real markSuccess().
+    auto queued = WorkerPoolTestPeer::takeQueuedSlices(*pool_);
+    EXPECT_EQ(queued.size(), 2u);
+    EXPECT_EQ(result.wait_for(50ms), std::future_status::timeout);
+    for (auto* slice : queued) {
+        EXPECT_EQ(slice->status, Transport::Slice::PENDING);
+        std::memcpy(reinterpret_cast<void*>(slice->rdma.dest_addr),
+                    slice->source_addr, slice->length);
+        slice->markSuccess();
+    }
+    EXPECT_EQ(result.wait_for(50ms), std::future_status::timeout);
+    batch.active_completion_callbacks.fetch_sub(1, std::memory_order_acq_rel);
+    ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
+    EXPECT_FALSE(result.get().has_value());
+    EXPECT_EQ(std::memcmp(source_.data(), destination_.data(), 2 * block), 0);
+    EXPECT_EQ(destination_[2 * block], 0);  // Unpublished tail was not copied.
+}
+
+INSTANTIATE_TEST_SUITE_P(RequestLayout, PartialSubmitPrefixTest,
+                         ::testing::Values(false, true));
+
+TEST_F(PartialSubmitTest, FailureBeforeHandoffReturnsWithoutWaiting) {
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine_, backend, engine_.getLocalIpAndPort());
+    const auto block = globalConfig().slice_size;
+    std::get<MemoryDescriptor>(replica_.descriptor_variant)
+        .buffer_descriptor.size_ = block;
+    std::vector<Slice> slices{{source_.data() + 3 * block, block}};
+    auto submitted = transport_->submitted.get_future();
+    auto result = std::async(std::launch::async, [&] {
+        return submitter.submit(replica_, slices, TransferRequest::WRITE);
+    });
+    ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
+    EXPECT_FALSE(result.get().has_value());
+    EXPECT_EQ(submitted.wait_for(0s), std::future_status::ready);
+    EXPECT_TRUE(WorkerPoolTestPeer::takeQueuedSlices(*pool_).empty());
+}
+
+TEST_F(PartialSubmitTest, RoutingFailureWithoutTasksReturnsWithoutWaiting) {
+    auto metadata = engine_.getMetadata();
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>(
+        *metadata->getSegmentDescByID(LOCAL_SEGMENT_ID));
+    desc->protocol = "not-installed";
+    metadata->addLocalSegment(LOCAL_SEGMENT_ID, engine_.getLocalIpAndPort(),
+                              std::move(desc));
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(engine_, backend, engine_.getLocalIpAndPort());
+    std::get<MemoryDescriptor>(replica_.descriptor_variant)
+        .buffer_descriptor.size_ = globalConfig().slice_size;
+    std::vector<Slice> slices{{source_.data(), globalConfig().slice_size}};
+    auto submitted = transport_->submitted.get_future();
+    auto result = std::async(std::launch::async, [&] {
+        return submitter.submit(replica_, slices, TransferRequest::WRITE);
+    });
+    ASSERT_EQ(result.wait_for(5s), std::future_status::ready);
+    EXPECT_FALSE(result.get().has_value());
+    EXPECT_EQ(submitted.wait_for(0s), std::future_status::timeout);
+}
+
+}  // namespace
 
 }  // namespace mooncake
 

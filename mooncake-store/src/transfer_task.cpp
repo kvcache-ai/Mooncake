@@ -1808,6 +1808,30 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         if (!s.ok()) {
             LOG(ERROR) << "Failed to submit all transfers, error code is "
                        << s.code();
+            // Submission may have handed a prefix to transport workers before
+            // preparation failed. Deferred batch deletion keeps metadata alive,
+            // not the caller's buffers. Drain every accepted task before
+            // returning nullopt, including when another task already failed.
+            auto& batch = Transport::toBatchDesc(batch_id);
+            for (size_t i = 0; i < batch.task_list.size(); ++i) {
+                if (batch.task_list[i].slice_count == 0) continue;
+                while (true) {
+                    TransferStatus status;
+                    const auto query =
+                        engine_.getTransferStatus(batch_id, i, status);
+                    if (query.ok() &&
+                        (status.s == TransferStatusEnum::COMPLETED ||
+                         status.s == TransferStatusEnum::FAILED)) {
+                        break;
+                    }
+                    // A timeout/status-query error does not revoke accesses.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            while (batch.active_completion_callbacks.load(
+                       std::memory_order_acquire) != 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             engine_.freeBatchID(batch_id);
             return std::nullopt;
         }
