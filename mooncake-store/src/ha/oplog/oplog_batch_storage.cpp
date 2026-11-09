@@ -471,11 +471,11 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     do {
         std::vector<KvPair> kvs;
         const size_t remaining = limit == 0 ? 0 : limit - batches.size();
-        ErrorCode err = serializable
-                            ? backend_.RangeSerializable(
-                                  begin_key, range.end_key, remaining, kvs)
-                            : backend_.Range(begin_key, range.end_key,
-                                             remaining, kvs);
+        ErrorCode err =
+            serializable
+                ? backend_.RangeSerializable(begin_key, range.end_key,
+                                             remaining, kvs)
+                : backend_.Range(begin_key, range.end_key, remaining, kvs);
         if (err != ErrorCode::OK) {
             return err;
         }

@@ -426,13 +426,10 @@ ErrorCode EtcdHelper::Create(const char* key, const size_t key_size,
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
-                                     const size_t start_key_size,
-                                     const char* end_key,
-                                     const size_t end_key_size, size_t limit,
-                                     std::string& json,
-                                     EtcdRevisionId& revision_id,
-                                     bool serializable) {
+ErrorCode EtcdHelper::GetRangeAsJson(
+    const char* start_key, const size_t start_key_size, const char* end_key,
+    const size_t end_key_size, size_t limit, std::string& json,
+    EtcdRevisionId& revision_id, bool serializable) {
     char* err_msg = nullptr;
     char* json_ptr = nullptr;
     int json_size = 0;
@@ -441,8 +438,8 @@ ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
     int ret = EtcdStoreGetRangeAsJsonWrapper(
         const_cast<char*>(start_key), (int)start_key_size,
         const_cast<char*>(end_key), (int)end_key_size, (int)limit,
-        static_cast<int>(serializable), &json_ptr, &json_size,
-        &go_revision_id, &err_msg);
+        static_cast<int>(serializable), &json_ptr, &json_size, &go_revision_id,
+        &err_msg);
     if (ret != 0) {
         LOG(ERROR) << "start_key=" << std::string(start_key, start_key_size)
                    << ", end_key=" << std::string(end_key, end_key_size)
@@ -725,13 +722,10 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
-ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
-                                     const size_t start_key_size,
-                                     const char* end_key,
-                                     const size_t end_key_size, size_t limit,
-                                     std::string& json,
-                                     EtcdRevisionId& revision_id,
-                                     bool serializable) {
+ErrorCode EtcdHelper::GetRangeAsJson(
+    const char* start_key, const size_t start_key_size, const char* end_key,
+    const size_t end_key_size, size_t limit, std::string& json,
+    EtcdRevisionId& revision_id, bool serializable) {
     (void)start_key;
     (void)start_key_size;
     (void)end_key;

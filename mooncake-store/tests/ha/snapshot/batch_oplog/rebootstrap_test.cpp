@@ -376,8 +376,7 @@ TEST_F(RebootstrapTest, WaitsBetweenPagesWhileSerializableRangeLags) {
     }));
     const auto range_times = backend_->SerializableRangeTimes();
     ASSERT_GE(range_times.size(), 5u);
-    EXPECT_GE(range_times[4] - range_times[1],
-              std::chrono::milliseconds(20));
+    EXPECT_GE(range_times[4] - range_times[1], std::chrono::milliseconds(20));
 }
 
 TEST_F(RebootstrapTest, NoEligibleSnapshotPreservesStateAndRetriesOnline) {

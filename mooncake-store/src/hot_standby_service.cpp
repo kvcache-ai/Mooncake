@@ -570,8 +570,8 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
         const uint64_t expected_before =
             oplog_applier_->GetExpectedSequenceId();
         const auto cursor_before = reader->GetLastAppliedDurablePrefix();
-        auto result = reader->PollOnce(
-            config_.oplog_standby_max_batches_per_poll);
+        auto result =
+            reader->PollOnce(config_.oplog_standby_max_batches_per_poll);
         const uint64_t expected_after = oplog_applier_->GetExpectedSequenceId();
         const auto cursor_after = reader->GetLastAppliedDurablePrefix();
         const bool made_progress =

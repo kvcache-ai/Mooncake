@@ -719,10 +719,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("oplog_batch_max_entries",
                              &master_config.oplog_batch_max_entries,
                              FLAGS_oplog_batch_max_entries);
-    default_config.GetUInt32(
-        "oplog_standby_max_batches_per_poll",
-        &master_config.oplog_standby_max_batches_per_poll,
-        FLAGS_oplog_standby_max_batches_per_poll);
+    default_config.GetUInt32("oplog_standby_max_batches_per_poll",
+                             &master_config.oplog_standby_max_batches_per_poll,
+                             FLAGS_oplog_standby_max_batches_per_poll);
     default_config.GetUInt32("batch_oplog_retry_timeout_sec",
                              &master_config.batch_oplog_retry_timeout_sec,
                              FLAGS_batch_oplog_retry_timeout_sec);
@@ -1230,8 +1229,8 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.oplog_batch_max_entries = FLAGS_oplog_batch_max_entries;
     }
-    if ((google::GetCommandLineFlagInfo(
-             "oplog_standby_max_batches_per_poll", &info) &&
+    if ((google::GetCommandLineFlagInfo("oplog_standby_max_batches_per_poll",
+                                        &info) &&
          !info.is_default) ||
         !conf_set) {
         master_config.oplog_standby_max_batches_per_poll =

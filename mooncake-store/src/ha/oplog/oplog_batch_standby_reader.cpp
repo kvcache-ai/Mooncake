@@ -86,11 +86,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
             SetPollError(result, err, IsRetryableBackendError(err));
         }
     }
-    result.has_more_pages = max_batches != 0 &&
-                            result.applied_batches >= max_batches &&
-                            result.durable_prefix_present &&
-                            last_applied_batch_id_ <
-                                result.durable_prefix.batch_id;
+    result.has_more_pages =
+        max_batches != 0 && result.applied_batches >= max_batches &&
+        result.durable_prefix_present &&
+        last_applied_batch_id_ < result.durable_prefix.batch_id;
     return result;
 }
 
@@ -236,8 +235,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
             break;
         }
     }
-    result.has_more_pages = max_batches != 0 &&
-                            batches.size() >= max_batches &&
+    result.has_more_pages = max_batches != 0 && batches.size() >= max_batches &&
                             last_applied_batch_id_ < prefix.batch_id;
     if (!result.has_more_pages && last_applied_batch_id_ < prefix.batch_id) {
         // A local serializable Range may trail the linearizable durable prefix.

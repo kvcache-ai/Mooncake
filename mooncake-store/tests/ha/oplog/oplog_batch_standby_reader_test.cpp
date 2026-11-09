@@ -269,12 +269,10 @@ TEST(OpLogBatchStandbyReaderTest,
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
                           EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
-    ASSERT_EQ(ErrorCode::OK,
-              backend.Put(BuildBatchRecordKey("clusterA", 1),
-                          EncodeOpLogBatchRecord(first)));
-    ASSERT_EQ(ErrorCode::OK,
-              backend.Put(BuildBatchRecordKey("clusterA", 2),
-                          EncodeOpLogBatchRecord(second)));
+    ASSERT_EQ(ErrorCode::OK, backend.Put(BuildBatchRecordKey("clusterA", 1),
+                                         EncodeOpLogBatchRecord(first)));
+    ASSERT_EQ(ErrorCode::OK, backend.Put(BuildBatchRecordKey("clusterA", 2),
+                                         EncodeOpLogBatchRecord(second)));
     backend.PublishLocal(BuildBatchRecordKey("clusterA", 1));
 
     MockMetadataStore metadata;
@@ -508,8 +506,7 @@ TEST(OpLogBatchStandbyReaderTest, DoesNothingWhenDurablePrefixDoesNotAdvance) {
 
     ASSERT_EQ(ErrorCode::OK, second.error);
     EXPECT_EQ(0u, second.applied_entries);
-    EXPECT_EQ(range_calls_after_first_poll,
-              backend.serializable_range_calls());
+    EXPECT_EQ(range_calls_after_first_poll, backend.serializable_range_calls());
     EXPECT_EQ(2u, applier.GetExpectedSequenceId());
 }
 

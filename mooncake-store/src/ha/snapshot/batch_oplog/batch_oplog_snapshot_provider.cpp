@@ -187,8 +187,7 @@ AttemptResult RestorePointer(
     SnapshotObjectStore& object_store, const std::string& snapshot_root,
     std::string_view pointer_bytes, StandbyMetadataStore& metadata,
     StandbySegmentRegistry& registry, OpLogApplier* supplied_applier,
-    size_t max_batches_per_poll,
-    const std::function<bool()>& cancelled) {
+    size_t max_batches_per_poll, const std::function<bool()>& cancelled) {
     if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     auto decoded_descriptor =
         ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
@@ -474,10 +473,9 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
             descriptor->last_included_batch_id < minimum_snapshot_batch) {
             continue;
         }
-        auto attempt = RestorePointer(cluster_id_, backend_, object_store_,
-                                      snapshot_root_, pointer_bytes, metadata,
-                                      registry, applier, max_batches_per_poll_,
-                                      cancelled);
+        auto attempt = RestorePointer(
+            cluster_id_, backend_, object_store_, snapshot_root_, pointer_bytes,
+            metadata, registry, applier, max_batches_per_poll_, cancelled);
         if (attempt.disposition == AttemptDisposition::kSuccess) {
             return metric_timer.Success(attempt.value);
         }
@@ -495,9 +493,9 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
     if (minimum_snapshot_batch != 0) {
         return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
     }
-    auto full_replay = RestoreCompleteOpLog(cluster_id_, backend_, metadata,
-                                            registry, applier,
-                                            max_batches_per_poll_, cancelled);
+    auto full_replay =
+        RestoreCompleteOpLog(cluster_id_, backend_, metadata, registry, applier,
+                             max_batches_per_poll_, cancelled);
     if (full_replay.disposition != AttemptDisposition::kSuccess) {
         metadata.Clear();
         registry.Clear();
