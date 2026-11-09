@@ -188,6 +188,13 @@ set_tests_properties(master_service_hca_affinity_test
                      PROPERTIES ENVIRONMENT "MC_STORE_HCA_AFFINITY=1")
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
+add_store_test(traffic_recorder_test traffic_recorder_test.cpp)
+target_include_directories(traffic_recorder_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_store_test(traffic_session_reader_test traffic_session_reader_test.cpp)
+target_include_directories(traffic_session_reader_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(traffic_session_reader_test PUBLIC traffic_session)
 add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
 add_test(
   NAME object_checksum_client_test
@@ -322,6 +329,8 @@ add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(standalone_client_test standalone_client_test.cpp)
 add_store_test(embedded_master_test embedded_master_test.cpp)
+target_include_directories(embedded_master_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 if(USE_TENT)
   add_test(NAME standalone_client_tent_test
            COMMAND standalone_client_test --gtest_filter=MetadataModes/*)

@@ -26,6 +26,7 @@
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
 #include "rpc_worker_pool.h"
+#include "master_rpc_server.h"
 #include "rpc_service.h"
 #include "shutdown_request.h"
 #include "types.h"
@@ -1718,11 +1719,11 @@ int main(int argc, char* argv[]) {
     } else {
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
-        coro_rpc::coro_rpc_server server(
+        mooncake::MasterRpcServer server(
             master_config.rpc_thread_num, master_config.rpc_port,
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
-            master_config.rpc_enable_tcp_no_delay);
+            master_config.rpc_enable_tcp_no_delay, /*enable_recording=*/true);
         if (rpc_protocol_config.use_rdma) {
 #ifdef YLT_ENABLE_IBV
             server.init_ibv();
@@ -1757,8 +1758,7 @@ int main(int argc, char* argv[]) {
         // is destroyed.
         mooncake::RpcWorkerPool worker_pool(
             master_config.handler_worker_thread_num);
-        mooncake::RegisterRpcService(server, *wrapped_master_service,
-                                     &worker_pool);
+        server.Register(*wrapped_master_service, &worker_pool);
 
         static std::atomic<bool> shutdown_requested{false};
         auto signal_handler = [](int /* signum */) {

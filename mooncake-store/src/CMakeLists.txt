@@ -100,6 +100,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     hot_standby_service.cpp
     metadata_store.cpp
     standby_state_machine.cpp
+    traffic/traffic_admin.cpp
+    traffic/traffic_config.cpp
+    traffic/traffic_redaction.cpp
+    traffic/traffic_recorder.cpp
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
@@ -704,6 +708,7 @@ target_include_directories(mooncake_store_master
 target_link_libraries(
   mooncake_store_master
   PRIVATE mooncake_local_ssd
+          mooncake_traffic_file_sink
           cachelib_memory_allocator
           ${ETCD_WRAPPER_LIB}
           glog::glog
@@ -747,6 +752,7 @@ target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store
   PUBLIC mooncake_local_ssd
+         mooncake_traffic_file_sink
          cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
          glog::glog

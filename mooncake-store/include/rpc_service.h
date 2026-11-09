@@ -441,8 +441,11 @@ class RpcWorkerPool;
 // With a worker pool, every handler except Ping and ServiceReady runs on its
 // worker threads; those two stay on the io threads, which the pool keeps
 // free. Without one, every handler runs inline on the io threads.
-void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+template <typename Server>
+void RegisterRpcService(Server& server,
                         mooncake::WrappedMasterService& wrapped_master_service,
-                        RpcWorkerPool* worker_pool = nullptr);
+                        RpcWorkerPool* worker_pool = nullptr,
+                        std::size_t rpc_threads = 0,
+                        bool enable_recording = false);
 
 }  // namespace mooncake

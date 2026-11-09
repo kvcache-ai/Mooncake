@@ -3,8 +3,6 @@
 #include <memory>
 #include <string>
 
-#include <ylt/coro_rpc/coro_rpc_server.hpp>
-
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
 #include "master_config.h"
@@ -12,14 +10,16 @@
 
 namespace mooncake {
 
+class MasterRpcServer;
+
 // In-process master used by tests and by opt-in enable_embedded_master.
 // When enabled, a store client starts this master in the same process so no
 // external mooncake_master is required. This is not a user-facing deployment
 // mode. All listeners bind to the IPv4 loopback address.
 class EmbeddedMaster {
    public:
-    EmbeddedMaster() = default;
-    ~EmbeddedMaster() { Stop(); }
+    EmbeddedMaster();
+    ~EmbeddedMaster();
 
     EmbeddedMaster(const EmbeddedMaster&) = delete;
     EmbeddedMaster& operator=(const EmbeddedMaster&) = delete;
@@ -47,7 +47,7 @@ class EmbeddedMaster {
     std::shared_ptr<WrappedMasterService> service() const { return wrapped_; }
 
    private:
-    std::unique_ptr<coro_rpc::coro_rpc_server> server_;
+    std::unique_ptr<MasterRpcServer> server_;
     std::shared_ptr<WrappedMasterService> wrapped_;
     std::unique_ptr<MasterAdminServer> admin_server_;
     std::unique_ptr<HttpMetadataServer> meta_server_;

@@ -1,6 +1,7 @@
 #include "rpc_service.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <string_view>
 #include <type_traits>
@@ -8,11 +9,15 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include <glog/logging.h>
+
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "rpc_worker_pool.h"
 #include "rpc_helper.h"
+#include "traffic/ylt_adapter.h"
+#include "traffic/traffic_recorder.h"
 #include "types.h"
 #include "common/scoped_vlog_timer.h"
 #include "version.h"
@@ -2055,24 +2060,48 @@ WrappedMasterService::RestoreFromBatchOpLogPromotion(
 namespace {
 
 template <auto... Methods>
-void RegisterPooledHandlers(coro_rpc::coro_rpc_server& server,
-                            WrappedMasterService& service,
-                            RpcWorkerPool* worker_pool) {
+void AddRouteNames(traffic::RouteNameRegistry& names) {
+    (names.Add(coro_rpc::func_id<Methods>(),
+               coro_rpc::get_func_name<Methods>()),
+     ...);
+}
+
+template <auto... Methods>
+void RegisterPooledHandlers(auto& server, WrappedMasterService& service,
+                            RpcWorkerPool* worker_pool,
+                            traffic::RouteNameRegistry& names) {
+    AddRouteNames<Methods...>(names);
     if (worker_pool == nullptr) {
-        server.register_handler<Methods...>(&service);
+        (server.template register_handler<Methods>(&service), ...);
         return;
     }
     (worker_pool->Register<Methods>(server, service), ...);
 }
 
+// Handlers registered outside the pool still need their names, and the two
+// calls take the same method list: registering one without the other would
+// leave a route that cannot be named in the recorder configuration.
+template <auto... Methods>
+void RegisterIndividual(auto& server, WrappedMasterService& service,
+                        traffic::RouteNameRegistry& names) {
+    AddRouteNames<Methods...>(names);
+    server.template register_handler<Methods...>(&service);
+}
+
 }  // namespace
 
-void RegisterRpcService(coro_rpc::coro_rpc_server& server,
+template <typename Server>
+void RegisterRpcService(Server& server,
                         WrappedMasterService& wrapped_master_service,
-                        RpcWorkerPool* worker_pool) {
-    server.register_handler<&WrappedMasterService::Ping,
-                            &WrappedMasterService::ServiceReady>(
-        &wrapped_master_service);
+                        RpcWorkerPool* worker_pool, std::size_t rpc_threads,
+                        bool enable_recording) {
+    // coro_rpc reports the handler it stores, which for a pooled handler is the
+    // pool's coroutine rather than the service method, so the names used by the
+    // recording configuration are collected here where both are known.
+    traffic::RouteNameRegistry route_names;
+    RegisterIndividual<&WrappedMasterService::Ping,
+                       &WrappedMasterService::ServiceReady>(
+        server, wrapped_master_service, route_names);
     RegisterPooledHandlers<
         &WrappedMasterService::ExistKey, &WrappedMasterService::ProbeKey,
         &WrappedMasterService::BatchQueryIp,
@@ -2141,19 +2170,35 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::StartWeightResidencyOperation,
         &WrappedMasterService::QueryWeightOperation,
         &WrappedMasterService::DeleteWeightRevision>(
-        server, wrapped_master_service, worker_pool);
+        server, wrapped_master_service, worker_pool, route_names);
     // The prefetch additions stay individual registrations on top of the
     // pool: read-only replica queries (no lease, no promotion-on-hit, no
     // metrics) and the prefetch task RPC. Purely additive for old peers.
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetReplicaListForAdmin>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::RegisterPrefetchTask>(
-        &wrapped_master_service);
+    RegisterIndividual<&WrappedMasterService::GetReplicaListForAdmin,
+                       &WrappedMasterService::BatchGetReplicaListForAdmin,
+                       &WrappedMasterService::RegisterPrefetchTask>(
+        server, wrapped_master_service, route_names);
+    if (enable_recording) {
+        traffic::RedactionRegistry redaction_registry;
+        traffic::RegisterMasterRedactors(redaction_registry);
+        traffic::TrafficRecorder::Instance().Install(
+            rpc_threads, std::move(redaction_registry), std::move(route_names));
+        if (traffic::TrafficRecorder::Instance().GetStatus().state == "error") {
+            const char* config = std::getenv("MOONCAKE_TRAFFIC_CONFIG");
+            if (config != nullptr && config[0] != '\0') {
+                LOG(FATAL) << "traffic recording configuration failed: "
+                           << config;
+            }
+            LOG(ERROR) << "traffic recording is disabled: no configuration";
+        }
+    }
 }
+
+template void RegisterRpcService<traffic::RecordingServer>(
+    traffic::RecordingServer&, WrappedMasterService&, RpcWorkerPool*,
+    std::size_t, bool);
+template void RegisterRpcService<coro_rpc::coro_rpc_server>(
+    coro_rpc::coro_rpc_server&, WrappedMasterService&, RpcWorkerPool*,
+    std::size_t, bool);
 
 }  // namespace mooncake
