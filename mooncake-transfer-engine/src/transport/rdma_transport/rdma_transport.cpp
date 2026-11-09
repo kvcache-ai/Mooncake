@@ -136,31 +136,6 @@ static uint64_t bytesUntilBufferEnd(
     return max_remaining;
 }
 
-// Says why submitTransferTask() found no active RNIC for a slice of `length`
-// bytes: selectDevice() never succeeded, so no selectable registered buffer
-// covers the slice, or it only picked the inactive RNICs in
-// `inactive_device_ids`. The two need different fixes, and the bare address
-// does not tell them apart.
-static std::string describeSelectionFailure(
-    size_t length, size_t registered_buffers,
-    const std::set<int> &inactive_device_ids,
-    const std::vector<std::shared_ptr<RdmaContext>> &contexts) {
-    if (inactive_device_ids.empty()) {
-        return "no selectable registered buffer covers " +
-               std::to_string(length) +
-               " bytes at this address; registered buffers: " +
-               std::to_string(registered_buffers);
-    }
-    std::string reason = "selected RNIC(s) inactive:";
-    const char *separator = " ";
-    for (const int device_id : inactive_device_ids) {
-        reason += separator;
-        reason += contexts[device_id]->deviceName();
-        separator = ", ";
-    }
-    return reason;
-}
-
 // Calculate slice length capped at MR boundary to avoid multi-MR WRs.
 struct SliceLengthCalculator {
     const Transport::TransferRequest &request;
@@ -1448,9 +1423,21 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                const std::string reason = describeSelectionFailure(
-                    slice->length, local_segment_desc->buffers.size(),
-                    inactive_device_ids, context_list_);
+                std::string reason;
+                if (inactive_device_ids.empty()) {
+                    reason = "no selectable registered buffer covers " +
+                             std::to_string(slice->length) +
+                             " bytes at this address; registered buffers: " +
+                             std::to_string(local_segment_desc->buffers.size());
+                } else {
+                    reason = "selected RNIC(s) inactive:";
+                    const char *separator = " ";
+                    for (const int device_id : inactive_device_ids) {
+                        reason += separator;
+                        reason += context_list_[device_id]->deviceName();
+                        separator = ", ";
+                    }
+                }
                 fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
