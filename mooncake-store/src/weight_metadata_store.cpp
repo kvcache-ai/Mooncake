@@ -927,6 +927,10 @@ WeightMetadataStore::PrepareStartOperation(
     if (current->second.policy.migration_mode == WeightMigrationMode::PINNED) {
         return tl::make_unexpected(WeightManagementError::POLICY_UNSATISFIABLE);
     }
+    if (request.target_residency == WeightResidencyState::MIXED &&
+        current->second.affinity_count < 2) {
+        return tl::make_unexpected(WeightManagementError::POLICY_UNSATISFIABLE);
+    }
     if (!CanAdvanceWeightMetadataGeneration(
             current->second.metadata_generation) ||
         next_operation_id_ == 0 ||

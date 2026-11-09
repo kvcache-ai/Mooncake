@@ -764,7 +764,9 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
 
     if (active_operation) {
         const auto& operation = active_operation;
-        if (complete && observed_residency == operation->target_residency) {
+        if (complete &&
+            operation->target_residency != WeightResidencyState::MIXED &&
+            observed_residency == operation->target_residency) {
             auto mutation = weight_metadata_.PrepareFinishOperation(
                 operation->operation_id, observed_residency, observed_hot_ratio,
                 now_ms);

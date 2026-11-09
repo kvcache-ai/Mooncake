@@ -124,6 +124,77 @@ class WeightGroupLifecycleTest : public MasterServiceTest {
     }
 };
 
+TEST_F(WeightGroupLifecycleTest, SingleAffinityRejectsExplicitMixedMigration) {
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReady(service, context.client_id);
+    const auto rejected = service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::MIXED,
+        .mixed_hot_ratio = 0.5,
+    });
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(WeightManagementError::POLICY_UNSATISFIABLE, rejected.error());
+    const auto unchanged =
+        service.GetWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(unchanged);
+    EXPECT_EQ(ready, unchanged->metadata);
+    const auto hot = service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::HOT,
+    });
+    ASSERT_TRUE(hot);
+    EXPECT_EQ(1, hot->operation_id);
+}
+
+TEST_F(WeightGroupLifecycleTest,
+       MixedObservationDoesNotCompletePendingOperation) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(0)
+                              .set_root_fs_dir("/mnt/ssd")
+                              .build());
+    const auto context = PrepareSimpleSegment(service);
+    const auto ready = PublishReadyWithPayloads(
+        service, context.client_id,
+        {{"payload-a", 1024, "affinity-a"}, {"payload-b", 3072, "affinity-b"}});
+    ASSERT_TRUE(service.PutEnd(context.client_id, "payload-a",
+                               TenantId::Default(), ReplicaType::DISK));
+    {
+        MasterServiceTestPeer::MetadataAccessorRW member(
+            &service, MasterServiceTestPeer::ObjectIdentity{TenantId::Default(),
+                                                            "payload-a"});
+        ASSERT_TRUE(member.Exists());
+        member.Get().VisitReplicas(
+            [](const Replica& replica) { return replica.is_memory_replica(); },
+            [](Replica& replica) { replica.mark_processing(); });
+    }
+    const auto started = service.StartWeightResidencyOperation({
+        .identity = ready.identity,
+        .expected_metadata_generation = ready.metadata_generation,
+        .target_residency = WeightResidencyState::MIXED,
+        .mixed_hot_ratio = 0.25,
+    });
+    ASSERT_TRUE(started);
+    const auto observed =
+        service.ReconcileWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(observed);
+    EXPECT_EQ(WeightResidencyState::MIXED, observed->residency);
+    EXPECT_EQ(0.75, observed->observed_hot_ratio);
+    EXPECT_EQ(started->operation_id, observed->operation_id);
+    const auto operation =
+        service.QueryWeightOperation({.operation_id = started->operation_id});
+    ASSERT_TRUE(operation);
+    EXPECT_NE("completed", operation->message);
+    EXPECT_EQ(0, operation->processed_units);
+    EXPECT_EQ(0, operation->processed_bytes);
+    const auto retry =
+        service.ReconcileWeightRevision({.identity = ready.identity});
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(*observed, *retry);
+}
+
 TEST_F(WeightGroupLifecycleTest, DefaultMixedImportRemainsObservedHot) {
     MasterService service;
     [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
