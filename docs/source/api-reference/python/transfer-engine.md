@@ -649,6 +649,32 @@ Unregisters multiple previously registered memory regions in a single batch oper
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
+### Ascend Direct Peers
+
+#### disconnect_all_peers()
+
+```python
+disconnect_all_peers()
+```
+
+Disconnects every peer recorded by the Ascend Direct transport. The call
+waits until transfers that have already started finish, including
+synchronous transfers and asynchronous transfers that are still being
+polled. A transfer submitted while the disconnect is in progress fails
+instead of starting, and the process keeps running. After the call
+returns, new transfers can connect to peers again.
+
+This method is available only when Mooncake is built with Ascend Direct
+transport. It returns -1 when the engine is not initialized, the Ascend
+transport is not installed, or the build does not include that transport.
+
+A peer that is already disconnected is removed and counts as success. If
+disconnecting any other peer fails, that peer stays recorded and the call
+returns -1. An empty peer table returns 0.
+
+**Returns:**
+- `int`: 0 when every recorded peer is removed, -1 on failure.
+
 ### Topology and Notification
 
 #### get_local_topology()
