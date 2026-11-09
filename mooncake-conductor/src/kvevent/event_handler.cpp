@@ -50,8 +50,9 @@ std::optional<prefixindex::StorageTier> SharedTier(
     return std::nullopt;
 }
 
-bool IsSglangGpuMedium(const std::optional<std::string>& medium) {
+bool IsSglangDeviceMedium(const std::optional<std::string>& medium) {
     // SGLang's base radix caches omit medium for their engine-local cache.
+    // The upstream wire name remains GPU on both GPU and NPU platforms.
     // Explicit CPU_PINNED and DISK values identify HiCache tiers instead.
     return !medium.has_value() || AsciiToLower(*medium) == "gpu";
 }
@@ -459,7 +460,7 @@ std::string KVEventHandler::HandleSglangStored(
         return "SGLang stored event has no block hashes";
     }
 
-    if (IsSglangGpuMedium(event.medium)) {
+    if (IsSglangDeviceMedium(event.medium)) {
         return manager_->GetIndexer()->StoreEngine({
             .context = ContextFromService(service_),
             .prefixes = std::move(prefixes),
@@ -495,7 +496,7 @@ std::string KVEventHandler::HandleSglangRemoved(
     if (prefixes.empty()) {
         return "";
     }
-    if (IsSglangGpuMedium(event.medium)) {
+    if (IsSglangDeviceMedium(event.medium)) {
         return manager_->GetIndexer()->RemoveEngine({
             .context = ContextFromService(service_),
             .prefixes = std::move(prefixes),
@@ -765,7 +766,7 @@ std::string KVEventHandler::HandleVllmStored(
     }
     const std::string medium = AsciiToLower(event.medium.value_or(""));
     if (medium != "gpu") {
-        // This adapter indexes GPU ownership; other tiers are expected no-ops.
+        // Upstream calls device memory GPU; other tiers are expected no-ops.
         VLOG(1) << "Ignoring vLLM non-GPU event endpoint=" << service_.endpoint
                 << " publisher_kind="
                 << common::PublisherKindName(metadata.publisher_kind)

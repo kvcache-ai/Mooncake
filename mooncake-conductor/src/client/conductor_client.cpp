@@ -28,6 +28,10 @@ ConductorClient::~ConductorClient() { Close(); }
 tl::expected<void, ErrorCode> ConductorClient::Setup(
     const ConductorClientConfig& config) {
     std::lock_guard lock(impl_->mu);
+    // Every setup attempt replaces the previous connection, even if the new
+    // address is invalid or the connection fails.
+    impl_->connected = false;
+    impl_->client.close();
     impl_->request_timeout_ms = config.request_timeout_ms;
     // Split "host:port" for coro_rpc_client::connect(host, port).
     const auto colon = config.conductor_addr.rfind(':');
@@ -39,6 +43,7 @@ tl::expected<void, ErrorCode> ConductorClient::Setup(
     auto ec = async_simple::coro::syncAwait(impl_->client.connect(
         host, port, std::chrono::milliseconds(config.connect_timeout_ms)));
     if (ec) {
+        impl_->client.close();
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
     impl_->connected = true;

@@ -41,12 +41,12 @@ bool DistributedStorageConfig::Validate() const {
         return false;
     }
     if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix" &&
-        fs_adapter_type != "oss") {
+        !UsesObjectStorage()) {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;
     }
-    if (fs_adapter_type == "oss") {
+    if (UsesObjectStorage()) {
         return true;
     }
     const auto parsed_allocator = ParseDfsAllocatorType(allocator_type);
@@ -94,7 +94,7 @@ bool DistributedStorageConfig::Validate() const {
 
 bool DistributedStorageConfig::ValidateForAllocator() const {
     if (!Validate()) return false;
-    if (fs_adapter_type == "oss") {
+    if (UsesObjectStorage()) {
         LOG(ERROR) << "DistributedStorageConfig: DFS allocator requires a "
                       "filesystem adapter";
         return false;

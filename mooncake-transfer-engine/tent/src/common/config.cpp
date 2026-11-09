@@ -51,9 +51,16 @@ Status Config::load(const std::string& content) {
     try {
         config_data_ = json::parse(content);
         return Status::OK();
-    } catch (const std::exception& e) {
-        return Status::InvalidArgument(std::string("Invalid JSON: ") +
-                                       e.what() + LOC_MARK);
+    } catch (const json::parse_error& e) {
+        // what() includes the last input token, which may contain credentials.
+        return Status::InvalidArgument("Invalid JSON: parse error " +
+                                       std::to_string(e.id) + " at byte " +
+                                       std::to_string(e.byte) + LOC_MARK);
+    } catch (const json::exception& e) {
+        return Status::InvalidArgument("Invalid JSON: parse error " +
+                                       std::to_string(e.id) + LOC_MARK);
+    } catch (const std::exception&) {
+        return Status::InvalidArgument("Invalid JSON: parsing failed" LOC_MARK);
     }
 }
 
@@ -172,9 +179,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         try {
             is_file = std::filesystem::exists(conf);
         } catch (const std::filesystem::filesystem_error& e) {
-            LOG(WARNING) << "Failed to check file existence for MC_TENT_CONF="
-                         << conf << ": " << e.what()
-                         << ", treating as JSON string";
+            LOG(WARNING) << "Failed to check MC_TENT_CONF as a file: "
+                         << e.code().message() << ", treating as JSON string";
         }
         if (is_file) {
             status = config.loadFile(conf);

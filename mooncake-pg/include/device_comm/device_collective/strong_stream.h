@@ -73,13 +73,14 @@ namespace mooncake {
 //              |                    kernel A                  |
 //            wait H2 <------------- record H2                 |
 //              |                       |                      |
-//      recordExternal(serial_event)    |                      |  post-A record
+//      recordExternal(serial_event) -> wait tail              |  post-A record
 //              |                       |                      |
 //          record H3 -------------------------------------> wait H3
 //              |                       |                   kernel B
 //            wait H4 <------------------------------------ record H4
 //              |                       |                      |
-//      recordExternal(serial_event)    |                      |  G1 final tail
+//      recordExternal(serial_event) ----------------------> wait tail
+//              |                       |                      |  G1 final tail
 //              |                       |                      |
 //
 //    The ordinary H1-H4 operations become static Graph edges. A's return

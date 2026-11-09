@@ -7,6 +7,7 @@
 #include <exception>
 #include <future>
 #include <limits>
+#include <string_view>
 #include <utility>
 
 #include <glog/logging.h>
@@ -39,6 +40,29 @@ constexpr size_t kDefaultPeerAccessibleCapacity =
     kDefaultDeviceCollectiveBufferSize + kDefaultDeviceCollectiveControlReserve;
 constexpr size_t kDefaultLocalStagingCapacity =
     kDefaultDeviceCollectiveBufferSize;
+
+PGResult<void> applyRouteDisableEnvironment(const char* variable,
+                                            bool& enabled) {
+    const char* raw_value = std::getenv(variable);
+    if (!raw_value) return {};
+
+    const std::string_view value(raw_value);
+    PG_VALIDATE_ARG(value == "0" || value == "1",
+                    std::string(variable) + " must be 0 or 1");
+    enabled = value == "0";
+    return {};
+}
+
+PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
+    DeviceRouteConfig config;
+    PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_P2P_ROUTE",
+                                        config.p2p.enabled));
+    PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_RDMA_ROUTE",
+                                        config.rdma.enabled));
+    PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_HOST_PROXY_ROUTE",
+                                        config.host_proxy.enabled));
+    return config;
+}
 #endif
 
 void copyDeviceToDevice(void* dst, const void* src, size_t bytes,
@@ -179,6 +203,11 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
         return {};
     }
 
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    PG_TRY(auto route_config, loadDeviceRouteConfigFromEnvironment());
+    route_config.rdma.device_filter = device_filters_;
+#endif
+
     // Ordering constraint: AgentHost::start() sends registerAgent immediately,
     // which includes LinkManager's localServerName() and getWarmupRecvAddr().
     // These must be non-empty, so the engine and LinkManager must be
@@ -206,7 +235,7 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
         PG_TRY(transfer_service->initialize(
             static_cast<GlobalRank>(rank), static_cast<uint32_t>(world_size),
             device_index, *engine, link_manager, kDefaultPeerAccessibleCapacity,
-            kDefaultLocalStagingCapacity));
+            kDefaultLocalStagingCapacity, route_config));
 
         PG_TRY(auto workspace,
                DeviceCollectiveWorkspace::create(

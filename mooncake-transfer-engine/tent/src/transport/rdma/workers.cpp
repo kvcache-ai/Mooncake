@@ -1524,8 +1524,65 @@ Status Workers::getRouteHint(RouteHint& hint, SegmentID segment_id,
     auto mem_id = hint.topo->getMemId(location);
     if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
     hint.topo_entry = hint.topo->getMemEntry(mem_id);
+    if (!hint.topo_entry)
+        return Status::DeviceNotFound(
+            "Unknown memory topology location" LOC_MARK);
     hint.location = std::move(location);
     return Status::OK();
+}
+
+uint64_t Workers::allocationDeviceMask(const RouteHint& source,
+                                       const RouteHint& target) {
+    const auto& machine = target.segment->machine_id;
+    const bool same_machine = source.segment->machine_id == machine;
+    {
+        std::shared_lock<std::shared_mutex> guard(allocation_rails_mutex_);
+        auto it = allocation_rails_.find(machine);
+        if (it != allocation_rails_.end() &&
+            it->second->local() == source.topo &&
+            it->second->remote() == target.topo)
+            return it->second->localDeviceMask(*target.topo_entry,
+                                               same_machine);
+    }
+    std::unique_lock<std::shared_mutex> guard(allocation_rails_mutex_);
+    auto& rail = getOrCreateRail(allocation_rails_, machine);
+    // No admission state or per-worker configuration is needed in this cache.
+    rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
+              std::shared_ptr<const Topology>(target.pin, target.topo),
+              rail_topo_json_);
+    return rail.localDeviceMask(*target.topo_entry, same_machine);
+}
+
+Status Workers::allocateDevices(const Request& request, uint32_t num_slices,
+                                uint64_t slice_bytes, uint64_t device_mask,
+                                std::vector<int>& slice_dev_ids) {
+    slice_dev_ids.clear();
+    RouteHint source, target;
+    CHECK_STATUS(getRouteHint(source, LOCAL_SEGMENT_ID,
+                              reinterpret_cast<uint64_t>(request.source),
+                              request.length));
+    CHECK_STATUS(getRouteHint(target, request.target_id, request.target_offset,
+                              request.length));
+    // A whole-request location is chosen by largest overlap. It cannot stand
+    // in for every slice when coalesced memory has different locations. Keep
+    // those requests on the per-slice path, before charging any allocation.
+    auto uniform_location = [&](const RouteHint& hint, uint64_t addr) {
+        uint64_t offset = hint.buffer->addr;
+        for (const auto& region : hint.buffer->regions) {
+            if (offset < addr + request.length && addr < offset + region.size &&
+                region.location != hint.location)
+                return false;
+            offset += region.size;
+        }
+        return true;
+    };
+    if (!uniform_location(source, reinterpret_cast<uint64_t>(request.source)) ||
+        !uniform_location(target, request.target_offset))
+        return Status::OK();
+    device_mask &= allocationDeviceMask(source, target);
+    return device_selector_->allocate(request.length, num_slices, slice_bytes,
+                                      source.topo_entry->name, slice_dev_ids,
+                                      request.priority, device_mask);
 }
 
 int Workers::getDeviceRank(const RouteHint& hint, int device_id) {
@@ -1540,10 +1597,21 @@ int Workers::getDeviceRank(const RouteHint& hint, int device_id) {
 Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
                                     RdmaSlice* slice) {
     auto& worker = worker_context_[tl_wid];
+    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
+    if (!rail.ready() || target.topo != rail.remote())
+        CHECK_STATUS(
+            rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
+                      std::shared_ptr<const Topology>(target.pin, target.topo),
+                      rail_topo_json_, transport_->conf_.get()));
     if (slice->source_dev_id < 0) {
+        const uint64_t device_mask =
+            slice->task->device_mask &
+            rail.localDeviceMask(
+                *target.topo_entry,
+                source.segment->machine_id == target.segment->machine_id);
         CHECK_STATUS(device_selector_->allocate(
-            slice->length, source.buffer->location, slice->source_dev_id,
-            slice->priority, slice->task->device_mask));
+            slice->length, source.topo_entry->name, slice->source_dev_id,
+            slice->priority, device_mask));
         slice->charged_dev = slice->source_dev_id;
     }
 
@@ -1551,11 +1619,6 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
-    if (!rail.ready() || target.topo != rail.remote())
-        rail.load(std::shared_ptr<const Topology>(source.pin, source.topo),
-                  std::shared_ptr<const Topology>(target.pin, target.topo),
-                  rail_topo_json_, transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);

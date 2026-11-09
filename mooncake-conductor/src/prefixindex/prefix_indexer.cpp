@@ -77,10 +77,10 @@ std::string ValidateEngineMutation(const EngineMutation& mutation) {
         !error.empty()) {
         return error;
     }
-    if (mutation.tier != StorageTier::kNpu &&
+    if (mutation.tier != StorageTier::kDevice &&
         mutation.tier != StorageTier::kCpuLocal &&
         mutation.tier != StorageTier::kDisk) {
-        return "engine mutation tier must be NPU, CPU_LOCAL, or DISK";
+        return "engine mutation tier must be DEVICE, CPU_LOCAL, or DISK";
     }
     return ValidateEngineOwner(mutation.owner);
 }
@@ -91,10 +91,10 @@ std::string ValidateEngineClear(const EngineClear& clear) {
         !error.empty()) {
         return error;
     }
-    if (clear.tier.has_value() && *clear.tier != StorageTier::kNpu &&
+    if (clear.tier.has_value() && *clear.tier != StorageTier::kDevice &&
         *clear.tier != StorageTier::kCpuLocal &&
         *clear.tier != StorageTier::kDisk) {
-        return "engine clear tier must be NPU, CPU_LOCAL, DISK, or omitted";
+        return "engine clear tier must be DEVICE, CPU_LOCAL, DISK, or omitted";
     }
     return ValidateEngineOwner(clear.owner);
 }
@@ -325,7 +325,7 @@ std::string PrefixCacheTable::Unregister(const ContextKey& context,
 
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
-        std::erase_if(presence.npu_owners, [&](const EngineOwner& owner) {
+        std::erase_if(presence.device_owners, [&](const EngineOwner& owner) {
             return owner.instance_id == instance_id && owner.dp_rank == dp_rank;
         });
         auto matches_engine = [&](const TierOwner& owner) {
@@ -359,8 +359,8 @@ std::string PrefixCacheTable::StoreEngine(const EngineMutation& mutation) {
     }
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto& presence = state->blocks[prefix];
-        if (mutation.tier == StorageTier::kNpu) {
-            presence.npu_owners.insert(mutation.owner);
+        if (mutation.tier == StorageTier::kDevice) {
+            presence.device_owners.insert(mutation.owner);
         } else if (mutation.tier == StorageTier::kCpuLocal) {
             presence.cpu_local_owners.insert(mutation.owner);
         } else {
@@ -386,8 +386,8 @@ std::string PrefixCacheTable::RemoveEngine(const EngineMutation& mutation) {
     for (ProjectedPrefix prefix : mutation.prefixes) {
         auto block = state->blocks.find(prefix);
         if (block != state->blocks.end()) {
-            if (mutation.tier == StorageTier::kNpu) {
-                block->second.npu_owners.erase(mutation.owner);
+            if (mutation.tier == StorageTier::kDevice) {
+                block->second.device_owners.erase(mutation.owner);
             } else if (mutation.tier == StorageTier::kCpuLocal) {
                 block->second.cpu_local_owners.erase(mutation.owner);
             } else {
@@ -414,8 +414,8 @@ std::string PrefixCacheTable::ClearEngine(const EngineClear& clear) {
     std::unique_lock state_lock(state->mutex);
     for (auto& [unused_prefix, presence] : state->blocks) {
         (void)unused_prefix;
-        if (!clear.tier || *clear.tier == StorageTier::kNpu) {
-            presence.npu_owners.erase(clear.owner);
+        if (!clear.tier || *clear.tier == StorageTier::kDevice) {
+            presence.device_owners.erase(clear.owner);
         }
         if (!clear.tier || *clear.tier == StorageTier::kCpuLocal) {
             presence.cpu_local_owners.erase(clear.owner);
@@ -619,15 +619,15 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
                                               owner.dp_rank == rank;
                                    });
             };
-            auto npu_present = [&](const BlockPresence& block) {
-                return engine_present(block.npu_owners);
+            auto device_present = [&](const BlockPresence& block) {
+                return engine_present(block.device_owners);
             };
 
             size_t cursor = 0;
-            advance_cursor(cursor, npu_present);
+            advance_cursor(cursor, device_present);
 
             RankCacheHitResult rank_match;
-            rank_match.npu =
+            rank_match.device =
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 
             auto accessible = [&](const std::set<TierOwner>& owners) {
@@ -639,7 +639,7 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
                     });
             };
             auto local_present = [&](const BlockPresence& block) {
-                return npu_present(block) ||
+                return device_present(block) ||
                        engine_present(block.cpu_local_owners);
             };
             // The allowed sets are nested; keep one cursor for all four tiers.
@@ -661,9 +661,9 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
             rank_match.disk =
                 MatchedTokens(cursor, context.block_size, queried_tokens);
 
-            result.dp.emplace(rank, rank_match.npu);
+            result.dp.emplace(rank, rank_match.device);
             result.rank_matches.emplace(rank, rank_match);
-            result.npu = std::max(result.npu, rank_match.npu);
+            result.device = std::max(result.device, rank_match.device);
             result.cpu_local = std::max(result.cpu_local, rank_match.cpu_local);
             result.cpu_share = std::max(result.cpu_share, rank_match.cpu_share);
             result.disk = std::max(result.disk, rank_match.disk);

@@ -105,9 +105,9 @@ sleep 2
 MASTER_PID=$!
 sleep 3
 
-PYTHONPATH="$BUILD_DIR/mooncake-integration" MC_NOF_TRTYPE=TCP python3 - <<PY >"$LOG_DIR/register.log" 2>&1
-import store
-ret = store.MooncakeDistributedNoFRegister().real_register(
+MOONCAKE_STORE_BACKEND=cpp MC_NOF_TRTYPE=TCP "${MOONCAKE_PYTHON_BIN:?MOONCAKE_PYTHON_BIN must point to the installed root-wheel virtualenv}" - <<PY >"$LOG_DIR/register.log" 2>&1
+from mooncake.store import MooncakeDistributedNoFRegister
+ret = MooncakeDistributedNoFRegister().real_register(
     "$TARGET_NQN",
     1,
     "$TARGET_HOST",

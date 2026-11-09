@@ -425,6 +425,8 @@ struct SpdkNofTask {
     int64_t* io_count;
     SpdkNofQos* nof_qos;
     SpdkNofTask* nxt;
+    NofMetric* metric = nullptr;
+    uint32_t block_size = 0;
 
     SpdkNofTask(nof_seg_handle* handle, void* buf, uint64_t off, uint32_t len,
                 int op_code, std::shared_ptr<SpdkNofOperationState> s)
@@ -578,6 +580,8 @@ class FilereadWorkerPool {
     std::shared_ptr<StorageBackend> backend_;
 };
 
+struct NofMetric;
+
 /**
  * @brief Submitter class for asynchronous transfer operations
  *
@@ -591,7 +595,8 @@ class TransferSubmitter {
                                std::shared_ptr<StorageBackend>& backend,
                                const std::string& local_hostname,
                                TransferMetric* transfer_metric = nullptr,
-                               int numa_socket_id = 0);
+                               int numa_socket_id = 0,
+                               NofMetric* nof_metric = nullptr);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -670,6 +675,7 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 #ifdef USE_NOF
     std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
+    NofMetric* nof_metric_;
 #endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;

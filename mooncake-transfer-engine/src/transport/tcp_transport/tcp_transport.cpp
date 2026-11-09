@@ -558,6 +558,9 @@ Status TcpTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
+        // Match every sibling transport: attach the batch so completion
+        // callbacks pin the BatchDesc and publish into finishIfComplete.
+        task.batch_id = batch_id;
         startTransfer(prepareTransfer(&task, request));
     }
 

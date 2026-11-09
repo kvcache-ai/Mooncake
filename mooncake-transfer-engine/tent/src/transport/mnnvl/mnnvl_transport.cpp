@@ -815,8 +815,19 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (local_fd < 0)
                 return Status::InternalError(
                     "Unable to import fd from remote process");
-            CHECK_CU(cuMemImportFromShareableHandle(&handle, &local_fd,
-                                                    handle_type_));
+            // For POSIX_FILE_DESCRIPTOR the driver takes the fd value itself
+            // (cast to void*), not a pointer to it; the export side is the
+            // one that takes a pointer. Passing &local_fd fails with
+            // CUDA_ERROR_UNKNOWN. The imported handle holds its own
+            // reference, so the fd is closed right away either way.
+            auto import_result = cuMemImportFromShareableHandle(
+                &handle, (void *)(uintptr_t)local_fd, handle_type_);
+            close(local_fd);
+            if (import_result != CUDA_SUCCESS) {
+                return Status::InternalError(
+                    std::string("cuMemImportFromShareableHandle: cuResult ") +
+                    std::to_string(import_result) + LOC_MARK);
+            }
         } else {
             std::vector<unsigned char> output_buffer;
             deserializeBinaryData(buffer->mnnvl_handle, output_buffer);

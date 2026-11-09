@@ -117,6 +117,9 @@
         },
         "hylink": {
             "enable": false
+        },
+        "memfabric": {
+            "enable": false
         }
     },
     "policy": [

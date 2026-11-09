@@ -67,6 +67,7 @@ if(USE_HTTP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+set_target_properties(transfer_engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 target_include_directories(
   transfer_engine
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
@@ -209,6 +210,17 @@ if(USE_TENT)
   target_link_libraries(transfer_engine PUBLIC tent_link_group)
 endif()
 
+if(USE_MEMFABRIC)
+  if(BUILD_UNIT_TESTS)
+    # Embed the implementation in libtransfer_engine.a so Cargo's native link
+    # resolves ACL calls from the TENT archives without a separate mock library.
+    target_sources(transfer_engine PRIVATE ../tent/tests/mock_acl/acl_stub.cpp)
+    target_include_directories(transfer_engine PRIVATE ../tent/tests/mock_acl)
+  else()
+    target_link_libraries(transfer_engine PUBLIC ascendcl)
+  endif()
+endif()
+
 if(USE_INTRA_NVLINK)
   message(STATUS "Enabled USE_INTRA_NVLINK support")
   target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
@@ -221,7 +233,7 @@ endif()
 
 if(USE_EFA)
   message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
-  target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
+  target_link_libraries(transfer_engine PUBLIC efa_transport)
 endif()
 if(USE_CXI)
   message(STATUS "Enabled USE_CXI (HPE Cray Slingshot) support")

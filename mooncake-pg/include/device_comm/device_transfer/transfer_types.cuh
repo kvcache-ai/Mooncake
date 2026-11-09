@@ -15,10 +15,14 @@ class TransferLane;
 // The caller decides how lanes map to its work.
 inline constexpr uint32_t kTransferLaneCount = 32;
 
+// Drain timeout for device recovery and host-side shutdown.
+inline constexpr uint64_t kTransferDrainTimeoutMs = 5000;
+
 enum class DeviceRouteType : uint32_t {
     Unreachable = 0,
     P2p = 1,
     HostProxy = 2,
+    Rdma = 3,
 };
 
 // Terminal outcomes visible to a transfer-service caller.
@@ -34,6 +38,12 @@ struct DeviceP2pRoute {
     uint64_t mapped_region_address;
 };
 
+struct DeviceRdmaRoute {
+    uint64_t remote_region_address;
+    uint32_t remote_key;
+    uint32_t qp_offset;
+};
+
 struct DeviceHostProxyRoute {
     // Address published by the peer and consumed by the host proxy through TE.
     uint64_t remote_region_address;
@@ -45,6 +55,7 @@ struct DeviceTransferRoute {
     uint64_t region_size = 0;
     union {
         DeviceP2pRoute p2p = {};
+        DeviceRdmaRoute rdma;
         DeviceHostProxyRoute host_proxy;
     };
 };
@@ -73,15 +84,37 @@ struct DeviceLocalRegion {
     }
 };
 
+struct DeviceRdmaContext {
+    void* qp_devctxs = nullptr;
+    DeviceLocalRegion peer_accessible_region;
+    DeviceLocalRegion local_staging_region;
+    uint32_t peer_accessible_lkey = 0;
+    uint32_t local_staging_lkey = 0;
+    uint32_t qps_per_rank = 0;
+    // Registered sink for the discarded RDMA fetch-and-add result.
+    uint64_t* atomic_sink = nullptr;
+    uint32_t atomic_sink_lkey = 0;
+};
+
+struct DeviceHostProxyContext {
+    HostProxyCommandSlot* command_slots = nullptr;
+};
+
+// Non-owning route-specific device state shared by all peer routes.
+struct DeviceRouteContext {
+    DeviceRdmaContext rdma;
+    DeviceHostProxyContext host_proxy;
+};
+
 // Stable device-resident state owned by DeviceTransferService. It contains
 // only device-wide resources; a caller supplies its own peer selection,
 // buffers, signals, and algorithm state.
 struct DeviceTransferHandle {
     DeviceLocalRegion peer_accessible_region;
     DeviceLocalRegion local_staging_region;
-    const DeviceTransferRoute* routes = nullptr;
-    uint64_t* lane_results = nullptr;
-    HostProxyCommandSlot* host_proxy_command_slots = nullptr;
+    DeviceRouteContext route_context;             // Per device.
+    const DeviceTransferRoute* routes = nullptr;  // One entry per peer.
+    uint64_t drain_timeout_ticks = 0;
 
     uint32_t max_world_size = 0;
 

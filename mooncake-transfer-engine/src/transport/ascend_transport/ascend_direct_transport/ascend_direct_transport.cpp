@@ -354,7 +354,6 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
                                                const std::string &location,
                                                bool remote_accessible,
                                                bool update_metadata) {
-    (void)remote_accessible;
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
         LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
@@ -396,7 +395,8 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     const int register_ret = transfer_executor_->registerMem(
-        addr, length, mem_type, transfer_executor_->getUseBufferPool());
+        addr, length, mem_type, transfer_executor_->getUseBufferPool(),
+        remote_accessible);
     if (register_ret == 0) {
         return 0;
     }

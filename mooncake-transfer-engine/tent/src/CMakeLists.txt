@@ -188,6 +188,7 @@ foreach(
   platform_sunrise
   platform_tpu
   platform_xpu
+  platform_mlu
   tent_xport_gds
   tent_xport_uring
   tent_xport_bufio
@@ -203,9 +204,11 @@ foreach(
   tent_xport_sunrise_link
   tent_xport_tpu
   tent_xport_xpu
+  tent_xport_mlu
   tent_xport_mpcomm
   tent_xport_hylink
   tent_xport_fabric
+  tent_xport_memfabric
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})

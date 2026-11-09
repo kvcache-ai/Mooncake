@@ -8,6 +8,19 @@ This document lists common errors that may occur when using Mooncake Store and p
 > - [ ] Incorrect RDMA device name and connection status is not active.
 > - [ ] etcd is not started normally and it is not bind with `0.0.0.0`.
 
+## TENT Configuration Load Failures
+
+`MC_TENT_CONF` accepts inline JSON or a configuration file path. Malformed JSON,
+an unreadable file, or a missing path prevents TENT from starting, including
+when vLLM's `MooncakeConnector` enables TENT through `MC_USE_TENT`.
+The log reports `Failed to construct Transfer Engine instance` with the
+configuration loading error. Check the JSON syntax and ensure the file exists
+and is readable in the worker's environment before retrying startup.
+
+The native `TransferEngine(config_path)` constructor also rejects missing or
+malformed files: `available()` stays false and no RPC server is started. Valid
+environment defaults do not rescue a failed explicit file load.
+
 ## Corrupted Data or Garbled Output
 
 Use object-level checksum diagnostics when a full-object Mooncake Store read returns corrupted data or the application produces garbled output that may originate from stored data. Deploy checksum-capable Mooncake Store client, primary master, and standby master binaries from the same version, then set `MOONCAKE_STORE_CHECKSUM=1` before starting every writer and reader client process:
@@ -25,6 +38,16 @@ An enabled reader skips verification when the object's metadata has no checksum,
 Checksum diagnostics add a full data scan to writes and reads, perform device-to-host staging for GPU buffers, and disable the local hot cache. Disable the switch after diagnosis. See the [Mooncake Store Deployment and Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for deployment and snapshot compatibility details.
 
 ## Metadata and Out-of-Band Communication
+
+### TENT Configuration Parse Diagnostics
+
+JSON parse errors report a parser code and byte position without echoing the
+configuration's input tokens. Check the original `MC_TENT_CONF` value or file
+privately at that position. Errors from probing an inline configuration as a
+filename report the filesystem error without printing the configuration.
+Numeric parsing failures also omit the input literal. Review other log fields
+and attachments for sensitive data before sharing them.
+
 1. At startup, a `TransferMetadata` object is constructed according to the incoming `metadata_server` parameter. During program execution, this object is used to communicate with the etcd server to maintain internal data required for connection.
 2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method.
 

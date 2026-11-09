@@ -171,22 +171,24 @@ Status MultiTransport::tryFreeBatchID(
             return query_status;
         }
         // A terminal transfer status only means the task published completion;
-        // event-driven completion callbacks may still be unwinding while
-        // holding raw BatchDesc access. Keep the batch alive until the explicit
-        // quiescence counter reaches zero below.
+        // the completion callback may still be unwinding while holding raw
+        // BatchDesc access. Keep the batch alive until the explicit quiescence
+        // counter reaches zero below.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
     }
-#ifdef USE_EVENT_DRIVEN_COMPLETION
+    // A terminal status only means the task published completion; the
+    // completion callback may still be unwinding while holding a pin on
+    // this BatchDesc and its TransferTask objects. Keep the batch alive
+    // until the pin count reaches zero.
     if (batch_desc.active_completion_callbacks.load(
             std::memory_order_acquire) != 0) {
         return Status::BatchBusy(
             "BatchID cannot be freed until completion callbacks are quiescent");
     }
-#endif
     if (before_delete) {
         before_delete();
     }
@@ -217,6 +219,12 @@ void MultiTransport::deferredCleanupLoop() {
              it != deferred_cleanup_batches_.end();) {
             Status status = tryFreeBatchID(it->first, it->second);
             if (status.ok()) {
+                it = deferred_cleanup_batches_.erase(it);
+            } else if (!status.IsBatchBusy()) {
+                // A permanent error (e.g. a stale task reference) will never
+                // resolve on retry; drop the entry instead of polling forever.
+                LOG(ERROR) << "Dropping deferred cleanup for batch "
+                           << it->first << ": " << status.ToString();
                 it = deferred_cleanup_batches_.erase(it);
             } else {
                 ++it;

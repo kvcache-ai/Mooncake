@@ -115,10 +115,26 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     }
 
     if (spdk_nvme_cpl_is_error(cpl)) {
+        if (task->metric) {
+            if (op == mooncake::kSpdkNofOpWrite) {
+                task->metric->RecordWriteErrors();
+            } else {
+                task->metric->RecordReadErrors();
+            }
+        }
         LOG(ERROR) << "task_complete: I/O failed"
                    << spdk_nvme_cpl_get_status_string(&cpl->status);
         task->remaining_lba = 0;
         task->failed = true;
+    } else if (task->metric) {
+        const uint64_t bytes =
+            static_cast<uint64_t>(sub_task->submit_lba_count) *
+            task->block_size;
+        if (op == mooncake::kSpdkNofOpWrite) {
+            task->metric->ObserveWrite(bytes);
+        } else {
+            task->metric->ObserveRead(bytes);
+        }
     }
 
     SpdkNofTaskCompletion(task);
@@ -554,6 +570,13 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             submit_lba_count, task->op, nvmf_io_complete,
                             sub_task);
                         if (ret != 0) {
+                            if (task->metric) {
+                                if (task->op == kSpdkNofOpWrite) {
+                                    task->metric->RecordWriteErrors();
+                                } else {
+                                    task->metric->RecordReadErrors();
+                                }
+                            }
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
                             task->failed = true;
@@ -1020,13 +1043,14 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      std::shared_ptr<StorageBackend>& backend,
                                      const std::string& local_hostname,
                                      TransferMetric* transfer_metric,
-                                     int numa_socket_id)
+                                     int numa_socket_id, NofMetric* nof_metric)
     : engine_(engine),
       tent_engine_(engine.getTentEngine().get()),
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
 #ifdef USE_NOF
       spdk_nvmf_pool_(std::make_unique<SpdkNofWorkerPool>(numa_socket_id)),
+      nof_metric_(nof_metric),
 #endif
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       local_hostname_(local_hostname),
@@ -1985,6 +2009,10 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     auto state = std::make_shared<SpdkNofOperationState>();
     SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,
                      size / block_size, op_code, state);
+    if (nof_metric_) {
+        task.metric = nof_metric_;
+        task.block_size = block_size;
+    }
     spdk_nvmf_pool_->submitTask(std::move(task));
 
     VLOG(1) << "SPDK NoF transfer submitted to " << handle.transport_endpoint_;

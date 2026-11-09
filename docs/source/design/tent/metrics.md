@@ -258,7 +258,7 @@ enum closed set — no arbitrary transport strings are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
-| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu` | The transport that handled the transfer |
+| `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric` | The transport that handled the transfer |
 | `operation` | `read`, `write` | Attempt operation |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -266,11 +266,26 @@ enum closed set — no arbitrary transport strings are accepted.
 Transport label values come from the shared `transportTypeName()` mapping.
 `unspec` covers transfers that failed before a transport was selected.
 
-**Cardinality**: the `transport` label has 11 values; the failover
-`from`/`to` pair has at most 11x11 = 121 combinations (in practice only a
-few pairs ever occur), and each attempt metric has at most 11x2 = 22
+**Cardinality**: the `transport` label has 17 values; the failover
+`from`/`to` pair has at most 17x17 = 289 combinations (in practice only a
+few pairs ever occur), and each attempt metric has at most 17x2 = 34
 transport/operation combinations. Total series across all metrics is bounded
-at ~1500.
+by this closed set.
+
+### Per-rail load (`getNicLoadStats`)
+
+`TransferEngine::getNicLoadStats()` returns `NicLoadStats` entries with
+`device_name`, `inflight_bytes` and `ewma_bandwidth_bps`. RDMA and UB
+both implement it: RDMA reports one entry per local NIC, UB reports one entry
+per device tracked by its quota manager under the same `ub:<name>:<eid>`
+topology name used in logs and metrics. UB reports the highest bandwidth
+sample from that device's unpaused rails, or zero when none has a sample.
+This snapshot does not filter devices by their current context health.
+
+These are pull-based snapshots, not Prometheus series: UB rail health
+(pauses, errors in window, timeouts, endpoint rebuilds) lives in `RailMonitor`
+and is read through the transport rather than scraped. See {ref}`TENT Failover
+<tent-failover>` for how those counters drive rail selection.
 
 ## Integration with TransferEngine
 

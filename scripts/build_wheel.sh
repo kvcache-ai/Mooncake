@@ -25,6 +25,11 @@ rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
 
+if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
+    rm -rf mooncake-wheel/mooncake/_pg_jit
+    cp -R "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" mooncake-wheel/mooncake/
+fi
+
 echo "Creating directory structure..."
 
 # Copy shared allocator helper used by both CUDA and Ascend pluggable allocators.
@@ -54,10 +59,10 @@ cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
-# Copy store.so to mooncake directory
-if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
-    echo "Copying store.so..."
-    cp ${BUILD_DIR}/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+# Copy the private C++ Store extension to the mooncake package.
+if compgen -G "${BUILD_DIR}/mooncake-integration/_store.*.so" >/dev/null; then
+    echo "Copying _store extension..."
+    cp ${BUILD_DIR}/mooncake-integration/_store.*.so mooncake-wheel/mooncake/
     echo "Copying master binary..."
     # Copy master binary
     cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
@@ -66,7 +71,7 @@ if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
     # Stage the canonical async Store client for the legacy wheel builder.
     cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
 else
-    echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
+    echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -184,7 +189,13 @@ echo "Building wheel package..."
 # combined-wheel builder. Each tracked source remains in its authoritative tree.
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+STORE_FACADE_SOURCE_DIR="python/mooncake/store"
+STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
+MIGRATED_PYTHON_INIT_BACKUP=""
 MIGRATED_PYTHON_MODULES=(
+    __init__.py
+    structured_object_store.py
+    _fast_copy.c
     http_metadata_server.py
     _launcher.py
     cli.py
@@ -205,16 +216,28 @@ RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
 cleanup_migrated_python_staging() {
     for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        if [ "${module}" = "__init__.py" ]; then
+            continue
+        fi
         rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
     done
+    if [ -n "${MIGRATED_PYTHON_INIT_BACKUP}" ]; then
+        cp "${MIGRATED_PYTHON_INIT_BACKUP}" "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py"
+        rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
+        MIGRATED_PYTHON_INIT_BACKUP=""
+    fi
+    rm -rf "${STORE_FACADE_STAGING_DIR}"
     rm -rf "${RESHARD_STAGING_DIR}"
 }
 trap cleanup_migrated_python_staging EXIT
 cleanup_migrated_python_staging
+MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
+cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
 for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
     cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
        "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
 done
+cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
 cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
 
 # Build the wheel package
@@ -465,6 +488,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
     --exclude libefa.so* \
+    --exclude libhwloc.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
     --exclude libnuma.so* \

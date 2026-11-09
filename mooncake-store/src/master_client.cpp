@@ -340,6 +340,11 @@ struct RpcNameTraits<&WrappedMasterService::EvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::EvictDiskReplicaIfCurrent> {
+    static constexpr const char* value = "EvictDiskReplicaIfCurrent";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
     static constexpr const char* value = "BatchEvictDiskReplica";
 };
@@ -560,12 +565,13 @@ tl::expected<bool, ErrorCode> MasterClient::ProbeKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchProbeKey(
-    const std::vector<std::string>& object_keys) {
+    const std::vector<std::string>& object_keys,
+    const GrantLeasePolicy& policy) {
     ScopedVLogTimer timer(1, "MasterClient::BatchProbeKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchProbeKey, bool>(
-        object_keys.size(), object_keys, tenant_id_.value());
+        object_keys.size(), policy, object_keys, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " keys");
     return result;
 }
@@ -1425,6 +1431,21 @@ tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
 
     auto result = invoke_rpc<&WrappedMasterService::EvictDiskReplica, void>(
         client_id_, key, tenant_id, replica_type);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::EvictDiskReplicaIfCurrent(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type, ReplicaID expected_replica_id) {
+    ScopedVLogTimer timer(1, "MasterClient::EvictDiskReplicaIfCurrent");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                     ", replica_type=", replica_type,
+                     ", expected_replica_id=", expected_replica_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::EvictDiskReplicaIfCurrent, bool>(
+            client_id_, key, tenant_id, replica_type, expected_replica_id);
     timer.LogResponseExpected(result);
     return result;
 }

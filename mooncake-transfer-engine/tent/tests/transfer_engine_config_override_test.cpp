@@ -28,6 +28,7 @@
 
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transfer_engine.h"
 
 #ifndef _WIN32
 #include <asio.hpp>
@@ -261,6 +262,57 @@ class TestHttpMetadataServer {
 #endif
 
 TEST(TransferEngineConfigOverrideTest,
+     InvalidInlineConfigPreventsDefaultConstruction) {
+    EnvVarGuard conf_guard("MC_TENT_CONF", "{");
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+
+    // Valid fallback settings must not start discovery or an RPC server when
+    // the requested configuration cannot be loaded.
+    TransferEngineImpl engine;
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     InvalidConfigFilePreventsExplicitConstruction) {
+    TempConfigFile conf_file("{");
+    EnvVarGuard conf_guard("MC_TENT_CONF", conf_file.path());
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+    auto config = std::make_shared<Config>();
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    configureTcpOnlyTransports(*config);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     MissingConfigFilePreventsDefaultConstruction) {
+    std::string missing_path;
+    {
+        TempConfigFile conf_file("{}");
+        missing_path = conf_file.path();
+    }
+    ASSERT_FALSE(std::filesystem::exists(missing_path));
+    EnvVarGuard conf_guard("MC_TENT_CONF", missing_path);
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+
+    TransferEngineImpl engine;
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest,
      LegacyRdmaBindAddressEnvLoadsIntoTentConfig) {
     EnvVarGuard guard("MC_RDMA_BIND_ADDRESS", "10.0.0.2");
 
@@ -357,6 +409,28 @@ TEST(TransferEngineConfigOverrideTest,
     ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
 
     EXPECT_TRUE(config.get("transports/rdma/log_slice_affinity", false));
+}
+
+TEST(TransferEngineConfigOverrideTest, InvalidConstructorFilePreventsStartup) {
+    TempConfigFile file("{invalid-json");
+    EnvVarGuard conf_guard("MC_TENT_CONF", "");
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+    TransferEngine engine(file.path());
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
+}
+
+TEST(TransferEngineConfigOverrideTest, MissingConstructorFilePreventsStartup) {
+    TempConfigFile file("{}");
+    EnvVarGuard conf_guard("MC_TENT_CONF", "");
+    EnvVarGuard tcp_guard("MC_FORCE_TCP", "1");
+    EnvVarGuard hostname_guard("MOONCAKE_LOCAL_HOSTNAME", kLoopbackHostname);
+    TransferEngine engine(file.path() + ".missing");
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(engine.getRpcServerPort(), 0);
+    EXPECT_EQ(engine.getLocalTopology(), nullptr);
 }
 
 TEST(TransferEngineConfigOverrideTest, FilterNicEnvLoadsRdmaWhitelist) {

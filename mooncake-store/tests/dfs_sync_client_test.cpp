@@ -36,7 +36,13 @@ class FailingPosixFsAdapter : public PosixFsAdapter {
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
-        if (call == fail_write_call_.load()) {
+        const int fail = fail_write_call_.load();
+        // Model a genuine, non-recoverable write failure: once the armed call
+        // is reached, keep failing. The backend retries POSIX write failures
+        // once after an fd reopen (SupportsFdReopen), so a single-call failure
+        // would be masked by the retry; a persistent failure correctly
+        // surfaces to the caller.
+        if (fail > 0 && call >= fail) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
         return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);

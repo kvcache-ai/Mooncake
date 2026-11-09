@@ -24,10 +24,13 @@
 #include "tent/platform/rocm.h"
 #elif defined(USE_SUNRISE)
 #include "tent/platform/sunrise.h"
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
 #include "tent/platform/ascend.h"
 #elif defined(USE_TPU)
 #include "tent/platform/tpu.h"
+#elif defined(USE_MLU)
+#include "tent/platform/mlu.h"
 #elif defined(USE_XPU)
 #include "tent/platform/xpu.h"
 #else
@@ -44,10 +47,13 @@ std::unique_ptr<Platform> Platform::create(std::shared_ptr<Config> conf) {
     return std::make_unique<RocmPlatform>(conf);
 #elif defined(USE_SUNRISE)
     return std::make_unique<SunrisePlatform>(conf);
-#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || \
+    defined(USE_MEMFABRIC)
     return std::make_unique<AscendPlatform>(conf);
 #elif defined(USE_TPU)
     return std::make_unique<TpuPlatform>(conf);
+#elif defined(USE_MLU)
+    return std::make_unique<MluPlatform>(conf);
 #elif defined(USE_XPU)
     return std::make_unique<XpuPlatform>(conf);
 #else

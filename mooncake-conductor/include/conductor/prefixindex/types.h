@@ -29,7 +29,8 @@ struct ProjectedPrefix {
     auto operator<=>(const ProjectedPrefix&) const = default;
 };
 
-enum class StorageTier { kNpu, kCpuLocal, kCpuShare, kDisk };
+// Device memory is platform-independent: GPU, NPU, or another accelerator.
+enum class StorageTier { kDevice, kCpuLocal, kCpuShare, kDisk };
 
 struct EngineOwner {
     std::string source_stream;
@@ -65,7 +66,7 @@ struct EngineMutation {
     EngineOwner owner;
     int64_t effective_block_size = 0;
     std::optional<int64_t> cache_group;
-    StorageTier tier = StorageTier::kNpu;
+    StorageTier tier = StorageTier::kDevice;
 };
 
 struct SharedMutation {
@@ -82,9 +83,9 @@ struct EngineClear {
     EngineOwner owner;
     int64_t effective_block_size = 0;
     std::optional<int64_t> cache_group;
-    // Explicit nullopt clears all local tiers; the default clears only NPU.
+    // Explicit nullopt clears all local tiers; the default clears only device.
     // Shared Store ownership is never affected.
-    std::optional<StorageTier> tier = StorageTier::kNpu;
+    std::optional<StorageTier> tier = StorageTier::kDevice;
 };
 
 struct SharedClear {

@@ -35,23 +35,6 @@ class FileSystemAdapter {
    public:
     virtual ~FileSystemAdapter() = default;
 
-    // === File I/O ===
-
-    virtual tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& path, std::span<const char> data) = 0;
-
-    // Read file into a pre-allocated buffer (zero-copy into Slice.ptr)
-    virtual tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
-                                                     void* buf, size_t len) = 0;
-
-    virtual tl::expected<size_t, ErrorCode> VectorWriteFile(
-        const std::string& path, const iovec* iov, int iovcnt,
-        off_t offset) = 0;
-
-    virtual tl::expected<size_t, ErrorCode> VectorReadFile(
-        const std::string& path, const iovec* iov, int iovcnt,
-        off_t offset) = 0;
-
     // === File management ===
 
     virtual tl::expected<void, ErrorCode> DeleteFile(
@@ -139,6 +122,14 @@ class FileSystemAdapter {
                                                    int64_t /*offset*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
+
+    // Whether a hard WriteAt/ReadAt failure can be recovered by closing and
+    // reopening the fd (stale-fd self-healing). Only meaningful for adapters
+    // backed by a plain long-lived positional fd (POSIX). Adapters whose I/O
+    // failures are unrelated to the file fd (e.g. 3FS USRBIO submit/completion
+    // or per-thread ior/iov state) must leave this false so the backend does
+    // not perform a pointless close/reopen/retry under the shard lock.
+    virtual bool SupportsFdReopen() const { return false; }
 
     // Opt in to backend batching and concurrent positional I/O on cached
     // shard fds. Other adapters retain per-request bucket handles and

@@ -194,7 +194,16 @@ PGResult<void> StrongStream::release(const GpuCaptureInfo& capture) {
     pending_release_.reset();
 
     if (capture.active) {
-        return serial_event_.recordExternal(graph_order->stream);
+        PG_TRY(serial_event_.recordExternal(graph_order->stream));
+
+        // The external record adds a node on the order stream. Make the user
+        // stream depend on that node through an ordinary event; otherwise,
+        // cudaStreamEndCapture fails with unjoined work after the last
+        // collective.
+        auto user_stream = GpuStream::borrow(capture.origin, device_index_);
+        PG_TRY(auto joined, GpuEvent::create(device_index_));
+        PG_TRY(joined.record(graph_order->stream));
+        return user_stream.waitEvent(joined);
     }
     if (ever_captured_) return serial_event_.record(eager_order_stream_);
     return {};

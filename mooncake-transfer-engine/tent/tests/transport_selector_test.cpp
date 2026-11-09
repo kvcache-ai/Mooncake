@@ -249,6 +249,7 @@ TEST(TransportSelectorTest, TransportTypeNameMapping) {
     EXPECT_STREQ(transportTypeName(UB), "ub");
     EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
     EXPECT_STREQ(transportTypeName(HP_TCP), "hp_tcp");
+    EXPECT_STREQ(transportTypeName(MEMFABRIC), "memfabric");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
@@ -265,6 +266,7 @@ TEST(TransportSelectorTest, ParseTransportType) {
     EXPECT_EQ(parseTransportType("ub"), UB);
     EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
     EXPECT_EQ(parseTransportType("hp_tcp"), HP_TCP);
+    EXPECT_EQ(parseTransportType("memfabric"), MEMFABRIC);
     EXPECT_EQ(parseTransportType("unknown"), UNSPEC);
 }
 
@@ -292,7 +294,9 @@ TEST(TransportTypeTest, WireValuesRemainStableWithXpuAppended) {
     EXPECT_EQ(static_cast<int>(XPU), 14);
     EXPECT_EQ(static_cast<int>(HYLINK), 15);
     EXPECT_EQ(static_cast<int>(FABRIC), 16);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 17);
+    EXPECT_EQ(static_cast<int>(MLU), 17);
+    EXPECT_EQ(static_cast<int>(MEMFABRIC), 18);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 19);
 }
 
 // MPComm is appended after UB, so it takes wire value 12. The same integer is
@@ -719,6 +723,133 @@ TEST(TransportSelectorTest, XpuStagingUsesHostCapsWithoutBypassingPolicy) {
     EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, RDMA);
     EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, UNSPEC);
     EXPECT_EQ(selector.select(ctx, transports, 0, XPU).transport, UNSPEC);
+    ctx.local_memory_type = MTYPE_CPU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "staging must not bypass the original memory policy";
+}
+
+TEST(TransportTypeTest, MluWireValueMatchesCApiAndRoundTrips) {
+    EXPECT_EQ(static_cast<int>(MLU), 17);
+    EXPECT_EQ(TRANSPORT_MLU, static_cast<int>(MLU));
+    EXPECT_EQ(c_to_transport_hint(TRANSPORT_MLU), MLU);
+    EXPECT_STREQ(transportTypeName(MLU), "mlu");
+    EXPECT_EQ(parseTransportType("mlu"), MLU);
+}
+
+TEST(TransportSelectorTest, MluStagingRoutesDeviceToHostViaGpuToDram) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[MLU] = std::make_shared<FakeTransport>(MLU);
+    auto* mlu = static_cast<FakeTransport*>(transports[MLU].get());
+    mlu->setGpuToDram(true);
+    mlu->setDramToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {MLU};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = true;
+    ctx.local_memory_type = MTYPE_MLU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, MLU)
+        << "MLU VRAM->host stage should route to MluTransport (gpu_to_dram)";
+
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_MLU;
+    result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, MLU)
+        << "host->MLU VRAM stage should route to MluTransport (dram_to_gpu)";
+
+    ctx.local_memory_type = MTYPE_MLU;
+    ctx.remote_memory_type = MTYPE_MLU;
+    result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, UNSPEC)
+        << "MLU VRAM<->VRAM must not be directly routable (forces staging)";
+}
+
+TEST(TransportSelectorTest, MluIsNotRoutableToPeerSegments) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[MLU] = std::make_shared<FakeTransport>(MLU);
+    auto* mlu = static_cast<FakeTransport*>(transports[MLU].get());
+    mlu->setGpuToDram(true);
+    mlu->setDramToGpu(true);
+
+    std::vector<TransportType> buffer_transports = {MLU};
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;  // remote hop
+    ctx.local_memory_type = MTYPE_MLU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "MLU must never carry a remote hop; it is local-stage-only";
+    ctx.same_machine = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
+        << "a different segment on the same host is not process-local";
+}
+
+TEST(TransportSelectorTest, MluMemoryPatternMatchesPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"mlu_stage","segment_type":"memory","local_memory":"mlu","transports":["mlu"]}]})")
+            .ok());
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[MLU] = std::make_shared<FakeTransport>(MLU);
+    static_cast<FakeTransport*>(transports[MLU].get())->setGpuToDram(true);
+
+    std::vector<TransportType> buffer_transports = {MLU};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = true;
+    ctx.local_segment = true;  // MLU copies use process-local addresses.
+    ctx.local_memory_type = MTYPE_MLU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, MLU)
+        << "an 'mlu' local_memory policy must match MTYPE_MLU buffers";
+}
+
+TEST(TransportSelectorTest, MluStagingUsesHostCapsWithoutBypassingPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(conf->load(R"({"policy":[{"name":"mlu_network",
+        "segment_type":"memory","local_memory":"mlu",
+        "transports":["hp_tcp","rdma"]}]})")
+                    .ok());
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    for (auto type : {HP_TCP, RDMA, TCP}) {
+        transports[type] = std::make_shared<FakeTransport>(type);
+        static_cast<FakeTransport*>(transports[type].get())
+            ->setDramToDram(true);
+    }
+    SelectionContext ctx{};
+    ctx.segment_type = SegmentType::Memory;
+    ctx.local_memory_type = ctx.remote_memory_type = MTYPE_MLU;
+    EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC);
+    ctx.host_staging = true;
+    EXPECT_EQ(selector.select(ctx, transports).transport, HP_TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, RDMA);
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, UNSPEC);
+    EXPECT_EQ(selector.select(ctx, transports, 0, MLU).transport, UNSPEC);
     ctx.local_memory_type = MTYPE_CPU;
     EXPECT_EQ(selector.select(ctx, transports).transport, UNSPEC)
         << "staging must not bypass the original memory policy";

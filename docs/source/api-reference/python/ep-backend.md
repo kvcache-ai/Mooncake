@@ -29,11 +29,15 @@ from source, enable the EP/PG extensions with:
 cmake .. -DWITH_EP=ON
 ```
 
-The extensions are compiled against a specific PyTorch version. At import time,
-`mooncake.pg` and `mooncake.ep` load version-suffixed extension modules that
-match the active `torch.__version__`. If the current PyTorch version does not
-match a built extension, import will fail with a message such as
-`Mooncake PG was not built against torch==...`.
+`mooncake.pg` compiles its Torch-facing adapter at first import and caches the
+result locally. The wheel provides the native PG core/device libraries and the
+adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
+with `nvcc`, and Ninja.
+
+PG symbols are exposed through `mooncake.pg`; `mooncake.ep` is the EP entry point
+and no longer re-exports PG symbols. Existing callers should move imports such
+as `MooncakeBackendOptions` and `set_host_ip` from `mooncake.ep` to
+`mooncake.pg`.
 
 ## Mooncake PG quick start
 
@@ -320,12 +324,26 @@ Returns the workspace size in bytes for the EP buffer. Use the maximum number of
 tokens a rank may dispatch in one step. Underestimating this value can cause
 buffer overflow or incorrect dispatch results.
 
-### `Buffer(group, num_ep_buffer_bytes=0)`
+### `Buffer(group, num_ep_buffer_bytes)`
 
 Creates the EP runtime for a Mooncake process group. The constructor exchanges
 RDMA and IPC metadata through the group, initializes fast-path transports when
 available, and falls back to the Python implementation if the fast path is not
 usable.
+
+`num_ep_buffer_bytes` is required and must be positive. Use
+`Buffer.get_ep_buffer_size_hint(...)` with the maximum dispatch shape to
+calculate a suitable size before constructing the buffer:
+
+```python
+num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
+    num_max_dispatch_tokens_per_rank,
+    hidden,
+    num_ranks,
+    num_experts,
+)
+buffer = Buffer(group, num_ep_buffer_bytes)
+```
 
 ### `Buffer.dispatch(...)`
 

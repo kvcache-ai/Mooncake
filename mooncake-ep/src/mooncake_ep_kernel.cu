@@ -27,6 +27,7 @@ using mooncake::device::mc_st_release;
 using mooncake::device::mc_atomic_add_release;
 #ifdef MOONCAKE_EP_USE_MUSA
 using mooncake::device::mc_atomic_add_relaxed;
+using mooncake::device::mc_fence_noflush;
 #endif
 using mooncake::device::mc_fence;
 using mooncake::device::mc_fence_barrier_fence;

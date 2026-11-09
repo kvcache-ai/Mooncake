@@ -127,31 +127,6 @@ class FakeFileSystemAdapter : public FileSystemAdapter {
    public:
     bool initialized = false;
 
-    tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string&, std::span<const char> data) override {
-        return data.size();
-    }
-
-    tl::expected<size_t, ErrorCode> ReadFile(const std::string&, void*,
-                                             size_t) override {
-        return 0;
-    }
-
-    tl::expected<size_t, ErrorCode> VectorWriteFile(const std::string&,
-                                                    const iovec* iov,
-                                                    int iovcnt,
-                                                    off_t) override {
-        size_t total = 0;
-        for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
-        return total;
-    }
-
-    tl::expected<size_t, ErrorCode> VectorReadFile(const std::string&,
-                                                   const iovec*, int,
-                                                   off_t) override {
-        return 0;
-    }
-
     tl::expected<void, ErrorCode> DeleteFile(const std::string&) override {
         return {};
     }

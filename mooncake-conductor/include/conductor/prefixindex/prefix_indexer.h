@@ -24,13 +24,13 @@ struct RegistrationResult {
 };
 
 struct BlockPresence {
-    std::set<EngineOwner> npu_owners;
+    std::set<EngineOwner> device_owners;
     std::set<EngineOwner> cpu_local_owners;
     std::set<SharedObjectOwner> cpu_share_owners;
     std::set<TierOwner> disk_owners;
 
     bool Empty() const {
-        return npu_owners.empty() && cpu_local_owners.empty() &&
+        return device_owners.empty() && cpu_local_owners.empty() &&
                cpu_share_owners.empty() && disk_owners.empty();
     }
 };
@@ -63,7 +63,7 @@ struct ContextState {
 };
 
 struct RankCacheHitResult {
-    int64_t npu = 0;
+    int64_t device = 0;
     int64_t cpu_local = 0;
     int64_t cpu_share = 0;
     int64_t disk = 0;
@@ -75,7 +75,7 @@ struct CacheHitResult {
     int64_t longest_match_tokens = 0;
     std::map<int64_t, int64_t> dp;
     std::map<int64_t, RankCacheHitResult> rank_matches;
-    int64_t npu = 0;
+    int64_t device = 0;
     int64_t cpu_local = 0;
     int64_t cpu_share = 0;
     int64_t disk = 0;

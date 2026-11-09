@@ -397,6 +397,23 @@ TEST(MasterScenarioContractTest, CollectionFailureIdentifiesObjectKey) {
         "Object(missing) is not readable: OBJECT_NOT_FOUND");
 }
 
+TEST(MasterScenarioContractTest, ReportsBatchProbeResultCountMismatch) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("batch probe result count mismatch")
+            .Given(MemoryNode("memory"))
+            .Then(BatchProbe({"present", "missing"}).Returns({false})),
+        "BatchProbe returned 2 results; expected 1");
+}
+
+TEST(MasterScenarioContractTest, ReportsUnexpectedBatchProbeResult) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("unexpected batch probe result")
+            .Given(MemoryNode("memory"))
+            .Given(Objects({"present"}).Size(1_KB).CompleteOn("memory"))
+            .Then(BatchProbe({"present", "missing"}).Returns({true, true})),
+        "BatchProbe returned an unexpected result for key missing");
+}
+
 TEST(MasterScenarioContractTest, ReportsUnexpectedMountLocalDiskError) {
     EXPECT_NONFATAL_FAILURE(
         MasterScenario("mount local disk without offload mode")

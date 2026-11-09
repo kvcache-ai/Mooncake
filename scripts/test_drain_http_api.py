@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """Manual/nightly drain HTTP verification script.
 
 This script intentionally targets non-ASan builds only. The ASan CI gate uses
@@ -8,7 +6,10 @@ TaskExecutorIntegrationTest.DrainJobCompleteFlow instead, because running the
 pybind store client inside a Python host process is not stable under ASan.
 """
 
+from __future__ import annotations
+
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -18,15 +19,16 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-BUILD_PYTHON_DIR = REPO_ROOT / "build" / "mooncake-integration"
+os.environ["MOONCAKE_STORE_BACKEND"] = "cpp"
 
 
 def _find_store_extension() -> Path:
-    candidates = sorted(BUILD_PYTHON_DIR.glob("store*.so"))
-    if not candidates:
-        return BUILD_PYTHON_DIR / "store.so"
-    return candidates[0]
+    spec = importlib.util.find_spec("mooncake._store")
+    if spec is None or spec.origin is None:
+        raise ImportError(
+            "the installed root wheel does not include the C++ Store component"
+        )
+    return Path(spec.origin).resolve()
 
 
 STORE_EXTENSION = _find_store_extension()
@@ -65,24 +67,8 @@ def ensure_non_asan(argv: list[str]) -> None:
 
 ensure_non_asan(sys.argv)
 
-try:
-    from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
-    from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
-except ModuleNotFoundError:
-    wheel_dir = REPO_ROOT / "mooncake-wheel"
-    if str(BUILD_PYTHON_DIR) not in sys.path:
-        sys.path.insert(0, str(BUILD_PYTHON_DIR))
-    if str(wheel_dir) not in sys.path:
-        sys.path.insert(0, str(wheel_dir))
-    try:
-        from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
-        from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
-    except ModuleNotFoundError:
-        import store as store_module  # noqa: E402
-        from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
-
-        MooncakeDistributedStore = store_module.MooncakeDistributedStore
-        ReplicateConfig = store_module.ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # noqa: E402
+from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
 
 
 class TestFailure(RuntimeError):
