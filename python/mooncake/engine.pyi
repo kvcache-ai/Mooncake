@@ -26,6 +26,26 @@ class CompletionNotificationFallback(Exception):
     """Notification was requested, but this submit must fall back to polling."""
 
 
+class TransferStatus:
+    """Values carried by ``drain_completions`` rows as ``status``."""
+
+    WAITING: ClassVar[TransferStatus]
+    PENDING: ClassVar[TransferStatus]
+    INVALID: ClassVar[TransferStatus]
+    CANCELED: ClassVar[TransferStatus]
+    COMPLETED: ClassVar[TransferStatus]
+    TIMEOUT: ClassVar[TransferStatus]
+    FAILED: ClassVar[TransferStatus]
+    __members__: ClassVar[dict[str, TransferStatus]]
+    def __init__(self, value: int) -> None: ...
+    def __int__(self) -> int: ...
+    def __index__(self) -> int: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
+
 class TransferOpcode:
     Read: ClassVar[TransferOpcode]
     Write: ClassVar[TransferOpcode]
@@ -300,12 +320,9 @@ class TransferEngine:
     ) -> int:
         """Return a batch id.
 
-        With completion notification enabled, an unsupported transport raises
-        CompletionNotificationFallback. openSegment failure, mismatched list
-        lengths, and any other failure on that path raise RuntimeError.
-        The exception is raised only after the batch has been released. When
-        the message does not say buffers may still be in use, the caller may
-        reuse them. Without the flag, those failures still return 0.
+        With completion notification enabled, a path that cannot complete
+        without polling raises CompletionNotificationFallback. Every other
+        failure still returns 0. Without the flag, failure also returns 0.
         """
         ...
     # The *_on_cuda methods are only bound when SUPPORT_CUDA is true.

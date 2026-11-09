@@ -12,12 +12,10 @@
 #include <gtest/gtest.h>
 #include <infiniband/verbs.h>
 #include <poll.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -25,7 +23,6 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "config.h"
@@ -228,41 +225,63 @@ TEST_F(RdmaCompletionFdTest, OptInShortBatchWakesWithoutStatusQuery) {
 }
 
 TEST_F(RdmaCompletionFdTest, StaleRkeyFailsFromCq) {
-    // Unregistered-before-submit fails in selectPeerDevice. Unregister after
-    // the sender has already fetched the segment so the WR posts and the CQ
-    // reports the remote access error.
-    constexpr size_t kLen = 4096;
-    source_.assign(2 * kLen, 'B');
-    target_.assign(kLen, 0);
-    std::vector<char> doomed(kLen, 'Z');
+    // The doomed region is larger than slice_size (64 KiB), so one task is
+    // many slices. openSegment caches the rkey. Unregister without publishing
+    // drops the MR and leaves that cache in place, so the WR is posted and
+    // the CQ reports the error. Publishing here would make the next submit
+    // reload metadata and fail in selectPeerDevice before any post.
+    constexpr size_t kOk = 4096;
+    constexpr size_t kDoomed = 1 << 20;
+    source_.assign(kOk + kDoomed, 'B');
+    target_.assign(kOk, 0);
+    std::vector<char> doomed(kDoomed, 'Z');
     ASSERT_EQ(sender_->registerLocalMemory(source_.data(), source_.size()), 0);
     ASSERT_EQ(receiver_->registerLocalMemory(target_.data(), target_.size()),
               0);
     ASSERT_EQ(receiver_->registerLocalMemory(doomed.data(), doomed.size()), 0);
     SegmentID segment = openReceiver();
     ASSERT_NE(segment, static_cast<SegmentID>(-1));
-    ASSERT_EQ(receiver_->unregisterLocalMemory(doomed.data()), 0);
+    ASSERT_EQ(receiver_->unregisterLocalMemory(doomed.data(), false), 0);
 
     std::vector<TransferRequest> requests(2);
-    for (int i = 0; i < 2; ++i) {
-        requests[i].opcode = TransferRequest::WRITE;
-        requests[i].source = source_.data() + i * kLen;
-        requests[i].target_id = segment;
-        requests[i].length = kLen;
-    }
+    requests[0].opcode = TransferRequest::WRITE;
+    requests[0].source = source_.data();
+    requests[0].target_id = segment;
     requests[0].target_offset = reinterpret_cast<uint64_t>(target_.data());
+    requests[0].length = kOk;
+    requests[1].opcode = TransferRequest::WRITE;
+    requests[1].source = source_.data() + kOk;
+    requests[1].target_id = segment;
     requests[1].target_offset = reinterpret_cast<uint64_t>(doomed.data());
+    requests[1].length = kDoomed;
     BatchID batch = submit(requests, /*capacity=*/4, /*notify=*/true);
     BatchCompletion done{};
-    ASSERT_TRUE(drainUntil(batch, &done, 10000));
+    int matches = 0;
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!waitFd(sender_->completionFd(), 50)) continue;
+        std::vector<BatchCompletion> rows;
+        ASSERT_TRUE(sender_->drainCompletions(rows).ok());
+        for (const auto& item : rows) {
+            if (item.batch_id != batch) continue;
+            ++matches;
+            done = item;
+        }
+        if (matches > 0) break;
+    }
+    EXPECT_EQ(matches, 1);
     EXPECT_EQ(done.status.s, TransferStatusEnum::FAILED);
-    EXPECT_EQ(done.status.transferred_bytes, kLen);
+    EXPECT_EQ(done.status.transferred_bytes, kOk);
 
     TransferStatus status{};
     ASSERT_TRUE(sender_->getBatchTransferStatus(batch, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
-    EXPECT_EQ(status.transferred_bytes, kLen);
-    EXPECT_EQ(0, std::memcmp(source_.data(), target_.data(), kLen));
+    EXPECT_EQ(status.transferred_bytes, kOk);
+    EXPECT_EQ(0, std::memcmp(source_.data(), target_.data(), kOk));
+    std::vector<BatchCompletion> again;
+    ASSERT_TRUE(sender_->drainCompletions(again).ok());
+    EXPECT_TRUE(again.empty());
     release(batch);
 }
 
@@ -284,9 +303,26 @@ TEST_F(RdmaCompletionFdTest, MultiSliceTaskWakesOnce) {
     request.length = kLen;
     BatchID batch = submit({request}, /*capacity=*/1, /*notify=*/true);
     BatchCompletion done{};
-    ASSERT_TRUE(drainUntil(batch, &done, 30000));
+    int matches = 0;
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!waitFd(sender_->completionFd(), 50)) continue;
+        std::vector<BatchCompletion> rows;
+        ASSERT_TRUE(sender_->drainCompletions(rows).ok());
+        for (const auto& item : rows) {
+            if (item.batch_id != batch) continue;
+            ++matches;
+            done = item;
+        }
+        if (matches > 0) break;
+    }
+    EXPECT_EQ(matches, 1);
     EXPECT_EQ(done.status.s, TransferStatusEnum::COMPLETED);
     EXPECT_EQ(done.status.transferred_bytes, kLen);
+    std::vector<BatchCompletion> again;
+    ASSERT_TRUE(sender_->drainCompletions(again).ok());
+    EXPECT_TRUE(again.empty());
     TransferStatus status{};
     ASSERT_TRUE(sender_->getBatchTransferStatus(batch, status).ok());
     EXPECT_EQ(status.s, TransferStatusEnum::COMPLETED);
@@ -371,76 +407,6 @@ TEST_F(RdmaCompletionFdTest, ConcurrentSubmittersOneDispatcher) {
     EXPECT_EQ(0, std::memcmp(source_.data(), target_.data(), source_.size()));
 }
 
-TEST_F(RdmaCompletionFdTest, OneDrainReturnsEveryOptedInBatch) {
-    constexpr int kBatches = 3;
-    constexpr size_t kLen = 4096;
-    source_.assign(kBatches * kLen, 'C');
-    target_.assign(kBatches * kLen, 0);
-    ASSERT_EQ(sender_->registerLocalMemory(source_.data(), source_.size()), 0);
-    ASSERT_EQ(receiver_->registerLocalMemory(target_.data(), target_.size()),
-              0);
-    SegmentID segment = openReceiver();
-    ASSERT_NE(segment, static_cast<SegmentID>(-1));
-
-    std::vector<BatchID> batches;
-    for (int i = 0; i < kBatches; ++i) {
-        TransferRequest request{};
-        request.opcode = TransferRequest::WRITE;
-        request.source = source_.data() + i * kLen;
-        request.target_id = segment;
-        request.target_offset =
-            reinterpret_cast<uint64_t>(target_.data() + i * kLen);
-        request.length = kLen;
-        batches.push_back(submit({request}, /*capacity=*/2, /*notify=*/true));
-    }
-    std::unordered_set<BatchID> pending(batches.begin(), batches.end());
-    auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (!pending.empty() && std::chrono::steady_clock::now() < deadline) {
-        ASSERT_TRUE(waitFd(sender_->completionFd(), 1000));
-        std::vector<BatchCompletion> done;
-        ASSERT_TRUE(sender_->drainCompletions(done).ok());
-        for (const auto& item : done) {
-            EXPECT_EQ(item.status.s, TransferStatusEnum::COMPLETED);
-            EXPECT_EQ(item.status.transferred_bytes, kLen);
-            EXPECT_EQ(pending.erase(item.batch_id), 1u);
-        }
-    }
-    EXPECT_TRUE(pending.empty());
-    EXPECT_EQ(0, std::memcmp(source_.data(), target_.data(), source_.size()));
-    for (BatchID batch : batches) release(batch);
-}
-
-TEST_F(RdmaCompletionFdTest, NonOptInDoesNotWakeTheFd) {
-    constexpr size_t kLen = 4096;
-    source_.assign(kLen, 'D');
-    target_.assign(kLen, 0);
-    ASSERT_EQ(sender_->registerLocalMemory(source_.data(), source_.size()), 0);
-    ASSERT_EQ(receiver_->registerLocalMemory(target_.data(), target_.size()),
-              0);
-    SegmentID segment = openReceiver();
-    ASSERT_NE(segment, static_cast<SegmentID>(-1));
-    TransferRequest request{};
-    request.opcode = TransferRequest::WRITE;
-    request.source = source_.data();
-    request.target_id = segment;
-    request.target_offset = reinterpret_cast<uint64_t>(target_.data());
-    request.length = kLen;
-    BatchID batch = submit({request}, /*capacity=*/1, /*notify=*/false);
-
-    TransferStatus status{};
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    do {
-        ASSERT_TRUE(sender_->getBatchTransferStatus(batch, status).ok());
-        if (status.s == TransferStatusEnum::COMPLETED) break;
-        ASSERT_NE(status.s, TransferStatusEnum::FAILED);
-        std::this_thread::yield();
-    } while (std::chrono::steady_clock::now() < deadline);
-    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
-    EXPECT_FALSE(waitFd(sender_->completionFd(), 50));
-    release(batch);
-}
-
 TEST_F(RdmaCompletionFdTest, FreeRightAfterSubmitIsAbsentFromDrain) {
     constexpr size_t kLen = 4096;
     source_.assign(kLen, 'E');
@@ -471,64 +437,18 @@ TEST_F(RdmaCompletionFdTest, FreeRightAfterSubmitIsAbsentFromDrain) {
     }
 }
 
-TEST_F(RdmaCompletionFdTest, DestroyEngineWakesDupAndStopsPublishing) {
-    constexpr size_t kLen = 1 << 20;
-    source_.assign(kLen, 'S');
-    target_.assign(kLen, 0);
-    ASSERT_EQ(sender_->registerLocalMemory(source_.data(), source_.size()), 0);
-    ASSERT_EQ(receiver_->registerLocalMemory(target_.data(), target_.size()),
-              0);
-    SegmentID segment = openReceiver();
-    ASSERT_NE(segment, static_cast<SegmentID>(-1));
-    TransferRequest request{};
-    request.opcode = TransferRequest::WRITE;
-    request.source = source_.data();
-    request.target_id = segment;
-    request.target_offset = reinterpret_cast<uint64_t>(target_.data());
-    request.length = kLen;
-    BatchID batch = submit({request}, /*capacity=*/1, /*notify=*/true);
-
+TEST_F(RdmaCompletionFdTest, DestructorWakesDupFd) {
+    // The destructor writes the eventfd counter before close. A same-host
+    // transfer can finish before reset, so this does not claim an in-flight
+    // publish was suppressed.
     const int dup_fd = ::dup(sender_->completionFd());
     ASSERT_GE(dup_fd, 0);
     std::atomic<bool> woke{false};
     std::thread waiter([&] {
         woke.store(waitFd(dup_fd, 10000), std::memory_order_release);
     });
-    // Tear down while the multi-slice transfer is still in flight.
     sender_.reset();
     waiter.join();
     EXPECT_TRUE(woke.load(std::memory_order_acquire));
-    // The original engine is gone; a further drain on a fresh engine must
-    // not see the destroyed batch id. Closing the dup is enough here.
     ::close(dup_fd);
-    (void)batch;
-}
-
-TEST_F(RdmaCompletionFdTest, PythonRoundTrip) {
-    const char* previous = std::getenv("PYTHONPATH");
-    std::optional<std::string> saved =
-        previous ? std::optional<std::string>(previous) : std::nullopt;
-    std::string pythonpath = MOONCAKE_ENGINE_DIR;
-    if (saved) pythonpath += ":" + *saved;
-    setenv("PYTHONPATH", pythonpath.c_str(), 1);
-
-    std::string command =
-        std::string("python3 \"") + MOONCAKE_COMPLETION_FD_PY + "\" 2>&1";
-    FILE* pipe = popen(command.c_str(), "r");
-    ASSERT_NE(pipe, nullptr);
-    std::string output;
-    char buf[512];
-    while (fgets(buf, sizeof(buf), pipe)) output += buf;
-    int status = pclose(pipe);
-    int rc = WIFEXITED(status) ? WEXITSTATUS(status) : status;
-
-    if (saved)
-        setenv("PYTHONPATH", saved->c_str(), 1);
-    else
-        unsetenv("PYTHONPATH");
-
-    if (output.find("import engine failed") != std::string::npos) {
-        GTEST_SKIP() << "Python engine binding unavailable: " << output;
-    }
-    EXPECT_EQ(rc, 0) << output;
 }

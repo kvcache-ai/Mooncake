@@ -1846,6 +1846,15 @@ PYBIND11_MODULE(engine, m) {
         .value("Write", TransferEnginePy::TransferOpcode::WRITE)
         .export_values();
 
+    py::enum_<TransferStatusEnum>(m, "TransferStatus")
+        .value("WAITING", TransferStatusEnum::WAITING)
+        .value("PENDING", TransferStatusEnum::PENDING)
+        .value("INVALID", TransferStatusEnum::INVALID)
+        .value("CANCELED", TransferStatusEnum::CANCELED)
+        .value("COMPLETED", TransferStatusEnum::COMPLETED)
+        .value("TIMEOUT", TransferStatusEnum::TIMEOUT)
+        .value("FAILED", TransferStatusEnum::FAILED);
+
     py::enum_<ScatterTransferCompletionStatus>(
         m, "ScatterTransferCompletionStatus")
         .value("COMPLETED", ScatterTransferCompletionStatus::COMPLETED)

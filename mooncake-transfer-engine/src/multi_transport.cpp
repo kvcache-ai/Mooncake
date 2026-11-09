@@ -112,7 +112,7 @@ MultiTransport::~MultiTransport() {
         std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
         stop_deferred_cleanup_ = true;
     }
-    deferred_cleanup_cv_.notify_all();
+    deferred_cleanup_cv_.notify_one();
     if (deferred_cleanup_thread_.joinable()) {
         deferred_cleanup_thread_.join();
     }
@@ -923,10 +923,12 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     }
     if (any_failed) {
         status.s = Transport::TransferStatusEnum::FAILED;
-        // Once every task has settled, share the fd's byte rule so a
-        // partial-success failure cannot drift between query and drain.
-        if (batch_desc.finished_task_count.load(std::memory_order_acquire) >=
-            task_count) {
+        // Opt-in batches share the fd byte rule once every task has settled.
+        // Legacy transports such as NVMeoF report bytes only from
+        // getTransferStatus, so their walk sum stays as it is.
+        if (batch_desc.event_enabled &&
+            batch_desc.finished_task_count.load(std::memory_order_acquire) >=
+                task_count) {
             status.transferred_bytes = batch_desc.settledTransferredBytes();
         }
         return Status::OK();
@@ -936,7 +938,6 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        status.transferred_bytes = batch_desc.settledTransferredBytes();
         batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
                                                  std::memory_order_relaxed);
         batch_desc.status_cached.store(true, std::memory_order_release);

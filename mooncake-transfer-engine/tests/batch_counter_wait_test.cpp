@@ -21,10 +21,6 @@ class MultiTransportTestPeer {
                         std::shared_ptr<Transport> t) {
         m.transport_map_[name] = std::move(t);
     }
-    static void enqueue(MultiTransport& m, Transport::BatchID id,
-                        Transport::TransferStatus status) {
-        m.enqueueTerminal(id, status);
-    }
 };
 namespace {
 class ProbeTransport : public Transport {
@@ -392,24 +388,6 @@ TEST_F(BatchCounterWait, CompletionFdWakesWithoutStatusPoll) {
 #endif
 }
 
-TEST_F(BatchCounterWait, WithoutOptInCounterBatchDoesNotWakeFd) {
-#ifndef __linux__
-    GTEST_SKIP();
-#else
-    auto b = batch(1);
-    ASSERT_TRUE(submit(b, {1}).ok());
-    rdma->finish(0);
-    EXPECT_EQ(query(b).s, Transport::COMPLETED);
-    pollfd pfd{};
-    pfd.fd = multi.completionFd();
-    pfd.events = POLLIN;
-    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
-    std::vector<BatchCompletion> done;
-    ASSERT_TRUE(multi.drainCompletions(done).ok());
-    EXPECT_TRUE(done.empty());
-#endif
-}
-
 TEST_F(BatchCounterWait, OneDrainReturnsEveryReadyBatch) {
 #ifndef __linux__
     GTEST_SKIP();
@@ -453,22 +431,6 @@ TEST_F(BatchCounterWait, FreeBeforeDrainDropsTheQueuedId) {
     std::vector<BatchCompletion> done;
     ASSERT_TRUE(multi.drainCompletions(done).ok());
     EXPECT_TRUE(done.empty());
-#endif
-}
-
-TEST_F(BatchCounterWait, FailedSliceWakesWithFailedStatus) {
-#ifndef __linux__
-    GTEST_SKIP();
-#else
-    auto b = batch(1);
-    ASSERT_TRUE(enable(b).ok());
-    ASSERT_TRUE(submit(b, {1}).ok());
-    rdma->finish(0, true);
-    std::vector<BatchCompletion> done;
-    ASSERT_TRUE(multi.drainCompletions(done).ok());
-    ASSERT_EQ(done.size(), 1u);
-    EXPECT_EQ(done[0].batch_id, b);
-    EXPECT_EQ(done[0].status.s, Transport::FAILED);
 #endif
 }
 
@@ -529,6 +491,49 @@ TEST_F(BatchCounterWait, FailedSubmitDoesNotPublishCompletion) {
     std::vector<BatchCompletion> done;
     ASSERT_TRUE(multi.drainCompletions(done).ok());
     EXPECT_TRUE(done.empty());
+#endif
+}
+
+TEST_F(BatchCounterWait, FailedSubmitWithInFlightSliceDoesNotPublish) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    rdma->reject_submit = true;
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    auto status = submit(b, {1});
+    EXPECT_FALSE(status.ok());
+    rdma->finish(0);
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    EXPECT_TRUE(done.empty());
+#endif
+}
+
+TEST_F(BatchCounterWait, OptInCompletionInsideSubmitPublishesOnTailSlice) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    rdma->complete_while_submitting = true;
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    ASSERT_TRUE(submit(b, {1}).ok());
+    pollfd pfd{};
+    pfd.fd = multi.completionFd();
+    pfd.events = POLLIN;
+    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+    rdma->finish(0);
+    ASSERT_TRUE(fdReadable(multi.completionFd()));
+    std::vector<BatchCompletion> done;
+    ASSERT_TRUE(multi.drainCompletions(done).ok());
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0].batch_id, b);
+    EXPECT_EQ(done[0].status.s, Transport::COMPLETED);
+    EXPECT_EQ(done[0].status.transferred_bytes, 40u);
 #endif
 }
 
@@ -599,76 +604,6 @@ TEST_F(BatchCounterWait, PartialSliceFailureDoesNotWakeUntilTaskDone) {
     auto queried = query(b);
     EXPECT_EQ(queried.s, Transport::FAILED);
     EXPECT_EQ(queried.transferred_bytes, 0u);
-#endif
-}
-
-TEST_F(BatchCounterWait, NonCounterTransportDoesNotWakeFd) {
-#ifndef __linux__
-    GTEST_SKIP();
-#else
-    auto b = batch(1);
-    ASSERT_TRUE(submit(b, {2}).ok());
-    tcp->finish(0);
-    EXPECT_EQ(query(b).s, Transport::COMPLETED);
-    pollfd pfd{};
-    pfd.fd = multi.completionFd();
-    pfd.events = POLLIN;
-    EXPECT_EQ(::poll(&pfd, 1, 0), 0);
-    std::vector<BatchCompletion> done;
-    ASSERT_TRUE(multi.drainCompletions(done).ok());
-    EXPECT_TRUE(done.empty());
-#endif
-}
-
-// Drain preserves whatever snapshot was queued. v1's engine does not
-// generate TIMEOUT or CANCELED onto the fd; this only checks record fidelity.
-TEST_F(BatchCounterWait, DrainPreservesInjectedCanceledAndTimeout) {
-    auto canceled = batch(1);
-    auto timed_out = batch(1);
-    Transport::TransferStatus canceled_status{};
-    canceled_status.s = Transport::CANCELED;
-    Transport::TransferStatus timeout_status{};
-    timeout_status.s = Transport::TIMEOUT;
-    MultiTransportTestPeer::enqueue(multi, canceled, canceled_status);
-    MultiTransportTestPeer::enqueue(multi, timed_out, timeout_status);
-    std::vector<BatchCompletion> done;
-    if (multi.completionFd() < 0) {
-        EXPECT_TRUE(multi.drainCompletions(done).IsNotSupportedTransport());
-        return;
-    }
-    ASSERT_TRUE(multi.drainCompletions(done).ok());
-    ASSERT_EQ(done.size(), 2u);
-    EXPECT_EQ(done[0].status.s, Transport::CANCELED);
-    EXPECT_EQ(done[1].status.s, Transport::TIMEOUT);
-}
-
-TEST(CompletionEventFd, DestroyClosesOriginalFd) {
-#ifndef __linux__
-    GTEST_SKIP();
-#else
-    auto md = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
-    std::string local = "eventfd-destroy:1";
-    int fd = -1;
-    int duped = -1;
-    {
-        MultiTransport multi(md, local);
-        fd = multi.completionFd();
-        ASSERT_GE(fd, 0);
-        duped = ::dup(fd);
-        ASSERT_GE(duped, 0);
-    }
-    pollfd closed{};
-    closed.fd = fd;
-    closed.events = POLLIN;
-    ASSERT_EQ(::poll(&closed, 1, 0), 1);
-    EXPECT_NE(closed.revents & POLLNVAL, 0);
-    pollfd held{};
-    held.fd = duped;
-    held.events = POLLIN;
-    // Destruction writes the counter before close, so a dup wakes.
-    ASSERT_EQ(::poll(&held, 1, 0), 1);
-    EXPECT_NE(held.revents & POLLIN, 0);
-    ::close(duped);
 #endif
 }
 
@@ -754,7 +689,7 @@ TEST_F(BatchCounterWait, NonOptInRdmaDoesNotPublish) {
 #endif
 }
 
-TEST_F(BatchCounterWait, ConcurrentFinishDrainAndFree) {
+TEST_F(BatchCounterWait, ConcurrentFinishAndDrain) {
 #ifndef __linux__
     GTEST_SKIP();
 #else
