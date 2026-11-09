@@ -48,6 +48,19 @@ std::unique_ptr<coro_rpc::coro_rpc_server> CreateRpcServer(
     return server;
 }
 
+uint64_t NonNegativeSequenceMetric(int64_t value) {
+    return value > 0 ? static_cast<uint64_t>(value) : 0;
+}
+
+void UpdateHAOpLogProgress(uint64_t applied_sequence_id,
+                           std::optional<uint64_t> latest_sequence_id) {
+    auto& metrics = HAMetricManager::instance();
+    HAStatusManager::instance().SetOpLogProgress(
+        applied_sequence_id, latest_sequence_id,
+        NonNegativeSequenceMetric(metrics.get_oplog_trimmed_sequence_id()),
+        NonNegativeSequenceMetric(metrics.get_oplog_gc_cursor_sequence_id()));
+}
+
 #ifdef STORE_USE_REDIS
 std::string GenerateMasterInstanceId() {
     std::random_device random;
@@ -84,19 +97,6 @@ std::string BuildSnapshotEndpoint(const std::string& master_endpoint,
         return "";
     }
     return host + ":" + std::to_string(snapshot_port);
-}
-
-uint64_t NonNegativeSequenceMetric(int64_t value) {
-    return value > 0 ? static_cast<uint64_t>(value) : 0;
-}
-
-void UpdateHAOpLogProgress(uint64_t applied_sequence_id,
-                           std::optional<uint64_t> latest_sequence_id) {
-    auto& metrics = HAMetricManager::instance();
-    HAStatusManager::instance().SetOpLogProgress(
-        applied_sequence_id, latest_sequence_id,
-        NonNegativeSequenceMetric(metrics.get_oplog_trimmed_sequence_id()),
-        NonNegativeSequenceMetric(metrics.get_oplog_gc_cursor_sequence_id()));
 }
 
 void UpdateHAStatusFromStandby(P2PHotStandbyService& standby) {
@@ -267,6 +267,12 @@ int P2PMaster::RunWithHA() {
             return -1;
 #endif
         } else {
+            // TODO(P2P HA): the etcd election backend is not fully supported
+            // by the HA status/doctor surface yet. It publishes no master
+            // view into the diagnostics cache, so a running etcd primary can
+            // report MASTER_VIEW_MISMATCH/MASTER_VIEW_LEASE_EXPIRED false
+            // positives. Treat Redis election as the supported HA backend
+            // until etcd state sampling is implemented.
             auto etcd_view =
                 std::make_unique<P2PEtcdMasterView>(config_.cluster_id);
             connect_result = etcd_view->Connect(config_.ha.etcd_endpoints);
@@ -557,30 +563,44 @@ int P2PMaster::RunWithHA() {
             }
         }
 
-        auto mark_primary = [&master_registry_heartbeat,
-                             primary_service =
-                                 &active_service->GetMasterService()] {
+#endif
+        auto mark_primary_running = [primary_service =
+                                         &active_service->GetMasterService()] {
             const uint64_t latest_sequence_id =
                 primary_service->GetLatestOpLogSequenceId();
             UpdateHAOpLogProgress(latest_sequence_id, latest_sequence_id);
             HAStatusManager::instance().SetRoleState("primary", "RUNNING");
-            if (master_registry_heartbeat) {
-                master_registry_heartbeat->SetAppliedSequenceProvider(
-                    [primary_service, latest_sequence_id] {
-                        const uint64_t sequence_id =
-                            primary_service->GetLatestOpLogSequenceId();
-                        UpdateHAOpLogProgress(sequence_id, sequence_id);
-                        return sequence_id;
-                    });
-                master_registry_heartbeat->SetSnapshotReadyProvider({});
-                master_registry_heartbeat->UpdateRole("primary", false);
-            }
         };
+#ifdef STORE_USE_REDIS
+        auto mark_redis_registry = [&master_registry_heartbeat,
+                                    primary_service =
+                                        &active_service->GetMasterService()] {
+            if (!master_registry_heartbeat) {
+                return;
+            }
+            master_registry_heartbeat->SetAppliedSequenceProvider(
+                [primary_service] {
+                    const uint64_t sequence_id =
+                        primary_service->GetLatestOpLogSequenceId();
+                    UpdateHAOpLogProgress(sequence_id, sequence_id);
+                    return sequence_id;
+                });
+            master_registry_heartbeat->SetSnapshotReadyProvider({});
+            master_registry_heartbeat->UpdateRole("primary", false);
+        };
+        auto mark_primary = [mark_primary_running,
+                             mark_redis_registry =
+                                 std::move(mark_redis_registry)] {
+            mark_primary_running();
+            mark_redis_registry();
+        };
+#else
+        auto mark_primary = std::move(mark_primary_running);
+#endif
         const int run_result = RunActiveRpcServers(*server, *active_service,
                                                    std::move(mark_primary));
+#ifdef STORE_USE_REDIS
         redis_oplog_trim_worker.reset();
-#else
-        const int run_result = RunActiveRpcServers(*server, *active_service);
 #endif
         HAStatusManager::instance().SetRoleState(
             leadership_lost.load(std::memory_order_acquire) ? "standby"
