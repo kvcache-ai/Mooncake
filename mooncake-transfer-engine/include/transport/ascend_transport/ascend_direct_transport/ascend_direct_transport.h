@@ -56,6 +56,8 @@ class AscendDirectTransport : public Transport {
 
     const char* getName() const override { return "ascend_direct"; }
 
+    int disconnectAllPeers();
+
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location, bool remote_accessible,
                             bool update_metadata) override;

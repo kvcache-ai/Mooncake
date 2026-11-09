@@ -458,6 +458,14 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
     return register_ret;
 }
 
+int AscendDirectTransport::disconnectAllPeers() {
+    if (transfer_executor_ == nullptr) {
+        LOG(ERROR) << "AscendDirectTransport is not initialized";
+        return -1;
+    }
+    return transfer_executor_->disconnectAllPeers();
+}
+
 int AscendDirectTransport::unregisterLocalMemory(void* addr,
                                                  bool update_metadata) {
     // Unregistering can run on a thread that never bound a context, such as the

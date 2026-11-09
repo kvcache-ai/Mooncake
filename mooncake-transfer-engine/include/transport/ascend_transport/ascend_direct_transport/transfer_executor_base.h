@@ -16,6 +16,7 @@
 #ifndef TRANSFER_EXECUTOR_BASE_H
 #define TRANSFER_EXECUTOR_BASE_H
 
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -102,6 +103,9 @@ class TransferExecutorBase {
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
                     bool use_buffer_pool, bool remote_accessible);
     int deregisterMem(void* addr);
+    // Drop every recorded Adxl peer. 0 means the table is empty afterward.
+    // Non-zero means at least one Disconnect failed and that peer was kept.
+    int disconnectAllPeers();
 
     const size_t getNumEngines() const { return adxl_engines_.size(); }
     const std::vector<aclrtContext>& getLocalEngineContexts() const {
@@ -153,6 +157,13 @@ class TransferExecutorBase {
 
     std::unordered_map<size_t, std::set<std::string>> connected_segments_;
     std::mutex connection_mutex_;
+
+    // Held only for the duration of disconnectAllPeers(). New execute() calls
+    // fail while it is set, and it is cleared before disconnectAllPeers returns.
+    std::mutex transfer_lifecycle_mutex_;
+    std::condition_variable transfer_lifecycle_cv_;
+    size_t active_sync_transfers_{0};
+    bool peers_quiesced_{false};
 
     std::shared_ptr<TransferMetadata> metadata_;
 

@@ -36,6 +36,10 @@
 #include "tent/transfer_engine.h"
 #endif
 
+#ifdef USE_ASCEND_DIRECT
+#include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
+#endif
+
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
 #endif
@@ -1429,6 +1433,26 @@ int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
     return engine_->unregisterLocalMemory(buffer);
 }
 
+int TransferEnginePy::disconnectAllPeers() {
+#ifdef USE_ASCEND_DIRECT
+    if (!engine_) {
+        LOG(ERROR) << "Transfer engine is not initialized";
+        return -1;
+    }
+    Transport* base_transport = engine_->getTransport("ascend");
+    if (base_transport == nullptr) {
+        LOG(ERROR) << "Ascend transport is not installed";
+        return -1;
+    }
+    auto* transport = static_cast<AscendDirectTransport*>(base_transport);
+    pybind11::gil_scoped_release release;
+    return transport->disconnectAllPeers();
+#else
+    LOG(ERROR) << "Mooncake was built without Ascend Direct transport";
+    return -1;
+#endif
+}
+
 #ifdef USE_CUDA
 
 /**
@@ -2007,6 +2031,7 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("location") = kWildcardLocation,
                  py::arg("remote_accessible") = true)
             .def("unregister_memory", &TransferEnginePy::unregisterMemory)
+            .def("disconnect_all_peers", &TransferEnginePy::disconnectAllPeers)
             .def("batch_register_memory",
                  &TransferEnginePy::batchRegisterMemory,
                  py::arg("buffer_addresses"), py::arg("capacities"),
