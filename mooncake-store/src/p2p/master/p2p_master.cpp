@@ -21,6 +21,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "p2p/ha/ha_status.h"
+#include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/ha/oplog/p2p_hot_standby_service.h"
 #include "p2p/ha/p2p_master_view.h"
 #include "p2p/master/p2p_rpc_service.h"
@@ -229,6 +230,12 @@ int P2PMaster::RunWithHA() {
     std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
     while (true) {
         HAStatusManager::instance().ClearDoctorIssues();
+        // Read-only diagnostics must be reachable in every role. A standby
+        // blocks inside ElectLeader below, so start the diagnostic server
+        // before the active (primary-only) HTTP server exists.
+        P2PStatusHttpServer status_http_server(
+            static_cast<uint16_t>(config_.metrics.http_port));
+        status_http_server.Start();
         auto server = CreateRpcServer(config_);
         std::unique_ptr<P2PMasterView> master_view;
         ErrorCode connect_result = ErrorCode::INVALID_PARAMS;
@@ -431,6 +438,9 @@ int P2PMaster::RunWithHA() {
             }
             stop_primary_rpc();
         };
+        // The active service serves the full HTTP surface (including
+        // business endpoints) on the same metrics port, so hand it over now.
+        status_http_server.Stop();
         auto active_service =
             CreateActiveService(config_, view_version, stepdown_callback);
         {

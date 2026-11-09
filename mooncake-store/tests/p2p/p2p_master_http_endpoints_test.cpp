@@ -34,6 +34,7 @@
 
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
+#include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "types.h"
 #include "utils.h"
@@ -928,6 +929,44 @@ TEST_F(P2PMasterHttpEndpointsTest,
     ASSERT_EQ(resp.status, 200) << "body=" << resp.resp_body;
     EXPECT_NE(resp.resp_body.find("master_cluster_total_get_requests"),
               std::string::npos);
+}
+
+// Reproduces the real standby lifecycle: the supervisor-level status server
+// runs while the active (primary-only) HTTP surface is absent.
+TEST_F(P2PMasterHttpEndpointsTest, StatusServerServesStandbyDiagnostics) {
+    P2PStatusHttpServer status_server(/*port=*/0);
+    status_server.Start();
+    const uint16_t status_port = status_server.port();
+    ASSERT_NE(status_port, 0);
+    const std::string status_base_url =
+        "http://127.0.0.1:" + std::to_string(status_port);
+
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Configure(/*ha_enabled=*/true, "test_cluster", "");
+    status.SetRoleState("standby", "WATCHING");
+
+    auto health = HttpGet(status_base_url + "/health");
+    ASSERT_EQ(health.status, 200) << "body=" << health.resp_body;
+    EXPECT_EQ(health.resp_body, "OK");
+
+    auto ha_status = HttpGet(status_base_url + "/ha/status");
+    ASSERT_EQ(ha_status.status, 200) << "body=" << ha_status.resp_body;
+    const auto status_body = ParseJson(ha_status.resp_body, "/ha/status");
+    EXPECT_EQ(status_body["role"].asString(), "standby");
+    EXPECT_EQ(status_body["state"].asString(), "WATCHING");
+
+    auto doctor = HttpGet(status_base_url + "/ha/doctor");
+    ASSERT_EQ(doctor.status, 200) << "body=" << doctor.resp_body;
+    const auto doctor_body = ParseJson(doctor.resp_body, "/ha/doctor");
+    EXPECT_EQ(doctor_body["status"]["role"].asString(), "standby");
+
+    auto metrics = HttpGet(status_base_url + "/metrics");
+    ASSERT_EQ(metrics.status, 200);
+    auto summary = HttpGet(status_base_url + "/metrics/summary");
+    ASSERT_EQ(summary.status, 200);
+
+    status_server.Stop();
 }
 
 }  // namespace testing

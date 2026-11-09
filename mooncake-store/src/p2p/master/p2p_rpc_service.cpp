@@ -11,6 +11,7 @@
 
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
+#include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "rpc_helper.h"
 #include "utils/scoped_vlog_timer.h"
@@ -73,37 +74,7 @@ void P2PMasterRpcService::init() {
 void P2PMasterRpcService::init_http_server() {
     using namespace coro_http;
 
-    http_server_.set_http_handler<GET>(
-        "/metrics", [](coro_http_request& req, coro_http_response& resp) {
-            auto metrics =
-                P2PMasterMetricManager::instance().serialize_metrics();
-            metrics += HAMetricManager::instance().serialize_metrics();
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, std::move(metrics));
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/ha/status", [](coro_http_request& req, coro_http_response& resp) {
-            resp.add_header("Content-Type", "application/json; charset=utf-8");
-            resp.set_status_and_content(
-                status_type::ok, HAStatusManager::instance().SerializeJson());
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/ha/doctor", [](coro_http_request& req, coro_http_response& resp) {
-            resp.add_header("Content-Type", "application/json; charset=utf-8");
-            resp.set_status_and_content(
-                status_type::ok,
-                HAStatusManager::instance().SerializeDoctorJson());
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/metrics/summary",
-        [](coro_http_request& req, coro_http_response& resp) {
-            std::string summary = GetMasterMetricsSummary();
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, std::move(summary));
-        });
+    RegisterStatusHttpHandlers(http_server_);
 
     http_server_.set_http_handler<GET>(
         "/get_all_keys", [&](coro_http_request& req, coro_http_response& resp) {
@@ -130,12 +101,6 @@ void P2PMasterRpcService::init_http_server() {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(
                 status_type::ok, std::to_string(master_service_.GetKeyCount()));
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/health", [](coro_http_request& req, coro_http_response& resp) {
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            resp.set_status_and_content(status_type::ok, "OK");
         });
 
     http_server_.set_http_handler<
