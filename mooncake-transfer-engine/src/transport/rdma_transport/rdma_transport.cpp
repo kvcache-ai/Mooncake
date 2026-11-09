@@ -28,7 +28,6 @@
 #include <cstring>
 #include <memory>
 #include <set>
-#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -137,45 +136,29 @@ static uint64_t bytesUntilBufferEnd(
     return max_remaining;
 }
 
-// Says why no RNIC could be selected for [address, address + length): no
-// registered buffer covers the range, or one does but none of the RNICs is
-// active. The two need different fixes, and the bare address does not tell
-// them apart.
-static std::string describeUnselectableRange(
-    const TransferMetadata::SegmentDesc *segment_desc, uint64_t address,
-    size_t length, const std::vector<std::shared_ptr<RdmaContext>> &contexts) {
-    const TransferMetadata::BufferDesc *covering = nullptr;
-    if (segment_desc) {
-        for (const auto &buffer : segment_desc->buffers) {
-#ifdef ENABLE_MULTI_PROTOCOL
-            if (!buffer.protocol.empty() && buffer.protocol != "rdma") continue;
-#endif
-            if (bufferCoversRange(buffer.addr, buffer.length, address,
-                                  length)) {
-                covering = &buffer;
-                break;
-            }
-        }
+// Says why submitTransferTask() found no active RNIC for a slice of `length`
+// bytes: selectDevice() never succeeded, so no selectable registered buffer
+// covers the slice, or it only picked the inactive RNICs in
+// `inactive_device_ids`. The two need different fixes, and the bare address
+// does not tell them apart.
+static std::string describeSelectionFailure(
+    size_t length, size_t registered_buffers,
+    const std::set<int> &inactive_device_ids,
+    const std::vector<std::shared_ptr<RdmaContext>> &contexts) {
+    if (inactive_device_ids.empty()) {
+        return "no selectable registered buffer covers " +
+               std::to_string(length) +
+               " bytes at this address; registered buffers: " +
+               std::to_string(registered_buffers);
     }
-
-    std::ostringstream reason;
-    if (!covering) {
-        reason << "no registered buffer covers " << length
-               << " bytes at this address; registered buffers: "
-               << (segment_desc ? segment_desc->buffers.size() : 0);
-        return reason.str();
-    }
-    reason << "covered by buffer " << reinterpret_cast<void *>(covering->addr)
-           << "+" << covering->length << " at " << covering->name
-           << ", but no active RNIC was selected; RNICs:";
+    std::string reason = "selected RNIC(s) inactive:";
     const char *separator = " ";
-    for (const auto &context : contexts) {
-        if (!context) continue;
-        reason << separator << context->deviceName()
-               << (context->active() ? " active" : " inactive");
+    for (const int device_id : inactive_device_ids) {
+        reason += separator;
+        reason += contexts[device_id]->deviceName();
         separator = ", ";
     }
-    return reason.str();
+    return reason;
 }
 
 // Calculate slice length capped at MR boundary to avoid multi-MR WRs.
@@ -1414,12 +1397,16 @@ Status RdmaTransport::submitTransferTask(
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
+            // Selected but inactive RNICs, named in the error below.
+            std::set<int> inactive_device_ids;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
                 auto &request_context = context_list_[request_device_id];
                 if (request_context && request_context->active()) {
                     found_device = true;
                     buffer_id = request_buffer_id;
                     device_id = request_device_id;
+                } else if (request_context) {
+                    inactive_device_ids.insert(request_device_id);
                 }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
@@ -1444,7 +1431,10 @@ Status RdmaTransport::submitTransferTask(
                        static_cast<size_t>(device_id) < context_list_.size());
                 auto &context = context_list_[device_id];
                 assert(context.get());
-                if (!context->active()) continue;
+                if (!context->active()) {
+                    inactive_device_ids.insert(device_id);
+                    continue;
+                }
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
                            local_segment_desc->buffers.size());
@@ -1458,10 +1448,9 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                const std::string reason = describeUnselectableRange(
-                    local_segment_desc.get(),
-                    reinterpret_cast<uint64_t>(source_addr), slice->length,
-                    context_list_);
+                const std::string reason = describeSelectionFailure(
+                    slice->length, local_segment_desc->buffers.size(),
+                    inactive_device_ids, context_list_);
                 fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
