@@ -391,7 +391,7 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
-    void RunDeferredHeartbeatTailScenario() {
+    void RunDeferredHeartbeatTailScenario(uint32_t workers = 1) {
         testing::InProcMaster master;
         ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
                                      .set_enable_offload(true)
@@ -422,7 +422,9 @@ class FileStorageTest : public ::testing::Test {
 
         auto config = FileStorageConfig::FromEnvironment();
         config.storage_backend_type = StorageBackendType::kBucket;
-        config.storage_filepath = data_path + "/heartbeat_tail";
+        config.storage_filepath =
+            data_path + "/heartbeat_tail_" + std::to_string(workers);
+        config.offload_write_workers = workers;
         config.local_buffer_size = 1024 * 1024;
         fs::create_directories(config.storage_filepath);
         FileStorage storage(config, client, endpoint);
@@ -1865,6 +1867,13 @@ TEST_F(FileStorageTest,
 
 TEST_F(FileStorageTest, EmptyHeartbeatFlushesDeferredTail) {
     RunDeferredHeartbeatTailScenario();
+}
+
+TEST_F(FileStorageTest, ParallelEmptyHeartbeatFlushesDeferredTail) {
+    for (uint32_t workers : {2u, 4u}) {
+        SCOPED_TRACE(workers);
+        RunDeferredHeartbeatTailScenario(workers);
+    }
 }
 
 TEST_F(FileStorageTest, OffloadObjects_capacity_limit_releases_deferred_tasks) {
