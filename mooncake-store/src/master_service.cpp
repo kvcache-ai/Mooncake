@@ -2940,11 +2940,12 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
     if (ns == nullptr) {
         return results;
     }
-    ns->objects.ReadBatch(keys, [&](size_t i, const ObjectMetadata& metadata) {
-        if (metadata.IsValid()) {
-            results[i] = ReadExistence(metadata, grant_lease);
+    for (auto object : ns->objects.ReadBatch(keys)) {
+        if (object.metadata().IsValid()) {
+            results[object.index()] =
+                ReadExistence(object.metadata(), grant_lease);
         }
-    });
+    }
     return results;
 }
 
@@ -4765,13 +4766,13 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const metadata::Namespace* ns = namespaces_.Lookup(normalized_tenant);
     if (ns != nullptr) {
-        ns->objects.ReadBatch(
-            keys, [&](size_t i, const ObjectMetadata& metadata) {
-                if (metadata.IsValid()) {
-                    results[i] = ReadReplicaList(normalized_tenant, keys[i],
-                                                 metadata, follow_ups);
-                }
-            });
+        for (auto object : ns->objects.ReadBatch(keys)) {
+            if (object.metadata().IsValid()) {
+                results[object.index()] =
+                    ReadReplicaList(normalized_tenant, keys[object.index()],
+                                    object.metadata(), follow_ups);
+            }
+        }
     }
     follow_ups.Run(*this);
     return results;
@@ -4795,11 +4796,12 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     if (ns == nullptr) {
         return results;
     }
-    ns->objects.ReadBatch(keys, [&](size_t i, const ObjectMetadata& metadata) {
-        if (metadata.IsValid()) {
-            results[i] = ReadReplicaListForAdmin(metadata);
+    for (auto object : ns->objects.ReadBatch(keys)) {
+        if (object.metadata().IsValid()) {
+            results[object.index()] =
+                ReadReplicaListForAdmin(object.metadata());
         }
-    });
+    }
     return results;
 }
 

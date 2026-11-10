@@ -782,10 +782,10 @@ TEST(ObjectRouteTest, ReadBatchVisitsEachKeyThatHoldsAnObjectInOrder) {
     keys.push_back("k7");
 
     std::vector<size_t> visited;
-    route.ReadBatch(keys, [&](size_t i, const ObjectMetadata& metadata) {
-        EXPECT_EQ(metadata.user_key, keys[i]);
-        visited.push_back(i);
-    });
+    for (auto object : route.ReadBatch(keys)) {
+        EXPECT_EQ(object.metadata().user_key, keys[object.index()]);
+        visited.push_back(object.index());
+    }
     std::vector<size_t> expected;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (keys[i] != "k0" && keys[i] != "missing") {
@@ -826,12 +826,12 @@ TEST(ObjectRouteTest, ReadBatchWaitsForABusyKeyWithNoStripeLocked) {
     std::atomic<size_t> visited{0};
     std::optional<uint64_t> busy_checksum;
     auto batch = std::async(std::launch::async, [&] {
-        route.ReadBatch(keys, [&](size_t i, const ObjectMetadata& metadata) {
-            if (i == 0) {
-                busy_checksum = metadata.GetPart(0).checksum();
+        for (auto object : route.ReadBatch(keys)) {
+            if (object.index() == 0) {
+                busy_checksum = object.metadata().GetPart(0).checksum();
             }
             ++visited;
-        });
+        }
     });
     EXPECT_EQ(batch.wait_for(std::chrono::milliseconds(50)),
               std::future_status::timeout);
@@ -865,16 +865,32 @@ TEST(ObjectRouteTest, ReadBatchSkipsABusyKeyTornDownMeanwhile) {
     std::atomic<size_t> visited{0};
     std::vector<size_t> indexes;
     auto batch = std::async(std::launch::async, [&] {
-        route.ReadBatch(keys, [&](size_t i, const ObjectMetadata&) {
-            indexes.push_back(i);
+        for (auto object : route.ReadBatch(keys)) {
+            indexes.push_back(object.index());
             ++visited;
-        });
+        }
     });
     ASSERT_TRUE(WaitForCount(visited, 1));
     tear_down.set_value();
     holder.join();
     batch.get();
     EXPECT_EQ(indexes, (std::vector<size_t>{0}));
+    EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 1u);
+}
+
+TEST(ObjectRouteTest, ReadBatchLetsGoOfTheKeysNotReachedWhenLeftEarly) {
+    ObjectRoute route;
+    const std::vector<std::string> keys = {"a", "b"};
+    for (const auto& key : keys) {
+        ASSERT_NE(PublishObject(route, key), 0u);
+    }
+    for (auto object : route.ReadBatch(keys)) {
+        EXPECT_EQ(object.index(), 0u);
+        // The batch holds the slot of "b" until it is left.
+        std::thread([&] { EXPECT_TRUE(TearDownKey(route, "b")); }).join();
+        EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 2u);
+        break;
+    }
     EXPECT_EQ(ObjectRouteTestPeer::SlotCount(route), 1u);
 }
 
@@ -930,6 +946,17 @@ TEST(ObjectRouteDeathTest, DestroyingARouteUnderACursorAborts) {
                 (void)object;
                 route.reset();
             }
+        },
+        "under an open cursor");
+}
+
+TEST(ObjectRouteDeathTest, DestroyingARouteUnderABatchReadCursorAborts) {
+    const std::vector<std::string> keys = {"missing"};
+    EXPECT_DEATH(
+        {
+            auto route = std::make_unique<ObjectRoute>();
+            auto batch = route->ReadBatch(keys);
+            route.reset();
         },
         "under an open cursor");
 }
@@ -1066,7 +1093,10 @@ TEST(ObjectRouteTest, ReadBatchReportsEachReadToAReadObserver) {
 
     const std::vector<std::string> keys = {"k1", "missing", "k2"};
     size_t visits = 0;
-    route.ReadBatch(keys, [&](size_t, const ObjectMetadata&) { ++visits; });
+    for (auto object : route.ReadBatch(keys)) {
+        (void)object;
+        ++visits;
+    }
     EXPECT_EQ(visits, 2u);
     EXPECT_EQ(observer.keys, (std::vector<std::string>{"k1", "k2"}));
 }
