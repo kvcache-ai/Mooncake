@@ -233,6 +233,10 @@ if(USE_CUDA)
     target_link_libraries(mooncake_ep_device PRIVATE NCCL::nccl)
   endif()
 elseif(USE_MUSA)
+  # Define this before pybind11_add_module(_ep). GCC LTO with the mcc-built
+  # object below leaves C++ constructor calls at address 0, which crashes _ep
+  # on import.
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
   set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
   if(DEFINED ENV{MUSA_HOME} AND NOT "$ENV{MUSA_HOME}" STREQUAL "")
     set(_ep_musa_compiler_hint "$ENV{MUSA_HOME}/bin")
