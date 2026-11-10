@@ -641,7 +641,8 @@ int TransferEngineImpl::freeSharedMemory(void* addr) {
     return shm->freeSharedMemory(addr);
 }
 
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+     defined(USE_HYGON)) &&                                         \
     !defined(USE_CXI)
 device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
     int num_ranks) {
@@ -653,10 +654,14 @@ device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
 
 device::RdmaTransport* TransferEngineImpl::getOrCreateRdmaTransport(
     const std::vector<std::string>& device_filter) {
+#if defined(USE_HYGON)
+    return nullptr;
+#else
     if (!rdma_transport_) {
         rdma_transport_ = device::createIbgdaDeviceTransport(device_filter);
     }
     return rdma_transport_.get();
+#endif
 }
 #endif
 
