@@ -178,14 +178,11 @@ struct NcclElasticState {
                      int requested_gin_context_count, bool use_rail_gin,
                      int gin_traffic_class,
                      const std::vector<int32_t>& nccl_unique_id,
-                     std::shared_ptr<device::NcclInitPhaseGate> init_phase_gate)
-        : transport(init_phase_gate
-                        ? device::createNcclDeviceTransportWithInitHook(
-                              [init_phase_gate] {
-                                  init_phase_gate->hostReadyAndWait();
-                              },
-                              init_phase_gate)
-                        : device::createNcclDeviceTransport()),
+                     std::weak_ptr<std::function<bool(bool)>> status_callback)
+        : transport(status_callback.expired()
+                        ? device::createNcclDeviceTransport()
+                        : device::createNcclDeviceTransportWithStatusCallback(
+                              std::move(status_callback))),
           allocation_bytes(bytes),
           gin_context_count(requested_gin_context_count) {
         if (!transport) {
@@ -473,25 +470,8 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
     bool allow_multiple_reduction, bool prefer_overlap_with_compute, int sl_idx,
     int num_allocated_qps, int num_cpu_timeout_secs, int num_gpu_timeout_secs,
     const std::string& transport, const std::vector<int32_t>& nccl_unique_id,
-    const std::vector<int32_t>& logical_to_transport_slots)
-    : MooncakeElasticBuffer(
-          transport_rank, capacity_ranks, logical_rank, logical_num_ranks,
-          num_buffer_bytes, num_max_tokens_per_rank, hidden, num_topk,
-          use_fp8_dispatch, deterministic, allow_hybrid_mode,
-          allow_multiple_reduction, prefer_overlap_with_compute, sl_idx,
-          num_allocated_qps, num_cpu_timeout_secs, num_gpu_timeout_secs,
-          transport, nccl_unique_id, logical_to_transport_slots, nullptr) {}
-
-MooncakeElasticBuffer::MooncakeElasticBuffer(
-    int transport_rank, int capacity_ranks, int logical_rank,
-    int logical_num_ranks, int64_t num_buffer_bytes,
-    int64_t num_max_tokens_per_rank, int64_t hidden, int64_t num_topk,
-    bool use_fp8_dispatch, bool deterministic, bool allow_hybrid_mode,
-    bool allow_multiple_reduction, bool prefer_overlap_with_compute, int sl_idx,
-    int num_allocated_qps, int num_cpu_timeout_secs, int num_gpu_timeout_secs,
-    const std::string& transport, const std::vector<int32_t>& nccl_unique_id,
     const std::vector<int32_t>& logical_to_transport_slots,
-    std::shared_ptr<device::NcclInitPhaseGate> init_phase_gate)
+    std::function<bool(bool)> init_status_callback)
     : transport_(transport),
       transport_rank_(transport_rank),
       capacity_ranks_(capacity_ranks),
@@ -524,9 +504,9 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
         throw std::invalid_argument(
             "ElasticBuffer transport must be either 'ibgda' or 'nccl'");
     }
-    if (init_phase_gate && transport_ != "nccl") {
+    if (init_status_callback && transport_ != "nccl") {
         throw std::invalid_argument(
-            "NCCL init phase gates require transport='nccl'");
+            "NCCL init status callbacks require transport='nccl'");
     }
 
     CUDA_CHECK(cudaGetDevice(&device_id_));
@@ -563,6 +543,12 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
         throw std::invalid_argument("ElasticBuffer size must be positive");
     }
 
+    std::shared_ptr<std::function<bool(bool)>> status_callback_holder;
+    if (init_status_callback) {
+        status_callback_holder = std::make_shared<std::function<bool(bool)>>(
+            std::move(init_status_callback));
+    }
+
     if (transport_ == "nccl") {
 #ifdef USE_NCCL_DEVICE
         const int context_count =
@@ -570,8 +556,7 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
         nccl_state_ = std::make_unique<NcclElasticState>(
             logical_rank, logical_num_ranks,
             static_cast<size_t>(num_buffer_bytes), context_count,
-            allow_hybrid_mode, sl_idx, nccl_unique_id,
-            std::move(init_phase_gate));
+            allow_hybrid_mode, sl_idx, nccl_unique_id, status_callback_holder);
         topology_ = make_nccl_topology(*nccl_state_, logical_rank,
                                        logical_num_ranks, allow_hybrid_mode);
 #else
@@ -732,7 +717,8 @@ void MooncakeElasticBuffer::reconfigure_nccl_membership(
     // ordinary CUDA stores while its old NCCL window remains registered.
     auto candidate = std::make_unique<NcclElasticState>(
         rank, num_ranks, nccl_state_->allocation_bytes, context_count,
-        config_.allow_hybrid_mode, config_.sl_idx, nccl_unique_id, nullptr);
+        config_.allow_hybrid_mode, config_.sl_idx, nccl_unique_id,
+        std::weak_ptr<std::function<bool(bool)>>{});
     const auto candidate_topology = make_nccl_topology(
         *candidate, rank, num_ranks, config_.allow_hybrid_mode);
 

@@ -10,9 +10,6 @@
 #define MOONCAKE_EP_HAS_ELASTIC 1
 #include <elastic/mooncake_ep_elastic_buffer.h>
 #endif
-#ifdef USE_NCCL_DEVICE
-#include <transport/device/nccl_device_transport.h>
-#endif
 #include <pybind11/pybind11.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
@@ -43,26 +40,6 @@ PYBIND11_MODULE(_ep, m) {
     m.def("calculate_elastic_buffer_size",
           &MooncakeElasticBuffer::calculate_buffer_size);
     m.def("create_nccl_unique_id", &create_elastic_nccl_unique_id);
-#ifdef USE_NCCL_DEVICE
-    py::class_<device::NcclInitPhaseGate,
-               std::shared_ptr<device::NcclInitPhaseGate>>(
-        m, "NcclInitPhaseGate")
-        .def(py::init<>())
-        .def("wait_host_ready", &device::NcclInitPhaseGate::waitForHostReady,
-             py::call_guard<py::gil_scoped_release>())
-        .def("release", &device::NcclInitPhaseGate::release)
-        .def("set_status_callback", [](device::NcclInitPhaseGate& gate,
-                                       py::function callback) {
-            gate.setStatusCallback(
-                [callback = std::move(callback)](bool local_success) {
-                    py::gil_scoped_acquire gil;
-                    return callback(local_success).cast<bool>();
-                });
-        })
-        .def("clear_status_callback",
-             &device::NcclInitPhaseGate::clearStatusCallback)
-        .def("_fail", &device::NcclInitPhaseGate::fail);
-#endif
 #endif
     m.def("has_nccl_device_support", []() {
 #ifdef USE_NCCL_DEVICE
@@ -173,40 +150,22 @@ PYBIND11_MODULE(_ep, m) {
              py::arg("num_gpu_timeout_secs"), py::arg("transport") = "ibgda",
              py::arg("nccl_unique_id") = std::vector<int32_t>{},
              py::call_guard<py::gil_scoped_release>())
-        .def(
-            py::init<int, int, int, int, int64_t, int64_t, int64_t, int64_t,
-                     bool, bool, bool, bool, bool, int, int, int, int,
-                     std::string, std::vector<int32_t>, std::vector<int32_t>>(),
-            py::arg("transport_rank"), py::arg("capacity_ranks"),
-            py::arg("logical_rank"), py::arg("logical_num_ranks"),
-            py::arg("num_buffer_bytes"), py::arg("num_max_tokens_per_rank"),
-            py::arg("hidden"), py::arg("num_topk"), py::arg("use_fp8_dispatch"),
-            py::arg("deterministic"), py::arg("allow_hybrid_mode"),
-            py::arg("allow_multiple_reduction"),
-            py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
-            py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
-            py::arg("num_gpu_timeout_secs"), py::arg("transport"),
-            py::arg("nccl_unique_id"), py::arg("logical_to_transport_slots"),
-            py::call_guard<py::gil_scoped_release>())
-#ifdef USE_NCCL_DEVICE
-        .def(
-            py::init<int, int, int, int, int64_t, int64_t, int64_t, int64_t,
-                     bool, bool, bool, bool, bool, int, int, int, int,
-                     std::string, std::vector<int32_t>, std::vector<int32_t>,
-                     std::shared_ptr<device::NcclInitPhaseGate>>(),
-            py::arg("transport_rank"), py::arg("capacity_ranks"),
-            py::arg("logical_rank"), py::arg("logical_num_ranks"),
-            py::arg("num_buffer_bytes"), py::arg("num_max_tokens_per_rank"),
-            py::arg("hidden"), py::arg("num_topk"), py::arg("use_fp8_dispatch"),
-            py::arg("deterministic"), py::arg("allow_hybrid_mode"),
-            py::arg("allow_multiple_reduction"),
-            py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
-            py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
-            py::arg("num_gpu_timeout_secs"), py::arg("transport"),
-            py::arg("nccl_unique_id"), py::arg("logical_to_transport_slots"),
-            py::arg("init_phase_gate"),
-            py::call_guard<py::gil_scoped_release>())
-#endif
+        .def(py::init<int, int, int, int, int64_t, int64_t, int64_t, int64_t,
+                      bool, bool, bool, bool, bool, int, int, int, int,
+                      std::string, std::vector<int32_t>, std::vector<int32_t>,
+                      std::function<bool(bool)>>(),
+             py::arg("transport_rank"), py::arg("capacity_ranks"),
+             py::arg("logical_rank"), py::arg("logical_num_ranks"),
+             py::arg("num_buffer_bytes"), py::arg("num_max_tokens_per_rank"),
+             py::arg("hidden"), py::arg("num_topk"),
+             py::arg("use_fp8_dispatch"), py::arg("deterministic"),
+             py::arg("allow_hybrid_mode"), py::arg("allow_multiple_reduction"),
+             py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
+             py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
+             py::arg("num_gpu_timeout_secs"), py::arg("transport"),
+             py::arg("nccl_unique_id"), py::arg("logical_to_transport_slots"),
+             py::arg("init_status_callback") = std::function<bool(bool)>{},
+             py::call_guard<py::gil_scoped_release>())
         .def("destroy", &MooncakeElasticBuffer::destroy,
              py::call_guard<py::gil_scoped_release>())
         .def("using_nccl", &MooncakeElasticBuffer::using_nccl)

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -12,10 +13,6 @@
 #include <mooncake_ep_buffer.h>
 
 namespace mooncake {
-
-namespace device {
-class NcclInitPhaseGate;
-}
 
 struct ElasticLaunchContext;
 struct NcclElasticState;
@@ -83,19 +80,8 @@ class MooncakeElasticBuffer {
         int sl_idx, int num_allocated_qps, int num_cpu_timeout_secs,
         int num_gpu_timeout_secs, const std::string& transport,
         const std::vector<int32_t>& nccl_unique_id,
-        const std::vector<int32_t>& logical_to_transport_slots);
-
-    MooncakeElasticBuffer(
-        int transport_rank, int capacity_ranks, int logical_rank,
-        int logical_num_ranks, int64_t num_buffer_bytes,
-        int64_t num_max_tokens_per_rank, int64_t hidden, int64_t num_topk,
-        bool use_fp8_dispatch, bool deterministic, bool allow_hybrid_mode,
-        bool allow_multiple_reduction, bool prefer_overlap_with_compute,
-        int sl_idx, int num_allocated_qps, int num_cpu_timeout_secs,
-        int num_gpu_timeout_secs, const std::string& transport,
-        const std::vector<int32_t>& nccl_unique_id,
         const std::vector<int32_t>& logical_to_transport_slots,
-        std::shared_ptr<device::NcclInitPhaseGate> init_phase_gate);
+        std::function<bool(bool)> init_status_callback = {});
 
     ~MooncakeElasticBuffer();
 

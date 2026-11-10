@@ -1,7 +1,6 @@
 import os
 import socket
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, List, Optional, Sequence, Tuple, Union
@@ -22,7 +21,6 @@ from .mooncake_ep_tcpstore import (
 _VALID_TRANSPORTS = {"auto", "ibgda", "nccl"}
 _TRANSPORT_TO_CODE = {"auto": 0, "ibgda": 1, "nccl": 2}
 _CODE_TO_TRANSPORT = {code: name for name, code in _TRANSPORT_TO_CODE.items()}
-_NCCL_INIT_PHASE_MODE = "late-gate-tcpstore-v2"
 _NCCL_INIT_STATUS_STAGES = (
     "capabilities",
     "device-communicator-create",
@@ -37,14 +35,6 @@ _NCCL_INIT_STATUS_STAGES = (
     "topology-shape",
     "mapped-host-workspace",
 )
-
-
-def _supports_nccl_init_status_callback(ep: Any) -> bool:
-    gate = getattr(ep, "NcclInitPhaseGate", None)
-    return gate is not None and all(
-        hasattr(gate, method)
-        for method in ("set_status_callback", "clear_status_callback")
-    )
 
 
 def _make_nccl_init_status_callback(collectives: TCPStoreCollectives):
@@ -573,8 +563,6 @@ class ElasticBuffer:
         previous_members: Sequence[int] = (),
         _prepared_membership: bool = False,
         _required_transport: Optional[str] = None,
-        _required_init_phase: Optional[str] = None,
-        _init_phase_gate: Optional[Any] = None,
         _tcp_store_owner: Optional[dist.TCPStore] = None,
     ) -> "ElasticBuffer":
         """Create a Store-backed ElasticBuffer without a ProcessGroup.
@@ -640,9 +628,6 @@ class ElasticBuffer:
         self._members = members
         self._active = not _prepared_membership
         self._pending_membership = None
-        self._init_phase_gate = None
-        self._native_runtime_future = None
-        self._native_runtime_executor = None
         self._tcp_store_owner = (
             tcp_store_group if _tcp_store_owner is None else _tcp_store_owner
         )
@@ -711,37 +696,6 @@ class ElasticBuffer:
             ep, required_transport=_required_transport
         )
         joining_nccl = bool(previous) and self.transport == "nccl"
-        if joining_nccl:
-            if _required_init_phase is None:
-                phase_key = self._membership_transition_key(
-                    store_namespace, "required-init-phase"
-                )
-                self._tcp_store.wait(
-                    [phase_key], timedelta(seconds=store_timeout_secs)
-                )
-                _required_init_phase = self._tcp_store.get(phase_key).decode()
-            if _required_init_phase != _NCCL_INIT_PHASE_MODE:
-                raise RuntimeError(
-                    "NCCL membership transition requires a compatible host-init phase gate"
-                )
-        if _prepared_membership or joining_nccl:
-            phase_capabilities = self._store_collectives.all_gather(
-                "nccl-init-phase-mode",
-                (_required_init_phase, _supports_nccl_init_status_callback(ep)),
-            )
-            if any(
-                mode != _NCCL_INIT_PHASE_MODE or not supported
-                for mode, supported in phase_capabilities
-            ):
-                raise RuntimeError(
-                    "NCCL membership transition requires compatible Python and native phase-gate support"
-                )
-            if _prepared_membership and _init_phase_gate is None:
-                raise RuntimeError(
-                    "prepared NCCL candidates require the coordinated native init phase gate"
-                )
-            if joining_nccl:
-                _init_phase_gate = ep.NcclInitPhaseGate()
         if previous and not joining_nccl:
             self._tcp_store.wait(
                 [self._membership_retired_key(store_namespace)],
@@ -765,36 +719,12 @@ class ElasticBuffer:
                 f"{store_namespace}/candidate-init-status",
                 store_timeout_secs,
             )
-            _init_phase_gate.set_status_callback(
-                _make_nccl_init_status_callback(status_collectives)
+            status_callback = _make_nccl_init_status_callback(status_collectives)
+            self.runtime = self._construct_capacity_runtime(
+                ep, nccl_unique_id, status_callback
             )
-            self._start_gated_native_runtime(ep, nccl_unique_id, _init_phase_gate)
-            try:
-                self._tcp_store.set(
-                    self._membership_transition_key(
-                        store_namespace, f"host-ready/{self._transport_rank}"
-                    ),
-                    b"1",
-                )
-                host_ready_keys = [
-                    self._membership_transition_key(
-                        store_namespace, f"host-ready/{member}"
-                    )
-                    for member in members
-                ]
-                self._tcp_store.wait(
-                    host_ready_keys, timedelta(seconds=store_timeout_secs)
-                )
-                _init_phase_gate.release()
-            except BaseException as exc:
-                _init_phase_gate.clear_status_callback()
-                _init_phase_gate._fail(f"{type(exc).__name__}: {exc}")
-                self._native_runtime_executor.shutdown(wait=False)
-                self._native_runtime_future = None
-                self._native_runtime_executor = None
-                self._init_phase_gate = None
-                raise
-            self._finish_gated_native_runtime()
+            with torch.cuda.device(self._device_index):
+                self._finish_native_runtime_initialization(staged_candidate=True)
             if joining_nccl:
                 self._finish_joining_membership()
             return self
@@ -1364,7 +1294,7 @@ class ElasticBuffer:
         self,
         ep: Any,
         nccl_unique_id: List[int],
-        init_phase_gate: Optional[Any] = None,
+        init_status_callback: Optional[Any] = None,
     ):
         args = (
             self._transport_rank,
@@ -1388,57 +1318,9 @@ class ElasticBuffer:
             nccl_unique_id,
             self._members,
         )
-        if init_phase_gate is None:
+        if init_status_callback is None:
             return ep.ElasticBuffer(*args)
-        return ep.ElasticBuffer(*args, init_phase_gate)
-
-    def _start_gated_native_runtime(
-        self, ep: Any, nccl_unique_id: List[int], init_phase_gate: Any
-    ) -> None:
-        executor = ThreadPoolExecutor(max_workers=1)
-
-        def construct():
-            try:
-                with torch.cuda.device(self._device_index):
-                    return self._construct_capacity_runtime(
-                        ep, nccl_unique_id, init_phase_gate
-                    )
-            except BaseException as exc:
-                init_phase_gate._fail(f"{type(exc).__name__}: {exc}")
-                raise
-
-        future = executor.submit(construct)
-        self._init_phase_gate = init_phase_gate
-        self._native_runtime_future = future
-        self._native_runtime_executor = executor
-        try:
-            init_phase_gate.wait_host_ready()
-        except BaseException as exc:
-            init_phase_gate.clear_status_callback()
-            init_phase_gate._fail(f"{type(exc).__name__}: {exc}")
-            executor.shutdown(wait=False)
-            self._native_runtime_future = None
-            self._native_runtime_executor = None
-            self._init_phase_gate = None
-            raise
-
-    def _finish_gated_native_runtime(self) -> None:
-        future = self._native_runtime_future
-        executor = self._native_runtime_executor
-        if future is None or executor is None:
-            raise RuntimeError("NCCL candidate has no pending native constructor")
-        init_phase_gate = self._init_phase_gate
-        try:
-            self.runtime = future.result()
-        finally:
-            if init_phase_gate is not None:
-                init_phase_gate.clear_status_callback()
-            executor.shutdown(wait=True)
-            self._native_runtime_future = None
-            self._native_runtime_executor = None
-            self._init_phase_gate = None
-        with torch.cuda.device(self._device_index):
-            self._finish_native_runtime_initialization(staged_candidate=True)
+        return ep.ElasticBuffer(*args, init_status_callback)
 
     def _finish_native_runtime_initialization(self, staged_candidate: bool) -> None:
         self._refresh_topology_from_runtime()
@@ -1477,9 +1359,7 @@ class ElasticBuffer:
         if staged_candidate:
             if self.rank_idx == 0:
                 self._tcp_store.set(
-                    self._membership_transition_key(
-                        self._store_namespace, "prepared"
-                    ),
+                    self._membership_transition_key(self._store_namespace, "prepared"),
                     b"1",
                 )
         else:
@@ -1603,8 +1483,8 @@ class ElasticBuffer:
         """Prepare target NCCL candidates while the current runtime is installed.
 
         All old members call this method. Target members construct a new buffer
-        with ``previous_members`` and finish initialization after all target
-        host communicators are ready. ``commit_membership`` waits for target
+        with ``previous_members`` and synchronize each initialization status
+        through the TCPStore. ``commit_membership`` waits for target
         preparation before draining the old cohort. A buffer supports one
         pending transition at a time; it cannot be cancelled.
         """
@@ -1635,9 +1515,6 @@ class ElasticBuffer:
             )
 
         transition_store = clone_tcp_store(self._tcp_store)
-        from mooncake import ep
-
-        gate_supported = _supports_nccl_init_status_callback(ep)
         old_collectives = TCPStoreCollectives(
             transition_store,
             self.rank_idx,
@@ -1663,38 +1540,25 @@ class ElasticBuffer:
                 tuple(new_members),
                 store_namespace,
                 self.transport,
-                _NCCL_INIT_PHASE_MODE,
-                gate_supported,
             ),
         )
         if any(
             tuple(members) != tuple(new_members)
             or namespace != store_namespace
             or transport != self.transport
-            or phase_mode != _NCCL_INIT_PHASE_MODE
-            or not supported
-            for members, namespace, transport, phase_mode, supported in plans
+            for members, namespace, transport in plans
         ):
             raise RuntimeError(
-                "old ElasticBuffer members disagree on the target membership or lack native phase-gate support"
+                "old ElasticBuffer members disagree on the target membership"
             )
         if self._transport_rank == min(old_members):
             transition_store.set(
                 self._membership_transition_key(store_namespace, "required-transport"),
                 self.transport.encode(),
             )
-            transition_store.set(
-                self._membership_transition_key(store_namespace, "required-init-phase"),
-                _NCCL_INIT_PHASE_MODE.encode(),
-            )
 
         candidate = None
         if self._transport_rank in new_members:
-            if not gate_supported:
-                raise RuntimeError(
-                    "Mooncake EP was built without NCCL init phase-gate support"
-                )
-            gate = ep.NcclInitPhaseGate()
             with torch.cuda.device(self._device_index):
                 candidate = type(self).create_elastic(
                     self._transport_rank,
@@ -1721,8 +1585,6 @@ class ElasticBuffer:
                     active_members=new_members,
                     _prepared_membership=True,
                     _required_transport=self.transport,
-                    _required_init_phase=_NCCL_INIT_PHASE_MODE,
-                    _init_phase_gate=gate,
                     _tcp_store_owner=self._tcp_store_owner,
                 )
 
