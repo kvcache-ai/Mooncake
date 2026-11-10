@@ -215,7 +215,7 @@ TEST(BucketDirectWriteConfigTest, RejectsUnsupportedModesBeforeCreatingFiles) {
     FileStorageConfig file_config;
     file_config.storage_filepath = path.string();
     BucketBackendConfig bucket_config;
-    for (const char* setting : {"aligned", "invalid", "PACKED", ""}) {
+    for (const char* setting : {"invalid", "PACKED", "ALIGNED", ""}) {
         SCOPED_TRACE(setting);
         ScopedEnvVar env("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE", setting);
         BucketStorageBackend backend(file_config, bucket_config);
@@ -225,6 +225,35 @@ TEST(BucketDirectWriteConfigTest, RejectsUnsupportedModesBeforeCreatingFiles) {
             EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
         }
         EXPECT_TRUE(std::filesystem::is_empty(path));
+    }
+    std::filesystem::remove_all(path);
+}
+
+TEST(BucketDirectWriteConfigTest, AcceptsAlignedAndRejectsItWithPacked) {
+    char directory[] = "/tmp/mooncake-bucket-mode-XXXXXX";
+    ASSERT_NE(mkdtemp(directory), nullptr);
+    const std::filesystem::path path = directory;
+    FileStorageConfig file_config;
+    file_config.storage_filepath = path.string();
+    {
+        ScopedEnvVar env("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE", "aligned");
+        BucketBackendConfig bucket_config =
+            BucketBackendConfig::FromEnvironment().value();
+        EXPECT_TRUE(bucket_config.aligned_direct_write);
+        BucketStorageBackend backend(file_config, bucket_config);
+        EXPECT_TRUE(backend.Init());
+    }
+    {
+        // aligned_direct_write set in code while the variable selects packed.
+        ScopedEnvVar env("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE", "packed");
+        BucketBackendConfig bucket_config;
+        bucket_config.aligned_direct_write = true;
+        BucketStorageBackend backend(file_config, bucket_config);
+        const auto result = backend.Init();
+        EXPECT_FALSE(result);
+        if (!result) {
+            EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        }
     }
     std::filesystem::remove_all(path);
 }

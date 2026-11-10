@@ -78,7 +78,9 @@ class MultiTransport {
         BatchID batch_id, size_t task_id,
         std::vector<TransferStatusEnum> &request_statuses);
 
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
+    // walk_tasks skips the finished-task counter shortcut and asks every task.
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status,
+                                  bool walk_tasks = false);
 
     Transport *installTransport(const std::string &proto,
                                 std::shared_ptr<Topology> topo);

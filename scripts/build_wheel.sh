@@ -14,6 +14,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # the existing staging directory and are selected from the CMake cache below.
 BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+INCLUDE_STORE_RS="${INCLUDE_STORE_RS:-0}"
 BUILD_ROOT="$(pwd)"
 CMAKE_CACHE="${BUILD_DIR_ABS}/CMakeCache.txt"
 
@@ -71,6 +72,35 @@ rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
 rm -rf mooncake-wheel/mooncake/_pg_jit
+
+if [ "$INCLUDE_STORE_RS" = "1" ]; then
+    STORE_RS_PYTHON_PREFIX=${STORE_RS_PYTHON_PREFIX:?STORE_RS_PYTHON_PREFIX must name the Store-RS CMake install prefix}
+    STORE_RS_PACKAGE_DIR="${STORE_RS_PYTHON_PREFIX}/mooncake"
+    store_rs_extensions=("${STORE_RS_PACKAGE_DIR}"/_store_rs.*.so)
+    if [ "${#store_rs_extensions[@]}" -ne 1 ] || [ ! -f "${store_rs_extensions[0]}" ]; then
+        echo "Error: expected one Store-RS extension under ${STORE_RS_PACKAGE_DIR}"
+        exit 1
+    fi
+    STORE_RS_EXPECTED_EXTENSION="_store_rs$("python${PYTHON_VERSION}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+    if [ "$(basename "${store_rs_extensions[0]}")" != "${STORE_RS_EXPECTED_EXTENSION}" ]; then
+        echo "Error: Store-RS extension was built for a different Python ABI: ${store_rs_extensions[0]}"
+        exit 1
+    fi
+    for artifact in \
+        "${store_rs_extensions[0]}" \
+        "${STORE_RS_PACKAGE_DIR}/libmooncake_classic_shim.so" \
+        "${STORE_RS_PACKAGE_DIR}/libmooncake_tent_shim.so" \
+        "${STORE_RS_PACKAGE_DIR}/libtent_shared.so" \
+        "${STORE_RS_PACKAGE_DIR}/mooncake-store-rs-client" \
+        "${STORE_RS_PACKAGE_DIR}/mooncake-store-rs-admin" \
+        "${STORE_RS_PACKAGE_DIR}/mooncake-store-rs-bench"; do
+        if [ ! -f "$artifact" ]; then
+            echo "Error: Store-RS CMake install is missing ${artifact}"
+            exit 1
+        fi
+        cp -a "$artifact" mooncake-wheel/mooncake/
+    done
+fi
 
 if [ "$WITH_PG_BUILD" = "1" ] && [ -d "$PG_JIT_STAGING_DIR" ]; then
     cp -R "$PG_JIT_STAGING_DIR" mooncake-wheel/mooncake/
@@ -160,10 +190,17 @@ if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
     cp "${BUILD_DIR}"/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so mooncake-wheel/mooncake/
 fi
 
-# Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
+# Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT or USE_ASCEND is set)
 if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
     echo "Copying ascend_transport.so..."
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
+fi
+
+# Copy ascend_allocator.so (classic store allocator, ContextManager and the
+# shared bound-runner registry). TENT links the same library.
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/allocator/ascend_allocator/ascend_allocator.so ]; then
+    echo "Copying ascend_allocator.so..."
+    cp ${BUILD_DIR}/mooncake-transfer-engine/allocator/ascend_allocator/ascend_allocator.so mooncake-wheel/mooncake/ascend_allocator.so
 fi
 
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
@@ -195,13 +232,6 @@ fi
 echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
 cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
-
-if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
-    cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
-    echo "Copying ascend_transport_mem libraries..."
-else
-    echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
-fi
 
 # EP/PG extensions are built during the CMake build according to the cached
 # component options. Host extensions are repaired by auditwheel; device
@@ -483,6 +513,24 @@ else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
 
+if [ "$INCLUDE_STORE_RS" = "1" ]; then
+    # The legacy wheel metadata intentionally omits Store-RS commands from
+    # ordinary release wheels. Preserve the pristine metadata (unless a build
+    # variant already did so), then add the Store-RS-only entry points and
+    # native executables for this opt-in wheel build. The EXIT trap above
+    # restores pyproject.toml even when the build fails.
+    if [ ! -f pyproject.toml.backup ]; then
+        cp pyproject.toml pyproject.toml.backup
+    fi
+    sed -i '/^transfer_engine_bench = /a\mooncake-store-rs-client = "mooncake._launcher:store_rs_client"\nmooncake-store-rs-admin = "mooncake._launcher:store_rs_admin"\nmooncake-store-rs-bench = "mooncake._launcher:store_rs_bench"' pyproject.toml
+    sed -i 's/"transfer_engine_bench",/"transfer_engine_bench", "mooncake-store-rs-client", "mooncake-store-rs-admin", "mooncake-store-rs-bench",/' pyproject.toml
+    if ! grep -q '^mooncake-store-rs-client = ' pyproject.toml || \
+       ! grep -q '"mooncake-store-rs-client"' pyproject.toml; then
+        echo "Error: failed to add Store-RS metadata to the legacy wheel"
+        exit 1
+    fi
+fi
+
 echo "Cleaning up previous build artifacts..."
 rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
@@ -726,6 +774,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libmetadef*.so \
     --exclude libllm_datadist*.so \
     --exclude ascend_transport*.so \
+    --exclude ascend_allocator*.so \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
     --exclude libmpcomm.so* \

@@ -8,7 +8,13 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from .mooncake_ep_buffer import EventOverlap, _native_current_stream_ptr
+from .mooncake_ep_buffer import (
+    EventOverlap,
+    _device_type,
+    _native_current_stream_ptr,
+    _synchronize_device,
+    _wait_native_event_on_current_stream,
+)
 from .mooncake_ep_tcpstore import (
     TCPStoreCollectives,
     clone_tcp_store,
@@ -63,6 +69,39 @@ def _requested_transport(transport: str) -> str:
             f"ElasticBuffer transport must be one of {choices}, got {requested!r}"
         )
     return requested
+
+
+def _ep_device_type() -> str:
+    """ "xpu" for an XPU build of the native module, else "cuda" -- also when it
+    is not built, so the pure-Python helpers work without it."""
+    try:
+        return _device_type()
+    except ImportError:
+        return "cuda"
+
+
+def _requested_xpu_transport(transport: str) -> str:
+    """XPU has one transport setting, 'ipc': Level Zero IPC, and RDMA
+    through a host proxy to remote ranks."""
+    requested = transport.strip().lower()
+    if requested == "auto":
+        requested = os.getenv("MOONCAKE_EP_TRANSPORT", "auto").strip().lower()
+    if requested not in {"auto", "ipc"}:
+        raise ValueError(
+            "ElasticBuffer on XPU supports only transport 'ipc' (or 'auto'), "
+            f"got {requested!r}"
+        )
+    return "ipc"
+
+
+class _XpuRdmaError(RuntimeError):
+    """Raised on every rank when XPU ranks on other nodes cannot connect."""
+
+
+def _current_device_index() -> int:
+    if _ep_device_type() == "xpu":
+        return torch.xpu.current_device()
+    return torch.cuda.current_device()
 
 
 def _nccl_topology_supported(
@@ -201,7 +240,7 @@ def _resolve_nccl_membership_masks(rank_masks: Sequence[Sequence[int]]) -> None:
 def _bootstrap_collective_device(group: dist.ProcessGroup) -> str:
     """Choose metadata tensors independently of the GPU EP data path."""
     backend = str(dist.get_backend(group)).lower()
-    return "cpu" if backend in {"gloo", "mooncake-cpu"} else "cuda"
+    return "cpu" if backend in {"gloo", "mooncake-cpu"} else _ep_device_type()
 
 
 def _select_transport_for_group(
@@ -436,8 +475,13 @@ class ElasticBuffer:
         self._tcp_store_owner = None
         self._store_namespace: Optional[str] = None
         self._store_timeout_secs = 300
-        self._device_index = torch.cuda.current_device()
-        self.requested_transport = _requested_transport(transport)
+        on_xpu = _ep_device_type() == "xpu"
+        self._device_index = _current_device_index()
+        self.requested_transport = (
+            _requested_xpu_transport(transport)
+            if on_xpu
+            else _requested_transport(transport)
+        )
         self.allow_hybrid_mode = allow_hybrid_mode
         self.allow_multiple_reduction = allow_multiple_reduction
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
@@ -482,15 +526,18 @@ class ElasticBuffer:
         # untouched while giving ElasticBuffer users a dedicated native entrypoint.
         from mooncake import ep
 
-        self.transport = _select_transport_for_group(
-            self.group,
-            self.requested_transport,
-            ep.has_nccl_device_support(),
-            self.num_ranks,
-            self.num_rdma_ranks,
-            self.num_nvlink_ranks,
-            self.allow_hybrid_mode,
-        )
+        if on_xpu:
+            self.transport = "ipc"
+        else:
+            self.transport = _select_transport_for_group(
+                self.group,
+                self.requested_transport,
+                ep.has_nccl_device_support(),
+                self.num_ranks,
+                self.num_rdma_ranks,
+                self.num_nvlink_ranks,
+                self.allow_hybrid_mode,
+            )
 
         nccl_unique_id = []
         if self.transport == "nccl":
@@ -515,6 +562,8 @@ class ElasticBuffer:
             num_gpu_timeout_secs,
             self.transport,
             nccl_unique_id,
+            # The XPU runtime allocates on, and orders against, this queue.
+            **({"stream_ptr": _native_current_stream_ptr()} if on_xpu else {}),
         )
         # NCCL's LSA team is the transport authority for the local domain; it
         # may differ from the CUDA-visible-device heuristic used before native
@@ -522,17 +571,20 @@ class ElasticBuffer:
         # exact native launch topology for both backends.
         self._refresh_topology_from_runtime()
         self._connect_native()
+        if on_xpu:
+            # The XPU runtime learns the nodes while connecting (init_rdma).
+            self._refresh_topology_from_runtime()
         # The native elastic kernels currently use fixed communicator
         # membership. Reuse this compatibility argument instead of allocating
         # and filling a CUDA tensor for every dispatch and combine call.
         self._active_ranks = torch.ones(
-            self.num_ranks, dtype=torch.int32, device="cuda"
+            self.num_ranks, dtype=torch.int32, device=_ep_device_type()
         )
         self._active_ranks_ready = None
 
-        torch.cuda.synchronize()
+        _synchronize_device()
         _dist_barrier(group)
-        torch.cuda.synchronize()
+        _synchronize_device()
 
     @classmethod
     def create_elastic(
@@ -581,6 +633,11 @@ class ElasticBuffer:
         the synchronous ``set_membership`` wrapper. IBGDA keeps its quiescent
         transition path. This API does not provide rank-failure recovery.
         """
+        if _ep_device_type() == "xpu":
+            raise NotImplementedError(
+                "ElasticBuffer.create_elastic is not supported on XPU yet; "
+                "use ElasticBuffer(group, ...)"
+            )
         if not allow_multiple_reduction:
             raise NotImplementedError(
                 "Mooncake ElasticBuffer currently supports only "
@@ -799,7 +856,10 @@ class ElasticBuffer:
         # Mooncake PG refreshes this CUDA mirror on its own stream. Wait for
         # that update before taking the host snapshot used for membership
         # agreement, including the replacement process's initial snapshot.
-        torch.cuda.synchronize(self._device_index)
+        if _ep_device_type() == "xpu":
+            torch.xpu.synchronize(self._device_index)
+        else:
+            torch.cuda.synchronize(self._device_index)
         return get_active_ranks(self.backend).cpu().tolist()
 
     def _require_full_nccl_membership(self) -> None:
@@ -935,18 +995,30 @@ class ElasticBuffer:
 
         try:
             local_handle_ints = self.runtime.get_ipc_handle()
+            collective_device = _bootstrap_collective_device(self.group)
             local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
+                local_handle_ints, dtype=torch.int32, device=collective_device
             )
             handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                torch.empty(
+                    len(local_handle_ints),
+                    dtype=torch.int32,
+                    device=collective_device,
+                )
                 for _ in range(self.num_ranks)
             ]
             dist.all_gather(handles, local_handle_tensor, self.group)
             remote_handles = [h.tolist() for h in handles]
 
             active_ranks_mask = self._active_ranks_mask()
+            if _ep_device_type() == "xpu":
+                self._connect_xpu_rdma(
+                    remote_handles, active_ranks_mask, collective_device
+                )
+            # On XPU, the Level Zero IPC import.
             self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+        except _XpuRdmaError:
+            raise
         except Exception as exc:
             if bool(self.runtime.ibgda_disabled()):
                 raise RuntimeError(
@@ -1196,6 +1268,62 @@ class ElasticBuffer:
             raise RuntimeError(
                 "ElasticBuffer native peer synchronization disabled IBGDA."
             )
+
+    def _connect_xpu_rdma(
+        self,
+        handles: List[List[int]],
+        active_ranks_mask: List[int],
+        device: Union[str, torch.device],
+    ) -> None:
+        """Connect the ranks on other nodes over RDMA (XPU only).
+
+        As in Buffer._connect_xpu_rdma, a rank is on another node if its IPC
+        handle comes from another host or pid namespace (words 3 and 4 of the
+        handle), or, with MC_EP_RANKS_PER_NODE=n, if rank // n differs. Unlike
+        the Buffer, the ElasticBuffer has no fallback path: if any rank cannot
+        connect, every rank raises.
+        """
+        per_node = int(os.environ.get("MC_EP_RANKS_PER_NODE", "0") or 0)
+        if per_node > 0:
+            nodes = [r // per_node for r in range(self.num_ranks)]
+        else:
+            nodes = [tuple(h[3:5]) for h in handles]
+        remote = [int(node != nodes[self.rank_idx]) for node in nodes]
+        # Every rank sees the same nodes, so all of them return here or none.
+        if not any(remote):
+            return
+
+        def agree(error: str) -> None:
+            ok = torch.tensor([int(not error)], dtype=torch.int32, device=device)
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=self.group)
+            if not ok.item():
+                raise _XpuRdmaError(
+                    f"[Rank {self.rank_idx}] ElasticBuffer ranks span several "
+                    "nodes, which XPU reaches over RDMA, and "
+                    + (error or "another rank could not connect")
+                )
+
+        info: List[int] = []
+        error = ""
+        if not self.runtime.rdma_available():
+            error = (
+                "this build lacks the XPU verbs path (rdma-core with "
+                "ibv_reg_dmabuf_mr)"
+            )
+        else:
+            try:
+                info = list(self.runtime.init_rdma(remote))
+            except Exception as e:
+                error = f"its setup failed: {e}"
+        agree(error)
+        local = torch.tensor(info, dtype=torch.int32, device=device)
+        infos = [torch.empty_like(local) for _ in range(self.num_ranks)]
+        dist.all_gather(infos, local, group=self.group)
+        try:
+            self.runtime.connect_rdma([t.tolist() for t in infos], active_ranks_mask)
+        except Exception as e:
+            error = f"connecting failed: {e}"
+        agree(error)
 
     def _exchange_nccl_unique_id(self, ep: Any) -> List[int]:
         create_unique_id = getattr(ep, "create_nccl_unique_id", None)
@@ -1943,6 +2071,13 @@ class ElasticBuffer:
         allow_multiple_reduction: bool = True,
     ) -> int:
         num_ranks = group if isinstance(group, int) else group.size()
+        if _ep_device_type() == "xpu":
+            # On XPU, remote ranks need room of their own in the buffer even
+            # though dispatch stays flat. Reserve it whenever the ranks span
+            # nodes, so that allow_hybrid_mode=False works there as on CUDA.
+            allow_hybrid_mode = (
+                allow_hybrid_mode or ElasticBuffer._xpu_ranks_span_nodes(group)
+            )
         try:
             from mooncake import ep
 
@@ -2004,6 +2139,17 @@ class ElasticBuffer:
         return num_max_session_bytes
 
     @staticmethod
+    def _xpu_ranks_span_nodes(group: Union[dist.ProcessGroup, int]) -> bool:
+        """Whether XPU ranks span nodes, as far as is known before the buffer
+        exists: from MC_EP_RANKS_PER_NODE as in _connect_xpu_rdma, else from
+        the physical domain size. Ranks found remote only from the host words
+        of their IPC handles are not seen here."""
+        per_node = int(os.environ.get("MC_EP_RANKS_PER_NODE", "0") or 0)
+        if per_node > 0:
+            return per_node < (group if isinstance(group, int) else group.size())
+        return ElasticBuffer._calculate_physical_domain_size(group)[0] > 1
+
+    @staticmethod
     def _calculate_physical_domain_size(
         group: Union[dist.ProcessGroup, int],
     ) -> Tuple[int, int]:
@@ -2020,7 +2166,8 @@ class ElasticBuffer:
             )
         if num_local_ranks <= 0:
             try:
-                num_local_ranks = max(1, min(num_ranks, torch.cuda.device_count()))
+                device_module = torch.xpu if _ep_device_type() == "xpu" else torch.cuda
+                num_local_ranks = max(1, min(num_ranks, device_module.device_count()))
             except Exception:
                 num_local_ranks = 1
         num_local_ranks = max(1, min(num_local_ranks, num_ranks))
@@ -2059,13 +2206,13 @@ class ElasticBuffer:
         if not self._active:
             raise RuntimeError("rank is outside the active ElasticBuffer membership")
         if with_cpu_sync:
-            torch.cuda.synchronize()
+            _synchronize_device()
         if self._store_collectives is not None:
             self._store_collectives.barrier("public-barrier")
         else:
             _dist_barrier(self.group)
         if with_cpu_sync:
-            torch.cuda.synchronize()
+            _synchronize_device()
 
     @staticmethod
     def capture() -> Any:
@@ -2074,8 +2221,15 @@ class ElasticBuffer:
         return ep.EventHandle(_native_current_stream_ptr())
 
     def get_theoretical_num_sms(self, num_experts: int, num_topk: int) -> int:
-        device = torch.cuda.current_device()
-        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        if _ep_device_type() == "xpu":
+            # The XPU kernels ignore num_sms unless
+            # MOONCAKE_EP_XPU_ASYNC_WITH_COMPUTE_STREAM_ENABLE is set; then it
+            # caps their work-groups, with the same defaults as on CUDA.
+            props = torch.xpu.get_device_properties(torch.xpu.current_device())
+            sm_count = int(getattr(props, "max_compute_units", 1))
+        else:
+            device = torch.cuda.current_device()
+            sm_count = torch.cuda.get_device_properties(device).multi_processor_count
         if self.prefer_overlap_with_compute:
             return max(1, min(24, sm_count // 4))
         return max(1, min(40, sm_count // 2, num_experts * max(1, num_topk)))
@@ -2150,6 +2304,8 @@ class ElasticBuffer:
         x_data = x[0] if isinstance(x, tuple) else x
         sf = x[1] if isinstance(x, tuple) else None
         assert x_data.dim() == 2 and x_data.is_contiguous()
+        # The kernels copy scale factors as 4-byte packs.
+        assert sf is None or (sf.dim() == 2 and sf.element_size() == 4)
         if num_experts is None:
             num_experts = int(torch.max(topk_idx).item()) + 1
         if num_max_tokens_per_rank is None:
@@ -2166,8 +2322,13 @@ class ElasticBuffer:
             if handle is not None
             else max_num_recv_tokens
         )
+        # Expanded, each local expert's rows start at an expert_alignment
+        # boundary, so leave room for up to expert_alignment - 1 padding rows
+        # per expert.
         num_recv_output_capacity = (
-            num_recv_tokens * num_topk if do_expand else num_recv_tokens
+            num_recv_tokens * num_topk + num_local_experts * (expert_alignment - 1)
+            if do_expand
+            else num_recv_tokens
         )
         use_hybrid = self.num_scaleout_ranks != 1
         hybrid_channels = self._hybrid_num_channels(num_sms) if use_hybrid else 0
@@ -2336,6 +2497,13 @@ class ElasticBuffer:
 
         num_recv_tokens_per_expert_list: List[int] = []
         if do_cpu_sync:
+            # With async_with_compute_stream the dispatch kernels run on the
+            # communication stream, but .cpu() copies on the compute stream. Make
+            # the compute stream wait for the dispatch so the copy reads the
+            # final counts. This makes do_cpu_sync=True effectively synchronous:
+            # for overlap, pass do_cpu_sync=False or a cached handle.
+            if async_with_compute_stream:
+                _wait_native_event_on_current_stream(event)
             scaleup_psum_cpu = psum_num_recv_tokens_per_scaleup_rank.cpu()
             expert_psum_cpu = full_psum_num_recv_tokens_per_expert.cpu()
             actual_num_recv_tokens = int(

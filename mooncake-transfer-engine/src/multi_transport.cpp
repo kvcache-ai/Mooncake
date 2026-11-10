@@ -42,9 +42,6 @@
 #ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #endif
-#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
-#include "transport/ascend_transport/hccl_transport/hccl_transport.h"
-#endif
 #ifdef USE_ASCEND_HETEROGENEOUS
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
@@ -624,7 +621,8 @@ Status MultiTransport::getScatterRequestStatuses(
 }
 
 Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
-                                              TransferStatus& status) {
+                                              TransferStatus& status,
+                                              bool walk_tasks) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
@@ -642,7 +640,8 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     // Timeout and failure inspection still use the per-task path.
     const uint64_t finished =
         batch_desc.finished_task_count.load(std::memory_order_acquire);
-    if (batch_desc.counter_eligible && globalConfig().slice_timeout <= 0 &&
+    if (!walk_tasks && batch_desc.counter_eligible &&
+        globalConfig().slice_timeout <= 0 &&
         !batch_desc.has_failure.load(std::memory_order_acquire) &&
         finished < task_count) {
         // Skip the per-task walk. transferred_bytes stays 0 (a valid lower
@@ -753,11 +752,6 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_ASCEND_DIRECT
     else if (std::string(proto) == "ascend") {
         transport = new AscendDirectTransport();
-    }
-#endif
-#ifdef USE_ASCEND
-    else if (std::string(proto) == "ascend") {
-        transport = new HcclTransport();
     }
 #endif
 #ifdef USE_ASCEND_HETEROGENEOUS
