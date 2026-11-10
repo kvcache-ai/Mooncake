@@ -230,6 +230,15 @@ bool TrafficRecorder::Start() {
     {
         std::lock_guard<std::mutex> lock(route_names_mu_);
         route_names_.clear();
+        for (const auto& [route_key, name] : registered_routes_.Names()) {
+            route_names_.try_emplace(route_key, name);
+        }
+        // Written before the first request is recorded. A process that dies
+        // never reaches StopInternal, and without this map the reader can only
+        // show route keys, not the methods behind them.
+        if (!session_dir_.empty()) {
+            WriteRouteNamesJson(session_dir_, route_names_);
+        }
     }
     generation_.fetch_add(1, std::memory_order_acq_rel);
     writer_thread_ = std::thread(&TrafficRecorder::WriterLoop, this);
