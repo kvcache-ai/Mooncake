@@ -153,6 +153,9 @@ Status NVLinkTransport::uninstall() {
             }
         }
         relocate_map_.clear();
+        // Invalidate thread-local relocate caches that still alias the
+        // mappings closed above (see relocateSharedMemoryAddress).
+        relocate_generation_.fetch_add(1, std::memory_order_release);
         installed_ = false;
     }
     return Status::OK();
@@ -630,10 +633,27 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                                     uint64_t length,
                                                     uint64_t target_id,
                                                     int src_device) {
-    thread_local HashMap tl_relocate_map;
-    if (tl_relocate_map.empty()) {
+    // The thread-local cache is only valid for the transport instance and
+    // generation that produced it: it must not be reused across instances or
+    // across uninstall() (mappings are closed there). A fresh thread starts
+    // with instance_id == 0, which no instance ever uses.
+    struct TlRelocateCache {
+        uint64_t instance_id = 0;
+        uint64_t generation = 0;
+        HashMap map;
+    };
+    thread_local TlRelocateCache tl_relocate_cache;
+    HashMap& tl_relocate_map = tl_relocate_cache.map;
+    const uint64_t current_generation =
+        relocate_generation_.load(std::memory_order_acquire);
+    if (tl_relocate_cache.instance_id != instance_id_ ||
+        tl_relocate_cache.generation != current_generation ||
+        tl_relocate_map.empty()) {
         RWSpinlock::ReadGuard guard(relocate_lock_);
         tl_relocate_map = relocate_map_;
+        tl_relocate_cache.instance_id = instance_id_;
+        tl_relocate_cache.generation =
+            relocate_generation_.load(std::memory_order_acquire);
     }
 
     // Fast path: a mapping cached for this address on src_device. The mapping
