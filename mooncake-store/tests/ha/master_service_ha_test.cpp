@@ -906,12 +906,6 @@ class MasterServiceHATest : public ::testing::Test {
         return MasterServiceTestPeer::NeedMemEviction(service).load();
     }
 
-    static void ClearInvalidHandlesForTesting(
-        MasterService& service,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-        MasterServiceTestPeer(service).ClearInvalidHandles(alive_clients);
-    }
-
     static void ClearInvalidHandlesForTesting(MasterService& service) {
         MasterServiceTestPeer(service).ClearInvalidHandles();
     }
@@ -1089,10 +1083,8 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService& service, const UUID& source_client,
         const TenantId& tenant_id, const std::string& key,
         CreateTask create_task) {
-        auto liveness =
-            MasterServiceTestPeer(service).FindClientRecord(source_client);
-        auto serving_guard =
-            liveness ? liveness->TryAcquireServingGuard() : std::nullopt;
+        auto serving_guard = MasterServiceTestPeer::ClientSessions(service)
+                                 .TryAcquireServingSession(source_client);
         if (!serving_guard) {
             return false;
         }
@@ -1133,20 +1125,14 @@ class MasterServiceHATest : public ::testing::Test {
     // go.
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
         MasterService& service) {
-        std::unique_lock<std::shared_mutex> client_lock(
-            MasterServiceTestPeer::ClientMutex(service), std::try_to_lock);
-        if (!client_lock.owns_lock()) {
-            return false;
-        }
         std::unique_lock<std::shared_mutex> snapshot_lock(
             MasterServiceTestPeer::MasterStateMutex(service), std::try_to_lock);
         return !snapshot_lock.owns_lock();
     }
 
-    static std::unique_lock<std::shared_mutex> LockClientForTesting(
+    static ClientSessionRegistry::RestoreBatch RestoreClientsForTesting(
         MasterService& service) {
-        return std::unique_lock<std::shared_mutex>(
-            MasterServiceTestPeer::ClientMutex(service));
+        return MasterServiceTestPeer::ClientSessions(service).BeginRestore();
     }
 
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
@@ -2181,13 +2167,15 @@ TEST_F(MasterServiceHATest,
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
-    // ReMountSegment holds client_mutex_ exclusively while waiting for the
-    // snapshot barrier. PutStart must not reacquire it inside that barrier.
-    auto client_lock = LockClientForTesting(service);
-    key_lock.reset();
-    const bool completed_while_client_locked =
-        put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
-    client_lock.unlock();
+    // Restore holds the session lifecycle barrier. PutStart must not need a
+    // registration scope while it holds the snapshot barrier.
+    bool completed_while_client_locked = false;
+    {
+        auto restore = RestoreClientsForTesting(service);
+        key_lock.reset();
+        completed_while_client_locked =
+            put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    }
 
     ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = put.get();
@@ -2234,19 +2222,24 @@ TEST_F(MasterServiceHATest,
                     .has_value());
     const auto record = ClientRecordForTesting(service, mounted.client_id);
     ASSERT_TRUE(record);
-    auto retaining_guard = record->TryAcquireRetainingGuard();
+    auto retaining_guard = MasterServiceTestPeer::ClientSessions(service)
+                               .TryAcquireRetainingSession(mounted.client_id);
     ASSERT_TRUE(retaining_guard);
 
     Replica replica(mounted.client_id, 1024, "retained_add_replica_endpoint",
                     ReplicaStatus::COMPLETE, record);
-    auto client_lock = LockClientForTesting(service);
-    auto add = std::async(std::launch::async, [&] {
-        return AddReplicaForRetainedClientForTesting(
-            service, mounted.client_id, "retained_add_replica_key", replica);
-    });
-    const bool completed_while_client_locked =
-        add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
-    client_lock.unlock();
+    std::future<tl::expected<bool, ErrorCode>> add;
+    bool completed_while_client_locked = false;
+    {
+        auto restore = RestoreClientsForTesting(service);
+        add = std::async(std::launch::async, [&] {
+            return AddReplicaForRetainedClientForTesting(
+                service, mounted.client_id, "retained_add_replica_key",
+                replica);
+        });
+        completed_while_client_locked =
+            add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    }
 
     ASSERT_EQ(add.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = add.get();
@@ -2876,7 +2869,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).empty());
 
     // Retry: the writer accepts now, and the same restore lands cleanly.
     auto retry = service.RestoreFromStandbySnapshot(
@@ -2950,7 +2943,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_ld_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).empty());
 
     // Retry with the writer accepting: the restore lands, and the disk
     // owner's record is installed for real this time.
@@ -2963,7 +2956,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_reject_ld_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).contains(
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).contains(
         disk_owner));
 }
 
@@ -3014,7 +3007,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairTimeoutThenRetrySucceeds) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_timeout_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).empty());
 
     // The first repair may still become durable after the local restore
     // has rolled back. Resume the writer, then retry the same snapshot.
@@ -3080,7 +3073,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWithoutWriterFailsRestore) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_repair_nowriter_lost"),
               0);
-    EXPECT_TRUE(MasterServiceTestPeer::ClientLivenessRecords(service).empty());
+    EXPECT_TRUE(MasterServiceTestPeer::ClientSessionRecords(service).empty());
 }
 
 TEST_F(MasterServiceHATest, FailedRepairRestoreKeepsReplicaIdCounterAdvanced) {
