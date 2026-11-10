@@ -153,10 +153,12 @@ SessionReader::OpenResult SessionReader::OpenNextFile(std::string* error) {
         return OpenResult::kError;
     }
     if (segment_count_ == 0) {
-        std::memcpy(uuid_.data(), header.session_uuid, uuid_.size());
+        std::memcpy(session_id_.data(), header.session_id,
+                    session_id_.size());
         redaction_ = header.redaction;
     } else if (redaction_ != header.redaction ||
-               !std::equal(uuid_.begin(), uuid_.end(), header.session_uuid)) {
+               !std::equal(session_id_.begin(), session_id_.end(),
+                           header.session_id)) {
         *error =
             "segment header does not match session: " + current_path_.string();
         return OpenResult::kError;
