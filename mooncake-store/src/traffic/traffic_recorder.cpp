@@ -3,6 +3,7 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -538,12 +539,23 @@ void TrafficRecorder::StopForWriterFailure() {
 void TrafficRecorder::WriterLoop() {
 #if defined(__linux__)
     if (const char* cpu_env = std::getenv("MOONCAKE_TRAFFIC_WRITER_CPU")) {
-        const long cpu = std::strtol(cpu_env, nullptr, 10);
-        if (cpu >= 0 && cpu < CPU_SETSIZE) {
+        char* end = nullptr;
+        errno = 0;
+        const long cpu = std::strtol(cpu_env, &end, 10);
+        if (end == cpu_env || *end != '\0' || errno == ERANGE || cpu < 0 ||
+            cpu >= CPU_SETSIZE) {
+            LOG(WARNING) << "traffic: ignoring MOONCAKE_TRAFFIC_WRITER_CPU='"
+                         << cpu_env << "': not a CPU index";
+        } else {
             cpu_set_t set;
             CPU_ZERO(&set);
             CPU_SET(static_cast<int>(cpu), &set);
-            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+            const int rc =
+                pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+            if (rc != 0) {
+                LOG(WARNING)
+                    << "traffic: cannot pin the traffic writer to CPU " << cpu;
+            }
         }
     }
 #endif
