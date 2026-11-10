@@ -1,5 +1,7 @@
 // ThreadPool.cpp
 #include "thread_pool.h"
+#include <glog/logging.h>
+#include <glog/raw_logging.h>
 #include <stdexcept>
 namespace mooncake {
 ThreadPool::ThreadPool(size_t num_threads) : stop_flag(false) {
@@ -26,6 +28,9 @@ ThreadPool::ThreadPool(size_t num_threads) : stop_flag(false) {
     } catch (...) {
         // Construction failure does not run ~ThreadPool().
         stop();
+        RAW_LOG(ERROR,
+                "ThreadPool construction failed (%zu/%zu workers started)",
+                workers.size(), num_threads);
         throw;
     }
 }
