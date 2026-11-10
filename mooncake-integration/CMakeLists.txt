@@ -1,7 +1,4 @@
 file(GLOB SOURCES "*.cpp")
-# TODO(F01-T111, replace-in=F01-3.2): Review and validate the ordinary/root
-# python-component install closure before closing this assignment.
-# Owner: F01-3.2; runtime verification and reception are still pending.
 set(PYTHON_PACKAGE_NAME "mooncake")
 if(SKBUILD)
   # scikit-build-core sets CMAKE_INSTALL_PREFIX to its private wheel tree. Keep

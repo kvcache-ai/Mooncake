@@ -8,9 +8,6 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
-# TODO(F01-T112, replace-in=F01-3.2): Review and validate wheel contents,
-# library loading, Store identities, and failure recovery before reception.
-# Owner: F01-3.2; deferred feature/platform providers retain their own TODOs.
 # Get Python version from environment variable or argument
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
