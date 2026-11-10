@@ -522,6 +522,35 @@ TEST_F(DfsSyncClientTest, DfsMetricsCountSuccessfulWriteAndRead) {
     EXPECT_EQ(metric->dfs_writes_skipped.value(), 0);
 }
 
+TEST_F(DfsSyncClientTest, RangeReadMetricsCountWindowBytes) {
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const int64_t base_read_ops = metric->dfs_read_ops.value();
+    const int64_t base_read_bytes = metric->dfs_read_bytes.value();
+
+    const std::string key = "dfs_metric_window";
+    std::string value(4096, 'W');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_FALSE(query->replicas.empty());
+
+    constexpr size_t kWindow = 1024;
+    std::vector<char> output(kWindow, '\0');
+    auto results = writer_->BatchReadFileReplicaRanges(
+        {key}, {query->replicas.front()}, {Slice{output.data(), kWindow}}, {0});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value()) << toString(results[0].error());
+    EXPECT_EQ(std::memcmp(output.data(), value.data(), kWindow), 0);
+    EXPECT_EQ(metric->dfs_read_ops.value(), base_read_ops + 1);
+    EXPECT_EQ(metric->dfs_read_bytes.value(),
+              base_read_bytes + static_cast<int64_t>(kWindow));
+}
+
 TEST_F(DfsSyncClientTest, DfsMetricsCountWriteFailureSeparatelyFromOps) {
     auto* metric = writer_->GetDfsMetricPtr();
     if (metric == nullptr) {

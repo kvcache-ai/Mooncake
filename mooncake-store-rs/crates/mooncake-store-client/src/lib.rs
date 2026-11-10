@@ -1,4 +1,7 @@
 mod client;
+// Tonic fixes the RPC error type as `tonic::Status`, and its generated async
+// service traits attach `#[must_use]` to futures that are already `must_use`.
+#[allow(clippy::double_must_use, clippy::result_large_err)]
 mod control_plane;
 mod memory;
 mod observability;

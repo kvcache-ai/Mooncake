@@ -37,10 +37,9 @@ enum class ReplicaType {
 /**
  * @brief How a reader transfers the contents of an allocated buffer.
  *
- * Only the CXL path needs per-buffer state beyond this tag, so this replaces
- * the string member every buffer used to carry. `kOther` keeps the protocol of
- * a descriptor this build does not know (a standby snapshot written by another
- * version), so that the descriptor still round-trips unchanged.
+ * TCP needs no per-buffer protocol state. `kCxl` keeps the client segment name,
+ * while `kOther` preserves every other mounted or restored protocol so that
+ * readers use the segment's transport and descriptors round-trip unchanged.
  */
 enum class BufferProtocol : uint8_t {
     kTcp = 0,  // Regular segment memory, addressed by its allocator
@@ -89,14 +88,12 @@ class AllocatedBuffer {
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
+    // A buffer carved from an allocator advertises the allocator's transport
+    // protocol.
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
-                        offset_handle = std::nullopt)
-        : allocator_(std::move(allocator)),
-          buffer_ptr_(buffer_ptr),
-          size_(size),
-          offset_handle_(std::move(offset_handle)) {}
+                        offset_handle = std::nullopt);
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     const Descriptor& descriptor);
@@ -177,11 +174,9 @@ class AllocatedBuffer {
         // Never kTcp: plain TCP is the null pointer.
         BufferProtocol kind;
         // kCxl: the client segment name the buffer transfers from.
-        // kOther: the protocol of a descriptor this build does not know.
+        // kOther: a mounted or restored protocol other than TCP/CXL.
         std::string value;
     };
-
-    bool copyTransferProtocolFrom(const AllocatedBuffer& source);
 
     [[nodiscard]] BufferProtocol protocolKind() const noexcept {
         return protocol_ ? protocol_->kind : BufferProtocol::kTcp;
@@ -199,7 +194,8 @@ class AllocatedBuffer {
     std::shared_ptr<ClientLivenessRecord> client_liveness_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
-    // Null for TCP; allocated only for a CXL buffer or an unknown protocol.
+    // Null for TCP; otherwise stores the mounted/restored protocol or the
+    // client segment name once change_to_cxl() ran.
     std::unique_ptr<ProtocolState> protocol_;
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
@@ -224,6 +220,9 @@ class BufferAllocatorBase {
     virtual uintptr_t base() const = 0;
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
+    // The protocol the segment was mounted with; every buffer allocated from
+    // this allocator advertises it to readers.
+    virtual std::string getTransportProtocol() const = 0;
 
     // Publish an immutable value; legacy remounts may enrich unknown locality.
     void SetLocality(std::optional<SegmentLocality> locality) {
@@ -308,6 +307,9 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    // Never allocates, so its replicas keep the protocol of the descriptors
+    // they were restored from.
+    std::string getTransportProtocol() const override { return {}; }
 
    private:
     std::string segment_name_;
@@ -337,7 +339,7 @@ class CachelibBufferAllocator
    public:
     static tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
     Create(std::string segment_name, size_t base, size_t size,
-           std::string transport_endpoint,
+           std::string transport_endpoint, std::string transport_protocol,
            ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
@@ -353,6 +355,9 @@ class CachelibBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    std::string getTransportProtocol() const override {
+        return transport_protocol_;
+    }
 
     /**
      * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
@@ -366,6 +371,7 @@ class CachelibBufferAllocator
    private:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
+                            std::string transport_protocol,
                             ReplicaType replica_type);
 
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
@@ -375,6 +381,7 @@ class CachelibBufferAllocator
     const size_t base_;
     const size_t total_size_;
     const std::string transport_endpoint_;
+    const std::string transport_protocol_;
     const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
@@ -389,7 +396,7 @@ class CachelibBufferAllocator
     friend std::optional<struct RestoredCachelibBufferAllocator>
     ImportCachelibBufferAllocator(
         std::string segment_name, size_t base, size_t size,
-        std::string transport_endpoint,
+        std::string transport_endpoint, std::string transport_protocol,
         const std::vector<LiveAllocation>& allocations,
         ReplicaType replica_type);
 };
@@ -401,7 +408,7 @@ struct RestoredCachelibBufferAllocator {
 
 std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
+    std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
@@ -416,6 +423,7 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
+                          std::string transport_protocol,
                           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
@@ -430,6 +438,9 @@ class OffsetBufferAllocator
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
+    }
+    std::string getTransportProtocol() const override {
+        return transport_protocol_;
     }
 
     /**
@@ -449,6 +460,7 @@ class OffsetBufferAllocator
     const size_t base_;
     const size_t total_size_;
     const std::string transport_endpoint_;
+    const std::string transport_protocol_;
     const ReplicaType replica_type_;
 
     // offset allocator implementation
@@ -465,7 +477,7 @@ struct RestoredOffsetBufferAllocator {
 // validation or allocation failure.
 std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
+    std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
@@ -473,6 +485,7 @@ tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,
                       std::string segment_name, size_t base, size_t size,
                       std::string transport_endpoint,
+                      std::string transport_protocol,
                       ReplicaType replica_type = ReplicaType::MEMORY);
 
 // The main difference is that it allocates real memory and returns it, while

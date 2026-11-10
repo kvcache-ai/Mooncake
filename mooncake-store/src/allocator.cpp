@@ -74,6 +74,26 @@ AllocatedBuffer::~AllocatedBuffer() {
     }
 }
 
+AllocatedBuffer::AllocatedBuffer(
+    std::shared_ptr<BufferAllocatorBase> allocator, void* buffer_ptr,
+    std::size_t size,
+    std::optional<offset_allocator::OffsetAllocationHandle>&& offset_handle)
+    : allocator_(allocator),
+      buffer_ptr_(buffer_ptr),
+      size_(size),
+      offset_handle_(std::move(offset_handle)) {
+    auto protocol =
+        allocator ? allocator->getTransportProtocol() : std::string();
+    if (protocol != "tcp") {
+        protocol_ = std::make_unique<ProtocolState>();
+        protocol_->kind =
+            protocol == "cxl" ? BufferProtocol::kCxl : BufferProtocol::kOther;
+        if (protocol_->kind == BufferProtocol::kOther) {
+            protocol_->value = std::move(protocol);
+        }
+    }
+}
+
 AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                                  const AllocatedBuffer::Descriptor& descriptor)
     : allocator_(std::move(allocator)),
@@ -84,8 +104,8 @@ AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
         protocol_->kind = BufferProtocol::kCxl;
         protocol_->value = descriptor.transport_endpoint_;
     } else if (descriptor.protocol_ != "tcp") {
-        // Keep a protocol this build does not know so the descriptor still
-        // round-trips through restore unchanged.
+        // Keep every other protocol so the descriptor still round-trips
+        // through restore unchanged.
         protocol_ = std::make_unique<ProtocolState>();
         protocol_->kind = BufferProtocol::kOther;
         protocol_->value = descriptor.protocol_;
@@ -103,19 +123,6 @@ std::string_view AllocatedBuffer::protocolName() const noexcept {
             break;
     }
     return "tcp";
-}
-
-bool AllocatedBuffer::copyTransferProtocolFrom(const AllocatedBuffer& source) {
-    if (protocolKind() == BufferProtocol::kCxl ||
-        source.protocolKind() == BufferProtocol::kCxl) {
-        return false;
-    }
-    if (!source.protocol_) {
-        protocol_.reset();
-        return true;
-    }
-    protocol_ = std::make_unique<ProtocolState>(*source.protocol_);
-    return true;
 }
 
 std::string AllocatedBuffer::getTransportEndpoint(
@@ -144,11 +151,12 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
-    // Build the state first. It is the only step that can throw, and a buffer
-    // whose address is already an offset but whose protocol is still TCP would
-    // be freed at the wrong address during unwinding (see
-    // CachelibBufferAllocator::deallocate).
-    auto state = std::make_unique<ProtocolState>();
+    // Reuse the state already created for a non-TCP segment. Only TCP needs
+    // an allocation here; do it before converting the address so unwinding
+    // cannot free an offset as a host address (see
+    // CachelibBufferAllocator::deallocate). The remaining steps are noexcept.
+    auto state =
+        protocol_ ? std::move(protocol_) : std::make_unique<ProtocolState>();
     state->kind = BufferProtocol::kCxl;
     state->value = std::move(client_segment_name);
 
@@ -177,6 +185,7 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
 CachelibBufferAllocator::Create(std::string segment_name, size_t base,
                                 size_t size, std::string transport_endpoint,
+                                std::string transport_protocol,
                                 ReplicaType replica_type) {
     if (!IsValidCachelibLayout(base, size)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -187,19 +196,21 @@ CachelibBufferAllocator::Create(std::string segment_name, size_t base,
     // exhaustion follows the process-level fail-fast policy.
     return std::shared_ptr<CachelibBufferAllocator>(new CachelibBufferAllocator(
         std::move(segment_name), base, size, std::move(transport_endpoint),
-        replica_type));
+        std::move(transport_protocol), replica_type));
 }
 
 tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,
                       std::string segment_name, size_t base, size_t size,
                       std::string transport_endpoint,
+                      std::string transport_protocol,
                       ReplicaType replica_type) {
     switch (allocator_type) {
         case BufferAllocatorType::CACHELIB: {
             auto allocator = CachelibBufferAllocator::Create(
                 std::move(segment_name), base, size,
-                std::move(transport_endpoint), replica_type);
+                std::move(transport_endpoint), std::move(transport_protocol),
+                replica_type);
             if (!allocator) {
                 return tl::make_unexpected(allocator.error());
             }
@@ -211,7 +222,8 @@ CreateBufferAllocator(BufferAllocatorType allocator_type,
             return std::shared_ptr<BufferAllocatorBase>(
                 std::make_shared<OffsetBufferAllocator>(
                     std::move(segment_name), base, size,
-                    std::move(transport_endpoint), replica_type));
+                    std::move(transport_endpoint),
+                    std::move(transport_protocol), replica_type));
         default:
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -220,11 +232,13 @@ CreateBufferAllocator(BufferAllocatorType allocator_type,
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
                                                  std::string transport_endpoint,
+                                                 std::string transport_protocol,
                                                  ReplicaType replica_type)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       transport_endpoint_(std::move(transport_endpoint)),
+      transport_protocol_(std::move(transport_protocol)),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
@@ -344,7 +358,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
 
 std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
+    std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
     if (replica_type != ReplicaType::MEMORY ||
         !IsValidCachelibLayout(base, size)) {
@@ -364,7 +378,8 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     }
 
     auto created = CachelibBufferAllocator::Create(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
+        std::move(segment_name), base, size, std::move(transport_endpoint),
+        std::move(transport_protocol), replica_type);
     if (!created) {
         return std::nullopt;
     }
@@ -387,11 +402,13 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
                                              std::string transport_endpoint,
+                                             std::string transport_protocol,
                                              ReplicaType replica_type)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       transport_endpoint_(std::move(transport_endpoint)),
+      transport_protocol_(std::move(transport_protocol)),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
@@ -526,14 +543,15 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
 
 std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
+    std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
     if (base > std::numeric_limits<size_t>::max() - size) {
         return std::nullopt;
     }
     const size_t end = base + size;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
+        std::move(segment_name), base, size, std::move(transport_endpoint),
+        std::move(transport_protocol), replica_type);
     const auto offset_allocator = allocator->getOffsetAllocator();
 
     std::vector<size_t> order(allocations.size());

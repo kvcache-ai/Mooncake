@@ -49,7 +49,7 @@ class BufferAllocatorTest : public ::testing::Test {
         BufferAllocatorType allocator_type) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         auto allocator = CreateBufferAllocator(allocator_type, segment_name,
-                                               base, size, segment_name);
+                                               base, size, segment_name, "tcp");
         if (!allocator) {
             throw std::invalid_argument("Invalid allocator test parameters");
         }
@@ -147,7 +147,7 @@ TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionRemainsExact) {
     constexpr size_t CAPACITY = 16 * 1024 * 1024;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
         "exact-largest-free-region", 0x140000000ULL, CAPACITY,
-        "exact-largest-free-region");
+        "exact-largest-free-region", "tcp");
 
     EXPECT_EQ(allocator->getLargestFreeRegion(), CAPACITY);
 
@@ -173,7 +173,7 @@ TEST_F(BufferAllocatorTest, ImportOffsetAllocationsAtOriginalAddresses) {
     const std::string endpoint = "restore-endpoint";
 
     auto original = std::make_shared<OffsetBufferAllocator>(
-        segment, kBase, kCapacity, endpoint);
+        segment, kBase, kCapacity, endpoint, "tcp");
     auto first = original->allocate(123);
     auto removed = original->allocate(5003);
     auto last = original->allocate(777);
@@ -190,7 +190,7 @@ TEST_F(BufferAllocatorTest, ImportOffsetAllocationsAtOriginalAddresses) {
     removed.reset();
 
     auto restored = ImportOffsetBufferAllocator(segment, kBase, kCapacity,
-                                                endpoint, allocations);
+                                                endpoint, "tcp", allocations);
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->buffers.size(), descriptors.size());
     EXPECT_EQ(restored->allocator->size(),
@@ -218,7 +218,7 @@ TEST_F(BufferAllocatorTest, ImportOffsetAllocationsValidatesRangesAndOrder) {
     std::vector<LiveAllocation> unsorted = {allocation(kBase + 512, 64),
                                             allocation(kBase + 128, 64)};
     auto restored = ImportOffsetBufferAllocator(segment, kBase, kCapacity,
-                                                endpoint, unsorted);
+                                                endpoint, "tcp", unsorted);
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->buffers.size(), unsorted.size());
     EXPECT_EQ(reinterpret_cast<uintptr_t>(restored->buffers[0]->data()),
@@ -229,23 +229,25 @@ TEST_F(BufferAllocatorTest, ImportOffsetAllocationsValidatesRangesAndOrder) {
     std::vector<LiveAllocation> overlapping = {allocation(kBase + 128, 100),
                                                allocation(kBase + 200, 32)};
     EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
-                                             endpoint, overlapping)
+                                             endpoint, "tcp", overlapping)
                      .has_value());
 
     std::vector<LiveAllocation> normalized_past_end = {
         allocation(kBase + kCapacity - 100, 100)};
     EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
-                                             endpoint, normalized_past_end)
+                                             endpoint, "tcp",
+                                             normalized_past_end)
                      .has_value());
 
     EXPECT_FALSE(ImportOffsetBufferAllocator(
                      segment, std::numeric_limits<size_t>::max() - 100, 200,
-                     endpoint, {})
+                     endpoint, "tcp", {})
                      .has_value());
     std::vector<LiveAllocation> allocation_overflow = {
         {std::numeric_limits<uintptr_t>::max() - kBase - 10, 20}};
     EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
-                                             endpoint, allocation_overflow)
+                                             endpoint, "tcp",
+                                             allocation_overflow)
                      .has_value());
 }
 
@@ -255,7 +257,7 @@ TEST_F(BufferAllocatorTest, ImportedOffsetHandleReleasesItsExactAddress) {
     const std::string endpoint = "restore-release";
     std::vector<LiveAllocation> allocations = {{0, 64}, {512, 64}};
     auto restored = ImportOffsetBufferAllocator(
-        "restore-release", kBase, kCapacity, endpoint, allocations);
+        "restore-release", kBase, kCapacity, endpoint, "tcp", allocations);
     ASSERT_TRUE(restored.has_value());
 
     restored->buffers[0].reset();
@@ -275,8 +277,9 @@ TEST_F(BufferAllocatorTest, ImportOffsetAllocationsHasNoArbitraryGapLimit) {
         allocations.push_back({1 + i * 2, 1});
     }
 
-    auto restored = ImportOffsetBufferAllocator(
-        "restore-many-gaps", kBase, kGapCount * 2 + 1, endpoint, allocations);
+    auto restored = ImportOffsetBufferAllocator("restore-many-gaps", kBase,
+                                                kGapCount * 2 + 1, endpoint,
+                                                "tcp", allocations);
     ASSERT_TRUE(restored.has_value());
     EXPECT_EQ(restored->buffers.size(), allocations.size());
     EXPECT_EQ(reinterpret_cast<uintptr_t>(restored->buffers.back()->data()),
@@ -289,7 +292,7 @@ TEST_F(BufferAllocatorTest, CachelibCreateRejectsInvalidMemoryLayout) {
 
     auto expect_invalid = [](size_t base, size_t size) {
         auto result = CachelibBufferAllocator::Create("cachelib-invalid", base,
-                                                      size, "endpoint");
+                                                      size, "endpoint", "tcp");
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     };
@@ -313,8 +316,8 @@ TEST_F(BufferAllocatorTest, ImportCachelibAllocationsAtOriginalAddresses) {
     constexpr size_t kCapacity = 4 * facebook::cachelib::Slab::kSize;
     const std::string segment = "cachelib-restore";
     const std::string endpoint = "cachelib-restore-endpoint";
-    auto created =
-        CachelibBufferAllocator::Create(segment, kBase, kCapacity, endpoint);
+    auto created = CachelibBufferAllocator::Create(segment, kBase, kCapacity,
+                                                   endpoint, "tcp");
     ASSERT_TRUE(created.has_value());
     auto original = std::move(*created);
 
@@ -343,7 +346,7 @@ TEST_F(BufferAllocatorTest, ImportCachelibAllocationsAtOriginalAddresses) {
     large_hole.reset();
 
     auto restored = ImportCachelibBufferAllocator(segment, kBase, kCapacity,
-                                                  endpoint, allocations);
+                                                  endpoint, "tcp", allocations);
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->buffers.size(), descriptors.size());
     for (size_t i = 0; i < descriptors.size(); ++i) {
@@ -373,8 +376,8 @@ TEST_F(BufferAllocatorTest, ImportCachelibAllocationsRejectsInvalidLayouts) {
         return LiveAllocation{address - kBase, size};
     };
     auto import = [&](const std::vector<LiveAllocation>& allocations) {
-        return ImportCachelibBufferAllocator("cachelib-invalid", kBase,
-                                             kCapacity, endpoint, allocations);
+        return ImportCachelibBufferAllocator(
+            "cachelib-invalid", kBase, kCapacity, endpoint, "tcp", allocations);
     };
 
     EXPECT_FALSE(
@@ -406,9 +409,9 @@ TEST_F(BufferAllocatorTest, CachelibImportRejectsNonMemoryReplicaType) {
     const std::string endpoint = "cachelib-memory-only";
     std::vector<LiveAllocation> allocations = {{0, 64}};
 
-    EXPECT_FALSE(ImportCachelibBufferAllocator("cachelib-memory-only", kBase,
-                                               kCapacity, endpoint, allocations,
-                                               ReplicaType::NOF_SSD)
+    EXPECT_FALSE(ImportCachelibBufferAllocator(
+                     "cachelib-memory-only", kBase, kCapacity, endpoint, "tcp",
+                     allocations, ReplicaType::NOF_SSD)
                      .has_value());
 }
 
@@ -598,7 +601,7 @@ TEST_F(SimpleAllocatorTest, StressTest) {
     }
 }
 
-// A buffer describes itself as plain TCP until it is moved to CXL.
+// A buffer allocated from a TCP segment describes itself as plain TCP.
 TEST(BufferProtocolTest, DefaultsToTcp) {
     auto allocator =
         std::make_shared<test::TestBufferAllocator>("seg", "endpoint", 4096);
@@ -613,20 +616,26 @@ TEST(BufferProtocolTest, DefaultsToTcp) {
 // A CXL buffer transfers from its client segment name, not from the endpoint
 // of the allocator that owns the memory.
 TEST(BufferProtocolTest, CxlCarriesTheClientSegmentName) {
-    auto allocator = std::make_shared<test::TestBufferAllocator>(
-        "seg", "endpoint", 4096, DEFAULT_CXL_BASE);
-    auto buffer = allocator->allocate(1024);
-    ASSERT_NE(buffer, nullptr);
-    void* host_address = buffer->data();
+    for (const auto* protocol : {"tcp", "cxl"}) {
+        SCOPED_TRACE(protocol);
+        auto allocator =
+            CreateBufferAllocator(BufferAllocatorType::OFFSET, "seg",
+                                  DEFAULT_CXL_BASE, 4096, "endpoint", protocol);
+        ASSERT_TRUE(allocator.has_value());
+        auto buffer = (*allocator)->allocate(1024);
+        ASSERT_NE(buffer, nullptr);
+        EXPECT_EQ(buffer->get_descriptor().protocol_, protocol);
+        void* host_address = buffer->data();
 
-    buffer->change_to_cxl("client-binding");
+        buffer->change_to_cxl("client-binding");
 
-    EXPECT_EQ(buffer->get_vaddr_from_cxl(), host_address);
-    const auto descriptor = buffer->get_descriptor();
-    EXPECT_EQ(descriptor.protocol_, "cxl");
-    EXPECT_EQ(descriptor.transport_endpoint_, "client-binding");
-    EXPECT_EQ(descriptor.buffer_address_,
-              reinterpret_cast<uintptr_t>(host_address) - DEFAULT_CXL_BASE);
+        EXPECT_EQ(buffer->get_vaddr_from_cxl(), host_address);
+        const auto descriptor = buffer->get_descriptor();
+        EXPECT_EQ(descriptor.protocol_, "cxl");
+        EXPECT_EQ(descriptor.transport_endpoint_, "client-binding");
+        EXPECT_EQ(descriptor.buffer_address_,
+                  reinterpret_cast<uintptr_t>(host_address) - DEFAULT_CXL_BASE);
+    }
 }
 
 // Restoring a descriptor must preserve its protocol, including values this
@@ -656,11 +665,11 @@ TEST(BufferProtocolTest, DescriptorProtocolsRoundTrip) {
     EXPECT_EQ(unknown.transport_endpoint_, "endpoint");
 }
 
-// Replacing a buffer's storage hands the stored protocol to the new buffer and
-// refuses CXL on either side.
-TEST(BufferProtocolTest, ReplacementKeepsTcpAndRejectsCxl) {
-    auto allocator = std::make_shared<test::TestBufferAllocator>(
-        "seg", "endpoint", 1 << 20, DEFAULT_CXL_BASE);
+// Replacing a buffer's storage uses the protocol of the newly mounted segment,
+// not the protocol stored in the old descriptor.
+TEST(BufferProtocolTest, ReplacementUsesNewBuffersProtocol) {
+    auto allocator =
+        std::make_shared<test::TestBufferAllocator>("seg", "endpoint", 1 << 20);
     auto protocol_of = [](const Replica& replica) {
         return replica.get_descriptor()
             .get_memory_descriptor()
@@ -672,8 +681,7 @@ TEST(BufferProtocolTest, ReplacementKeepsTcpAndRejectsCxl) {
     ASSERT_TRUE(tcp_replica.replace_memory_buffer(allocator->allocate(1024)));
     EXPECT_EQ(protocol_of(tcp_replica), "tcp");
 
-    // A descriptor with an unknown protocol keeps it: the imported buffer
-    // adopts what the replica advertised before the remount.
+    // A restored descriptor does not override the newly mounted protocol.
     auto unknown_allocator =
         std::make_shared<DummyBufferAllocator>("seg", "endpoint");
     AllocatedBuffer::Descriptor unknown{};
@@ -686,19 +694,39 @@ TEST(BufferProtocolTest, ReplacementKeepsTcpAndRejectsCxl) {
         ReplicaStatus::COMPLETE);
     ASSERT_TRUE(
         unknown_replica.replace_memory_buffer(allocator->allocate(1024)));
-    EXPECT_EQ(protocol_of(unknown_replica), "nvmeof");
+    EXPECT_EQ(protocol_of(unknown_replica), "tcp");
 
-    // CXL is refused whether it is the stored protocol or the new buffer's.
-    auto new_cxl = allocator->allocate(1024);
-    ASSERT_NE(new_cxl, nullptr);
-    new_cxl->change_to_cxl("client-binding");
-    EXPECT_FALSE(tcp_replica.replace_memory_buffer(std::move(new_cxl)));
+    // The replacement can also move from TCP to another mounted protocol.
+    auto mounted_allocator = CreateBufferAllocator(
+        BufferAllocatorType::OFFSET, "nvlink-segment", 0x1C0000000ULL, 1 << 20,
+        "nvlink-endpoint", "nvlink");
+    ASSERT_TRUE(mounted_allocator.has_value());
+    ASSERT_TRUE(tcp_replica.replace_memory_buffer(
+        (*mounted_allocator)->allocate(1024)));
+    EXPECT_EQ(protocol_of(tcp_replica), "nvlink");
+}
 
-    auto stored_cxl = allocator->allocate(1024);
-    ASSERT_NE(stored_cxl, nullptr);
-    stored_cxl->change_to_cxl("client-binding");
-    Replica cxl_replica(std::move(stored_cxl), ReplicaStatus::COMPLETE);
-    EXPECT_FALSE(cxl_replica.replace_memory_buffer(allocator->allocate(1024)));
+TEST_F(BufferAllocatorTest, BuffersAdvertiseTheirSegmentsProtocol) {
+    constexpr uintptr_t kBase = 0x1C0000000ULL;
+    constexpr size_t kCapacity = 16 * 1024 * 1024;
+    for (auto type :
+         {BufferAllocatorType::CACHELIB, BufferAllocatorType::OFFSET}) {
+        auto allocator =
+            CreateBufferAllocator(type, "nvlink-segment", kBase, kCapacity,
+                                  "nvlink-endpoint", "nvlink");
+        ASSERT_TRUE(allocator.has_value());
+        EXPECT_EQ((*allocator)->getTransportProtocol(), "nvlink");
+        auto buffer = (*allocator)->allocate(4096);
+        ASSERT_NE(buffer, nullptr);
+        EXPECT_EQ(buffer->get_descriptor().protocol_, "nvlink");
+    }
+
+    std::vector<LiveAllocation> allocations = {{0, 64}};
+    auto restored = ImportOffsetBufferAllocator(
+        "rdma-segment", kBase, kCapacity, "rdma-endpoint", "rdma", allocations);
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_EQ(restored->buffers.size(), 1u);
+    EXPECT_EQ(restored->buffers[0]->get_descriptor().protocol_, "rdma");
 }
 
 }  // namespace mooncake

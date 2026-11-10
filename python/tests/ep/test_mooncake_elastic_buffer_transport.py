@@ -12,11 +12,14 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import mooncake.mooncake_elastic_buffer as elastic_buffer_module
+import mooncake.mooncake_ep_buffer as ep_buffer_module
 from mooncake.mooncake_ep_buffer import Buffer as LegacyBuffer
 from mooncake.mooncake_elastic_buffer import (
     ElasticBuffer,
     _bootstrap_collective_device,
     _requested_transport,
+    _requested_xpu_transport,
     _resolve_nccl_membership_masks,
     _resolve_transport_consensus,
     _select_transport,
@@ -35,7 +38,9 @@ def test_legacy_buffer_requires_explicit_size() -> None:
         (-1, 1, 4096, "invalid EP rank or world size"),
         (1, 1, 4096, "invalid EP rank or world size"),
         (0, 0, 4096, "invalid EP rank or world size"),
+        # One past CUDA's MAX_QP_COUNT; XPU allows more ranks.
         (0, 257, 4096, "invalid EP rank or world size"),
+        (0, 1 << 16, 4096, "invalid EP rank or world size"),
         (0, 1, -1, "EP buffer size must be positive"),
         (0, 1, 0, "EP buffer size must be positive"),
     ],
@@ -45,6 +50,11 @@ def test_legacy_buffer_rejects_invalid_constructor_arguments(
 ) -> None:
     if importlib.util.find_spec("mooncake._ep") is None:
         pytest.skip("requires Mooncake EP native extension")
+    if num_ranks == 257:
+        from mooncake import _ep
+
+        if _ep.DEVICE_TYPE == "xpu":
+            pytest.skip("257 ranks is within the XPU limit")
 
     script = f"""
 from mooncake._ep import Buffer
@@ -139,6 +149,45 @@ def test_torchrun_local_world_size_drives_topology(monkeypatch) -> None:
     monkeypatch.delenv("MOONCAKE_EP_NUM_LOCAL_RANKS", raising=False)
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
     assert ElasticBuffer._calculate_physical_domain_size(Group()) == (4, 4)
+
+
+@pytest.mark.parametrize(
+    ("device_type", "ranks_per_node", "local_world_size", "reserves_room"),
+    [
+        ("xpu", "4", "8", True),  # MC_EP_RANKS_PER_NODE splits the ranks
+        ("xpu", None, "4", True),  # torchrun across nodes
+        ("xpu", None, "8", False),  # one node
+        ("xpu", "8", "4", False),  # MC_EP_RANKS_PER_NODE takes precedence
+        ("cuda", "4", "4", False),  # CUDA needs no room for flat RDMA
+    ],
+)
+def test_buffer_size_hint_reserves_room_for_ranks_on_other_nodes(
+    monkeypatch,
+    device_type: str,
+    ranks_per_node: str | None,
+    local_world_size: str,
+    reserves_room: bool,
+) -> None:
+    class Group:
+        @staticmethod
+        def size() -> int:
+            return 8
+
+    monkeypatch.setattr(elastic_buffer_module, "_ep_device_type", lambda: device_type)
+    monkeypatch.delenv("MOONCAKE_EP_NUM_LOCAL_RANKS", raising=False)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", local_world_size)
+    if ranks_per_node is None:
+        monkeypatch.delenv("MC_EP_RANKS_PER_NODE", raising=False)
+    else:
+        monkeypatch.setenv("MC_EP_RANKS_PER_NODE", ranks_per_node)
+
+    def hint(allow_hybrid_mode: bool) -> int:
+        return ElasticBuffer.get_buffer_size_hint(
+            Group(), 128, 1024, num_topk=8, allow_hybrid_mode=allow_hybrid_mode
+        )
+
+    assert (hint(False) == hint(True)) == reserves_room
+    assert hint(False) <= hint(True)
 
 
 def test_environment_can_roll_auto_mode_back_to_ibgda(monkeypatch) -> None:
@@ -390,10 +439,12 @@ def test_handle_without_generation_remains_valid_for_ibgda() -> None:
     buffer._validate_handle_generation(LegacyHandle())
 
 
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
 @pytest.mark.parametrize("backend_name", ["mooncake", "mooncake-cpu"])
 def test_active_rank_mask_uses_registered_mooncake_backend(
-    monkeypatch, backend_name: str
+    monkeypatch, backend_name: str, device_type: str
 ) -> None:
+    monkeypatch.setattr(elastic_buffer_module, "_ep_device_type", lambda: device_type)
     backend = object()
     buffer = object.__new__(ElasticBuffer)
     buffer.backend = backend
@@ -405,7 +456,9 @@ def test_active_rank_mask_uses_registered_mooncake_backend(
     monkeypatch.setitem(sys.modules, "mooncake.pg", fake_pg)
     monkeypatch.setattr(dist, "get_backend", lambda group: backend_name)
     synchronized_devices = []
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronized_devices.append)
+    monkeypatch.setattr(
+        getattr(torch, device_type), "synchronize", synchronized_devices.append
+    )
 
     assert buffer._active_ranks_mask() == [1, 0]
     assert synchronized_devices == [3]
@@ -423,12 +476,49 @@ def test_non_mooncake_group_uses_full_membership(monkeypatch, backend_name) -> N
 
 
 @pytest.mark.parametrize(
-    ("backend_name", "device"),
-    [("gloo", "cpu"), ("mooncake-cpu", "cpu"), ("mooncake", "cuda"), ("nccl", "cuda")],
+    ("ep_device", "backend_name", "device"),
+    [
+        ("cuda", "gloo", "cpu"),
+        ("cuda", "mooncake-cpu", "cpu"),
+        ("cuda", "mooncake", "cuda"),
+        ("cuda", "nccl", "cuda"),
+        ("xpu", "gloo", "cpu"),
+        ("xpu", "xccl", "xpu"),
+    ],
 )
-def test_bootstrap_collective_device(monkeypatch, backend_name, device) -> None:
+def test_bootstrap_collective_device(
+    monkeypatch, ep_device, backend_name, device
+) -> None:
+    monkeypatch.setattr(elastic_buffer_module, "_ep_device_type", lambda: ep_device)
     monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
     assert _bootstrap_collective_device(object()) == device
+
+
+@pytest.mark.parametrize("requested", ["auto", "ipc", " IPC "])
+def test_xpu_transport_is_ipc(monkeypatch, requested: str) -> None:
+    monkeypatch.delenv("MOONCAKE_EP_TRANSPORT", raising=False)
+    assert _requested_xpu_transport(requested) == "ipc"
+
+
+def test_xpu_auto_transport_honours_environment(monkeypatch) -> None:
+    monkeypatch.setenv("MOONCAKE_EP_TRANSPORT", "ipc")
+    assert _requested_xpu_transport("auto") == "ipc"
+    monkeypatch.setenv("MOONCAKE_EP_TRANSPORT", "ibgda")
+    with pytest.raises(ValueError, match="only transport 'ipc'"):
+        _requested_xpu_transport("auto")
+
+
+@pytest.mark.parametrize("requested", ["ibgda", "nccl", "xccl"])
+def test_xpu_rejects_other_transports(monkeypatch, requested: str) -> None:
+    monkeypatch.delenv("MOONCAKE_EP_TRANSPORT", raising=False)
+    with pytest.raises(ValueError, match="only transport 'ipc'"):
+        _requested_xpu_transport(requested)
+
+
+def test_xpu_create_elastic_is_rejected(monkeypatch) -> None:
+    monkeypatch.setattr(elastic_buffer_module, "_ep_device_type", lambda: "xpu")
+    with pytest.raises(NotImplementedError, match="not supported on XPU"):
+        ElasticBuffer.create_elastic(0, 2, object(), store_namespace="test")
 
 
 @pytest.mark.parametrize("backend_name", ["gloo", "mooncake-cpu"])
@@ -451,3 +541,85 @@ def test_nccl_unique_id_exchange_uses_cpu_metadata(monkeypatch, backend_name) ->
     monkeypatch.setattr(dist, "broadcast", fake_broadcast)
     assert buffer._exchange_nccl_unique_id(fake_ep) == expected_id
     assert broadcasts == [[0], expected_id]
+
+
+@pytest.mark.parametrize(
+    ("do_cpu_sync", "async_with_compute_stream", "expected_calls"),
+    [
+        (True, True, ["dispatch", "wait", "cpu", "cpu"]),
+        (True, False, ["dispatch", "cpu", "cpu"]),
+        (False, True, ["dispatch"]),
+    ],
+)
+def test_dispatch_cpu_sync_waits_for_async_kernels(
+    monkeypatch, do_cpu_sync: bool, async_with_compute_stream: bool, expected_calls
+) -> None:
+    calls = []
+
+    class FakeEvent:
+        def current_stream_wait(self, stream_ptr: int) -> None:
+            calls.append("wait")
+
+    def fake_dispatch(*args) -> FakeEvent:
+        calls.append("dispatch")
+        return FakeEvent()
+
+    original_cpu = torch.Tensor.cpu
+
+    def recording_cpu(self, *args, **kwargs):
+        calls.append("cpu")
+        return original_cpu(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", recording_cpu)
+    monkeypatch.setattr(elastic_buffer_module, "_native_current_stream_ptr", lambda: 0)
+    monkeypatch.setattr(ep_buffer_module, "_native_current_stream_ptr", lambda: 0)
+    buffer = object.__new__(ElasticBuffer)
+    buffer.runtime = types.SimpleNamespace(dispatch=fake_dispatch)
+    buffer.num_ranks = 1
+    buffer.num_scaleup_ranks = 1
+    buffer.num_scaleout_ranks = 1
+    buffer._active_ranks = torch.ones(1, dtype=torch.int32)
+    buffer._generation = 0
+
+    buffer.dispatch(
+        torch.zeros((2, 4), dtype=torch.bfloat16),
+        topk_idx=torch.zeros((2, 1), dtype=torch.int64),
+        num_experts=2,
+        num_max_tokens_per_rank=2,
+        expert_alignment=1,
+        do_cpu_sync=do_cpu_sync,
+        num_sms=1,
+        async_with_compute_stream=async_with_compute_stream,
+    )
+
+    assert calls == expected_calls
+
+
+def test_expanded_dispatch_output_includes_alignment_padding(monkeypatch) -> None:
+    # One rank, one token, top-2 experts 0 and 1, alignment 8: expert 1's row
+    # starts at 8, so the output needs at least 9 rows, not 1 * 2.
+    monkeypatch.setattr(elastic_buffer_module, "_native_current_stream_ptr", lambda: 0)
+    buffer = object.__new__(ElasticBuffer)
+    buffer.runtime = types.SimpleNamespace(dispatch=lambda *args: object())
+    buffer.num_ranks = 1
+    buffer.num_scaleup_ranks = 1
+    buffer.num_scaleout_ranks = 1
+    buffer._active_ranks = torch.ones(1, dtype=torch.int32)
+    buffer._generation = 0
+
+    with pytest.warns(RuntimeWarning, match="do_expand=True"):
+        recv_x, _, recv_topk_weights, _, _ = buffer.dispatch(
+            torch.zeros((1, 4), dtype=torch.bfloat16),
+            topk_idx=torch.tensor([[0, 1]], dtype=torch.int64),
+            topk_weights=torch.ones((1, 2), dtype=torch.float32),
+            num_experts=2,
+            num_max_tokens_per_rank=1,
+            expert_alignment=8,
+            do_expand=True,
+            do_cpu_sync=False,
+            num_sms=1,
+            async_with_compute_stream=False,
+        )
+
+    assert recv_x.shape[0] >= 9
+    assert recv_topk_weights.shape[0] == recv_x.shape[0]

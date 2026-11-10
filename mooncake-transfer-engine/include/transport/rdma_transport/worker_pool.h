@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -26,7 +27,52 @@
 #include "config.h"
 #include "rdma_context.h"
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control.h"
+#endif
+
 namespace mooncake {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+class ClassicRdmaCongestionControl {
+   public:
+    using SliceList = std::vector<Transport::Slice *>;
+
+    explicit ClassicRdmaCongestionControl(
+        adaptive_congestion_control::Config config);
+    ~ClassicRdmaCongestionControl();
+
+    ClassicRdmaCongestionControl(const ClassicRdmaCongestionControl &) = delete;
+    ClassicRdmaCongestionControl &operator=(
+        const ClassicRdmaCongestionControl &) = delete;
+
+    bool enabled() const {
+        return mode_ != adaptive_congestion_control::Mode::kOff;
+    }
+    void prepare(Transport::Slice *slice, const std::string &peer_nic_path);
+    void prepare(SliceList &slices, const std::string &peer_nic_path);
+    void bindEndpoint(Transport::Slice *slice, RdmaEndPoint *endpoint);
+    void retireEndpoint(const std::string &peer_nic_path,
+                        RdmaEndPoint *endpoint);
+    size_t gate(SliceList &queued);
+    void complete(Transport::Slice *slice, ibv_wc_status status,
+                  uint32_t vendor_error = 0);
+    void releaseUnposted(Transport::Slice *slice);
+    void tick(uint64_t now_ns);
+    void resetDevice();
+
+   private:
+    struct RouteState;
+
+    RouteState *route(const std::string &peer_nic_path);
+
+    adaptive_congestion_control::Config config_;
+    adaptive_congestion_control::Mode mode_;
+    std::unique_ptr<adaptive_congestion_control::DomainState> device_;
+    std::mutex routes_mutex_;
+    std::unordered_map<std::string, std::unique_ptr<RouteState>> routes_;
+};
+#endif
+
 class WorkerPoolTestPeer;
 class WorkerPool {
     friend class WorkerPoolTestPeer;
@@ -191,6 +237,9 @@ class WorkerPool {
     std::atomic<int> context_failure_count_{0};
     uint64_t breaker_reactivate_after_ns_{0};
     static constexpr int kLocalCompletionFailureThreshold = 32;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    ClassicRdmaCongestionControl adaptive_congestion_control_;
+#endif
 };
 }  // namespace mooncake
 

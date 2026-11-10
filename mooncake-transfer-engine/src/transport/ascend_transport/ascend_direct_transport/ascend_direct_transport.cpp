@@ -35,6 +35,8 @@
 namespace mooncake {
 namespace {
 
+constexpr uintptr_t kHccsDeviceMemAlignment = 2 * 1024 * 1024;
+
 int32_t ResolveCurrentEngineId(bool agent_mode) {
     if (!agent_mode) {
         return 0;
@@ -153,7 +155,10 @@ int AscendDirectTransport::install(std::string& local_server_name,
         return ret;
     }
 
-    if (agent_mode_ && roce_mode_) {
+    // RoceDummyRealSliceDispatcher is the sunset path for a standalone holder
+    // that still sets HCCL_INTRA_ROCE_ENABLE. roce:device and roce:host stay
+    // on DefaultSliceDispatcher even when agent_mode publishes every NPU.
+    if (agent_mode_ && IsHcclIntraRoceEnabled()) {
         dispatcher_ = std::make_unique<RoceDummyRealSliceDispatcher>(
             transfer_executor_.get(), local_engine_contexts_,
             local_engine_device_ids_);
@@ -162,6 +167,12 @@ int AscendDirectTransport::install(std::string& local_server_name,
             transfer_executor_.get(), local_engine_contexts_,
             local_engine_device_ids_);
     }
+    LOG(INFO) << "AscendDirectTransport: dispatcher="
+              << (agent_mode_ && IsHcclIntraRoceEnabled()
+                      ? "RoceDummyRealSliceDispatcher"
+                      : "DefaultSliceDispatcher")
+              << ", agent_mode=" << agent_mode_ << ", roce_mode=" << roce_mode_
+              << ", local_devices=" << local_engine_device_ids_.size();
     return 0;
 }
 
@@ -194,10 +205,19 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     // process-global config.
     use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
                       globalConfig().ascend_store_te_init;
+    // Snapshot the role-resolved protocol. ascend_store_te_init is cleared
+    // after install, so a later read of the raw env would see the wrong
+    // subtree.
+    hccs_device_protocol_ = HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        ResolveAscendGlobalResourceConfig(
+            std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG"))
+            .c_str());
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
               << ", roce_mode=" << (roce_mode_ ? "true" : "false")
               << ", use_fabric_mem=" << (use_fabric_mem_ ? "true" : "false")
+              << ", hccs_device_protocol="
+              << (hccs_device_protocol_ ? "true" : "false")
               << (agent_mode_
                       ? ", launched as standalone real client (manages all "
                         "local NPU devices)"
@@ -295,10 +315,6 @@ Status AscendDirectTransport::submitTransfer(
 Status AscendDirectTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
     const int32_t current_engine_id = ResolveCurrentEngineId(agent_mode_);
-    if (current_engine_id < 0) {
-        return Status::Context("aclrtGetDevice failed");
-    }
-
     std::vector<Slice*> slice_list;
     slice_list.reserve(task_list.size());
 
@@ -313,6 +329,13 @@ Status AscendDirectTransport::submitTransferTask(
         task.slice_list.push_back(slice);
         __sync_fetch_and_add(&task.slice_count, 1);
         slice_list.push_back(slice);
+    }
+
+    if (current_engine_id < 0) {
+        // MultiTransport already published these tasks. Attach every slice
+        // before completing any, so rejected tasks cannot look successful.
+        for (auto* slice : slice_list) slice->markFailed();
+        return Status::Context("aclrtGetDevice failed");
     }
 
     if (dispatcher_) {
@@ -333,6 +356,11 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
+    // TENT drives local-copy completion from the transport status path; do the
+    // same here instead of running a per-engine completion thread.
+    if (transfer_executor_) {
+        transfer_executor_->pollLocalCopies();
+    }
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
@@ -395,6 +423,18 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
         // treating that memory as host.
         mem_type = adxl::MEM_DEVICE;
     }
+    // hccs:device exports device memory on 2 MiB pages. ADXL RegisterMem
+    // accepts an unaligned base, but the export then fails at connect time.
+    // The gate is the resolved protocol and fabric mem, both captured at
+    // install.
+    const bool hccs_mode = !use_fabric_mem_ && hccs_device_protocol_;
+    if (mem_type == adxl::MEM_DEVICE && hccs_mode && remote_accessible &&
+        reinterpret_cast<uintptr_t>(addr) % kHccsDeviceMemAlignment != 0) {
+        LOG(ERROR) << "Device mem addr:" << addr << ", length:" << length
+                   << " is not aligned to " << kHccsDeviceMemAlignment
+                   << " bytes, which hccs:device requires.";
+        return ERR_INVALID_ARGUMENT;
+    }
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
@@ -420,14 +460,23 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
 
 int AscendDirectTransport::unregisterLocalMemory(void* addr,
                                                  bool update_metadata) {
+    // Unregistering can run on a thread that never bound a context, such as the
+    // signal handling thread that unmounts the store segments on Ctrl-C. There
+    // is then nothing to put back, and deregisterMem binds the context each
+    // handle was registered with regardless of what the caller has bound.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        LOG_FIRST_N(WARNING, 1)
+            << "aclrtGetCurrentContext failed while unregistering memory "
+               "(no ACL context on this thread), errmsg: "
+            << aclGetRecentErrMsg();
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     int ret = transfer_executor_->deregisterMem(addr);
     if (ret != 0) {

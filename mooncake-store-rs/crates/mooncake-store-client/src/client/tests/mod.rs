@@ -2465,14 +2465,16 @@ impl MetadataBackend for BlockingCasMetadataBackend {
             .is_some_and(|error_key| error_key == key);
         if should_error {
             let remaining = self.error_cas_failures_remaining.load(Ordering::SeqCst);
-            if remaining == usize::MAX
-                || self
-                    .error_cas_failures_remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                        current.checked_sub(1)
-                    })
-                    .is_ok()
-            {
+            if remaining == usize::MAX || {
+                // Keep fetch_update for compatibility with Rust versions before 1.95.
+                #[allow(deprecated)]
+                let update_result = self.error_cas_failures_remaining.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |current| current.checked_sub(1),
+                );
+                update_result.is_ok()
+            } {
                 return Err(StoreError::Metadata(format!(
                     "injected CAS error for {}",
                     key.0
@@ -6445,6 +6447,14 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
                 ]),
         )
         .expect("replicated put should succeed");
+    // Quarantining A also removes it from route-authority selection. Ensure
+    // the surviving authority has received the asynchronous publication first.
+    let mirrored = wait_for_authority_route(
+        &metadata.route_namespace(),
+        &store_b.runtime_id().stable_id,
+        &route.key,
+    );
+    assert_eq!(mirrored.version, route.version);
     let dead_replica = route
         .replicas
         .iter()

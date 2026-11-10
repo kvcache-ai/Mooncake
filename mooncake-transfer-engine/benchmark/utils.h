@@ -79,6 +79,8 @@ struct XferBenchConfig {
     static int start_num_threads;
     static size_t target_offset;
     static size_t target_range_size;
+    static std::string target_access;
+    static size_t target_window_size;
     static std::string qos_classes;
     static std::string qos_classes_json;
     static std::string workload_classes_json;
@@ -227,6 +229,14 @@ static inline bool isCudaMemory(void* ptr) {
     auto ret = cudaPointerGetAttributes(&attr, ptr);
     return ret == cudaSuccess && attr.type == cudaMemoryTypeDevice;
 }
+
+// cudaMemset/cudaMemcpy on another GPU's memory fail with "invalid argument"
+// unless that GPU is current, and bench threads may touch any GPU.
+static inline void useCudaDeviceOf(void* ptr) {
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, ptr) == cudaSuccess)
+        cudaSetDevice(attr.device);
+}
 #endif
 
 #ifdef USE_HIP
@@ -269,7 +279,23 @@ static inline void copyMluData(void* host, void* device, size_t length,
 }
 #endif
 
+#ifdef USE_XPU
+// Defined in utils.cpp: tent/runtime/platform.h must stay out of this header
+// because tent/common/types.h #defines LOCAL_SEGMENT_ID, which breaks the
+// classic transfer engine headers included alongside it.
+bool isXpuMemory(void* ptr);
+void copyXpuData(void* dst, void* src, size_t length);
+#endif
+
 static inline void fillData(void* addr, size_t length, uint8_t seed) {
+#ifdef USE_XPU
+    if (isXpuMemory(addr)) {
+        std::vector<uint8_t> data(length);
+        fillData(data.data(), length, seed);
+        copyXpuData(addr, data.data(), length);
+        return;
+    }
+#endif
 #ifdef USE_MLU
     if (isMluMemory(addr)) {
         std::vector<uint8_t> data(length);
@@ -280,6 +306,7 @@ static inline void fillData(void* addr, size_t length, uint8_t seed) {
 #endif
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
+        useCudaDeviceOf(addr);
         auto err = cudaMemset(addr, seed, length);
         LOG_ASSERT(err == cudaSuccess)
             << "cudaMemset failed: " << cudaGetErrorString(err);
@@ -322,6 +349,17 @@ static inline uint8_t fillData(void* addr, size_t length) {
 
 static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     std::vector<uint8_t> ref_data(length, seed);
+#ifdef USE_XPU
+    if (isXpuMemory(addr)) {
+        fillData(ref_data.data(), length, seed);
+        std::vector<uint8_t> act_data(length);
+        copyXpuData(act_data.data(), addr, length);
+        if (memcmp(act_data.data(), ref_data.data(), length)) {
+            LOG(FATAL) << "Inconsistent data detected";
+        }
+        return;
+    }
+#endif
 #ifdef USE_MLU
     if (isMluMemory(addr)) {
         fillData(ref_data.data(), length, seed);
@@ -335,6 +373,7 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
 #endif
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
+        useCudaDeviceOf(addr);
         std::vector<uint8_t> act_data(length);
         cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
