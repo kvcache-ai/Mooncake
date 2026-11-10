@@ -82,8 +82,7 @@ static inline CUresult cuMemAddressFree(CUdeviceptr ptr, size_t size) {
 }
 
 static inline CUresult cuMemCreate(CUmemGenericAllocationHandle *handle,
-                                   size_t size,
-                                   const CUmemAllocationProp *prop,
+                                   size_t size, const CUmemAllocationProp *prop,
                                    unsigned long long flags) {
     return (CUresult)efdrvMemCreate(handle, size, prop, flags);
 }
@@ -125,7 +124,8 @@ static inline CUresult cuMemImportFromShareableHandle(
 static inline CUresult cuMemGetAllocationGranularity(
     size_t *granularity, const CUmemAllocationProp *prop,
     CUmemAllocationGranularity_flags option) {
-    return (CUresult)efdrvMemGetAllocationGranularity(granularity, prop, option);
+    return (CUresult)efdrvMemGetAllocationGranularity(granularity, prop,
+                                                      option);
 }
 
 static inline CUresult cuMemRetainAllocationHandle(
@@ -134,8 +134,8 @@ static inline CUresult cuMemRetainAllocationHandle(
 }
 
 static inline CUresult cuMemGetHandleForAddressRange(
-    void *handle, CUdeviceptr dptr, size_t size, CUmemRangeHandleType handleType,
-    unsigned long long flags) {
+    void *handle, CUdeviceptr dptr, size_t size,
+    CUmemRangeHandleType handleType, unsigned long long flags) {
     return (CUresult)efdrvMemGetHandleForAddressRange(handle, dptr, size,
                                                       handleType, flags);
 }
