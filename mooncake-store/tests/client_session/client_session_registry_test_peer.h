@@ -49,8 +49,17 @@ class ClientSessionRegistryTestPeer {
         return registry.Observe(client_id, now);
     }
 
+    // Deliver queued transitions on the caller's thread instead of the
+    // registry's delivery thread.
+    static void Drain(ClientSessionRegistry& registry) {
+        registry.events_.Drain();
+    }
+
+    // One deterministic tick: evaluate every session, then deliver what it
+    // published.
     static void Poll(ClientSessionRegistry& registry, Clock::time_point now) {
         registry.ExpireSessions(now);
+        registry.events_.Drain();
     }
 
     static Slot FindSlot(const ClientSessionRegistry& registry,

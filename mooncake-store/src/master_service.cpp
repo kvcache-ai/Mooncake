@@ -494,14 +494,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
       nof_eviction_high_watermark_ratio_(
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
-      client_sessions_(
-          std::chrono::seconds(config.client_active_ttl_sec),
-          std::chrono::seconds(config.client_suspicion_ttl_sec),
-          [this] { return AdmitsBusinessWorkers(); },
-          [this] { client_offboarding_worker_.ReserveJob(); },
-          [this](const UUID& client_id, ClientSessionSharedPtr session) {
-              OnClientRetired(client_id, std::move(session));
-          }),
+      client_offboarding_worker_([this](ClientOffboardingJob& job) {
+          return ProcessClientOffboardingJob(job);
+      }),
+      client_sessions_(std::chrono::seconds(config.client_active_ttl_sec),
+                       std::chrono::seconds(config.client_suspicion_ttl_sec),
+                       [this] { return AdmitsBusinessWorkers(); }),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -751,22 +749,21 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
-    // This worker is part of the Client lifecycle protocol. Start it before
-    // any raw std::thread so a startup failure can unwind the constructor
-    // normally instead of encountering joinable thread destructors.
+    CHECK(client_sessions_.AddListener([this](const ClientSessionEvent& event) {
+        OnClientSessionChanged(event);
+    }));
+    // Start these owned lifecycles before any raw std::thread so a startup
+    // failure can unwind the constructor normally instead of encountering
+    // joinable thread destructors. Cleanup must be able to accept work before
+    // expiry can retire a session.
     client_offboarding_worker_.Start();
-    VLOG(1) << "action=start_client_offboarding_worker";
+    client_sessions_.Start();
+    VLOG(1) << "action=start_client_session_plane";
     if (dfs_kvcs_capacity_provider_) kvcs_capacity_refresh_worker_.Start();
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
-
-    // Start client monitor thread in all modes so TTL/heartbeat works
-    client_monitor_running_ = true;
-    client_monitor_thread_ =
-        std::thread(&MasterService::ClientMonitorFunc, this);
-    VLOG(1) << "action=start_client_monitor_thread";
 
 #ifdef USE_NOF
     nof_heartbeat_running_ = true;
@@ -954,7 +951,10 @@ void MasterService::InitDfsAllocatorFromEnvironment(
 MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
-    client_monitor_running_ = false;
+    // Stop publishing transitions and deliver what is already queued, while
+    // the offboarding worker can still accept the resulting jobs and the
+    // members the listener touches are still alive.
+    client_sessions_.Stop();
 
     task_cleanup_running_ = false;
     {
@@ -984,9 +984,6 @@ MasterService::~MasterService() {
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
-    }
-    if (client_monitor_thread_.joinable()) {
-        client_monitor_thread_.join();
     }
 #ifdef USE_NOF
     if (nof_heartbeat_thread_.joinable()) {
@@ -2420,6 +2417,27 @@ void MasterService::CleanupExpiredSoftPins(
     }
 }
 
+void MasterService::OnClientSessionChanged(const ClientSessionEvent& event) {
+    if (event.current != ClientLivenessState::OFFLINE) {
+        return;
+    }
+    const auto& client_id = event.client_id;
+    // The registry has already dropped its own state for this incarnation.
+    // Cancel graceful-unmount deadlines before terminal cleanup prepares the
+    // same segments. Everything that needs the snapshot or segment locks is
+    // the job's, so a long remount cannot stall event delivery.
+    graceful_unmount_scheduler_.RemoveIf(
+        [&client_id](const GracefulUnmountDeadlineRecord& pending) {
+            return pending.client_id == client_id;
+        });
+    // Only the job's completion removes the OFFLINE session and lifts the
+    // snapshot barrier.
+    ClientOffboardingJob job;
+    job.client_id = client_id;
+    job.retired_session = event.session;
+    client_offboarding_worker_.Schedule(std::move(job));
+}
+
 void MasterService::ClearInvalidHandles() {
     std::shared_lock snapshot_lock(master_state_mutex_);
     ClearInvalidHandlesLocked();
@@ -2519,47 +2537,52 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
-        if (!job.pending_prepare_segments.empty()) {
+        {
+            // Prepare whatever the client still owns and this job has not
+            // prepared yet. The segments are enumerated again on every attempt
+            // instead of being carried in the job.
             ScopedSegmentAccess segment_access =
                 segment_manager_.getSegmentAccess();
-            for (auto it = job.pending_prepare_segments.begin();
-                 it != job.pending_prepare_segments.end();) {
-                SegmentStatus status = SegmentStatus::UNDEFINED;
-                const auto status_err =
-                    segment_access.GetSegmentStatusById(it->segment_id, status);
-                if (status_err == ErrorCode::SEGMENT_NOT_FOUND) {
-                    it = job.pending_prepare_segments.erase(it);
+            std::vector<Segment> segments;
+            if (segment_access.GetClientSegments(job.client_id, segments) !=
+                ErrorCode::OK) {
+                segments.clear();
+            }
+            bool unprepared_segment = false;
+            for (const auto& segment : segments) {
+                if (std::any_of(job.prepared_segments.begin(),
+                                job.prepared_segments.end(),
+                                [&segment](const auto& prepared) {
+                                    return prepared.segment_id == segment.id;
+                                })) {
                     continue;
                 }
-                if (status_err == ErrorCode::OK &&
-                    status == SegmentStatus::UNMOUNTING) {
-                    ++it;
-                    continue;
-                }
-
                 size_t metrics_dec_capacity = 0;
                 const auto err = segment_access.PrepareUnmountSegment(
-                    it->segment_id, metrics_dec_capacity);
+                    segment.id, metrics_dec_capacity);
                 if (err == ErrorCode::OK) {
                     job.prepared_segments.push_back(
-                        {.segment_id = it->segment_id,
-                         .segment_name = it->segment_name,
-                         .transport_endpoint = it->transport_endpoint,
+                        {.segment_id = segment.id,
+                         .segment_name = segment.name,
+                         .transport_endpoint = segment.te_endpoint,
                          .metrics_dec_capacity = metrics_dec_capacity});
-                    it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
                 if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-                    it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
-                LOG(ERROR) << "client_id=" << job.client_id
-                           << ", segment_name=" << it->segment_name
-                           << ", action=prepare_client_offboarding"
-                           << ", error=" << toString(err);
-                ++it;
+                // An existing unmount owns the preparation; retry later
+                // without taking over its capacity accounting or logging
+                // errors.
+                if (err != ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                    LOG(ERROR) << "client_id=" << job.client_id
+                               << ", segment_name=" << segment.name
+                               << ", action=prepare_client_offboarding"
+                               << ", error=" << toString(err);
+                }
+                unprepared_segment = true;
             }
-            if (!job.pending_prepare_segments.empty()) {
+            if (unprepared_segment) {
                 return false;
             }
         }
@@ -2575,7 +2598,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                                job.client_id;
                     }
                     return replica.is_memory_replica() &&
-                           replica.isAffiliatedWith(job.liveness);
+                           replica.isAffiliatedWith(job.retired_session);
                 });
             if (!cleanup_result) {
                 LOG(ERROR) << "client_id=" << job.client_id
@@ -2593,7 +2616,8 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                     if (object.metadata().HasReplica(
                             [&job](const Replica& replica) {
                                 return replica.is_processing() &&
-                                       replica.isAffiliatedWith(job.liveness);
+                                       replica.isAffiliatedWith(
+                                           job.retired_session);
                             })) {
                         unfinished_affiliated_replica = true;
                         break;
@@ -2673,7 +2697,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         return false;
     }
 
-    client_sessions_.Remove(job.client_id, job.liveness);
+    client_sessions_.Remove(job.client_id, job.retired_session);
     return true;
 }
 
@@ -10015,75 +10039,6 @@ bool MasterService::ProbeNoFSegment(const std::string& te_endpoint,
         static_cast<uint32_t>(nof_heartbeat_probe_timeout_ms_.count()),
         error_reason);
 #endif
-}
-
-void MasterService::ClientMonitorFunc() {
-    while (client_monitor_running_) {
-        client_sessions_.ExpireSessions(ClientLivenessRecord::Clock::now());
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kClientMonitorSleepMs));
-    }
-}
-
-void MasterService::OnClientRetired(const UUID& client_id,
-                                    ClientSessionSharedPtr session) {
-    graceful_unmount_scheduler_.RemoveIf(
-        [&client_id](const GracefulUnmountDeadlineRecord& pending) {
-            return pending.client_id == client_id;
-        });
-
-    ClientOffboardingJob job;
-    job.client_id = client_id;
-    job.liveness = std::move(session);
-    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-    {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        std::vector<Segment> segments;
-        const auto get_result =
-            segment_access.GetClientSegments(client_id, segments);
-        if (get_result == ErrorCode::OK) {
-            for (const auto& segment : segments) {
-                SegmentStatus status = SegmentStatus::UNDEFINED;
-                const auto status_result =
-                    segment_access.GetSegmentStatusById(segment.id, status);
-                if (status_result == ErrorCode::SEGMENT_NOT_FOUND) {
-                    continue;
-                }
-                if (status_result == ErrorCode::OK &&
-                    status == SegmentStatus::UNMOUNTING) {
-                    job.pending_prepare_segments.push_back(
-                        {.segment_id = segment.id,
-                         .segment_name = segment.name,
-                         .transport_endpoint = segment.te_endpoint});
-                    continue;
-                }
-
-                size_t metrics_dec_capacity = 0;
-                const auto prepare_result =
-                    segment_access.PrepareUnmountSegment(segment.id,
-                                                         metrics_dec_capacity);
-                if (prepare_result == ErrorCode::OK) {
-                    job.prepared_segments.push_back(
-                        {.segment_id = segment.id,
-                         .segment_name = segment.name,
-                         .transport_endpoint = segment.te_endpoint,
-                         .metrics_dec_capacity = metrics_dec_capacity});
-                } else if (prepare_result != ErrorCode::SEGMENT_NOT_FOUND) {
-                    job.pending_prepare_segments.push_back(
-                        {.segment_id = segment.id,
-                         .segment_name = segment.name,
-                         .transport_endpoint = segment.te_endpoint});
-                    LOG(ERROR) << "client_id=" << client_id
-                               << ", segment_name=" << segment.name
-                               << ", action=prepare_client_offboarding"
-                               << ", error=" << toString(prepare_result);
-                }
-            }
-        }
-    }
-
-    client_offboarding_worker_.ScheduleReserved(std::move(job));
 }
 
 bool MasterService::TryUnmountNoFSegmentByHeartbeat(
