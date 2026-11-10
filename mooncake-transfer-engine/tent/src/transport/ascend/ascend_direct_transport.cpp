@@ -37,6 +37,7 @@ namespace {
 
 constexpr int64_t kMillisToNano = 1000000;
 constexpr int kMaxInflightReqs = 100;
+constexpr int kMaxHixlInitAttempts = 4;
 
 bool IsHostMem(const std::string& location, void* addr) {
     if (location.rfind("cpu", 0) == 0) {
@@ -159,25 +160,37 @@ Status AscendDirectTransport::initEngines() {
 
     const auto host_ip = HostIpFromSegmentName(local_segment_name_);
     for (const auto& [device_id, context] : devices) {
-        auto port = FindHixlListenPort(options_.base_port, device_id);
-        if (port == 0) {
-            return Status::InternalError("Find available port failed" LOC_MARK);
-        }
-        auto engine = std::make_unique<HixlEngine>();
-        const auto name = MakeHixlEngineName(host_ip, port);
-        auto init = init_options_;
-        if (options_.roce_mode) {
-            const auto roce_listen = HixlRoceListenPort(port);
-            init = WithHixlListenPort(init_options_, roce_listen);
-            LOG(INFO) << "HIXL engine " << name
-                      << " roce listen_port=" << roce_listen;
-        } else {
-            LOG(INFO) << "HIXL engine " << name;
-        }
-        auto status = engine->initialize(name, context, device_id, init);
-        if (!status.ok()) {
+        std::vector<uint16_t> excluded_ports;
+        std::unique_ptr<HixlEngine> engine;
+        for (int attempt = 0; attempt < kMaxHixlInitAttempts; ++attempt) {
+            auto port = FindHixlListenPort(options_.base_port, device_id,
+                                           excluded_ports);
+            if (port == 0) {
+                return Status::InternalError(
+                    "Find available port failed" LOC_MARK);
+            }
+            engine = std::make_unique<HixlEngine>();
+            const auto name = MakeHixlEngineName(host_ip, port);
+            auto init = init_options_;
+            if (options_.roce_mode) {
+                const auto roce_listen = HixlRoceListenPort(port);
+                init = WithHixlListenPort(init_options_, roce_listen);
+                LOG(INFO) << "HIXL engine " << name
+                          << " roce listen_port=" << roce_listen;
+            } else {
+                LOG(INFO) << "HIXL engine " << name;
+            }
+            auto status = engine->initialize(name, context, device_id, init);
+            if (status.ok()) {
+                break;
+            }
             engine->finalize();
-            return status;
+            excluded_ports.push_back(port);
+            if (attempt + 1 == kMaxHixlInitAttempts) {
+                return status;
+            }
+            LOG(WARNING) << "HIXL initialization failed for " << name
+                         << "; retrying with a different listen port";
         }
         auto local_copy = std::make_unique<LocalCopyEngine>();
         auto copy_status = local_copy->initialize(engine->context(), device_id);

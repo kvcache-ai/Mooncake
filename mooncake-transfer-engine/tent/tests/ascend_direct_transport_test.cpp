@@ -22,11 +22,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <netinet/in.h>
 #include <string>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "tent/common/config.h"
@@ -235,6 +239,8 @@ struct MockHixlState {
     bool fail_next_transfer = false;
     int fail_register_on = -1;
     HixlXferState xfer_state = HixlXferState::Completed;
+    std::deque<uint32_t> initialize_results;
+    std::vector<std::string> initialize_names;
     std::map<std::string, std::string> last_options;
     std::string last_remote;
     std::vector<std::map<std::string, std::string>> all_options;
@@ -249,11 +255,16 @@ class MockHixlVendor final : public HixlEngine::Vendor {
     uint32_t Initialize(
         const std::string& local_name,
         const std::map<std::string, std::string>& options) override {
-        (void)local_name;
         std::lock_guard<std::mutex> lock(state_->mu);
         state_->initialize_calls++;
+        state_->initialize_names.push_back(local_name);
         state_->last_options = options;
         state_->all_options.push_back(options);
+        if (!state_->initialize_results.empty()) {
+            const auto result = state_->initialize_results.front();
+            state_->initialize_results.pop_front();
+            return result;
+        }
         return kHixlOk;
     }
 
@@ -492,6 +503,23 @@ TEST_F(AscendDirectTransportTest, HccsInitDoesNotInjectRoceListenPort) {
     const auto& cfg = state_->last_options.at("GlobalResourceConfig");
     EXPECT_EQ(cfg.find("listen_port"), std::string::npos);
     EXPECT_NE(cfg.find("hccs:device"), std::string::npos);
+}
+
+TEST_F(AscendDirectTransportTest, InitializeRetriesWithDistinctHixlPorts) {
+    state_->initialize_results = {1, 1, kHixlOk};
+    ASSERT_TRUE(Install().ok());
+    ASSERT_EQ(state_->initialize_names.size(), 3u);
+    EXPECT_NE(state_->initialize_names[0], state_->initialize_names[1]);
+    EXPECT_NE(state_->initialize_names[0], state_->initialize_names[2]);
+    EXPECT_NE(state_->initialize_names[1], state_->initialize_names[2]);
+    EXPECT_EQ(AscendDirectTransportTestPeer::engineName(*transport_, 0),
+              state_->initialize_names[2]);
+}
+
+TEST_F(AscendDirectTransportTest, InitializeFailureIsBounded) {
+    state_->initialize_results = {1, 1, 1, 1};
+    EXPECT_FALSE(Install().ok());
+    EXPECT_EQ(state_->initialize_calls, 4);
 }
 
 TEST_F(AscendDirectTransportTest, SubmitRollbackLeavesBatchUnchanged) {
@@ -771,6 +799,46 @@ TEST(AscendDirectResourceConfigTest, RoceListenPortAvoidsHixlControlPort) {
     EXPECT_EQ(HixlRoceListenPort(42067), 52067);
     EXPECT_NE(HixlRoceListenPort(20000), 20000u);
     EXPECT_EQ(HixlRoceListenPort(60000), 50000);
+}
+
+TEST(AscendDirectResourceConfigTest, ListenPortsDoNotShareDeviceBoundary) {
+    constexpr int kPortsPerDevice = 100;
+    std::vector<int> sockets;
+    int base_port = 0;
+    for (int candidate = 30000; candidate < 50000; candidate += 1000) {
+        bool complete = true;
+        for (int offset = 0; offset < kPortsPerDevice; ++offset) {
+            const int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) {
+                complete = false;
+                break;
+            }
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(candidate + offset);
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&address),
+                     sizeof(address)) != 0) {
+                close(fd);
+                complete = false;
+                break;
+            }
+            sockets.push_back(fd);
+        }
+        if (complete) {
+            base_port = candidate;
+            break;
+        }
+        for (const int fd : sockets) close(fd);
+        sockets.clear();
+    }
+    if (base_port == 0) {
+        FAIL() << "Could not reserve a consecutive test port range";
+    }
+
+    const auto selected = FindHixlListenPort(base_port, 0);
+    for (const int fd : sockets) close(fd);
+    EXPECT_EQ(selected, 0);
 }
 
 TEST(AscendDirectResourceConfigTest, WithHixlListenPortKeepsProtocolDesc) {
