@@ -101,6 +101,16 @@ At the center of Mooncake is a KVCache-centric scheduler that balances effective
 :gutter: 2
 :class-container: latest-blogs
 
+:::{grid-item-card} ATOM Meets Mooncake: A Shared KV Pool for Agentic Serving on AMD Instinct GPUs
+:img-top: https://kvcache.ai/blog/atom-meets-mooncake/featured.png
+:img-alt: ATOM with Mooncake Store and Transfer Engine on AMD Instinct MI355X
+:link: https://kvcache.ai/blog/atom-meets-mooncake/
+:link-alt: ATOM Meets Mooncake: A Shared KV Pool for Agentic Serving on AMD Instinct GPUs
+:class-body: blog-card-date
+
+November 8, 2026
+:::
+
 :::{grid-item-card} Over One Trillion Tokens per Day: How Mooncake Powers Approaching.AI’s Token Factory
 :img-top: https://kvcache.ai/blog/mooncake-in-approaching-ai/featured_hue86b549ecdd836b0c6b3aa760df33338_1244829_2a2b63e1a97ff4921bf0e665a65e1403.webp
 :img-alt: The HiCache + Mooncake Store Architecture within a PD Group
@@ -139,6 +149,16 @@ July 15, 2026
 :class-body: blog-card-date
 
 June 26, 2026
+:::
+
+:::{grid-item-card} Mooncake Joins the PyTorch Ecosystem
+:img-top: https://kvcache.ai/blog/mooncake-joins-pytorch-ecosystem/featured.png
+:img-alt: Mooncake joins the PyTorch Ecosystem
+:link: https://kvcache.ai/blog/mooncake-joins-pytorch-ecosystem/
+:link-alt: Mooncake Joins the PyTorch Ecosystem
+:class-body: blog-card-date
+
+February 12, 2026
 :::
 
 ::::
