@@ -29,6 +29,7 @@ struct MountedSegment {
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
     std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
+    bool remount_in_progress{false};
 };
 
 struct MountedNoFSegment {
@@ -144,6 +145,9 @@ class ScopedSegmentAccess {
      */
     void BindClientSession(const ClientSessionSharedPtr& owner_session);
     void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
+    // A newly mounted allocator remains closed until all restored replicas
+    // have been rebound. Control operations retry rather than retiring it.
+    void SetRemountInProgress(const UUID& segment_id, bool in_progress);
     [[nodiscard]] bool RebindBufferToOwningSegment(AllocatedBuffer& buffer);
 
     /**

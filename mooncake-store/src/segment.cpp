@@ -170,6 +170,15 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         return ErrorCode::INVALID_PARAMS;
     }
     const UUID client_id = owner_session->ClientId();
+    for (const auto& [id, mounted] : segment_manager_->mounted_segments_) {
+        if (mounted.remount_in_progress &&
+            (id == segment.id || mounted.segment.name == segment.name ||
+             mounted.segment.te_endpoint == segment.te_endpoint ||
+             mounted.segment.name == segment.te_endpoint ||
+             mounted.segment.te_endpoint == segment.name)) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+    }
     if (segment.locality && segment.locality->numa_node < 0) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -310,6 +319,15 @@ void ScopedSegmentAccess::BindBufferToSegment(const UUID& segment_id,
         .allocator_registration->BindBuffer(buffer);
 }
 
+void ScopedSegmentAccess::SetRemountInProgress(const UUID& segment_id,
+                                               bool in_progress) {
+    auto& mounted = segment_manager_->mounted_segments_.at(segment_id);
+    CHECK(mounted.status == SegmentStatus::OK &&
+          mounted.allocator_registration);
+    mounted.remount_in_progress = in_progress;
+    mounted.allocator_registration->SetAllocatable(!in_progress);
+}
+
 bool ScopedSegmentAccess::RebindBufferToOwningSegment(AllocatedBuffer& buffer) {
     for (auto& [segment_id, mounted] : segment_manager_->mounted_segments_) {
         (void)segment_id;
@@ -365,6 +383,9 @@ ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
     auto mounted = segment_manager_->mounted_segments_.find(segment.id);
     if (mounted == segment_manager_->mounted_segments_.end()) {
         return ErrorCode::OK;
+    }
+    if (mounted->second.remount_in_progress) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     const auto owner = segment_manager_->client_segments_.find(client_id);
     const bool owned = owner != segment_manager_->client_segments_.end() &&
@@ -448,9 +469,10 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
                      << ", warn=segment_not_found";
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
-    if (it->second.status == SegmentStatus::UNMOUNTING) {
-        // A concurrent unmount already owns preparation. Offboarding retries
-        // this expected state without taking over the first caller's
+    if (it->second.remount_in_progress ||
+        it->second.status == SegmentStatus::UNMOUNTING) {
+        // A concurrent remount or unmount already owns preparation. Offboarding
+        // retries this expected state without taking over the first caller's
         // accounting.
         VLOG(1) << "segment_id=" << segment_id
                 << ", error=segment_is_unmounting";
@@ -495,7 +517,7 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     auto status = it->second.status;
-    if (status == SegmentStatus::UNMOUNTING) {
+    if (it->second.remount_in_progress || status == SegmentStatus::UNMOUNTING) {
         LOG(ERROR) << "segment_id=" << segment_id
                    << ", error=segment_is_unmounting";
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
@@ -810,7 +832,8 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     }
 
     auto& mounted_segment = mounted_segment_it->second;
-    if (mounted_segment.status == SegmentStatus::UNMOUNTING) {
+    if (mounted_segment.remount_in_progress ||
+        mounted_segment.status == SegmentStatus::UNMOUNTING) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     if (mounted_segment.status == status) {
