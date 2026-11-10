@@ -71,7 +71,15 @@ class ClassicRdmaCongestionControl {
     struct RouteState;
 
     RouteState *route(const std::string &peer_nic_path);
-    void rebind(Transport::Slice *slice, RouteState *next_route);
+    void rebind(Transport::Slice *slice, RouteState *next_route) {
+        auto *current_route =
+            static_cast<RouteState *>(slice->rdma_congestion_control_route);
+        if (current_route != next_route) {
+            releaseUnposted(slice);
+            slice->rdma_congestion_control_window_episode = 0;
+        }
+        slice->rdma_congestion_control_route = next_route;
+    }
 
     adaptive_congestion_control::Config config_;
     adaptive_congestion_control::Mode mode_;

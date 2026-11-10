@@ -207,17 +207,6 @@ void ClassicRdmaCongestionControl::prepare(Transport::Slice *slice,
     rebind(slice, route(peer_nic_path));
 }
 
-void ClassicRdmaCongestionControl::rebind(Transport::Slice *slice,
-                                          RouteState *next_route) {
-    auto *current_route =
-        static_cast<RouteState *>(slice->rdma_congestion_control_route);
-    if (current_route != next_route) {
-        releaseUnposted(slice);
-        slice->rdma_congestion_control_window_episode = 0;
-    }
-    slice->rdma_congestion_control_route = next_route;
-}
-
 void ClassicRdmaCongestionControl::prepare(SliceList &slices,
                                            const std::string &peer_nic_path) {
     if (!enabled() || slices.empty()) return;
