@@ -1454,15 +1454,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifndef USE_VRAM_SEGMENT
             } else if (protocol == "efa") {
                 // EFA host segments must be THP backed and must not pile up
-                // on one NUMA node; see allocate_buffer_thp_interleaved().
+                // on one NUMA node; see allocate_buffer_thp().
                 mapped_size = align_up(segment_size, SZ_2MB);
-                ptr = allocate_buffer_thp_interleaved(mapped_size);
+                ptr = allocate_buffer_thp(mapped_size,
+                                          ThpNumaPolicy::kInterleaveIfDefault);
                 use_mmap_segment = true;
             } else if (protocol == "rdma") {
                 // At most one usable NIC NUMA node: THP backed like the
                 // NUMA-segmented path, under the task's own NUMA policy.
                 mapped_size = align_up(segment_size, SZ_2MB);
-                ptr = allocate_buffer_thp(mapped_size);
+                ptr = allocate_buffer_thp(mapped_size,
+                                          ThpNumaPolicy::kInheritTask);
                 use_mmap_segment = true;
 #endif
             } else {

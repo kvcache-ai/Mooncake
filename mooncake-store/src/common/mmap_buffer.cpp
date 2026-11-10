@@ -350,25 +350,6 @@ void *mmap_thp_aligned(size_t size) {
     return ptr;
 }
 
-// THP-advised private mapping of total_size bytes, or nullptr.
-void *map_thp_buffer(size_t total_size) {
-    if (total_size == 0 || total_size % SZ_2MB != 0) {
-        LOG(ERROR) << "Invalid THP segment size " << total_size
-                   << ", must be a non-zero multiple of " << SZ_2MB;
-        return nullptr;
-    }
-
-    // The mapping is exactly [ptr, ptr + total_size), which is what
-    // free_buffer_mmap_memory() unmaps.
-    void *ptr = mmap_thp_aligned(total_size);
-    if (ptr == MAP_FAILED) {
-        LOG(ERROR) << "mmap failed, size=" << total_size << ", errno=" << errno
-                   << " (" << strerror(errno) << ")";
-        return nullptr;
-    }
-    return ptr;
-}
-
 }  // namespace
 
 std::vector<int> FilterNumaNodesToAllowed(const std::vector<int> &nodes) {
@@ -496,18 +477,26 @@ void *allocate_buffer_numa_segments(size_t total_size,
     return ptr;
 }
 
-void *allocate_buffer_thp(size_t total_size) {
-    void *ptr = map_thp_buffer(total_size);
-    if (ptr) {
+void *allocate_buffer_thp(size_t total_size, ThpNumaPolicy numa_policy) {
+    if (total_size == 0 || total_size % SZ_2MB != 0) {
+        LOG(ERROR) << "Invalid THP segment size " << total_size
+                   << ", must be a non-zero multiple of " << SZ_2MB;
+        return nullptr;
+    }
+
+    // The mapping is exactly [ptr, ptr + total_size), which is what
+    // free_buffer_mmap_memory() unmaps.
+    void *ptr = mmap_thp_aligned(total_size);
+    if (ptr == MAP_FAILED) {
+        LOG(ERROR) << "mmap failed, size=" << total_size << ", errno=" << errno
+                   << " (" << strerror(errno) << ")";
+        return nullptr;
+    }
+    if (numa_policy == ThpNumaPolicy::kInheritTask) {
         LOG(INFO) << "Allocated THP buffer: " << total_size << " bytes at "
                   << ptr;
+        return ptr;
     }
-    return ptr;
-}
-
-void *allocate_buffer_thp_interleaved(size_t total_size) {
-    void *ptr = map_thp_buffer(total_size);
-    if (!ptr) return nullptr;
 
     // Interleave across all allowed NUMA nodes. Under the default local
     // policy one node fills first, and from then on every THP fault runs
