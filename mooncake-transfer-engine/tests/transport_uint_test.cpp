@@ -53,7 +53,6 @@ using namespace mooncake;
 
 namespace mooncake {
 
-#ifdef USE_TENT
 class ScopedEnvVar {
    public:
     ScopedEnvVar(const char* name, const char* value) : name_(name) {
@@ -76,7 +75,6 @@ class ScopedEnvVar {
     std::string name_;
     std::optional<std::string> old_value_;
 };
-#endif
 
 class TransferEngineImplTestPeer {
    public:
@@ -345,6 +343,31 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
               "rdma");
 }
+
+#if !defined(USE_UBSHMEM) && !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
+TEST(TransferEngineDeviceFilterTest,
+     CustomTopoJsonRejectsEmptyDeviceFilterIntersection) {
+    char path[] = "/tmp/mc_custom_topo_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_NE(fd, -1);
+    const std::string json = R"({"cpu:0": [["mc_fake_0"], ["mc_fake_1"]]})";
+    const ssize_t written = write(fd, json.data(), json.size());
+    close(fd);
+    ASSERT_EQ(written, static_cast<ssize_t>(json.size()));
+
+    {
+        ScopedEnvVar custom_topology("MC_CUSTOM_TOPO_JSON", path);
+        ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+        ScopedEnvVar force_shm("MC_FORCE_SHM", nullptr);
+        ScopedEnvVar force_hca("MC_FORCE_HCA", nullptr);
+        TransferEngineImpl engine(true, {"mlx5_absent"});
+        EXPECT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:0"),
+                  ERR_DEVICE_NOT_FOUND);
+        EXPECT_TRUE(engine.getLocalTopology()->getHcaList().empty());
+    }
+    unlink(path);
+}
+#endif
 
 TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
@@ -790,6 +813,25 @@ class TerminalFailureTransport : public BatchResultTransport {
    private:
     bool initially_finished_;
     std::vector<TransferTask*> tasks_;
+};
+
+// Models RDMA's completion order: a task's status query already reports
+// COMPLETED while the worker has not yet bumped the batch's finished-task
+// counter.
+class CounterLaggingTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) task->slice_count = 1;
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = TransferStatusEnum::COMPLETED;
+        return Status::OK();
+    }
+
+    bool supportsBatchCompletionCounter() const override { return true; }
 };
 
 enum class ScatterPollFailure { kStatusError, kTimeout };
@@ -1553,6 +1595,42 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
     EXPECT_EQ(
         engine.unregisterLocalMemoryBatch({buffer.data(), buffer.data() + 1}),
         0);
+}
+
+TEST_F(TransportTest, TaskCompletedSendsNotifyBeforeBatchCounterCatchesUp) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<CounterLaggingTransport>();
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"counter-lagging", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "127.0.0.1:1";
+    descriptor->protocol = "counter-lagging";
+    engine.getMetadata()->addLocalSegment(kSegmentId, "127.0.0.1:1",
+                                          std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = buffer.data(),
+                            .target_id = kSegmentId,
+                            .target_offset = 0,
+                            .length = buffer.size()};
+    auto batch_id = engine.allocateBatchID(1);
+    ASSERT_TRUE(
+        engine
+            .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
+            .ok());
+    ASSERT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
+
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(Transport::toBatchDesc(batch_id).finished_task_count.load(), 0u);
+    // A caller that frees the batch now must not lose the notification.
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+    EXPECT_TRUE(engine.freeBatchID(batch_id).ok());
 }
 
 TEST_F(TransportTest, FreeBatchClearsPendingNotify) {

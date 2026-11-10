@@ -164,6 +164,34 @@ request. Store hot-cache redirection applies only to memory replicas. DFS reads
 can still benefit from filesystem or storage caches; DFS I/O does not
 necessarily mean a physical disk read.
 
+## Backends
+
+`--store-backend` selects the Store implementation the tool drives. Both
+backends run the same scenarios, report the same phase names, and produce the
+same metric fields.
+
+- `cpp` (default): the C++ Store. `setup()` receives the classic argument order
+  and the run uses `--metadata-server` and `--master-server`.
+- `rs`: Store-RS. The tool sets `MOONCAKE_STORE_BACKEND=rs` before importing
+  `mooncake.store` and passes the Store-RS `setup()` arguments.
+
+Store-RS options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--rs-metadata-url` | `redis://127.0.0.1:6380` | Store metadata backend (`redis://` or `etcd://`) |
+| `--rs-transport-metadata-url` | `P2PHANDSHAKE` | Transfer Engine metadata |
+| `--rs-keyspace` | empty | Metadata keyspace prefix |
+| `--rs-route-control` | `embedded_wrh` | Route control mode |
+
+The `zcopy` buffer strategy differs by backend. The C++ Store allocates from its
+registered local buffer pool. Store-RS allocates a dedicated region and
+registers it with `register_buffer`, because its local scratch pool is already
+registered with the transfer engine and cannot be registered a second time.
+
+The summary JSON records a `backend` object with the backend, protocol,
+transport metadata, routing mode, keyspace, tenant, and replica count.
+
 ## Key Rules
 
 - Keys are generated deterministically:
@@ -258,6 +286,7 @@ The tables below describe the current defaults and workload semantics.
 | Option | Default | Meaning |
 |---|---|---|
 | `--scenario` | Required | One of the nine scenarios listed above. |
+| `--store-backend` | `cpp` | Store implementation: `cpp` or `rs`. The Store-RS options are listed under [Backends](#backends). |
 | `--local-hostname` | `127.0.0.1:50071` | Client endpoint; use a distinct endpoint for separate benchmark processes. |
 | `--metadata-server` | `http://127.0.0.1:8080/metadata` | Transfer Engine metadata connection string. |
 | `--master-server` | `127.0.0.1:50051` | Store master endpoint. |

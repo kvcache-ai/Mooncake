@@ -2,13 +2,18 @@
 
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <locale>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ascii_string.h"
 #include "bool_parser.h"
+#include "config.h"
+#include "config/distributed_storage_config.h"
 #include "environ.h"
 #include "environment_variables.h"
 
@@ -34,6 +39,19 @@ double ParseDiskEvictionRatioOr(const std::string& raw_value,
         return default_value;
     }
     return value;
+}
+
+// FabricMem host allocations must be 1GiB-aligned. Zero and negative sizes
+// are left alone. A positive size that is already a multiple of 1GiB stays
+// unchanged; any other positive size rounds up to the next boundary.
+int64_t AlignUpToOneGiB(int64_t size) {
+    constexpr int64_t kOneGiB = static_cast<int64_t>(kGB);
+    if (size <= 0) return size;
+    const int64_t remainder = size % kOneGiB;
+    if (remainder == 0) return size;
+    const int64_t padding = kOneGiB - remainder;
+    if (size > std::numeric_limits<int64_t>::max() - padding) return size;
+    return size + padding;
 }
 
 bool ParseStrictBoolOr(const std::string& raw_value, bool default_value) {
@@ -70,9 +88,16 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.storage_filepath = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_FILE_STORAGE_PATH, config.storage_filepath);
 
+    config.storage_paths = ResolveOffloadDiskPaths(config.storage_filepath);
+
     config.local_buffer_size =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
                         config.local_buffer_size);
+    // FabricMem host allocations must be 1GiB-aligned. Round the resolved
+    // size up to that boundary. An aligned size stays unchanged.
+    if (globalConfig().ascend_use_fabric_mem) {
+        config.local_buffer_size = AlignUpToOneGiB(config.local_buffer_size);
+    }
 
     config.pinned_restore_arena_size =
         Environ::ReadOr(Variables::MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES,
@@ -205,8 +230,35 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
+    // storage_filepath may be a comma-separated multi-disk list. ValidatePath
+    // stats a single path and would reject the raw list string (stat of
+    // "/d0,/d1" is ENOENT), so validate each root on its own. Distributed
+    // storage on kvcs resolves its paths through the distributed backend, so
+    // keep skipping the local-directory checks there.
+    const bool uses_kvcs =
+        storage_backend_type == StorageBackendType::kDistributed &&
+        DistributedStorageConfig::FromEnvironment().UsesKvcs();
+    if (!uses_kvcs) {
+        if (TrimAsciiWhitespace(storage_filepath).empty()) {
+            LOG(ERROR) << "FileStorageConfig: storage_filepath must not be "
+                          "empty";
+            return false;
+        }
+        // Every entry names one disk, so dropping an empty one would silently
+        // run on fewer disks than the list has entries.
+        const auto paths =
+            SplitAsciiList(storage_filepath, ',', /*keep_empty=*/true);
+        for (size_t i = 0; i < paths.size(); ++i) {
+            if (paths[i].empty()) {
+                LOG(ERROR) << "FileStorageConfig: storage_filepath='"
+                           << storage_filepath << "' has an empty entry at "
+                           << "position " << i;
+                return false;
+            }
+            if (!ValidatePath(std::string(paths[i]))) {
+                return false;
+            }
+        }
     }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";

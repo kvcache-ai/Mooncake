@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -153,7 +154,10 @@ Status NvlinkHostNumaAllocation::DiscoverHostNumaNodes(
 Status NvlinkHostNumaAllocation::ValidateVisibleGpuFabricSupportWithDriverApi(
     const DriverApi& api, std::vector<CUdevice>& visible_devices) {
     visible_devices.clear();
-    if (std::getenv("MC_USE_NVLINK_IPC") != nullptr)
+    // Same meaning as in NvlinkTransport: only MC_USE_NVLINK_IPC=0 keeps
+    // fabric memory, any other value selects IPC.
+    const char* nvlink_ipc = std::getenv("MC_USE_NVLINK_IPC");
+    if (nvlink_ipc != nullptr && std::strcmp(nvlink_ipc, "0") != 0)
         return Status::NotSupportedTransport(
             "MC_USE_NVLINK_IPC disables Fabric allocations");
     if (!api.device_get_count) return missingDriverFunction("cuDeviceGetCount");

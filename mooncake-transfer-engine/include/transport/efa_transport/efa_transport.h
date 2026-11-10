@@ -79,6 +79,20 @@ class EfaTransport : public Transport {
     buildLocalNicMap(const TopologyMatrix& matrix,
                      const std::vector<std::string>& device_names);
 
+    // Writes to `indexed` a copy of `topology` that lists only `device_names`
+    // (the EFA devices the transport opened), numbered in the topology's own
+    // order. A topology index selects both the NIC in context_list_ and the
+    // buffer key in lkey/rkey, which hold one entry per opened device, so a
+    // topology that also lists other HCAs -- the two non-EFA InfiniBand HCAs
+    // on p6-b300, or an EFA device that failed to open -- shifts every
+    // selection to another NIC. Topology::disableDevice() cannot close the
+    // gap, because it keeps indices stable for the RDMA transport.
+    //
+    // Exposed for testing.
+    static int indexTopologyOverDevices(
+        const Topology& topology, const std::vector<std::string>& device_names,
+        Topology& indexed);
+
     // Eagerly populate the address vector with every (local_ctx, peer_nic)
     // handshake for `segment_name`.
     //
@@ -151,11 +165,20 @@ class EfaTransport : public Transport {
     int startHandshakeDaemon(std::string& local_server_name);
 
    public:
+    // Published as the lkey of a buffer registered without remote_accessible,
+    // in place of its real MR key (see registerLocalMemoryInternal()).
+    static constexpr uint64_t kLocalOnlyKey = 1;
+
+    // require_remote_key: true for a peer's segment (the device must hold an
+    // rkey), false for the local segment, whose buffers registered without
+    // remote_accessible publish only lkeys.
     static int selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
-                            int& buffer_id, int& device_id, int retry_cnt = 0);
+                            int& buffer_id, int& device_id, int retry_cnt = 0,
+                            bool require_remote_key = true);
     static int selectDevice(SegmentDesc* desc, uint64_t offset, size_t length,
                             std::string_view hint, int& buffer_id,
-                            int& device_id, int retry_cnt = 0);
+                            int& device_id, int retry_cnt = 0,
+                            bool require_remote_key = true);
 
    private:
     // Start/stop CQ polling worker threads

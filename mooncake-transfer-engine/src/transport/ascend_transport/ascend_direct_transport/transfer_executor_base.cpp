@@ -212,6 +212,12 @@ int TransferExecutorBase::initEngines() {
         LOG(ERROR) << "Buffer pool mode does not support async transfer.";
         return -1;
     }
+    if (params_.use_buffer_pool && params_.client_server_mode) {
+        LOG(ERROR) << "Client-Server mode only supports BufferPool=0:0, got "
+                   << "a nonzero ASCEND_BUFFER_POOL. Unset ASCEND_BUFFER_POOL "
+                   << "or disable Client-Server mode.";
+        return -1;
+    }
     local_copy_engine_ = std::make_unique<LocalCopyEngine>();
     if (!local_copy_engine_) {
         return ERR_MEMORY;
@@ -299,6 +305,10 @@ int TransferExecutorBase::initEngines() {
     char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
     std::string resolved_resource_config =
         ResolveAscendGlobalResourceConfig(global_resource_config);
+    // TE support for configuring HIXL's nic_topo_path from MC_CUSTOM_TOPO_JSON
+    // (if set). HIXL decides whether to consume it based on protocol_desc.
+    resolved_resource_config =
+        InjectNicTopoPathFromCustomTopoEnvTe(resolved_resource_config);
     if (!resolved_resource_config.empty()) {
         options["GlobalResourceConfig"] = resolved_resource_config.c_str();
         LOG(INFO) << "[AscendTE] init adxl, te is created for store="

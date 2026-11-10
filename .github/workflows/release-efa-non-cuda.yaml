@@ -23,6 +23,7 @@ jobs:
       build-profile: release
       cmake-args: >-
         -DUSE_HTTP=ON -DUSE_ETCD=ON -DWITH_EP=OFF -DSTORE_USE_ETCD=ON
+        -DENABLE_DEBUG_SYMBOLS=OFF
       artifact-prefix: mooncake-wheel-efa-non-cuda
 
   publish-release:

@@ -47,6 +47,22 @@
 
 namespace mooncake {
 
+namespace {
+
+// Mirrors the ownership test the submit path already uses (see the
+// buffer.protocol checks below): descs published by this transport, plus
+// legacy descs with no protocol field. Without this, RDMA's removal can
+// erase a same-address desc belonging to HIP/nvlink, which now filter.
+bool isOwnRdmaDesc(const TransferMetadata::BufferDesc &desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return desc.protocol.empty() || desc.protocol == "rdma";
+#else
+    return desc.shm_name.empty();
+#endif
+}
+
+}  // namespace
+
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
 
@@ -583,7 +599,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         size_t n = std::min(committed, chunks.size());
         for (size_t ri = 0; ri < n; ++ri) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                chunks[ri].first, /*update_metadata=*/false);
+                chunks[ri].first, isOwnRdmaDesc, /*update_metadata=*/false);
             if (rc)
                 LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
                                 "at "
@@ -792,7 +808,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         // chunk); publish once after all removals, below.
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+                reinterpret_cast<void *>(ca), isOwnRdmaDesc,
+                /*update_metadata=*/false);
             // ERR_ADDRESS_NOT_REGISTERED means an earlier attempt already
             // removed this chunk's metadata and then failed partway through
             // deregistration: tolerate it so the retry reaches the MR cleanup.
@@ -854,7 +871,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         return first_err;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, isOwnRdmaDesc,
+                                                update_metadata);
     // A missing metadata entry does NOT prove the MRs are gone: a partial
     // ibv_dereg_mr failure on an earlier attempt leaves live MRs behind it.
     // But a missing entry also occurs for an address that was never a
@@ -1193,7 +1211,15 @@ Status RdmaTransport::submitTransfer(
 #endif
         task_list.push_back(&task);
     }
-    return submitTransferTask(task_list);
+    return submitTransferTaskWithSeal(task_list);
+}
+
+Status RdmaTransport::submitTransferTaskWithSeal(
+    const std::vector<TransferTask *> &task_list) {
+    for (auto *task : task_list) Slice::unsealTaskSubmission(task);
+    auto status = submitTransferTask(task_list);
+    for (auto *task : task_list) Slice::sealTaskSubmission(task);
+    return status;
 }
 
 Status RdmaTransport::submitTransferTask(
@@ -1217,6 +1243,15 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    size_t pending_slice_count = 0;
+    auto flush_pending_slices = [&]() {
+        for (auto &entry : slices_to_post) {
+            if (entry.second.empty()) continue;
+            entry.first->submitPostSend(entry.second);
+            entry.second.clear();
+        }
+        pending_slice_count = 0;
+    };
     auto fail_unposted_slices = [&]() {
         for (auto &entry : slices_to_post)
             for (auto *slice : entry.second) slice->markFailed();
@@ -1249,7 +1284,6 @@ Status RdmaTransport::submitTransferTask(
         fail_unposted_slices();
         fail_unstarted_tasks(task_index + 1);
     };
-    uint64_t nr_slices;
     size_t task_index = 0, request_index = 0;
     BatchRdmaDeviceCache local_device_cache;
     int last_local_buffer_id = -1;
@@ -1261,7 +1295,6 @@ Status RdmaTransport::submitTransferTask(
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
         const size_t current_task_index = task_index;
-        nr_slices = 0;
         assert(task.request);
         auto &request = task.request[request_index++];
         if (request_index == task.request_count) {
@@ -1323,10 +1356,6 @@ Status RdmaTransport::submitTransferTask(
 
             Slice *slice = getSliceCache().allocate();
             assert(slice);
-            if (!slice->from_cache) {
-                nr_slices++;
-            }
-
             slice->source_addr = (char *)request.source + offset;
             slice->length = slice_length;
             slice->source_location.clear();
@@ -1415,19 +1444,16 @@ Status RdmaTransport::submitTransferTask(
                 __sync_fetch_and_add(&task.slice_count, 1);
             }
 
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
-                nr_slices = 0;
-            }
+            // Flush prepared slices so TE worker post can overlap with slice
+            // preparation
+            if (++pending_slice_count >= kSubmitWatermark)
+                flush_pending_slices();
 
             offset += slice->length;
         }
     }
 
-    for (auto &entry : slices_to_post)
-        if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
+    flush_pending_slices();
     return Status::OK();
 }
 

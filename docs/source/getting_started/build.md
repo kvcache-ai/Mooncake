@@ -57,6 +57,81 @@ make -j
 sudo make install
 ```
 
+(build-with-mlu-store)=
+### Build with MLU Store Support
+
+Install the Cambricon Neuware SDK. If it is installed outside
+`/usr/local/neuware`, set `NEUWARE_HOME` to its root directory.
+
+Follow the Default Build steps above, adding
+`-DWITH_STORE=ON -DUSE_MLU=ON -DUSE_CUDA=OFF` to the `cmake ..` command.
+
+For the Python Tensor API, install `torch_mlu` along with the `torch` and
+Neuware SDK versions supported by that release.
+
+Both Classic TE and TENT can use this Store backend. To use TENT, also add
+`-DUSE_TENT=ON` when building and set `MC_USE_TENT=1` before starting the client.
+
+(mlu-tensor-offload-and-reload)=
+#### MLU Tensor Offload and Reload
+
+Store uses CNRT for MLU pointer detection, device selection, synchronous copies,
+and pinned host buffers.
+
+Start `mooncake_master` and create a `store` client as shown in
+{ref}`Start a Store Client <start-a-store-client>`. The following example
+offloads a Tensor to Store and reloads it into a new MLU allocation:
+
+```python
+from uuid import uuid4
+
+import torch
+import torch_mlu
+
+key = f"mlu-example-{uuid4().hex}"
+source = torch.arange(4096, dtype=torch.float32).to("mlu")
+torch.mlu.synchronize()  # Finish the producer before Store reads the pointer.
+result = store.put_tensor(key, source)
+if result != 0:
+    raise RuntimeError(f"put_tensor failed: {result}")
+try:
+    del source
+    destination = torch.empty(4096, dtype=torch.float32, device="mlu")
+    size = destination.numel() * destination.element_size()
+    result = store.register_buffer(destination.data_ptr(), size)
+    if result != 0:
+        raise RuntimeError(f"register_buffer failed: {result}")
+    try:
+        # This API also accepts contiguous MLU tensors.
+        result = store.get_tensor_into_cuda(key, destination)
+        if result != size:
+            raise RuntimeError(f"get_tensor_into_cuda returned {result}, expected {size}")
+        if not torch.equal(destination.cpu(), torch.arange(4096, dtype=torch.float32)):
+            raise RuntimeError("Reloaded Tensor does not match the original data")
+    finally:
+        result = store.unregister_buffer(destination.data_ptr())
+        if result != 0:
+            raise RuntimeError(f"unregister_buffer failed: {result}")
+finally:
+    result = store.remove(key, force=True)
+    if result != 0:
+        raise RuntimeError(f"remove failed: {result}")
+```
+
+Keep registered Tensor owners alive until transfers finish and buffers are
+unregistered. For a producer on a nondefault stream, synchronize its event or
+stream before calling Store. Tensor writes currently gather metadata and payload
+into host staging; registered-pointer writes use the Transfer Engine path.
+
+With `mooncake_master` running, run the real-device regression suite from the
+repository root:
+
+```bash
+MC_STORE_TEST_REQUIRE_MLU=1 MASTER_SERVER=127.0.0.1:50051 \
+  PROTOCOL=tcp python3 -m unittest discover -s mooncake-wheel/tests \
+  -p test_mlu_tensor.py
+```
+
 (build-with-intel-xpu)=
 ### Build with Intel XPU
 
@@ -278,18 +353,16 @@ device-code model, which is not cross-version compatible.
 ```{admonition} GPU-Direct RDMA
 :class: note
 Mooncake can use the DMA-BUF path for GPU-Direct RDMA, which does **not**
-require the `nvidia-peermem` kernel module. Set `WITH_NVIDIA_PEERMEM=0` before
-starting Mooncake to use DMA-BUF. Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
-`ibv_reg_mr` path, which requires `nvidia-peermem`. See Section 3.7 of
-https://docs.nvidia.com/cuda/gpudirect-rdma/ for `nvidia-peermem` installation
-instructions.
-
-When `WITH_NVIDIA_PEERMEM` is **unset**, Mooncake uses the legacy `ibv_reg_mr`
-path. On hosts without `nvidia-peermem` (for example the NVIDIA open kernel
-modules with the inbox RDMA stack and no MLNX_OFED), GPU memory registration
-then fails with `Failed to register memory 0x...: Bad address [14]`; set
-`WITH_NVIDIA_PEERMEM=0` there. DMA-BUF needs the NVIDIA open kernel modules and
-Linux 5.12 or later.
+require the `nvidia-peermem` kernel module. When `WITH_NVIDIA_PEERMEM` is
+**unset**, Mooncake uses the legacy `ibv_reg_mr` path if a peer-memory module
+(`nvidia-peermem`, or `nv_peer_mem` from MLNX_OFED) is loaded and DMA-BUF
+otherwise (for example the NVIDIA open kernel modules with the inbox RDMA stack
+and no MLNX_OFED, where `ibv_reg_mr` on GPU memory would fail with
+`Failed to register memory 0x...: Bad address [14]`). Set
+`WITH_NVIDIA_PEERMEM=0` to force DMA-BUF, or `WITH_NVIDIA_PEERMEM=1` to force
+`ibv_reg_mr`. DMA-BUF needs the NVIDIA open kernel modules and Linux 5.12 or
+later; see Section 3.7 of https://docs.nvidia.com/cuda/gpudirect-rdma/ for
+`nvidia-peermem` installation instructions.
 
 Intel XPU builds (`-DUSE_XPU=ON`) use DMA-BUF for direct RDMA: when a USM
 device allocation is registered, TENT asks the Level Zero runtime to export it

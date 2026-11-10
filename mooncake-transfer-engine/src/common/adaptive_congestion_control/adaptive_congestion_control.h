@@ -57,21 +57,25 @@ struct Config {
     Mode mode = Mode::kOff;
     uint64_t min_window_bytes = 4ULL << 20;
     uint64_t max_window_bytes = 64ULL << 20;
+    // Retained for configuration compatibility, not used by window decisions.
     uint64_t target_drain_time_ns = 2'000'000;
     uint32_t high_pressure_epochs = 2;
     uint32_t low_pressure_epochs = 3;
 };
 
 struct Signals {
+    // Compatibility inputs; adapters no longer sample or consume these values.
     uint64_t backlog_bytes = 0;
     uint64_t delivery_rate_bytes_per_sec = 0;
     uint64_t completed_bytes = 0;
     uint64_t successful_completions = 0;
     uint64_t receiver_pressure = 0;
-    // Legacy health signals are accepted but do not affect the window.
+    // Explicit errors veto growth for the addressed domain in this epoch.
+    // They do not indicate congestion or replace transport recovery.
     uint64_t route_timeouts = 0;
     uint64_t hard_errors = 0;
     uint64_t fatal_failures = 0;
+    // Poller stalls remain observational and do not veto growth.
     bool poller_stalled = false;
 };
 
@@ -121,14 +125,9 @@ class DomainState {
 
     std::atomic<uint32_t> feedback_generation_{1};
     std::atomic<uint32_t> feedback_writers_{0};
-    std::atomic<uint64_t> backlog_bytes_{0};
-    std::atomic<uint64_t> delivery_rate_bytes_per_sec_{0};
-    std::atomic<bool> has_rate_sample_{false};
-    std::atomic<uint64_t> completed_bytes_{0};
     std::atomic<uint64_t> successful_completions_{0};
     std::atomic<uint64_t> receiver_pressure_{0};
-    uint32_t high_pressure_streak_ = 0;
-    uint32_t low_pressure_streak_ = 0;
+    std::atomic<bool> epoch_error_{false};
 };
 
 // DomainState instances must outlive their PathHandle and every active Permit.
