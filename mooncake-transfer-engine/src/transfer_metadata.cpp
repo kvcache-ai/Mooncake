@@ -1855,6 +1855,13 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
 
 int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
+    return removeLocalMemoryBuffer(
+        addr, [](const BufferDesc &) { return true; }, update_metadata);
+}
+
+int TransferMetadata::removeLocalMemoryBuffer(
+    void *addr, const std::function<bool(const BufferDesc &)> &pred,
+    bool update_metadata) {
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -1862,12 +1869,13 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
         for (auto iter = new_segment_desc->buffers.begin();
              iter != new_segment_desc->buffers.end(); ++iter) {
-            if (iter->addr == (uint64_t)addr
+            if ((iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                || (iter->offset + new_segment_desc->cxl_base_addr) ==
-                       (uint64_t)addr
+                 || (iter->offset + new_segment_desc->cxl_base_addr) ==
+                        (uint64_t)addr
 #endif
-            ) {
+                 ) &&
+                pred(*iter)) {
                 new_segment_desc->buffers.erase(iter);
                 addr_exist = true;
                 new_segment_desc->rebuildBufferRangeIndex();

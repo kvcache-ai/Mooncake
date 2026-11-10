@@ -1006,6 +1006,9 @@ TEST_F(MemFabricTransportTest, SubmitAndGetStatusPending) {
 
     auto* mf_batch = dynamic_cast<MemFabricSubBatch*>(batch_);
     EXPECT_EQ(mf_batch->pending_batch_count, 1u);
+
+    // Let fixture cleanup use the non-pending fast path.
+    SetQueryResult(SM_OK);
 }
 
 TEST_F(MemFabricTransportTest, InvalidDestinationLeavesEmptyBatchUnchanged) {
@@ -1125,20 +1128,62 @@ TEST_F(MemFabricTransportTest, FailedBatchPropagatesToAllTasks) {
     EXPECT_EQ(mf_batch->pending_batch_count, 0u);
 }
 
-TEST_F(MemFabricTransportTest, PendingBatchDestructorWarning) {
+TEST_F(MemFabricTransportTest, FreeSubBatchDrainsPendingBatch) {
     ASSERT_TRUE(Install().ok());
     ASSERT_TRUE(transport_->allocateSubBatch(batch_, 4).ok());
+    SetTransferTimeout(1000);
+    std::array<char, 32> src, dst{};
+    src.fill(0x5a);
+    state_->copy_data = true;
+    state_->defer_copy = true;
+    state_->pending_queries = 2;
+    ASSERT_TRUE(
+        transport_
+            ->submitTransferTasks(
+                batch_,
+                {MakeWrite(src.data(), reinterpret_cast<uint64_t>(dst.data()),
+                           src.size())})
+            .ok());
 
+    auto* mf_batch = dynamic_cast<MemFabricSubBatch*>(batch_);
+    ASSERT_NE(mf_batch, nullptr);
+    EXPECT_EQ(mf_batch->pending_batch_count, 1u);
+    EXPECT_EQ(InflightCount(), 1);
+
+    ASSERT_TRUE(transport_->freeSubBatch(batch_).ok());
+    EXPECT_EQ(batch_, nullptr);
+    EXPECT_EQ(InflightCount(), 0);
+    EXPECT_EQ(state_->status_query_calls, 3);
+    EXPECT_EQ(dst, src);
+}
+
+TEST_F(MemFabricTransportTest, FreeSubBatchTimeoutRetainsBatchForRetry) {
+    ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 4).ok());
+    SetTransferTimeout(100);
     char src[32]{};
     ASSERT_TRUE(
         transport_->submitTransferTasks(batch_, {MakeWrite(src, 0x1000, 32)})
             .ok());
-
     auto* mf_batch = dynamic_cast<MemFabricSubBatch*>(batch_);
-    EXPECT_EQ(mf_batch->pending_batch_count, 1u);
+    ASSERT_NE(mf_batch, nullptr);
+    SetQueryResult(SM_NEED_RETRY);
 
-    transport_->freeSubBatch(batch_);
-    batch_ = nullptr;
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(transport_->freeSubBatch(batch_).ok());
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    EXPECT_GE(elapsed, 90);
+    ASSERT_EQ(batch_, mf_batch);
+    EXPECT_EQ(mf_batch->pending_batch_count, 1u);
+    EXPECT_EQ(mf_batch->task_list[0].status_word, TransferStatusEnum::PENDING);
+    EXPECT_EQ(InflightCount(), 1);
+
+    SetQueryResult(SM_OK);
+    ASSERT_TRUE(transport_->freeSubBatch(batch_).ok());
+    EXPECT_EQ(batch_, nullptr);
+    EXPECT_EQ(InflightCount(), 0);
 }
 
 TEST_F(MemFabricTransportTest, QuiesceDrainsInflightBatches) {

@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -12,14 +14,14 @@
 #include <vector>
 
 #include <glog/logging.h>
+#include <acl/acl.h>
+
+#include "ascend_affinity.h"
 #include "ascend_allocator.h"
-#include "bool_parser.h"
-#include "config.h"
 #include "shared_segment/host_memfd.h"
-#include "acl/acl.h"
+#include "tent/thirdparty/nlohmann/json.h"
 #include "transport/ascend_transport/ascend_direct_transport/adxl_compat.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
-#include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
 namespace mooncake {
 namespace {
@@ -31,13 +33,115 @@ constexpr int kBestEffortPercentStep = 10;
 
 std::atomic<uint32_t> g_agent_alloc_next{0};
 
+// Process switches. globalConfig() must not appear in this library: a
+// TENT-only consumer loads ascend_allocator.so without the transfer engine, so
+// the TE registers a provider that reads globalConfig() live, and a consumer
+// without the TE either sets runtime flags or relies on the env default.
+constexpr int kRuntimeAgentMode = 1 << 0;
+constexpr int kRuntimeFabricMem = 1 << 1;
+std::atomic<AscendConfigBoolFn> g_agent_mode_provider{nullptr};
+std::atomic<AscendConfigBoolFn> g_use_fabric_mem_provider{nullptr};
+std::atomic<int> g_runtime_flags{-1};
+
+bool AgentModeEnabled() {
+    AscendConfigBoolFn provider =
+        g_agent_mode_provider.load(std::memory_order_acquire);
+    if (provider != nullptr) {
+        return provider();
+    }
+    const int flags = g_runtime_flags.load(std::memory_order_acquire);
+    if (flags >= 0) {
+        return (flags & kRuntimeAgentMode) != 0;
+    }
+    return false;
+}
+
+bool FabricMemEnabled() {
+    AscendConfigBoolFn provider =
+        g_use_fabric_mem_provider.load(std::memory_order_acquire);
+    if (provider != nullptr) {
+        return provider();
+    }
+    const int flags = g_runtime_flags.load(std::memory_order_acquire);
+    if (flags >= 0) {
+        return (flags & kRuntimeFabricMem) != 0;
+    }
+    // Classic store semantics: the variable being set enables fabric memory,
+    // whatever its value is.
+    return std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM") != nullptr;
+}
+
+// Small self-contained bool parser (the classic bool_parser.h dependency is a
+// shared component, not part of this library).
+std::optional<bool> ParseBoolValue(const char* value) {
+    if (value == nullptr) {
+        return std::nullopt;
+    }
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (text == "1" || text == "true" || text == "on" || text == "yes") {
+        return true;
+    }
+    if (text == "0" || text == "false" || text == "off" || text == "no") {
+        return false;
+    }
+    return std::nullopt;
+}
+
+// Self-contained roce:host check for the A5 host-mmap gate. Parsed with the
+// vendored nlohmann JSON header so this library does not depend on jsoncpp.
+bool ProtocolDescSelectsRoceHost(const nlohmann::json& object) {
+    if (!object.is_object()) {
+        return false;
+    }
+    nlohmann::json protocol;
+    if (object.contains("comm_resource_config.protocol_desc")) {
+        protocol = object["comm_resource_config.protocol_desc"];
+    } else if (object.contains("comm_resource_config") &&
+               object["comm_resource_config"].is_object() &&
+               object["comm_resource_config"].contains("protocol_desc")) {
+        protocol = object["comm_resource_config"]["protocol_desc"];
+    } else {
+        return false;
+    }
+    auto is_roce_host = [](const std::string& desc) {
+        return desc == "roce:host";
+    };
+    if (protocol.is_string()) {
+        return is_roce_host(protocol.get<std::string>());
+    }
+    if (protocol.is_array()) {
+        for (const auto& item : protocol) {
+            if (item.is_string() && is_roce_host(item.get<std::string>())) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool HasRoceHostProtocolDesc(const char* config_str) {
+    if (config_str == nullptr || config_str[0] == '\0') {
+        return false;
+    }
+    nlohmann::json root = nlohmann::json::parse(config_str, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) {
+        return false;
+    }
+    if (ProtocolDescSelectsRoceHost(root)) {
+        return true;
+    }
+    return root.contains("store") && ProtocolDescSelectsRoceHost(root["store"]);
+}
+
 // logic_device_id is the standalone round-robin slot, or -1 when this alloc
 // stays on the caller's device. The caller passes it to the matching pool.
 bool BindNextAgentDevice(int32_t* logic_device_id) {
     if (logic_device_id != nullptr) {
         *logic_device_id = -1;
     }
-    if (!globalConfig().ascend_agent_mode) {
+    if (!AgentModeEnabled()) {
         return true;
     }
     auto& mgr = ContextManager::getInstance();
@@ -61,7 +165,7 @@ bool BindNextAgentDevice(int32_t* logic_device_id) {
 }
 
 void CommitAgentDeviceSlot() {
-    if (!globalConfig().ascend_agent_mode) {
+    if (!AgentModeEnabled()) {
         return;
     }
     if (!ContextManager::getInstance().isInitialized()) {
@@ -101,7 +205,7 @@ bool SharedHostMemRequested() {
     if (value == nullptr) {
         return false;
     }
-    const auto parsed = TryParseBool(value);
+    const auto parsed = ParseBoolValue(value);
     if (!parsed.has_value()) {
         LOG(WARNING) << "Invalid value '" << value
                      << "' for ASCEND_USE_SHMEM, treating it as disabled";
@@ -145,7 +249,7 @@ bool HostMmapRequested() {
         return true;
     }
     const char* config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
-    return HasRoceHostProtocolDescInGlobalResourceConfig(config);
+    return HasRoceHostProtocolDesc(config);
 }
 
 // Host segments backed by an mmap rather than aclrtMallocHost. The mapped
@@ -390,8 +494,8 @@ void* allocate_fabric_exact(size_t total_size, bool quiet = false) {
 }
 #endif
 
-void* RunNonFabricAlloc(const std::function<void*()>& alloc,
-                        int32_t logic_device_id) {
+void* RunBoundAlloc(const std::function<void*()>& alloc,
+                    int32_t logic_device_id) {
     aclrtContext ctx = nullptr;
     const bool have_ctx =
         aclrtGetCurrentContext(&ctx) == ACL_ERROR_NONE && ctx != nullptr;
@@ -408,20 +512,16 @@ void* RunNonFabricAlloc(const std::function<void*()>& alloc,
         }
         ptr = alloc();
     };
-    // Standalone selected a device. Run the alloc on that device's transfer
-    // pool so the first touch follows that device's CPU affinity. No
-    // per-device pool (single device, or the dispatcher is not installed)
-    // keeps the shared runner.
-    if (logic_device_id >= 0) {
-        RunOnDeviceBoundAffinityThread(logic_device_id, run);
-    } else {
-        RunOnBoundAffinityThread(run);
-    }
+    // Standalone selects a device slot; run the allocation on that slot's
+    // transport pool so the first touch follows the device's CPU affinity.
+    // -1 (non-agent) uses the transport's shared pool. With no published pool
+    // the registry runs this inline.
+    RunAllocationOnAffinityPool(logic_device_id, run);
     return ptr;
 }
 
 void* AllocateStoreMemoryImpl(size_t total_size, const std::string& protocol) {
-    if (globalConfig().ascend_use_fabric_mem) {
+    if (FabricMemEnabled()) {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
         return allocate_fabric_exact(total_size);
 #else
@@ -517,7 +617,11 @@ void* AllocateFabricBestEffort(size_t target_size, size_t* actual_size) {
 
 void* ascend_allocate_vmm_memory_direct(size_t total_size) {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
-    return allocate_vmm_memory_direct_impl(total_size);
+    // This API has no device slot (it serves process-wide shm/cache mappings),
+    // so use the transport's shared affinity pool when one is published.
+    return RunBoundAlloc(
+        [&] { return allocate_vmm_memory_direct_impl(total_size); },
+        /*logic_device_id=*/-1);
 #else
     (void)total_size;
     return nullptr;
@@ -543,14 +647,11 @@ void* ascend_allocate_memory(size_t total_size, const std::string& protocol) {
     if (!BindNextAgentDevice(&logic_device_id)) {
         return nullptr;
     }
-    void* ptr = nullptr;
-    if (globalConfig().ascend_use_fabric_mem) {
-        ptr = AllocateStoreMemoryImpl(total_size, protocol);
-    } else {
-        ptr = RunNonFabricAlloc(
-            [&] { return AllocateStoreMemoryImpl(total_size, protocol); },
-            logic_device_id);
-    }
+    // Fabric and non-fabric allocations both first-touch host pages, so both
+    // must run on the affinity pool selected for this device slot.
+    void* ptr = RunBoundAlloc(
+        [&] { return AllocateStoreMemoryImpl(total_size, protocol); },
+        logic_device_id);
     if (ptr) {
         CommitAgentDeviceSlot();
     }
@@ -572,8 +673,8 @@ void* ascend_allocate_memory_best_effort(size_t target_size,
     if (!BindNextAgentDevice(&logic_device_id)) {
         return nullptr;
     }
-    if (!globalConfig().ascend_use_fabric_mem) {
-        return RunNonFabricAlloc(
+    if (!FabricMemEnabled()) {
+        return RunBoundAlloc(
             [&] {
                 return AllocateExactOnBoundDevice(
                     target_size, protocol, actual_size, host_alloc,
@@ -586,7 +687,9 @@ void* ascend_allocate_memory_best_effort(size_t target_size,
     (void)host_alignment;
     (void)defer_hugetlb_population;
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
-    return AllocateFabricBestEffort(target_size, actual_size);
+    return RunBoundAlloc(
+        [&] { return AllocateFabricBestEffort(target_size, actual_size); },
+        logic_device_id);
 #else
     LOG(ERROR) << "Fabric mem mode is not supported, please upgrade Ascend "
                   "HDK and CANN.";
@@ -702,6 +805,23 @@ void ascend_free_memory(const std::string& protocol, void* ptr) {
         remove_store_memory_range(ptr);
         aclrtFreeHost(ptr);
     }
+}
+
+void ascend_allocator_set_config_provider(AscendConfigBoolFn agent_mode,
+                                          AscendConfigBoolFn use_fabric_mem) {
+    g_agent_mode_provider.store(agent_mode, std::memory_order_release);
+    g_use_fabric_mem_provider.store(use_fabric_mem, std::memory_order_release);
+}
+
+void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem) {
+    int flags = 0;
+    if (agent_mode) {
+        flags |= kRuntimeAgentMode;
+    }
+    if (use_fabric_mem) {
+        flags |= kRuntimeFabricMem;
+    }
+    g_runtime_flags.store(flags, std::memory_order_release);
 }
 
 }  // namespace mooncake

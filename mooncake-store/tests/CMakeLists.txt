@@ -46,8 +46,21 @@ add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+if(USE_MLU)
+  foreach(mlu_test mlu_accelerator_test mlu_store_test)
+    # These tests do not use master_service_test_peer, which would pull the
+    # production mooncake_store library back into shared builds.
+    add_executable(${mlu_test} ${mlu_test}.cpp mlu_test_hooks.cpp)
+    target_link_libraries(${mlu_test} PRIVATE mooncake_store_mlu_test gtest
+                                              gtest_main pthread)
+    target_link_options(${mlu_test} PRIVATE "-Wl,--wrap=cnrtMemcpy"
+                        "-Wl,--wrap=cnrtHostMalloc" "-Wl,--wrap=cnrtFreeHost")
+    add_test(NAME ${mlu_test} COMMAND ${mlu_test})
+  endforeach()
+endif()
 add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(real_client_direct_read_test real_client_direct_read_test.cpp)
+add_store_test(local_shm_conflict_test local_shm_conflict_test.cpp)
 add_store_test(ranged_disk_lease_test ranged_disk_lease_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
@@ -163,6 +176,7 @@ endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(variadic_serialization_test variadic_serialization_test.cpp)
 add_test(NAME client_hca_affinity_test
          COMMAND client_integration_test
                  --gtest_filter=HcaAffinityTest.*:ReadAffinityTest.*)
@@ -238,8 +252,14 @@ if(USE_TENT)
       transfer_task_test
       --gtest_filter=TransferTaskTest.TransferScatterHandlesFragmentedCpuBuffers
   )
-  set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
-                                                           "MC_USE_TENT=1")
+  # Scatter transfers require a cancellable transport; without RDMA the default
+  # TENT config only installs TCP, so swap it for HP_TCP.
+  set_tests_properties(
+    transfer_scatter_tent_test
+    PROPERTIES
+      ENVIRONMENT
+      "MC_USE_TENT=1;MC_TENT_CONF={\"transports\":{\"tcp\":{\"enable\":false},\"hp_tcp\":{\"enable\":true}}}"
+  )
   add_test(
     NAME transfer_submitter_scatter_tent_test
     COMMAND
@@ -395,12 +415,17 @@ add_store_test(nvme_kv_io_concurrency_config_test
                nvme_kv/io_concurrency_config_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv/storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(bucket_direct_write_test bucket_direct_write_test.cpp)
+if(TARGET Mooncake::liburing)
+  target_compile_definitions(bucket_direct_write_test PRIVATE USE_URING)
+endif()
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
+add_store_test(object_storage_backend_test object_storage_backend_test.cpp)
 add_store_test(kvcs_object_storage_adapter_test
                kvcs_object_storage_adapter_test.cpp)
 if(NOT MOONCAKE_KVCS_SDK_FOUND)
@@ -492,10 +517,32 @@ add_ha_test(ha_backend_availability_test
 add_ha_test(leader_label_reconciler_test
             ha/leadership/leader_label_reconciler_test.cpp)
 add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
+add_ha_test(ha_kv_backend_write_result_test
+            ha/kv/ha_kv_backend_write_result_test.cpp)
+# Exercise the actual etcd adapter with a controlled external helper. Keep this
+# target independent of the real etcd helper/client so timeouts need no server.
+add_executable(
+  etcd_ha_kv_backend_write_result_test
+  ha/kv/etcd_ha_kv_backend_write_result_test.cpp
+  ../src/ha/kv/etcd_ha_kv_backend.cpp ../src/types.cpp)
+target_include_directories(etcd_ha_kv_backend_write_result_test
+                           PRIVATE ../include)
+target_link_libraries(
+  etcd_ha_kv_backend_write_result_test
+  PRIVATE cachelib_memory_allocator
+          yalantinglibs::yalantinglibs
+          JsonCpp::JsonCpp
+          glog::glog
+          gtest
+          gtest_main
+          pthread)
+add_test(NAME etcd_ha_kv_backend_write_result_test
+         COMMAND etcd_ha_kv_backend_write_result_test)
 add_ha_test(redis_ha_kv_backend_test ha/kv/redis_ha_kv_backend_test.cpp)
 if(STORE_USE_REDIS)
-  target_sources(redis_ha_kv_backend_test
-                 PRIVATE ha/kv/redis_oplog_ha_recovery_test.cpp)
+  target_sources(
+    redis_ha_kv_backend_test PRIVATE ha/kv/redis_oplog_ha_recovery_test.cpp
+                                     ha/kv/redis_ha_kv_protocol_test.cpp)
   target_link_libraries(redis_ha_kv_backend_test PRIVATE Mooncake::hiredis)
   # gtest_main never calls gflags::ParseCommandLineFlags, so --redis_endpoint
   # would stay empty. This target provides main() instead.

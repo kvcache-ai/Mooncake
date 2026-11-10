@@ -324,7 +324,7 @@ impl PyMooncakeDistributedStore {
                         if let Some(policy) = policy {
                             request = request.replication(policy);
                         }
-                        client.batch_put(&[request]).map(|_| ())
+                        client.put_request(&request).map(|_| ())
                     })
                 })
                 .map_err(store_error_to_py)?;
