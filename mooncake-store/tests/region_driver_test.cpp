@@ -13,7 +13,8 @@ namespace {
 constexpr size_t kRegionSize = 16U * 1024 * 1024;
 
 RegionResourceSpec MakeSpec(uintptr_t base = 0x100000000ULL) {
-    return {generate_uuid(), "memory", base, kRegionSize, "memory-endpoint"};
+    return {generate_uuid(), "memory",          base,
+            kRegionSize,     "memory-endpoint", "rdma"};
 }
 
 std::unique_ptr<RegionDriver> CreateTestDriver(RegionKind kind) {
@@ -146,11 +147,24 @@ TEST(RegionDriverTest, FailedRestoreDoesNotPublishResource) {
     EXPECT_EQ(driver->GetResource(spec.id), nullptr);
 }
 
+TEST(RegionDriverTest, OpenedRegionAllocatesBuffersWithItsProtocol) {
+    auto driver = CreateTestDriver(RegionKind::HOST_MEMORY);
+    ASSERT_NE(driver, nullptr);
+    auto spec = MakeSpec();
+    spec.transport_protocol = "nvlink";
+    auto prepared = driver->PrepareOpen(spec, {});
+    ASSERT_TRUE(prepared.has_value());
+
+    auto buffer = prepared->resource().candidate->Allocate(4096);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(buffer->get_descriptor().protocol_, "nvlink");
+}
+
 TEST(RegionDriverTest, CxlRejectsLiveRestoreInput) {
     auto driver = CreateTestDriver(RegionKind::CXL);
     ASSERT_NE(driver, nullptr);
-    RegionResourceSpec spec{generate_uuid(), "binding", 0, kRegionSize,
-                            "transport"};
+    RegionResourceSpec spec{generate_uuid(), "binding",   0,
+                            kRegionSize,     "transport", "cxl"};
     auto prepared = driver->PrepareOpen(spec, {{{0, 4096}}});
     EXPECT_FALSE(prepared.has_value());
     EXPECT_EQ(prepared.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -160,8 +174,8 @@ TEST(RegionDriverTest, CxlRejectsLiveRestoreInput) {
 TEST(RegionDriverTest, CxlCandidateProducesCxlDescriptors) {
     auto driver = CreateTestDriver(RegionKind::CXL);
     ASSERT_NE(driver, nullptr);
-    RegionResourceSpec spec{generate_uuid(), "binding", 0, kRegionSize,
-                            "transport"};
+    RegionResourceSpec spec{generate_uuid(), "binding",   0,
+                            kRegionSize,     "transport", "cxl"};
     auto prepared = driver->PrepareOpen(spec, {});
     ASSERT_TRUE(prepared.has_value());
 
