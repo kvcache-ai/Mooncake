@@ -97,6 +97,8 @@ class WeightStoreManager {
     WeightMetadataStore::Result<WeightRevisionMetadata> DeleteWeightRevision(
         const DeleteWeightRevisionRequest& request);
 
+    WeightMetadataStore::Result<WeightRevisionMetadata> UpdateWeightPolicy(
+        const UpdateWeightPolicyRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
     WeightMetadataStore::Result<WeightRevisionMetadata> CommitWeightImport(

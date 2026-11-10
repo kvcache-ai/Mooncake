@@ -180,6 +180,9 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
     tl::expected<PendingHandle, ErrorCode> Commit(
         Reservation&& reservation, OpLogEntry entry,
         DurableCallback callback) override {
+        if (reject_next_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
         auto result = OrderedOpLogWriter::Commit(
             std::move(reservation), std::move(entry),
             [this, callback = std::move(callback)](const OpLogEntry& durable) {
@@ -207,6 +210,8 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
         return result;
     }
 
+    void RejectNextCommit() { reject_next_.store(true); }
+
     bool WaitForSubmittedCount(size_t count,
                                std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -217,6 +222,9 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
     tl::expected<std::vector<PendingHandle>, ErrorCode> CommitBatch(
         Reservation&& reservation, std::vector<OpLogEntry> entries,
         DurableCallback callback) override {
+        if (reject_next_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
         return OrderedOpLogWriter::CommitBatch(
             std::move(reservation), std::move(entries),
             [this, callback = std::move(callback)](const OpLogEntry& durable) {
@@ -285,6 +293,7 @@ class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
     uint64_t released_through_{UINT64_MAX};
     uint64_t completed_through_{0};
     size_t submitted_count_{0};
+    std::atomic<bool> reject_next_{false};
     bool stopping_{false};
 };
 
@@ -7725,9 +7734,79 @@ TEST_F(MasterServiceHATest,
             },
     });
     ASSERT_TRUE(ready);
-    const auto active = service.StartWeightResidencyOperation({
+    const auto before_policy = ExportWeightMetadata(service);
+    const UpdateWeightPolicyRequest pinned_request{
         .identity = identity,
         .expected_metadata_generation = ready->metadata_generation,
+        .policy = {.preferred_residency = WeightResidencyState::COLD,
+                   .migration_mode = WeightMigrationMode::PINNED},
+    };
+    writer->RejectNextCommit();
+    const auto rejected = service.UpdateWeightPolicy(pinned_request);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, rejected.error());
+    const auto after_rejection = ExportWeightMetadata(service);
+    EXPECT_EQ(before_policy.schema_version, after_rejection.schema_version);
+    EXPECT_EQ(before_policy.metadata, after_rejection.metadata);
+    EXPECT_EQ(before_policy.leases, after_rejection.leases);
+    EXPECT_EQ(before_policy.operations, after_rejection.operations);
+    EXPECT_EQ(before_policy.next_lease_id, after_rejection.next_lease_id);
+    EXPECT_GT(after_rejection.next_operation_id,
+              before_policy.next_operation_id);
+    const auto unpublished = service.QueryWeightOperation(
+        {.operation_id = before_policy.next_operation_id});
+    ASSERT_FALSE(unpublished);
+    EXPECT_EQ(WeightManagementError::NOT_FOUND, unpublished.error());
+
+    auto satisfied_request = pinned_request;
+    satisfied_request.policy.preferred_residency = WeightResidencyState::HOT;
+    const auto pinned = service.UpdateWeightPolicy(satisfied_request);
+    ASSERT_TRUE(pinned);
+    EXPECT_FALSE(pinned->operation_id);
+    {
+        StandbyMetadataStore policy_standby;
+        OpLogApplier policy_applier(&policy_standby, cluster_id);
+        OpLogBatchStandbyReader policy_reader(cluster_id, *backend,
+                                              policy_applier);
+        const auto replayed = policy_reader.PollOnce();
+        ASSERT_EQ(ErrorCode::OK, replayed.error);
+        ASSERT_TRUE(replayed.durable_prefix_present);
+        const auto snapshot = policy_standby.SnapshotWeightMetadata();
+        const auto published = ExportWeightMetadata(service);
+        EXPECT_EQ(published.schema_version, snapshot.schema_version);
+        EXPECT_EQ(published.metadata, snapshot.metadata);
+        EXPECT_EQ(published.leases, snapshot.leases);
+        EXPECT_EQ(published.operations, snapshot.operations);
+        EXPECT_EQ(published.next_lease_id, snapshot.next_lease_id);
+        // OpLog replay does not reproduce IDs reserved by rejected mutations.
+        EXPECT_EQ(before_policy.next_operation_id, snapshot.next_operation_id);
+        MasterService restored;
+        ASSERT_TRUE(restored.RestoreFromStandbySnapshot(
+            {}, replayed.durable_prefix.last_seq, {}, snapshot));
+        const auto recovered =
+            restored.GetWeightRevision({.identity = identity});
+        ASSERT_TRUE(recovered);
+        EXPECT_EQ(*pinned, recovered->metadata);
+    }
+    const auto pinned_snapshot = ExportWeightMetadata(service);
+    const auto blocked = service.StartWeightResidencyOperation({
+        .identity = identity,
+        .expected_metadata_generation = pinned->metadata_generation,
+        .target_residency = WeightResidencyState::COLD,
+    });
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(WeightManagementError::POLICY_UNSATISFIABLE, blocked.error());
+    EXPECT_EQ(pinned_snapshot, ExportWeightMetadata(service));
+    const auto manual = service.UpdateWeightPolicy({
+        .identity = identity,
+        .expected_metadata_generation = pinned->metadata_generation,
+        .policy = {.preferred_residency = WeightResidencyState::HOT,
+                   .migration_mode = WeightMigrationMode::MANUAL},
+    });
+    ASSERT_TRUE(manual);
+    const auto active = service.StartWeightResidencyOperation({
+        .identity = identity,
+        .expected_metadata_generation = manual->metadata_generation,
         .target_residency = WeightResidencyState::HOT,
     });
     ASSERT_TRUE(active);

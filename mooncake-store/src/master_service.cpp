@@ -1719,6 +1719,10 @@ MasterService::DeleteWeightRevision(
     return weight_manager_.DeleteWeightRevision(request);
 }
 
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::UpdateWeightPolicy(const UpdateWeightPolicyRequest& request) {
+    return weight_manager_.UpdateWeightPolicy(request);
+}
 std::vector<std::string> MasterService::GetGroupMemberKeys(
     const TenantId& tenant_id, const std::string& group_id) const {
     const metadata::Namespace* ns = namespaces_.Lookup(tenant_id);

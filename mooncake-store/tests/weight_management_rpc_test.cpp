@@ -347,6 +347,34 @@ TEST_F(WeightManagementTcpTest, LeaseProtectsPublishedBytesUntilManagedDelete) {
     ASSERT_TRUE(view->has_value());
     EXPECT_EQ(**ready, (*view)->metadata);
 
+    MasterClient policy_client(generate_uuid(), nullptr, "default");
+    ASSERT_EQ(ErrorCode::OK, policy_client.Connect(server_.master_address()));
+    const UpdateWeightPolicyRequest policy_request{
+        .identity = Identity(),
+        .expected_metadata_generation = (*ready)->metadata_generation,
+        .policy = {.preferred_residency = WeightResidencyState::HOT,
+                   .migration_mode = WeightMigrationMode::PINNED},
+    };
+    const auto updated = policy_client.UpdateWeightPolicy(policy_request);
+    ASSERT_TRUE(updated && *updated);
+    EXPECT_EQ("default", (*updated)->identity.tenant_id);
+    EXPECT_EQ(policy_request.policy, (*updated)->policy);
+    EXPECT_FALSE((*updated)->operation_id);
+    const auto retried = policy_client.UpdateWeightPolicy(policy_request);
+    ASSERT_TRUE(retried && *retried);
+    EXPECT_EQ(**updated, **retried);
+    const auto observed_policy =
+        reader_->GetWeightRevision({.identity = Identity()});
+    ASSERT_TRUE(observed_policy && *observed_policy);
+    EXPECT_EQ(**updated, (*observed_policy)->metadata);
+    ready = policy_client.UpdateWeightPolicy({
+        .identity = Identity(),
+        .expected_metadata_generation = (*updated)->metadata_generation,
+        .policy = {.preferred_residency = WeightResidencyState::HOT,
+                   .migration_mode = WeightMigrationMode::MANUAL},
+    });
+    ASSERT_TRUE(ready && *ready);
+
     auto lease = reader_->AcquireWeightRevisionLease({
         .identity = Identity(),
         .expected_metadata_generation = (*ready)->metadata_generation,
