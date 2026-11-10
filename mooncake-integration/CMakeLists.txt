@@ -169,8 +169,8 @@ if(NOT SKBUILD)
     PATTERN "*.py")
 
   # TODO(F01-T115, replace-in=UPG1-F02-B05): Receive U's canonical Store
-  # CLI/client/config and full REST behavior. The U launcher is wired in F01-3.2;
-  # review/validation/reception of that assignment are still pending.
+  # CLI/client/config and full REST behavior. The U launcher was accepted in F01-3.2;
+  # its runtime validation remains assigned to F01-final-validation.
   # Owner: F02-B05; keep the remaining feature consumers together.
   if(WITH_STORE)
     install(
