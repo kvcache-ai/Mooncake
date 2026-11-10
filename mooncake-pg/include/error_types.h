@@ -155,6 +155,21 @@ inline auto makePGError(PGErrorCode code, std::string message) {
         }                                                                      \
     } while (false)
 
+#define PG_TRY_CU(expression)                                                \
+    do {                                                                     \
+        const auto pg_cu_error_internal = (expression);                      \
+        if (pg_cu_error_internal != CUDA_SUCCESS) {                          \
+            const char* pg_cu_description_internal = nullptr;                \
+            cuGetErrorString(pg_cu_error_internal,                           \
+                             &pg_cu_description_internal);                   \
+            return ::mooncake::makePGError(                                  \
+                ::mooncake::PGErrorCode::SystemError,                        \
+                std::string(#expression) + " failed: " +                     \
+                    (pg_cu_description_internal ? pg_cu_description_internal \
+                                                : "CUDA driver error"));     \
+        }                                                                    \
+    } while (false)
+
 #define PG_VALIDATE_ARG(condition, message)                           \
     do {                                                              \
         if (!(condition)) {                                           \

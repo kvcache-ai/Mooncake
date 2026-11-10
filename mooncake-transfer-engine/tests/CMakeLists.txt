@@ -318,6 +318,17 @@ if(USE_TCP)
                                                        gtest_main CUDA::cudart)
     add_test(NAME tcp_cuda_staging_test COMMAND tcp_cuda_staging_test)
   endif()
+
+  if(USE_ASCEND
+     OR USE_ASCEND_DIRECT
+     OR USE_ASCEND_HETEROGENEOUS
+     OR USE_UBSHMEM)
+    add_executable(tcp_ascend_staging_test
+                   ${WORKSPACE}/tcp_ascend_staging_test.cpp)
+    target_link_libraries(tcp_ascend_staging_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+    add_test(NAME tcp_ascend_staging_test COMMAND tcp_ascend_staging_test)
+  endif()
 endif()
 
 add_executable(tcp_address_validation_test
@@ -673,6 +684,16 @@ add_test(NAME memory_location_test COMMAND memory_location_test)
 add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
+
+if(USE_ASCEND_DIRECT)
+  # ascend_allocator.so API: config provider precedence, runtime flags, host
+  # allocation/free, ASCEND_USE_SHMEM handle publication. ACL calls are mocked
+  # in the test file.
+  add_executable(ascend_allocator_test ${WORKSPACE}/ascend_allocator_test.cpp)
+  target_link_libraries(ascend_allocator_test PUBLIC ascend_allocator gtest
+                                                     gtest_main)
+  add_test(NAME ascend_allocator_test COMMAND ascend_allocator_test)
+endif()
 
 if(USE_ASCEND_DIRECT)
   # AscendDirectTransport unit test with mock implementations Mock
