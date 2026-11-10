@@ -4,6 +4,10 @@ project(mooncake CXX C)
 # indicates cmake is invoked from top-level dir
 set(GLOBAL_CONFIG "true")
 
+if(SKBUILD)
+  add_subdirectory(python)
+endif()
+
 include(mooncake-common/FindJsonCpp.cmake)
 include(mooncake-common/FindGLOG.cmake)
 include(mooncake-common/common.cmake)
@@ -18,8 +22,13 @@ option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
-set(PYTHON_EXECUTABLE "python3")
+include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
+if(SKBUILD)
+  set(PYBIND11_FINDPYTHON ON)
+  find_package(pybind11 CONFIG REQUIRED)
+else()
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+endif()
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
     OUTPUT_VARIABLE PYTHON_SYS_PATH
