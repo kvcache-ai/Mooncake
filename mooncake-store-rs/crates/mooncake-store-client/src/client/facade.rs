@@ -180,6 +180,33 @@ fn common_value<'a>(mut values: impl Iterator<Item = &'a str>) -> String {
 }
 
 impl StoreClient {
+    /// Write one object with its complete namespace, QoS, and replication policy.
+    pub fn put_request(&self, request: &PutRequest<'_>) -> Result<ObjectRoute> {
+        let tenant = request.tenant.unwrap_or(self.default_tenant());
+        let _span = info_span!(
+            "store.put",
+            runtime = %self.lease.runtime,
+            tenant,
+            key = request.key,
+            bytes = request.value.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("put")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1)
+            .input_bytes(request.value.len() as u64);
+        let object = ObjectRef {
+            tenant: request.tenant,
+            domain: request.domain,
+            object_set: request.object_set,
+            qos_tier: request.qos_tier,
+            key: request.key,
+        };
+        let result = self.put_object(&object, request.value, request.policy.as_ref());
+        tracker.finish(&result, request.value.len() as u64);
+        result
+    }
+
     fn expect_exactly_one<T>(mut items: Vec<T>, operation: &str) -> Result<T> {
         match items.len() {
             1 => Ok(items.pop().expect("single-item vector should contain one element")),
@@ -1332,21 +1359,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn put_in_tenant(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute> {
-        let _span = info_span!(
-            "store.put",
-            runtime = %self.lease.runtime,
-            tenant,
-            key,
-            bytes = value.len()
-        )
-        .entered();
-        let tracker = OperationTracker::new("put")
-            .attribute_str("mooncake.tenant", tenant)
-            .attribute_u64("mooncake.item_count", 1)
-            .input_bytes(value.len() as u64);
-        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, None);
-        tracker.finish(&result, value.len() as u64);
-        result
+        self.put_request(&PutRequest::new(key, value).tenant(tenant))
     }
 
     fn put_with_policy(
@@ -1365,21 +1378,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
         value: &[u8],
         policy: &ReplicationPolicy,
     ) -> Result<ObjectRoute> {
-        let _span = info_span!(
-            "store.put",
-            runtime = %self.lease.runtime,
-            tenant,
-            key,
-            bytes = value.len()
+        self.put_request(
+            &PutRequest::new(key, value)
+                .tenant(tenant)
+                .replication(policy.clone()),
         )
-        .entered();
-        let tracker = OperationTracker::new("put")
-            .attribute_str("mooncake.tenant", tenant)
-            .attribute_u64("mooncake.item_count", 1)
-            .input_bytes(value.len() as u64);
-        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, Some(policy));
-        tracker.finish(&result, value.len() as u64);
-        result
     }
 
     fn put_from(&self, key: &str, buffer: *const c_void, size: usize) -> Result<ObjectRoute> {
