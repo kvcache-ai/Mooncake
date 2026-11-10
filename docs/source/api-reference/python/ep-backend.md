@@ -520,10 +520,9 @@ The NCCL backend currently has the following constraints:
   selects IPC + IBGDA for other shapes.
 - Groups with more than one rank request GIN resources, including runs whose
   data path remains inside one LSA team.
-- For buffers created with the ProcessGroup constructor,
-  `ElasticBuffer(group, ...)`, logical membership remains fixed. After every
-  process observes that Mooncake PG has restored every original logical rank
-  slot, rebuild between EP iterations. Each surviving process
+- Logical membership remains fixed. After every process observes that Mooncake
+  PG has restored every original logical rank slot, rebuild between EP
+  iterations. Each surviving process
   calls `update_ep_member()` on its existing buffer while each replacement
   process constructs an `ElasticBuffer` with the same arguments. Healthy
   reconfiguration, with no replaced process, calls `update_ep_member()` on
@@ -544,27 +543,6 @@ The NCCL backend currently has the following constraints:
   minimal CUDA control resources) is not recoverable in place and may require
   restarting the process group. Use identical NCCL/CUDA configuration on every
   rank.
-
-### Planned grow and shrink with Store-backed buffers
-
-For planned membership changes, create a Store-backed buffer with
-`ElasticBuffer.create_elastic(..., capacity_ranks=..., active_members=...)`.
-`capacity_ranks` reserves stable rank slots and determines the default buffer
-size; `active_members` lists the slots in the current generation. All ranks in
-a generation use the same `store_namespace`, and each transition uses a fresh
-namespace. Joining ranks pass `previous_members=old_members` to coordinate the
-handoff through the TCPStore, which must remain available for the whole session.
-
-With NCCL, every old member calls `prepare_membership(target_members,
-new_namespace)` to build the target candidate while the old runtime continues
-serving. Every old member then calls `commit_membership(prepared)` to drain old
-work and install the candidate. `set_membership(target_members, new_namespace)`
-performs both steps synchronously. With IBGDA, every old member calls
-`set_membership(target_members, new_namespace)` at a quiescent boundary. Joining
-IBGDA ranks wait for the old cohort's retirement
-signal before creating their runtime; survivors keep their existing runtime
-and update peer connections. This API supports planned changes, not rank-failure
-recovery.
 
 ## Active-rank tensors: PG vs EP
 
