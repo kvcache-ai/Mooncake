@@ -17,6 +17,7 @@
 #include <async_simple/executors/SimpleExecutor.h>
 
 #include <stdexcept>
+#include <iterator>
 
 #include "transfer_engine_rpc_client_io_context.h"
 #include "tent/common/utils/ip.h"
@@ -63,11 +64,12 @@ class ClientPool {
     }
 
     // A client is only released after a call succeeded on it, which proves it
-    // is alive, so it goes back regardless of which generation it came from.
+    // is alive, so it goes back regardless of which generation it came from,
+    // unless the pool has been evicted or stopped.
     void release(std::unique_ptr<coro_rpc_client> client) {
         if (!client) return;
         std::lock_guard<std::mutex> guard(lock_);
-        idle_clients_.push_back(std::move(client));
+        if (!retired_) idle_clients_.push_back(std::move(client));
     }
 
     // Drop every idle client, but only on behalf of a caller that is still
@@ -82,8 +84,12 @@ class ClientPool {
         idle_clients_.clear();
     }
 
-    void clear() {
+    // Eviction closes idle clients, while leases keep in-flight calls alive.
+    // A late successful call must not refill an evicted pool that other
+    // long-running leases still retain.
+    void retire() {
         std::lock_guard<std::mutex> guard(lock_);
+        retired_ = true;
         ++generation_;
         idle_clients_.clear();
     }
@@ -91,6 +97,7 @@ class ClientPool {
    private:
     std::mutex lock_;
     uint64_t generation_ = 0;
+    bool retired_ = false;
     std::vector<std::unique_ptr<coro_rpc_client>> idle_clients_;
 };
 
@@ -166,9 +173,11 @@ Status CoroRpcAgent::stop() {
 
     std::lock_guard<std::mutex> lock(pools_mutex_);
     for (auto& entry : pools_) {
-        entry.second->clear();
+        entry.second.pool->retire();
     }
     pools_.clear();
+    pool_recency_.clear();
+    running_ = false;
     return Status::OK();
 }
 
@@ -215,10 +224,22 @@ std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
     const std::string& server_addr) {
     std::lock_guard<std::mutex> lock(pools_mutex_);
     auto it = pools_.find(server_addr);
-    if (it == pools_.end()) {
-        it = pools_.emplace(server_addr, std::make_shared<ClientPool>()).first;
+    if (it != pools_.end()) {
+        pool_recency_.splice(pool_recency_.end(), pool_recency_,
+                             it->second.recency);
+        return it->second.pool;
     }
-    return it->second;
+    if (pools_.size() >= kMaxCachedPools) {
+        auto oldest = pools_.find(pool_recency_.front());
+        oldest->second.pool->retire();
+        pools_.erase(oldest);
+        pool_recency_.pop_front();
+    }
+    auto pool = std::make_shared<ClientPool>();
+    pool_recency_.push_back(server_addr);
+    pools_.emplace(server_addr,
+                   PoolEntry{pool, std::prev(pool_recency_.end())});
+    return pool;
 }
 
 namespace {
