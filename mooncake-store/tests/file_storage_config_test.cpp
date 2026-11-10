@@ -393,13 +393,13 @@ TEST_F(FileStorageConfigTest, OffloadWriteWorkersParseStrictly) {
     }
 }
 
-TEST_F(FileStorageConfigTest, OffloadWriteWorkersRequirePosixBucket) {
+TEST_F(FileStorageConfigTest, OffloadWriteWorkersRequireLocalBucket) {
     FileStorageConfig config;
     config.storage_filepath = data_path.string();
     config.offload_write_workers = 2;
     ASSERT_TRUE(config.Validate());
     config.use_uring = true;
-    EXPECT_FALSE(config.Validate());
+    EXPECT_TRUE(config.Validate());
     config.use_uring = false;
     config.enable_dfs = true;
     EXPECT_FALSE(config.Validate());

@@ -459,7 +459,8 @@ class FileStorageTest : public ::testing::Test {
     }
 
     void RunDeferredOffloadFailureScenario(bool capacity_limit,
-                                           uint32_t workers = 1) {
+                                           uint32_t workers = 1,
+                                           bool use_uring = false) {
         testing::InProcMaster master;
         ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
                                      .set_enable_offload(true)
@@ -506,6 +507,7 @@ class FileStorageTest : public ::testing::Test {
         config.total_keys_limit = 2;
         fs::create_directories(config.storage_filepath);
         config.offload_write_workers = workers;
+        config.use_uring = use_uring;
         FileStorage file_storage(config, client, endpoint);
         BucketBackendConfig bucket_config;
         bucket_config.bucket_keys_limit = 2;
@@ -695,6 +697,78 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
+    void RunParallelOffloadReadback(uint32_t workers, bool use_uring = false,
+                                    const char* mode = "0") {
+        const auto run_path =
+            fs::path(data_path) /
+            ("parallel_" + std::to_string(workers) + "_" + mode);
+        fs::create_directories(run_path / "ssd");
+        const auto master_root = run_path / "master";
+        std::filesystem::create_directories(master_root);
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_root_fs_dir(master_root.string())
+                                     .build()));
+        constexpr size_t bytes = 64 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> memory(
+            std::aligned_alloc(4096, bytes), &std::free);
+        ASSERT_NE(memory.get(), nullptr);
+        const auto addr = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(addr, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = created.value();
+        ASSERT_TRUE(client->MountSegment(memory.get(), bytes, "tcp"));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+        SetEnv("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE", mode);
+        SetEnv("MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS", "true");
+        FileStorageConfig config;
+        config.storage_filepath = (run_path / "ssd").string();
+        config.local_buffer_size = 4 * 1024 * 1024;
+        config.offload_write_workers = workers;
+        config.use_uring = use_uring;
+        FileStorage storage(config, client, addr);
+        ASSERT_TRUE(
+            InitBackend(storage));  // Keep heartbeat manual/deterministic.
+        std::string value(4096, 'K');
+        std::vector<std::string> keys;
+        for (uint32_t i = 0; i <= workers; ++i) {
+            auto key = "parallel_key_" + std::to_string(i);
+            keys.push_back(key);
+            std::vector<Slice> slices{{value.data(), value.size()}};
+            ASSERT_TRUE(client->Put(key, slices, ReplicateConfig{}));
+        }
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(tasks.size(), workers + 1u);
+        // A missing source is failed individually; healthy buckets must
+        // survive.
+        tasks.push_back(OffloadTaskItem{.tenant_id = tasks.front().tenant_id,
+                                        .key = "source_gone",
+                                        .size = 4096});
+        ASSERT_TRUE(FileStorageOffloadObjects(storage, tasks));
+        EXPECT_TRUE(GetDeferredTaskByStorageKey(storage).empty());
+        for (const auto& key : keys) {
+            auto result = client->Query(key);
+            ASSERT_TRUE(result);
+            EXPECT_TRUE(std::any_of(
+                result->replicas.begin(), result->replicas.end(),
+                [](const auto& r) { return r.is_local_disk_replica(); }));
+            auto loaded =
+                storage.BatchGet({TenantId::Default().MakeScopedKey(key)},
+                                 {static_cast<int64_t>(value.size())});
+            ASSERT_TRUE(loaded);
+            ASSERT_EQ(loaded->pointers.size(), 1u);
+            EXPECT_EQ(
+                std::string(reinterpret_cast<const char*>(loaded->pointers[0]),
+                            value.size()),
+                value);
+        }
+        ASSERT_TRUE(client->UnmountSegment(memory.get(), bytes));
+    }
+
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
@@ -720,6 +794,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
         UnsetEnv("MOONCAKE_USE_URING");
         UnsetEnv("MOONCAKE_OFFLOAD_WRITE_WORKERS");
+        UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE");
         UnsetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE");
         UnsetEnv("MOONCAKE_DFS_FS_ADAPTER");
         UnsetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR");
@@ -2859,65 +2934,33 @@ TEST_F(FileStorageTest, OffloadWriteAbortedEmittedCarryIsNotRetained) {
 }
 
 TEST_F(FileStorageTest, OffloadWriteParallelRegistersReplicasAndReadsBack) {
-    const auto master_root =
-        std::filesystem::path(data_path) / "parallel_master";
-    std::filesystem::create_directories(master_root);
-    testing::InProcMaster master;
-    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
-                                 .set_enable_offload(true)
-                                 .set_root_fs_dir(master_root.string())
-                                 .build()));
-    constexpr size_t bytes = 64 * 1024 * 1024;
-    std::unique_ptr<void, decltype(&std::free)> memory(
-        std::aligned_alloc(4096, bytes), &std::free);
-    ASSERT_NE(memory.get(), nullptr);
-    const auto addr = "127.0.0.1:" + std::to_string(getFreeTcpPort());
-    auto created = Client::Create(addr, master.metadata_url(), "tcp",
-                                  std::nullopt, master.master_address());
-    ASSERT_TRUE(created);
-    auto client = created.value();
-    ASSERT_TRUE(client->MountSegment(memory.get(), bytes, "tcp"));
-    ASSERT_TRUE(client->MountLocalDiskSegment(true));
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "3");
-    SetEnv("MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS", "true");
-    FileStorageConfig config;
-    config.storage_filepath = data_path;
-    config.local_buffer_size = 4 * 1024 * 1024;
-    config.offload_write_workers = 4;
-    FileStorage storage(config, client, addr);
-    ASSERT_TRUE(InitBackend(storage));  // Keep heartbeat manual/deterministic.
-    std::string value(4096, 'K');
-    std::vector<std::string> keys;
-    for (int i = 0; i < 13; ++i) {
-        auto key = "parallel_key_" + std::to_string(i);
-        keys.push_back(key);
-        std::vector<Slice> slices{{value.data(), value.size()}};
-        ASSERT_TRUE(client->Put(key, slices, ReplicateConfig{}));
-    }
-    std::vector<OffloadTaskItem> tasks;
-    ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
-    ASSERT_EQ(tasks.size(), 13u);
-    // A missing source is failed individually; healthy buckets must survive.
-    tasks.push_back(OffloadTaskItem{.tenant_id = tasks.front().tenant_id,
-                                    .key = "source_gone",
-                                    .size = 4096});
-    ASSERT_TRUE(FileStorageOffloadObjects(storage, tasks));
-    EXPECT_TRUE(GetDeferredTaskByStorageKey(storage).empty());
-    for (const auto& key : keys) {
-        auto result = client->Query(key);
-        ASSERT_TRUE(result);
-        EXPECT_TRUE(std::any_of(
-            result->replicas.begin(), result->replicas.end(),
-            [](const auto& r) { return r.is_local_disk_replica(); }));
-        std::vector<char> output(value.size());
-        std::unordered_map<std::string, Slice> reads{
-            {TenantId::Default().MakeScopedKey(key),
-             Slice{output.data(), output.size()}}};
-        ASSERT_TRUE(FileStorageBatchLoad(storage, reads));
-        EXPECT_EQ(std::string(output.begin(), output.end()), value);
-    }
-    ASSERT_TRUE(client->UnmountSegment(memory.get(), bytes));
+    RunParallelOffloadReadback(4);
 }
+
+#ifdef USE_URING
+TEST_F(FileStorageTest, UringReadsWithParallelPosixOffload) {
+    struct io_uring ring;
+    if (io_uring_queue_init(2, &ring, 0) < 0)
+        GTEST_SKIP() << "io_uring is unavailable";
+    io_uring_queue_exit(&ring);
+    for (uint32_t workers : {2u, 4u, 16u}) {
+        SCOPED_TRACE(workers);
+        for (const char* mode : {"0", "aligned"}) {
+            SCOPED_TRACE(mode);
+            ASSERT_NO_FATAL_FAILURE(
+                RunParallelOffloadReadback(workers, true, mode));
+        }
+    }
+}
+
+TEST_F(FileStorageTest, UringParallelCapacityFailureReleasesTasks) {
+    RunDeferredOffloadFailureScenario(true, 4, true);
+}
+
+TEST_F(FileStorageTest, UringParallelWriteFailurePreservesTail) {
+    RunDeferredOffloadFailureScenario(false, 4, true);
+}
+#endif
 
 TEST_F(FileStorageTest, OffloadWriteParallelCapacityFailureReleasesTasks) {
     RunDeferredOffloadFailureScenario(true, 4);

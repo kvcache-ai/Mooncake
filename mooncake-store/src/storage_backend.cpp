@@ -2172,6 +2172,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                           "MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE selects packed";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (direct_write.value() && file_storage_config_.use_uring &&
+            file_storage_config_.offload_write_workers > 1) {
+            LOG(ERROR) << "Parallel offload supports io_uring reads with POSIX "
+                          "writes; set MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE=0 "
+                          "or MOONCAKE_OFFLOAD_WRITE_WORKERS=1 for packed "
+                          "io_uring writes";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         if (direct_write.value()) {
 #ifdef USE_URING
             if (!file_storage_config_.use_uring) {

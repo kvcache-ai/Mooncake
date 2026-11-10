@@ -246,9 +246,9 @@ bool FileStorageConfig::Validate() const {
         return false;
     }
     if (offload_write_workers > 1 &&
-        (use_uring || enable_dfs ||
-         storage_backend_type != StorageBackendType::kBucket)) {
-        LOG(ERROR) << "Parallel offload requires the POSIX bucket backend";
+        (enable_dfs || storage_backend_type != StorageBackendType::kBucket)) {
+        LOG(ERROR) << "Parallel offload requires local bucket storage with DFS "
+                      "disabled";
         return false;
     }
 
