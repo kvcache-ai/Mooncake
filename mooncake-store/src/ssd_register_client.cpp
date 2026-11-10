@@ -116,4 +116,13 @@ int NoFRegisterClient::set_unregister_by_endpoint(
     return all_unmounted ? OPERATION_OK : OPERATION_FAILED;
 }
 
+tl::expected<std::vector<NoFSegment>, ErrorCode>
+NoFRegisterClient::get_all_nof_segments(const std::string &master_server_addr) {
+    auto err = master_client_.Connect(master_server_addr);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return master_client_.GetAllNoFSegments();
+}
+
 }  // namespace mooncake
