@@ -30,6 +30,7 @@ class MluPlatform : public CpuPlatform {
     MemoryType getMemoryType(void* addr) override;
     const std::vector<RangeLocation> getLocation(
         void* start, size_t len, bool skip_prefault = false) override;
+    Status exportDmabuf(void* addr, size_t length, DmabufExport& out) override;
     Status synchronizeDevices(const Topology* topology) override;
     const std::string type() const override { return "mlu"; }
 };

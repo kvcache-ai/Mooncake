@@ -345,6 +345,29 @@ sudo make install
 ```
 :::
 
+
+:::{tab-item} MemFabric
+**Prerequisites**
+
+- Python 3.10 or later.
+- Ascend CANN Toolkit. Source `/usr/local/Ascend/cann/set_env.sh` before
+  running Mooncake.
+- The `MemFabric` runtime dependency, installed with `pip install memfabric_hybrid`.
+
+**Installation**
+
+```bash
+pip install memfabric_hybrid
+pip install mooncake-transfer-engine-memfabric
+source /usr/local/Ascend/cann/set_env.sh
+```
+
+See [MemFabric guide Transport](../design/transfer-engine/transport/memfabric_transport.md)
+for the recommended MemFabric TENT path. A detailed Chinese walkthrough, including SGLang
+configuration examples, is available in the
+[Mooncake (MemFabric) complete guide](https://memfabric-hybrid.readthedocs.io/zh-cn/latest/wiki/user_guide/integration/Mooncake-MemFabric-Guide/).
+:::
+
 ::::
 
 ## Start Mooncake Store

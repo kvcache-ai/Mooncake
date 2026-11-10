@@ -146,7 +146,7 @@ TEST_F(TCPTransportTest, Writetest) {
         if (status.s == TransferStatusEnum::COMPLETED) completed = true;
     }
     s = engine->freeBatchID(batch_id);
-    ASSERT_EQ(s, Status::OK());
+    ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred());
 }
 
 TEST_F(TCPTransportTest, WriteAndReadtest) {
@@ -191,7 +191,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred());
     }
 
     {
@@ -215,7 +215,7 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
         s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
+        LOG_ASSERT(s.ok() || s.IsBatchCleanupDeferred());
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
@@ -264,7 +264,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred());
     }
 
     {
@@ -287,7 +287,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
         s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
+        LOG_ASSERT(s.ok() || s.IsBatchCleanupDeferred());
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
@@ -314,7 +314,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
             if (status.s == TransferStatusEnum::COMPLETED) completed = true;
         }
         s = engine->freeBatchID(batch_id);
-        ASSERT_EQ(s, Status::OK());
+        ASSERT_TRUE(s.ok() || s.IsBatchCleanupDeferred());
     }
 
     {
@@ -337,7 +337,7 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
             LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         }
         s = engine->freeBatchID(batch_id);
-        LOG_ASSERT(s.ok());
+        LOG_ASSERT(s.ok() || s.IsBatchCleanupDeferred());
     }
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
@@ -393,7 +393,10 @@ TEST_F(TCPTransportTest, CApiBatchTransferStatus) {
     EXPECT_EQ(getBatchTransferStatus(c_engine, batch_id, nullptr),
               kInvalidArgument);
 
-    ASSERT_TRUE(engine->freeBatchID(batch_id).ok());
+    {
+        auto freed = engine->freeBatchID(batch_id);
+        ASSERT_TRUE(freed.ok() || freed.IsBatchCleanupDeferred());
+    }
     ASSERT_EQ(engine->unregisterLocalMemory(addr), 0);
     numa_free(addr, ram_buffer_size);
 }

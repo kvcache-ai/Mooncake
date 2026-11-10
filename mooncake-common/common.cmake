@@ -104,7 +104,7 @@ endif()
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
-option(USE_ASCEND "option for using npu with HCCL" OFF)
+option(USE_ASCEND "option for using npu with Ascend Direct transport" OFF)
 option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
 option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
 option(USE_ASCEND_HETEROGENEOUS
@@ -135,6 +135,13 @@ option(USE_FABRIC
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 option(USE_MEMFABRIC "option for using memfabric transport" OFF)
+
+# USE_ASCEND and USE_ASCEND_DIRECT both select the Ascend Direct transport; the
+# HCCL transport it used to select is no longer built. Keep the two switches
+# equivalent so existing build commands work either way.
+if(USE_ASCEND)
+  set(USE_ASCEND_DIRECT ON)
+endif()
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -727,8 +734,6 @@ if(USE_ASCEND
 endif()
 
 if(USE_ASCEND)
-  set(ASCEND_DEVLIB_DIR "${ASCEND_TOOLKIT_ROOT}/devlib")
-  link_directories(${ASCEND_DEVLIB_DIR})
   add_compile_definitions(USE_ASCEND)
 endif()
 

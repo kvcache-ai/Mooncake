@@ -22,6 +22,8 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +35,21 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+
+namespace {
+
+bool EnvFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return false;
+    }
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return text == "1" || text == "true" || text == "yes" || text == "on";
+}
+
+}  // namespace
 namespace {
 constexpr const char* kAutoConnect = "AutoConnect";
 constexpr const char* kEnabled = "1";
@@ -97,7 +114,9 @@ int CurrentEngineIndex(size_t engine_count, size_t& engine_idx) {
 TransferExecutorBase::TransferExecutorBase(const InitParams& params)
     : params_(params),
       local_engine_contexts_(params.local_engine_contexts),
-      metadata_(params.metadata) {}
+      metadata_(params.metadata) {
+    use_shmem_ = EnvFlagEnabled("ASCEND_USE_SHMEM");
+}
 
 TransferExecutorBase::~TransferExecutorBase() = default;
 
@@ -218,20 +237,21 @@ int TransferExecutorBase::initEngines() {
                    << "or disable Client-Server mode.";
         return -1;
     }
-    local_copy_engine_ = std::make_unique<LocalCopyEngine>();
-    if (!local_copy_engine_) {
-        return ERR_MEMORY;
-    }
-    int ret = local_copy_engine_->Initialize(params_.transfer_timeout,
-                                             local_engine_contexts_.size());
-    if (ret != 0) {
-        LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
-        return ret;
+    local_copy_engines_.reserve(local_engine_contexts_.size());
+    for (const auto& context : local_engine_contexts_) {
+        auto engine = std::make_unique<LocalCopyEngine>();
+        int ret = engine->Initialize(context, params_.transfer_timeout,
+                                     local_engine_contexts_.size());
+        if (ret != 0) {
+            LOG(ERROR) << "Failed to initialize LocalCopyEngine, ret: " << ret;
+            return ret;
+        }
+        local_copy_engines_.push_back(std::move(engine));
     }
     // Whether a destination can be copied locally is decided per buffer, from
     // the memfd handle in shm_name. Install the mapper for every non-fabric
     // engine so that check can run; a buffer without a handle stays on adxl.
-    if (!params_.use_fabric_mem) {
+    if (!params_.use_fabric_mem && use_shmem_) {
         shared_host_mapper_ = std::make_unique<SharedHostMapper>();
     }
     aclrtContext saved_ctx = nullptr;
@@ -358,10 +378,12 @@ void TransferExecutorBase::finalizeEngines() {
             engine->Finalize();
         }
     }
-    if (local_copy_engine_) {
-        local_copy_engine_->Finalize();
-        local_copy_engine_.reset();
+    for (auto& engine : local_copy_engines_) {
+        if (engine) {
+            engine->Finalize();
+        }
     }
+    local_copy_engines_.clear();
     // Released after the copy engine, so no copy can still be reading through
     // one of the imported mappings when it is unmapped.
     shared_host_mapper_.reset();
@@ -502,8 +524,8 @@ void TransferExecutorBase::cleanupConnections() {
                                << connected_segment
                                << ", errmsg: " << aclGetRecentErrMsg();
                 } else {
-                    LOG(INFO) << "Success to disconnect AdxlEngine:"
-                              << connected_segment;
+                    VLOG(1) << "Success to disconnect AdxlEngine:"
+                            << connected_segment;
                 }
             }
         }
@@ -610,14 +632,22 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
 }
 
 int TransferExecutorBase::deregisterMem(void* addr) {
+    // A caller tearing the client down may hold no context at all; each handle
+    // is deregistered under the engine context it was registered with below, so
+    // the only thing a missing context costs is having nothing to restore.
     aclrtContext saved_ctx = nullptr;
     if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
-        LOG(ERROR) << "aclrtGetCurrentContext failed, errmsg: "
-                   << aclGetRecentErrMsg();
-        return -1;
+        LOG_FIRST_N(WARNING, 1)
+            << "aclrtGetCurrentContext failed while deregistering memory (no "
+               "ACL context on this thread), errmsg: "
+            << aclGetRecentErrMsg();
+        saved_ctx = nullptr;
     }
-    MAKE_GUARD(ctx_restore,
-               [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
 
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
     auto it = addr_to_mem_handles_.find(addr);
@@ -677,6 +707,19 @@ bool TransferExecutorBase::resolveLocalCopyDestinations(
         if (!shared_host_mapper_->Translate(segment_desc,
                                             slice->ascend_direct.dest_addr,
                                             slice->length, &local_addr)) {
+            size_t shm_buffers = 0;
+            for (const auto& buffer : segment_desc->buffers) {
+                if (!buffer.shm_name.empty()) {
+                    ++shm_buffers;
+                }
+            }
+            VLOG(1) << "classic local-copy miss target_segment="
+                    << slice->target_id
+                    << " dest=" << slice->ascend_direct.dest_addr
+                    << " len=" << slice->length
+                    << " buffers=" << segment_desc->buffers.size()
+                    << " shm_buffers=" << shm_buffers
+                    << " opcode=" << static_cast<int>(slice->opcode);
             dest_addrs.clear();
             return false;
         }
@@ -687,15 +730,26 @@ bool TransferExecutorBase::resolveLocalCopyDestinations(
 
 void TransferExecutorBase::setLocalCopyTaskRunner(
     std::function<void(std::function<void()>)> runner) {
-    if (local_copy_engine_) {
-        local_copy_engine_->SetTaskRunner(std::move(runner));
+    for (auto& engine : local_copy_engines_) {
+        if (engine) {
+            engine->SetTaskRunner(runner);
+        }
     }
 }
 
-void TransferExecutorBase::processSliceList(
+void TransferExecutorBase::pollLocalCopies() {
+    for (auto& engine : local_copy_engines_) {
+        if (engine) {
+            engine->Poll();
+        }
+    }
+}
+
+std::vector<std::vector<Transport::Slice*>>
+TransferExecutorBase::splitByTargetEngine(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
-        return;
+        return {};
     }
     auto target_segment_desc =
         metadata_->getSegmentDescByID(slice_list[0]->target_id);
@@ -703,7 +757,7 @@ void TransferExecutorBase::processSliceList(
         LOG(ERROR) << "Cannot find segment descriptor for target_id: "
                    << slice_list[0]->target_id;
         markSlicesFailed(slice_list);
-        return;
+        return {};
     }
 
     std::map<std::string, std::vector<Transport::Slice*>> groups;
@@ -712,19 +766,22 @@ void TransferExecutorBase::processSliceList(
                                            slice->ascend_direct.dest_addr)]
             .push_back(slice);
     }
+    std::vector<std::vector<Transport::Slice*>> result;
+    result.reserve(groups.size());
     for (auto& [_, group] : groups) {
-        processHomogeneousSliceList(group);
+        result.push_back(std::move(group));
     }
+    return result;
 }
 
-void TransferExecutorBase::processHomogeneousSliceList(
+void TransferExecutorBase::processGroupedSliceList(
     const std::vector<Transport::Slice*>& slice_list) {
     if (slice_list.empty()) {
         return;
     }
     size_t local_engine_idx =
         params_.agent_mode ? slice_list[0]->ascend_direct.engine_id : 0;
-    VLOG(1) << "processSliceList for dev:" << local_engine_idx;
+    VLOG(1) << "processGroupedSliceList for dev:" << local_engine_idx;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     if (!local_segment_desc ||
         local_engine_idx >= local_segment_desc->rank_info.endpoints.size()) {
@@ -780,10 +837,26 @@ void TransferExecutorBase::processHomogeneousSliceList(
             (target_adxl_engine_name == local_engine_name ||
              resolveLocalCopyDestinations(target_segment_desc, slice_list,
                                           local_dest_addrs));
-        if (need_local_copy && local_copy_engine_) {
+        auto* local_copy_engine =
+            local_engine_idx < local_copy_engines_.size()
+                ? local_copy_engines_[local_engine_idx].get()
+                : nullptr;
+        if (need_local_copy && local_copy_engine != nullptr) {
+            if (VLOG_IS_ON(1)) {
+                size_t copy_bytes = 0;
+                for (auto* slice : slice_list) {
+                    copy_bytes += slice->length;
+                }
+                VLOG(1) << "classic route local_copy=1 opcode="
+                        << static_cast<int>(slice_list[0]->opcode)
+                        << " slices=" << slice_list.size()
+                        << " bytes=" << copy_bytes
+                        << " target_engine=" << target_adxl_engine_name
+                        << " local_engine=" << local_engine_name;
+            }
             auto start = std::chrono::steady_clock::now();
-            local_copy_engine_->Copy(slice_list[0]->opcode, slice_list,
-                                     local_dest_addrs);
+            local_copy_engine->Copy(slice_list[0]->opcode, slice_list,
+                                    local_dest_addrs);
             VLOG(1) << "Local copy time: "
                     << std::chrono::duration_cast<std::chrono::microseconds>(
                            std::chrono::steady_clock::now() - start)

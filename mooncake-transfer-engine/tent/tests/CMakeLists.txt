@@ -230,6 +230,28 @@ target_include_directories(transfer_engine_config_override_test
 add_test(NAME transfer_engine_config_override_test
          COMMAND transfer_engine_config_override_test)
 
+# Platform::getLoader is a process-wide singleton. Keep this regression in a
+# dedicated CPU-only process so its first call always exercises the null-config
+# initialization path without probing accelerator hardware.
+if(NOT USE_CUDA
+   AND NOT USE_HIP
+   AND NOT USE_SUNRISE
+   AND NOT USE_ASCEND
+   AND NOT USE_ASCEND_DIRECT
+   AND NOT USE_MEMFABRIC
+   AND NOT USE_TPU
+   AND NOT USE_MLU
+   AND NOT USE_XPU)
+  add_executable(tent_platform_default_config_test
+                 platform_default_config_test.cpp)
+  target_link_libraries(tent_platform_default_config_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_platform_default_config_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_platform_default_config_test
+           COMMAND tent_platform_default_config_test)
+endif()
+
 add_executable(tent_tcp_transport_test tcp_transport_test.cpp)
 target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
                                                       tent_link_group)
@@ -850,8 +872,22 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT)
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   set_target_properties(tent_ascend_direct_transport_test
                         PROPERTIES LINK_FLAGS "-Wl,--allow-shlib-undefined")
+  if(TARGET ascend_allocator)
+    target_compile_definitions(tent_ascend_direct_transport_test
+                               PRIVATE TENT_HAS_ASCEND_ALLOCATOR)
+  endif()
   add_test(NAME tent_ascend_direct_transport_test
            COMMAND tent_ascend_direct_transport_test)
+endif()
+
+if(USE_ASCEND_DIRECT)
+  add_executable(tent_shared_host_mapper_test shared_host_mapper_test.cpp)
+  target_link_libraries(tent_shared_host_mapper_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  target_include_directories(tent_shared_host_mapper_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_shared_host_mapper_test
+           COMMAND tent_shared_host_mapper_test)
 endif()
 
 add_executable(tent_segment_desc_retry_test segment_desc_retry_test.cpp)

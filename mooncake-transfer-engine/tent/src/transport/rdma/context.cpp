@@ -18,7 +18,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef USE_SHCA
@@ -540,8 +539,8 @@ int RdmaContext::resume() {
                : -1;
 }
 
-RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
-                                                int access) {
+RdmaContext::MemReg RdmaContext::registerMemReg(
+    void* addr, size_t length, int access, const DmabufExport* shared_export) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
@@ -605,27 +604,31 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     }
 #endif
 
-    // Device memory with a dma-buf export (Intel XPU today): register the
-    // exported buffer so the NIC DMAs to VRAM directly. The exporter returns
-    // NotImplemented (platform has no export path) or InvalidArgument (not
-    // device memory) for everything that must take the plain ibv_reg_mr path
-    // below; any other failure, or a failed ibv_reg_dmabuf_mr, is reported as
-    // a registration failure so the buffer is staged instead of being
-    // registered as host memory (which would EFAULT or, worse, silently
-    // register the wrong pages).
+    // Register exported device memory so the NIC DMAs to VRAM directly.
+    // NotImplemented or InvalidArgument may describe ordinary host memory;
+    // the memory-type check below prevents an MLU pointer from reaching
+    // ibv_reg_mr if export is unavailable. Any other export failure, or a
+    // failed ibv_reg_dmabuf_mr, leaves the buffer to the staging route.
+    if (shared_export && shared_export->fd >= 0 && !supportsDmabuf())
+        return nullptr;
     if (verbs_.ibv_reg_dmabuf_mr) {
         DmabufExport handle;
-        Status s = dmabuf_exporter_ ? dmabuf_exporter_(addr, length, handle)
-                                    : Platform::getLoader().exportDmabuf(
-                                          addr, length, handle);
+        Status s = Status::NotImplemented("No shared dma-buf export");
+        if (shared_export) {
+            handle = *shared_export;
+            handle.close_fd = false;
+            if (handle.fd >= 0) s = Status::OK();
+        } else {
+            s = exportDmabuf(addr, length, handle);
+        }
+        DmabufExportGuard export_guard{handle};
         if (s.ok()) {
             ibv_mr* entry = verbs_.ibv_reg_dmabuf_mr(
                 native_pd_, handle.offset, length,
                 reinterpret_cast<uint64_t>(addr), handle.fd, access);
-            // The MR takes its own reference to the dma-buf. The fd itself
-            // stays with the exporting runtime (see DmabufExport): Level
-            // Zero hands out one cached descriptor per allocation, so
-            // closing it here would leave the driver with a stale fd.
+            // The MR takes its own reference to the dma-buf. Shared exports
+            // and Level Zero descriptors are borrowed; only a private,
+            // caller-owned export is closed by this guard.
             if (!entry) {
                 const void* end = static_cast<const char*>(addr) + length;
                 PLOG(ERROR)
@@ -645,6 +648,11 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
             return nullptr;
         }
     }
+
+    // MLU memory must not reach the plain MR path when dma-buf verbs or export
+    // are unavailable. The engine may still use a separate host stage buffer.
+    const auto memory_type = Platform::getLoader().getMemoryType(addr);
+    if (memory_type == MTYPE_MLU) return nullptr;
 
     // Standard CPU memory registration
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
@@ -708,16 +716,9 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     // dma-buf MRs pin no host pages: rdma-core stores the dma-buf offset in
     // `addr`, not a host VMA, so there is no fork state to restore.
     if (is_dmabuf) return 0;
-    // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
-    // madvise(MADV_DONTFORK) on the registered range when fork protection
-    // is active; failing to undo this on unregister leaves VMAs permanently
-    // split, exhausting vm.max_map_count under high register/unregister churn.
-    // See issue #3639.
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
-    }
+    // No MADV_DOFORK here (reverted #3660): ibv_dereg_mr() already restores the
+    // fork state of a plain host MR through ibv_dofork_range(), and the extra
+    // call only failed with EINVAL/ENOMEM on dma-buf and device ranges.
 
     return 0;
 }

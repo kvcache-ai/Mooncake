@@ -24,6 +24,8 @@ class AgentStateMachine {
     AgentApplyResult handleRankStateUpdate(const RankStatePush& push);
     PGResult<AgentApplyResult> applyGroupView(const GroupView& view);
     PGResult<AgentApplyResult> handleViewUpdate(const ViewUpdatePush& push);
+    PGResult<AgentApplyResult> handleTransferEndpointUpdate(
+        uint64_t request_id, const TransferEndpointUpdatePush& push) const;
 
     HeartbeatRequest buildHeartbeat() const;
 
