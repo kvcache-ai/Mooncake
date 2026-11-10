@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 #include <future>
+#include <limits>
 
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/ordered_oplog_writer.h"
@@ -159,9 +160,8 @@ namespace mooncake {
 namespace {
 
 ObjectReplicaTarget Target() {
-    return {
-        "s3", "http://localhost:9000", "objects", "us-east-1", "test/", true,
-        1000};
+    return {"s3", "http://localhost:9000", "objects", "us-east-1", "test/",
+            true};
 }
 
 ObjectUploadRecord Upload() {
@@ -265,6 +265,7 @@ TEST(ObjectReplicaStateTest,
     replica.descriptor_variant = DiskDescriptor{"existing-disk", payload.size};
     payload.replicas = {replica};
     payload.client_id = {9, 9};
+    payload.replicas[0].id = record.replica_id;
     ObjectReplicaMutation mutation{Target(),
                                    {record},
                                    {},
@@ -289,6 +290,71 @@ TEST(ObjectReplicaStateTest,
     EXPECT_FALSE(store.Exists("default", "key"));
     EXPECT_EQ(store.SnapshotObjectReplicas().records.front().phase,
               ObjectUploadPhase::RETIRED);
+}
+
+TEST(ObjectReplicaStateTest,
+     RejectsInvalidMetadataReplicaIdsWithoutPartialApply) {
+    StandbyMetadataStore store;
+    auto record = Upload();
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key", {Target(), {record}, {}, {}, false}));
+
+    MetadataPayload payload;
+    payload.client_id = record.writer;
+    payload.size = record.object.object_size;
+    Replica::Descriptor replica;
+    replica.descriptor_variant = DiskDescriptor{"existing-disk", payload.size};
+    replica.id = record.replica_id;
+    payload.replicas = {replica};
+    const auto original_metadata = payload.ToStandbyMetadata();
+    ASSERT_TRUE(store.PutMetadata("default", "key", original_metadata));
+    const auto original_uploads =
+        struct_pack::serialize<std::string>(store.SnapshotObjectReplicas());
+    const auto original_value =
+        struct_pack::serialize<std::string>(original_metadata);
+
+    record.phase = ObjectUploadPhase::UPLOADED;
+    record.upload_finished = true;
+    for (const auto& ids : std::vector<std::vector<ReplicaID>>{
+             {0},
+             {std::numeric_limits<ReplicaID>::max()},
+             {record.replica_id, record.replica_id}}) {
+        payload.replicas.clear();
+        for (const auto id : ids) {
+            replica.id = id;
+            payload.replicas.push_back(replica);
+        }
+        EXPECT_FALSE(store.ApplyObjectReplicaMutation(
+            "default", "key",
+            {Target(),
+             {record},
+             {},
+             struct_pack::serialize<std::string>(payload),
+             false}));
+        EXPECT_EQ(original_uploads, struct_pack::serialize<std::string>(
+                                        store.SnapshotObjectReplicas()));
+        const auto current = store.GetMetadata("default", "key");
+        ASSERT_TRUE(current);
+        EXPECT_EQ(original_value,
+                  struct_pack::serialize<std::string>(*current));
+    }
+
+    replica.id = record.replica_id;
+    payload.replicas = {replica};
+    ASSERT_TRUE(store.ApplyObjectReplicaMutation(
+        "default", "key",
+        {Target(),
+         {record},
+         {},
+         struct_pack::serialize<std::string>(payload),
+         false}));
+    StandbyMetadataStore restored;
+    ASSERT_TRUE(restored.RestoreObjectReplicas(store.SnapshotObjectReplicas()));
+    ASSERT_TRUE(restored.RestoreMetadata("default", "key",
+                                         *store.GetMetadata("default", "key")));
+    ReplicaID maximum = 0;
+    EXPECT_TRUE(restored.ValidateReplicaIds(maximum));
+    EXPECT_EQ(record.replica_id, maximum);
 }
 
 TEST(ObjectReplicaStateTest, RestoresUncertainUploadsWithoutDiscardingThem) {

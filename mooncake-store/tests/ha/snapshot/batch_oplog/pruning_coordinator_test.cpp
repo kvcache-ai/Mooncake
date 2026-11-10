@@ -115,6 +115,10 @@ class RecordingObjectStore final : public SnapshotObjectStore {
     tl::expected<void, std::string> DownloadBuffer(
         const std::string& key, std::vector<uint8_t>& bytes) override {
         ++buffer_downloads;
+        downloaded_keys.push_back(key);
+        if (key == failed_download_key) {
+            return tl::make_unexpected("download failed");
+        }
         auto it = objects.find(key);
         if (it == objects.end()) return tl::make_unexpected("missing");
         bytes = it->second;
@@ -165,6 +169,8 @@ class RecordingObjectStore final : public SnapshotObjectStore {
 
     bool checksums{true}, bad_checksum{false}, inspection_error{false};
     size_t buffer_downloads{0};
+    std::string failed_download_key;
+    std::vector<std::string> downloaded_keys;
     std::vector<std::string> deleted;
     std::map<std::string, std::vector<uint8_t>> objects;
 };
@@ -288,6 +294,51 @@ TEST_F(PruningTest, MissingObjectArtifactDoesNotAdvanceFloorOrDeleteLog) {
         EXPECT_EQ(0u, backend.delete_count);
         store.objects[key] = bytes;
     }
+    EXPECT_EQ(ErrorCode::OK, Run());
+    EXPECT_EQ("10", backend.values.at(floor_key));
+    EXPECT_EQ(1u, backend.delete_count);
+}
+
+TEST_F(PruningTest, ObjectArtifactsWithoutChecksumsAreReadBackBeforePruning) {
+    backend.Put(latest_key, AddSnapshot(store, 20, 101, true, true));
+    backend.Put(fallback_key, AddSnapshot(store, 10, 101, true, true));
+    store.checksums = false;
+
+    ASSERT_EQ(ErrorCode::OK, Run());
+    const std::vector<std::string> expected{
+        ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", "20-101"),
+        ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", "10-101")};
+    EXPECT_EQ(expected, store.downloaded_keys);
+    EXPECT_EQ("10", backend.values.at(floor_key));
+    EXPECT_EQ(1u, backend.delete_count);
+}
+
+TEST_F(PruningTest, ObjectReadbackFailurePreservesFloorAndLog) {
+    backend.Put(latest_key, AddSnapshot(store, 20, 101, true, true));
+    backend.Put(fallback_key, AddSnapshot(store, 10, 101, true, true));
+    backend.Put(floor_key, "5");
+    store.checksums = false;
+
+    for (const auto& id : {"20-101", "10-101"}) {
+        SCOPED_TRACE(id);
+        const auto key =
+            ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", id);
+        const auto original = store.objects.at(key);
+        store.objects[key][0] ^= 1;
+        ASSERT_NE(ErrorCode::OK, Run());
+        EXPECT_EQ("5", backend.values.at(floor_key));
+        EXPECT_EQ(0u, backend.txn_count);
+        EXPECT_EQ(0u, backend.delete_count);
+        store.objects[key] = original;
+
+        store.failed_download_key = key;
+        ASSERT_NE(ErrorCode::OK, Run());
+        EXPECT_EQ("5", backend.values.at(floor_key));
+        EXPECT_EQ(0u, backend.txn_count);
+        EXPECT_EQ(0u, backend.delete_count);
+        store.failed_download_key.clear();
+    }
+
     EXPECT_EQ(ErrorCode::OK, Run());
     EXPECT_EQ("10", backend.values.at(floor_key));
     EXPECT_EQ(1u, backend.delete_count);

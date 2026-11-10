@@ -19,8 +19,8 @@ logical key has already been removed.
 `ObjectUploadRecord` identifies an immutable backend object by its non-secret
 storage target and object name. It also retains the tenant, logical key, writer,
 replica ID, size and reclamation deadline. Credentials are process-local and
-are not included. The target and read-lease TTL stay bound even after the last
-record is forgotten; ordinary mutations cannot silently redirect old work.
+are not included. The target stays bound even after the last record is
+forgotten; ordinary mutations cannot silently redirect old work.
 
 The state is monotonic:
 
@@ -43,6 +43,8 @@ satisfied protection. There is no bucket scan or DELETE implementation here.
 `MetadataPayload` or logical removal in one ordered-log entry. All validation
 precedes publication under the standby store mutex. Invalid names, transitions,
 namespace changes or cross-writer updates leave both stores unchanged.
+Metadata replica IDs use the recovery checks: zero, the reserved maximum ID
+and duplicate IDs within one object are rejected before either store changes.
 
 The next integration must validate exact replica descriptors and attempt tokens
 before producing a mutation. It must use the existing fenced
@@ -69,12 +71,26 @@ installation. Snapshot GC and log pruning validate this artifact before deleting
 recovery evidence. Existing v1/v2 snapshots remain readable; snapshots without
 object state retain their existing version.
 
+Before log pruning advances the compaction floor, it checks the object-state
+artifact's size and CRC32C. If inspection supplies no CRC32C, pruning reads the
+artifact back and computes it; ordinary object chunks retain their existing
+inspection policy.
+
 Both promotion export paths retain the records. This intermediate review unit
 refuses to serve as a Master when a handoff contains object state: it cannot yet
 resume uploads/reclamation. This avoids silently dropping obligations. The next
-integration must restore these obligations, apply a conservative post-failover
-read-lease grace period, and only then open the serving gate. There is no new
-public configuration to create such state in this intermediate version.
+integration must restore these obligations and use the existing
+`default_kv_lease_ttl` configuration for read protection, rather than storing a
+second lease duration in the storage target. Participating Masters must use
+the same read-lease duration. A shorter duration must not take effect until
+previously granted longer leases have expired.
+
+Before opening the serving gate, that integration must protect restored live
+objects and retain retired objects until at least the restore time plus the
+configured read-lease duration. Each retired object's `not_before_ms` must be
+the maximum of its existing deadline and that recovery deadline. This review
+unit does not execute that lifecycle, and there is no new public configuration
+to create such state in this intermediate version.
 
 ## Verification and costs
 
@@ -87,5 +103,7 @@ from a combined integration do not validate this smaller change.
 
 There is no added ordinary Put/Get work besides the existing operation-type
 dispatch. Applying an object mutation costs logarithmic record-map operations
-plus constant-time replica-ID lookup; snapshot capture copies retained records.
-No threads, timers, network requests or additional persistence service are added.
+plus constant-time replica-ID lookup and a scan of the submitted metadata's
+replica IDs; snapshot capture copies retained records. Pruning adds an
+object-state artifact download when the backend supplies no CRC32C. No threads,
+timers or additional persistence service are added.

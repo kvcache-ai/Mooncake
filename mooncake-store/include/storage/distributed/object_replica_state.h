@@ -17,9 +17,8 @@ struct ObjectReplicaTarget {
     std::string region;
     std::string prefix;
     bool path_style{false};
-    uint64_t read_lease_ttl_ms{0};
     YLT_REFL(ObjectReplicaTarget, provider, endpoint, bucket, region, prefix,
-             path_style, read_lease_ttl_ms);
+             path_style);
     bool operator==(const ObjectReplicaTarget&) const = default;
 };
 

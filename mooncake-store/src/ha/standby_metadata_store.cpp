@@ -10,7 +10,22 @@ namespace {
 bool ValidTarget(const ObjectReplicaTarget& target) {
     return (target.provider == "oss" || target.provider == "s3") &&
            !target.endpoint.empty() && !target.bucket.empty() &&
-           !target.prefix.empty() && target.read_lease_ttl_ms > 0;
+           !target.prefix.empty();
+}
+
+bool ValidateMetadataReplicaIds(
+    const std::vector<Replica::Descriptor>& replicas,
+    ReplicaID& max_replica_id) {
+    std::unordered_set<ReplicaID> object_ids;
+    for (const auto& replica : replicas) {
+        if (replica.id == 0 ||
+            replica.id == std::numeric_limits<ReplicaID>::max() ||
+            !object_ids.insert(replica.id).second) {
+            return false;
+        }
+        max_replica_id = std::max(max_replica_id, replica.id);
+    }
+    return true;
 }
 
 bool ValidateObjectUploadRecord(const ObjectUploadRecord& record) {
@@ -39,9 +54,11 @@ bool StandbyMetadataStore::ApplyObjectReplicaMutation(
     }
     const auto tenant = NormalizeTenantId(tenant_id);
     MetadataPayload payload;
+    ReplicaID max_replica_id = 0;
     if (!mutation.metadata_payload.empty() &&
-        struct_pack::deserialize_to(payload, mutation.metadata_payload) !=
-            struct_pack::errc::ok) {
+        (struct_pack::deserialize_to(payload, mutation.metadata_payload) !=
+             struct_pack::errc::ok ||
+         !ValidateMetadataReplicaIds(payload.replicas, max_replica_id))) {
         return false;
     }
     std::unordered_set<std::string> changed;
@@ -454,15 +471,8 @@ bool StandbyMetadataStore::ValidateReplicaIds(ReplicaID& max_replica_id) const {
         (void)tenant_id;
         for (const auto& [key, metadata] : objects) {
             (void)key;
-            std::unordered_set<ReplicaID> object_ids;
-            for (const auto& replica : metadata.replicas) {
-                if (replica.id == 0 ||
-                    replica.id == std::numeric_limits<ReplicaID>::max() ||
-                    !object_ids.insert(replica.id).second) {
-                    return false;
-                }
-                max_replica_id = std::max(max_replica_id, replica.id);
-            }
+            if (!ValidateMetadataReplicaIds(metadata.replicas, max_replica_id))
+                return false;
         }
     }
     return true;

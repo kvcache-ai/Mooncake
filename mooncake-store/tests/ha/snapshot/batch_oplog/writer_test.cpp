@@ -1266,8 +1266,7 @@ TEST_F(BatchOpLogSnapshotWriterTest,
 TEST_F(BatchOpLogSnapshotWriterTest,
        RestoresObjectUploadObligationsWithoutTheOriginalLog) {
     ObjectReplicaTarget target{
-        "s3", "http://localhost:9000", "test", "us-east-1", "objects/", true,
-        1000};
+        "s3", "http://localhost:9000", "test", "us-east-1", "objects/", true};
     ObjectUploadRecord pending{target,
                                "default",
                                "pending",
