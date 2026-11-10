@@ -53,6 +53,9 @@ enum class SkipReason : uint8_t {
     kSoftPinned,
     // Another component evicts it, such as a managed weight's lifecycle.
     kExternalEvict,
+    // The object still misses a part: the parts it holds belong to the write
+    // that is going to join them.
+    kIncomplete,
     // No replica the policy would release.
     kNothingToRelease,
 };

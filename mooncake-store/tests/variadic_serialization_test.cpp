@@ -50,4 +50,35 @@ TEST(VariadicSerializationTest, PreservesAllCompatibleFields) {
     EXPECT_TRUE(empty_actual.residency_affinity_ids->empty());
 }
 
+// A PutStart names the part in the two compatible fields that follow every
+// other argument; they are what a release master acts on.
+TEST(VariadicSerializationTest, PreservesPartFields) {
+    using RpcRequest =
+        std::tuple<UUID, std::string, uint64_t, ReplicateConfig, std::string,
+                   struct_pack::compatible<uint32_t>,
+                   struct_pack::compatible<uint32_t>>;
+    ReplicateConfig config;
+    config.session_ids = std::vector<std::string>{"session-a"};
+    const auto wire = struct_pack::serialize(
+        UUID{1, 2}, std::string("key"), uint64_t{4096}, config,
+        std::string("default"), struct_pack::compatible<uint32_t>{3},
+        struct_pack::compatible<uint32_t>{16});
+    auto decoded = struct_pack::deserialize<RpcRequest>(wire);
+    ASSERT_TRUE(decoded);
+    ASSERT_TRUE(std::get<5>(*decoded).has_value());
+    EXPECT_EQ(*std::get<5>(*decoded), 3u);
+    ASSERT_TRUE(std::get<6>(*decoded).has_value());
+    EXPECT_EQ(*std::get<6>(*decoded), 16u);
+
+    // A call that names no part still carries the fields, unset.
+    const auto bare_wire = struct_pack::serialize(
+        UUID{1, 2}, std::string("key"), uint64_t{4096}, ReplicateConfig{},
+        std::string("default"), struct_pack::compatible<uint32_t>{},
+        struct_pack::compatible<uint32_t>{});
+    auto bare = struct_pack::deserialize<RpcRequest>(bare_wire);
+    ASSERT_TRUE(bare);
+    EXPECT_FALSE(std::get<5>(*bare).has_value());
+    EXPECT_FALSE(std::get<6>(*bare).has_value());
+}
+
 }  // namespace mooncake
