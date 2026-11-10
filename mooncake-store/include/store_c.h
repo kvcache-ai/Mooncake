@@ -69,6 +69,41 @@ mooncake_store_t mooncake_store_create();
 
 void mooncake_store_destroy(mooncake_store_t store);
 
+/*
+ * Configure etcd TLS certificates.
+ *
+ * Must be called BEFORE mooncake_store_setup().
+ *
+ * @param store: Store handle (currently unused; TLS is process-global).
+ * @param enabled: Non-zero to enable TLS, zero to disable/clear TLS.
+ *                 When enabled, all three certificate paths must be non-NULL
+ *                 and non-empty; otherwise TLS is rejected.
+ * @param ca_file: Path to CA certificate file (NULL or empty to skip).
+ * @param cert_file: Path to client certificate file (NULL or empty to skip).
+ * @param key_file: Path to client key file (NULL or empty to skip).
+ *
+ * Passing enabled=0 clears any previously configured TLS and disables TLS
+ * for subsequent connections.  All string parameters are copied internally;
+ * caller may free them after return.
+ */
+void mooncake_store_set_etcd_tls_config(mooncake_store_t store, int enabled,
+                                        const char *ca_file,
+                                        const char *cert_file,
+                                        const char *key_file);
+
+/*
+ * Apply environment-variable fallback for etcd TLS configuration.
+ *
+ * If mooncake_store_set_etcd_tls_config() was never called with explicit
+ * parameters, this function reads MC_ETCD_CA_FILE, MC_ETCD_CERT_FILE, and
+ * MC_ETCD_KEY_FILE from the environment and applies them.  No-op when TLS
+ * was already explicitly configured or when etcd support is not compiled in.
+ *
+ * Called automatically by mooncake_store_setup() and by the Python pybind
+ * setup() methods.  Safe to call multiple times.
+ */
+void mooncake_store_apply_etcd_tls_env_fallback(void);
+
 int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          const char *metadata_server,
                          uint64_t global_segment_size,

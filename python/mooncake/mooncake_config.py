@@ -239,6 +239,10 @@ class MooncakeConfig:
     master_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
+    etcd_tls_enabled: bool = False
+    etcd_ca_file: str = ""
+    etcd_cert_file: str = ""
+    etcd_key_file: str = ""
     tenant_id: str = "default"
     enable_client_http_server: bool = False
     client_http_port: int = 9300
@@ -324,6 +328,10 @@ class MooncakeConfig:
             ssd_offload_path=str(ssd_offload_path)
             if ssd_offload_path is not None
             else "",
+            etcd_tls_enabled=_parse_bool(config.get("etcd_tls_enabled", False)),
+            etcd_ca_file=str(config.get("etcd_ca_file", "")),
+            etcd_cert_file=str(config.get("etcd_cert_file", "")),
+            etcd_key_file=str(config.get("etcd_key_file", "")),
             tenant_id=str(tenant_id) if tenant_id is not None else "default",
             enable_client_http_server=_parse_bool(
                 config.get("enable_client_http_server", False)
@@ -365,6 +373,10 @@ class MooncakeConfig:
                     os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")
                 ),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
+                etcd_tls_enabled=_parse_bool(os.getenv("MC_ETCD_TLS_ENABLED", "false")),
+                etcd_ca_file=os.getenv("MC_ETCD_CA_FILE", ""),
+                etcd_cert_file=os.getenv("MC_ETCD_CERT_FILE", ""),
+                etcd_key_file=os.getenv("MC_ETCD_KEY_FILE", ""),
                 tenant_id=os.getenv("MOONCAKE_TENANT_ID", "default"),
                 enable_client_http_server=_parse_bool(
                     os.getenv("MOONCAKE_ENABLE_CLIENT_HTTP_SERVER", "false")

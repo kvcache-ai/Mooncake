@@ -22,6 +22,12 @@ class EtcdHelper {
      * @brief Connect to the etcd store client. There is a global etcd client in
      * libetcd. It is used for all the etcd operations for mooncake-store. This
      * function ensures the client is only connected once.
+     *
+     * TLS support: If TLS has been globally configured via SetTLSConfig()
+     * before calling this function, it automatically delegates to the TLS
+     * variant (ConnectToEtcdStoreClientWithTLS). Otherwise, a plain-text
+     * connection is established.
+     *
      * @param etcd_endpoints: The endpoints of the etcd store client.
      *        Multiple endpoints are separated by semicolons.
      * @return: Error code.
@@ -30,14 +36,43 @@ class EtcdHelper {
         const std::string& etcd_endpoints);
 
     /*
+     * @brief Connect to the etcd store client with TLS support.
+     * @param etcd_endpoints: The endpoints of the etcd store client.
+     * @param ca_file: Path to CA certificate file (optional, empty for no TLS).
+     * @param cert_file: Path to client certificate file (optional).
+     * @param key_file: Path to client key file (optional).
+     * @return: Error code.
+     */
+    static ErrorCode ConnectToEtcdStoreClientWithTLS(
+        const std::string& etcd_endpoints, const std::string& ca_file,
+        const std::string& cert_file, const std::string& key_file);
+
+    /*
      * @brief Reset the global store etcd client and reconnect to the given
-     *        endpoints. This cancels active store watches and maintenance
-     *        sessions. Each lease keep-alive uses an independent client and
-     *        continues.
+     *        endpoints. This cancels active store watches/keepalives in the Go
+     *        wrapper and creates a fresh clientv3.Client.
+     *
+     * TLS support: If TLS has been globally configured via SetTLSConfig()
+     * before calling this function, it automatically delegates to the TLS
+     * variant (ResetEtcdStoreClientWithTLS). Otherwise, a plain-text connection
+     * is established.
+     *
      * @param etcd_endpoints: The endpoints of the etcd store client.
      * @return: Error code.
      */
     static ErrorCode ResetEtcdStoreClient(const std::string& etcd_endpoints);
+
+    /*
+     * @brief Reset the global store etcd client with TLS support.
+     * @param etcd_endpoints: The endpoints of the etcd store client.
+     * @param ca_file: Path to CA certificate file (optional).
+     * @param cert_file: Path to client certificate file (optional).
+     * @param key_file: Path to client key file (optional).
+     * @return: Error code.
+     */
+    static ErrorCode ResetEtcdStoreClientWithTLS(
+        const std::string& etcd_endpoints, const std::string& ca_file,
+        const std::string& cert_file, const std::string& key_file);
 
     /*
      * @brief Get the value of a key from the etcd.
@@ -284,6 +319,37 @@ class EtcdHelper {
     static std::string connected_endpoints_;
     static std::mutex etcd_mutex_;
     static bool etcd_connected_;
+
+    // TLS configuration for etcd connections.
+    // Set via SetTLSConfig() before the first ConnectToEtcdStoreClient call.
+    static bool etcd_tls_enabled_;
+    static std::string etcd_ca_file_;
+    static std::string etcd_cert_file_;
+    static std::string etcd_key_file_;
+
+   public:
+    /*
+     * @brief Set global TLS configuration for etcd connections.
+     *        Must be called before the first ConnectToEtcdStoreClient() call.
+     *
+     * When enabled=true, all three certificate file paths must be non-empty;
+     * otherwise the configuration is rejected and TLS is not activated.
+     * When enabled=false, TLS is disabled regardless of the file paths.
+     *
+     * @param enabled: Whether to enable TLS for etcd connections.
+     * @param ca_file: Path to CA certificate file.
+     * @param cert_file: Path to client certificate file.
+     * @param key_file: Path to client key file.
+     */
+    static void SetTLSConfig(bool enabled, const std::string& ca_file,
+                             const std::string& cert_file,
+                             const std::string& key_file);
+
+    /*
+     * @brief Check if TLS is configured and enabled.
+     * @return true if TLS is enabled and all cert paths are non-empty.
+     */
+    static bool IsTLSConfigured();
 };
 
 }  // namespace mooncake
