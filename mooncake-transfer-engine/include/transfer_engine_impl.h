@@ -49,6 +49,21 @@
 namespace mooncake {
 class TransferEngineImplTestPeer;
 
+// Whether an Ascend build installs the Ascend transport for a protocol hint.
+// Hints that name no protocol or name Ascend install it; a hint naming a host
+// transport (e.g. "rdma") leaves the classic host-transport selection in
+// charge. USE_ASCEND and USE_ASCEND_DIRECT both build the Ascend Direct
+// transport, so they behave identically here.
+static inline bool shouldInstallAscendTransport(const std::string& protocol) {
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    return protocol.empty() || protocol == "ascend" ||
+           protocol == "ascend_direct";
+#else
+    (void)protocol;
+    return false;
+#endif
+}
+
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -127,36 +142,12 @@ class TransferEngineImpl {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
-        Status s = multi_transports_->submitTransfer(batch_id, entries);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->submitTransfer(batch_id, entries);
     }
 
     Status submitScatter(const std::vector<TransferRequest>& entries,
                          MultiTransport::ScatterSubmission& submission) {
-        Status s = multi_transports_->submitScatter(entries, submission);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(submission.batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->submitScatter(entries, submission);
     }
 
     Status submitTransferWithNotify(BatchID batch_id,
@@ -170,18 +161,6 @@ class TransferEngineImpl {
         if (!s.ok()) {
             return s;
         }
-
-#ifdef WITH_METRICS
-        if (metrics_enabled_) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
 
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -204,20 +183,7 @@ class TransferEngineImpl {
     Status mp_submitTransfer(BatchID batch_id,
                              const std::vector<TransferRequest>& entries,
                              std::string& proto) {
-        Status s =
-            multi_transports_->mp_submitTransfer(batch_id, entries, proto);
-#ifdef WITH_METRICS
-        if (metrics_enabled_ && s.ok()) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
-        return s;
+        return multi_transports_->mp_submitTransfer(batch_id, entries, proto);
     }
 
     Status mp_submitTransferWithNotify(
@@ -232,18 +198,6 @@ class TransferEngineImpl {
         if (!s.ok()) {
             return s;
         }
-
-#ifdef WITH_METRICS
-        if (metrics_enabled_) {
-            auto& batch = Transport::toBatchDesc(batch_id);
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task : batch.task_list) {
-                if (task.start_time.time_since_epoch().count() == 0) {
-                    task.start_time = now;
-                }
-            }
-        }
-#endif
 
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
@@ -309,6 +263,13 @@ class TransferEngineImpl {
             if (start.time_since_epoch().count() == 0) {
                 goto metrics_done;
             }
+            if (__atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE) == 0) {
+                goto metrics_done;
+            }
+            if (__atomic_exchange_n(&task.log_metrics_recorded, true,
+                                    __ATOMIC_ACQ_REL)) {
+                goto metrics_done;
+            }
 
             // Only record metrics for successful completions
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -321,9 +282,6 @@ class TransferEngineImpl {
                         now - start);
                 task_completion_latency_us_.observe(duration.count());
             }
-
-            // Reset start_time to prevent duplicate processing
-            task.start_time = std::chrono::steady_clock::time_point();
         }
     metrics_done:
 #endif
@@ -335,8 +293,20 @@ class TransferEngineImpl {
             // when the overall status is COMPLETED
             // skip_metrics=true to avoid double counting since we already
             // recorded metrics above
+            //
+            // This task's COMPLETED comes from its slice counters, which a
+            // worker publishes before it bumps the batch's finished-task
+            // counter. If a notification is pending, walk the tasks instead of
+            // trusting that counter: the caller may free the batch next, and
+            // that drops a notification not sent by then.
+            bool notify_pending;
+            {
+                RWSpinlock::ReadGuard guard(send_notifies_lock_);
+                notify_pending = notifies_to_send_.count(batch_id) != 0;
+            }
             TransferStatus dummy_status;
-            auto status = getBatchTransferStatus(batch_id, dummy_status, true);
+            auto status = getBatchTransferStatus(batch_id, dummy_status, true,
+                                                 notify_pending);
             if (!status.ok()) {
                 LOG(ERROR) << status.ToString();
             }
@@ -352,9 +322,10 @@ class TransferEngineImpl {
     }
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status,
-                                  bool skip_metrics = false) {
-        Status result =
-            multi_transports_->getBatchTransferStatus(batch_id, status);
+                                  bool skip_metrics = false,
+                                  bool walk_tasks = false) {
+        Status result = multi_transports_->getBatchTransferStatus(
+            batch_id, status, walk_tasks);
 #ifdef WITH_METRICS
         if (metrics_enabled_ && !skip_metrics && result.ok() &&
             status.s == TransferStatusEnum::COMPLETED) {
@@ -426,6 +397,19 @@ class TransferEngineImpl {
         auto_discover_config_ = config;
     }
 
+    // Optional transport hint carried by the protocol argument of init(). An
+    // empty value keeps the config written by setAutoDiscover(), which Store
+    // uses to pass the protocol of the client before calling init(). A hint
+    // for a transport this build does not provide is dropped, so discovery
+    // still falls back to the host transports rather than failing the install.
+    void applyProtocolHint(const std::string& protocol) {
+        if (protocol.empty()) return;
+#ifndef USE_EFA
+        if (protocol == "efa") return;
+#endif
+        auto_discover_config_.protocol = protocol;
+    }
+
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
 
     void* allocateSharedMemory(size_t length);
@@ -494,6 +478,17 @@ class TransferEngineImpl {
             return "rdma_twosided";
         }
         return "rdma";
+    }
+
+    // True when auto-discovery should set up the EFA transport. Only USE_EFA
+    // builds can construct it; elsewhere protocol=efa keeps the RDMA-style
+    // discovery that excludes EFA NICs.
+    bool autoDiscoverUsesEfa() const {
+#ifdef USE_EFA
+        return autoDiscoverTransport() == "efa";
+#else
+        return false;
+#endif
     }
 
     // Discover topology and install transports automatically when enabled.

@@ -53,15 +53,15 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
 #elif defined(MOONCAKE_EP_USE_MACA)
 
 // -- FP8 types ---------------------------------------------------------------
-// MetaX C500 does not support the FP8 EP path.  The dispatch<true> template is
-// still compiled because the host selects the kernel through a runtime bool, so
-// provide storage stubs and reject actual FP8 use in the host/Python wrappers.
 #include <cstdint>
-using ep_fp8_storage_t = uint8_t;
+#include <maca_fp8.h>
+using ep_fp8_storage_t = __maca_fp8_e4m3;
 using ep_fp8x2_storage_t = uint16_t;
 #if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
-__device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2) {
-    return 0;
+__device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
+    const auto x0 = __maca_fp8_e4m3(x.x);
+    const auto x1 = __maca_fp8_e4m3(x.y);
+    return static_cast<uint16_t>(x0.__x) | (static_cast<uint16_t>(x1.__x) << 8);
 }
 #endif
 

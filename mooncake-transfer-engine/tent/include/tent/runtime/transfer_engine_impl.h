@@ -99,6 +99,14 @@ struct TaskInfo {
     std::chrono::steady_clock::time_point attempt_post_time{};
     TransportType attempt_type{UNSPEC};
     bool attempt_active{false};
+#if TENT_METRICS_ENABLED
+    // Pairing tokens for lossless accounting. A token is set only when the
+    // corresponding start was recorded, and is consumed before the terminal
+    // observation so runtime enable/disable transitions cannot create an
+    // unmatched start or finish.
+    bool logical_observability_active{false};
+    bool attempt_observability_active{false};
+#endif
     // Failure attribution for tent_task_failures_total (first failure wins):
     // -1 = none, 0 = submit-stage, 1 = poll-stage. Set where the failure
     // originates and never overwritten, so a poll-observed failure stays
@@ -134,7 +142,12 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+#if TENT_METRICS_ENABLED
+          logical_observability_active(other.logical_observability_active),
+          attempt_observability_active(other.attempt_observability_active),
+#endif
+          failure_stage(other.failure_stage) {
+    }
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -160,7 +173,12 @@ struct TaskInfo {
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
           attempt_active(other.attempt_active),
-          failure_stage(other.failure_stage) {}
+#if TENT_METRICS_ENABLED
+          logical_observability_active(other.logical_observability_active),
+          attempt_observability_active(other.attempt_observability_active),
+#endif
+          failure_stage(other.failure_stage) {
+    }
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -189,6 +207,10 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+#if TENT_METRICS_ENABLED
+            logical_observability_active = other.logical_observability_active;
+            attempt_observability_active = other.attempt_observability_active;
+#endif
             failure_stage = other.failure_stage;
         }
         return *this;
@@ -221,6 +243,10 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+#if TENT_METRICS_ENABLED
+            logical_observability_active = other.logical_observability_active;
+            attempt_observability_active = other.attempt_observability_active;
+#endif
             failure_stage = other.failure_stage;
         }
         return *this;
@@ -235,7 +261,8 @@ class TransferEngineImpl {
    public:
     TransferEngineImpl();
 
-    TransferEngineImpl(std::shared_ptr<Config> config);
+    TransferEngineImpl(std::shared_ptr<Config> config,
+                       bool config_loaded = true);
 
     ~TransferEngineImpl();
 
@@ -394,7 +421,8 @@ class TransferEngineImpl {
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
     // enable_progress_worker is false. Transport completion paths use this as
     // an idempotent "maybe ready" signal.
-    void notifyBatchMaybeReady(BatchID batch_id);
+    void notifyBatchMaybeReady(BatchID batch_id,
+                               bool poll_until_terminal = false);
 
    private:
     friend class ProgressWorker;
@@ -410,10 +438,23 @@ class TransferEngineImpl {
     SelectionResult getTransportType(const Request& request,
                                      int transport_index = 0);
 
+    // One selection pass behind getTransportType(). `allow_device_direct` lets
+    // dma-buf-registered XPU or MLU buffers route directly over RDMA (see
+    // deviceDirectRdmaReady); when false device buffers are host-staged for the
+    // network transports. `allow_xpu_ipc` additionally offers XpuTransport,
+    // unstaged, for a same-host peer's XPU buffer that may be IPC-mapped (see
+    // xpuIpcCandidate); the mapping is made only if XPU is selected, and the
+    // pass is redone without IPC if that fails. `device_direct`, if given,
+    // reports whether this pass planned the network transports unstaged, so
+    // the caller can retry staged when it yields no transport.
+    SelectionResult planTransport(const Request& request, int transport_index,
+                                  bool allow_device_direct, bool allow_xpu_ipc,
+                                  bool* device_direct);
+
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-    void deregisterRemovedBuffer(BufferDesc& desc);
+    Status deregisterRemovedBuffer(BufferDesc& desc);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
@@ -465,7 +506,8 @@ class TransferEngineImpl {
                          PreparedSubmit& prepared,
                          bool require_post_submit_cancellation = false);
 
-    Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
+    Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared,
+                                QueueOwnerKind owner_kind);
 
     void attachProgressNotifier(Batch* batch, Transport::SubBatchRef sub_batch);
 
@@ -485,6 +527,19 @@ class TransferEngineImpl {
 
     Status finishQueuedOwner(QueueOwnerId owner_id,
                              TransferStatusEnum terminal_status);
+
+    // An owner the queue dropped at pick time: terminal on the queue side
+    // already, so only the impl's record and the batch's task statuses are
+    // left to settle. It never entered the dispatch window.
+    Status finishDroppedOwner(QueueOwnerId owner_id);
+
+    // Every queue owner of `batch`, dispatched or not, is finished with
+    // `terminal_status` so the dispatch window and the queue's byte accounting
+    // give back what the batch held. For a batch that is leaving the normal
+    // lifecycle (deferred staging teardown, quarantine): nothing will poll it
+    // to a terminal state any more.
+    Status detachQueuedOwnersOfBatch(Batch* batch,
+                                     TransferStatusEnum terminal_status);
 
     Status cancelQueuedOwner(QueueOwnerId owner_id);
 
@@ -517,6 +572,29 @@ class TransferEngineImpl {
     void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
 
+    // True when a request touching XPU or MLU memory can go over RDMA without
+    // host staging: the RDMA transport advertises the device capability the
+    // memory-type pair needs, and every buffer involved was registered on RDMA
+    // (a device buffer only carries RDMA when its dma-buf registration
+    // succeeded). `remote_entry` is the remote buffer the request targets.
+    bool deviceDirectRdmaReady(const Request& req,
+                               const BufferDesc* remote_entry,
+                               MemoryType local_mtype, MemoryType remote_mtype);
+
+    // True when the XPU buffer `remote_entry` of segment `desc` is on this
+    // host and publishes a Level Zero IPC handle XpuTransport may map, so
+    // XPU can be offered for the request. Does not import; always false
+    // without USE_XPU.
+    bool xpuIpcCandidate(const Request& req, const SegmentDesc* desc,
+                         const BufferDesc* remote_entry);
+
+    // True when the XPU buffer `remote_entry` of same-host segment `desc` is
+    // mapped into this process by XpuTransport (Level Zero IPC), so the
+    // request can run as a local PCIe P2P copy instead of RDMA or staging.
+    // Imports on first use; always false without USE_XPU.
+    bool xpuIpcReady(const Request& req, const SegmentDesc* desc,
+                     const BufferDesc* remote_entry);
+
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 
     void addSubmitHook(Batch* batch, size_t start_task_id,
@@ -526,6 +604,8 @@ class TransferEngineImpl {
     void recordTaskCompletionMetrics(TaskInfo& task,
                                      TransferStatusEnum prev_status,
                                      TransferStatusEnum new_status);
+
+    void startLogicalRequestObservability(TaskInfo& task);
 
     void startTransportAttempt(TaskInfo& task, TransportType type,
                                std::chrono::steady_clock::time_point post_time);
@@ -618,8 +698,8 @@ class TransferEngineImpl {
     DeferredStageTeardown deferred_stage_teardown_;
     std::unique_ptr<ProgressWorker> progress_worker_;
 
-    // Per-batch hot paths (poll / free / retain) lock only the shard for
-    // that BatchID instead of progress_mutex_, so N threads polling N
+    // Per-batch hot paths (submit / poll / free / retain) lock only the shard
+    // for that BatchID instead of progress_mutex_, so N threads polling N
     // independent batches do not serialize.
     //
     // Exception: enable_runtime_queue=true keeps those paths on
@@ -643,8 +723,16 @@ class TransferEngineImpl {
         std::unordered_set<BatchID> alive_batches;
     };
     BatchShard& batchShard(BatchID batch_id) {
-        return batch_shards_[reinterpret_cast<uintptr_t>(batch_id) %
-                             kBatchLockShards];
+        // Batches come from a slab in sizeof(Batch) steps, so the low address
+        // bits take only a few values. Mix all bits (MurmurHash3 fmix64) so
+        // batches spread over every shard.
+        uint64_t key = batch_id;
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33;
+        key *= 0xc4ceb9fe1a85ec53ULL;
+        key ^= key >> 33;
+        return batch_shards_[key % kBatchLockShards];
     }
     std::recursive_mutex& batchShardMutex(BatchID batch_id) {
         return batchShard(batch_id).mtx;

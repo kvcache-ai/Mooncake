@@ -45,10 +45,20 @@ struct FilePerKeyEnvironmentVariables {
 };
 
 struct BucketBackendEnvironmentVariables {
+    // 0/false: buffered; packed/true/1: packed direct writes;
+    // aligned: aligned direct writes
+    // (BucketBackendConfig::aligned_direct_write).
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_OFFLOAD_BUCKET_COPY_THREADS);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_BUCKET_MAX_TOTAL_SIZE);
+    // Comma-separated per-disk quotas, positionally aligned with the disk
+    // list in MOONCAKE_OFFLOAD_FILE_STORAGE_PATH. Kept as a string because it
+    // is a list, not a scalar.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY);
@@ -133,6 +143,7 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_ROOT_DIR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_FS_ADAPTER);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_FS_TYPE);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCS_EFC_CONFIG);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_ALLOCATOR);
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_DISTRIBUTED_HEALTH_CHECK);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_SHARD_COUNT);
@@ -146,6 +157,17 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(double, MOONCAKE_DFS_EVICTION_LOW_WATERMARK);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_DEFERRED_FREE_SECONDS);
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
+};
+
+struct KvcsEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCS_EFC_SOCKET);
+    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCS_MAX_VALUE_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_MAX_KEY_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_MAX_KEYS_PER_BATCH);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_GET_WORKERS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_SET_WORKERS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_KVCS_SIMPLE_WORKERS);
+    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCS_OPERATION_TIMEOUT_MS);
 };
 
 struct OssAdapterEnvironmentVariables {
@@ -168,6 +190,26 @@ struct OssAdapterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MOONCAKE_OSS_UPLOAD_BUFFER_SIZE);
 };
 
+struct S3AdapterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_ENDPOINT);
+    MC_DEFINE_ENV_VAR(std::string, AWS_ENDPOINT_URL);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_BUCKET);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_REGION);
+    MC_DEFINE_ENV_VAR(std::string, AWS_REGION);
+    MC_DEFINE_ENV_VAR(std::string, AWS_DEFAULT_REGION);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, AWS_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_SECRET_ACCESS_KEY);
+    MC_DEFINE_ENV_VAR(std::string, AWS_SECRET_ACCESS_KEY);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_S3_SESSION_TOKEN);
+    MC_DEFINE_ENV_VAR(std::string, AWS_SESSION_TOKEN);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_S3_PATH_STYLE);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_S3_ANONYMOUS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_S3_MAX_CONNECTIONS);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_S3_RECEIVE_BUFFER_SIZE);
+    MC_DEFINE_ENV_VAR(int, MOONCAKE_S3_UPLOAD_BUFFER_SIZE);
+};
+
 struct OffsetAllocatorBackendEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_EVICTION_POLICY);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_HIGH_RATIO);
@@ -180,6 +222,8 @@ struct OffsetAllocatorBackendEnvironmentVariables {
 };
 
 struct ReplicaSelectionEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_HCA_AFFINITY);
+    MC_DEFINE_ENV_VAR(bool, MC_STORE_HCA_NUMA_SEGMENTS);
     // Only the exact string "1" enables scoring, unlike canonical bool parsing.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
 };

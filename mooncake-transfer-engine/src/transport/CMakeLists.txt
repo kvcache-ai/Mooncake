@@ -44,11 +44,9 @@ endif()
 add_subdirectory(shm_transport)
 target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
 
+
 if(USE_ASCEND_DIRECT)
   add_subdirectory(ascend_transport)
-elseif(USE_ASCEND)
-  add_subdirectory(ascend_transport)
-  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
 endif()
 
 if(USE_ASCEND_HETEROGENEOUS)
@@ -99,7 +97,7 @@ endif()
 if(USE_EFA)
   add_subdirectory(efa_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:efa_transport>)
-  target_link_libraries(transport PRIVATE fabric)
+  target_link_libraries(transport PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 if(USE_CXI)

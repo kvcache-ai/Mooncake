@@ -1,6 +1,8 @@
 #include "gpu_runtime.h"
 
+#include <algorithm>
 #include <exception>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -17,6 +19,22 @@ void warnCleanupFailure(const char* operation, const char* error) noexcept {
 }
 
 }  // namespace
+
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+PGResult<uint64_t> gpuTimeoutTicks(int device_index, size_t timeout_us) {
+    if (timeout_us == 0) return uint64_t{0};
+    PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
+    int clock_rate_khz_value = 0;
+    PG_TRY_CUDA(cudaDeviceGetAttribute(&clock_rate_khz_value,
+                                       cudaDevAttrClockRate, device_index));
+    const uint64_t clock_rate_khz = static_cast<uint64_t>(clock_rate_khz_value);
+    if (clock_rate_khz == 0) return uint64_t{0};
+    if (timeout_us > std::numeric_limits<uint64_t>::max() / clock_rate_khz) {
+        return uint64_t{std::numeric_limits<uint64_t>::max()};
+    }
+    return uint64_t{std::max<uint64_t>(1, timeout_us * clock_rate_khz / 1000)};
+}
+#endif
 
 PGResult<GpuDeviceGuard> GpuDeviceGuard::create(int device) {
     PG_VALIDATE_ARG(device >= 0, "invalid CUDA device index");

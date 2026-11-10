@@ -25,6 +25,7 @@
 #ifdef WITH_METRICS
 #include <iomanip>
 #include <sstream>
+#include "transfer_engine_metrics.h"
 #endif
 
 #include "transfer_metadata_plugin.h"
@@ -128,12 +129,11 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
-#ifdef USE_ASCEND
-    // The only difference in initializing the Ascend Transport is that the
-    // `local_server_name` must include the physical NPU card ID. The format
-    // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
-    // While the desc_name stored in the metadata remains in the format of
-    // ip:port.
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    // Ascend builds also accept the legacy `ip:port:npu_x` local_server_name
+    // form. The NPU id is only informational now (the Ascend Direct transport
+    // selects devices through ACL/adxl); the segment name stored in the
+    // metadata stays in the `ip:port` form.
     int devicePhyId = -1;
     auto [host_name, port] =
         parseHostNameWithPortAscend(local_server_name, &devicePhyId);
@@ -174,15 +174,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 LOG(ERROR) << "P2P: No valid port found for local TCP service.";
                 return -1;
             }
-#if defined(USE_ASCEND)
-            // The current version of Ascend Transport does not support IPv6,
-            // but it will be added in a future release.
-            local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
-#else
             local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
                                  std::to_string(desc.rpc_port);
-#endif
         }
     } else {
         rpc_binding_method = "new RPC mapping";
@@ -221,15 +214,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
               << "";
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-#ifdef USE_ASCEND
-    std::string mutable_server_name =
-        local_server_name_ + ":npu_" + std::to_string(devicePhyId);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, mutable_server_name);
-#else
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
-#endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
@@ -274,13 +260,22 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    Transport* ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
-    if (!ascend_transport) {
-        LOG(ERROR) << "Failed to install Ascend transport";
-        return -1;
+    if (shouldInstallAscendTransport(auto_discover_config_.protocol)) {
+        Transport* ascend_transport =
+            multi_transports_->installTransport("ascend", local_topology_);
+        if (!ascend_transport) {
+            LOG(ERROR) << "Failed to install Ascend transport";
+            return -1;
+        }
+        maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+        return 0;
     }
-#else
+    // The hint asked for a host transport. Discovery installs it below when
+    // enabled; with discovery off the caller installs it explicitly, the way
+    // Store and the Python binding do.
+    LOG(INFO) << "protocol=" << auto_discover_config_.protocol
+              << ", skipping Ascend Direct for the host transports";
+#endif
 
 #ifdef USE_UBSHMEM
     Transport* ubshmem_transport =
@@ -292,8 +287,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     auto_discover_config_.enabled = false;
 #endif
 
-#if defined(USE_CXL) && !defined(USE_ASCEND) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
+#if defined(USE_CXL) && !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport* cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
@@ -306,22 +300,52 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
     if (auto_discover_config_.enabled) {
         LOG(INFO) << "Auto-discovering topology...";
+        // RDMA discovery drops EFA NICs (they expose SRD only, not the RC QPs
+        // the RDMA transport needs), but EFA discovery must keep them.
+        const bool use_efa = autoDiscoverUsesEfa();
         if (getenv("MC_CUSTOM_TOPO_JSON")) {
             auto path = getenv("MC_CUSTOM_TOPO_JSON");
             LOG(INFO) << "Using custom topology from: " << path;
             auto topo_json = loadTopologyJsonFile(path);
             if (!topo_json.empty()) {
-                local_topology_->parse(topo_json);
+                ret = local_topology_->parse(topo_json, filter_);
+                if (ret == 0 && !filter_.empty() &&
+                    local_topology_->getHcaList().empty()) {
+                    std::string names;
+                    for (const auto& name : filter_)
+                        names += (names.empty() ? "" : ",") + name;
+                    LOG(ERROR) << "No HCA in " << path
+                               << " matches device filter [" << names << "]";
+                    return ERR_DEVICE_NOT_FOUND;
+                }
             } else {
                 LOG(WARNING) << "Failed to load custom topology from " << path
                              << ", falling back to auto-detect.";
-                local_topology_->discover(filter_);
+                local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
             }
         } else {
-            local_topology_->discover(filter_);
+            local_topology_->discover(filter_, /*exclude_efa=*/!use_efa);
         }
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
+
+#ifdef USE_EFA
+        // Install EFA before the per-build transport selection below. The
+        // NVLink/MNNVL branch never installs EFA, so builds that combine
+        // USE_EFA with it (the default CUDA wheels) would otherwise fall back
+        // to TCP, or to RDMA on the host's non-EFA NICs.
+        if (use_efa) {
+            Transport* efa_transport =
+                multi_transports_->installTransport("efa", local_topology_);
+            if (!efa_transport) {
+                LOG(ERROR) << "Failed to install EFA transport";
+                return -1;
+            }
+            LOG(INFO) << "installTransport, type=efa";
+            maybeInstallShmTransport(multi_transports_.get(), local_topology_);
+            return 0;
+        }
+#endif
 
 #ifdef USE_UB
         Transport* ub_transport =
@@ -431,13 +455,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using " << gpu_p2p_name << " transport "
                       << "(forced or no HCA detected)";
         } else if (!no_hca || force_hca) {
-            Transport* t =
-                multi_transports_->installTransport("rdma", local_topology_);
+            const char* rdma_protocol =
+                globalConfig().use_rdma_twosided ? "rdma_twosided" : "rdma";
+            Transport* t = multi_transports_->installTransport(rdma_protocol,
+                                                               local_topology_);
             if (!t) {
                 LOG(ERROR) << "Failed to install RDMA transport";
                 return -1;
             }
-            LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
+            LOG(INFO) << "Using RDMA transport, type=" << rdma_protocol;
         } else {
 #ifdef USE_TCP
             Transport* t = multi_transports_->installTransport("tcp", nullptr);
@@ -507,7 +533,6 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
     }
-#endif
 
     maybeInstallShmTransport(multi_transports_.get(), local_topology_);
     return 0;
@@ -1131,6 +1156,11 @@ void TransferEngineImpl::InitializeMetricsConfig() {
                          << interval_env
                          << ", using default: " << metrics_interval_seconds_;
         }
+    }
+
+    if (metrics_enabled_) {
+        TransferEngineMetrics::enable();
+        TransferEngineMetrics::instance().initializeFromEnv();
     }
 }
 

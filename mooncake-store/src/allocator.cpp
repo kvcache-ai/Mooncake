@@ -74,6 +74,16 @@ AllocatedBuffer::~AllocatedBuffer() {
     }
 }
 
+AllocatedBuffer::AllocatedBuffer(
+    std::shared_ptr<BufferAllocatorBase> allocator, void* buffer_ptr,
+    std::size_t size,
+    std::optional<offset_allocator::OffsetAllocationHandle>&& offset_handle)
+    : allocator_(allocator),
+      buffer_ptr_(buffer_ptr),
+      size_(size),
+      protocol(allocator ? allocator->getTransportProtocol() : std::string()),
+      offset_handle_(std::move(offset_handle)) {}
+
 AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                                  const AllocatedBuffer::Descriptor& descriptor)
     : allocator_(std::move(allocator)),
@@ -85,30 +95,29 @@ AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
     }
 }
 
-bool AllocatedBuffer::copyTransferProtocolFrom(const AllocatedBuffer& source) {
-    if (protocol == "cxl" || source.protocol == "cxl") {
-        return false;
-    }
-    protocol = source.protocol;
-    return true;
-}
-
-// Implementation of get_descriptor
-AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
+std::string AllocatedBuffer::getTransportEndpoint(
+    std::optional<SegmentLocality>* locality) const {
     auto alloc = allocator_.lock();
     std::string endpoint;
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
+        if (locality) *locality = alloc->GetLocality();
     } else {
-        LOG(ERROR) << "allocator=expired_or_null in get_descriptor";
+        LOG(ERROR) << "allocator=expired_or_null in getTransportEndpoint";
     }
 
     if (this->protocol == "cxl") {
         endpoint = this->segment_name_;
     }
+    return endpoint;
+}
 
+// Implementation of get_descriptor
+AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor(
+    std::optional<SegmentLocality>* locality) const {
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol,
+            getTransportEndpoint(locality)};
 }
 
 void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
@@ -138,6 +147,7 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
 CachelibBufferAllocator::Create(std::string segment_name, size_t base,
                                 size_t size, std::string transport_endpoint,
+                                std::string transport_protocol,
                                 ReplicaType replica_type) {
     if (!IsValidCachelibLayout(base, size)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -148,19 +158,21 @@ CachelibBufferAllocator::Create(std::string segment_name, size_t base,
     // exhaustion follows the process-level fail-fast policy.
     return std::shared_ptr<CachelibBufferAllocator>(new CachelibBufferAllocator(
         std::move(segment_name), base, size, std::move(transport_endpoint),
-        replica_type));
+        std::move(transport_protocol), replica_type));
 }
 
 tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,
                       std::string segment_name, size_t base, size_t size,
                       std::string transport_endpoint,
+                      std::string transport_protocol,
                       ReplicaType replica_type) {
     switch (allocator_type) {
         case BufferAllocatorType::CACHELIB: {
             auto allocator = CachelibBufferAllocator::Create(
                 std::move(segment_name), base, size,
-                std::move(transport_endpoint), replica_type);
+                std::move(transport_endpoint), std::move(transport_protocol),
+                replica_type);
             if (!allocator) {
                 return tl::make_unexpected(allocator.error());
             }
@@ -172,7 +184,8 @@ CreateBufferAllocator(BufferAllocatorType allocator_type,
             return std::shared_ptr<BufferAllocatorBase>(
                 std::make_shared<OffsetBufferAllocator>(
                     std::move(segment_name), base, size,
-                    std::move(transport_endpoint), replica_type));
+                    std::move(transport_endpoint),
+                    std::move(transport_protocol), replica_type));
         default:
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -181,11 +194,13 @@ CreateBufferAllocator(BufferAllocatorType allocator_type,
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
                                                  std::string transport_endpoint,
+                                                 std::string transport_protocol,
                                                  ReplicaType replica_type)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       transport_endpoint_(std::move(transport_endpoint)),
+      transport_protocol_(std::move(transport_protocol)),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
@@ -305,7 +320,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
 
 std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
+    std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
     if (replica_type != ReplicaType::MEMORY ||
         !IsValidCachelibLayout(base, size)) {
@@ -325,7 +340,8 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     }
 
     auto created = CachelibBufferAllocator::Create(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
+        std::move(segment_name), base, size, std::move(transport_endpoint),
+        std::move(transport_protocol), replica_type);
     if (!created) {
         return std::nullopt;
     }
@@ -348,11 +364,13 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
                                              std::string transport_endpoint,
+                                             std::string transport_protocol,
                                              ReplicaType replica_type)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       transport_endpoint_(std::move(transport_endpoint)),
+      transport_protocol_(std::move(transport_protocol)),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
@@ -369,9 +387,7 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
         max_capacity =
             std::max(max_capacity, static_cast<uint64_t>(1024 * 1024));
         max_capacity =
-            std::min(max_capacity,
-                     static_cast<uint64_t>(
-                         offset_allocator::OffsetAllocatorSnapshot::kMaxNodes));
+            std::min(max_capacity, static_cast<uint64_t>(64 * 1024 * 1024));
         // Create the offset allocator
         offset_allocator_ = offset_allocator::OffsetAllocator::create(
             base, size, static_cast<uint32_t>(init_capacity),
@@ -387,79 +403,6 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
         LOG(ERROR) << "offset_allocator_init_exception error=" << e.what();
         throw;
     }
-}
-
-OffsetBufferAllocator::OffsetBufferAllocator(
-    OffsetBufferAllocatorSnapshot snapshot,
-    std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator)
-    : segment_name_(std::move(snapshot.segment_name)),
-      base_(snapshot.base),
-      total_size_(snapshot.capacity),
-      transport_endpoint_(std::move(snapshot.transport_endpoint)),
-      replica_type_(ReplicaType::MEMORY),
-      offset_allocator_(std::move(offset_allocator)) {}
-
-tl::expected<void, std::string>
-OffsetBufferAllocatorSnapshot::ValidateMetadata() const {
-    if (allocation_state.base != base ||
-        allocation_state.capacity != capacity) {
-        return tl::make_unexpected(fmt::format(
-            "allocator bounds mismatch: outer base={}, capacity={}; inner "
-            "base={}, capacity={}",
-            base, capacity, allocation_state.base, allocation_state.capacity));
-    }
-    if (used_bytes > capacity ||
-        used_bytes >
-            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-        return tl::make_unexpected(
-            fmt::format("invalid usage {} for capacity {} or signed metrics",
-                        used_bytes, capacity));
-    }
-    if (used_bytes != allocation_state.allocated_size) {
-        return tl::make_unexpected(
-            fmt::format("used_bytes {} does not match allocated_size {}",
-                        used_bytes, allocation_state.allocated_size));
-    }
-    return {};
-}
-
-tl::expected<void, std::string> OffsetBufferAllocatorSnapshot::Validate()
-    const {
-    if (auto valid = ValidateMetadata(); !valid) return valid;
-    return allocation_state.Validate();
-}
-
-tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
-OffsetBufferAllocator::Restore(OffsetBufferAllocatorSnapshot snapshot) {
-    const auto used_bytes = snapshot.used_bytes;
-    if (auto valid = snapshot.ValidateMetadata(); !valid) {
-        LOG(ERROR) << "OffsetBufferAllocator::Restore rejected snapshot for "
-                   << snapshot.segment_name << ": " << valid.error();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    // The inner factory validates its complete snapshot and logs the specific
-    // failure before constructing an allocator. No metrics are published yet.
-    auto offset_allocator = offset_allocator::OffsetAllocator::Restore(
-        std::move(snapshot.allocation_state));
-    if (!offset_allocator) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto allocator =
-        std::shared_ptr<OffsetBufferAllocator>(new OffsetBufferAllocator(
-            std::move(snapshot), std::move(*offset_allocator)));
-    // No allocation handles exist yet. Pair restored usage with the same
-    // accounting that allocate()/destruction use, before publishing the object.
-    MasterMetricManager::instance().inc_allocated_mem_size(
-        allocator->segment_name_, static_cast<int64_t>(used_bytes));
-    allocator->SetUsageBytesForRestore(used_bytes);
-    return allocator;
-}
-
-OffsetBufferAllocatorSnapshot OffsetBufferAllocator::CaptureSnapshot() const {
-    return {segment_name_,       base_,
-            total_size_,         size(),
-            transport_endpoint_, offset_allocator_->CaptureSnapshot()};
 }
 
 OffsetBufferAllocator::~OffsetBufferAllocator() {
@@ -562,14 +505,15 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
 
 std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
-    std::string transport_endpoint,
+    std::string transport_endpoint, std::string transport_protocol,
     const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
     if (base > std::numeric_limits<size_t>::max() - size) {
         return std::nullopt;
     }
     const size_t end = base + size;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
+        std::move(segment_name), base, size, std::move(transport_endpoint),
+        std::move(transport_protocol), replica_type);
     const auto offset_allocator = allocator->getOffsetAllocator();
 
     std::vector<size_t> order(allocations.size());

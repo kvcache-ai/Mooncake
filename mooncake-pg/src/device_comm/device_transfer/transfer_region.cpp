@@ -1,6 +1,7 @@
 #include "device_comm/device_transfer/transfer_region.h"
 
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <utility>
 
@@ -40,7 +41,7 @@ RegionSlice& RegionSlice::operator=(RegionSlice&& other) noexcept {
 }
 
 void* RegionSlice::addr() const noexcept {
-    return static_cast<char*>(owner_->addr_) + offset_;
+    return static_cast<char*>(owner_->addr()) + offset_;
 }
 
 uint64_t RegionSlice::offset() const noexcept { return offset_; }
@@ -64,38 +65,17 @@ PGResult<DeviceTransferRegion> DeviceTransferRegion::create(int device_index,
                                                             size_t size) {
     PG_VALIDATE_ARG(size != 0, "device transfer region is empty");
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
-
-    DeviceTransferRegion region(device_index, size);
-    PG_TRY_CUDA(cudaMalloc(&region.addr_, size));
-
-    PG_ASSERT(!addOverflows(reinterpret_cast<uintptr_t>(region.addr_), size),
-              "DeviceTransferRegion address range overflows");
-    region.free_ranges_.emplace(0, size);
+    DeviceTransferRegion region(device_index);
+    PG_TRY(region.allocateBacking(size));
+    PG_ASSERT(
+        !addOverflows(reinterpret_cast<uintptr_t>(region.addr_), region.size_),
+        "DeviceTransferRegion address range overflows");
+    region.free_ranges_.emplace(0, region.size_);
     return region;
 }
 
-PGResult<DeviceTransferRegion> DeviceTransferRegion::createWithAllocator(
-    int device_index, size_t size, Allocate allocate, Deallocate deallocate) {
-    PG_VALIDATE_ARG(size != 0, "device transfer region is empty");
-    PG_ASSERT(allocate && deallocate,
-              "DeviceTransferRegion requires a complete allocator");
-    PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
-
-    DeviceTransferRegion region(device_index, size);
-    region.deallocate_ = std::move(deallocate);
-    region.addr_ = allocate(size);
-    PG_VALIDATE_STATE(region.addr_,
-                      "failed to allocate device transfer region");
-
-    PG_ASSERT(!addOverflows(reinterpret_cast<uintptr_t>(region.addr_), size),
-              "DeviceTransferRegion address range overflows");
-    region.free_ranges_.emplace(0, size);
-    return region;
-}
-
-DeviceTransferRegion::DeviceTransferRegion(int device_index,
-                                           size_t size) noexcept
-    : device_index_(device_index), size_(size) {}
+DeviceTransferRegion::DeviceTransferRegion(int device_index) noexcept
+    : device_index_(device_index) {}
 
 DeviceTransferRegion::~DeviceTransferRegion() noexcept {
     auto result = release();
@@ -110,21 +90,81 @@ DeviceTransferRegion::DeviceTransferRegion(
     : device_index_(std::exchange(other.device_index_, -1)),
       addr_(std::exchange(other.addr_, nullptr)),
       size_(std::exchange(other.size_, 0)),
-      deallocate_(std::move(other.deallocate_)),
+      handle_(std::exchange(other.handle_, 0)),
+      mapped_(std::exchange(other.mapped_, false)),
       free_ranges_(std::move(other.free_ranges_)),
       allocations_(std::move(other.allocations_)) {
     PG_ASSERT(allocations_.empty(),
               "cannot move DeviceTransferRegion with live slices");
 }
 
+PGResult<void> DeviceTransferRegion::allocateBacking(size_t bytes) {
+#if CUDA_VERSION >= 12030
+    // FABRIC VMM lets TE P2P and NCCL share the same allocation.
+    int fabric_supported = 0;
+    cuDeviceGetAttribute(&fabric_supported,
+                         CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+                         device_index_);
+    if (fabric_supported) {
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device_index_;
+        prop.requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
+            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR |
+            CU_MEM_HANDLE_TYPE_FABRIC);
+        int rdma_supported = 0;
+        PG_TRY_CU(cuDeviceGetAttribute(
+            &rdma_supported,
+            CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
+            device_index_));
+        prop.allocFlags.gpuDirectRDMACapable = rdma_supported != 0;
+
+        // Match NCCL's user-buffer requirements without depending on libnccl.
+        size_t granularity = 0;
+        PG_TRY_CU(cuMemGetAllocationGranularity(
+            &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+        PG_VALIDATE_STATE(granularity != 0,
+                          "VMM allocation granularity is zero");
+        const size_t padding =
+            (granularity - bytes % granularity) % granularity;
+        PG_VALIDATE_ARG(bytes <= std::numeric_limits<size_t>::max() - padding,
+                        "device region size overflows VMM alignment");
+        size_ = bytes + padding;
+
+        const auto result = cuMemCreate(&handle_, size_, &prop, 0);
+        if (result != CUDA_ERROR_NOT_PERMITTED &&
+            result != CUDA_ERROR_NOT_SUPPORTED) {
+            PG_TRY_CU(result);
+            CUdeviceptr address = 0;
+            PG_TRY_CU(cuMemAddressReserve(&address, size_, granularity, 0, 0));
+            addr_ = reinterpret_cast<void*>(address);
+            PG_TRY_CU(cuMemMap(address, size_, 0, handle_, 0));
+            mapped_ = true;
+            CUmemAccessDesc access{};
+            access.location = prop.location;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            PG_TRY_CU(cuMemSetAccess(address, size_, &access, 1));
+            return {};
+        }
+    }
+#endif
+    // Without FABRIC, TE P2P needs legacy CUDA IPC: POSIX FD import is not
+    // implemented. Prefer keeping P2P available when both routes cannot share
+    // one allocation.
+    PG_TRY_CUDA(cudaMalloc(&addr_, bytes));
+    size_ = bytes;
+    return {};
+}
+
 PGResult<RegionSlice> DeviceTransferRegion::allocate(size_t size,
                                                      size_t alignment) {
     std::lock_guard<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(addr_, "DeviceTransferRegion is closed");
+    PG_VALIDATE_STATE(addr(), "DeviceTransferRegion is closed");
     PG_VALIDATE_ARG(size != 0, "DeviceTransferRegion slice is empty");
     PG_VALIDATE_ARG(alignment != 0, "DeviceTransferRegion alignment is zero");
 
-    const uint64_t base_address = reinterpret_cast<uintptr_t>(addr_);
+    const uint64_t base_address = reinterpret_cast<uintptr_t>(addr());
 
     for (auto current = free_ranges_.begin(); current != free_ranges_.end();
          ++current) {
@@ -161,7 +201,7 @@ PGResult<RegionSlice> DeviceTransferRegion::allocate(size_t size,
 }
 
 PGResult<void> DeviceTransferRegion::release() {
-    if (!addr_) return {};
+    if (!addr_ && !handle_) return {};
     PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index_));
 
     {
@@ -173,15 +213,23 @@ PGResult<void> DeviceTransferRegion::release() {
         free_ranges_.clear();
     }
 
-    if (deallocate_) {
-        deallocate_(addr_, size_);
-    } else {
+    if (!handle_) {
         PG_TRY_CUDA(cudaFree(addr_));
+        addr_ = nullptr;
+    } else {
+        if (mapped_) {
+            PG_TRY_CU(cuMemUnmap(reinterpret_cast<CUdeviceptr>(addr_), size_));
+            mapped_ = false;
+        }
+        if (addr_) {
+            PG_TRY_CU(
+                cuMemAddressFree(reinterpret_cast<CUdeviceptr>(addr_), size_));
+            addr_ = nullptr;
+        }
+        PG_TRY_CU(cuMemRelease(handle_));
+        handle_ = 0;
     }
-    addr_ = nullptr;
     size_ = 0;
-    deallocate_ = {};
-    device_index_ = -1;
     return {};
 }
 

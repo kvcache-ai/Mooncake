@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <atomic>
+
 #include "config.h"
 #include "common.h"
 #include "transfer_metadata.h"
@@ -45,30 +47,54 @@ void TransferMetadata::SegmentDesc::dump() const {
     LOG(INFO) << "  timestamp: " << timestamp;
 }
 
-void TransferMetadata::dumpMetadataContent(const std::string& segment_name,
-                                           uint64_t offset, uint64_t length) {
-    thread_local uint64_t last_ts = 0;
-    uint64_t current_ts = getCurrentTimeInNano();
-    const static uint64_t kMinDisplayThreshold = 500000000;  // 0.5 sec
+void TransferMetadata::dumpMetadataContent(
+    const std::shared_ptr<const SegmentDesc>& desc, uint64_t offset,
+    uint64_t length) {
+    const uint64_t now_ns = getCurrentTimeInNano();
+    static constexpr uint64_t kMinDisplayThreshold = 500000000;  // 0.5 sec
 
-    auto segment_locked = segment_lock_.tryLockShared();
-    auto rpc_meta_locked = rpc_meta_lock_.tryLockShared();
-    if (!segment_locked || !rpc_meta_locked) {
-        if (rpc_meta_locked) rpc_meta_lock_.unlockShared();
-        if (segment_locked) segment_lock_.unlockShared();
+    // Runs synchronously on the transfer worker (CQ polling) thread, so the
+    // per-event record must be fixed-size and capped process-wide: at most
+    // one line per window, with a suppressed-event counter keeping the
+    // failure rate observable without flooding.
+    static std::atomic<uint64_t> g_last_log_ns{0};
+    static std::atomic<uint64_t> g_suppressed_count{0};
+
+    uint64_t prev = g_last_log_ns.load(std::memory_order_relaxed);
+    if (!globalConfig().trace &&
+        !(now_ns - prev > kMinDisplayThreshold &&
+          g_last_log_ns.compare_exchange_strong(prev, now_ns,
+                                                std::memory_order_relaxed))) {
+        g_suppressed_count.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
-    if (current_ts - last_ts > kMinDisplayThreshold || globalConfig().trace) {
-        LOG(INFO) << "Failed to get segment descriptor for segment "
-                  << segment_name << " address " << (void*)offset << "--"
-                  << (void*)(offset + length);
-        dumpMetadataContentUnlocked();
-        last_ts = current_ts;
+    // The caller holds the descriptor the failed device/buffer selection
+    // matched against; log that exact snapshot (its metadata_version is the
+    // failure-relevant one) rather than re-looking-up the segment cache,
+    // which may already hold a newer descriptor installed by a concurrent
+    // syncSegmentCache.  No metadata locks are needed for a held snapshot.
+    const uint64_t suppressed =
+        g_suppressed_count.exchange(0, std::memory_order_relaxed);
+    if (desc) {
+        LOG(INFO) << "Failed to select peer device/buffer: segment "
+                  << desc->name << ", address " << (void*)offset << "--"
+                  << (void*)(offset + length) << ", metadata_version "
+                  << desc->metadata_version << ", buffers "
+                  << desc->buffers.size() << ", suppressed " << suppressed
+                  << " similar events in the last window";
+    } else {
+        LOG(INFO) << "Failed to select peer device/buffer: address "
+                  << (void*)offset << "--" << (void*)(offset + length)
+                  << ", no descriptor held, suppressed " << suppressed
+                  << " similar events in the last window";
     }
 
-    if (rpc_meta_locked) rpc_meta_lock_.unlockShared();
-    if (segment_locked) segment_lock_.unlockShared();
+    // The full descriptor body (one line per registered buffer) is unbounded
+    // work; keep it trace-mode only, printed from the caller-held snapshot.
+    if (globalConfig().trace && desc) {
+        desc->dump();
+    }
 }
 
 void TransferMetadata::dumpMetadataContentUnlocked() {
