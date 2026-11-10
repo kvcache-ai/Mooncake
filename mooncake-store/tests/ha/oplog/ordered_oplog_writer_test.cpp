@@ -31,7 +31,8 @@ namespace {
 
 class TimeoutGate {
    public:
-    TimeoutGate() {
+    explicit TimeoutGate(std::string failpoint = "durable_wait_before_timeout")
+        : failpoint_(std::move(failpoint)) {
         char pattern[] = "/tmp/mooncake-durable-wait-XXXXXX";
         const char* directory = mkdtemp(pattern);
         if (!directory) throw std::runtime_error("cannot create timeout gate");
@@ -92,7 +93,7 @@ class TimeoutGate {
 
    private:
     std::string Path(const std::string& suffix) const {
-        return root_ + "/durable_wait_before_timeout" + suffix;
+        return root_ + "/" + failpoint_ + suffix;
     }
     static void Save(const char* name, std::optional<std::string>& value) {
         if (const char* current = std::getenv(name)) value = current;
@@ -105,6 +106,7 @@ class TimeoutGate {
             unsetenv(name);
     }
     std::string root_;
+    std::string failpoint_;
     std::optional<std::string> previous_dir_, previous_timeout_;
     bool released_{false};
 };
@@ -2311,6 +2313,46 @@ TEST(OrderedOpLogWriterTimeoutTest, ConcurrentContinuationsCanStopWriter) {
                 std::this_thread::yield();
             if (finished != 2) std::_Exit(1);
             deadline_gate.Close();
+            std::_Exit(0);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
+TEST(OrderedOpLogWriterTimeoutTest,
+     DispatchFailureFallbackDoesNotBlockDeadlineThread) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        ([] {
+            TimeoutGate dispatch_gate("durable_wait_before_dispatch_failure");
+            OrderedOpLogWriter writer(
+                {}, [](const auto&, const auto&) { return ErrorCode::OK; });
+            auto callback_entered_promise = std::promise<void>();
+            auto callback_entered = callback_entered_promise.get_future();
+            auto release_callback_promise = std::promise<void>();
+            auto release_callback =
+                release_callback_promise.get_future().share();
+            auto waiter = writer.AwaitDurable(1, std::chrono::milliseconds(1))
+                              .thenValue([&](ErrorCode error) {
+                                  callback_entered_promise.set_value();
+                                  release_callback.wait();
+                                  return error;
+                              });
+            if (!dispatch_gate.WaitForHit() || !dispatch_gate.Release())
+                std::_Exit(1);
+            if (callback_entered.wait_for(std::chrono::seconds(5)) !=
+                std::future_status::ready)
+                std::_Exit(1);
+
+            auto stopped =
+                std::async(std::launch::async, [&] { writer.Stop(); });
+            if (stopped.wait_for(std::chrono::seconds(2)) !=
+                std::future_status::ready)
+                std::_Exit(1);
+            release_callback_promise.set_value();
+            if (std::move(waiter).get() != ErrorCode::PERSISTENT_FAIL)
+                std::_Exit(1);
+            stopped.get();
+            dispatch_gate.Close();
             std::_Exit(0);
         }()),
         ::testing::ExitedWithCode(0), "");

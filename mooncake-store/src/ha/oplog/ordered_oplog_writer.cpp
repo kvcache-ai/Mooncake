@@ -5,7 +5,9 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -24,6 +26,14 @@ namespace {
 
 thread_local const void* current_writer_worker = nullptr;
 
+class DurableWaitNotification {
+   public:
+    virtual ~DurableWaitNotification() = default;
+    virtual void Complete() = 0;
+
+    std::shared_ptr<DurableWaitNotification> next;
+};
+
 class DurableWaitExecutor final : public async_simple::Executor {
    public:
     static DurableWaitExecutor& Instance() {
@@ -34,8 +44,28 @@ class DurableWaitExecutor final : public async_simple::Executor {
     }
 
     bool schedule(Func task) override {
+        if (TestFailPoint::Wait("durable_wait_before_dispatch_failure")) {
+            throw std::system_error(std::make_error_code(
+                std::errc::resource_unavailable_try_again));
+        }
         pool_.enqueue(std::move(task));
         return true;
+    }
+
+    // Promise completion is drained away from the deadline thread. If
+    // async_simple has to fall back to inline continuation execution after a
+    // dispatch failure, a blocking continuation therefore cannot pin timers.
+    void Notify(std::shared_ptr<DurableWaitNotification> notification) {
+        {
+            std::lock_guard<std::mutex> lock(notification_mutex_);
+            if (notification_tail_) {
+                notification_tail_->next = notification;
+            } else {
+                notification_head_ = notification;
+            }
+            notification_tail_ = std::move(notification);
+        }
+        notification_cv_.notify_one();
     }
 
     // Queue-only execution, without thread affinity or inline dispatch.
@@ -43,8 +73,30 @@ class DurableWaitExecutor final : public async_simple::Executor {
     bool currentThreadInExecutor() const override { return false; }
 
    private:
-    DurableWaitExecutor() : pool_(4) {}
+    DurableWaitExecutor()
+        : pool_(4), notification_thread_([this] { NotificationLoop(); }) {}
+
+    void NotificationLoop() {
+        while (true) {
+            std::shared_ptr<DurableWaitNotification> notification;
+            {
+                std::unique_lock<std::mutex> lock(notification_mutex_);
+                notification_cv_.wait(
+                    lock, [this] { return notification_head_ != nullptr; });
+                notification = std::move(notification_head_);
+                notification_head_ = std::move(notification->next);
+                if (!notification_head_) notification_tail_.reset();
+            }
+            notification->Complete();
+        }
+    }
+
     ThreadPool pool_;
+    std::mutex notification_mutex_;
+    std::condition_variable notification_cv_;
+    std::shared_ptr<DurableWaitNotification> notification_head_;
+    std::shared_ptr<DurableWaitNotification> notification_tail_;
+    std::thread notification_thread_;
 };
 
 }  // namespace
@@ -55,12 +107,17 @@ struct OrderedOpLogWriter::Impl {
     using WaitScheduler = DeadlineScheduler<WaitDeadline>;
     using DurableWaiters =
         std::multimap<uint64_t, std::shared_ptr<DurableWaiter>>;
-    struct DurableWaiter {
+    struct DurableWaiter : DurableWaitNotification {
         async_simple::Promise<ErrorCode> promise;
+        ErrorCode completion_error{ErrorCode::OK};
         WaitScheduler::Handle deadline;
         // Protected by mutex; position is valid only while pending is true.
         DurableWaiters::iterator position;
         bool pending{false};
+
+        void Complete() override {
+            promise.setValue(ErrorCode{completion_error});
+        }
     };
 
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
@@ -100,9 +157,8 @@ struct OrderedOpLogWriter::Impl {
                               : last_error;
               }
               if (timed_out) {
-                  // The future's executor queues continuations separately:
-                  // setting the result never waits for a notification worker.
-                  timed_out->promise.setValue(ErrorCode{error});
+                  timed_out->completion_error = error;
+                  DurableWaitExecutor::Instance().Notify(std::move(timed_out));
               }
           }) {
         if (this->config.max_entries_per_batch == 0) {
