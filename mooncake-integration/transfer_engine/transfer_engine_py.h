@@ -312,6 +312,14 @@ class TransferEnginePy {
     uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }
 
    private:
+    // One status check for every task of an async batch, shared by
+    // transfer_check_status and get_batch_transfer_status. Returns 1 when
+    // every task completed, 0 while any is still running, -1 on a failure and
+    // -2 when a slice timed out. Does not free the batch; call forgetBatch()
+    // before freeing it.
+    int pollBatch(batch_id_t batch_id);
+    void forgetBatch(batch_id_t batch_id);
+
     std::shared_ptr<ScatterTransferTicket> scatterTransferSyncWithTicket(
         const std::string &endpoint,
         const std::vector<uintptr_t> &local_base_addresses,
@@ -333,6 +341,11 @@ class TransferEnginePy {
    private:
     std::shared_ptr<TransferEngine> engine_;
     Transport *xport_;
+
+    // For each async batch being polled, the first task not yet seen
+    // complete (see pollBatch).
+    std::mutex poll_mutex_;
+    std::unordered_map<batch_id_t, size_t> poll_next_task_;
 
     std::mutex mutex_;
     std::vector<std::stack<char *>> free_list_;
