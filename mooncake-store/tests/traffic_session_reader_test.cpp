@@ -174,23 +174,6 @@ TEST_F(SessionReaderTest, DetectsCorruptedBlock) {
     EXPECT_NE(error.find("block crc mismatch"), std::string::npos) << error;
 }
 
-TEST_F(SessionReaderTest, DetectsTruncatedSegment) {
-    const std::string session = WriteSession();
-    const auto segment = OnlySegment(session);
-    std::error_code ec;
-    std::filesystem::resize_file(
-        segment, kTrafficFileHeaderSize + kTrafficBlockHeaderSize + 2, ec);
-    ASSERT_FALSE(ec) << ec.message();
-
-    SessionReader reader;
-    std::string error;
-    ASSERT_TRUE(reader.Open(session, &error)) << error;
-    Record record;
-    EXPECT_EQ(reader.Next(&record, &error), SessionReader::NextResult::kError);
-    EXPECT_NE(error.find("truncated block payload"), std::string::npos)
-        << error;
-}
-
 TEST_F(SessionReaderTest, AcceptsSegmentWithoutFooter) {
     const std::string session = WriteSession();
     const auto segment = OnlySegment(session);
@@ -209,6 +192,37 @@ TEST_F(SessionReaderTest, AcceptsSegmentWithoutFooter) {
     EXPECT_TRUE(reader.incomplete());
     EXPECT_EQ(reader.records(), 2u);
     EXPECT_EQ(reader.payload_bytes(), 8u);
+    EXPECT_EQ(reader.block_count(), 1u);
+}
+
+TEST_F(SessionReaderTest, AcceptsTornFinalBlock) {
+    FileSink sink(1024 * 1024, 300, 0, RedactionMode::kNone);
+    ASSERT_TRUE(sink.OpenSession(dir_.path().string(), 1));
+    auto first = MakeRecord(7, 1, "abcdef");
+    auto second = MakeRecord(9, 2, "gh");
+    struct iovec first_iov[2] = {{first.data(), first.size()},
+                                 {second.data(), second.size()}};
+    ASSERT_TRUE(
+        sink.WriteRecords(first_iov, 2, first.size() + second.size(), 2));
+    auto third = MakeRecord(11, 3, "xyz");
+    struct iovec second_iov[1] = {{third.data(), third.size()}};
+    ASSERT_TRUE(sink.WriteRecords(second_iov, 1, third.size(), 1));
+    sink.Close();
+
+    const auto segment = OnlySegment(sink.session_dir());
+    const auto size = std::filesystem::file_size(segment);
+    std::error_code ec;
+    // A process killed during a write leaves no footer and a short last block.
+    // The block before it is intact, so the read stops at the cut.
+    std::filesystem::resize_file(segment, size - kTrafficFooterSize - 10, ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    SessionReader reader;
+    std::string error;
+    ASSERT_TRUE(reader.Open(sink.session_dir(), &error)) << error;
+    EXPECT_TRUE(reader.Finish(&error)) << error;
+    EXPECT_TRUE(reader.incomplete());
+    EXPECT_EQ(reader.records(), 2u);
     EXPECT_EQ(reader.block_count(), 1u);
 }
 

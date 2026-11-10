@@ -70,6 +70,9 @@ class SessionReader {
     std::uint8_t redaction_ = 0;
     bool footer_seen_ = false;
     bool incomplete_ = false;
+    // Set when the current segment ends in the middle of a block header or a
+    // block payload, which is what a process killed during a write leaves.
+    bool cut_short_ = false;
     std::vector<char> block_;
     std::size_t block_offset_ = 0;
     std::uint32_t block_records_left_ = 0;
