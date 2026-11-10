@@ -359,8 +359,8 @@ class TransferEngineImpl {
             }
             auto rc = sendNotifyByID(value.first, std::move(value.second));
             if (rc) {
-                LOG(ERROR)
-                    << "Failed to send notify message, error code: " << rc;
+                LOG(ERROR) << "Failed to send notify message, error code: "
+                           << rc;
             }
         }
         return result;

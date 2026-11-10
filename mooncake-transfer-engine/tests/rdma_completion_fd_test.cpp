@@ -257,8 +257,7 @@ TEST_F(RdmaCompletionFdTest, StaleRkeyFailsFromCq) {
     BatchID batch = submit(requests, /*capacity=*/4, /*notify=*/true);
     BatchCompletion done{};
     int matches = 0;
-    auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (std::chrono::steady_clock::now() < deadline) {
         if (!waitFd(sender_->completionFd(), 50)) continue;
         std::vector<BatchCompletion> rows;
@@ -304,8 +303,7 @@ TEST_F(RdmaCompletionFdTest, MultiSliceTaskWakesOnce) {
     BatchID batch = submit({request}, /*capacity=*/1, /*notify=*/true);
     BatchCompletion done{};
     int matches = 0;
-    auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (std::chrono::steady_clock::now() < deadline) {
         if (!waitFd(sender_->completionFd(), 50)) continue;
         std::vector<BatchCompletion> rows;
@@ -339,8 +337,8 @@ TEST_F(RdmaCompletionFdTest, ConcurrentSubmittersOneDispatcher) {
     source_.assign(total * kLen, 0);
     target_.assign(total * kLen, 0);
     for (int i = 0; i < total; ++i)
-        std::memset(source_.data() + i * kLen, static_cast<char>('A' + (i % 26)),
-                    kLen);
+        std::memset(source_.data() + i * kLen,
+                    static_cast<char>('A' + (i % 26)), kLen);
     ASSERT_EQ(sender_->registerLocalMemory(source_.data(), source_.size()), 0);
     ASSERT_EQ(receiver_->registerLocalMemory(target_.data(), target_.size()),
               0);
@@ -380,8 +378,7 @@ TEST_F(RdmaCompletionFdTest, ConcurrentSubmittersOneDispatcher) {
     }
 
     std::unordered_map<BatchID, BatchCompletion> got;
-    auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (got.size() < static_cast<size_t>(total) &&
            std::chrono::steady_clock::now() < deadline) {
         if (!waitFd(sender_->completionFd(), 100)) continue;
@@ -444,9 +441,8 @@ TEST_F(RdmaCompletionFdTest, DestructorWakesDupFd) {
     const int dup_fd = ::dup(sender_->completionFd());
     ASSERT_GE(dup_fd, 0);
     std::atomic<bool> woke{false};
-    std::thread waiter([&] {
-        woke.store(waitFd(dup_fd, 10000), std::memory_order_release);
-    });
+    std::thread waiter(
+        [&] { woke.store(waitFd(dup_fd, 10000), std::memory_order_release); });
     sender_.reset();
     waiter.join();
     EXPECT_TRUE(woke.load(std::memory_order_acquire));

@@ -126,9 +126,7 @@ class TestTransferEngineCompletionFd(unittest.TestCase):
         ready, _, _ = select.select([fd], [], [], 10)
         self.assertTrue(ready, "completion fd was not readable")
         rows = [
-            row
-            for row in source.drain_completions()
-            if row["batch_id"] == batch_id
+            row for row in source.drain_completions() if row["batch_id"] == batch_id
         ]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], int(TransferStatus.COMPLETED))

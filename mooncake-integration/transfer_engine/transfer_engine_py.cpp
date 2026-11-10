@@ -1290,8 +1290,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
-            if (enable_completion_notification &&
-                s.IsNotSupportedTransport()) {
+            if (enable_completion_notification && s.IsNotSupportedTransport()) {
                 throw CompletionNotificationFallback(s.ToString());
             }
             return 0;

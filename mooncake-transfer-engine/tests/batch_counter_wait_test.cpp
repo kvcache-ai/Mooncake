@@ -128,6 +128,82 @@ class ProbeTransport : public Transport {
     }
     const char* getName() const override { return "probe"; }
 };
+// NVMeoF never stores task.transferred_bytes. Its getTransferStatus sums
+// slice statuses, so settledTransferredBytes() would report 0.
+class SliceStatusProbe : public Transport {
+   public:
+    bool supportsBatchCompletionCounter() const override { return false; }
+    std::vector<TransferTask*> tasks;
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::OK();
+    }
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& incoming) override {
+        for (auto* task : incoming) {
+            tasks.push_back(task);
+            auto* slice = new Slice{};
+            slice->task = task;
+            slice->length = 17;
+            slice->ts = 0;
+            task->slice_list.push_back(slice);
+            task->slice_count = 1;
+            task->total_bytes = 17;
+        }
+        return Status::OK();
+    }
+    void succeed(size_t index) {
+        tasks.at(index)->slice_list.front()->status = Slice::SUCCESS;
+    }
+    void fail(size_t index) {
+        auto* task = tasks.at(index);
+        task->slice_list.front()->status = Slice::FAILED;
+        task->failed_slice_count = 1;
+    }
+    Status getTransferStatus(BatchID batch, size_t index,
+                             TransferStatus& status) override {
+        auto& task = toBatchDesc(batch).task_list.at(index);
+        uint64_t bytes = 0;
+        size_t settled = 0;
+        bool failed = false;
+        for (auto* slice : task.slice_list) {
+            if (slice->status == Slice::PENDING ||
+                slice->status == Slice::POSTED) {
+                continue;
+            }
+            ++settled;
+            if (slice->status == Slice::SUCCESS) {
+                bytes += slice->length;
+            } else {
+                failed = true;
+            }
+        }
+        if (settled < task.slice_count) {
+            status.s = WAITING;
+        } else if (failed) {
+            status.s = FAILED;
+        } else {
+            status.s = COMPLETED;
+        }
+        status.transferred_bytes = status.s == COMPLETED ? bytes : 0;
+        return Status::OK();
+    }
+
+   private:
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
+    int unregisterLocalMemory(void*, bool) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+    const char* getName() const override { return "slice-status"; }
+};
 class BatchCounterWait : public ::testing::Test {
    protected:
     std::string local = "counter-test:1";
@@ -138,6 +214,8 @@ class BatchCounterWait : public ::testing::Test {
         std::make_shared<ProbeTransport>(true);
     std::shared_ptr<ProbeTransport> tcp =
         std::make_shared<ProbeTransport>(false);
+    std::shared_ptr<SliceStatusProbe> nvmeof =
+        std::make_shared<SliceStatusProbe>();
     std::vector<Transport::BatchID> batches;
     std::vector<Transport::TransferRequest> requests;
     int64_t saved_timeout;
@@ -146,7 +224,9 @@ class BatchCounterWait : public ::testing::Test {
         globalConfig().slice_timeout = -1;
         MultiTransportTestPeer::install(multi, "rdma", rdma);
         MultiTransportTestPeer::install(multi, "tcp", tcp);
-        for (auto [id, proto] : {std::pair{1, "rdma"}, std::pair{2, "tcp"}}) {
+        MultiTransportTestPeer::install(multi, "nvmeof", nvmeof);
+        for (auto [id, proto] : {std::pair{1, "rdma"}, std::pair{2, "tcp"},
+                                 std::pair{3, "nvmeof"}}) {
             auto d = std::make_shared<TransferMetadata::SegmentDesc>();
             d->name = "peer:" + std::to_string(id);
             d->protocol = proto;
@@ -203,6 +283,31 @@ TEST_F(BatchCounterWait, ZeroAndPartialCounterSkipTransportPolling) {
     int polls = rdma->polls;
     EXPECT_EQ(query(b).transferred_bytes, 34u);
     EXPECT_EQ(rdma->polls, polls);
+}
+TEST_F(BatchCounterWait, LegacySliceStatusBytesStayOnTheWalk) {
+    auto completed = batch(2);
+    ASSERT_TRUE(submit(completed, {3, 3}).ok());
+    nvmeof->succeed(0);
+    nvmeof->succeed(1);
+    auto done = query(completed);
+    EXPECT_EQ(done.s, Transport::COMPLETED);
+    EXPECT_EQ(done.transferred_bytes, 34u);
+    for (const auto& task : Transport::toBatchDesc(completed).task_list) {
+        const uint64_t stored = task.transferred_bytes;
+        EXPECT_EQ(stored, 0u);
+    }
+
+    const size_t base = nvmeof->tasks.size();
+    auto failed = batch(2);
+    ASSERT_TRUE(submit(failed, {3, 3}).ok());
+    nvmeof->succeed(base);
+    nvmeof->fail(base + 1);
+    auto status = query(failed);
+    EXPECT_EQ(status.s, Transport::FAILED);
+    // The successful task contributes its slice sum. settledTransferredBytes
+    // is 0 because this probe never writes task.transferred_bytes.
+    EXPECT_EQ(Transport::toBatchDesc(failed).settledTransferredBytes(), 0u);
+    EXPECT_EQ(status.transferred_bytes, 17u);
 }
 TEST_F(BatchCounterWait, LegacyAndMixedBatchesKeepPolling) {
     auto b = batch();
