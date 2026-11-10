@@ -167,7 +167,9 @@ class HAMetricManager {
      * @brief Set the replication lag (entries behind Primary).
      *
      * Published by HotStandbyService::ReplicationLoop from the same
-     * primary/applied pair that GetSyncStatus() reports as lag_entries.
+     * primary/applied pair that GetSyncStatus() reports as lag_entries, after
+     * every poll including failed ones. While the standby is disconnected the
+     * loop does not poll, so the last published value is retained.
      */
     void set_oplog_standby_lag(int64_t lag);
     int64_t get_oplog_standby_lag();

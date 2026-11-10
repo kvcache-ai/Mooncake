@@ -78,9 +78,14 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
             result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         } else if (err == ErrorCode::OK && current_floor > floor &&
                    current_floor == last_applied_batch_id_) {
+            // The first attempt may already have advanced the applier and
+            // filtered entries before it failed; carry those counts over so
+            // the retry does not discard them.
             const auto applied_batches = result.applied_batches;
+            const auto skipped_entries = result.skipped_entries;
             result = PollBatches(max_batches, current_floor);
             result.applied_batches += applied_batches;
+            result.skipped_entries += skipped_entries;
         } else if (err != ErrorCode::OK &&
                    err != ErrorCode::ETCD_KEY_NOT_EXIST) {
             SetPollError(result, err, IsRetryableBackendError(err));
