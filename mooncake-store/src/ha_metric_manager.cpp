@@ -89,8 +89,10 @@ HAMetricManager::HAMetricManager()
     // OpLog Sequence Gauges
     : oplog_applied_sequence_id_("ha_oplog_applied_sequence_id",
                                  "Latest OpLog sequence ID applied by Standby"),
-      oplog_standby_lag_("ha_oplog_standby_lag",
-                         "Number of OpLog entries Standby is behind Primary"),
+      oplog_standby_lag_(
+          "ha_oplog_standby_lag",
+          "Number of OpLog entries Standby is behind Primary; the last "
+          "observed value is retained while the standby is disconnected"),
 
       // Error Counters
       oplog_skipped_entries_total_(
