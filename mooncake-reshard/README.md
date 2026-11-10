@@ -366,6 +366,10 @@ still occurs before a batch is produced; batching does not raise the budget.
 
 These implementation choices reduce Python bookkeeping while preserving
 coverage, bounds, canonical identities, and allocation lifetime contracts.
+Integer geometry normalization reuses exact immutable tuples only after checking
+every element and its minimum value. Lists and other supported sequences retain
+their existing normalization and validation behavior; no metadata is cached
+across bindings or generations.
 End-to-end startup also includes framework initialization, model allocation,
 transport, and serving readiness; it must be measured separately from these
 CPU paths.
