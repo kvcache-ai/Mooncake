@@ -318,6 +318,17 @@ if(USE_TCP)
                                                        gtest_main CUDA::cudart)
     add_test(NAME tcp_cuda_staging_test COMMAND tcp_cuda_staging_test)
   endif()
+
+  if(USE_ASCEND
+     OR USE_ASCEND_DIRECT
+     OR USE_ASCEND_HETEROGENEOUS
+     OR USE_UBSHMEM)
+    add_executable(tcp_ascend_staging_test
+                   ${WORKSPACE}/tcp_ascend_staging_test.cpp)
+    target_link_libraries(tcp_ascend_staging_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+    add_test(NAME tcp_ascend_staging_test COMMAND tcp_ascend_staging_test)
+  endif()
 endif()
 
 add_executable(tcp_address_validation_test
