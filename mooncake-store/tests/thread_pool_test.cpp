@@ -6,6 +6,13 @@
 #include <condition_variable>
 #include "thread_pool.h"
 
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <system_error>
+#endif
+
 namespace mooncake {
 
 class ThreadPoolTest : public ::testing::Test {
@@ -132,6 +139,42 @@ TEST_F(ThreadPoolTest, StressTest) {
 
     EXPECT_EQ(counter.load(), num_tasks);
 }
+
+#ifdef __linux__
+TEST_F(ThreadPoolTest, ConstructorFailureReturnsToCaller) {
+    const pid_t pid = fork();
+    ASSERT_NE(pid, -1);
+    if (pid == 0) {
+        const rlimit address_space = {1024ULL * 1024 * 1024,
+                                      1024ULL * 1024 * 1024};
+        if (setrlimit(RLIMIT_AS, &address_space) != 0) _Exit(2);
+        try {
+            ThreadPool pool(256);
+        } catch (const std::system_error&) {
+            _Exit(0);
+        } catch (...) {
+            _Exit(4);
+        }
+        _Exit(5);
+    }
+
+    int status = 0;
+    bool finished = false;
+    for (int attempt = 0; attempt < 1000 && !finished; ++attempt) {
+        finished = waitpid(pid, &status, WNOHANG) == pid;
+        if (!finished)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!finished) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        FAIL() << "ThreadPool constructor did not return after a worker "
+                  "creation failure";
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+#endif
 
 }  // namespace mooncake
 
