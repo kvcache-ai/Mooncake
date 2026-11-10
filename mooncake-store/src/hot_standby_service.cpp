@@ -197,6 +197,8 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
             preserve_promotion_baseline_ = false;
             applied_seq_id_.store(preserved_seq, std::memory_order_release);
             primary_seq_id_.store(preserved_seq, std::memory_order_release);
+            HAMetricManager::instance().set_oplog_applied_sequence_id(
+                static_cast<int64_t>(preserved_seq));
             baseline_seq_id = preserved_seq;
             {
                 std::lock_guard<std::mutex> cursor_lock(
@@ -226,6 +228,8 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
 
     applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
     primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(baseline_seq_id));
     return ErrorCode::OK;
 }
 
@@ -267,6 +271,8 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     });
     applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
     primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(baseline_seq_id));
     return ErrorCode::OK;
 }
 
@@ -1157,6 +1163,8 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     }
     applied_seq_id_.store(cursor->last_seq);
     primary_seq_id_.store(cursor->last_seq);
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(cursor->last_seq));
     last_error_.store(ErrorCode::OK);
     recovering_.store(false, std::memory_order_release);
     return metric_timer.Success(ErrorCode::OK);

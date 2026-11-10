@@ -319,5 +319,12 @@ def add_pr_dashboard_assets(app, pagename, templatename, context, doctree):
         app.add_js_file("pr-dashboard.js", loading_method="defer")
 
 
+def add_pypi_downloads_assets(app, pagename, templatename, context, doctree):
+    if pagename == "community/pypi-downloads":
+        app.add_css_file("pypi-downloads.css")
+        app.add_js_file("pypi-downloads.js", loading_method="defer")
+
+
 def setup(app):
     app.connect("html-page-context", add_pr_dashboard_assets)
+    app.connect("html-page-context", add_pypi_downloads_assets)

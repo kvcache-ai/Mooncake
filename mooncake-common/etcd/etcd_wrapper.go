@@ -33,8 +33,12 @@ import "C"
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +48,7 @@ import (
 	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
+	"google.golang.org/grpc"
 )
 
 // prefixWatchInfo stores cancel function and callback context for a prefix watch
@@ -136,13 +141,153 @@ const (
 	maintenanceStartupTimeout = 5 * time.Second
 )
 
-func newStoreClientConfig(validEndpoints []string) clientv3.Config {
+const (
+	mooncakeEtcdCACertEnv     = "MOONCAKE_ETCD_CA_CERT"
+	mooncakeEtcdClientCertEnv = "MOONCAKE_ETCD_CLIENT_CERT"
+	mooncakeEtcdClientKeyEnv  = "MOONCAKE_ETCD_CLIENT_KEY"
+	mooncakeEtcdServerNameEnv = "MOONCAKE_ETCD_SERVER_NAME"
+)
+
+type etcdTLSConfigSpec struct {
+	CACertPath     string
+	ClientCertPath string
+	ClientKeyPath  string
+	ServerName     string
+}
+
+// getenvViaLibc reads an env var directly from libc's `environ`, bypassing
+// the Go runtime's `syscall.envs` snapshot (which is frozen at the moment
+// `goenvs_unix()` runs — typically the first cgo dlopen). Without this,
+// any env var set by the host process AFTER libetcd_wrapper.so is dlopened
+// (e.g. via os.environ in Python, or via libc.setenv) is invisible to
+// Go's os.Getenv, causing TLS config to be silently dropped.
+func getenvViaLibc(name string) string {
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+	v := C.getenv(cName)
+	if v == nil {
+		return ""
+	}
+	return C.GoString(v)
+}
+
+func loadEtcdTLSConfigSpecFromEnv() (*etcdTLSConfigSpec, error) {
+	ca := strings.TrimSpace(getenvViaLibc(mooncakeEtcdCACertEnv))
+	cert := strings.TrimSpace(getenvViaLibc(mooncakeEtcdClientCertEnv))
+	key := strings.TrimSpace(getenvViaLibc(mooncakeEtcdClientKeyEnv))
+	serverName := strings.TrimSpace(getenvViaLibc(mooncakeEtcdServerNameEnv))
+
+	if ca == "" && cert == "" && key == "" {
+		if serverName != "" {
+			return nil, fmt.Errorf("%s requires an etcd CA or client certificate", mooncakeEtcdServerNameEnv)
+		}
+		return nil, nil
+	}
+	if (cert == "") != (key == "") {
+		return nil, fmt.Errorf("%s and %s must be set together",
+			mooncakeEtcdClientCertEnv, mooncakeEtcdClientKeyEnv)
+	}
+
+	return &etcdTLSConfigSpec{
+		CACertPath:     ca,
+		ClientCertPath: cert,
+		ClientKeyPath:  key,
+		ServerName:     serverName,
+	}, nil
+}
+
+func validateEtcdTLSFiles(spec *etcdTLSConfigSpec) error {
+	for envName, path := range map[string]string{
+		mooncakeEtcdCACertEnv:     spec.CACertPath,
+		mooncakeEtcdClientCertEnv: spec.ClientCertPath,
+		mooncakeEtcdClientKeyEnv:  spec.ClientKeyPath,
+	} {
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("failed to access %s (%s): %w", envName, path, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("%s points to a directory, expected a file: %s", envName, path)
+		}
+	}
+	return nil
+}
+
+func buildEtcdTLSConfig(spec *etcdTLSConfigSpec) (*tls.Config, error) {
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: spec.ServerName,
+	}
+	if spec.CACertPath != "" {
+		caPEM, err := os.ReadFile(spec.CACertPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read etcd CA certificate file %s: %w", spec.CACertPath, err)
+		}
+		pool := x509.NewCertPool()
+		if ok := pool.AppendCertsFromPEM(caPEM); !ok {
+			return nil, fmt.Errorf("failed to parse etcd CA certificate bundle from %s", spec.CACertPath)
+		}
+		config.RootCAs = pool
+	}
+	if spec.ClientCertPath != "" {
+		cert, err := tls.LoadX509KeyPair(spec.ClientCertPath, spec.ClientKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load etcd client certificate/key (%s, %s): %w",
+				spec.ClientCertPath, spec.ClientKeyPath, err)
+		}
+		config.Certificates = []tls.Certificate{cert}
+	}
+	return config, nil
+}
+
+// buildEtcdClientTLSFromEnv returns (nil, nil) when no TLS env vars are set,
+// so existing deployments retain their endpoint-defined transport behavior.
+// A partial or broken configuration is an error rather than a silent downgrade.
+func buildEtcdClientTLSFromEnv(endpoints []string) (*tls.Config, error) {
+	spec, err := loadEtcdTLSConfigSpecFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if spec == nil {
+		return nil, nil
+	}
+	for _, endpoint := range endpoints {
+		// clientv3 deliberately drops transport credentials for http:// URLs.
+		if strings.HasPrefix(strings.ToLower(endpoint), "http://") {
+			return nil, fmt.Errorf("etcd TLS is configured but endpoint %q uses http://; use https:// or host:port", endpoint)
+		}
+	}
+	if err := validateEtcdTLSFiles(spec); err != nil {
+		return nil, err
+	}
+	return buildEtcdTLSConfig(spec)
+}
+
+func etcdTLSDialOptions(config *tls.Config) []grpc.DialOption {
+	if config == nil || config.ServerName == "" {
+		return nil
+	}
+	// gRPC derives TLS SNI and hostname verification from the connection
+	// authority, which can otherwise override tls.Config.ServerName.
+	return []grpc.DialOption{grpc.WithAuthority(config.ServerName)}
+}
+
+func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		return clientv3.Config{}, err
+	}
 	return clientv3.Config{
 		Endpoints:            validEndpoints,
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
-	}
+		TLS:                  tlsConfig,
+		DialOptions:          etcdTLSDialOptions(tlsConfig),
+	}, nil
 }
 
 func parseEtcdEndpoints(endpoints *C.char) []string {
@@ -190,11 +335,19 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        5 * time.Second,
 		MaxCallSendMsgSize: MaxMsgSize,
 		MaxCallRecvMsgSize: MaxMsgSize,
+		TLS:                tlsConfig,
+		DialOptions:        etcdTLSDialOptions(tlsConfig),
 	})
 
 	if err != nil {
@@ -299,7 +452,13 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	clientConfig, err := newStoreClientConfig(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	cli, err := clientv3.New(clientConfig)
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -318,7 +477,13 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	clientConfig, err := newStoreClientConfig(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	cli, err := clientv3.New(clientConfig)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
@@ -368,11 +533,19 @@ func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
+	tlsConfig, err := buildEtcdClientTLSFromEnv(validEndpoints)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        10 * time.Second,
 		MaxCallSendMsgSize: snapshotMaxMsgSize,
 		MaxCallRecvMsgSize: snapshotMaxMsgSize,
+		TLS:                tlsConfig,
+		DialOptions:        etcdTLSDialOptions(tlsConfig),
 	})
 
 	if err != nil {
@@ -760,7 +933,12 @@ func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
 	}
 	// Keep lease traffic separate from Store traffic. A Store client reset or
 	// a busy Store connection must not stop leadership keep-alive.
-	cli, err := clientv3.New(newStoreClientConfig(storeCli.Endpoints()))
+	clientConfig, err := newStoreClientConfig(storeCli.Endpoints())
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	cli, err := clientv3.New(clientConfig)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1

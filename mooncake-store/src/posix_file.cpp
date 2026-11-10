@@ -1,13 +1,20 @@
+#include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
 #include <string>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <vector>
 #include <glog/logging.h>
 
 #include "file_interface.h"
+#include "iovec_cursor.h"
 
 namespace mooncake {
+
+using detail::ConsumeIovecs;
+using detail::SkipEmptyIovecs;
+
 bool StorageFile::drop_page_cache() {
     int ret = posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
     if (ret != 0) {
@@ -27,6 +34,7 @@ PosixFile::PosixFile(const std::string &filename, int fd)
 
 tl::expected<void, ErrorCode> PosixFile::datasync() {
     if (fdatasync(fd_) != 0) {
+        record_sys_errno(errno);
         LOG(ERROR) << "fdatasync failed: " << strerror(errno);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -75,6 +83,7 @@ tl::expected<size_t, ErrorCode> PosixFile::write(std::span<const char> data,
         ssize_t written = ::write(fd_, ptr, remaining);
         if (written == -1) {
             if (errno == EINTR) continue;
+            record_sys_errno(errno);
             return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
         }
         remaining -= written;
@@ -106,6 +115,7 @@ tl::expected<size_t, ErrorCode> PosixFile::read(std::string &buffer,
         ssize_t n = ::read(fd_, ptr, length - read_bytes);
         if (n == -1) {
             if (errno == EINTR) continue;
+            record_sys_errno(errno);
             buffer.clear();
             return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
         }
@@ -127,19 +137,33 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_write(const iovec *iov,
     if (fd_ < 0) {
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
-
-    size_t expected_bytes = 0;
-    for (int i = 0; i < iovcnt; ++i) expected_bytes += iov[i].iov_len;
-
-    ssize_t ret = ::pwritev(fd_, iov, iovcnt, offset);
-    if (ret < 0) {
-        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
-    }
-    if (static_cast<size_t>(ret) != expected_bytes) {
-        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    if (iovcnt < 0) {
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    return ret;
+    // A short pwritev is not an error (e.g. the filesystem shut down in the
+    // middle of the write): write the rest, and if the device is failing the
+    // next call reports why with errno.
+    std::vector<iovec> rest(iov, iov + iovcnt);
+    size_t first = 0;
+    size_t written = 0;
+    while (SkipEmptyIovecs(rest, first)) {
+        ssize_t ret = ::pwritev(fd_, rest.data() + first,
+                                static_cast<int>(rest.size() - first),
+                                offset + static_cast<off_t>(written));
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            record_sys_errno(errno);
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+        }
+        // Writing nothing and reporting no error would loop forever.
+        if (ret == 0) {
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+        }
+        written += static_cast<size_t>(ret);
+        ConsumeIovecs(rest, first, static_cast<size_t>(ret));
+    }
+    return written;
 }
 
 tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
@@ -148,13 +172,30 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
     if (fd_ < 0) {
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
-
-    ssize_t ret = ::preadv(fd_, iov, iovcnt, offset);
-    if (ret < 0) {
-        return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+    if (iovcnt < 0) {
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    return ret;
+    // Read until the iovecs are full or EOF. A short preadv before EOF (e.g.
+    // a bad block) is not an error; the next call reports it with errno.
+    // Returning fewer bytes than asked therefore always means EOF.
+    std::vector<iovec> rest(iov, iov + iovcnt);
+    size_t first = 0;
+    size_t read_bytes = 0;
+    while (SkipEmptyIovecs(rest, first)) {
+        ssize_t ret = ::preadv(fd_, rest.data() + first,
+                               static_cast<int>(rest.size() - first),
+                               offset + static_cast<off_t>(read_bytes));
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            record_sys_errno(errno);
+            return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+        }
+        if (ret == 0) break;  // EOF
+        read_bytes += static_cast<size_t>(ret);
+        ConsumeIovecs(rest, first, static_cast<size_t>(ret));
+    }
+    return read_bytes;
 }
 
 }  // namespace mooncake

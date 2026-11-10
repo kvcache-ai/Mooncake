@@ -18,6 +18,7 @@ MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES:-}
 MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS:-}
 MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE:-}
 MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX:-}
+RUN_STORE_RS_TESTS=${RUN_STORE_RS_TESTS:-false}
 USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-true}
 MOONCAKE_RENDER_DEVICES=${MOONCAKE_RENDER_DEVICES:-}
 MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES:-}
@@ -57,6 +58,13 @@ All_TEST_SCRIPTS_VLLM=(
     "test_vllm_1p1d_erdma.sh"
 )
 
+# Store-RS uses a wheel built by scripts/build_store_rs_wheel.sh. Keep it
+# opt-in for ordinary release-wheel jobs, and append it to the SGLang group so
+# the combined Nightly lane reuses the existing SGLang container lifecycle.
+if [ "${RUN_STORE_RS_TESTS}" = "true" ]; then
+    All_TEST_SCRIPTS_SGLANG+=("test_hicache_storage_mooncake_store_rs.sh")
+fi
+
 list_tests() {
     case "${1:-default}" in
         default)
@@ -76,7 +84,13 @@ list_tests() {
 }
 
 if [ "${1:-}" = "list-tests" ]; then
-    list_tests "${2:-default}"
+    if [ "${RUN_STORE_RS_TESTS}" = "true" ]; then
+        # Ignore a legacy framework argument so the T-One parser tracks the
+        # five SGLang cases, the appended Store-RS case, and the vLLM case.
+        list_tests default
+    else
+        list_tests "${2:-default}"
+    fi
     exit $?
 fi
 
@@ -95,6 +109,17 @@ E2E_DIR=$(cd "$SUITE_DIR/../e2e" && pwd)
 REMOTE_WORK_ROOT=/tmp/Mooncake_tone/mooncake_ci_test
 source "$E2E_DIR/scripts/controller.sh"
 
+run_requested_suite() {
+    if [ "${RUN_STORE_RS_TESTS}" = "true" ] && [ "${1:-}" = "run-all" ]; then
+        # The T-One template may invoke `run-all` with a legacy framework
+        # argument. The Store-RS case is already the last SGLang entry, so one
+        # normal run-all reuses that container before switching to vLLM.
+        main run-all
+    else
+        main "$@"
+    fi
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-    main "$@"
+    run_requested_suite "$@"
 fi
