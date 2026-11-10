@@ -102,6 +102,19 @@ TEST(ObjectPartTest, PopsOnlyTheMatchingReplicas) {
     EXPECT_TRUE(part.replicas().empty());
 }
 
+// The first replica lives in the part itself, so the common one-replica part
+// needs no allocation of its own.
+TEST(ObjectPartTest, OneReplicaStaysInsideThePart) {
+    ObjectPart part(kObjectLength, MakeDiskReplicas({ReplicaStatus::COMPLETE}));
+    ASSERT_EQ(part.replicas().size(), 1u);
+
+    const auto replica =
+        reinterpret_cast<std::uintptr_t>(part.replicas().data());
+    const auto part_begin = reinterpret_cast<std::uintptr_t>(&part);
+    EXPECT_GE(replica, part_begin);
+    EXPECT_LT(replica, part_begin + sizeof(ObjectPart));
+}
+
 TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     auto metadata = MakeEnvelope(kObjectLength,
                                  MakeDiskReplicas({ReplicaStatus::COMPLETE}));
@@ -119,6 +132,24 @@ TEST(EnvelopePartTest, TheEnvelopeReadsAndWritesItsSinglePart) {
     metadata->VisitReplicas([&](const Replica&) { ++walked; });
     EXPECT_EQ(walked, part.replicas().size());
     EXPECT_TRUE(metadata->HasReplica(&Replica::fn_is_completed));
+}
+
+// A part gets a slot when it is written, so an object that declares many parts
+// and writes one pays for the part it wrote.
+TEST(EnvelopePartTest, HoldsOnlyThePartsThatWereWritten) {
+    auto metadata = std::make_unique<ObjectMetadata>(
+        /*part_count=*/4, TenantId(), "part-test-key", std::string(kGroupId),
+        ObjectDataType::UNKNOWN, /*hard_pinned=*/false, std::nullopt);
+    EXPECT_EQ(metadata->GetPart(0), nullptr);
+
+    auto begin_write = metadata->BeginWrite(
+        /*index=*/2, kObjectLength, MakeDiskReplicas({ReplicaStatus::COMPLETE}),
+        UUID{1, 2},
+        /*session_id=*/"", kWriteTime);
+    ASSERT_TRUE(begin_write.has_value());
+    EXPECT_EQ(metadata->GetPart(0), nullptr);
+    ASSERT_NE(metadata->GetPart(2), nullptr);
+    EXPECT_EQ(metadata->GetPart(2)->length(), kObjectLength);
 }
 
 TEST(EnvelopePartTest, VisitsAndErasesThroughTheEnvelope) {

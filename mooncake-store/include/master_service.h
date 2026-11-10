@@ -1399,7 +1399,6 @@ class MasterService {
         const std::chrono::system_clock::time_point& ttl);
     struct StaleHandleCleanupPlan {
         std::vector<ReplicaID> removed_ids;
-        std::vector<Replica::Descriptor> remaining;
         bool would_invalidate{false};
     };
     // Whether a replica's handle is dead, or the client that owns its local
@@ -1633,11 +1632,8 @@ class MasterService {
     // after one forced bucket eviction. Memory or NoF exhaustion is left to
     // the background eviction, so it cannot delete unrelated DFS data. Each
     // attempt takes the key afresh, since recovery evicts other keys.
-    auto AdmitWithDfsRecovery(
-        const ReplicateConfig& config,
-        const std::function<
-            tl::expected<std::vector<Replica::Descriptor>, ErrorCode>(
-                bool* dfs_allocation_failed)>& admit)
+    template <typename Admit>
+    auto AdmitWithDfsRecovery(const ReplicateConfig& config, const Admit& admit)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Discards the namespace's expired processing replicas and expired tasks.
@@ -1799,11 +1795,9 @@ class MasterService {
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
                            AsIs = {})
             : service_(service),
-              object_id_(std::move(object_id)),
-              ns_(service_->namespaces_.Lookup(object_id_.tenant_id)),
+              ns_(service_->namespaces_.Lookup(object_id.tenant_id)),
               guard_(ns_ == nullptr ? std::optional<route::WriteGuard>()
-                                    : ns_->objects.Write(object_id_.user_key)) {
-        }
+                                    : ns_->objects.Write(object_id.user_key)) {}
 
         struct CreateKey {
             // Sweep the dead replica handles of an object already published
@@ -1812,12 +1806,11 @@ class MasterService {
         };
         // Holds the key whether or not it holds an object, creating the
         // namespace if needed, so the caller can publish one under it.
-        MetadataAccessorRW(MasterService* service, ObjectIdentity object_id,
-                           CreateKey options)
+        MetadataAccessorRW(MasterService* service,
+                           const ObjectIdentity& object_id, CreateKey options)
             : service_(service),
-              object_id_(std::move(object_id)),
-              ns_(&service_->namespaces_.GetOrCreate(object_id_.tenant_id)),
-              guard_(ns_->objects.WriteKey(object_id_.user_key)) {
+              ns_(&service_->namespaces_.GetOrCreate(object_id.tenant_id)),
+              guard_(ns_->objects.WriteKey(object_id.user_key)) {
             if (options.cleanup_invalid && IsPublished()) {
                 service_->CleanupInvalidMemoryReplicas(*this);
             }
@@ -1828,7 +1821,6 @@ class MasterService {
         MetadataAccessorRW(MasterService* service, const TenantId& tenant_id,
                            const route::ObjectRef& ref)
             : service_(service),
-              object_id_{tenant_id, ref.key},
               ns_(service_->namespaces_.Lookup(tenant_id)),
               guard_(ns_ == nullptr ? std::optional<route::WriteGuard>()
                                     : ns_->objects.Write(ref)) {}
@@ -1856,9 +1848,9 @@ class MasterService {
             return IsPublished() && guard_->state().replication_task;
         }
 
-        const std::string& GetKey() const { return object_id_.user_key; }
-        // The tenant the object was resolved under.
-        const TenantId& GetTenantId() const { return object_id_.tenant_id; }
+        // The held key and its tenant; only while a key is held.
+        const std::string& GetKey() const { return guard_->key(); }
+        const TenantId& GetTenantId() const { return ns_->id(); }
         // The held publication; like `Get()`, only while one is held.
         route::ObjectRef GetRef() const { return guard_->ref(); }
 
@@ -1916,7 +1908,6 @@ class MasterService {
 
        private:
         MasterService* service_;
-        ObjectIdentity object_id_;
         // Null when the namespace does not exist; a namespace stays put once
         // created, so the pointer outlives the guard.
         metadata::Namespace* ns_;

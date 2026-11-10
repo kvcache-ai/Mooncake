@@ -2162,9 +2162,6 @@ MasterService::BuildStaleHandleCleanupPlan(
             plan.removed_ids.push_back(replica.id());
             return;
         }
-        if (replica.status() == ReplicaStatus::COMPLETE) {
-            plan.remaining.push_back(replica.get_descriptor());
-        }
         if (!replica.is_memory_replica() || !replica.has_invalid_mem_handle()) {
             has_valid_after_cleanup = true;
         }
@@ -2181,19 +2178,27 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
         return {};
     }
 
+    const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
+                                            plan.removed_ids.end());
     const auto op_type =
         plan.would_invalidate ? OpType::REMOVE : OpType::PUT_END;
-    const std::string payload =
-        plan.would_invalidate ? std::string{}
-                              : SerializeMetadataForOpLogFromReplicaDescriptors(
-                                    metadata, plan.remaining);
+    std::string payload;
+    if (!plan.would_invalidate) {
+        std::vector<Replica::Descriptor> remaining;
+        metadata.VisitReplicas([&ids, &remaining](const Replica& replica) {
+            if (!ids.contains(replica.id()) &&
+                replica.status() == ReplicaStatus::COMPLETE) {
+                remaining.push_back(replica.get_descriptor());
+            }
+        });
+        payload = SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                  remaining);
+    }
 
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
         return tl::make_unexpected(reservation.error());
     }
-    const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
-                                            plan.removed_ids.end());
     metadata.VisitReplicas(
         [&ids](const Replica& replica) { return ids.contains(replica.id()); },
         [](Replica& replica) { replica.mark_removed(); });
@@ -5915,11 +5920,10 @@ auto MasterService::CleanupStaleBeforeWrite(
     return {};
 }
 
-auto MasterService::AdmitWithDfsRecovery(
-    const ReplicateConfig& config,
-    const std::function<tl::expected<std::vector<Replica::Descriptor>,
-                                     ErrorCode>(bool* dfs_allocation_failed)>&
-        admit) -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+template <typename Admit>
+auto MasterService::AdmitWithDfsRecovery(const ReplicateConfig& config,
+                                         const Admit& admit)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     // Set by AllocateReplicas only when DFS allocation itself failed with
     // capacity exhaustion; gates the forced bucket eviction retry below so
     // memory/NoF exhaustion cannot delete unrelated DFS data.
@@ -7320,60 +7324,42 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
     if (enable_oplog_ && ordered_oplog_writer_) {
         auto remaining =
             BuildRemainingReplicaDescriptors(metadata, target_pred);
-        if (enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
-            if (!reservation) {
-                return tl::make_unexpected(reservation.error());
-            }
-            std::vector<ReplicaID> removed_ids;
-            metadata.VisitReplicas(target_pred,
-                                   [&removed_ids](Replica& replica) {
-                                       removed_ids.push_back(replica.id());
-                                       replica.mark_removed();
-                                   });
-
-            tl::expected<OpLogEntry, ErrorCode> persist_result;
-            if (remaining.empty()) {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
-                    std::move(reservation.value()), OpType::REMOVE,
-                    metadata.tenant_id.value(), key, {},
-                    [this, removed_ids = std::move(removed_ids)](
-                        const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(durable_entry,
-                                                            removed_ids);
-                    });
-            } else {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
-                    std::move(reservation.value()), OpType::PUT_END,
-                    metadata.tenant_id.value(), key,
-                    SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
-                                                                    remaining),
-                    [this, removed_ids = std::move(removed_ids)](
-                        const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(durable_entry,
-                                                            removed_ids);
-                    });
-            }
-            if (!persist_result) {
-                return tl::make_unexpected(persist_result.error());
-            }
-            return true;
+        auto reservation = ReserveBatchOpLogSlot();
+        if (!reservation) {
+            return tl::make_unexpected(reservation.error());
         }
+        std::vector<ReplicaID> removed_ids;
+        metadata.VisitReplicas(target_pred, [&removed_ids](Replica& replica) {
+            removed_ids.push_back(replica.id());
+            replica.mark_removed();
+        });
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::REMOVE, metadata.tenant_id.value(), key, {}, nullptr);
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::REMOVE,
+                metadata.tenant_id.value(), key, {},
+                [this, removed_ids = std::move(removed_ids)](
+                    const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
+                });
         } else {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
+            persist_result = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::PUT_END,
+                metadata.tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
                                                                 remaining),
-                nullptr);
+                [this, removed_ids = std::move(removed_ids)](
+                    const OpLogEntry& durable_entry) {
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
+                });
         }
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
+        return true;
     }
 
     if (replica_type == ReplicaType::DISK || replica_type == ReplicaType::DFS) {
@@ -8095,27 +8081,19 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             }
         });
         tl::expected<OpLogEntry, ErrorCode> persist_result;
-        if (enable_oplog_) {
-            auto reservation = ReserveBatchOpLogSlot();
-            if (!reservation) {
-                return tl::make_unexpected(reservation.error());
-            }
-            source->mark_removed();
-            persist_result = AppendReservedOpLogWithDurableFinalize(
-                std::move(reservation.value()), OpType::PUT_END,
-                metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
-                [this, removed_ids = std::vector<ReplicaID>{source_id}](
-                    const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(durable_entry,
-                                                        removed_ids);
-                });
-        } else {
-            persist_result = AppendOpLogWithDurableFinalize(
-                OpType::PUT_END, metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
-                nullptr);
+        auto reservation = ReserveBatchOpLogSlot();
+        if (!reservation) {
+            return tl::make_unexpected(reservation.error());
         }
+        source->mark_removed();
+        persist_result = AppendReservedOpLogWithDurableFinalize(
+            std::move(reservation.value()), OpType::PUT_END,
+            metadata.tenant_id.value(), key,
+            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
+            [this, removed_ids = std::vector<ReplicaID>{source_id}](
+                const OpLogEntry& durable_entry) {
+                FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids);
+            });
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }

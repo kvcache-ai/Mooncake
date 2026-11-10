@@ -87,6 +87,13 @@ tl::expected<PartPosition, ErrorCode> ResolvePartPosition(
     const struct_pack::compatible<uint32_t>& part_index,
     const struct_pack::compatible<uint32_t>& part_count) {
     PartPosition position;
+    if (part_index.has_value() && !part_count.has_value()) {
+        // An index without the count cannot be read as part 0 of 1 without
+        // turning a part write into a whole-object write.
+        LOG(ERROR) << "part_index=" << *part_index
+                   << ", error=part_count_missing";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (part_count.has_value()) {
         if (*part_count == 0) {
             LOG(ERROR) << "part_count=0, error=part_count_must_be_positive";
