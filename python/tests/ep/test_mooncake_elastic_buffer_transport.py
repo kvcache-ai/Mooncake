@@ -151,6 +151,45 @@ def test_torchrun_local_world_size_drives_topology(monkeypatch) -> None:
     assert ElasticBuffer._calculate_physical_domain_size(Group()) == (4, 4)
 
 
+@pytest.mark.parametrize(
+    ("device_type", "ranks_per_node", "local_world_size", "reserves_room"),
+    [
+        ("xpu", "4", "8", True),  # MC_EP_RANKS_PER_NODE splits the ranks
+        ("xpu", None, "4", True),  # torchrun across nodes
+        ("xpu", None, "8", False),  # one node
+        ("xpu", "8", "4", False),  # MC_EP_RANKS_PER_NODE takes precedence
+        ("cuda", "4", "4", False),  # CUDA needs no room for flat RDMA
+    ],
+)
+def test_buffer_size_hint_reserves_room_for_ranks_on_other_nodes(
+    monkeypatch,
+    device_type: str,
+    ranks_per_node: str | None,
+    local_world_size: str,
+    reserves_room: bool,
+) -> None:
+    class Group:
+        @staticmethod
+        def size() -> int:
+            return 8
+
+    monkeypatch.setattr(elastic_buffer_module, "_ep_device_type", lambda: device_type)
+    monkeypatch.delenv("MOONCAKE_EP_NUM_LOCAL_RANKS", raising=False)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", local_world_size)
+    if ranks_per_node is None:
+        monkeypatch.delenv("MC_EP_RANKS_PER_NODE", raising=False)
+    else:
+        monkeypatch.setenv("MC_EP_RANKS_PER_NODE", ranks_per_node)
+
+    def hint(allow_hybrid_mode: bool) -> int:
+        return ElasticBuffer.get_buffer_size_hint(
+            Group(), 128, 1024, num_topk=8, allow_hybrid_mode=allow_hybrid_mode
+        )
+
+    assert (hint(False) == hint(True)) == reserves_room
+    assert hint(False) <= hint(True)
+
+
 def test_environment_can_roll_auto_mode_back_to_ibgda(monkeypatch) -> None:
     monkeypatch.setenv("MOONCAKE_EP_TRANSPORT", "IBGDA")
     assert _requested_transport("auto") == "ibgda"

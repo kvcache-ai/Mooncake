@@ -46,6 +46,16 @@ if(USE_XPU)
                                ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   target_compile_options(xpu_ep_hybrid_test PRIVATE ${_ep_xpu_sycl_flags})
   target_link_options(xpu_ep_hybrid_test PRIVATE ${_ep_xpu_sycl_flags})
+  # The same for the ElasticBuffer (not built by default).
+  add_executable(
+    xpu_ep_elastic_hybrid_test EXCLUDE_FROM_ALL
+    ../tests/xpu_ep_elastic_hybrid_test.cpp xpu/xpu_ep_elastic_kernels.cpp)
+  target_include_directories(
+    xpu_ep_elastic_hybrid_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/xpu
+                                       ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_options(xpu_ep_elastic_hybrid_test
+                         PRIVATE ${_ep_xpu_sycl_flags})
+  target_link_options(xpu_ep_elastic_hybrid_test PRIVATE ${_ep_xpu_sycl_flags})
 
   # The verbs path to ranks on other nodes needs an rdma-core with
   # ibv_reg_dmabuf_mr. Without it _ep reaches only ranks on its node. The

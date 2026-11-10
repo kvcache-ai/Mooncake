@@ -182,8 +182,9 @@ PYBIND11_MODULE(_ep, m) {
 #endif
 
 #if defined(MOONCAKE_EP_USE_XPU)
-    // One node over Level Zero IPC. Like the XPU Buffer it allocates on the
-    // caller's queue, so it takes stream_ptr as well.
+    // Level Zero IPC on the node and RDMA across nodes through a host proxy,
+    // as in the XPU Buffer, which it also follows in allocating on the
+    // caller's queue: it takes stream_ptr as well.
     using xpu_ep::MooncakeEpXpuElasticBuffer;
     py::class_<MooncakeEpXpuElasticBuffer>(m, "ElasticBuffer")
         .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,
@@ -212,6 +213,12 @@ PYBIND11_MODULE(_ep, m) {
         .def("get_ipc_handle", &MooncakeEpXpuElasticBuffer::get_ipc_handle)
         .def("sync_nvlink_ipc_handles",
              &MooncakeEpXpuElasticBuffer::sync_nvlink_ipc_handles)
+        .def_static("rdma_available",
+                    &MooncakeEpXpuElasticBuffer::rdma_available)
+        .def("init_rdma", &MooncakeEpXpuElasticBuffer::init_rdma,
+             py::arg("remote"))
+        .def("connect_rdma", &MooncakeEpXpuElasticBuffer::connect_rdma,
+             py::arg("infos"), py::arg("active_ranks_mask"))
         .def("dispatch", &MooncakeEpXpuElasticBuffer::dispatch)
         .def("combine", &MooncakeEpXpuElasticBuffer::combine);
 #endif

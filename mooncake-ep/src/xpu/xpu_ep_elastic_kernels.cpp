@@ -130,7 +130,10 @@ sycl::event dispatch_send(sycl::queue& q, const ElasticDispatchArgs a,
                         base += sycl::reduce_over_group(grp, sel,
                                                         sycl::plus<int>());
                     }
-                    if (tid == 0) rank_counts[r] = base;
+                    if (tid == 0) {
+                        rank_counts[r] = base;
+                        if (a.host_counts) a.host_counts[r] = base;
+                    }
                 }
 
                 const auto* x = static_cast<const uint8_t*>(a.x);
@@ -162,8 +165,44 @@ sycl::event dispatch_send(sycl::queue& q, const ElasticDispatchArgs a,
     });
 }
 
+// Hybrid: copies the messages for each rank on another node, in slot order,
+// from msgs to its outbox, which the proxy writes into that rank's
+// local_stage once this kernel completes.
+sycl::event dispatch_pack(sycl::queue& q, const ElasticDispatchArgs a,
+                          const ElasticMsgLayout m,
+                          const ElasticHalfLayout hl) {
+    const int num_wgs = std::max(
+        1, std::min(a.max_wgs,
+                    a.num_ranks * a.num_max_tokens_per_rank / kNumWarps));
+    return q.parallel_for(
+        sycl::nd_range<1>(static_cast<size_t>(num_wgs) * kWGSize, kWGSize),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarpSize)]] {
+            const int tid = static_cast<int>(it.get_local_id(0));
+            const int warp = tid / kWarpSize;
+            const int lane = tid % kWarpSize;
+            const int wg = static_cast<int>(it.get_group(0));
+            const int T = a.num_max_tokens_per_rank;
+            const auto* rank_counts = at<int>(a.staging, hl.rank_counts);
+            const auto* rank_lists = at<int>(a.staging, hl.rank_lists);
+            for (int r = 0; r < a.num_ranks; ++r) {
+                if (!a.peers.remote[r]) continue;
+                const int n = rank_counts[r];
+                const int* list = rank_lists + static_cast<size_t>(r) * T;
+                uint8_t* out = a.staging + hl.outbox +
+                               static_cast<size_t>(r) * T * m.bytes;
+                for (int j = wg * kNumWarps + warp; j < n;
+                     j += num_wgs * kNumWarps)
+                    coop_copy(out + static_cast<size_t>(j) * m.bytes,
+                              a.staging + hl.msgs +
+                                  static_cast<size_t>(list[j]) * m.bytes,
+                              m.bytes, lane, kWarpSize);
+            }
+        });
+}
+
 // A work-group per source rank s: waits for its flag, then pulls the tokens
-// s listed for this rank into local_stage[s], in slot order.
+// s listed for this rank into local_stage[s], in slot order. A source on
+// another node has already written them there, before its flag.
 sycl::event dispatch_recv(sycl::queue& q, const ElasticDispatchArgs a,
                           const ElasticMsgLayout m,
                           const ElasticHalfLayout hl) {
@@ -179,18 +218,20 @@ sycl::event dispatch_recv(sycl::queue& q, const ElasticDispatchArgs a,
                 const int T = a.num_max_tokens_per_rank;
                 const int s = static_cast<int>(it.get_group(0));
                 const uint8_t* src = rebase(a.peers, a.staging, s);
+                const bool pushed = a.peers.remote && a.peers.remote[s];
 
                 // An unmapped peer (inactive at connect) never posts a flag;
                 // an inactive rank contributes no tokens.
                 if (tid == 0)
                     s_flag[0] =
-                        src ? wait_flag(a.ready + s * kReadyStride,
+                        src || pushed
+                            ? wait_flag(a.ready + s * kReadyStride,
                                         a.active_ranks, s, a.timeout_ticks)
                             : 0;
                 group_acquire(it);
                 const int n = s_flag[0] ? s_flag[0] - 1 : 0;
                 if (tid == 0) a.scratch.recv_count[s] = n;
-                if (n == 0) return;
+                if (n == 0 || pushed) return;
 
                 const int* list = at<int>(src, hl.rank_lists) +
                                   static_cast<size_t>(a.rank) * T;
@@ -395,8 +436,14 @@ sycl::event dispatch_copy(sycl::queue& q, const ElasticDispatchArgs a,
 
 // Expert side: one BF16 row per received token i -- x[i], or expanded, the
 // unweighted sum of the rows dispatch put its picks in -- staged at
-// rows[source rank][source token], then flags every rank.
-sycl::event combine_send(sycl::queue& q, const ElasticCombineArgs a) {
+// rows[source rank][source token], then flags every rank. For a source on
+// another node the rows are packed in slot order instead, for the proxy.
+//
+// Hybrid, as a source, it also recomputes the slot each of its tokens took
+// at each rank on another node (as dispatch_send numbered them), for
+// combine_recv to find the rows that rank wrote into the inbox.
+sycl::event combine_send(sycl::queue& q, const ElasticCombineArgs a,
+                         const ElasticHalfLayout hl) {
     const int num_wgs = std::max(1, a.max_wgs);
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int, 1> s_last(1, h);
@@ -417,14 +464,56 @@ sycl::event combine_send(sycl::queue& q, const ElasticCombineArgs a) {
                               a.num_ranks * T);
                 const auto* x = static_cast<const uint8_t*>(a.x);
 
+                const int* psum = a.psum_num_recv_tokens_per_rank;
+                const int* remote = a.peers.remote;
+
                 if (wg == 0) clean_ready(tid, a.next_ready, a.num_ranks);
+                if (remote && wg == 0 && a.host_counts)
+                    for (int s = tid; s < a.num_ranks; s += kWGSize)
+                        a.host_counts[s] = psum[s] - (s ? psum[s - 1] : 0);
+
+                if (remote) {
+                    const auto grp = it.get_group();
+                    const int num_local = a.num_experts / a.num_ranks;
+                    int* slots = at<int>(a.staging, hl.slots);
+                    for (int r = wg; r < a.num_ranks; r += num_wgs) {
+                        if (!remote[r]) continue;
+                        int base = 0;
+                        for (int t0 = 0; t0 < a.num_combined_tokens;
+                             t0 += kWGSize) {
+                            const int t = t0 + tid;
+                            int sel = 0;
+                            if (t < a.num_combined_tokens)
+                                for (int k = 0; k < K; ++k) {
+                                    const int64_t e =
+                                        a.topk_idx[static_cast<size_t>(t) * K +
+                                                   k];
+                                    if (e >= 0 && e / num_local == r) {
+                                        sel = 1;
+                                        break;
+                                    }
+                                }
+                            const int slot =
+                                base + sycl::exclusive_scan_over_group(
+                                           grp, sel, sycl::plus<int>());
+                            if (sel)
+                                slots[static_cast<size_t>(r) * T + t] = slot;
+                            base += sycl::reduce_over_group(grp, sel,
+                                                            sycl::plus<int>());
+                        }
+                    }
+                }
 
                 for (int i = wg * kNumWarps + warp; i < N;
                      i += num_wgs * kNumWarps) {
                     const int* meta =
                         a.recv_src_metadata + static_cast<size_t>(i) * (K + 2);
-                    uint8_t* row =
-                        a.staging + static_cast<size_t>(meta[0]) * row_bytes;
+                    size_t idx = static_cast<size_t>(meta[0]);
+                    const int s = meta[0] / T;
+                    if (remote && remote[s])
+                        idx = static_cast<size_t>(s) * T + i -
+                              (s ? psum[s - 1] : 0);
+                    uint8_t* row = a.staging + idx * row_bytes;
                     if (!a.do_expand) {
                         coop_copy(row, x + static_cast<size_t>(i) * row_bytes,
                                   row_bytes, lane, kWarpSize);
@@ -461,9 +550,25 @@ sycl::event combine_send(sycl::queue& q, const ElasticCombineArgs a) {
     });
 }
 
+// Hybrid: waits for every reachable peer's combine flag in one work-group,
+// before combine_recv. On the B60, more than about 96 work-groups polling
+// slow the NIC's writes into this GPU more than tenfold.
+sycl::event combine_wait(sycl::queue& q, const ElasticCombineArgs a) {
+    return q.parallel_for(
+        sycl::nd_range<1>(kWGSize, kWGSize), [=](sycl::nd_item<1> it) {
+            const int tid = static_cast<int>(it.get_local_id(0));
+            for (int r = tid; r < a.num_ranks; r += kWGSize)
+                if (a.peers.peer_bases[r] || a.peers.remote[r])
+                    wait_flag(a.ready + r * kReadyStride, a.active_ranks, r,
+                              a.timeout_ticks);
+        });
+}
+
 // Source side: a work-group per token sums, unweighted, the row each distinct
-// destination rank of the token staged for it (zeros if it has none).
-sycl::event combine_recv(sycl::queue& q, const ElasticCombineArgs a) {
+// destination rank of the token staged for it (zeros if it has none). A rank
+// on another node wrote its rows into the inbox, at the token's slot there.
+sycl::event combine_recv(sycl::queue& q, const ElasticCombineArgs a,
+                         const ElasticHalfLayout hl) {
     const int num_wgs = std::max(1, std::min(a.num_combined_tokens, a.max_wgs));
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint64_t, 1> s_row(kWarpSize, h);
@@ -483,11 +588,13 @@ sycl::event combine_recv(sycl::queue& q, const ElasticCombineArgs a) {
                 const int n_vec = a.hidden / 8;
 
                 // Wait for every rank's rows (a timed-out rank is dropped
-                // from active_ranks and skipped below).
-                for (int r = tid; r < a.num_ranks; r += kWGSize)
-                    if (a.peers.peer_bases[r])
-                        wait_flag(a.ready + r * kReadyStride, a.active_ranks, r,
-                                  a.timeout_ticks);
+                // from active_ranks and skipped below). Hybrid: combine_wait
+                // has.
+                if (!a.peers.remote)
+                    for (int r = tid; r < a.num_ranks; r += kWGSize)
+                        if (a.peers.peer_bases[r])
+                            wait_flag(a.ready + r * kReadyStride,
+                                      a.active_ranks, r, a.timeout_ticks);
                 group_acquire(it);
 
                 for (int t = wg; t < a.num_combined_tokens; t += num_wgs) {
@@ -505,13 +612,21 @@ sycl::event combine_recv(sycl::queue& q, const ElasticCombineArgs a) {
                         }
                         const uint8_t* src = nullptr;
                         if (first &&
-                            device_atomic<int32_t>(a.active_ranks[r]).load())
-                            src = rebase(
-                                a.peers,
-                                a.staging +
-                                    (static_cast<size_t>(a.rank) * T + t) *
-                                        row_bytes,
-                                r);
+                            device_atomic<int32_t>(a.active_ranks[r]).load()) {
+                            const size_t rt = static_cast<size_t>(r) * T;
+                            if (a.peers.remote && a.peers.remote[r])
+                                src = a.staging + hl.inbox +
+                                      (rt +
+                                       at<int>(a.staging, hl.slots)[rt + t]) *
+                                          row_bytes;
+                            else
+                                src = rebase(
+                                    a.peers,
+                                    a.staging +
+                                        (static_cast<size_t>(a.rank) * T + t) *
+                                            row_bytes,
+                                    r);
+                        }
                         s_row[lane] = reinterpret_cast<uint64_t>(src);
                     }
                     group_barrier(it.get_group());
@@ -557,21 +672,105 @@ sycl::event combine_recv(sycl::queue& q, const ElasticCombineArgs a) {
     });
 }
 
+ElasticMsgLayout msg_layout(const ElasticDispatchArgs& a) {
+    return ElasticMsgLayout(a.hidden, a.elem_size, a.num_sf_packs, a.num_topk);
+}
+
+ElasticHalfLayout half_layout(const ElasticDispatchArgs& a) {
+    return ElasticHalfLayout(a.num_ranks, a.num_max_tokens_per_rank,
+                             msg_layout(a), a.hidden);
+}
+
+// Combine uses only the offsets that do not depend on the message.
+ElasticHalfLayout half_layout(const ElasticCombineArgs& a) {
+    return ElasticHalfLayout(
+        a.num_ranks, a.num_max_tokens_per_rank,
+        ElasticMsgLayout(a.hidden, kBf16Size, 0, a.num_topk), a.hidden);
+}
+
 }  // namespace
 
-sycl::event elastic_dispatch(sycl::queue& q, const ElasticDispatchArgs& a) {
-    const ElasticMsgLayout m(a.hidden, a.elem_size, a.num_sf_packs, a.num_topk);
-    const ElasticHalfLayout hl(a.num_ranks, a.num_max_tokens_per_rank, m,
-                               a.hidden);
-    dispatch_send(q, a, m, hl);
+sycl::event elastic_dispatch_send(sycl::queue& q,
+                                  const ElasticDispatchArgs& a) {
+    const ElasticMsgLayout m = msg_layout(a);
+    const ElasticHalfLayout hl = half_layout(a);
+    sycl::event e = dispatch_send(q, a, m, hl);
+    return a.peers.remote ? dispatch_pack(q, a, m, hl) : e;
+}
+
+sycl::event elastic_dispatch_recv(sycl::queue& q,
+                                  const ElasticDispatchArgs& a) {
+    const ElasticMsgLayout m = msg_layout(a);
+    const ElasticHalfLayout hl = half_layout(a);
     dispatch_recv(q, a, m, hl);
     dispatch_count(q, a, m, hl);
     return dispatch_copy(q, a, m, hl);
 }
 
+sycl::event elastic_combine_send(sycl::queue& q, const ElasticCombineArgs& a) {
+    return combine_send(q, a, half_layout(a));
+}
+
+sycl::event elastic_combine_recv(sycl::queue& q, const ElasticCombineArgs& a) {
+    if (a.peers.remote) combine_wait(q, a);
+    return combine_recv(q, a, half_layout(a));
+}
+
+sycl::event elastic_dispatch(sycl::queue& q, const ElasticDispatchArgs& a) {
+    elastic_dispatch_send(q, a);
+    return elastic_dispatch_recv(q, a);
+}
+
 sycl::event elastic_combine(sycl::queue& q, const ElasticCombineArgs& a) {
-    combine_send(q, a);
-    return combine_recv(q, a);
+    elastic_combine_send(q, a);
+    return elastic_combine_recv(q, a);
+}
+
+std::vector<ProxyPut> elastic_dispatch_puts(const ElasticDispatchArgs& a,
+                                            const void* base,
+                                            const std::vector<int>& ranks) {
+    // Into rank b's local_stage for this rank go the messages of its outbox
+    // here; its flag carries their number, as post_ready's would.
+    const ElasticMsgLayout m = msg_layout(a);
+    const ElasticHalfLayout hl = half_layout(a);
+    const uint64_t t = a.num_max_tokens_per_rank;
+    const auto* b0 = static_cast<const uint8_t*>(base);
+    const uint64_t staging = a.staging - b0;
+    const uint64_t flag =
+        reinterpret_cast<const uint8_t*>(a.ready + a.rank * kReadyStride) - b0;
+    std::vector<ProxyPut> puts;
+    for (int b : ranks) {
+        const uint64_t n = a.host_counts[b];
+        if (n)
+            puts.push_back({b, staging + hl.outbox + b * t * m.bytes,
+                            staging + hl.local_stage + a.rank * t * m.bytes,
+                            static_cast<uint32_t>(n * m.bytes), 0});
+        puts.push_back({b, 0, flag, 0, static_cast<uint32_t>(n + 1)});
+    }
+    return puts;
+}
+
+std::vector<ProxyPut> elastic_combine_puts(const ElasticCombineArgs& a,
+                                           const void* base,
+                                           const std::vector<int>& ranks) {
+    // Rank b's rows, packed in its slot order, go to its inbox for this rank.
+    const ElasticHalfLayout hl = half_layout(a);
+    const uint64_t t = a.num_max_tokens_per_rank;
+    const uint64_t row_bytes = static_cast<uint64_t>(a.hidden) * kBf16Size;
+    const auto* b0 = static_cast<const uint8_t*>(base);
+    const uint64_t staging = a.staging - b0;
+    const uint64_t flag =
+        reinterpret_cast<const uint8_t*>(a.ready + a.rank * kReadyStride) - b0;
+    std::vector<ProxyPut> puts;
+    for (int b : ranks) {
+        const uint64_t n = a.host_counts[b];
+        if (n)
+            puts.push_back({b, staging + b * t * row_bytes,
+                            staging + hl.inbox + a.rank * t * row_bytes,
+                            static_cast<uint32_t>(n * row_bytes), 0});
+        puts.push_back({b, 0, flag, 0, 1});
+    }
+    return puts;
 }
 
 }  // namespace xpu_ep
