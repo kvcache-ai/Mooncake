@@ -19,13 +19,16 @@
 #include <acl/acl_rt.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
 #include "multi_transport.h"
-#include <cstdint>
-#include <cstdlib>
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
+#include "transport/ascend_transport/ascend_direct_transport/local_copy_engine.h"
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 #include "ascend_allocator.h"
 #include "transport/ascend_transport/ascend_direct_transport/adxl_compat.h"
@@ -66,10 +69,49 @@ static int g_get_device_call_count = 0;
 static int g_set_device_call_count = 0;
 static std::set<int> g_set_device_ids;
 static std::map<const void*, aclrtMemLocation> g_memory_locations;
+// False stands for a thread that never bound a context, which is what the
+// signal handling thread looks like when it tears the client down.
+static bool g_thread_context_bound = true;
 static std::mutex g_acl_mutex;
 // 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
 static size_t g_malloc_physical_max_success = 0;
 static int g_malloc_physical_call_count = 0;
+
+// Ordered ACL events, so a regression test can assert e.g. that the streams
+// were aborted before the failed group's host flags were released. The call
+// log also records the ACL context bound on the calling thread.
+struct AclCall {
+    std::string op;
+    aclrtContext context;
+};
+static int g_acl_event_seq = 0;
+static int g_last_stream_abort_seq = 0;
+static int g_stream_abort_count = 0;
+static int g_stream_destroy_count = 0;
+static int g_device_free_count = 0;
+static std::vector<void*> g_host_allocs;
+static std::map<void*, int> g_host_free_seq;
+static std::vector<AclCall> g_acl_calls;
+// Simulates a D2H completion-flag write that has not landed yet: the copy
+// succeeds but the flag keeps its previous value, so the group stays in flight.
+static bool g_skip_flag_copy = false;
+// Detects two callers inside aclrtMemcpyAsync on the same stream at once. A
+// short sleep widens the window so a missing per-device submission lock shows
+// up reliably instead of only under unlucky scheduling.
+static std::atomic<bool> g_detect_stream_overlap{false};
+static std::mutex g_overlap_mutex;
+static std::set<aclrtStream> g_inflight_streams;
+static int g_stream_overlap_count = 0;
+
+constexpr size_t kMockFlagBytes = sizeof(uint32_t);
+
+// Caller holds g_acl_mutex.
+void RecordAclCallLocked(const char* op) {
+    AclCall call;
+    call.op = op;
+    call.context = g_context;
+    g_acl_calls.push_back(std::move(call));
+}
 
 constexpr uintptr_t kDeviceContextBase = 0x10000;
 
@@ -102,8 +144,24 @@ void reset() {
     g_set_device_call_count = 0;
     g_set_device_ids.clear();
     g_memory_locations.clear();
+    g_thread_context_bound = true;
     g_malloc_physical_max_success = 0;
     g_malloc_physical_call_count = 0;
+    g_acl_event_seq = 0;
+    g_last_stream_abort_seq = 0;
+    g_stream_abort_count = 0;
+    g_stream_destroy_count = 0;
+    g_device_free_count = 0;
+    g_host_allocs.clear();
+    g_host_free_seq.clear();
+    g_acl_calls.clear();
+    g_skip_flag_copy = false;
+    g_detect_stream_overlap.store(false);
+    {
+        std::lock_guard<std::mutex> overlap_lock(g_overlap_mutex);
+        g_inflight_streams.clear();
+        g_stream_overlap_count = 0;
+    }
 }
 
 void set_malloc_physical_max_success(size_t max_success) {
@@ -119,6 +177,11 @@ int malloc_physical_call_count() {
 void set_device_count(int count) {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_device_count = count;
+}
+
+void set_thread_context_bound(bool bound) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_thread_context_bound = bound;
 }
 
 void set_pointer_location(void* ptr, aclrtMemLocationType type, uint32_t id) {
@@ -173,6 +236,63 @@ bool all_devices_covered(int begin, int end_exclusive) {
     }
     return true;
 }
+
+void set_skip_flag_copy(bool skip) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_skip_flag_copy = skip;
+}
+
+int stream_abort_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_stream_abort_count;
+}
+
+int stream_destroy_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_stream_destroy_count;
+}
+
+int device_free_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_device_free_count;
+}
+
+int last_stream_abort_seq() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_last_stream_abort_seq;
+}
+
+// Returns the ordered event sequence at which host_flags was released, or -1
+// when the buffer is still alive.
+int host_free_seq(void* host_flags) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    auto it = g_host_free_seq.find(host_flags);
+    return it == g_host_free_seq.end() ? -1 : it->second;
+}
+
+std::vector<void*> host_allocs() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_host_allocs;
+}
+
+std::vector<AclCall> acl_calls() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_acl_calls;
+}
+
+void clear_acl_calls() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_acl_calls.clear();
+}
+
+void set_detect_stream_overlap(bool detect) {
+    g_detect_stream_overlap.store(detect);
+}
+
+int stream_overlap_count() {
+    std::lock_guard<std::mutex> lock(g_overlap_mutex);
+    return g_stream_overlap_count;
+}
 }  // namespace mock_acl
 
 extern "C" {
@@ -201,6 +321,9 @@ aclError aclrtSetDevice(int deviceId) {
 }
 
 aclError aclrtGetCurrentContext(aclrtContext* context) {
+    if (!g_thread_context_bound) {
+        return 1;
+    }
     *context = g_context;
     return ACL_ERROR_NONE;
 }
@@ -218,14 +341,24 @@ aclError aclrtCreateStreamWithConfig(aclrtStream* stream, uint32_t priority,
                                      uint32_t config) {
     (void)priority;
     (void)config;
-    *stream = reinterpret_cast<aclrtStream>(0x5678);
+    // Every stream must get a distinct handle: the submission-overlap detector
+    // below keys on the handle, so returning one shared dummy would make it
+    // unable to tell a same-stream overlap from two different streams running
+    // concurrently (which is allowed, and the point of per-stream locking).
+    static std::atomic<uintptr_t> next_stream_handle{0x5678};
+    *stream = reinterpret_cast<aclrtStream>(
+        next_stream_handle.fetch_add(1, std::memory_order_relaxed));
     std::lock_guard<std::mutex> lock(g_acl_mutex);
+    RecordAclCallLocked("create_stream");
     ++g_stream_create_count;
     return ACL_ERROR_NONE;
 }
 
 aclError aclrtDestroyStream(aclrtStream stream) {
     (void)stream;
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    RecordAclCallLocked("destroy_stream");
+    ++g_stream_destroy_count;
     return ACL_ERROR_NONE;
 }
 
@@ -238,6 +371,10 @@ aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream,
 
 aclError aclrtStreamAbort(aclrtStream stream) {
     (void)stream;
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    RecordAclCallLocked("abort_stream");
+    ++g_stream_abort_count;
+    g_last_stream_abort_seq = ++g_acl_event_seq;
     return ACL_ERROR_NONE;
 }
 
@@ -248,6 +385,7 @@ aclError aclrtMemcpy(void* dst, size_t destMax, const void* src, size_t count,
     aclError result;
     {
         std::lock_guard<std::mutex> lock(g_acl_mutex);
+        RecordAclCallLocked("memcpy");
         result = g_memcpy_result;
         if (result == ACL_ERROR_NONE) {
             memcpy(dst, src, count);
@@ -260,19 +398,40 @@ aclError aclrtMemcpyAsync(void* dst, size_t destMax, const void* src,
                           size_t count, aclrtMemcpyKind kind,
                           aclrtStream stream) {
     (void)destMax;
-    (void)kind;
-    (void)stream;
+    if (g_detect_stream_overlap.load()) {
+        {
+            std::lock_guard<std::mutex> lock(g_overlap_mutex);
+            if (!g_inflight_streams.insert(stream).second) {
+                ++g_stream_overlap_count;
+            }
+        }
+        // Widen the window: without a per-stream submission lock the second
+        // copy enters here while the first one is still inside the same
+        // mocked stream.
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        {
+            std::lock_guard<std::mutex> lock(g_overlap_mutex);
+            g_inflight_streams.erase(stream);
+        }
+    }
     char thread_name[16] = {};
     pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
 
     aclError result;
     {
         std::lock_guard<std::mutex> lock(g_acl_mutex);
+        RecordAclCallLocked("memcpy_async");
         result = g_memcpy_async_result;
         ++g_memcpy_async_call_count;
         g_memcpy_async_thread_names.emplace_back(thread_name);
         if (result == ACL_ERROR_NONE) {
-            memcpy(dst, src, count);
+            // A completion-flag D2H write that is still queued on the stream.
+            const bool pending_flag_write = g_skip_flag_copy &&
+                                            kind == ACL_MEMCPY_DEVICE_TO_HOST &&
+                                            count == kMockFlagBytes;
+            if (!pending_flag_write) {
+                memcpy(dst, src, count);
+            }
         }
     }
     return result;
@@ -296,6 +455,16 @@ const char* aclGetRecentErrMsg() { return "mock acl error message"; }
 aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
                                       int32_t* physical_dev_id) {
     *physical_dev_id = logic_dev_id;
+    return ACL_ERROR_NONE;
+}
+
+// The direct ACL VMM path converts the user device id
+// (ASCEND_RT_VISIBLE_DEVICES index) to a driver logical id before granting
+// access. The mock keeps the identity mapping so VMM allocations succeed
+// without a real device.
+aclError aclrtGetLogicDevIdByUserDevId(int32_t user_dev_id,
+                                       int32_t* logic_dev_id) {
+    *logic_dev_id = user_dev_id;
     return ACL_ERROR_NONE;
 }
 
@@ -352,11 +521,35 @@ aclError aclrtUnmapMem(void* va) {
 }
 
 aclError aclrtMallocHost(void** host_ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    RecordAclCallLocked("malloc_host");
     *host_ptr = malloc(size);
+    if (*host_ptr != nullptr) {
+        g_host_allocs.push_back(*host_ptr);
+    }
     return *host_ptr ? ACL_ERROR_NONE : ACL_ERROR_FAILURE;
 }
 
+aclError aclrtMalloc(void** dev_ptr, size_t size, aclrtMemMallocPolicy policy) {
+    (void)policy;
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    RecordAclCallLocked("malloc_device");
+    *dev_ptr = malloc(size);
+    return *dev_ptr ? ACL_ERROR_NONE : ACL_ERROR_FAILURE;
+}
+
+aclError aclrtFree(void* dev_ptr) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    RecordAclCallLocked("free_device");
+    ++g_device_free_count;
+    free(dev_ptr);
+    return ACL_ERROR_NONE;
+}
+
 aclError aclrtFreeHost(void* host_ptr) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    RecordAclCallLocked("free_host");
+    g_host_free_seq[host_ptr] = ++g_acl_event_seq;
     free(host_ptr);
     return ACL_ERROR_NONE;
 }
@@ -390,6 +583,7 @@ static std::vector<std::string> g_connect_targets;
 static adxl::Status g_get_capability_result = adxl::SUCCESS;
 static int32_t g_get_capability_value = 0;
 static std::map<std::string, std::string> g_last_init_options;
+static std::map<void*, size_t> g_adxl_malloc_sizes;
 
 namespace adxl_mock {
 void reset() {
@@ -420,6 +614,7 @@ void reset() {
     g_get_capability_result = adxl::SUCCESS;
     g_get_capability_value = 0;
     g_last_init_options.clear();
+    g_adxl_malloc_sizes.clear();
 }
 
 void set_capability_result(adxl::Status status, int32_t value) {
@@ -545,6 +740,12 @@ std::map<std::string, std::string> get_last_init_options() {
 
 // Override ADXL methods with strong symbols
 namespace adxl {
+
+// Unit tests run without an NPU driver. When llm_datadist is linked into the
+// transport, adxl::AdxlEngine::MallocMem/FreeMem are no longer null weak
+// symbols, so the allocator's fabric path calls them instead of the ACL VMM
+// fallback. Keep a small stub allocation (test sizes reach tens of GiB) and
+// reuse the ACL mock's size limit to simulate physical allocation failures.
 
 class AdxlEngine::AdxlEngineImpl {};
 
@@ -682,6 +883,37 @@ Status AdxlEngine::GetCapability(FeatureType feature_type, int32_t& value) {
     std::lock_guard<std::mutex> lock(g_mutex);
     value = g_get_capability_value;
     return g_get_capability_result;
+}
+
+Status AdxlEngine::MallocMem(MemType type, size_t size, void** ptr) {
+    (void)type;
+    if (ptr == nullptr) {
+        return PARAM_INVALID;
+    }
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    if (g_malloc_physical_max_success > 0 &&
+        size > g_malloc_physical_max_success) {
+        return FAILED;
+    }
+    constexpr size_t kStubVaBytes = 64;
+    void* va = malloc(kStubVaBytes);
+    if (va == nullptr) {
+        return RESOURCE_EXHAUSTED;
+    }
+    g_adxl_malloc_sizes[va] = size;
+    *ptr = va;
+    return SUCCESS;
+}
+
+Status AdxlEngine::FreeMem(void* ptr) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    auto it = g_adxl_malloc_sizes.find(ptr);
+    if (it == g_adxl_malloc_sizes.end()) {
+        return PARAM_INVALID;
+    }
+    g_adxl_malloc_sizes.erase(it);
+    free(ptr);
+    return SUCCESS;
 }
 
 }  // namespace adxl
@@ -989,9 +1221,9 @@ TEST_F(AscendDirectTransportTest, Install_DummyRealModeSkipsGetDevice) {
     const int get_device_calls_before = mock_acl::get_get_device_call_count();
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
-    // allocateLocalSegmentID uses ContextManager instead of aclrtGetDevice.
-    // With ContextManager pre-initialized in SetUp, transport uses it, so
-    // install should not introduce extra aclrtGetDevice calls.
+    // allocateLocalSegmentID uses ContextManager instead of aclrtGetDevice,
+    // with ContextManager pre-initialized in SetUp. Each local copy engine is
+    // created with its engine's context, so install probes no device.
     EXPECT_EQ(mock_acl::get_get_device_call_count(), get_device_calls_before);
     globalConfig().ascend_agent_mode = false;
 }
@@ -1051,7 +1283,8 @@ TEST_F(AscendDirectTransportTest,
     const int get_device_calls_before = mock_acl::get_get_device_call_count();
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
-    // allocateLocalSegmentID uses ContextManager instead of aclrtGetDevice.
+    // allocateLocalSegmentID uses ContextManager instead of aclrtGetDevice, and
+    // the local copy engines take their context from it as well.
     EXPECT_EQ(mock_acl::get_get_device_call_count(), get_device_calls_before);
     auto metadata = transport->meta();
     ASSERT_NE(metadata, nullptr);
@@ -1317,6 +1550,21 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterAndUnregister) {
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
 }
 
+TEST_F(AscendDirectTransportTest, Memory_UnregisterWithoutCallerContext) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    // Ctrl-C unmounts the store segments from the signal handling thread, which
+    // has no context of its own to save and restore.
+    mock_acl::set_thread_context_bound(false);
+    EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 1);
+}
+
 TEST_F(AscendDirectTransportTest, Memory_RegisterPassesLocalOnly) {
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
@@ -1397,7 +1645,12 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterWithDeviceLocation) {
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterRejectsUnalignedDeviceMem) {
+    // hccs:device exports on 2 MiB pages; install snapshots the resolved
+    // protocol, so the env only has to be live while the transport installs.
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"comm_resource_config.protocol_desc":"hccs:device"})", 1);
     auto transport = createTransport();
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
     ASSERT_NE(transport, nullptr);
 
     // Mirrors a torch_npu caching-allocator sub-block 512 bytes past a 2 MiB
@@ -1416,7 +1669,10 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterRejectsUnalignedDeviceMem) {
 
 TEST_F(AscendDirectTransportTest,
        Memory_RegisterAllowsUnalignedLocalOnlyDeviceMem) {
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"comm_resource_config.protocol_desc":"hccs:device"})", 1);
     auto transport = createTransport();
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
     ASSERT_NE(transport, nullptr);
 
     auto buffer = allocateDeviceAlignedBuffer();
@@ -1709,13 +1965,20 @@ class AscendDirectParallelLocalCopyTest : public AscendDirectTransportTest {
     static constexpr size_t kCopyBytes = kSliceCount * kSliceSize;
 
     // Copies kSliceCount host slices to device memory in one batch, which is
-    // the shape a store batch put produces for a single target.
-    TransferWaitResult runHostToDeviceSlices(AscendDirectTransport* transport) {
+    // the shape a store batch put produces for a single target. contiguous
+    // models one key's pages; false leaves a gap after each slice, which is
+    // what a real store layout has between separately allocated keys.
+    // dst_base selects the registered destination buffer, and therefore the
+    // local engine its buffer device_id resolves to.
+    TransferWaitResult runHostToDeviceSlices(AscendDirectTransport* transport,
+                                             bool contiguous = true,
+                                             void* dst_base = nullptr) {
+        void* const dst = dst_base != nullptr ? dst_base : test_buffer_dst_;
         mock_acl::set_pointer_location(test_buffer_src_,
                                        ACL_MEM_LOCATION_TYPE_HOST, 0);
-        mock_acl::set_pointer_location(test_buffer_dst_,
-                                       ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+        mock_acl::set_pointer_location(dst, ACL_MEM_LOCATION_TYPE_DEVICE, 0);
         initTestData(kCopyBytes);
+        constexpr size_t kSliceStride = kSliceSize + 64;
 
         auto batch_id = transport->allocateBatchID(kSliceCount);
         EXPECT_NE(batch_id, 0);
@@ -1723,10 +1986,11 @@ class AscendDirectParallelLocalCopyTest : public AscendDirectTransportTest {
         for (size_t i = 0; i < kSliceCount; ++i) {
             Transport::TransferRequest req;
             req.opcode = Transport::TransferRequest::WRITE;
-            req.source = test_buffer_src_ + i * kSliceSize;
+            const size_t step = contiguous ? kSliceSize : kSliceStride;
+            req.source = test_buffer_src_ + i * step;
             req.target_id = 0;
             req.target_offset =
-                reinterpret_cast<uint64_t>(test_buffer_dst_ + i * kSliceSize);
+                reinterpret_cast<uint64_t>(static_cast<char*>(dst) + i * step);
             req.length = kSliceSize;
             requests.push_back(req);
         }
@@ -1737,7 +2001,7 @@ class AscendDirectParallelLocalCopyTest : public AscendDirectTransportTest {
     }
 };
 
-TEST_F(AscendDirectParallelLocalCopyTest, AsyncCopyUsesSixStreams) {
+TEST_F(AscendDirectParallelLocalCopyTest, AsyncCopyCoalescesContiguousSlices) {
     const int streams_before = mock_acl::stream_create_count();
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
@@ -1749,25 +2013,57 @@ TEST_F(AscendDirectParallelLocalCopyTest, AsyncCopyUsesSixStreams) {
               0);
     EXPECT_EQ(mock_acl::stream_create_count(), streams_before + 6);
 
-    auto result = runHostToDeviceSlices(transport.get());
+    auto result = runHostToDeviceSlices(transport.get(), true);
     ASSERT_TRUE(result.finished);
     EXPECT_FALSE(result.failed);
     EXPECT_TRUE(verifyTestData(kCopyBytes));
-    EXPECT_EQ(mock_acl::memcpy_async_call_count(),
-              static_cast<int>(kSliceCount));
+    // Contiguous slices merge into one copy, so the group uses a single stream
+    // and writes a single completion flag. A one-stream group is issued on the
+    // dispatcher worker instead of taking a memcpy-pool round trip.
+    constexpr int kCompletionFlags = 1;
+    EXPECT_EQ(mock_acl::memcpy_async_call_count(), 1 + kCompletionFlags);
     EXPECT_EQ(mock_acl::stream_create_count(), streams_before + 6);
     const auto thread_names = mock_acl::memcpy_async_thread_names();
-    ASSERT_EQ(thread_names.size(), kSliceCount);
+    ASSERT_EQ(thread_names.size(), static_cast<size_t>(1 + kCompletionFlags));
+    for (const auto& name : thread_names) {
+        EXPECT_EQ(name.compare(0, 10, "ascend-wk-"), 0)
+            << "aclrtMemcpyAsync ran on " << name;
+    }
+}
+
+TEST_F(AscendDirectParallelLocalCopyTest, AsyncCopyKeepsGapsSeparate) {
+    const int streams_before = mock_acl::stream_create_count();
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    EXPECT_EQ(mock_acl::stream_create_count(), streams_before + 6);
+
+    auto result = runHostToDeviceSlices(transport.get(), false);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    constexpr int kCompletionFlags = 6;
+    EXPECT_EQ(mock_acl::memcpy_async_call_count(),
+              static_cast<int>(kSliceCount) + kCompletionFlags);
+    const auto thread_names = mock_acl::memcpy_async_thread_names();
+    ASSERT_EQ(thread_names.size(),
+              static_cast<size_t>(kSliceCount) + kCompletionFlags);
     for (const auto& name : thread_names) {
         EXPECT_EQ(name.compare(0, 7, "mc-cpy-"), 0)
             << "aclrtMemcpyAsync ran on " << name;
     }
 }
 
-TEST_F(AscendDirectParallelLocalCopyTest, MultiDeviceDefersPerDeviceStreams) {
+TEST_F(AscendDirectParallelLocalCopyTest,
+       MultiDeviceCreatesStreamsOnFirstCopy) {
     globalConfig().ascend_agent_mode = true;
     ContextManager::getInstance().finalize();
     constexpr int kDeviceCount = 4;
+    constexpr int kStreamsPerEngine = 6;
     mock_acl::set_device_count(kDeviceCount);
     ASSERT_TRUE(ContextManager::getInstance().initialize());
 
@@ -1780,15 +2076,325 @@ TEST_F(AscendDirectParallelLocalCopyTest, MultiDeviceDefersPerDeviceStreams) {
     ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
                                              "cpu:0", true, true),
               0);
-    EXPECT_EQ(mock_acl::stream_create_count(), streams_before);
+    // A second destination buffer registered while device 1 is current: its
+    // device_id makes a slice into it resolve to engine 1, so a copy into it is
+    // engine 1's local copy.
+    void* const second_dst = test_buffer_dst_ + kRegisterMemSize;
+    ASSERT_EQ(aclrtSetDevice(1), ACL_ERROR_NONE);
+    ASSERT_EQ(transport->registerLocalMemory(second_dst, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    // A process with several local engines creates the copy streams on the
+    // first copy that needs them, not at install: each engine carries its own
+    // six streams, and a store process copies locally only on the devices it
+    // serves.
+    EXPECT_EQ(mock_acl::stream_create_count(), streams_before)
+        << "a multi-engine install must not create the copy streams";
 
     ASSERT_EQ(aclrtSetDevice(0), ACL_ERROR_NONE);
     auto first = runHostToDeviceSlices(transport.get());
     ASSERT_TRUE(first.finished);
     EXPECT_FALSE(first.failed);
-    EXPECT_EQ(mock_acl::stream_create_count(), streams_before + 6);
+    EXPECT_EQ(mock_acl::stream_create_count(),
+              streams_before + kStreamsPerEngine)
+        << "the first copy creates only the streams of the engine it runs on";
+
+    // A copy on another engine creates that engine's streams as well; the
+    // engines that are still unused keep none.
+    ASSERT_EQ(aclrtSetDevice(1), ACL_ERROR_NONE);
+    auto second = runHostToDeviceSlices(transport.get(), true, second_dst);
+    ASSERT_TRUE(second.finished);
+    EXPECT_FALSE(second.failed);
+    EXPECT_EQ(mock_acl::stream_create_count(),
+              streams_before + 2 * kStreamsPerEngine);
 
     globalConfig().ascend_agent_mode = false;
+}
+
+// -----------------------------------------------------------------------------
+// LocalCopyEngine regression tests
+// -----------------------------------------------------------------------------
+
+// Drives the engine directly: the transport-level tests above exercise it
+// through submitTransfer/getTransferStatus, but the timeout, teardown and
+// per-device submission ordering this file asserts need control over the mock's
+// D2H completion writes and over the caller thread's ACL context.
+class LocalCopyEngineTest : public ::testing::Test {
+   protected:
+    static constexpr size_t kCopyStreamCount = 6;
+    static constexpr size_t kFlagStride = 64;
+
+    struct CopyGroup {
+        std::vector<char> source;
+        std::vector<char> destination;
+        std::vector<std::unique_ptr<Transport::Slice>> slices;
+        std::vector<void*> dest_addrs;
+    };
+
+    void SetUp() override { mock_acl::reset(); }
+
+    void TearDown() override {
+        mock_acl::set_detect_stream_overlap(false);
+        mock_acl::reset();
+    }
+
+    CopyGroup BuildCopyGroup(size_t bytes, size_t slice_count = 1) {
+        CopyGroup group;
+        group.source.assign(bytes, static_cast<char>(0x5a));
+        group.destination.assign(bytes, 0);
+        const size_t slice_bytes = bytes / slice_count;
+        for (size_t i = 0; i < slice_count; ++i) {
+            auto slice = std::make_unique<Transport::Slice>();
+            slice->status = Transport::Slice::PENDING;
+            slice->source_addr = group.source.data() + i * slice_bytes;
+            slice->length = slice_bytes;
+            slice->opcode = Transport::TransferRequest::WRITE;
+            slice->task = &task_;
+            group.dest_addrs.push_back(group.destination.data() +
+                                       i * slice_bytes);
+            group.slices.push_back(std::move(slice));
+        }
+        mock_acl::set_pointer_location(group.destination.data(),
+                                       ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+        return group;
+    }
+
+    static std::vector<Transport::Slice*> Pointers(CopyGroup& group) {
+        std::vector<Transport::Slice*> slice_ptrs;
+        slice_ptrs.reserve(group.slices.size());
+        for (auto& slice : group.slices) {
+            slice_ptrs.push_back(slice.get());
+        }
+        return slice_ptrs;
+    }
+
+    Transport::TransferTask task_;
+};
+
+// A timed-out group must have its streams aborted before its host flags are
+// released: the flag is the destination of an in-flight D2H, so freeing it
+// first would let the stream write into released memory. The abort drops the
+// queued work, so the streams are recreated for later copies.
+TEST_F(LocalCopyEngineTest, TimeoutAbortsStreamsBeforeFreeingFlags) {
+    LocalCopyEngine engine;
+    ASSERT_EQ(engine.Initialize(ContextForDevice(0), 20, 1), 0);
+    const int creates_before = mock_acl::stream_create_count();
+    const int destroys_before = mock_acl::stream_destroy_count();
+    const int device_frees_before = mock_acl::device_free_count();
+
+    mock_acl::set_skip_flag_copy(true);
+    auto group = BuildCopyGroup(kTransferBufSize);
+    auto slice_ptrs = Pointers(group);
+    engine.Copy(Transport::TransferRequest::WRITE, slice_ptrs,
+                group.dest_addrs);
+    const auto host_allocs = mock_acl::host_allocs();
+    ASSERT_EQ(host_allocs.size(), 1U);
+    void* const host_flags = host_allocs[0];
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    engine.Poll();
+
+    EXPECT_EQ(group.slices[0]->status, Transport::Slice::FAILED);
+    EXPECT_GT(mock_acl::stream_abort_count(), 0);
+    const int free_seq = mock_acl::host_free_seq(host_flags);
+    ASSERT_GE(free_seq, 0) << "timed-out group's host flags must be released";
+    EXPECT_GT(free_seq, mock_acl::last_stream_abort_seq())
+        << "stream abort must precede aclrtFreeHost of the group's flags";
+
+    // The streams are aborted, destroyed and recreated, so the next copy starts
+    // on a generation that carries no work from the timed-out one.
+    EXPECT_EQ(mock_acl::stream_destroy_count(),
+              destroys_before + static_cast<int>(kCopyStreamCount));
+    EXPECT_EQ(mock_acl::stream_create_count(),
+              creates_before + static_cast<int>(kCopyStreamCount));
+    // The device completion value lives outside the stream generation.
+    EXPECT_EQ(mock_acl::device_free_count(), device_frees_before);
+
+    mock_acl::set_skip_flag_copy(false);
+    auto next_group = BuildCopyGroup(kTransferBufSize);
+    auto next_slice_ptrs = Pointers(next_group);
+    engine.Copy(Transport::TransferRequest::WRITE, next_slice_ptrs,
+                next_group.dest_addrs);
+    engine.Poll();
+    EXPECT_EQ(next_group.slices[0]->status, Transport::Slice::SUCCESS);
+    EXPECT_EQ(mock_acl::stream_create_count(),
+              creates_before + static_cast<int>(kCopyStreamCount));
+
+    engine.Finalize();
+}
+
+// Aborting the streams also cancels the queued work of every group that shared
+// them, so their completion flags can no longer land. They fail together
+// instead of hanging until their own deadlines.
+TEST_F(LocalCopyEngineTest, TimeoutFailsEveryGroupOnTheStreams) {
+    LocalCopyEngine engine;
+    ASSERT_EQ(engine.Initialize(ContextForDevice(0), 50, 1), 0);
+    mock_acl::set_skip_flag_copy(true);
+
+    auto first = BuildCopyGroup(kTransferBufSize);
+    auto first_slice_ptrs = Pointers(first);
+    engine.Copy(Transport::TransferRequest::WRITE, first_slice_ptrs,
+                first.dest_addrs);
+
+    // The second group is admitted later, so its own deadline is later too.
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
+    auto second = BuildCopyGroup(kTransferBufSize);
+    auto second_slice_ptrs = Pointers(second);
+    engine.Copy(Transport::TransferRequest::WRITE, second_slice_ptrs,
+                second.dest_addrs);
+
+    const auto host_allocs = mock_acl::host_allocs();
+    ASSERT_EQ(host_allocs.size(), 2U);
+    void* const first_flags = host_allocs[0];
+    void* const second_flags = host_allocs[1];
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    engine.Poll();
+
+    EXPECT_EQ(first.slices[0]->status, Transport::Slice::FAILED);
+    EXPECT_EQ(second.slices[0]->status, Transport::Slice::FAILED)
+        << "recreating the streams drops the sibling's queued work too";
+    const int first_free_seq = mock_acl::host_free_seq(first_flags);
+    ASSERT_GE(first_free_seq, 0);
+    EXPECT_GT(first_free_seq, mock_acl::last_stream_abort_seq());
+    EXPECT_GE(mock_acl::host_free_seq(second_flags), 0);
+
+    engine.Finalize();
+}
+
+// Poll() runs on the getTransferStatus() thread, which often has no ACL context
+// (or another device's), and teardown can run on a similar thread. Every ACL
+// call the engine makes for abort/destroy/free must bind the owning device's
+// context explicitly, or ACL ignores it and the flags are still freed.
+TEST_F(LocalCopyEngineTest, AbortAndTeardownBindOwningDeviceContext) {
+    LocalCopyEngine engine;
+    ASSERT_EQ(engine.Initialize(ContextForDevice(0), 20, 1), 0);
+    mock_acl::clear_acl_calls();
+
+    mock_acl::set_skip_flag_copy(true);
+    auto timed_out = BuildCopyGroup(kTransferBufSize);
+    auto timed_out_slice_ptrs = Pointers(timed_out);
+    engine.Copy(Transport::TransferRequest::WRITE, timed_out_slice_ptrs,
+                timed_out.dest_addrs);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+
+    // getTransferStatus() runs on a thread with another device's context and
+    // no way to read a context back to restore later. If the engine does not
+    // bind the owning device's context, the ACL calls below are recorded with
+    // device 3's context.
+    ASSERT_EQ(aclrtSetCurrentContext(ContextForDevice(3)), ACL_ERROR_NONE);
+    mock_acl::set_thread_context_bound(false);
+    engine.Poll();
+    EXPECT_EQ(timed_out.slices[0]->status, Transport::Slice::FAILED);
+
+    // A group still pending when Finalize() runs.
+    mock_acl::set_thread_context_bound(true);
+    ASSERT_EQ(aclrtSetCurrentContext(ContextForDevice(0)), ACL_ERROR_NONE);
+    auto outstanding = BuildCopyGroup(kTransferBufSize);
+    auto outstanding_slice_ptrs = Pointers(outstanding);
+    engine.Copy(Transport::TransferRequest::WRITE, outstanding_slice_ptrs,
+                outstanding.dest_addrs);
+    mock_acl::set_skip_flag_copy(false);
+
+    // Teardown from a thread bound to another device's context.
+    ASSERT_EQ(aclrtSetCurrentContext(ContextForDevice(3)), ACL_ERROR_NONE);
+    engine.Finalize();
+    EXPECT_EQ(outstanding.slices[0]->status, Transport::Slice::FAILED);
+
+    bool saw_abort = false;
+    bool saw_destroy = false;
+    bool saw_device_free = false;
+    bool saw_host_free = false;
+    for (const auto& call : mock_acl::acl_calls()) {
+        if (call.op == "abort_stream") {
+            saw_abort = true;
+        } else if (call.op == "destroy_stream") {
+            saw_destroy = true;
+        } else if (call.op == "free_device") {
+            saw_device_free = true;
+        } else if (call.op == "free_host") {
+            saw_host_free = true;
+        } else {
+            continue;
+        }
+        EXPECT_EQ(call.context, ContextForDevice(0))
+            << call.op << " ran without the owning device's context";
+    }
+    EXPECT_TRUE(saw_abort);
+    EXPECT_TRUE(saw_destroy);
+    EXPECT_TRUE(saw_device_free);
+    EXPECT_TRUE(saw_host_free);
+}
+
+// Copy() issues the whole group while it holds the engine mutex, so two copies
+// on one device cannot run aclrtMemcpyAsync on the same stream concurrently.
+// The mock flags overlapping calls on one stream and sleeps for a moment to
+// make the race observable.
+TEST_F(LocalCopyEngineTest, ConcurrentCopiesSerializeStreamSubmission) {
+    LocalCopyEngine engine;
+    ASSERT_EQ(engine.Initialize(ContextForDevice(0), 1000, 1), 0);
+    const int creates_before = mock_acl::stream_create_count();
+
+    auto first = BuildCopyGroup(kTransferBufSize, 2);
+    auto second = BuildCopyGroup(kTransferBufSize, 2);
+    mock_acl::set_detect_stream_overlap(true);
+
+    std::atomic<int> ready{0};
+    auto submit = [&engine, &ready](CopyGroup* group) {
+        ready.fetch_add(1);
+        while (ready.load() < 2) {
+            std::this_thread::yield();
+        }
+        auto slice_ptrs = Pointers(*group);
+        engine.Copy(Transport::TransferRequest::WRITE, slice_ptrs,
+                    group->dest_addrs);
+    };
+    std::thread first_thread(submit, &first);
+    std::thread second_thread(submit, &second);
+    first_thread.join();
+    second_thread.join();
+    mock_acl::set_detect_stream_overlap(false);
+
+    EXPECT_EQ(mock_acl::stream_overlap_count(), 0)
+        << "two copies submitted to the same stream concurrently";
+    EXPECT_GT(mock_acl::memcpy_async_call_count(), 0);
+    EXPECT_EQ(mock_acl::stream_create_count(), creates_before);
+
+    engine.Poll();
+    EXPECT_EQ(first.slices[0]->status, Transport::Slice::SUCCESS);
+    EXPECT_EQ(first.slices[1]->status, Transport::Slice::SUCCESS);
+    EXPECT_EQ(second.slices[0]->status, Transport::Slice::SUCCESS);
+    EXPECT_EQ(second.slices[1]->status, Transport::Slice::SUCCESS);
+
+    engine.Finalize();
+}
+
+// A process that runs several local engines creates each engine's six copy
+// streams on the first copy, not at Initialize: it copies locally only on the
+// devices it serves, so most engines would otherwise hold six unused streams
+// from install on. Finalize() tears down whatever was created.
+TEST_F(LocalCopyEngineTest, MultiEngineDefersStreamCreationUntilFirstCopy) {
+    LocalCopyEngine engine;
+    ASSERT_EQ(engine.Initialize(ContextForDevice(0), 1000, 4), 0);
+    EXPECT_EQ(mock_acl::stream_create_count(), 0)
+        << "a multi-engine install must not create the copy streams";
+    engine.Poll();
+    EXPECT_EQ(mock_acl::stream_create_count(), 0)
+        << "a status poll must not create the copy streams";
+
+    auto group = BuildCopyGroup(kTransferBufSize);
+    auto slice_ptrs = Pointers(group);
+    engine.Copy(Transport::TransferRequest::WRITE, slice_ptrs,
+                group.dest_addrs);
+    EXPECT_EQ(mock_acl::stream_create_count(),
+              static_cast<int>(kCopyStreamCount))
+        << "the first copy creates this engine's six streams";
+    engine.Poll();
+    EXPECT_EQ(group.slices[0]->status, Transport::Slice::SUCCESS);
+
+    engine.Finalize();
+    EXPECT_EQ(mock_acl::stream_destroy_count(),
+              static_cast<int>(kCopyStreamCount));
 }
 
 // -----------------------------------------------------------------------------
@@ -2608,72 +3214,47 @@ TEST(AgentModeAllocTest, EntireBestEffortFailureDoesNotConsumeSlot) {
 
 struct BoundRunnerGuard {
     const void* owner = nullptr;
-    ~BoundRunnerGuard() {
-        ClearPerDeviceBoundAffinityRunners(owner);
-        ClearBoundAffinityRunner(owner);
-    }
+    ~BoundRunnerGuard() { ClearAllocationAffinityPools(owner); }
 };
 
 TEST(BoundAffinityRunnerTest, DeviceTaskRunsOnThatDevicePool) {
     auto pool0 = std::make_unique<AscendThreadPool>(1, "t0-");
     auto pool1 = std::make_unique<AscendThreadPool>(1, "t1-");
     BoundRunnerGuard guard{pool0.get()};
-    int which = -1;
-    std::vector<std::function<void(std::function<void()>)>> runners;
-    runners.push_back([raw = pool0.get(), &which](std::function<void()> task) {
-        raw->enqueue([&which, task = std::move(task)] {
-            which = 0;
-            task();
+    AllocationAffinityPools pools;
+    for (auto* pool : {pool0.get(), pool1.get()}) {
+        pools.per_device.push_back([pool](std::function<void()> task) {
+            (void)pool->tryEnqueue(std::move(task));
         });
-    });
-    runners.push_back([raw = pool1.get(), &which](std::function<void()> task) {
-        raw->enqueue([&which, task = std::move(task)] {
-            which = 1;
-            task();
-        });
-    });
-    SetPerDeviceBoundAffinityRunners(guard.owner, std::move(runners));
+    }
+    PublishAllocationAffinityPools(guard.owner, std::move(pools));
 
-    which = -1;
-    RunOnDeviceBoundAffinityThread(0, [] {});
-    EXPECT_EQ(which, 0);
-    which = -1;
-    RunOnDeviceBoundAffinityThread(1, [] {});
-    EXPECT_EQ(which, 1);
+    std::atomic<int> which{-1};
+    RunAllocationOnAffinityPool(0, [&] { which = 0; });
+    EXPECT_EQ(which.load(), 0);
+    RunAllocationOnAffinityPool(1, [&] { which = 1; });
+    EXPECT_EQ(which.load(), 1);
 
-    ClearPerDeviceBoundAffinityRunners(guard.owner);
+    ClearAllocationAffinityPools(guard.owner);
     which = -1;
-    RunOnDeviceBoundAffinityThread(1, [&which] { which = 7; });
-    EXPECT_EQ(which, 7);
+    RunAllocationOnAffinityPool(1, [&] { which = 7; });
+    EXPECT_EQ(which.load(), 7);
 }
 
 TEST(BoundAffinityRunnerTest, MissingDeviceUsesSharedRunner) {
     auto shared = std::make_unique<AscendThreadPool>(1, "sh-");
     auto device = std::make_unique<AscendThreadPool>(1, "dv-");
-    int which = -1;
     BoundRunnerGuard guard{shared.get()};
-    SetBoundAffinityRunner(
-        guard.owner, [raw = shared.get(), &which](std::function<void()> task) {
-            raw->enqueue([&which, task = std::move(task)] {
-                which = 0;
-                task();
-            });
-        });
-    std::vector<std::function<void(std::function<void()>)>> runners;
-    runners.push_back([raw = device.get(), &which](std::function<void()> task) {
-        raw->enqueue([&which, task = std::move(task)] {
-            which = 1;
-            task();
-        });
-    });
-    SetPerDeviceBoundAffinityRunners(guard.owner, std::move(runners));
+    AllocationAffinityPools pools;
+    pools.shared = MakeAllocationRunner(shared.get());
+    pools.per_device.push_back(MakeAllocationRunner(device.get()));
+    PublishAllocationAffinityPools(guard.owner, std::move(pools));
 
-    which = -1;
-    RunOnDeviceBoundAffinityThread(0, [] {});
-    EXPECT_EQ(which, 1);
-    which = -1;
-    RunOnDeviceBoundAffinityThread(3, [] {});
-    EXPECT_EQ(which, 0);
+    std::atomic<int> which{-1};
+    RunAllocationOnAffinityPool(0, [&] { which = 1; });
+    EXPECT_EQ(which.load(), 1);
+    RunAllocationOnAffinityPool(3, [&] { which = 0; });
+    EXPECT_EQ(which.load(), 0);
 }
 
 TEST(RoceModeDetectionTest, GlobalResourceConfig_StringRoceDesc) {
@@ -2684,6 +3265,26 @@ TEST(RoceModeDetectionTest, GlobalResourceConfig_StringRoceDesc) {
 TEST(RoceModeDetectionTest, GlobalResourceConfig_ArrayRoceDesc) {
     EXPECT_TRUE(HasRoceProtocolDescInGlobalResourceConfig(
         R"({"comm_resource_config.protocol_desc":["hccs:device","roce:host"]})"));
+}
+
+TEST(RoceModeDetectionTest, HccsDeviceProtocolDesc) {
+    // Ported from upstream #5049: only the resolved hccs:device entry gates
+    // HCCS device alignment.
+    EXPECT_TRUE(HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":"hccs:device"})"));
+    EXPECT_TRUE(HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config":{"protocol_desc":"hccs:device"}})"));
+    EXPECT_TRUE(HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config":{)"
+        R"("protocol_desc":["hccs:host","hccs:device"]}})"));
+    EXPECT_FALSE(HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":"hccs:host"})"));
+    EXPECT_FALSE(HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":"roce:device"})"));
+    EXPECT_FALSE(HasHccsDeviceProtocolDescInGlobalResourceConfig(
+        R"({"comm_resource_config":{"listen_port":26666}})"));
+    EXPECT_FALSE(HasHccsDeviceProtocolDescInGlobalResourceConfig(""));
+    EXPECT_FALSE(HasHccsDeviceProtocolDescInGlobalResourceConfig("{not json"));
 }
 
 TEST(RoceModeDetectionTest, GlobalResourceConfig_RoceHostString) {
@@ -2735,7 +3336,130 @@ TEST(RoceModeDetectionTest, IsRoceModeEnabled_FromHcclEnv) {
     unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
     setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1);
     EXPECT_TRUE(IsRoceModeEnabled());
+    EXPECT_TRUE(IsHcclIntraRoceEnabled());
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
+}
+
+// Dispatcher selection uses IsHcclIntraRoceEnabled(), not IsRoceModeEnabled().
+// roce:device and roce:host still report RoCE mode, and they stay on
+// DefaultSliceDispatcher.
+TEST(RoceModeDetectionTest, HcclIntraRoceIgnoresProtocolDesc) {
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"comm_resource_config.protocol_desc":"roce:device"})", 1);
+    EXPECT_TRUE(IsRoceModeEnabled());
+    EXPECT_FALSE(IsHcclIntraRoceEnabled());
+
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"comm_resource_config.protocol_desc":"roce:host"})", 1);
+    EXPECT_TRUE(IsRoceModeEnabled());
+    EXPECT_FALSE(IsHcclIntraRoceEnabled());
+
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    setenv("HCCL_INTRA_ROCE_ENABLE", "0", 1);
+    EXPECT_FALSE(IsHcclIntraRoceEnabled());
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+}
+
+// The unread-device assignment is a pure function so the distribution can be
+// asserted with a constructed topology instead of depending on this host's
+// NUMA layout.
+TEST(AscendAffinityPlanTest, UnreadDevicesSpreadEvenlyOverNodes) {
+    const std::vector<std::pair<int, std::vector<int>>> nodes{
+        {2, {2, 3}}, {10, {10, 11}}, {18, {18}}};
+    const auto assignment = AllocateUnreadDevicesToNumaNodes(7, nodes);
+    ASSERT_EQ(assignment.size(), 7U);
+    std::vector<size_t> per_node(nodes.size(), 0);
+    for (size_t index : assignment) {
+        ASSERT_LT(index, nodes.size());
+        ++per_node[index];
+    }
+    // Fewest-used node first, ties broken by node id: devices land on the nodes
+    // round-robin, so their counts differ by at most one.
+    EXPECT_EQ(per_node[0], 3U);
+    EXPECT_EQ(per_node[1], 2U);
+    EXPECT_EQ(per_node[2], 2U);
+    EXPECT_EQ(assignment, (std::vector<size_t>{0, 1, 2, 0, 1, 2, 0}));
+    // Fewer than two usable nodes: nothing to spread over, so the plan stays
+    // unbound instead of pinning every device to the only node.
+    EXPECT_TRUE(AllocateUnreadDevicesToNumaNodes(4, {{0, {0, 1}}}).empty());
+}
+
+TEST(AscendAffinityPlanTest, BuildPlanInvariants) {
+    const std::vector<int32_t> ids{0, 1, 2};
+    const auto plan = BuildAscendAffinityPlan(ids);
+    ASSERT_EQ(plan.per_device_cpus.size(), ids.size());
+
+    const auto& nodes = NumaNodeCpuLists();
+    for (const auto& cpus : plan.per_device_cpus) {
+        if (cpus.empty()) {
+            continue;
+        }
+        // A non-empty entry must be exactly one readable node's cpulist.
+        bool matches_node = false;
+        for (const auto& node : nodes) {
+            matches_node = matches_node || node.second == cpus;
+        }
+        EXPECT_TRUE(matches_node);
+    }
+    // The shared set is published only when every device resolved to the same
+    // node, so it must then match every per-device entry.
+    if (!plan.shared_cpus.empty()) {
+        for (const auto& cpus : plan.per_device_cpus) {
+            EXPECT_EQ(cpus, plan.shared_cpus);
+        }
+    }
+}
+
+// The allocation-affinity registry is shared with TENT, so the publication and
+// clear contract is verified directly here (the transport tests exercise it
+// through the host allocator).
+TEST(AscendBoundAffinityRunnerTest, PublishesAndClearsSharedRunner) {
+    int owner = 0;
+    int other_owner = 0;
+    ClearAllocationAffinityPools(&owner);
+    int runs = 0;
+    AllocationAffinityPools pools;
+    pools.shared = [&runs](std::function<void()> task) {
+        ++runs;
+        task();
+    };
+    PublishAllocationAffinityPools(&owner, std::move(pools));
+    bool ran_inline = false;
+    RunAllocationOnAffinityPool(-1, [&ran_inline] { ran_inline = true; });
+    EXPECT_TRUE(ran_inline);
+    EXPECT_EQ(runs, 1);
+    // A clear from a different owner must not remove this runner.
+    ClearAllocationAffinityPools(&other_owner);
+    RunAllocationOnAffinityPool(-1, [] {});
+    EXPECT_EQ(runs, 2);
+    ClearAllocationAffinityPools(&owner);
+    RunAllocationOnAffinityPool(-1, [] {});
+    EXPECT_EQ(runs, 2);
+}
+
+TEST(AscendBoundAffinityRunnerTest, PublishesAndClearsPerDeviceRunners) {
+    int owner = 0;
+    ClearAllocationAffinityPools(&owner);
+    std::vector<int> runs(2, 0);
+    AllocationAffinityPools pools;
+    for (int i = 0; i < 2; ++i) {
+        pools.per_device.push_back([&runs, i](std::function<void()> task) {
+            ++runs[static_cast<size_t>(i)];
+            task();
+        });
+    }
+    PublishAllocationAffinityPools(&owner, std::move(pools));
+    RunAllocationOnAffinityPool(1, [] {});
+    EXPECT_EQ(runs[0], 0);
+    EXPECT_EQ(runs[1], 1);
+    // A device without a runner of its own falls back to the shared runner;
+    // with none published it runs inline.
+    RunAllocationOnAffinityPool(5, [] {});
+    EXPECT_EQ(runs[0] + runs[1], 1);
+    ClearAllocationAffinityPools(&owner);
+    RunAllocationOnAffinityPool(1, [] {});
+    EXPECT_EQ(runs[1], 1);
 }
 
 // -----------------------------------------------------------------------------

@@ -779,6 +779,35 @@ publish session tags. Upgrade the Store client and Master to enable attribution.
 A storage node's disk scan alone cannot reconstruct metadata tags after all
 Master metadata is lost; preserve the metadata recovery artifacts as well.
 
+#### residency_affinity_ids
+**Type:** `Optional[List[str]]`
+**Default:** `None`
+
+Optional opaque per-key residency affinity metadata. Supply one entry per input
+key, including one entry for a single-key write. An empty string records no
+affinity; an empty list is invalid for a nonempty write. Batch splitting and
+retry subsets preserve the IDs in key order.
+
+```python
+config = ReplicateConfig()
+config.residency_affinity_ids = ["tensor-a", "tensor-a", ""]
+store.put_batch(["key-a", "key-b", "key-c"], [b"a", b"b", b"c"], config)
+config.residency_affinity_ids = None
+```
+
+Upsert preserves an existing object's affinity when the field is omitted,
+including when storage is reallocated. An explicitly different ID is rejected;
+remove and recreate the object to change its affinity. Duplicate Put leaves
+the existing metadata unchanged.
+
+Affinity survives metadata OpLog replay, snapshots, and standby promotion.
+Persisted object metadata appends affinity after the existing session and
+checksum extensions. Old records default to empty affinity, and old readers
+can ignore the new field.
+Upgrade clients and Masters together to retain affinity throughout recovery.
+This field only records metadata: it does not enable migration, change placement
+or eviction policy, or alter the weight metadata snapshot schema.
+
 #### group_ids
 **Type:** `List[str] | None`
 **Default:** `None`
@@ -3152,10 +3181,11 @@ are read into request-scoped host staging and then scattered to host or device
 destinations; for device destinations, staging first uses the fixed-capacity
 pinned restore arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`
 and falls back to the regular client buffer allocator if it is unavailable or
-exhausted. LOCAL_DISK replicas are restored on the owner via the offload RPC
-and then scatter object-byte ranges into already `register_buffer`'d
-destinations (the reader does not need a setup local buffer). DISK replicas
-`BatchGet` into a temporary host buffer and scatter by `src_offset`. If a key
+exhausted. LOCAL_DISK replicas restore only the requested byte window on the
+owner via the offload RPC and then scatter that window into already
+`register_buffer`'d destinations (the reader does not need a setup local
+buffer). DISK and DFS replicas read that same window into a temporary host
+buffer and scatter it. If a key
 has no complete MEMORY, DFS, LOCAL_DISK, or DISK replica — for example because
 it has only NOF replicas — `batch_get_session_start` returns
 `INVALID_REPLICA` for that key and does not open a session. Put sessions

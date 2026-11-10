@@ -33,6 +33,10 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // When range_read is set, slices are a window of the value starting at
+    // value_offset. Otherwise slices must cover the whole object.
+    uint64_t value_offset = 0;
+    bool range_read = false;
 };
 
 /**
@@ -66,6 +70,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
     bool UsesKvcs() const {
         return UsesObjectStorage() && distributed_config_.UsesKvcs();
     }
+
+    // True when reads go through a filesystem adapter that can read straight
+    // into arbitrary host memory without an intermediate buffer.
+    bool SupportsArbitraryHostReadBuffers() const;
 
     tl::expected<void, ErrorCode> Init() override;
 

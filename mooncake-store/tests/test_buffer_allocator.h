@@ -39,7 +39,8 @@ class TestBufferAllocator final : public BufferAllocatorBase {
                     base_ +
                     next_offset_.fetch_add(size, std::memory_order_relaxed);
                 return std::make_unique<AllocatedBuffer>(
-                    shared_from_this(), reinterpret_cast<void*>(address), size);
+                    weak_from_this(), reinterpret_cast<void*>(address), size,
+                    std::nullopt, getTransportProtocol());
             }
         }
         return nullptr;
@@ -55,6 +56,7 @@ class TestBufferAllocator final : public BufferAllocatorBase {
     uintptr_t base() const override { return base_; }
     std::string getSegmentName() const override { return name_; }
     std::string getTransportEndpoint() const override { return endpoint_; }
+    std::string getTransportProtocol() const override { return "tcp"; }
     size_t getLargestFreeRegion() const override {
         return capacity_ - std::min(size(), capacity_);
     }
