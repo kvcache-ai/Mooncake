@@ -369,6 +369,17 @@ if(STORE_USE_K8S_LEASE)
       "${CMAKE_BINARY_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.h")
 endif()
 
+# File output for the traffic recorder. Kept separate from the recorder core so
+# the format and sink can be tested and reviewed without the RPC integration.
+# Later traffic PRs link this library instead of compiling file_sink.cpp a
+# second time into mooncake_store.
+add_library(mooncake_traffic_file_sink STATIC traffic/file_sink.cpp)
+target_include_directories(
+  mooncake_traffic_file_sink
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(mooncake_traffic_file_sink PUBLIC glog::glog)
+
 # NoF support code that is SPDK-free (page-registration bookkeeping,
 # probe-context pooling, and controller env parsing). Built in every
 # configuration so unit tests can exercise it without SPDK; both mooncake_store
