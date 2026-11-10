@@ -6447,6 +6447,14 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
                 ]),
         )
         .expect("replicated put should succeed");
+    // Quarantining A also removes it from route-authority selection. Ensure
+    // the surviving authority has received the asynchronous publication first.
+    let mirrored = wait_for_authority_route(
+        &metadata.route_namespace(),
+        &store_b.runtime_id().stable_id,
+        &route.key,
+    );
+    assert_eq!(mirrored.version, route.version);
     let dead_replica = route
         .replicas
         .iter()

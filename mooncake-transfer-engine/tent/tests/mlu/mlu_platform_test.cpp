@@ -14,7 +14,9 @@
 
 #include <cnrt.h>
 #include <cn_api.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <limits>
 #include <thread>
@@ -82,6 +84,81 @@ TEST_F(MluPlatformTest, ExternalInteriorPointerOnFreshWorker) {
     });
     worker.join();
     EXPECT_TRUE(std::equal(seed.begin(), seed.end() - 17, readback.begin()));
+}
+
+TEST_F(MluPlatformTest, ExportsDeviceRangeAndRejectsHostOrEmpty) {
+    DmabufExport out;
+    uint8_t host[16] = {};
+    EXPECT_TRUE(
+        platform_.exportDmabuf(host, sizeof(host), out).IsInvalidArgument());
+    EXPECT_EQ(out.fd, -1);
+    EXPECT_TRUE(platform_.exportDmabuf(device_, 0, out).IsInvalidArgument());
+    EXPECT_EQ(out.fd, -1);
+
+    auto status = platform_.exportDmabuf(device_, kSize, out);
+    if (!status.ok()) GTEST_SKIP() << "MLU DMA-BUF unavailable: " << status;
+    ASSERT_GE(out.fd, 0);
+    EXPECT_TRUE(out.close_fd);
+    EXPECT_EQ(out.offset, 0u);
+    EXPECT_NE(fcntl(out.fd, F_GETFD), -1);
+    EXPECT_EQ(close(out.fd), 0);
+
+    auto* interior = static_cast<uint8_t*>(device_) + 17;
+    status = platform_.exportDmabuf(interior, 4096, out);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_LE(out.offset, 17u);
+    EXPECT_EQ(close(out.fd), 0);
+}
+
+TEST_F(MluPlatformTest, NonPageMultipleLengthRequiresAlignedBacking) {
+    DmabufExport probe;
+    auto status = platform_.exportDmabuf(device_, kSize, probe);
+    if (!status.ok()) GTEST_SKIP() << "MLU DMA-BUF unavailable: " << status;
+    ASSERT_GE(probe.fd, 0);
+    ASSERT_EQ(close(probe.fd), 0);
+
+    constexpr size_t kNonPageMultipleLength = 1'000'000;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    ASSERT_GT(page_size, 0);
+    ASSERT_NE(kNonPageMultipleLength % static_cast<size_t>(page_size), 0u);
+    DmabufExport padded;
+    status = platform_.exportDmabuf(device_, kNonPageMultipleLength, padded);
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_GE(padded.fd, 0);
+    EXPECT_EQ(padded.offset, 0u);
+    EXPECT_EQ(close(padded.fd), 0);
+
+    ASSERT_EQ(cnrtFree(device_), cnrtSuccess);
+    device_ = nullptr;
+    ASSERT_EQ(cnrtMalloc(&device_, kNonPageMultipleLength), cnrtSuccess);
+
+    CNaddr base = 0;
+    cn_uint64_t allocation_size = 0;
+    ASSERT_EQ(cnMemGetAddressRange(&base, &allocation_size,
+                                   reinterpret_cast<CNaddr>(device_)),
+              CN_SUCCESS);
+    ASSERT_EQ(base, reinterpret_cast<CNaddr>(device_));
+    if (allocation_size != kNonPageMultipleLength)
+        GTEST_SKIP() << "CNDrv reports a different allocation size: "
+                     << allocation_size;
+
+    DmabufExport out;
+    status = platform_.exportDmabuf(device_, kNonPageMultipleLength, out);
+    EXPECT_TRUE(status.IsNotImplemented()) << status;
+    EXPECT_EQ(out.fd, -1);
+
+    auto* interior = static_cast<uint8_t*>(device_) + 17;
+    status = platform_.exportDmabuf(interior, kNonPageMultipleLength - 18, out);
+    EXPECT_TRUE(status.IsNotImplemented()) << status;
+    EXPECT_EQ(out.fd, -1);
+}
+
+TEST_F(MluPlatformTest, CrossBoundaryExportIsUnavailable) {
+    DmabufExport out;
+    auto* tail = static_cast<uint8_t*>(device_) + kSize - 1;
+    auto status = platform_.exportDmabuf(tail, 2, out);
+    EXPECT_TRUE(status.IsNotImplemented()) << status;
+    EXPECT_EQ(out.fd, -1);
 }
 
 // A second driver context on the same card catches context restoration bugs

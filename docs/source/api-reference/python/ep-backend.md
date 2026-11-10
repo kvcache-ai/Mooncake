@@ -35,8 +35,8 @@ adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
 with `nvcc`, and Ninja.
 
 On Intel XPU, Mooncake EP is built natively with the oneAPI DPC++ compiler
-(TENT and Mooncake PG are not needed). It supports ranks on one node; see
-{ref}`Intel XPU <mooncake-ep-intel-xpu>` in the EP design notes:
+(TENT and Mooncake PG are not needed); see {ref}`Intel XPU
+<mooncake-ep-intel-xpu>` in the EP design notes:
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
@@ -460,7 +460,9 @@ NCCL Device API and the inferred EP topology is supported by the compiled NCCL
 kernels. Existing constructor calls require no changes. If NCCL cannot be
 used, auto mode falls back to IPC + IBGDA and retains the previous backend
 behavior. As before, the requested workload must have a compiled elastic kernel
-shape.
+shape. On Intel XPU, `ElasticBuffer` uses Level Zero IPC instead, and RDMA
+for ranks on other nodes; see
+{ref}`ElasticBuffer on Intel XPU <mooncake-ep-intel-xpu-elastic>`.
 
 NCCL support is opt-in. Build with
 `-DWITH_EP=ON -DUSE_CUDA=ON -DUSE_NCCL_DEVICE=ON`; the option defaults to

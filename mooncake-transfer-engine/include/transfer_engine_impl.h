@@ -52,13 +52,10 @@ class TransferEngineImplTestPeer;
 // Whether an Ascend build installs the Ascend transport for a protocol hint.
 // Hints that name no protocol or name Ascend install it; a hint naming a host
 // transport (e.g. "rdma") leaves the classic host-transport selection in
-// charge. HCCL builds (USE_ASCEND without USE_ASCEND_DIRECT) return true here
-// whatever the hint says, so they install Ascend and never reach that block.
+// charge. USE_ASCEND and USE_ASCEND_DIRECT both build the Ascend Direct
+// transport, so they behave identically here.
 static inline bool shouldInstallAscendTransport(const std::string& protocol) {
-#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
-    (void)protocol;
-    return true;
-#elif defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     return protocol.empty() || protocol == "ascend" ||
            protocol == "ascend_direct";
 #else
@@ -296,8 +293,20 @@ class TransferEngineImpl {
             // when the overall status is COMPLETED
             // skip_metrics=true to avoid double counting since we already
             // recorded metrics above
+            //
+            // This task's COMPLETED comes from its slice counters, which a
+            // worker publishes before it bumps the batch's finished-task
+            // counter. If a notification is pending, walk the tasks instead of
+            // trusting that counter: the caller may free the batch next, and
+            // that drops a notification not sent by then.
+            bool notify_pending;
+            {
+                RWSpinlock::ReadGuard guard(send_notifies_lock_);
+                notify_pending = notifies_to_send_.count(batch_id) != 0;
+            }
             TransferStatus dummy_status;
-            auto status = getBatchTransferStatus(batch_id, dummy_status, true);
+            auto status = getBatchTransferStatus(batch_id, dummy_status, true,
+                                                 notify_pending);
             if (!status.ok()) {
                 LOG(ERROR) << status.ToString();
             }
@@ -313,9 +322,10 @@ class TransferEngineImpl {
     }
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status,
-                                  bool skip_metrics = false) {
-        Status result =
-            multi_transports_->getBatchTransferStatus(batch_id, status);
+                                  bool skip_metrics = false,
+                                  bool walk_tasks = false) {
+        Status result = multi_transports_->getBatchTransferStatus(
+            batch_id, status, walk_tasks);
 #ifdef WITH_METRICS
         if (metrics_enabled_ && !skip_metrics && result.ok() &&
             status.s == TransferStatusEnum::COMPLETED) {

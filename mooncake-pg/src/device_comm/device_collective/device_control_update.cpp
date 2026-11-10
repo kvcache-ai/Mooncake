@@ -1,18 +1,9 @@
 #include "device_comm/device_collective/device_control_update.h"
 
-#include <atomic>
 #include <cstring>
 #include <limits>
-#include <thread>
 
 namespace mooncake {
-namespace {
-
-uint32_t stateValue(ControlUpdateState state) noexcept {
-    return static_cast<uint32_t>(state);
-}
-
-}  // namespace
 
 PGResult<void> ControlUpdateBuilder::append(ControlUpdateOp operation) {
     PG_VALIDATE_STATE(
@@ -73,43 +64,6 @@ PGResult<void> ControlUpdateBuilder::fillU64(uint64_t* destination,
         .count = static_cast<uint32_t>(count),
     };
     return append(operation);
-}
-
-void publishControlUpdate(ControlUpdateSlot& slot, const ControlUpdate& update,
-                          bool pinned) {
-    const auto published_state =
-        pinned ? ControlUpdateState::Pinned : ControlUpdateState::Published;
-    auto state = std::atomic_ref(slot.state);
-    while (true) {
-        const auto observed = static_cast<ControlUpdateState>(
-            state.load(std::memory_order_acquire));
-        switch (observed) {
-            case ControlUpdateState::Idle:
-            case ControlUpdateState::Published: {
-                uint32_t expected = stateValue(observed);
-                if (!state.compare_exchange_strong(
-                        expected, stateValue(ControlUpdateState::Writing),
-                        std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    continue;
-                }
-                std::memcpy(&slot.update, &update, sizeof(update));
-                state.store(stateValue(published_state),
-                            std::memory_order_release);
-                return;
-            }
-            case ControlUpdateState::Pinned:
-            case ControlUpdateState::Claimed:
-                // Wait the device kernel.
-                std::this_thread::yield();
-                continue;
-            case ControlUpdateState::Writing:
-                PG_ASSERT(
-                    false,
-                    "another host publisher owns the control-update slot");
-            default:
-                PG_ASSERT(false, "invalid control-update state");
-        }
-    }
 }
 
 }  // namespace mooncake

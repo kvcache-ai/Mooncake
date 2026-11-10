@@ -12,13 +12,16 @@ namespace {
 bool SameImmutableWeightReference(const WeightRevisionMetadata& lhs,
                                   const WeightRevisionMetadata& rhs) {
     if (lhs.identity != rhs.identity ||
-        lhs.created_at_ms != rhs.created_at_ms) {
+        lhs.created_at_ms != rhs.created_at_ms ||
+        lhs.affinity_count != rhs.affinity_count ||
+        lhs.affinity_digest != rhs.affinity_digest) {
         return false;
     }
     if (lhs.availability == WeightAvailabilityState::IMPORTING) {
         return lhs.manifest.payload_group_id == rhs.manifest.payload_group_id &&
                lhs.manifest.payload_count == rhs.manifest.payload_count &&
-               lhs.manifest.logical_bytes == rhs.manifest.logical_bytes;
+               lhs.manifest.logical_bytes == rhs.manifest.logical_bytes &&
+               lhs.policy == rhs.policy;
     }
     return lhs.manifest == rhs.manifest;
 }
@@ -240,20 +243,8 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
     static_assert(struct_pack::get_type_code<WeightMetadataUpsertOp>() !=
                   struct_pack::get_type_code<WeightRevisionMetadata>());
     WeightMetadataUpsertOp upsert;
-    bool decoded = struct_pack::deserialize_to(upsert, entry.payload) ==
-                   struct_pack::errc::ok;
-    if (!decoded) {
-        // Before residency operations, this op type carried metadata directly.
-        // struct_pack checks the distinct type hashes before decoding either
-        // shape. Legacy records could only contain idle metadata.
-        WeightRevisionMetadata legacy;
-        decoded = struct_pack::deserialize_to(legacy, entry.payload) ==
-                      struct_pack::errc::ok &&
-                  legacy.operation == WeightOperationState::NONE;
-        if (decoded) {
-            upsert = {.metadata = std::move(legacy), .operation = std::nullopt};
-        }
-    }
+    const bool decoded = struct_pack::deserialize_to(upsert, entry.payload) ==
+                         struct_pack::errc::ok;
     if (!decoded || !ValidateWeightRevisionMetadata(upsert.metadata).ok() ||
         !MatchesWeightTenantAndKey(entry, upsert.metadata.identity)) {
         LOG(ERROR) << "OpLogApplier: invalid weight metadata upsert, key="
@@ -261,19 +252,14 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
         return false;
     }
     const auto& next = upsert.metadata;
-    if ((next.operation != WeightOperationState::NONE &&
+    if ((next.operation_id.has_value() &&
          (!upsert.operation.has_value() ||
           upsert.operation->identity != next.identity ||
-          upsert.operation->operation_id != next.operation_id ||
-          upsert.operation->operation != next.operation ||
+          upsert.operation->operation_id != *next.operation_id ||
           upsert.operation->fenced_metadata_generation !=
               next.metadata_generation ||
-          upsert.operation->processed_members >
-              upsert.operation->total_members ||
-          (!upsert.operation->cursor.empty() &&
-           !IsValidWeightComponent(upsert.operation->cursor)))) ||
-        (next.operation == WeightOperationState::NONE &&
-         upsert.operation.has_value() &&
+          !IsValidWeightOperationShape(*upsert.operation))) ||
+        (!next.operation_id.has_value() && upsert.operation.has_value() &&
          (upsert.operation->identity != next.identity ||
           !IsWeightOperationTerminal(upsert.operation->message) ||
           upsert.operation->fenced_metadata_generation >=
@@ -345,7 +331,6 @@ bool OpLogApplier::ApplyWeightMetadataUpsert(const OpLogEntry& entry) {
             metadata_store_->GetWeightOperation(upsert.operation->operation_id);
         if (!previous ||
             current->operation_id != upsert.operation->operation_id ||
-            current->operation != previous->operation ||
             current->metadata_generation !=
                 previous->fenced_metadata_generation ||
             IsWeightOperationTerminal(previous->message) ||
