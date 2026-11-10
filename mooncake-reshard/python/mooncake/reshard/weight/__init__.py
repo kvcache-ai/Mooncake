@@ -2,6 +2,7 @@
 
 from .tiled_coo import (
     BoundTiledCOOReadPlan,
+    TiledCOODenseFragment,
     TiledCOOIndexRange,
     TiledCOOLayout,
     TiledCOOPayloadRange,
@@ -80,6 +81,7 @@ from .te import (
 
 __all__ = [
     "BoundTiledCOOReadPlan",
+    "TiledCOODenseFragment",
     "TiledCOOIndexRange",
     "TiledCOOLayout",
     "TiledCOOPayloadRange",
