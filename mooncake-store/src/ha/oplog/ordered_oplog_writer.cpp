@@ -6,7 +6,6 @@
 #include <deque>
 #include <map>
 #include <mutex>
-#include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -17,6 +16,7 @@
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha_metric_manager.h"
 #include "deadline_scheduler.h"
+#include "thread_pool.h"
 
 namespace mooncake {
 
@@ -34,11 +34,7 @@ class DurableWaitExecutor final : public async_simple::Executor {
     }
 
     bool schedule(Func task) override {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            tasks_.push_back(std::move(task));
-        }
-        cv_.notify_one();
+        pool_.enqueue(std::move(task));
         return true;
     }
 
@@ -47,42 +43,8 @@ class DurableWaitExecutor final : public async_simple::Executor {
     bool currentThreadInExecutor() const override { return false; }
 
    private:
-    DurableWaitExecutor() {
-        workers_.reserve(4);
-        try {
-            for (size_t i = 0; i < 4; ++i) {
-                workers_.emplace_back([this] {
-                    while (true) {
-                        Func task;
-                        {
-                            std::unique_lock<std::mutex> lock(mutex_);
-                            cv_.wait(lock, [this] {
-                                return stopping_ || !tasks_.empty();
-                            });
-                            if (stopping_) return;
-                            task = std::move(tasks_.front());
-                            tasks_.pop_front();
-                        }
-                        task();
-                    }
-                });
-            }
-        } catch (...) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stopping_ = true;
-            }
-            cv_.notify_all();
-            for (auto& worker : workers_) worker.join();
-            throw;
-        }
-    }
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::deque<Func> tasks_;
-    bool stopping_{false};
-    std::vector<std::thread> workers_;
+    DurableWaitExecutor() : pool_(4) {}
+    ThreadPool pool_;
 };
 
 }  // namespace
@@ -95,7 +57,7 @@ struct OrderedOpLogWriter::Impl {
         std::multimap<uint64_t, std::shared_ptr<DurableWaiter>>;
     struct DurableWaiter {
         async_simple::Promise<ErrorCode> promise;
-        WaitScheduler::Handle deadline{0};
+        WaitScheduler::Handle deadline;
         // Protected by mutex; position is valid only while pending is true.
         DurableWaiters::iterator position;
         bool pending{false};
@@ -215,9 +177,7 @@ struct OrderedOpLogWriter::Impl {
         for (auto it = durable_waiters.begin(); it != end;) {
             auto current = it++;
             current->second->pending = false;
-            if (current->second->deadline != 0) {
-                waiter_deadlines.Cancel(current->second->deadline);
-            }
+            current->second->deadline.Cancel();
             covered.insert(durable_waiters.extract(current));
         }
         return covered;
@@ -561,15 +521,16 @@ async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
     auto waiter = std::make_shared<Impl::DurableWaiter>();
     auto future = waiter->promise.getFuture();
     if (timeout != std::chrono::milliseconds::max()) {
-        try {
-            future = std::move(future).via(&DurableWaitExecutor::Instance());
-        } catch (const std::system_error&) {
-            return async_simple::makeReadyFuture<ErrorCode>(
-                ErrorCode::INTERNAL_ERROR);
-        }
+        future = std::move(future).via(&DurableWaitExecutor::Instance());
     }
     waiter->position = impl_->durable_waiters.emplace(sequence, waiter);
     waiter->pending = true;
+    const auto unregister = [this](Impl::DurableWaiter* pending) {
+        pending->pending = false;
+        impl_->durable_waiters.erase(pending->position);
+    };
+    std::unique_ptr<Impl::DurableWaiter, decltype(unregister)> registration(
+        waiter.get(), unregister);
     if (timeout != std::chrono::milliseconds::max()) {
         const auto now = std::chrono::steady_clock::now();
         const auto remaining =
@@ -578,20 +539,9 @@ async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
         const auto deadline = timeout >= remaining
                                   ? std::chrono::steady_clock::time_point::max()
                                   : now + timeout;
-        try {
-            waiter->deadline =
-                impl_->waiter_deadlines.Schedule(waiter, deadline);
-        } catch (const std::system_error&) {
-            waiter->pending = false;
-            impl_->durable_waiters.erase(waiter->position);
-            return async_simple::makeReadyFuture<ErrorCode>(
-                ErrorCode::INTERNAL_ERROR);
-        } catch (...) {
-            waiter->pending = false;
-            impl_->durable_waiters.erase(waiter->position);
-            throw;
-        }
+        waiter->deadline = impl_->waiter_deadlines.Schedule(waiter, deadline);
     }
+    registration.release();
     return future;
 }
 

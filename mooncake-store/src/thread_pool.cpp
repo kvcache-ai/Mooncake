@@ -3,6 +3,10 @@
 #include <stdexcept>
 namespace mooncake {
 ThreadPool::ThreadPool(size_t num_threads) : stop_flag(false) {
+    // Join already-started workers if a later thread construction fails.
+    const auto cleanup = [](ThreadPool* pool) { pool->stop(); };
+    std::unique_ptr<ThreadPool, decltype(cleanup)> startup(this, cleanup);
+    workers.reserve(num_threads);
     for (size_t i = 0; i < num_threads; ++i) {
         workers.emplace_back([this] {
             while (true) {
@@ -22,6 +26,7 @@ ThreadPool::ThreadPool(size_t num_threads) : stop_flag(false) {
             }
         });
     }
+    startup.release();
 }
 
 void ThreadPool::stop() {

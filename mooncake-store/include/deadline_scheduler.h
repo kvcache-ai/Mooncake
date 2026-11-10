@@ -1,15 +1,13 @@
 #pragma once
 
-#include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
-#include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
-#include <stdexcept>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -20,154 +18,150 @@ class DeadlineScheduler {
    public:
     using Clock = std::chrono::steady_clock;
     using Callback = std::function<void(const Id& id)>;
-    using Handle = uint64_t;
+
+   private:
+    struct Record;
+    using Records = std::multimap<Clock::time_point, std::shared_ptr<Record>>;
+    struct Record {
+        explicit Record(Id value) : id(std::move(value)) {}
+        Id id;
+        typename Records::iterator position;
+        bool pending{false};
+    };
+    struct State {
+        explicit State(Callback fn) : callback(std::move(fn)) {}
+        Callback callback;
+        std::mutex mutex;
+        std::condition_variable cv;
+        Records records;
+        bool stopping{false};
+    };
+
+   public:
+    class Handle {
+       public:
+        Handle() = default;
+
+        // Explicit and idempotent. Dropping a handle does not cancel its
+        // record; cancellation after scheduler destruction is a no-op.
+        bool Cancel() const {
+            auto state = state_.lock();
+            auto record = record_.lock();
+            if (!state || !record) return false;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->stopping || !record->pending) return false;
+                record->pending = false;
+                state->records.erase(record->position);
+            }
+            state->cv.notify_one();
+            return true;
+        }
+
+       private:
+        friend class DeadlineScheduler;
+        Handle(const std::shared_ptr<State>& state,
+               const std::shared_ptr<Record>& record)
+            : state_(state), record_(record) {}
+        std::weak_ptr<State> state_;
+        std::weak_ptr<Record> record_;
+    };
 
     explicit DeadlineScheduler(Callback callback)
-        : callback_(std::move(callback)) {}
+        : state_(std::make_shared<State>(std::move(callback))) {}
 
     ~DeadlineScheduler() { Stop(); }
 
     Handle Schedule(Id id, Clock::time_point deadline) {
-        Handle handle;
+        std::shared_ptr<Record> record;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (stopping_) {
-                return 0;
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if (state_->stopping) return {};
+            if (!timer_thread_.joinable()) {
+                // TimerLoop takes the same mutex before observing records.
+                // Failed thread construction publishes no startup state.
+                timer_thread_ =
+                    std::thread([state = state_] { TimerLoop(state); });
             }
-            if (next_handle_ == 0)
-                throw std::overflow_error("deadline handles exhausted");
-            if (!timer_running_.load()) {
-                timer_running_.store(true);
-                try {
-                    timer_thread_ =
-                        std::thread([this]() { this->TimerLoop(); });
-                } catch (...) {
-                    timer_running_.store(false);
-                    throw;
-                }
-            }
-            handle = next_handle_++;
-            auto record =
-                records_.emplace(deadline, Record{std::move(id), handle});
-            try {
-                handles_.emplace(handle, record);
-            } catch (...) {
-                records_.erase(record);
-                throw;
-            }
+            record = std::make_shared<Record>(std::move(id));
+            record->position = state_->records.emplace(deadline, record);
+            record->pending = true;
         }
-        timer_cv_.notify_one();
-        return handle;
-    }
-
-    // Zero, cancelled, and already-expired handles are harmless no-ops.
-    bool Cancel(Handle handle) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto found = handles_.find(handle);
-            if (found == handles_.end()) return false;
-            records_.erase(found->second);
-            handles_.erase(found);
-        }
-        timer_cv_.notify_one();
-        return true;
+        state_->cv.notify_one();
+        return Handle(state_, record);
     }
 
     template <typename Predicate>
     void RemoveIf(Predicate predicate) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = records_.begin(); it != records_.end();) {
-            if (predicate(it->second.id)) {
-                handles_.erase(it->second.handle);
-                it = records_.erase(it);
-            } else {
-                ++it;
+        Records discarded;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            for (auto it = state_->records.begin();
+                 it != state_->records.end();) {
+                if (predicate(it->second->id)) {
+                    it->second->pending = false;
+                    auto current = it++;
+                    discarded.insert(state_->records.extract(current));
+                } else {
+                    ++it;
+                }
             }
         }
-        timer_cv_.notify_one();
+        state_->cv.notify_one();
     }
 
     void Stop() {
-        // Release payloads and index storage after joining, outside mutex_.
         Records discarded;
-        HandleIndex discarded_handles;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-            timer_running_.store(false);
-            discarded.swap(records_);
-            discarded_handles.swap(handles_);
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->stopping = true;
+            discarded.swap(state_->records);
         }
-        timer_cv_.notify_all();
-        if (timer_thread_.joinable()) {
-            timer_thread_.join();
-        }
+        state_->cv.notify_all();
+        if (timer_thread_.joinable()) timer_thread_.join();
     }
 
    private:
-    void TimerLoop() {
-        while (timer_running_.load()) {
-            std::vector<Record> expired;
+    static void TimerLoop(const std::shared_ptr<State>& state) {
+        while (true) {
+            std::vector<std::shared_ptr<Record>> expired;
             {
-                std::unique_lock<std::mutex> lock(mutex_);
-                if (records_.empty()) {
-                    timer_cv_.wait(lock, [this]() {
-                        return !timer_running_.load() || !records_.empty();
+                std::unique_lock<std::mutex> lock(state->mutex);
+                if (state->stopping) return;
+                if (state->records.empty()) {
+                    state->cv.wait(lock, [&] {
+                        return state->stopping || !state->records.empty();
                     });
-                    if (!timer_running_.load()) break;
                     continue;
                 }
-
                 auto now = Clock::now();
-                auto next_deadline = records_.begin()->first;
-                if (next_deadline > now) {
-                    timer_cv_.wait_until(
-                        lock, next_deadline, [this, next_deadline]() {
-                            return !timer_running_.load() || records_.empty() ||
-                                   records_.begin()->first != next_deadline;
-                        });
-                    if (!timer_running_.load()) break;
+                const auto next = state->records.begin()->first;
+                if (next > now) {
+                    // Bound each sleep: older standard libraries convert to
+                    // system_clock internally, which can overflow near max().
+                    const auto delay = std::min(
+                        next - now, Clock::duration(std::chrono::hours(24)));
+                    state->cv.wait_for(lock, delay, [&] {
+                        return state->stopping || state->records.empty() ||
+                               state->records.begin()->first != next;
+                    });
                     continue;
                 }
-
-                while (!records_.empty() && records_.begin()->first <= now) {
-                    expired.push_back(PopNextRecord());
+                while (!state->records.empty() &&
+                       state->records.begin()->first <= now) {
+                    auto first = state->records.begin();
+                    expired.push_back(first->second);
+                    first->second->pending = false;
+                    state->records.erase(first);
                 }
             }
-
-            // Run callbacks with the scheduler mutex released: callbacks may
-            // acquire other locks, so holding mutex_ here risks lock-order
-            // inversion deadlocks.
-            for (auto& rec : expired) {
-                callback_(rec.id);
-            }
+            // Neither callbacks nor record payload destruction hold mutex.
+            for (auto& record : expired) state->callback(record->id);
         }
     }
 
-    struct Record {
-        Id id;
-        Handle handle;
-    };
-    using Records = std::multimap<Clock::time_point, Record>;
-    using HandleIndex = std::unordered_map<Handle, typename Records::iterator>;
-
-    Record PopNextRecord() {
-        auto first = records_.begin();
-        auto record = std::move(first->second);
-        handles_.erase(record.handle);
-        records_.erase(first);
-        return record;
-    }
-
-    Callback callback_;
-    std::mutex mutex_;
-    Records records_;
-    HandleIndex handles_;
-    Handle next_handle_{1};
+    std::shared_ptr<State> state_;
     std::thread timer_thread_;
-    std::atomic<bool> timer_running_{false};
-    bool stopping_{false};
-    std::condition_variable timer_cv_;
 };
 
 }  // namespace mooncake

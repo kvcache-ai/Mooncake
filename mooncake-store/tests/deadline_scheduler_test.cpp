@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -223,15 +224,15 @@ TEST(DeadlineSchedulerTest, CancelSelectsOneRecordEvenWhenIdsMatch) {
     auto first = scheduler.Schedule(MakeUuid(100), now + std::chrono::hours(1));
     auto second =
         scheduler.Schedule(MakeUuid(100), now + std::chrono::milliseconds(10));
-    EXPECT_NE(first, second);
-    EXPECT_TRUE(scheduler.Cancel(first));
-    EXPECT_FALSE(scheduler.Cancel(first));
-    EXPECT_FALSE(scheduler.Cancel(0));
+    auto copy = first;
+    EXPECT_TRUE(copy.Cancel());
+    EXPECT_FALSE(first.Cancel());
+    EXPECT_FALSE(Scheduler::Handle{}.Cancel());
     ASSERT_TRUE(recorder.WaitForSize(1, std::chrono::seconds(5)));
     scheduler.Stop();
     EXPECT_EQ(recorder.Size(), 1);
-    EXPECT_FALSE(scheduler.Cancel(second));
-    EXPECT_EQ(scheduler.Schedule(MakeUuid(101), now), 0);
+    EXPECT_FALSE(second.Cancel());
+    EXPECT_FALSE(scheduler.Schedule(MakeUuid(101), now).Cancel());
 }
 
 TEST(DeadlineSchedulerTest, RemovedHandlesCannotCancelLaterRecords) {
@@ -241,10 +242,9 @@ TEST(DeadlineSchedulerTest, RemovedHandlesCannotCancelLaterRecords) {
         scheduler.Schedule(MakeUuid(110), Clock::now() + std::chrono::hours(1));
     scheduler.RemoveIf([](const UUID&) { return true; });
     auto later = scheduler.Schedule(MakeUuid(111), Clock::now());
-    EXPECT_NE(removed, later);
-    EXPECT_FALSE(scheduler.Cancel(removed));
+    EXPECT_FALSE(removed.Cancel());
     ASSERT_TRUE(recorder.WaitForSize(1, std::chrono::seconds(5)));
-    EXPECT_FALSE(scheduler.Cancel(later));
+    EXPECT_FALSE(later.Cancel());
     EXPECT_EQ(recorder.Records().front(), MakeUuid(111));
 }
 
@@ -252,11 +252,86 @@ TEST(DeadlineSchedulerTest, StopReleasesPendingPayloadBeforeDestruction) {
     DeadlineScheduler<std::shared_ptr<int>> scheduler([](const auto&) {});
     auto payload = std::make_shared<int>(42);
     std::weak_ptr<int> observer = payload;
-    scheduler.Schedule(payload, Clock::now() + std::chrono::hours(1));
+    auto handle =
+        scheduler.Schedule(payload, Clock::now() + std::chrono::hours(1));
     payload.reset();
     ASSERT_FALSE(observer.expired());
     scheduler.Stop();
     EXPECT_TRUE(observer.expired());
+    EXPECT_FALSE(handle.Cancel());
+}
+
+TEST(DeadlineSchedulerTest, HandleCanOutliveScheduler) {
+    Scheduler::Handle handle;
+    {
+        Scheduler scheduler([](const UUID&) {});
+        handle = scheduler.Schedule(MakeUuid(120),
+                                    Clock::now() + std::chrono::hours(1));
+    }
+    EXPECT_FALSE(handle.Cancel());
+}
+
+TEST(DeadlineSchedulerTest, DroppingHandleDoesNotCancelRecord) {
+    CallbackRecorder recorder;
+    Scheduler scheduler([&](const UUID& id) { recorder.Record(id); });
+    {
+        auto handle = scheduler.Schedule(MakeUuid(121), Clock::now());
+    }
+    ASSERT_TRUE(recorder.WaitForSize(1, std::chrono::seconds(5)));
+    EXPECT_EQ(recorder.Records().front(), MakeUuid(121));
+}
+
+TEST(DeadlineSchedulerTest,
+     DistantDeadlineAllowsEarlierRecordsAndCancellation) {
+    CallbackRecorder recorder;
+    Scheduler scheduler([&](const UUID& id) { recorder.Record(id); });
+    auto distant = scheduler.Schedule(MakeUuid(124), Clock::time_point::max());
+    scheduler.Schedule(MakeUuid(125), Clock::now());
+    ASSERT_TRUE(recorder.WaitForSize(1, std::chrono::seconds(5)));
+    EXPECT_TRUE(distant.Cancel());
+    scheduler.Stop();
+    EXPECT_EQ(recorder.Records(), (std::vector<UUID>{MakeUuid(125)}));
+}
+
+TEST(DeadlineSchedulerTest, FailedRegistrationPropagatesAndCanBeRetried) {
+    struct Id {
+        Id(int value, bool& fail) : value(value), fail(&fail) {}
+        Id(Id&& other) : value(other.value), fail(other.fail) {
+            if (*fail) throw std::runtime_error("record construction failed");
+        }
+        int value;
+        bool* fail;
+    };
+    CallbackRecorder recorder;
+    DeadlineScheduler<Id> scheduler(
+        [&](const Id& id) { recorder.Record(MakeUuid(id.value)); });
+    bool fail = true;
+    EXPECT_THROW(scheduler.Schedule(Id(122, fail), Clock::now()),
+                 std::runtime_error);
+    fail = false;
+    scheduler.Schedule(Id(123, fail), Clock::now());
+    ASSERT_TRUE(recorder.WaitForSize(1, std::chrono::seconds(5)));
+    scheduler.Stop();
+    EXPECT_EQ(recorder.Records(), (std::vector<UUID>{MakeUuid(123)}));
+}
+
+TEST(DeadlineSchedulerTest, CancellationRacingExpiryDeliversAtMostOnce) {
+    CallbackRecorder recorder;
+    Scheduler scheduler([&](const UUID& id) { recorder.Record(id); });
+    std::vector<Scheduler::Handle> handles;
+    const size_t count = 256;
+    auto deadline = Clock::now() + std::chrono::milliseconds(2);
+    for (size_t i = 0; i < count; ++i)
+        handles.push_back(scheduler.Schedule(MakeUuid(i), deadline));
+    size_t cancelled = 0;
+    std::thread cancelling([&] {
+        for (const auto& handle : handles) cancelled += handle.Cancel();
+    });
+    cancelling.join();
+    EXPECT_TRUE(
+        recorder.WaitForSize(count - cancelled, std::chrono::seconds(5)));
+    scheduler.Stop();
+    EXPECT_EQ(cancelled + recorder.Size(), count);
 }
 
 }  // namespace mooncake::test

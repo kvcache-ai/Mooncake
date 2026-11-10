@@ -110,9 +110,9 @@ class OrderedOpLogWriter {
     // rejection, and must not trigger an unconditional replay of the mutation.
     // Finite waits use a shared four-thread executor for continuations. Their
     // results become ready even if its workers are busy. Use via(executor) for
-    // blocking continuations; queued continuations may outlive Stop(). Thread
-    // initialization failure returns INTERNAL_ERROR without registering a wait.
-    // Zero polls the current prefix; max() retains the unbounded wait.
+    // blocking continuations; queued continuations may outlive Stop(). Resource
+    // initialization failures propagate to the caller without registering a
+    // wait. Zero polls the current prefix; max() retains the unbounded wait.
     async_simple::Future<ErrorCode> AwaitDurable(
         uint64_t sequence,
         std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
