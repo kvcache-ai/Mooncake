@@ -19,6 +19,7 @@
 #include "client_metric.h"
 #include "common/network.h"
 #include "file_storage.h"
+#include "master_metric_manager.h"
 #include "storage_backend.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
@@ -778,6 +779,11 @@ class FileStorageTest : public ::testing::Test {
             offloading_objects, buckets_keys, deferred_keys);
     }
 
+    tl::expected<void, ErrorCode> FileStorageInitBackend(
+        FileStorage& fileStorage) {
+        return fileStorage.storage_backend_->Init();
+    }
+
     tl::expected<void, ErrorCode> FileStorageOffloadObjects(
         FileStorage& fileStorage,
         const std::vector<OffloadTaskItem>& offloading_objects) {
@@ -1419,6 +1425,94 @@ TEST_F(FileStorageTest, SkippedOffloadAllFileWritesFailReleasesSourceTasks) {
 
 TEST_F(FileStorageTest, SkippedOffloadWriteFailureReleasesAllSourceTasks) {
     RunSkippedOffloadScenario(1, true);
+}
+
+TEST_F(FileStorageTest, OffloadSourceLookupDoesNotCountReadHits) {
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_default_kv_lease_ttl(1000)
+                                 .set_root_fs_dir("")
+                                 .build()));
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    std::unique_ptr<void, decltype(&std::free)> segment(
+        allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+    ASSERT_NE(segment, nullptr);
+    SimpleAllocator allocator(kSegmentSize);
+    const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                  std::nullopt, master.master_address());
+    ASSERT_TRUE(created);
+    auto client = *created;
+    ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+    ASSERT_TRUE(client->RegisterLocalMemory(allocator.getBase(), kSegmentSize,
+                                            "cpu:0", false, false));
+    ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+    constexpr size_t kValueSize = 128;
+    auto* buffer = allocator.allocate(kValueSize);
+    ASSERT_NE(buffer, nullptr);
+    std::memset(buffer, 'o', kValueSize);
+    ReplicateConfig replicate;
+    replicate.replica_num = 1;
+    std::vector<Slice> slices{{buffer, kValueSize}};
+    const std::string key = "offload-read-hit-metrics";
+    ASSERT_TRUE(client->Put(key, slices, replicate));
+    allocator.deallocate(buffer, kValueSize);
+
+    std::vector<OffloadTaskItem> tasks;
+    ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+    ASSERT_EQ(tasks.size(), 1);
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/offload_read_hit_metrics";
+    config.local_buffer_size = 1024 * 1024;
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    fs::create_directories(config.storage_filepath);
+    FileStorage storage(config, client, endpoint);
+    ASSERT_TRUE(FileStorageInitBackend(storage));
+
+    auto& metrics = MasterMetricManager::instance();
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+    const auto baseline = metrics.calculate_cache_stats();
+    const auto baseline_mem_bytes = metrics.get_mem_cache_hit_bytes();
+    const auto baseline_file_bytes = metrics.get_file_cache_hit_bytes();
+
+    ASSERT_TRUE(FileStorageOffloadObjects(storage, tasks));
+
+    auto after_offload = metrics.calculate_cache_stats();
+    EXPECT_EQ(after_offload.at(CacheHitStat::MEMORY_HITS),
+              baseline.at(CacheHitStat::MEMORY_HITS));
+    EXPECT_EQ(after_offload.at(CacheHitStat::SSD_HITS),
+              baseline.at(CacheHitStat::SSD_HITS));
+    EXPECT_EQ(metrics.get_mem_cache_hit_bytes(), baseline_mem_bytes);
+    EXPECT_EQ(metrics.get_file_cache_hit_bytes(), baseline_file_bytes);
+
+    auto replicas = client->BatchQueryReadOnly({key});
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas[0].has_value());
+    EXPECT_EQ(std::count_if(replicas[0]->replicas.begin(),
+                            replicas[0]->replicas.end(),
+                            [](const auto& replica) {
+                                return replica.is_local_disk_replica();
+                            }),
+              1);
+
+    // A real read-intent query must retain the existing cache-hit accounting.
+    auto read = client->BatchQuery({key});
+    ASSERT_EQ(read.size(), 1);
+    ASSERT_TRUE(read[0].has_value());
+    auto after_read = metrics.calculate_cache_stats();
+    EXPECT_EQ(after_read.at(CacheHitStat::MEMORY_HITS),
+              baseline.at(CacheHitStat::MEMORY_HITS) + 1);
+    EXPECT_EQ(after_read.at(CacheHitStat::SSD_HITS),
+              baseline.at(CacheHitStat::SSD_HITS));
+    EXPECT_EQ(metrics.get_mem_cache_hit_bytes(),
+              baseline_mem_bytes + kValueSize);
+    EXPECT_EQ(metrics.get_file_cache_hit_bytes(), baseline_file_bytes);
+
+    EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+    EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
 }
 
 TEST_F(FileStorageTest, IsEnableOffloading) {
