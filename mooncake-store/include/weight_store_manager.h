@@ -24,8 +24,10 @@ class WeightStoreManager {
     };
 
    public:
-    explicit WeightStoreManager(WeightStoreBackend& backend)
-        : backend_(backend) {}
+    explicit WeightStoreManager(WeightStoreBackend& backend,
+                                uint64_t migration_max_members_per_round = 64,
+                                uint64_t migration_max_bytes_per_round = 1ULL
+                                                                         << 30);
 
     // A successful guard excludes append-to-publication mutations while the
     // caller captures the OpLog boundary and weight state together.
@@ -59,6 +61,7 @@ class WeightStoreManager {
     tl::expected<ImportWriteGuard, ErrorCode> TrackImportWrite(
         const TenantId& tenant, const std::string& group);
     void RecordImportWrite(const TenantId& tenant, const std::string& group);
+    bool RecordOffloadFailures(std::vector<uint64_t> operation_ids);
     bool HasActiveLease(const WeightRevisionIdentity& identity,
                         uint64_t generation, uint64_t now_ms) const {
         return weight_metadata_.HasActiveLease(identity, generation, now_ms);
@@ -111,8 +114,6 @@ class WeightStoreManager {
         const ReconcileWeightRevisionRequest& request, size_t* member_budget);
     WeightMetadataStore::Result<void> RemoveWeightMembers(
         const WeightRevisionMetadata& revision, size_t* member_budget);
-    std::vector<std::string> SelectReconciliationMembers(
-        const WeightRevisionMetadata& revision, size_t* member_budget);
     void ForgetReconciliationCursor(const WeightRevisionIdentity& identity);
     WeightMetadataStore::Result<WeightResidencyOperation>
     PersistAndPublishWeightOperationMutation(
@@ -128,6 +129,8 @@ class WeightStoreManager {
                                  const WeightRevisionMetadata& importing) const;
 
     WeightStoreBackend& backend_;
+    const uint64_t weight_migration_max_members_per_round_;
+    const uint64_t weight_migration_max_bytes_per_round_;
     std::shared_ptr<ImportActivity> FindImportActivity(
         const TenantId& tenant, const std::string& group);
     void RegisterImportActivity(const WeightRevisionMetadata& metadata);

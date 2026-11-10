@@ -29,6 +29,11 @@ tl::expected<void, ErrorCode> MasterStoreBackend::RemoveObject(
     return master_.RemoveObject(key, tenant_id, force, allow_managed_weight);
 }
 
+bool MasterStoreBackend::QueueManagedWeightMemberOffload(
+    const WeightRevisionMetadata& revision, const std::string& key) {
+    return master_.QueueManagedWeightMemberOffload(revision, key);
+}
+
 void MasterStoreBackend::EvictManagedWeightMembersToCold(
     const WeightRevisionMetadata& revision,
     const std::vector<std::string>& member_keys) {

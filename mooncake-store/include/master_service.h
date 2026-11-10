@@ -1319,6 +1319,8 @@ class MasterService {
     void EvictManagedWeightMembersToCold(
         const WeightRevisionMetadata& metadata,
         const std::vector<std::string>& member_keys);
+    bool QueueManagedWeightMemberOffload(const WeightRevisionMetadata& metadata,
+                                         const std::string& member_key);
 
     void ReleaseLocalDiskUsage(std::span<const Replica> replicas);
     // How an erase is published to KV-event subscribers: as the object's
