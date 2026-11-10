@@ -681,7 +681,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             if (!control_stream_ ||
                 reportCudaError(
                     cudaStreamSynchronize(control_stream_),
-                    "cudaStreamSynchronize(before CPU status agreement)") != 0) {
+                    "cudaStreamSynchronize(before CPU status agreement)") !=
+                    0) {
                 callback_local_success = false;
             }
             return (*status_callback)(callback_local_success);
