@@ -109,9 +109,12 @@ SessionReader::NextResult SessionReader::Next(Record* record,
             continue;
         }
         if (input_.gcount() != static_cast<std::streamsize>(sizeof(magic))) {
-            *error =
-                "truncated segment before footer: " + current_path_.string();
-            return NextResult::kError;
+            // A short read only happens at the end of the file, so a block
+            // header that stops inside its first four bytes is the same kind of
+            // cut: the process died while writing.
+            input_.close();
+            incomplete_ = true;
+            return NextResult::kDone;
         }
         if (magic == kTrafficFooterMagic) {
             if (!ReadFooter(magic, error)) {
@@ -125,6 +128,11 @@ SessionReader::NextResult SessionReader::Next(Record* record,
         }
         if (!ReadBlock(magic, error)) {
             return NextResult::kError;
+        }
+        if (cut_short_) {
+            input_.close();
+            incomplete_ = true;
+            return NextResult::kDone;
         }
     }
 }
@@ -195,8 +203,10 @@ bool SessionReader::ReadBlock(std::uint32_t magic, std::string* error) {
                 sizeof(header) - sizeof(magic));
     if (input_.gcount() !=
         static_cast<std::streamsize>(sizeof(header) - sizeof(magic))) {
-        *error = "truncated block header: " + current_path_.string();
-        return false;
+        // A short read only happens at the end of the file: the process died
+        // while writing this header.
+        cut_short_ = true;
+        return true;
     }
     if (header.block_bytes > kMaxBlockBytes) {
         *error = "block too large: " + current_path_.string();
@@ -207,8 +217,11 @@ bool SessionReader::ReadBlock(std::uint32_t magic, std::string* error) {
         input_.read(block_.data(), header.block_bytes);
         if (input_.gcount() !=
             static_cast<std::streamsize>(header.block_bytes)) {
-            *error = "truncated block payload: " + current_path_.string();
-            return false;
+            // A kill or a power loss in the middle of the block leaves a
+            // complete header and part of the payload. The blocks before it
+            // are still intact, so the read stops at the cut.
+            cut_short_ = true;
+            return true;
         }
     }
     Crc32c crc;
