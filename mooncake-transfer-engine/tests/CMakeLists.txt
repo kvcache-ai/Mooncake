@@ -76,6 +76,15 @@ if(USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+# The timeout decision is stateful but independent of RDMA hardware; keep its
+# timing behavior covered by a deterministic unit test.
+add_executable(cq_timeout_diagnostic_test
+               ${WORKSPACE}/cq_timeout_diagnostic_test.cpp)
+target_include_directories(cq_timeout_diagnostic_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(cq_timeout_diagnostic_test PRIVATE gtest gtest_main)
+add_test(NAME cq_timeout_diagnostic_test COMMAND cq_timeout_diagnostic_test)
+
 # Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
 # the device's advertised limits; no RDMA device required.
 add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
@@ -309,6 +318,17 @@ if(USE_TCP)
                                                        gtest_main CUDA::cudart)
     add_test(NAME tcp_cuda_staging_test COMMAND tcp_cuda_staging_test)
   endif()
+
+  if(USE_ASCEND
+     OR USE_ASCEND_DIRECT
+     OR USE_ASCEND_HETEROGENEOUS
+     OR USE_UBSHMEM)
+    add_executable(tcp_ascend_staging_test
+                   ${WORKSPACE}/tcp_ascend_staging_test.cpp)
+    target_link_libraries(tcp_ascend_staging_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+    add_test(NAME tcp_ascend_staging_test COMMAND tcp_ascend_staging_test)
+  endif()
 endif()
 
 add_executable(tcp_address_validation_test
@@ -422,6 +442,12 @@ if(USE_EFA)
   target_compile_options(
     efa_endpoint_handshake_test
     PRIVATE -iquote${WORKSPACE}/efa_endpoint_handshake_fakes)
+  # The test builds efa_endpoint.cpp against fake EFA headers and does not link
+  # transfer_engine, so it does not inherit the include path of the generated
+  # mooncake_te_build_config.h, which transport.h includes.
+  target_include_directories(
+    efa_endpoint_handshake_test
+    PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>)
   target_link_libraries(
     efa_endpoint_handshake_test PUBLIC glog::glog gflags::gflags gtest
                                        gtest_main pthread)

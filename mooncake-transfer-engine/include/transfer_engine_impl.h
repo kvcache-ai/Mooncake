@@ -296,8 +296,20 @@ class TransferEngineImpl {
             // when the overall status is COMPLETED
             // skip_metrics=true to avoid double counting since we already
             // recorded metrics above
+            //
+            // This task's COMPLETED comes from its slice counters, which a
+            // worker publishes before it bumps the batch's finished-task
+            // counter. If a notification is pending, walk the tasks instead of
+            // trusting that counter: the caller may free the batch next, and
+            // that drops a notification not sent by then.
+            bool notify_pending;
+            {
+                RWSpinlock::ReadGuard guard(send_notifies_lock_);
+                notify_pending = notifies_to_send_.count(batch_id) != 0;
+            }
             TransferStatus dummy_status;
-            auto status = getBatchTransferStatus(batch_id, dummy_status, true);
+            auto status = getBatchTransferStatus(batch_id, dummy_status, true,
+                                                 notify_pending);
             if (!status.ok()) {
                 LOG(ERROR) << status.ToString();
             }
@@ -313,9 +325,10 @@ class TransferEngineImpl {
     }
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status,
-                                  bool skip_metrics = false) {
-        Status result =
-            multi_transports_->getBatchTransferStatus(batch_id, status);
+                                  bool skip_metrics = false,
+                                  bool walk_tasks = false) {
+        Status result = multi_transports_->getBatchTransferStatus(
+            batch_id, status, walk_tasks);
 #ifdef WITH_METRICS
         if (metrics_enabled_ && !skip_metrics && result.ok() &&
             status.s == TransferStatusEnum::COMPLETED) {

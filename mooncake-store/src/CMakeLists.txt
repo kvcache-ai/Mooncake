@@ -15,6 +15,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     config/replica_selection_config.cpp
     config/store_cluster_identity_config.cpp
     storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/object_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp
     storage/distributed/kvcs/kvcs_efc_target.cpp
@@ -779,6 +780,26 @@ if(USE_SUNRISE)
   target_link_libraries(
     mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+endif()
+
+if(BUILD_UNIT_TESTS AND USE_MLU)
+  # --wrap cannot intercept CNRT calls inside a shared mooncake_store. Reuse its
+  # objects in a test-only archive so those calls reach the final link. Keep
+  # this target here so directory-scoped dependency targets are visible.
+  add_library(
+    mooncake_store_mlu_test STATIC
+    $<TARGET_OBJECTS:mooncake_store_shared_objects>
+    $<TARGET_OBJECTS:mooncake_store_master_objects>
+    $<TARGET_OBJECTS:mooncake_store_client_objects>)
+  target_include_directories(
+    mooncake_store_mlu_test
+    PUBLIC $<TARGET_PROPERTY:mooncake_store,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_compile_definitions(
+    mooncake_store_mlu_test
+    PUBLIC $<TARGET_PROPERTY:mooncake_store,INTERFACE_COMPILE_DEFINITIONS>)
+  get_target_property(mlu_test_store_dependencies mooncake_store LINK_LIBRARIES)
+  target_link_libraries(mooncake_store_mlu_test
+                        PUBLIC ${mlu_test_store_dependencies})
 endif()
 
 if(BUILD_SHARED_LIBS)

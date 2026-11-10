@@ -25,6 +25,7 @@
 #include <mutex>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
@@ -5691,6 +5692,50 @@ TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
     EXPECT_EQ(load_result.error(), ErrorCode::FILE_READ_FAIL);
 }
 
+// With io_uring, a failed read CQE reaches the disk-error observer with its
+// errno, as a failed preadv does on the PosixFile path.
+TEST_F(StorageBackendTest, BucketBackendReportsUringReadErrno) {
+    {
+        struct io_uring ring;
+        if (io_uring_queue_init(2, &ring, 0) < 0)
+            GTEST_SKIP() << "io_uring is unavailable";
+        io_uring_queue_exit(&ring);
+    }
+    constexpr size_t kValueSize = 4096;
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+    std::vector<std::pair<int, std::string>> reported;
+    storage_backend.SetDiskErrorObserver([&reported](int err, const char* op) {
+        reported.emplace_back(err, op);
+    });
+
+    const std::string key = "uring_errno_key";
+    std::string value(kValueSize, 'u');
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch{
+        {key, std::vector<Slice>{Slice{value.data(), value.size()}}}};
+    auto offload_result = storage_backend.BatchOffload(
+        offload_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+    EXPECT_TRUE(reported.empty());
+
+    // The O_DIRECT read into an inaccessible buffer fails with EFAULT.
+    void* mem = mmap(nullptr, 2 * kValueSize, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mem, MAP_FAILED);
+    std::unordered_map<std::string, Slice> load_batch{
+        {key, Slice{mem, kValueSize}}};
+    EXPECT_FALSE(storage_backend.BatchLoad(load_batch).has_value());
+    munmap(mem, 2 * kValueSize);
+    ASSERT_EQ(reported.size(), 1u);
+    EXPECT_EQ(reported[0], std::make_pair(EFAULT, std::string("read")));
+}
+
 #endif
 
 TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
@@ -5749,5 +5794,1090 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     ASSERT_TRUE(exists.has_value());
     EXPECT_FALSE(exists.value());
 }
+
+// A failed disk syscall reaches the disk-error observer with its errno and
+// name; a logical failure (no errno) does not.
+TEST_F(StorageBackendTest, BucketBackendReportsFailedSyscallErrno) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    std::vector<std::pair<int, std::string>> reported;
+    storage_backend.SetDiskErrorObserver([&reported](int err, const char* op) {
+        reported.emplace_back(err, op);
+    });
+
+    std::unordered_map<std::string, std::string> data;
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> buckets;
+    ASSERT_TRUE(BatchOffloadUtil(storage_backend, keys, sizes, data, buckets));
+    ASSERT_GE(buckets.size(), 2u);
+    const size_t keys_per_bucket = keys.size() / buckets.size();
+    auto bucket_file = [&](size_t i) {
+        return (fs::path(data_path) / (std::to_string(buckets[i]) + ".bucket"))
+            .string();
+    };
+    auto load_first_key_of = [&](size_t i) {
+        const auto& key = keys[i * keys_per_bucket];
+        std::string out(data.at(key).size(), '\0');
+        std::unordered_map<std::string, Slice> batch{
+            {key, Slice{out.data(), out.size()}}};
+        return storage_backend.BatchLoad(batch);
+    };
+    EXPECT_TRUE(reported.empty());
+
+    // open() of a vanished bucket file fails with ENOENT.
+    ASSERT_TRUE(fs::remove(bucket_file(0)));
+    ASSERT_FALSE(load_first_key_of(0));
+    ASSERT_EQ(reported.size(), 1u);
+    EXPECT_EQ(reported[0], std::make_pair(ENOENT, std::string("open")));
+
+    // A directory in its place opens fine; preadv() fails with EISDIR.
+    ASSERT_TRUE(fs::remove(bucket_file(1)));
+    ASSERT_TRUE(fs::create_directory(bucket_file(1)));
+    ASSERT_FALSE(load_first_key_of(1));
+    ASSERT_EQ(reported.size(), 2u);
+    EXPECT_EQ(reported[1], std::make_pair(EISDIR, std::string("preadv")));
+
+    // The injected datasync failure has no errno: logical, not reported.
+    storage_backend.SetDatasyncFailureForTest(true);
+    std::string value = "logical_failure_payload";
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {"logical_failure_key",
+         std::vector<Slice>{Slice{value.data(), value.size()}}}};
+    ASSERT_FALSE(storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    EXPECT_EQ(reported.size(), 2u);
+}
+
+//----------------------------- multi-disk ------------------------------------
+
+namespace {
+
+// Writes one bucket holding a single key of `size` bytes. bucket_keys_limit=1
+// in these tests makes every call produce exactly one bucket, so the number of
+// .meta files per directory equals the number of buckets routed to that disk.
+tl::expected<int64_t, ErrorCode> OffloadOneKey(BucketStorageBackend& backend,
+                                               const std::string& key,
+                                               size_t size, char fill = 'a') {
+    std::vector<char> value(size, fill);
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{value.data(), value.size()}});
+    return backend.BatchOffload(batch, [](const std::vector<std::string>&,
+                                          std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    });
+}
+
+int CountMetaFiles(const std::string& dir) {
+    int count = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (entry.path().extension() == ".meta") {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int64_t DirectoryBytes(const std::string& dir) {
+    int64_t bytes = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (entry.is_regular_file()) {
+            bytes += static_cast<int64_t>(fs::file_size(entry.path()));
+        }
+    }
+    return bytes;
+}
+
+}  // namespace
+
+TEST_F(StorageBackendTest, MultiDiskSplitAsciiList) {
+    EXPECT_TRUE(SplitAsciiList("", ',').empty());
+    EXPECT_EQ(SplitAsciiList("/d0", ',').size(), 1u);
+    EXPECT_EQ(SplitAsciiList("/d0,/d1,/d2", ',').size(), 3u);
+    // Whitespace around entries is trimmed and empty segments are dropped.
+    EXPECT_EQ(SplitAsciiList(" /d0 , /d1 ", ',').at(1), "/d1");
+    EXPECT_EQ(SplitAsciiList("/d0,,/d1", ',').size(), 2u);
+    EXPECT_EQ(SplitAsciiList("/d0,", ',').size(), 1u);
+
+    // keep_empty preserves positions, so a caller can tell a missing entry
+    // apart from a shorter list.
+    EXPECT_EQ(SplitAsciiList("a,,b", ',', /*keep_empty=*/true),
+              (std::vector<std::string_view>{"a", "", "b"}));
+    EXPECT_EQ(SplitAsciiList(" a , , b ", ',', /*keep_empty=*/true),
+              (std::vector<std::string_view>{"a", "", "b"}));
+    EXPECT_EQ(SplitAsciiList("a,", ',', /*keep_empty=*/true),
+              (std::vector<std::string_view>{"a", ""}));
+    EXPECT_EQ(SplitAsciiList(",a", ',', /*keep_empty=*/true),
+              (std::vector<std::string_view>{"", "a"}));
+
+    // Only the requested delimiter splits.
+    EXPECT_EQ(SplitAsciiList("a,b; c", ';'),
+              (std::vector<std::string_view>{"a,b", "c"}));
+}
+
+// Two live clients that share any one disk would collide on that disk's bucket
+// files (#3528), so every root is locked. A client that fails part-way must
+// release the roots it already locked.
+TEST_F(StorageBackendTest, MultiDiskOwnerLockCoversEveryDisk) {
+    const std::string d0 = data_path + "/lock0";
+    const std::string d1 = data_path + "/lock1";
+    fs::create_directories(d0);
+    fs::create_directories(d1);
+    BucketBackendConfig bucket_config;
+
+    FileStorageConfig holder_config;
+    holder_config.storage_filepath = d1;
+    BucketStorageBackend holder(holder_config, bucket_config);
+    ASSERT_TRUE(holder.Init());
+
+    FileStorageConfig both_config;
+    both_config.storage_filepath = d0 + "," + d1;
+    BucketStorageBackend both(both_config, bucket_config);
+    auto both_init = both.Init();
+    ASSERT_FALSE(both_init.has_value())
+        << "a client sharing only the second disk must still fail Init";
+    EXPECT_EQ(both_init.error(), ErrorCode::FILE_OPEN_FAIL);
+
+    FileStorageConfig first_only_config;
+    first_only_config.storage_filepath = d0;
+    BucketStorageBackend first_only(first_only_config, bucket_config);
+    EXPECT_TRUE(first_only.Init())
+        << "the failed client must release the lock it took on the first disk";
+}
+
+TEST_F(StorageBackendTest, MultiDiskWriteAndReadBackAcrossDisks) {
+    fs::create_directories(data_path + "/disk0");
+    fs::create_directories(data_path + "/disk1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0," + data_path + "/disk1";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;  // broadcast to both disks
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::unordered_map<std::string, std::string> test_data;
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> buckets;
+    ASSERT_TRUE(BatchOffloadUtil(backend, keys, sizes, test_data, buckets));
+
+    std::unordered_map<std::string, StorageObjectMetadata> metadata;
+    ASSERT_TRUE(backend.BatchQuery(keys, metadata));
+    EXPECT_EQ(metadata.size(), test_data.size());
+}
+
+TEST_F(StorageBackendTest, MultiDiskInitRecoversKeysFromEveryDisk) {
+    fs::create_directories(data_path + "/disk0");
+    fs::create_directories(data_path + "/disk1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0," + data_path + "/disk1";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    std::vector<std::string> written_keys;
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        for (int i = 0; i < 6; ++i) {
+            const std::string key = "k" + std::to_string(i);
+            ASSERT_TRUE(
+                OffloadOneKey(backend, key, 4096, static_cast<char>('a' + i)));
+            written_keys.push_back(key);
+        }
+    }
+    // Round-robin means the buckets are spread over both roots, so recovery
+    // only works if Init scans every disk.
+    EXPECT_GT(CountMetaFiles(data_path + "/disk0"), 0);
+    EXPECT_GT(CountMetaFiles(data_path + "/disk1"), 0);
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        for (const auto& key : written_keys) {
+            auto exists = backend.IsExist(key);
+            ASSERT_TRUE(exists.has_value());
+            EXPECT_TRUE(exists.value()) << "key lost after restart: " << key;
+        }
+    }
+}
+
+TEST_F(StorageBackendTest, MultiDiskRoundRobinSpreadsWritesEvenly) {
+    constexpr int kDisks = 3;
+    std::string paths;
+    for (int d = 0; d < kDisks; ++d) {
+        fs::create_directories(data_path + "/disk" + std::to_string(d));
+        if (d) {
+            paths += ",";
+        }
+        paths += data_path + "/disk" + std::to_string(d);
+    }
+
+    FileStorageConfig config;
+    config.storage_filepath = paths;
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;  // large: never evicts
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    constexpr int kWrites = 9;  // multiple of kDisks
+    for (int i = 0; i < kWrites; ++i) {
+        ASSERT_TRUE(OffloadOneKey(backend, "k" + std::to_string(i), 4096));
+    }
+    for (int d = 0; d < kDisks; ++d) {
+        EXPECT_EQ(CountMetaFiles(data_path + "/disk" + std::to_string(d)),
+                  kWrites / kDisks)
+            << "disk" << d << " did not get its round-robin share";
+    }
+}
+
+// Regression for disk starvation. A "most free space wins" policy pins every
+// write to the disk that was just evicted from — it regains the most headroom
+// and therefore always looks freest — leaving the other disks frozen at full.
+// Bucket ids increase with write order, so if a disk stopped receiving writes
+// its newest surviving id falls far behind the global newest.
+TEST_F(StorageBackendTest, MultiDiskRoundRobinDoesNotStarveDisksUnderEviction) {
+    constexpr int kDisks = 3;
+    std::string paths;
+    for (int d = 0; d < kDisks; ++d) {
+        fs::create_directories(data_path + "/disk" + std::to_string(d));
+        if (d) {
+            paths += ",";
+        }
+        paths += data_path + "/disk" + std::to_string(d);
+    }
+
+    FileStorageConfig config;
+    config.storage_filepath = paths;
+    BucketBackendConfig bucket_config;
+    // Small equal quotas so every disk starts evicting quickly.
+    bucket_config.max_total_size_per_disk = {32 * 1024, 32 * 1024, 32 * 1024};
+    bucket_config.bucket_size_limit = 16 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    for (int i = 0; i < 30; ++i) {
+        ASSERT_TRUE(OffloadOneKey(backend, "k" + std::to_string(i), 8 * 1024));
+    }
+
+    auto newest_bucket_id = [](const std::string& dir) -> int64_t {
+        int64_t newest = -1;
+        for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+            if (entry.path().extension() != ".meta") {
+                continue;
+            }
+            newest = std::max<int64_t>(
+                newest, std::stoll(entry.path().stem().string()));
+        }
+        return newest;
+    };
+    std::vector<int64_t> newest(kDisks);
+    int64_t global_newest = -1;
+    for (int d = 0; d < kDisks; ++d) {
+        newest[d] = newest_bucket_id(data_path + "/disk" + std::to_string(d));
+        global_newest = std::max(global_newest, newest[d]);
+    }
+    ASSERT_GE(global_newest, 0);
+    for (int d = 0; d < kDisks; ++d) {
+        EXPECT_GE(newest[d], 0) << "disk" << d << " holds nothing (starved)";
+        EXPECT_LE(global_newest - newest[d], static_cast<int64_t>(kDisks))
+            << "disk" << d << " stopped receiving recent writes (starvation)";
+    }
+}
+
+// Each disk enforces its own quota. A backend that evicted against a single
+// global total would let the small disk grow past its own cap.
+TEST_F(StorageBackendTest, MultiDiskEvictionRespectsPerDiskQuota) {
+    fs::create_directories(data_path + "/disk0");
+    fs::create_directories(data_path + "/disk1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0," + data_path + "/disk1";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size_per_disk = {40 * 1024, 80 * 1024};
+    bucket_config.bucket_size_limit = 16 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    for (int i = 0; i < 40; ++i) {
+        // Writes may legitimately fail once a disk is at its cap; the point of
+        // this test is the resulting on-disk footprint.
+        (void)OffloadOneKey(backend, "k" + std::to_string(i), 8 * 1024);
+    }
+
+    const int64_t disk0_bytes = DirectoryBytes(data_path + "/disk0");
+    const int64_t disk1_bytes = DirectoryBytes(data_path + "/disk1");
+    // Allow one bucket of slack for the write that is being admitted.
+    EXPECT_LE(disk0_bytes, 40 * 1024 + 16 * 1024);
+    EXPECT_LE(disk1_bytes, 80 * 1024 + 16 * 1024);
+    EXPECT_GT(disk0_bytes, 0);
+    EXPECT_GT(disk1_bytes, 0);
+}
+
+TEST_F(StorageBackendTest, MultiDiskRejectsBucketLargerThanEveryDisk) {
+    fs::create_directories(data_path + "/disk0");
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0";
+    BucketBackendConfig bucket_config;
+    // The bucket fits under bucket_size_limit but exceeds the disk's whole
+    // quota, so no amount of eviction could make room for it.
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.max_total_size_per_disk = {4 * 1024 * 1024};
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    auto result = OffloadOneKey(backend, "big", 8 * 1024 * 1024);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_DISK);
+}
+
+// With eviction enabled, a disk whose whole quota is smaller than the incoming
+// bucket must be skipped rather than selected. Selecting it would evict every
+// bucket it holds and still fail the write: the cache is destroyed for nothing.
+TEST_F(StorageBackendTest,
+       MultiDiskSkipsDiskTooSmallForBucketInsteadOfEvicting) {
+    fs::create_directories(data_path + "/small");
+    fs::create_directories(data_path + "/big");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/small," + data_path + "/big";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size_per_disk = {2 * 1024 * 1024, 64 * 1024 * 1024};
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;  // <= the small quota
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.bucket_keys_limit = 1;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    // Seed the small disk. rr_cursor_ starts at 0, so this lands there.
+    ASSERT_TRUE(OffloadOneKey(backend, "resident", 64 * 1024, 'r'));
+    ASSERT_EQ(CountMetaFiles(data_path + "/small"), 1);
+
+    // Buckets larger than the small disk's entire quota. Whenever round-robin
+    // offers the small disk, it must be skipped in favour of the big one.
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(OffloadOneKey(backend, "big" + std::to_string(i),
+                                  4 * 1024 * 1024, 'b'))
+            << "write " << i << " should have gone to the big disk";
+    }
+
+    EXPECT_EQ(CountMetaFiles(data_path + "/big"), 4);
+    // The seeded bucket survived: the small disk was never evicted to make
+    // room for a bucket it could never hold.
+    auto resident = backend.IsExist("resident");
+    ASSERT_TRUE(resident.has_value());
+    EXPECT_TRUE(resident.value())
+        << "small disk was evicted for a bucket that cannot fit on it";
+    EXPECT_EQ(CountMetaFiles(data_path + "/small"), 1);
+}
+
+// The per-disk quota list is positionally aligned with the disks, so an empty
+// or unparsable entry must fail startup. Skipping it would shift every later
+// disk onto its neighbour's quota ("100,,300" would read as {100, 300}), and
+// falling back to the scalar quota would silently ignore the configuration.
+TEST_F(StorageBackendTest, MultiDiskQuotaListRejectsEmptyOrUnparsableEntry) {
+    const char* kEnv = "MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE_LIST";
+
+    setenv(kEnv, "100,200,300", 1);
+    auto good = BucketBackendConfig::FromEnvironment();
+    ASSERT_TRUE(good.has_value());
+    EXPECT_EQ(good->max_total_size_per_disk,
+              (std::vector<int64_t>{100, 200, 300}));
+
+    for (const char* value :
+         {"100,abc,300", "100,,300", "100, ,300", ",100,200", "100,200,300,"}) {
+        setenv(kEnv, value, 1);
+        auto bad = BucketBackendConfig::FromEnvironment();
+        ASSERT_FALSE(bad.has_value()) << value;
+        EXPECT_EQ(bad.error(), ErrorCode::INVALID_PARAMS) << value;
+    }
+
+    for (const char* value : {"", "  "}) {
+        setenv(kEnv, value, 1);
+        auto blank = BucketBackendConfig::FromEnvironment();
+        ASSERT_TRUE(blank.has_value()) << "'" << value << "'";
+        EXPECT_TRUE(blank->max_total_size_per_disk.empty());
+    }
+
+    unsetenv(kEnv);
+    auto absent = BucketBackendConfig::FromEnvironment();
+    ASSERT_TRUE(absent.has_value());
+    EXPECT_TRUE(absent->max_total_size_per_disk.empty());
+}
+
+// The quota list is matched to the disks by position, so any length other
+// than one entry per disk is ambiguous: "100,200" on three disks could be a
+// forgotten entry anywhere. Init must refuse it rather than guess.
+TEST_F(StorageBackendTest, MultiDiskInitRejectsQuotaListLengthMismatch) {
+    fs::create_directories(data_path + "/q0");
+    fs::create_directories(data_path + "/q1");
+    fs::create_directories(data_path + "/q2");
+
+    FileStorageConfig config;
+    config.storage_filepath =
+        data_path + "/q0," + data_path + "/q1," + data_path + "/q2";
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    for (const std::vector<int64_t>& quotas : std::vector<std::vector<int64_t>>{
+             {16 * 1024 * 1024},
+             {16 * 1024 * 1024, 32 * 1024 * 1024},
+             {16 * 1024 * 1024, 32 * 1024 * 1024, 48 * 1024 * 1024,
+              64 * 1024 * 1024}}) {
+        bucket_config.max_total_size_per_disk = quotas;
+        BucketStorageBackend backend(config, bucket_config);
+        auto init = backend.Init();
+        ASSERT_FALSE(init.has_value()) << quotas.size() << " entries";
+        EXPECT_EQ(init.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    bucket_config.max_total_size_per_disk = {16 * 1024 * 1024, 32 * 1024 * 1024,
+                                             48 * 1024 * 1024};
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    EXPECT_EQ(backend.DiskQuotasForTest(),
+              (std::vector<int64_t>{16 * 1024 * 1024, 32 * 1024 * 1024,
+                                    48 * 1024 * 1024}));
+}
+
+// Two roots that resolve to the same directory (or nest) would let both disks
+// claim the same files: accounting double-counts them, and the orphan pass
+// deletes a live bucket's data while its metadata stays in the index. Init
+// must refuse such a configuration rather than silently corrupt the cache.
+TEST_F(StorageBackendTest, MultiDiskInitRejectsOverlappingStorageRoots) {
+    fs::create_directories(data_path + "/root");
+    fs::create_directories(data_path + "/root/nested");
+
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    // Same directory twice, spelled differently.
+    {
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/root," + data_path + "/root/";
+        BucketStorageBackend backend(config, bucket_config);
+        auto result = backend.Init();
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    // One root nested inside the other.
+    {
+        FileStorageConfig config;
+        config.storage_filepath =
+            data_path + "/root," + data_path + "/root/nested";
+        BucketStorageBackend backend(config, bucket_config);
+        auto result = backend.Init();
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    // Sibling directories sharing a prefix are NOT nested and must be accepted.
+    {
+        fs::create_directories(data_path + "/d");
+        fs::create_directories(data_path + "/d1");
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/d," + data_path + "/d1";
+        BucketStorageBackend backend(config, bucket_config);
+        EXPECT_TRUE(backend.Init());
+    }
+}
+
+// Without eviction the quota is a hard admission limit, so Init must not
+// synthesise a 90%-of-device quota: doing so would start rejecting writes with
+// NO_AVAILABLE_DISK on deployments that never configured a quota, which
+// previously ran up to total_size_limit.
+TEST_F(StorageBackendTest, MultiDiskNoEvictionDoesNotSynthesiseDiskQuota) {
+    fs::create_directories(data_path + "/disk0");
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 0;  // unconfigured
+    bucket_config.bucket_size_limit = 16 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::NONE;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    // The quota stays unset, so disk selection never enforces a limit.
+    ASSERT_EQ(backend.DiskQuotasForTest().size(), 1u);
+    EXPECT_EQ(backend.DiskQuotasForTest().front(), 0)
+        << "no quota may be synthesised when eviction is disabled";
+    EXPECT_TRUE(OffloadOneKey(backend, "unbounded", 1024 * 1024, 'u'));
+
+    // With eviction enabled the 90% default still applies, so the gate above
+    // is about the NONE policy specifically and not a blanket removal.
+    FileStorageConfig evicting_config;
+    evicting_config.storage_filepath = data_path + "/disk1";
+    fs::create_directories(evicting_config.storage_filepath);
+    BucketBackendConfig evicting_bucket_config = bucket_config;
+    evicting_bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend evicting_backend(evicting_config,
+                                          evicting_bucket_config);
+    ASSERT_TRUE(evicting_backend.Init());
+    ASSERT_EQ(evicting_backend.DiskQuotasForTest().size(), 1u);
+    EXPECT_GT(evicting_backend.DiskQuotasForTest().front(), 0)
+        << "eviction-enabled disks must still get the 90% capacity default";
+}
+
+// The reported total must track the bytes actually on disk, and must return to
+// exactly zero once everything is deleted. A commit/evict accounting asymmetry
+// would leave a permanent drift that silently shrinks the usable quota.
+TEST_F(StorageBackendTest, MultiDiskTotalSizeMatchesOnDiskBytes) {
+    fs::create_directories(data_path + "/disk0");
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/disk0";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 256 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+
+    auto offload_result = OffloadOneKey(backend, "acct", 4096, 'z');
+    ASSERT_TRUE(offload_result.has_value());
+    const int64_t bucket_id = offload_result.value();
+
+    auto after_write = backend.GetStoreMetadata();
+    ASSERT_TRUE(after_write.has_value());
+    EXPECT_EQ(after_write.value().total_size,
+              DirectoryBytes(data_path + "/disk0"));
+
+    ASSERT_TRUE(backend.DeleteBucket(bucket_id));
+    auto after_delete = backend.GetStoreMetadata();
+    ASSERT_TRUE(after_delete.has_value());
+    EXPECT_EQ(after_delete.value().total_size, 0);
+}
+
+// A caller that overrides storage_filepath after FromEnvironment() has cached
+// storage_paths must still have its override honored: the backend derives the
+// disks from storage_filepath, never from the stale cache.
+TEST_F(StorageBackendTest, MultiDiskStorageFilepathOverrideWinsOverCache) {
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    const std::string owned_dir = data_path + "/owned_override";
+    fs::create_directories(owned_dir);
+    config.storage_filepath = owned_dir;
+    // storage_paths deliberately left pointing at the environment default.
+
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size = 64 * 1024 * 1024;
+    bucket_config.bucket_size_limit = 4 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    ASSERT_TRUE(OffloadOneKey(backend, "override_key", 64, 'q'));
+
+    int bucket_files = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(owned_dir)) {
+        if (entry.path().extension() == ".bucket") {
+            ++bucket_files;
+        }
+    }
+    EXPECT_EQ(bucket_files, 1)
+        << "bucket must land in the overridden storage_filepath";
+}
+
+// FileStorage's constructor throws when Validate() fails, so a Validate() that
+// stat()s the raw comma list would make every multi-disk deployment die at
+// startup.
+TEST_F(StorageBackendTest, MultiDiskValidateAcceptsCommaListStorageFilepath) {
+    fs::create_directories(data_path + "/v0");
+    fs::create_directories(data_path + "/v1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/v0," + data_path + "/v1";
+    config.total_keys_limit = 1000000;
+    config.total_size_limit = 1024 * 1024 * 1024;
+    config.heartbeat_interval_seconds = 5;
+    EXPECT_TRUE(config.Validate());
+
+    FileStorageConfig missing_dir = config;
+    missing_dir.storage_filepath =
+        data_path + "/v0," + data_path + "/does_not_exist";
+    EXPECT_FALSE(missing_dir.Validate());
+
+    FileStorageConfig single = config;
+    single.storage_filepath = data_path + "/v0";
+    EXPECT_TRUE(single.Validate());
+}
+
+// Every path entry names one disk, so dropping an empty one would silently run
+// on fewer disks than the list has entries. Validate() must reject it wherever
+// it appears.
+TEST_F(StorageBackendTest, MultiDiskValidateRejectsEmptyStoragePathEntry) {
+    fs::create_directories(data_path + "/v0");
+    fs::create_directories(data_path + "/v1");
+
+    FileStorageConfig config;
+    config.total_keys_limit = 1000000;
+    config.total_size_limit = 1024 * 1024 * 1024;
+    config.heartbeat_interval_seconds = 5;
+
+    const std::string v0 = data_path + "/v0";
+    const std::string v1 = data_path + "/v1";
+    for (const std::string& value :
+         {v0 + ",," + v1, v0 + ",", "," + v0, v0 + ", ," + v1}) {
+        config.storage_filepath = value;
+        EXPECT_FALSE(config.Validate()) << value;
+    }
+
+    config.storage_filepath = v0 + " , " + v1;
+    EXPECT_TRUE(config.Validate());
+}
+
+// Callers such as benchmarks construct the backend without Validate(), so
+// Init() must reject an empty root on its own instead of dropping it.
+TEST_F(StorageBackendTest, MultiDiskInitRejectsEmptyStorageRoot) {
+    fs::create_directories(data_path + "/r0");
+    fs::create_directories(data_path + "/r1");
+    const std::string r0 = data_path + "/r0";
+    const std::string r1 = data_path + "/r1";
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    for (const std::string& value : {r0 + ",," + r1, r0 + ",", "," + r0}) {
+        FileStorageConfig config;
+        config.storage_filepath = value;
+        BucketStorageBackend backend(config, bucket_config);
+        auto init = backend.Init();
+        ASSERT_FALSE(init.has_value()) << value;
+        EXPECT_EQ(init.error(), ErrorCode::INVALID_PARAMS) << value;
+    }
+}
+
+// total_size_limit is a separate knob from the per-disk quotas, and it is what
+// the client reports to the master as this node's SSD capacity. Nothing forces
+// them to agree, so adding disks without scaling total_size_limit silently
+// leaves the master either under-using the node or over-committing it. Init
+// must say so rather than let the mismatch pass unnoticed.
+TEST_F(StorageBackendTest, MultiDiskWarnsWhenTotalSizeLimitDisagrees) {
+    fs::create_directories(data_path + "/cap0");
+    fs::create_directories(data_path + "/cap1");
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/cap0," + data_path + "/cap1";
+    BucketBackendConfig bucket_config;
+    bucket_config.max_total_size_per_disk = {64 * 1024 * 1024,
+                                             64 * 1024 * 1024};
+    bucket_config.bucket_size_limit = 1 * 1024 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+
+    // A mismatch is a warning, never a startup failure: it is recoverable by
+    // editing the configuration, and the node still serves reads and writes.
+    config.total_size_limit = 8 * 1024 * 1024;  // far below the 128MB of quota
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        EXPECT_TRUE(OffloadOneKey(backend, "under", 4096, 'u'));
+    }
+
+    config.total_size_limit = 128 * 1024 * 1024;  // matches the quota sum
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+    }
+}
+
+// A zero or negative entry in the position-aligned quota list is a typo that
+// would silently unlimit exactly one disk, so Validate() rejects it even
+// though the scalar max_total_size treats <= 0 as "unlimited".
+TEST_F(StorageBackendTest, MultiDiskValidateRejectsNonPositiveQuotaEntry) {
+    BucketBackendConfig config;
+    config.max_total_size_per_disk = {16 * 1024 * 1024, 32 * 1024 * 1024};
+    EXPECT_TRUE(config.Validate());
+
+    config.max_total_size_per_disk = {16 * 1024 * 1024, 0};
+    EXPECT_FALSE(config.Validate());
+
+    config.max_total_size_per_disk = {-1};
+    EXPECT_FALSE(config.Validate());
+}
+
+//-----------------------------------------------------------------------------
+
+namespace {
+
+using AlignedTestBuffer = std::unique_ptr<char, decltype(&std::free)>;
+
+AlignedTestBuffer AllocateAligned(size_t size) {
+    void* buf = nullptr;
+    if (posix_memalign(&buf, 4096, std::max<size_t>(size, 1)) != 0) {
+        return AlignedTestBuffer(nullptr, &std::free);
+    }
+    return AlignedTestBuffer(static_cast<char*>(buf), &std::free);
+}
+
+// One object of an aligned direct write test: its key, its value bytes, and
+// the slices that hand those bytes to BatchOffload from buffers placed at
+// chosen offsets from a 4 KiB boundary.
+struct AlignedTestObject {
+    std::string key;
+    std::string value;
+    std::vector<AlignedTestBuffer> buffers;
+    std::vector<Slice> slices;
+};
+
+// pieces: (byte offset from a 4 KiB boundary, length) for each slice.
+AlignedTestObject MakeAlignedTestObject(
+    const std::string& key,
+    const std::vector<std::pair<size_t, size_t>>& pieces, int seed) {
+    AlignedTestObject object{key, {}, {}, {}};
+    for (const auto& [offset, length] : pieces) {
+        object.buffers.push_back(AllocateAligned(offset + length));
+        char* p = object.buffers.back().get() + offset;
+        for (size_t i = 0; i < length; ++i) {
+            p[i] = static_cast<char>((seed * 131 + object.value.size() + i) &
+                                     0xff);
+        }
+        object.value.append(p, length);
+        object.slices.push_back(Slice{p, length});
+    }
+    return object;
+}
+
+std::unordered_map<std::string, std::vector<Slice>> BatchOf(
+    const std::vector<AlignedTestObject>& objects) {
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (const auto& object : objects) batch.emplace(object.key, object.slices);
+    return batch;
+}
+
+ErrorCode AcceptAll(const std::vector<std::string>&,
+                    std::vector<StorageObjectMetadata>&) {
+    return ErrorCode::OK;
+}
+
+std::string ReadWholeFile(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+}
+
+fs::path OnlyBucketFile(const std::string& dir) {
+    fs::path found;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (entry.path().extension() == ".bucket") {
+            EXPECT_TRUE(found.empty()) << "more than one bucket file";
+            found = entry.path();
+        }
+    }
+    return found;
+}
+
+size_t AlignUp4K(size_t n) { return (n + 4095) & ~size_t{4095}; }
+
+// The bucket file must hold, for each object, zeros and the key ending on a
+// 4 KiB boundary, then the value padded with zeros to a 4 KiB boundary, at
+// the offsets the metadata reports, and nothing else.
+void ExpectAlignedLayout(BucketStorageBackend& backend,
+                         const std::vector<AlignedTestObject>& objects,
+                         const std::string& dir) {
+    std::vector<std::string> keys;
+    size_t expected_size = 0;
+    for (const auto& object : objects) {
+        keys.push_back(object.key);
+        expected_size +=
+            AlignUp4K(object.key.size()) + AlignUp4K(object.value.size());
+    }
+    std::unordered_map<std::string, StorageObjectMetadata> metadata;
+    ASSERT_TRUE(backend.BatchQuery(keys, metadata).has_value());
+
+    const fs::path bucket_path = OnlyBucketFile(dir);
+    ASSERT_FALSE(bucket_path.empty());
+    const std::string file = ReadWholeFile(bucket_path);
+    ASSERT_EQ(file.size(), expected_size);
+
+    std::string expected(file.size(), '\0');
+    for (const auto& object : objects) {
+        SCOPED_TRACE(object.key.substr(0, 16));
+        const auto& m = metadata.at(object.key);
+        EXPECT_EQ(m.key_size, static_cast<int64_t>(object.key.size()));
+        EXPECT_EQ(m.data_size, static_cast<int64_t>(object.value.size()));
+        EXPECT_EQ((m.offset + m.key_size) % 4096, 0);
+        ASSERT_LE(static_cast<size_t>(m.offset + m.key_size + m.data_size),
+                  file.size());
+        expected.replace(m.offset, m.key_size, object.key);
+        expected.replace(m.offset + m.key_size, m.data_size, object.value);
+    }
+    EXPECT_TRUE(file == expected)
+        << "the bucket file differs from keys and values at their offsets "
+           "with zeros elsewhere";
+}
+
+void ExpectLoadsBack(BucketStorageBackend& backend,
+                     const std::vector<AlignedTestObject>& objects) {
+    std::vector<std::string> loaded(objects.size());
+    std::unordered_map<std::string, Slice> load_batch;
+    for (size_t i = 0; i < objects.size(); ++i) {
+        loaded[i].resize(objects[i].value.size());
+        load_batch.emplace(objects[i].key,
+                           Slice{loaded[i].data(), loaded[i].size()});
+    }
+    ASSERT_TRUE(backend.BatchLoad(load_batch).has_value());
+    for (size_t i = 0; i < objects.size(); ++i) {
+        EXPECT_TRUE(loaded[i] == objects[i].value)
+            << objects[i].key.substr(0, 16);
+    }
+}
+
+// Aligned values, a partial last block, an unaligned buffer, several slices,
+// a short middle slice and a key longer than a block.
+std::vector<AlignedTestObject> MixedAlignedTestObjects() {
+    std::vector<AlignedTestObject> objects;
+    objects.push_back(MakeAlignedTestObject("ad_aligned", {{0, 65536}}, 1));
+    objects.push_back(MakeAlignedTestObject("ad_tail", {{0, 65536 + 100}}, 2));
+    objects.push_back(
+        MakeAlignedTestObject("ad_unaligned", {{1, 8192 + 7}}, 3));
+    objects.push_back(MakeAlignedTestObject(
+        "ad_slices", {{0, 4096}, {0, 8192}, {0, 1000}}, 4));
+    objects.push_back(
+        MakeAlignedTestObject("ad_short_slice", {{0, 1000}, {0, 4096}}, 5));
+    objects.push_back(
+        MakeAlignedTestObject(std::string(5000, 'k'), {{0, 12288}}, 6));
+    return objects;
+}
+
+}  // namespace
+
+// The data file has the aligned layout, and only the key blocks, the partial
+// last blocks and the unaligned values were copied; aligned blocks went to
+// the file from the caller's buffers.
+TEST_F(StorageBackendTest, AlignedDirectWriteAlignsEveryValue) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    const auto objects = MixedAlignedTestObjects();
+    auto offload_result =
+        storage_backend.BatchOffload(BatchOf(objects), AcceptAll);
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+
+    // Copied: ad_aligned key block (4096); ad_tail key block and tail block
+    // (8192); ad_unaligned key block and its whole value (4096 + 12288);
+    // ad_slices key block and the block of its 1000-byte last slice (8192);
+    // ad_short_slice key block and its whole value, since its 1000-byte
+    // first slice is not a block multiple (4096 + 8192); the 5000-byte key
+    // (8192).
+    EXPECT_EQ(storage_backend.GetLastAlignedCopyBytesForTest(), 57344u);
+    ExpectAlignedLayout(storage_backend, objects, data_path);
+    ExpectLoadsBack(storage_backend, objects);
+}
+
+// Where O_DIRECT is unavailable, the same layout goes through the page cache.
+TEST_F(StorageBackendTest, AlignedDirectWriteFallsBackToPageCache) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+    storage_backend.SetDirectIOUnavailableForTest(true);
+
+    const auto objects = MixedAlignedTestObjects();
+    auto offload_result =
+        storage_backend.BatchOffload(BatchOf(objects), AcceptAll);
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+    ExpectAlignedLayout(storage_backend, objects, data_path);
+    ExpectLoadsBack(storage_backend, objects);
+}
+
+// A backend with the option off reads aligned direct buckets after a
+// restart, and the restart counts the same total size as the writer did
+// (logical sizes, not the padded file).
+TEST_F(StorageBackendTest, AlignedDirectBucketsSurviveRestartWithOptionOff) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    std::vector<AlignedTestObject> objects;
+    for (int i = 0; i < 8; ++i) {
+        const size_t offset = static_cast<size_t>(i % 2);
+        const size_t length = 4096 * static_cast<size_t>(i) + 333;
+        objects.push_back(MakeAlignedTestObject(
+            "ad_restart_" + std::to_string(i), {{offset, length}}, i));
+    }
+    int64_t total_size_after_write = 0;
+    {
+        BucketBackendConfig bucket_config;
+        bucket_config.aligned_direct_write = true;
+        BucketStorageBackend writer(config, bucket_config);
+        ASSERT_TRUE(writer.Init().has_value());
+        ASSERT_TRUE(writer.BatchOffload(BatchOf(objects), AcceptAll));
+        auto store_metadata = writer.GetStoreMetadata();
+        ASSERT_TRUE(store_metadata.has_value());
+        total_size_after_write = store_metadata->total_size;
+    }
+
+    BucketStorageBackend reader(config, BucketBackendConfig{});
+    ASSERT_TRUE(reader.Init().has_value());
+    auto store_metadata = reader.GetStoreMetadata();
+    ASSERT_TRUE(store_metadata.has_value());
+    EXPECT_EQ(store_metadata->total_keys, static_cast<int64_t>(objects.size()));
+    EXPECT_EQ(store_metadata->total_size, total_size_after_write);
+    ExpectLoadsBack(reader, objects);
+}
+
+// 600 objects of 4 KiB + 100 bytes need 1800 iovecs (key block, whole block,
+// tail block), more than one pwritev takes.
+TEST_F(StorageBackendTest, AlignedDirectWriteSplitsAtIovMax) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    bucket_config.bucket_keys_limit = 600;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    std::vector<AlignedTestObject> objects;
+    for (int i = 0; i < 600; ++i) {
+        objects.push_back(MakeAlignedTestObject("ad_iov_" + std::to_string(i),
+                                                {{0, 4096 + 100}}, i));
+    }
+    auto offload_result =
+        storage_backend.BatchOffload(BatchOf(objects), AcceptAll);
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+    ExpectLoadsBack(storage_backend, objects);
+}
+
+// The space an aligned direct bucket reserves includes its padding: with a
+// max_physical_bytes cap that the new bucket's logical size would fit under
+// but its padded file would not, the write must not push the directory over
+// the cap.
+TEST_F(StorageBackendTest, AlignedDirectReservationCountsPadding) {
+    const auto disk_bytes = [this] {
+        int64_t total = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(data_path)) {
+            struct stat st{};
+            if (entry.is_regular_file() &&
+                ::stat(entry.path().c_str(), &st) == 0) {
+                total += static_cast<int64_t>(st.st_blocks) * 512;
+            }
+        }
+        return total;
+    };
+    // 600 x (4 KiB + 100 B): about 2.4 MiB of keys and values, 7 MiB of file.
+    const auto make_objects = [](const std::string& prefix) {
+        std::vector<AlignedTestObject> objects;
+        for (int i = 0; i < 600; ++i) {
+            objects.push_back(MakeAlignedTestObject(prefix + std::to_string(i),
+                                                    {{0, 4096 + 100}}, i));
+        }
+        return objects;
+    };
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    bucket_config.bucket_keys_limit = 600;
+    const auto first = make_objects("ad_res_a_");
+    {
+        BucketStorageBackend writer(config, bucket_config);
+        ASSERT_TRUE(writer.Init().has_value());
+        ASSERT_TRUE(writer.BatchOffload(BatchOf(first), AcceptAll));
+    }
+
+    const auto second = make_objects("ad_res_b_");
+    int64_t second_logical = 0;
+    for (const auto& object : second) {
+        second_logical +=
+            static_cast<int64_t>(object.key.size() + object.value.size());
+    }
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.disk_scan_cache_ms = 0;
+    bucket_config.max_physical_bytes =
+        disk_bytes() + second_logical + (1 << 20);
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+    // Evicting the first bucket does not make room either (the freed estimate
+    // is logical), so the write is rejected; either way the cap holds.
+    (void)storage_backend.BatchOffload(
+        BatchOf(second), AcceptAll,
+        [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            return {};
+        });
+    EXPECT_LE(disk_bytes(), bucket_config.max_physical_bytes);
+}
+
+// A failed datasync removes the aligned direct bucket like a packed one.
+TEST_F(StorageBackendTest, AlignedDirectDatasyncFailureRemovesBucket) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+    storage_backend.SetDatasyncFailureForTest(true);
+
+    const auto objects = MixedAlignedTestObjects();
+    auto offload_result =
+        storage_backend.BatchOffload(BatchOf(objects), AcceptAll);
+    ASSERT_FALSE(offload_result.has_value());
+    EXPECT_EQ(offload_result.error(), ErrorCode::FILE_WRITE_FAIL);
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        EXPECT_NE(entry.path().extension(), ".bucket") << entry.path();
+        EXPECT_NE(entry.path().extension(), ".meta") << entry.path();
+    }
+    for (const auto& object : objects) {
+        auto exists = storage_backend.IsExist(object.key);
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value()) << object.key.substr(0, 16);
+    }
+}
+
+#ifdef USE_URING
+// The io_uring read path reads each value from its aligned offset with
+// O_DIRECT.
+TEST_F(StorageBackendTest, AlignedDirectBucketBatchLoadWithUring) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig bucket_config;
+    bucket_config.aligned_direct_write = true;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    const auto objects = MixedAlignedTestObjects();
+    ASSERT_TRUE(storage_backend.BatchOffload(BatchOf(objects), AcceptAll));
+
+    std::vector<AlignedTestBuffer> read_buffers;
+    std::unordered_map<std::string, Slice> load_batch;
+    for (const auto& object : objects) {
+        read_buffers.push_back(AllocateAligned(object.value.size() + 8192));
+        load_batch.emplace(
+            object.key, Slice{read_buffers.back().get(), object.value.size()});
+    }
+    auto load_result = storage_backend.BatchLoad(load_batch);
+    ASSERT_TRUE(load_result.has_value()) << load_result.error();
+    for (const auto& object : objects) {
+        const auto& loaded = load_batch.at(object.key);
+        EXPECT_TRUE(std::string_view(static_cast<char*>(loaded.ptr),
+                                     loaded.size) == object.value)
+            << object.key.substr(0, 16);
+    }
+}
+#endif
 
 }  // namespace mooncake::test

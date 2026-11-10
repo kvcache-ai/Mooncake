@@ -471,13 +471,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using " << gpu_p2p_name << " transport "
                       << "(forced or no HCA detected)";
         } else if (!no_hca || force_hca) {
-            Transport* t =
-                multi_transports_->installTransport("rdma", local_topology_);
+            const char* rdma_protocol =
+                globalConfig().use_rdma_twosided ? "rdma_twosided" : "rdma";
+            Transport* t = multi_transports_->installTransport(rdma_protocol,
+                                                               local_topology_);
             if (!t) {
                 LOG(ERROR) << "Failed to install RDMA transport";
                 return -1;
             }
-            LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
+            LOG(INFO) << "Using RDMA transport, type=" << rdma_protocol;
         } else {
 #ifdef USE_TCP
             Transport* t = multi_transports_->installTransport("tcp", nullptr);

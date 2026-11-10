@@ -5197,6 +5197,63 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
+       StaleCleanupOpLogLeavesOutTheStaleReplica) {
+    const std::string cluster_id = "test_batch_record_stale_payload";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    auto gone = PrepareSimpleSegment(service, "stale_payload_gone");
+    ReadBatchEventually(storage, 1, batch);
+    PrepareSimpleSegment(service, "stale_payload_kept",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 2, batch);
+    const std::string key = "stale_payload_key";
+    ReplicateConfig config;
+    config.replica_num = 2;
+    ASSERT_TRUE(
+        service.PutStart(gone.client_id, key, kDefaultTenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(gone.client_id, key, kDefaultTenant, ReplicaType::MEMORY)
+            .has_value());
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_TRUE(
+        service.UnmountSegment(gone.segment_id, gone.client_id).has_value());
+
+    bool found = false;
+    for (uint64_t id = 4; id <= 6 && !found; ++id) {
+        ReadBatchEventually(storage, id, batch);
+        for (const auto& entry : batch.entries) {
+            if (entry.op_type != OpType::PUT_END || entry.object_key != key) {
+                continue;
+            }
+            found = true;
+            MetadataPayload payload;
+            ASSERT_EQ(struct_pack::errc::ok,
+                      struct_pack::deserialize_to(payload, entry.payload));
+            ASSERT_EQ(1u, payload.replicas.size());
+            EXPECT_EQ("stale_payload_kept",
+                      payload.replicas[0]
+                          .get_memory_descriptor()
+                          .buffer_descriptor.transport_endpoint_);
+        }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
        UpsertStartStaleCleanupReleasesResourcesAfterDurable) {
     const std::string cluster_id = "test_batch_record_upsert_stale_finalize";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();

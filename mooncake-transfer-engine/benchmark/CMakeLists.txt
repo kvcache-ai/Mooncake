@@ -114,8 +114,17 @@ if(BUILD_UNIT_TESTS)
     add_test(NAME tebench_xpu_data_test COMMAND tebench_xpu_data_test)
   endif()
 
+  # Checks that the build-tree tebench finds Mooncake's libraries through its
+  # RPATH. A USE_XPU build also needs the oneAPI SYCL runtime, which is outside
+  # the build tree: keep the library path of the environment the build was
+  # configured in (setvars.sh), still dropping anything set at test time.
+  if(USE_XPU)
+    set(TEBENCH_HELP_ENV "LD_LIBRARY_PATH=$ENV{LD_LIBRARY_PATH}")
+  else()
+    set(TEBENCH_HELP_ENV --unset=LD_LIBRARY_PATH)
+  endif()
   add_test(NAME tebench_build_tree_help
-           COMMAND ${CMAKE_COMMAND} -E env --unset=LD_LIBRARY_PATH
+           COMMAND ${CMAKE_COMMAND} -E env ${TEBENCH_HELP_ENV}
                    $<TARGET_FILE:tebench> --help)
   set_tests_properties(
     tebench_build_tree_help
