@@ -117,6 +117,8 @@ bool ShmHelper::cleanup() {
     std::lock_guard<std::mutex> lock(shm_mutex_);
     bool ret = true;
     for (auto& shm : shms_) {
+        std::lock_guard<std::mutex> registration_lock(
+            shm->registration_mutex);
         if (shm->fd != -1) {
             close(shm->fd);
             shm->fd = -1;
@@ -303,6 +305,9 @@ int ShmHelper::free(void* addr) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
     for (auto it = shms_.begin(); it != shms_.end(); ++it) {
         if ((*it)->base_addr == addr) {
+            const auto segment = *it;
+            std::lock_guard<std::mutex> registration_lock(
+                segment->registration_mutex);
             if ((*it)->fd != -1) {
                 close((*it)->fd);
                 (*it)->fd = -1;
@@ -341,6 +346,8 @@ int ShmHelper::free(void* addr) {
             }
             LOG(INFO) << "Freed shared memory at " << addr
                       << ", size: " << (*it)->size;
+            (*it)->base_addr = nullptr;
+            (*it)->registered = false;
             shms_.erase(it);
             return 0;
         }

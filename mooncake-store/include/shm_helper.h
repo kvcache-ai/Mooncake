@@ -23,6 +23,7 @@ class NVMeoFInitiator;
 class ShmHelper {
    public:
     struct ShmSegment {
+        std::mutex registration_mutex;
         int fd = -1;
         void *base_addr = nullptr;
         // Size of the actual mapping; may be padded up to the hugepage/2MB
@@ -50,7 +51,8 @@ class ShmHelper {
     // Find the segment that contains the given address
     std::shared_ptr<ShmSegment> get_shm(void *addr);
 
-    const std::vector<std::shared_ptr<ShmSegment>> &get_shms() const {
+    std::vector<std::shared_ptr<ShmSegment>> get_shms() const {
+        std::lock_guard<std::mutex> lock(shm_mutex_);
         return shms_;
     }
 
