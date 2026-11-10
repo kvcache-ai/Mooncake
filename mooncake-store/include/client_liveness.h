@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <memory>
 
@@ -16,6 +18,20 @@ enum class ClientLivenessState {
     SUSPECTED,
     OFFLINE,
 };
+
+// Readable spelling for log lines and diagnostics.
+[[nodiscard]] constexpr std::string_view toString(
+    ClientLivenessState state) noexcept {
+    switch (state) {
+        case ClientLivenessState::ACTIVE:
+            return "ACTIVE";
+        case ClientLivenessState::SUSPECTED:
+            return "SUSPECTED";
+        case ClientLivenessState::OFFLINE:
+            return "OFFLINE";
+    }
+    return "UNKNOWN";
+}
 
 enum class ClientLivenessTransition {
     NONE,
@@ -180,10 +196,9 @@ class ClientLivenessRecord {
     }
 
    private:
-    friend class ClientSessionRegistry;
     [[nodiscard]] ClientLivenessObservation CommitObservationLocked(
         TimePoint now, ClientLivenessState current_state) {
-        last_liveness_at_ = now;
+        last_liveness_at_ = std::max(last_liveness_at_, now);
         if (current_state == ClientLivenessState::SUSPECTED) {
             state_.store(ClientLivenessState::ACTIVE,
                          std::memory_order_release);
