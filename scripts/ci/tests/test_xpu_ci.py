@@ -170,7 +170,7 @@ class BuildDirectoryTest(unittest.TestCase):
                     "bash",
                     "-ec",
                     'source "$1"; DEVICE_LIBRARY_BASENAMES=(libmooncake_ep_device.so); '
-                    'cleanup_build_directory; '
+                    "cleanup_build_directory; "
                     'printf "%s\\n" "$DEVICE_STAGING_TEMP" "$CUDA_EP_JIT_DIR" > "$2"',
                     "bash",
                     str(ROOT / "scripts/build_wheel.sh"),
