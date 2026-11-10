@@ -17,22 +17,35 @@ class HttpMetadataServerTest : public ::testing::Test {
     struct HttpResponse {
         int status;
         std::string body;
+        std::string conditional;
     };
+
+    template <typename Response>
+    static std::string ConditionalHeader(const Response& response) {
+        for (const auto& header : response.resp_headers) {
+            if (header.name == "X-Mooncake-Conditional-Put")
+                return std::string(header.value);
+        }
+        return {};
+    }
 
     HttpResponse Get(int port, const std::string& path) {
         coro_http::coro_http_client client;
         auto response = async_simple::coro::syncAwait(client.async_get(
             "http://127.0.0.1:" + std::to_string(port) + path));
-        return {response.status, std::string(response.resp_body)};
+        return {response.status, std::string(response.resp_body),
+                ConditionalHeader(response)};
     }
 
-    HttpResponse Put(int port, const std::string& path,
-                     const std::string& body) {
+    HttpResponse Put(int port, const std::string& path, const std::string& body,
+                     bool create_only = false) {
         coro_http::coro_http_client client;
+        if (create_only) client.add_header("If-None-Match", "*");
         auto response = async_simple::coro::syncAwait(
             client.async_put("http://127.0.0.1:" + std::to_string(port) + path,
                              body, coro_http::req_content_type::json));
-        return {response.status, std::string(response.resp_body)};
+        return {response.status, std::string(response.resp_body),
+                ConditionalHeader(response)};
     }
 
     void WaitUntilReady(int port) {
@@ -94,6 +107,26 @@ TEST_F(HttpMetadataServerTest, RejectsChangedRpcMetaRepublish) {
     EXPECT_EQ(stored.body, original);
 
     server.stop();
+}
+
+TEST_F(HttpMetadataServerTest, ConditionalPutDoesNotOverwrite) {
+    int port = getFreeTcpPort();
+    HttpMetadataServer server(static_cast<uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(server.start());
+    WaitUntilReady(port);
+    const std::string path = "/metadata?key=engram%2Ftest%2Fmember";
+    auto created = Put(port, path, "first", true);
+    EXPECT_EQ(created.status, 200);
+    EXPECT_EQ(created.conditional, "1");
+    auto conflict = Put(port, path, "second", true);
+    EXPECT_EQ(conflict.status, 409);
+    EXPECT_EQ(conflict.conditional, "1");
+    EXPECT_EQ(Put(port, path, "first", true).status, 409);
+    EXPECT_EQ(Get(port, path).body, "first");
+    auto legacy = Put(port, path, "legacy");
+    EXPECT_EQ(legacy.status, 200);
+    EXPECT_TRUE(legacy.conditional.empty());
+    EXPECT_EQ(Get(port, path).body, "legacy");
 }
 
 TEST_F(HttpMetadataServerTest, StartReportsBindFailure) {

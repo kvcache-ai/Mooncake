@@ -168,7 +168,9 @@ class KVBootstrapServer:
                     status=413,
                     content_type="application/json",
                 )
-            return await self._handle_put(key, request)
+            return await self._handle_put(
+                key, request, create_only=request.headers.get("If-None-Match") == "*"
+            )
         elif request.method == "DELETE":
             return await self._handle_delete(key)
         return web.Response(
@@ -189,11 +191,17 @@ class KVBootstrapServer:
     def _entry_bytes(key: str, value: bytes) -> int:
         return len(key.encode("utf-8")) + len(value)
 
-    async def _handle_put(self, key, request):
+    async def _handle_put(self, key, request, *, create_only=False):
         """Handle PUT requests."""
         async with self._put_slots:
             data = await request.read()
+        conditional = create_only
+        headers = {"X-Mooncake-Conditional-Put": "1"} if conditional else {}
         async with self.lock:
+            if conditional and key in self.store:
+                return web.Response(
+                    text="metadata already exists", status=412, headers=headers
+                )
             if key.find("rpc_meta") != -1 and key in self.store:
                 # Re-publishing the same rpc_meta value is idempotent; only a
                 # conflicting value is rejected. Mirrors the C++ metadata server
@@ -230,7 +238,10 @@ class KVBootstrapServer:
             self.store[key] = data
             self._total_bytes = new_total
         return web.Response(
-            text="metadata updated", status=200, content_type="application/json"
+            text="metadata updated",
+            status=200,
+            content_type="application/json",
+            headers=headers,
         )
 
     async def _handle_delete(self, key):

@@ -1165,7 +1165,8 @@ static int importFdFromProcess(pid_t pid, int remote_fd) {
 }
 
 Status MnnvlTransport::importRemoteBuffer(const BufferDesc &buffer,
-                                          OpenedMnnvlEntry &entry) {
+                                          OpenedMnnvlEntry &entry,
+                                          bool require_egm) {
     if (buffer.length == 0)
         return Status::InvalidArgument("Empty MNNVL import range" LOC_MARK);
     CUmemGenericAllocationHandle handle;
@@ -1220,6 +1221,70 @@ Status MnnvlTransport::importRemoteBuffer(const BufferDesc &buffer,
         memcpy(&export_handle, output_buffer.data(), sizeof(export_handle));
         CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
                                                 handle_type_));
+    }
+
+    if (require_egm) {
+        // Dedicated lease import must clean up retryably; do not reuse the
+        // copy path's best-effort rollback.
+        LocalAllocation allocation{nullptr, buffer.length, handle, false};
+        auto rollback = [&](Status failure) {
+            auto cleaned = releaseLocalAllocation(allocation);
+            if (!cleaned.ok()) {
+                std::lock_guard<std::mutex> lock(allocate_mutex_);
+                failed_allocations_.push_back(allocation);
+            }
+            return failure;
+        };
+        CUmemAllocationProp properties = {};
+        auto rc = cuMemGetAllocationPropertiesFromHandle(&properties, handle);
+        if (rc != CUDA_SUCCESS ||
+            properties.location.type != CU_MEM_LOCATION_TYPE_HOST_NUMA ||
+            handle_type_ != CU_MEM_HANDLE_TYPE_FABRIC) {
+            return rollback(Status::InvalidArgument(
+                "mapping must come from a HOST_NUMA FABRIC allocation"));
+        }
+        rc = cuMemAddressReserve(
+            reinterpret_cast<CUdeviceptr *>(&allocation.addr), allocation.size,
+            0, 0, 0);
+        if (rc != CUDA_SUCCESS)
+            return rollback(Status::InternalError("EGM reserve failed: " +
+                                                  std::to_string(rc)));
+        rc = cuMemMap(reinterpret_cast<CUdeviceptr>(allocation.addr),
+                      allocation.size, 0, handle, 0);
+        if (rc != CUDA_SUCCESS)
+            return rollback(
+                Status::InternalError("EGM map failed: " + std::to_string(rc)));
+        allocation.mapped = true;
+        int count = 0;
+        auto runtime_rc = cudaGetDeviceCount(&count);
+        if (runtime_rc != cudaSuccess || count <= 0)
+            return rollback(Status::InternalError(
+                "EGM import found no available local GPU"));
+        std::vector<CUmemAccessDesc> access(count);
+        for (int device = 0; device < count; ++device) {
+            access[device].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access[device].location.id = device;
+            access[device].flags = CU_MEM_ACCESS_FLAGS_PROT_READ;
+        }
+        rc = cuMemSetAccess(reinterpret_cast<CUdeviceptr>(allocation.addr),
+                            allocation.size, access.data(), access.size());
+        if (rc != CUDA_SUCCESS)
+            return rollback(Status::InternalError("EGM access failed: " +
+                                                  std::to_string(rc)));
+        rc = cuMemRelease(handle);
+        if (rc != CUDA_SUCCESS)
+            return rollback(Status::InternalError(
+                "EGM release import handle failed: " + std::to_string(rc)));
+        allocation.handle = 0;
+        entry.mnnvl_addr = allocation.addr;
+        entry.length = allocation.size;
+        entry.mnnvl_handle = buffer.mnnvl_handle;
+        runtime_rc = cudaGetDevice(&entry.cuda_id);
+        if (runtime_rc != cudaSuccess)
+            return rollback(
+                Status::InternalError(
+                    "EGM import failed to query the current device"));
+        return Status::OK();
     }
 
     void *mnnvl_addr = nullptr;
@@ -1377,6 +1442,89 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     auto mnnvl_addr = entry_it->second.mnnvl_addr;
     dest_addr = dest_addr - buffer->addr + ((uint64_t)mnnvl_addr);
     refresh_cache();
+    return Status::OK();
+}
+
+Status MnnvlTransport::acquireEgmMemory(
+    SegmentID segment, uint64_t address, size_t length, int device,
+    std::shared_ptr<MappedMemory> &mapping) {
+    if (mapping || !strictFabricEgm() || !address || !length ||
+        length > UINT64_MAX - address)
+        return Status::InvalidArgument(
+            "Invalid EGM mapping request or nonempty output");
+    int count = 0, current = -1;
+    CHECK_CUDA(cudaGetDeviceCount(&count));
+    CHECK_CUDA(cudaGetDevice(&current));
+    if (device < 0 || device >= count || current != device)
+        return Status::InvalidArgument(
+            "EGM mapping must be created on the caller's current CUDA device");
+    CHECK_STATUS(ensureCudaContext());
+    SegmentDescRef pin;
+    BufferDesc buffer;
+    CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
+        segment, pin, [&](SegmentDesc *desc) {
+            auto *candidate = desc->findBuffer(address, length);
+            if (!candidate || candidate->addr != address ||
+                candidate->length != length || candidate->mnnvl_handle.empty())
+                return Status::InvalidArgument(
+                    "EGM acquire requires a complete published arena");
+            buffer = *candidate;
+            return Status::OK();
+        }));
+    const std::string key = std::to_string(segment) + ":" +
+                            std::to_string(address) + ":" +
+                            std::to_string(length) + ":" + buffer.mnnvl_handle;
+    std::lock_guard<std::mutex> lock(lease_mutex_);
+    auto found = leased_mappings_.find(key);
+    if (found != leased_mappings_.end()) {
+        mapping = found->second.lock();
+        if (mapping && mapping->address()) return Status::OK();
+        mapping.reset();
+    }
+    // Store only weak references; once the last external lease disappears,
+    // reclaim immediately.
+    for (auto it = leased_mappings_.begin(); it != leased_mappings_.end();) {
+        if (it->second.expired())
+            it = leased_mappings_.erase(it);
+        else
+            ++it;
+    }
+    OpenedMnnvlEntry entry;
+    CHECK_STATUS(importRemoteBuffer(buffer, entry, true));
+    try {
+        mapping = std::make_shared<MappedMemory>(
+            reinterpret_cast<uint64_t>(entry.mnnvl_addr), entry.length,
+            [entry, unmapped = false]() mutable -> Status {
+                // Independent of the transport instance; an old instance
+                // exiting must not release an external kernel's mapping.
+                int previous = -1;
+                CHECK_CUDA(cudaGetDevice(&previous));
+                CHECK_CUDA(cudaSetDevice(entry.cuda_id));
+                struct RestoreDevice {
+                    int previous;
+                    ~RestoreDevice() { cudaSetDevice(previous); }
+                } restore{previous};
+                CHECK_CUDA(cudaFree(nullptr));
+                if (!unmapped) {
+                    auto rc =
+                        cuMemUnmap((CUdeviceptr)entry.mnnvl_addr, entry.length);
+                    if (rc != CUDA_SUCCESS) {
+                        LOG(ERROR) << "EGM unmap failed, retaining VA: " << rc;
+                        return Status::InternalError("EGM unmap failed");
+                    }
+                    unmapped = true;
+                }
+                auto rc = cuMemAddressFree((CUdeviceptr)entry.mnnvl_addr,
+                                           entry.length);
+                if (rc != CUDA_SUCCESS)
+                    return Status::InternalError("EGM address free failed");
+                return Status::OK();
+            });
+    } catch (...) {
+        releaseImportedEntry(entry);
+        throw;
+    }
+    leased_mappings_[key] = mapping;
     return Status::OK();
 }
 

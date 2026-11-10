@@ -18,6 +18,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "tent/common/cuda_fabric_compat.h"
+#include "tent/common/mapped_memory.h"
 
 #include <atomic>
 #include <functional>
@@ -110,6 +111,8 @@ class MnnvlTransport : public Transport {
     }
     Status getEgmNumaNodes(std::vector<int> &nodes, bool nearest);
     Status getEgmGranularity(int node, size_t &granularity);
+    Status acquireEgmMemory(SegmentID segment, uint64_t address, size_t length,
+                            int device, std::shared_ptr<MappedMemory> &mapping);
 
     virtual Status allocateLocalMemory(void **addr, size_t size,
                                        MemoryOptions &options);
@@ -147,8 +150,14 @@ class MnnvlTransport : public Transport {
         std::string mnnvl_handle;
     };
 
-    Status importRemoteBuffer(const BufferDesc &buffer,
-                              OpenedMnnvlEntry &entry);
+    Status importRemoteBuffer(const BufferDesc &buffer, OpenedMnnvlEntry &entry,
+                              bool require_egm = false);
+
+    // External kernels share the importer with TE copies but do not borrow
+    // the copy cache's raw pointers.
+    std::mutex lease_mutex_;
+    std::unordered_map<std::string, std::weak_ptr<MappedMemory>>
+        leased_mappings_;
 
     static void releaseImportedEntry(const OpenedMnnvlEntry &entry);
 
