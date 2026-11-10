@@ -381,14 +381,10 @@ TEST(TransferEngineAscendTransportTest, AscendHintsSelectAscendTransport) {
 }
 
 TEST(TransferEngineAscendTransportTest, HostHintsKeepHostTransportPath) {
-#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
-    // HCCL builds always install Ascend, whatever the hint names.
-    EXPECT_TRUE(shouldInstallAscendTransport("rdma"));
-    EXPECT_TRUE(shouldInstallAscendTransport("tcp"));
-#else
+    // Ascend builds (USE_ASCEND or USE_ASCEND_DIRECT) install the Ascend Direct
+    // transport only when the hint names it; host hints keep the host path.
     EXPECT_FALSE(shouldInstallAscendTransport("rdma"));
     EXPECT_FALSE(shouldInstallAscendTransport("tcp"));
-#endif
 }
 
 TEST(TransferEngineAscendTransportTest, ProtocolHintMergeKeepsStoredProtocol) {

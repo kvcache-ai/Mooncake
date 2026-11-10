@@ -25,7 +25,7 @@ namespace mooncake {
 
 namespace {
 // Helper function to check ACL return code
-bool checkAclError(aclError error, const char *message) {
+bool checkAclError(aclError error, const char* message) {
     if (error != ACL_ERROR_NONE) {
         LOG(ERROR) << message << ", error: " << error << ", "
                    << aclGetRecentErrMsg();
@@ -35,7 +35,7 @@ bool checkAclError(aclError error, const char *message) {
 }
 }  // namespace
 
-ContextManager &ContextManager::getInstance() {
+ContextManager& ContextManager::getInstance() {
     static ContextManager instance;
     return instance;
 }
