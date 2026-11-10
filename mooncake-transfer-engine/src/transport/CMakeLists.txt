@@ -110,12 +110,13 @@ endif()
 
 if(USE_CUDA
    OR USE_MUSA
-   OR USE_MACA)
+   OR USE_MACA
+   OR USE_HYGON)
   add_subdirectory(device)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
   # device_transport (ibgda_device_transport.cpp / mlx5gda.cpp) calls libmlx5
   # DevX symbols (mlx5dv_devx_*, mlx5dv_init_obj) directly.
-  if((USE_CUDA OR USE_MUSA OR USE_MACA) AND NOT USE_CXI)
+  if((USE_CUDA OR USE_MUSA OR USE_MACA OR USE_HYGON) AND NOT USE_CXI)
     target_link_libraries(transport PUBLIC mlx5)
   endif()
   if(USE_CUDA AND MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
@@ -129,3 +130,4 @@ if(USE_FLAGCX)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:flagcx_transport>)
   target_link_libraries(transport PRIVATE FlagCX::flagcx)
 endif()
+

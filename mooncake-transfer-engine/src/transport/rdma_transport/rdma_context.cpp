@@ -40,7 +40,7 @@
 #include "config.h"
 #include "cuda_alike.h"
 #include "hip_device_guard.h"
-#if defined(USE_HIP_DMABUF)
+#if defined(USE_HIP_DMABUF) || defined(USE_HYGON_DMABUF)
 #include <sys/utsname.h>
 
 #include <vector>
@@ -794,6 +794,46 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         out.alloc_base = allocBase;
         out.device = hipAttr.device;
     }
+#elif defined(USE_HYGON_DMABUF)
+    CUmemorytype memType;
+    CUresult result = cuPointerGetAttribute(
+        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+
+    if (result != CUDA_SUCCESS || memType != CU_MEMORYTYPE_DEVICE) {
+        out.method = DmabufExport::Method::kHostReg;
+    } else {
+        CUdeviceptr allocBase = 0;
+        size_t allocSize = 0;
+        result =
+            cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            const char *errStr = nullptr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
+                       << (uintptr_t)addr
+                       << " cuda error=" << (errStr ? errStr : "unknown");
+            return ERR_CONTEXT;
+        }
+
+        int dmabuf_fd = -1;
+        uint64_t hsa_dmabuf_offset = 0;
+        hsa_status_t hsaRes = hsa_amd_portable_export_dmabuf(
+            reinterpret_cast<void *>(allocBase), allocSize, &dmabuf_fd,
+            &hsa_dmabuf_offset);
+        if (hsaRes != HSA_STATUS_SUCCESS) {
+            const char *hsaErr = nullptr;
+            hsa_status_string(hsaRes, &hsaErr);
+            LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
+                       << " base=" << (uintptr_t)allocBase
+                       << " size=" << allocSize
+                       << " hsa error=" << (hsaErr ? hsaErr : "unknown");
+            return ERR_CONTEXT;
+        }
+
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = dmabuf_fd;
+        out.offset = (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
+    }
 #else
     out.method = DmabufExport::Method::kHostReg;
 #endif
@@ -828,7 +868,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.addr = addr;
     mrMeta.length = length;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
-    defined(USE_HIP_DMABUF) || defined(USE_SUPA)
+    defined(USE_HIP_DMABUF) || defined(USE_HYGON_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
         // #5015: a DMA-BUF MR whose start is 2^k-aligned (k >= 32) and whose
         // length exceeds 2^k wraps every 2^k bytes, so an RDMA READ/WRITE at

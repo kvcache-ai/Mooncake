@@ -7,6 +7,7 @@
 set(DEVICE_TRANSPORT_SOURCES p2p_device_transport.cpp)
 if((USE_CUDA OR USE_MUSA OR USE_MACA) AND NOT USE_CXI)
     list(APPEND DEVICE_TRANSPORT_SOURCES ibgda_device_transport.cpp mlx5gda.cpp)
+
 endif()
 if(USE_NCCL_DEVICE)
     list(APPEND DEVICE_TRANSPORT_SOURCES nccl_device_transport.cpp)
@@ -29,3 +30,8 @@ endif()
 if(USE_MACA)
     target_compile_definitions(device_transport PRIVATE USE_MACA)
 endif()
+
+if(USE_HYGON)
+  target_include_directories(device_transport PRIVATE ${DTK_INCLUDE_DIR})
+endif()
+

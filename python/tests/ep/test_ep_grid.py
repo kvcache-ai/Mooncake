@@ -1,16 +1,26 @@
-import os
+import faulthandler
 import itertools
+import os
+import traceback
 import unittest
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.testing as testing
-import faulthandler
-import traceback
 
 from mooncake.mooncake_ep_buffer import Buffer
-import mooncake.pg as pg
+
+try:
+    import mooncake.pg as pg
+except ImportError:
+    pg = None
+
+os.environ.setdefault("HSA_FORCE_FINE_GRAIN_PCIE", "1")
+
+
+def sync_barrier(buf: Buffer, group: dist.ProcessGroup):
+    dist.barrier(group)
 
 
 def using_musa_backend() -> bool:
@@ -29,6 +39,24 @@ def using_maca_backend() -> bool:
         "TRUE",
         "YES",
     } or bool(getattr(torch.version, "maca", None))
+
+
+def using_hygon_backend() -> bool:
+    if os.getenv("MOONCAKE_EP_USE_HYGON", "").upper() in {
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
+    }:
+        return True
+    try:
+        if bool(getattr(torch.version, "hip", None)):
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                dev_name = torch.cuda.get_device_name(0).lower()
+                return any(k in dev_name for k in ("hygon", "dcu", "z100", "k100"))
+    except Exception:
+        pass
+    return False
 
 
 def import_torchada_if_needed():
@@ -121,7 +149,7 @@ def run_test_iteration(
     # 5s timeout if we simulate a failed rank
     timeout_us = 5 * 1_000_000 if fail_rank != -1 else -1
 
-    dist.barrier(group)
+    sync_barrier(buf, group)
 
     if rank == fail_rank:
         os._exit(0)
@@ -206,7 +234,7 @@ def run_test_iteration(
 
     torch.cuda.synchronize()
     if fail_rank == -1:
-        dist.barrier(group)
+        sync_barrier(buf, group)
 
 
 def worker(rank, world_size, config_dict):
@@ -218,14 +246,15 @@ def worker(rank, world_size, config_dict):
         for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
         if f
     ]
-    if device_filter:
+    if pg is not None and device_filter:
         pg.set_device_filter(device_filter)
 
     torch.cuda.set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
 
-    dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
+    backend = "gloo" if using_hygon_backend() else "mooncake"
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
     try:
@@ -310,7 +339,7 @@ def run_stale_data_test(
         torch.bfloat16
     )
 
-    dist.barrier(group)
+    sync_barrier(buf, group)
 
     recv_x, _, handle, event, _ = buf.dispatch(
         x,
@@ -325,7 +354,7 @@ def run_stale_data_test(
     event.current_stream_wait()
     torch.cuda.synchronize()
 
-    dist.barrier(group)
+    sync_barrier(buf, group)
 
     if rank == fail_rank:
         os._exit(0)
@@ -371,14 +400,15 @@ def stale_data_worker(rank, world_size):
         for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
         if f
     ]
-    if device_filter:
+    if pg is not None and device_filter:
         pg.set_device_filter(device_filter)
 
     torch.cuda.set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
 
-    dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
+    backend = "gloo" if using_hygon_backend() else "mooncake"
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     group = dist.group.WORLD
 
     try:
@@ -402,8 +432,19 @@ class TestMooncakeEPBuffer(unittest.TestCase):
     def setUp(self):
         import_torchada_if_needed()
         self.world_size = torch.cuda.device_count()
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        import socket
+
+        port = int(os.environ.get("MASTER_PORT", 29500))
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("", port))
+        except OSError:
+            s.bind(("", 0))
+            port = s.getsockname()[1]
+        finally:
+            s.close()
+        os.environ["MASTER_PORT"] = str(port)
 
     def run_single_config(self, config_dict):
         mp.spawn(
