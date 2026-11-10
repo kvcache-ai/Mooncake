@@ -892,8 +892,7 @@ WeightStoreManager::ReconcileWeightRevisionBounded(
             }
             if (member_budget) {
                 std::lock_guard lock(member_cursor_mutex_);
-                member_cursors_[cursor_key] =
-                    (index + 1) % member_keys.size();
+                member_cursors_[cursor_key] = (index + 1) % member_keys.size();
             }
             if (should_be_hot) {
                 const auto result =
@@ -1248,6 +1247,24 @@ size_t WeightStoreManager::ReconcileWeightMetadataStoreOnce(uint64_t now_ms,
     MasterMetricManager::instance().project_weight_metadata(
         weight_metadata_.ExportSnapshot(), now_ms);
     return actions;
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+WeightStoreManager::UpdateWeightPolicy(
+    const UpdateWeightPolicyRequest& request) {
+    if (MakeWeightPayloadGroupId(request.identity).empty()) {
+        return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
+    }
+    auto group_operation_lock = LockGroup(request.identity);
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    auto mutation = weight_metadata_.PrepareUpdatePolicy(request, now_ms);
+    if (!mutation) {
+        return tl::make_unexpected(mutation.error());
+    }
+    return PersistAndPublishWeightMutation(*mutation);
 }
 
 bool WeightStoreManager::RecordOffloadFailures(
