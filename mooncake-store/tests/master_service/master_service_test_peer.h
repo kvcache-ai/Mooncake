@@ -435,6 +435,32 @@ class MasterServiceTestPeer {
 
     void ClearInvalidHandles() { service_.ClearInvalidHandles(); }
 
+    // The test retains a BeginRemount scope through both phases, just like
+    // the RPC, but can deterministically mutate metadata in the lock gap.
+    auto PrepareRemountForTesting(const std::vector<Segment>& segments,
+                                  const UUID& client_id) {
+        std::shared_lock lock(service_.master_state_mutex_);
+        return service_.PrepareRemount(segments, client_id, true);
+    }
+
+    auto CommitRemountForTesting(MasterService::PreparedRemount& preparation,
+                                 const UUID& client_id,
+                                 const ClientSessionSharedPtr& session) {
+        std::unique_lock lock(service_.master_state_mutex_);
+        return service_.CommitRemount(preparation, client_id, session, lock);
+    }
+
+    static void SetRemountBatchHookForTesting(
+        MasterService::PreparedRemount& preparation,
+        std::function<void()> hook) {
+        preparation.after_batch_for_testing = std::move(hook);
+    }
+
+    static std::string LastPreparedRemountKeyForTesting(
+        const MasterService::PreparedRemount& preparation) {
+        return preparation.segments.back().replicas.back().object.key;
+    }
+
     void DiscardExpiredProcessingReplicas(
         const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now) {

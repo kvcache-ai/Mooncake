@@ -824,6 +824,15 @@ class MasterServiceHATest : public ::testing::Test {
         return StandbyObjectEntry{"default", key, std::move(metadata)};
     }
 
+    StandbyObjectEntry MakeRemountableStandbyObject(
+        const std::string& key, const std::string& endpoint) const {
+        auto object = MakeStandbyObject(key, endpoint);
+        object.metadata.replicas.front()
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+        return object;
+    }
+
     StandbySegmentInfo MakeStandbyMemorySegment(
         const std::string& endpoint,
         size_t capacity = kDefaultSegmentSize) const {
@@ -2389,6 +2398,254 @@ TEST_F(MasterServiceHATest, InvalidHandleCleanupWaitsForSnapshotBarrier) {
     ASSERT_EQ(cleanup.wait_for(std::chrono::seconds(5)),
               std::future_status::ready);
     cleanup.get();
+}
+
+TEST_F(MasterServiceHATest, RemountDoesNotVisitUnrelatedObjects) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "indexed_remount";
+    auto restored =
+        MakeRemountableStandbyObject("indexed_restored_key", endpoint);
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {restored}, 1, {MakeStandbyMemorySegment(endpoint)}));
+    const auto live =
+        PrepareSimpleSegment(service, "indexed_live", 0x400000000);
+    const std::string unrelated = "indexed_unrelated_key";
+    PutObjectOnSegment(service, live.client_id, unrelated, "indexed_live");
+
+    using Access = MasterServiceTestPeer::MetadataAccessorRW;
+    auto held = std::make_unique<Access>(
+        &service,
+        MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, unrelated},
+        Access::AsIs{});
+    ASSERT_TRUE(held->IsPublished());
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid());
+    });
+    const auto status = remount.wait_for(std::chrono::seconds(1));
+    held.reset();
+    EXPECT_EQ(status, std::future_status::ready);
+    ASSERT_TRUE(remount.get());
+}
+
+TEST_F(MasterServiceHATest, RemountPreparationDoesNotBlockOtherClientReads) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "shared_prepare_remount";
+    const std::string key = "shared_prepare_restored_key";
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {MakeRemountableStandbyObject(key, endpoint)}, 1,
+        {MakeStandbyMemorySegment(endpoint)}));
+    const auto live =
+        PrepareSimpleSegment(service, "shared_prepare_live", 0x400000000);
+    const std::string other = "shared_prepare_other_key";
+    PutObjectOnSegment(service, live.client_id, other, "shared_prepare_live");
+    using Access = MasterServiceTestPeer::MetadataAccessorRW;
+    auto held = std::make_unique<Access>(
+        &service, MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, key},
+        Access::AsIs{});
+    std::promise<void> entered;
+    auto started = entered.get_future();
+    auto remount = std::async(std::launch::async, [&] {
+        entered.set_value();
+        return service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid());
+    });
+    started.wait();
+    EXPECT_EQ(remount.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    auto read = std::async(std::launch::async, [&] {
+        return service.GetReplicaList(other, kDefaultTenant);
+    });
+    const auto status = read.wait_for(std::chrono::seconds(1));
+    held.reset();
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_TRUE(read.get());
+    EXPECT_TRUE(remount.get());
+}
+
+TEST_F(MasterServiceHATest, RemountDropsReservationsDeletedDuringPreparation) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "remount_delete_gap";
+    auto first = MakeRemountableStandbyObject("remount_deleted_key", endpoint);
+    auto second =
+        MakeRemountableStandbyObject("remount_retained_key", endpoint);
+    second.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+    const auto baseline =
+        MasterMetricManager::instance().get_allocated_mem_size();
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {first, second}, 1, {MakeStandbyMemorySegment(endpoint)}));
+    const UUID owner = generate_uuid();
+    auto registration =
+        MasterServiceTestPeer::ClientSessions(service).BeginRemount(owner);
+    ASSERT_TRUE(registration);
+    MasterServiceTestPeer peer(service);
+    auto prepared =
+        peer.PrepareRemountForTesting({MakeSegment(endpoint)}, owner);
+    ASSERT_TRUE(prepared);
+    EraseObjectForTesting(service, kDefaultTenant, first.key);
+    ASSERT_TRUE(peer.CommitRemountForTesting(*prepared, owner,
+                                             registration->Session()));
+    registration->Commit();
+    EXPECT_TRUE(service.GetReplicaList(second.key, kDefaultTenant));
+    EXPECT_EQ(
+        MasterMetricManager::instance().get_allocated_mem_size() - baseline,
+        1024);
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 1024);
+}
+
+TEST_F(MasterServiceHATest, RemountDoesNotReplaceARecreatedKey) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "remount_recreate_gap";
+    const std::string key = "remount_recreated_key";
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {MakeRemountableStandbyObject(key, endpoint)}, 1,
+        {MakeStandbyMemorySegment(endpoint)}));
+    const auto live =
+        PrepareSimpleSegment(service, "remount_recreate_live", 0x400000000);
+    const UUID owner = generate_uuid();
+    auto registration =
+        MasterServiceTestPeer::ClientSessions(service).BeginRemount(owner);
+    ASSERT_TRUE(registration);
+    MasterServiceTestPeer peer(service);
+    auto prepared =
+        peer.PrepareRemountForTesting({MakeSegment(endpoint)}, owner);
+    ASSERT_TRUE(prepared);
+    EraseObjectForTesting(service, kDefaultTenant, key);
+    PutObjectOnSegment(service, live.client_id, key, "remount_recreate_live");
+    auto before = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(before);
+    ASSERT_TRUE(peer.CommitRemountForTesting(*prepared, owner,
+                                             registration->Session()));
+    registration->Commit();
+    auto after = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(after);
+    ASSERT_EQ(after->replicas.size(), 1u);
+    EXPECT_EQ(after->replicas.front().id, before->replicas.front().id);
+    EXPECT_EQ(after->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "remount_recreate_live");
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 0);
+}
+
+TEST_F(MasterServiceHATest, RemountCommitBatchesKeepOtherClientsServing) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "remount_batched_publication";
+    std::vector<StandbyObjectEntry> objects;
+    constexpr size_t count = 600;
+    for (size_t i = 0; i < count; ++i) {
+        auto object = MakeRemountableStandbyObject(
+            "remount_batch_key_" + std::to_string(i), endpoint);
+        auto& replica = object.metadata.replicas.front();
+        replica.id = i + 1;
+        replica.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+            kDefaultSegmentBase + i * 1024;
+        objects.push_back(std::move(object));
+    }
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        objects, 1, {MakeStandbyMemorySegment(endpoint)}));
+    const auto live =
+        PrepareSimpleSegment(service, "remount_batch_live", 0x400000000);
+    const std::string other = "remount_batch_other_key";
+    PutObjectOnSegment(service, live.client_id, other, "remount_batch_live");
+    const auto segment = MakeSegment(endpoint);
+    const auto owner = generate_uuid();
+    auto registration =
+        MasterServiceTestPeer::ClientSessions(service).BeginRemount(owner);
+    ASSERT_TRUE(registration);
+    MasterServiceTestPeer peer(service);
+    auto prepared = peer.PrepareRemountForTesting({segment}, owner);
+    ASSERT_TRUE(prepared);
+    const auto recreated = peer.LastPreparedRemountKeyForTesting(*prepared);
+    std::promise<void> paused, resume;
+    auto paused_future = paused.get_future();
+    auto resume_future = resume.get_future();
+    std::atomic<bool> first{true};
+    peer.SetRemountBatchHookForTesting(*prepared, [&] {
+        if (first.exchange(false)) {
+            paused.set_value();
+            resume_future.wait();
+        }
+    });
+    auto commit = std::async(std::launch::async, [&] {
+        return peer.CommitRemountForTesting(*prepared, owner,
+                                            registration->Session());
+    });
+    const auto paused_status = paused_future.wait_for(std::chrono::seconds(5));
+    if (paused_status != std::future_status::ready) {
+        resume.set_value();
+        EXPECT_TRUE(commit.get());
+        FAIL() << "No commit batch checkpoint";
+    }
+    auto online = std::async(std::launch::async, [&] {
+        EXPECT_TRUE(service.GetReplicaList(other, kDefaultTenant));
+        auto pending =
+            service.GetReplicaList(objects.front().key, kDefaultTenant);
+        EXPECT_FALSE(pending);
+        if (!pending)
+            EXPECT_EQ(pending.error(), ErrorCode::REPLICA_IS_NOT_READY);
+        auto unmount = service.UnmountSegment(segment.id, owner);
+        EXPECT_FALSE(unmount);
+        if (!unmount)
+            EXPECT_EQ(unmount.error(),
+                      ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    });
+    const auto online_status = online.wait_for(std::chrono::seconds(1));
+    if (online_status == std::future_status::ready) {
+        EraseObjectForTesting(service, kDefaultTenant, recreated);
+        PutObjectOnSegment(service, live.client_id, recreated,
+                           "remount_batch_live");
+    }
+    resume.set_value();
+    online.get();
+    EXPECT_EQ(online_status, std::future_status::ready);
+    ASSERT_TRUE(commit.get());
+    registration->Commit();
+    auto after = service.GetReplicaList(recreated, kDefaultTenant);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->replicas.front()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "remount_batch_live");
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint),
+              (count - 1) * 1024);
+}
+
+TEST_F(MasterServiceHATest, RemountRejectsAnAllocatorPublishedInTheLockGap) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "remount_mount_gap";
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot(
+        {MakeRemountableStandbyObject("remount_mount_gap_key", endpoint)}, 1,
+        {MakeStandbyMemorySegment(endpoint)}));
+    const auto segment = MakeSegment(endpoint);
+    const UUID owner = generate_uuid();
+    const UUID winner = generate_uuid();
+    auto registration =
+        MasterServiceTestPeer::ClientSessions(service).BeginRemount(owner);
+    ASSERT_TRUE(registration);
+    MasterServiceTestPeer peer(service);
+    auto prepared = peer.PrepareRemountForTesting({segment}, owner);
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(service.MountSegment(segment, winner));
+    std::shared_ptr<BufferAllocatorBase> winner_allocator;
+    {
+        auto access =
+            MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+        winner_allocator = access.GetAllocator(segment.id);
+    }
+    auto committed =
+        peer.CommitRemountForTesting(*prepared, owner, registration->Session());
+    ASSERT_FALSE(committed);
+    EXPECT_EQ(committed.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    auto access =
+        MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
+    EXPECT_EQ(access.GetAllocator(segment.id), winner_allocator);
 }
 
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {

@@ -2319,6 +2319,44 @@ class MasterService {
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
 
+    struct RestoredReplicaReference {
+        TenantId tenant_id;
+        route::ObjectRef object;
+        ReplicaID replica_id;
+    };
+    // Built before a restored master serves requests. A remount visits only
+    // its restored publications; erased/replaced keys are rejected by ref/id.
+    std::unordered_map<std::string, std::vector<RestoredReplicaReference>>
+        standby_replica_index_;
+
+    struct PreparedRemountSegment {
+        Segment segment;
+        std::shared_ptr<BufferAllocatorBase> expected_allocator;
+        std::shared_ptr<BufferAllocatorBase> orphan_allocator;
+        std::shared_ptr<BufferAllocatorBase> restored_allocator;
+        std::vector<RestoredReplicaReference> replicas;
+        std::vector<AllocatedBuffer::Descriptor> descriptors;
+        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+    };
+    struct PreparedRemount {
+        std::vector<PreparedRemountSegment> segments;
+        bool concurrent_preparation;
+        // Reclaim the potentially large index outside the global lock.
+        std::vector<std::vector<RestoredReplicaReference>> retired_indexes;
+        // Set only through the test peer to exercise a commit-batch gap.
+        std::function<void()> after_batch_for_testing;
+    };
+    // The caller retains the session registration through both phases. That
+    // also excludes another restore, without holding the global state lock.
+    bool CanPrepareRemountConcurrently(const std::vector<Segment>& segments);
+    tl::expected<PreparedRemount, ErrorCode> PrepareRemount(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        bool concurrent_preparation);
+    tl::expected<void, ErrorCode> CommitRemount(
+        PreparedRemount& preparation, const UUID& client_id,
+        const ClientSessionSharedPtr& owner_session,
+        std::unique_lock<std::shared_mutex>& state_lock);
+
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     // True while the replica sits on an endpoint in

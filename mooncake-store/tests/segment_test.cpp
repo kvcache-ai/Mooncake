@@ -1421,6 +1421,42 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
                             empty_client_ids_vec);
 }
 
+TEST_F(SegmentTest, RemountPublicationFencesAllocationsAndControlOperations) {
+    SegmentManager manager;
+    auto access = manager.getSegmentAccess();
+    const auto owner = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "remount_publication";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x100000000;
+    segment.size = 16 * 1024 * 1024;
+    ASSERT_EQ(access.MountSegment(segment, SessionFor(owner)), ErrorCode::OK);
+    access.SetRemountInProgress(segment.id, true);
+    EXPECT_FALSE(access.IsSegmentAllocatable(segment.name));
+    size_t capacity = 0;
+    EXPECT_EQ(access.PrepareUnmountSegment(segment.id, capacity),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(access.PrepareGracefulUnmountSegment(segment.id),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(
+        access.SetSegmentStatusByName(segment.name, SegmentStatus::DRAINING),
+        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(access.MountSegment(segment, SessionFor(owner)),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    auto alias = segment;
+    alias.id = generate_uuid();
+    alias.name = "different_name_same_endpoint";
+    EXPECT_EQ(access.MountSegment(alias, SessionFor(generate_uuid())),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    access.SetRemountInProgress(segment.id, false);
+    EXPECT_TRUE(access.IsSegmentAllocatable(segment.name));
+    EXPECT_EQ(access.PrepareUnmountSegment(segment.id, capacity),
+              ErrorCode::OK);
+    EXPECT_EQ(access.CommitUnmountSegment(segment.id, owner, capacity),
+              ErrorCode::OK);
+}
+
 // QuerySegments:
 // 1. Create and mount 10 different segments with different names and different
 // client ids;
