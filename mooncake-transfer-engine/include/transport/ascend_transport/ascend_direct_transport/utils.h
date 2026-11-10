@@ -77,7 +77,8 @@ class ScopeGuard {
 
 std::string GenAdxlEngineName(const std::string& ip, const uint64_t port);
 
-uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id);
+uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports = {});
 
 // True when HCCL_INTRA_ROCE_ENABLE=1 or ASCEND_GLOBAL_RESOURCE_CONFIG sets
 // comm_resource_config.protocol_desc to a roce:* entry (string or array).
