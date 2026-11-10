@@ -777,6 +777,71 @@ if(USE_TPU)
     tent_tpu_transport_test
     PRIVATE MOCK_TPU_PJRT_LIB="$<TARGET_FILE:mock_tpu_pjrt>")
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
+
+  # The adapter hides the registry's symbols, so compile its source directly.
+  add_executable(
+    tent_tpu_fake_address_registry_test
+    tpu/tpu_fake_address_registry_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu/tpu_synthetic_address_registry.cpp
+  )
+  target_link_libraries(tent_tpu_fake_address_registry_test PRIVATE gtest
+                                                                    gtest_main)
+  target_include_directories(tent_tpu_fake_address_registry_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../plugins/tpu)
+  add_test(NAME tent_tpu_fake_address_registry_test
+           COMMAND tent_tpu_fake_address_registry_test)
+
+  add_library(mock_tpu_buffer_provider SHARED tpu/mock_tpu_buffer_provider.cpp)
+  target_include_directories(mock_tpu_buffer_provider
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+
+  add_executable(tent_tpu_pjrt_adapter_test tpu/tpu_pjrt_adapter_test.cpp)
+  add_dependencies(tent_tpu_pjrt_adapter_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(
+    tent_tpu_pjrt_adapter_test PRIVATE gtest gtest_main tent_link_group
+                                       ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_pjrt_adapter_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_pjrt_adapter_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_pjrt_adapter_test COMMAND tent_tpu_pjrt_adapter_test)
+
+  add_executable(tent_tpu_adapter_engine_test tpu/tpu_adapter_engine_test.cpp)
+  add_dependencies(tent_tpu_adapter_engine_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(
+    tent_tpu_adapter_engine_test PRIVATE gtest gtest_main tent_link_group
+                                         ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_adapter_engine_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_adapter_engine_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_adapter_engine_test
+           COMMAND tent_tpu_adapter_engine_test)
+  set_tests_properties(tent_tpu_adapter_engine_test PROPERTIES TIMEOUT 300)
+
+  add_executable(tent_tpu_adapter_process_test tpu/tpu_adapter_process_test.cpp)
+  add_dependencies(tent_tpu_adapter_process_test tent_tpu_pjrt_adapter
+                   mock_tpu_buffer_provider)
+  target_link_libraries(tent_tpu_adapter_process_test
+                        PRIVATE gtest tent_link_group ${CMAKE_DL_LIBS})
+  target_include_directories(tent_tpu_adapter_process_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_compile_definitions(
+    tent_tpu_adapter_process_test
+    PRIVATE
+      TPU_PJRT_ADAPTER_LIB="$<TARGET_FILE:tent_tpu_pjrt_adapter>"
+      MOCK_TPU_BUFFER_PROVIDER_LIB="$<TARGET_FILE:mock_tpu_buffer_provider>")
+  add_test(NAME tent_tpu_adapter_process_test
+           COMMAND tent_tpu_adapter_process_test)
+  set_tests_properties(tent_tpu_adapter_process_test PROPERTIES TIMEOUT 300)
 endif()
 
 # XPU SYCL platform test: exercises XpuPlatform (device allocation, pointer

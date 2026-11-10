@@ -15,3 +15,7 @@ endif()
 if (USE_HIP)
     add_subdirectory(rocm)
 endif()
+
+if (USE_TPU)
+    add_subdirectory(tpu)
+endif()
