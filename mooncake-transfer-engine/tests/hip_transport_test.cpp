@@ -386,6 +386,42 @@ TEST_F(HipTransportAsyncTest, UnregisteredTargetFailsEveryTask) {
 // and serves it until its stdin closes.
 constexpr size_t kIpcLen = 4 << 20;
 
+// VMM memory has no IPC handle. Registering it must succeed without
+// publishing a hip buffer, so the other transports can still register it.
+TEST_F(HipTransportAsyncTest, VmmMemoryIsSkippedInIpcMode) {
+    hipMemAllocationProp prop = {};
+    prop.type = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = 0;
+    size_t size = 0;
+    ASSERT_EQ(hipMemGetAllocationGranularity(
+                  &size, &prop, hipMemAllocationGranularityMinimum),
+              hipSuccess);
+    hipMemGenericAllocationHandle_t handle;
+    if (hipMemCreate(&handle, size, &prop, 0) != hipSuccess) {
+        GTEST_SKIP() << "VMM allocation unsupported.";
+    }
+    void* ptr = nullptr;
+    ASSERT_EQ(hipMemAddressReserve(&ptr, size, 0, nullptr, 0), hipSuccess);
+    ASSERT_EQ(hipMemMap(ptr, size, 0, handle, 0), hipSuccess);
+    hipMemAccessDesc access = {};
+    access.location = prop.location;
+    access.flags = hipMemAccessFlagsProtReadWrite;
+    ASSERT_EQ(hipMemSetAccess(ptr, size, &access, 1), hipSuccess);
+
+    EXPECT_EQ(engine_->registerLocalMemory(ptr, size, GPU_PREFIX + "0"), 0);
+    auto desc = engine_->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(desc);
+    for (const auto& buffer : desc->buffers) {
+        EXPECT_NE(buffer.addr, reinterpret_cast<uint64_t>(ptr));
+    }
+    EXPECT_EQ(engine_->unregisterLocalMemory(ptr), 0);
+
+    (void)hipMemUnmap(ptr, size);
+    (void)hipMemAddressFree(ptr, size);
+    (void)hipMemRelease(handle);
+}
+
 TEST(HipIpcTest, Target) {
     const char* port = getenv("MC_HIP_TEST_IPC_TARGET");
     if (!port) GTEST_SKIP() << "Runs as the child of TwoProcessCopies.";
