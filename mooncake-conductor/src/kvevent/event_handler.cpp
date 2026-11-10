@@ -411,14 +411,12 @@ std::string KVEventHandler::HandleVllmBatch(
         return "batch data_parallel_rank conflicts with trusted registration";
     }
 
-    const bool count_metrics = metrics_.AcceptSequence(metadata.sequence);
+    metrics_.RecordBatch(metadata.sequence, metadata.from_replay);
     for (size_t index = 0; index < batch.events.size(); ++index) {
         const auto& decoded = batch.events[index];
         if (!decoded.ok()) {
-            if (count_metrics) {
-                metrics_.Record(EventMetrics::kUnknown, EventMetrics::kRejected,
-                                metadata.from_replay);
-            }
+            metrics_.Record(EventMetrics::kUnknown, EventMetrics::kRejected,
+                            metadata.from_replay);
             LOG(WARNING) << "Rejected vLLM event endpoint=" << service_.endpoint
                          << " publisher_kind="
                          << common::PublisherKindName(metadata.publisher_kind)
@@ -443,10 +441,8 @@ std::string KVEventHandler::HandleVllmBatch(
                 }
             },
             *decoded.event);
-        if (count_metrics) {
-            RecordEngineEvent(metrics_, *decoded.event, error,
-                              metadata.from_replay);
-        }
+        RecordEngineEvent(metrics_, *decoded.event, error,
+                          metadata.from_replay);
         if (!error.empty()) {
             LOG(WARNING) << "Rejected vLLM event endpoint=" << service_.endpoint
                          << " publisher_kind="
@@ -467,14 +463,12 @@ std::string KVEventHandler::HandleSglangBatch(
         *batch.data_parallel_rank != service_.dp_rank) {
         return "batch data_parallel_rank conflicts with trusted registration";
     }
-    const bool count_metrics = metrics_.AcceptSequence(metadata.sequence);
+    metrics_.RecordBatch(metadata.sequence, metadata.from_replay);
     for (size_t index = 0; index < batch.events.size(); ++index) {
         const auto& decoded = batch.events[index];
         if (!decoded.ok()) {
-            if (count_metrics) {
-                metrics_.Record(EventMetrics::kUnknown, EventMetrics::kRejected,
-                                metadata.from_replay);
-            }
+            metrics_.Record(EventMetrics::kUnknown, EventMetrics::kRejected,
+                            metadata.from_replay);
             LOG(WARNING) << "Rejected SGLang event endpoint="
                          << service_.endpoint << " event_index=" << index
                          << " error=" << decoded.error;
@@ -493,10 +487,8 @@ std::string KVEventHandler::HandleSglangBatch(
                 }
             },
             *decoded.event);
-        if (count_metrics) {
-            RecordEngineEvent(metrics_, *decoded.event, error,
-                              metadata.from_replay);
-        }
+        RecordEngineEvent(metrics_, *decoded.event, error,
+                          metadata.from_replay);
         if (!error.empty()) {
             LOG(WARNING) << "Rejected SGLang event endpoint="
                          << service_.endpoint << " event_index=" << index

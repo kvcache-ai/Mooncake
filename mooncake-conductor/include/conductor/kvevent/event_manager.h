@@ -62,6 +62,10 @@ class KVEventHandler : public zmq::EventHandler {
     std::string RenderMetrics(const std::string& labels) const {
         return metrics_.Render(labels);
     }
+    std::map<std::string, std::string> RenderMetricFamilies(
+        const std::string& labels) const {
+        return metrics_.RenderFamilies(labels);
+    }
 
     // Waits for callbacks admitted before MarkUnavailable() to finish. Must be
     // called without EventManager::mu_ held.

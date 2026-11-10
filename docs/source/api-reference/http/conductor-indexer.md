@@ -382,7 +382,7 @@ capability sample, along with the metric family HELP and TYPE declarations:
 ```text
 # HELP mooncake_conductor_metrics_info Conductor event metrics schema version.
 # TYPE mooncake_conductor_metrics_info gauge
-mooncake_conductor_metrics_info{schema="1"} 1
+mooncake_conductor_metrics_info{schema="2"} 1
 ```
 
 Configure Prometheus to scrape the Conductor HTTP listener:
@@ -413,11 +413,12 @@ block hashes, tokens, or error strings are used as labels.
 
 | Metric | Type | Meaning / additional labels |
 |---|---|---|
-| `mooncake_conductor_metrics_info` | Gauge | Value `1`, with `schema="1"`. Present even without subscriptions. |
+| `mooncake_conductor_metrics_info` | Gauge | Value `1`, with `schema="2"`. Present even without subscriptions. |
 | `mooncake_conductor_events_supported` | Gauge | `1` for vLLM/SGLang engine event counters, `0` for Mooncake storage publishers. |
-| `mooncake_conductor_events_total` | Counter | Engine events by `event_type`, `result`, and `origin`. |
+| `mooncake_conductor_events_total` | Counter | Engine event handling attempts by `event_type`, `result`, and `origin`, including redeliveries. |
 | `mooncake_conductor_event_block_references_total` | Counter | Block hashes carried by successfully applied stored/removed events; `event_type` and `origin`. |
 | `mooncake_conductor_last_applied_event_timestamp_seconds` | Gauge | Conductor receive time of the last successfully applied engine event, in Unix seconds. Absent until an event is applied. |
+| `mooncake_conductor_event_batch_redeliveries_total` | Counter | Engine batches delivered to the handler with a non-increasing nonnegative transport sequence; label `origin`. Includes retries and duplicate deliveries. |
 | `mooncake_conductor_source_stale` | Gauge | `1` when an unrecoverable gap or dispatch failure invalidates the source; otherwise `0`. This is not an idle-time detector. |
 | `mooncake_conductor_batch_failures_total` | Counter | Malformed multipart frames, invalid envelopes, or failed batch dispatches. |
 | `mooncake_conductor_sequence_gaps_total` | Counter | Gaps observed in the live transport sequence. |
@@ -432,11 +433,26 @@ counted by `batch_failures_total`, rather than inventing individual events.
 vLLM CPU events and SGLang engine-local CPU/DISK events are included when the
 indexer accepts them.
 
-`origin` is `live` or `replay`. A subscription's transport sequence is counted
-once, including live/replay overlap. Direct handler calls without a sequence
-are counted on each call. Repeated references in different sequences count
-again. In an overlapping buffered live/replay message, the first buffered copy
-determines the origin.
+`origin` is `live` or `replay`. Event and block-reference counters describe
+**handling attempts**, not unique events or final cache contents. If a rejected
+event is corrected and delivered again with the same sequence, both the rejected
+attempt and the later applied attempt are counted. In a partially successful
+batch, already successful events that are processed again also count again.
+Repeated successes and repeated failures are observable; counters never decrease.
+
+`event_batch_redeliveries_total` separately counts batches whose nonnegative
+sequence is at or below the highest sequence previously delivered to that
+subscription's handler. It does not distinguish a corrected retry from an
+identical duplicate. Calls without a transport sequence count their events but
+do not affect this batch counter. Metrics do not suppress processing or change
+transport recovery: messages discarded by transport deduplication never reach
+the handler and therefore do not add handling attempts. For overlapping buffered
+live/replay messages, the first buffered copy determines the origin.
+
+Schema `2` replaces the earlier schema `1` sequence-deduplicated event counts
+with these handling-attempt semantics and adds the redelivery counter. Each
+metric family's HELP/TYPE declarations and all its subscriptions' samples are
+emitted together for compatibility with Prometheus text parsers.
 
 Engine event counters start at zero for each subscription. Mooncake storage
 publishers expose transport metrics and `events_supported=0`; they do not

@@ -3538,7 +3538,7 @@ TEST(ConductorMetrics, AppliedEventsBlocksRejectionsAndReplayAreDistinct) {
     batch.events.push_back({.event = std::nullopt, .error = "invalid payload"});
     auto metadata = MetadataFor(service, "", 10);
     ASSERT_EQ(handler.HandleBatch(batch, metadata), "");
-    // Replay overlap must not inflate counters for the same sequence.
+    // An actual handler redelivery records its results, including retries.
     metadata.from_replay = true;
     ASSERT_EQ(handler.HandleBatch(batch, metadata), "");
     const auto samples =
@@ -3557,17 +3557,80 @@ TEST(ConductorMetrics, AppliedEventsBlocksRejectionsAndReplayAreDistinct) {
     EXPECT_NE(samples.find("event_type=\"cleared\",result=\"applied\"} 1\n"),
               std::string::npos);
     EXPECT_NE(samples.find("origin=\"replay\",event_type=\"stored\","
-                           "result=\"applied\"} 0\n"),
+                           "result=\"applied\"} 1\n"),
               std::string::npos);
     metadata.sequence = 11;
     ASSERT_EQ(handler.HandleBatch(batch, metadata), "");
     const auto replay = handler.RenderMetrics("instance_id=\"metrics-engine\"");
     EXPECT_NE(replay.find("origin=\"replay\",event_type=\"stored\","
-                          "result=\"applied\"} 1\n"),
+                          "result=\"applied\"} 2\n"),
               std::string::npos);
     EXPECT_NE(
         replay.find("mooncake_conductor_last_applied_event_timestamp_seconds{"),
         std::string::npos);
+}
+
+TEST(ConductorMetrics, RejectedEventsCanSucceedOnRedelivery) {
+    EventManager manager({}, 0);
+    const auto service = SglangScopeService("metrics-retry");
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(service)).error.empty());
+    KVEventHandler handler(&manager, service);
+    mooncake::conductor::zmq::SglangStoredEvent stored;
+    stored.block_hashes = {11};
+    stored.block_size = service.block_size;
+    stored.medium = "GPU";
+    auto rejected = stored;
+    rejected.block_hashes = {22};
+    rejected.block_size = service.block_size * 2;
+    mooncake::conductor::zmq::SglangEventBatch batch;
+    batch.events.push_back({.event = stored, .error = ""});
+    batch.events.push_back({.event = rejected, .error = ""});
+    auto metadata = MetadataFor(service, "", 10);
+    ASSERT_EQ(handler.HandleBatch(batch, metadata), "");
+    // Retrying the same failed batch must remain observable.
+    ASSERT_EQ(handler.HandleBatch(batch, metadata), "");
+    batch.events[1].event = stored;
+    ASSERT_EQ(handler.HandleBatch(batch, metadata), "");
+    // Advancing the sequence must not hide a subsequent older redelivery.
+    metadata.sequence = 11;
+    ASSERT_EQ(handler.HandleBatch(batch, metadata), "");
+    metadata.sequence = 10;
+    ASSERT_EQ(handler.HandleBatch(batch, metadata), "");
+    const auto samples = handler.RenderMetrics("instance_id=\"metrics-retry\"");
+    EXPECT_NE(
+        samples.find(
+            "origin=\"live\",event_type=\"stored\",result=\"applied\"} 8\n"),
+        std::string::npos);
+    EXPECT_NE(
+        samples.find(
+            "origin=\"live\",event_type=\"stored\",result=\"rejected\"} 2\n"),
+        std::string::npos);
+    EXPECT_NE(samples.find("event_batch_redeliveries_total{instance_id="
+                           "\"metrics-retry\",origin=\"live\"} 3\n"),
+              std::string::npos);
+}
+
+TEST(ConductorMetrics, CallsWithoutSequenceAreNotClassifiedAsRedeliveries) {
+    EventManager manager({}, 0);
+    const auto service = VllmService("direct-calls");
+    ASSERT_TRUE(
+        manager.GetIndexer()->Register(RegistrationFor(service)).error.empty());
+    KVEventHandler handler(&manager, service);
+    VllmEventBatch batch;
+    batch.events.push_back(
+        {.event = VllmStored(11, service.block_size), .error = ""});
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_EQ(handler.HandleBatch(batch, MetadataFor(service, "", -1)), "");
+    }
+    const auto samples = handler.RenderMetrics("instance_id=\"direct-calls\"");
+    EXPECT_NE(
+        samples.find(
+            "origin=\"live\",event_type=\"stored\",result=\"applied\"} 2\n"),
+        std::string::npos);
+    EXPECT_NE(samples.find("event_batch_redeliveries_total{instance_id="
+                           "\"direct-calls\",origin=\"live\"} 0\n"),
+              std::string::npos);
 }
 
 TEST(ConductorMetrics, VllmCpuEventsAreApplied) {
@@ -3604,7 +3667,7 @@ TEST(ConductorMetrics, PlainTextEndpointWorksWithoutRegisteredSources) {
     EXPECT_EQ(response.headers.at("content-type"),
               "text/plain; version=0.0.4; charset=utf-8");
     EXPECT_NE(
-        response.body.find("mooncake_conductor_metrics_info{schema=\"1\"} 1\n"),
+        response.body.find("mooncake_conductor_metrics_info{schema=\"2\"} 1\n"),
         std::string::npos);
     EXPECT_EQ(response.body.find("instance_id="), std::string::npos);
     EXPECT_EQ(mooncake::conductor::kvevent::EventMetrics::Quote("a\"b\\c\nd"),

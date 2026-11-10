@@ -1027,40 +1027,52 @@ std::string EventManager::RenderMetrics() {
         }
     }
     // No manager lock is held while taking a subscriber/metrics lock.
-    std::string out =
-        "# HELP mooncake_conductor_metrics_info Conductor event metrics "
-        "schema version.\n"
-        "# TYPE mooncake_conductor_metrics_info gauge\n"
-        "mooncake_conductor_metrics_info{schema=\"1\"} 1\n"
-        "# HELP mooncake_conductor_events_total Engine events observed once "
-        "per transport sequence and subscription.\n"
-        "# TYPE mooncake_conductor_events_total counter\n"
-        "# HELP mooncake_conductor_event_block_references_total Block "
-        "references in applied events, not distinct resident blocks.\n"
-        "# TYPE mooncake_conductor_event_block_references_total counter\n"
-        "# HELP mooncake_conductor_last_applied_event_timestamp_seconds Unix "
-        "receive time of the last applied engine event; absent before the "
-        "first application.\n"
-        "# TYPE mooncake_conductor_last_applied_event_timestamp_seconds gauge\n"
-        "# HELP mooncake_conductor_source_stale Whether an unrecoverable "
-        "event source was invalidated (1) or remains usable (0).\n"
-        "# TYPE mooncake_conductor_source_stale gauge\n"
-        "# HELP mooncake_conductor_events_supported Whether engine event "
-        "counters are supported for this publisher kind.\n"
-        "# TYPE mooncake_conductor_events_supported gauge\n"
-        "# HELP mooncake_conductor_batch_failures_total Malformed transport "
-        "frames, invalid envelopes, or failed batch dispatches.\n"
-        "# TYPE mooncake_conductor_batch_failures_total counter\n"
-        "# HELP mooncake_conductor_sequence_gaps_total Gaps observed in the "
-        "live transport sequence.\n"
-        "# TYPE mooncake_conductor_sequence_gaps_total counter\n"
-        "# HELP mooncake_conductor_sequence_missing_messages_total Messages "
-        "missing from live sequence gaps, including messages later recovered "
-        "by replay.\n"
-        "# TYPE mooncake_conductor_sequence_missing_messages_total counter\n"
-        "# HELP mooncake_conductor_replay_requests_total Replay attempts by "
-        "terminal result, including failed retries.\n"
-        "# TYPE mooncake_conductor_replay_requests_total counter\n";
+    struct Family {
+        const char* name;
+        const char* help;
+        const char* type;
+    };
+    static constexpr Family families[] = {
+        {"mooncake_conductor_metrics_info",
+         "Conductor event metrics schema version.", "gauge"},
+        {"mooncake_conductor_events_total",
+         "Engine event handling attempts, including redeliveries.", "counter"},
+        {"mooncake_conductor_event_block_references_total",
+         "Block references in applied event attempts, not distinct resident "
+         "blocks.",
+         "counter"},
+        {"mooncake_conductor_last_applied_event_timestamp_seconds",
+         "Unix receive time of the last applied engine event; absent before "
+         "the first application.",
+         "gauge"},
+        {"mooncake_conductor_event_batch_redeliveries_total",
+         "Engine batches delivered with a non-increasing transport sequence, "
+         "including retries.",
+         "counter"},
+        {"mooncake_conductor_source_stale",
+         "Whether an unrecoverable event source was invalidated (1) or remains "
+         "usable (0).",
+         "gauge"},
+        {"mooncake_conductor_events_supported",
+         "Whether engine event counters are supported for this publisher kind.",
+         "gauge"},
+        {"mooncake_conductor_batch_failures_total",
+         "Malformed transport frames, invalid envelopes, or failed batch "
+         "dispatches.",
+         "counter"},
+        {"mooncake_conductor_sequence_gaps_total",
+         "Gaps observed in the live transport sequence.", "counter"},
+        {"mooncake_conductor_sequence_missing_messages_total",
+         "Messages missing from live sequence gaps, including messages later "
+         "recovered by replay.",
+         "counter"},
+        {"mooncake_conductor_replay_requests_total",
+         "Replay attempts by terminal result, including failed retries.",
+         "counter"},
+    };
+    std::map<std::string, std::string> samples;
+    samples["mooncake_conductor_metrics_info"] =
+        "mooncake_conductor_metrics_info{schema=\"2\"} 1\n";
     for (const auto& source : sources) {
         const auto& cfg = source.config;
         const auto quote = EventMetrics::Quote;
@@ -1076,11 +1088,16 @@ std::string EventManager::RenderMetrics() {
             cfg.publisher_kind == common::PublisherKind::kSglang;
         auto sample = [&](const std::string& name, uint64_t value,
                           const std::string& extra = "") {
-            out += name + "{" + labels + extra + "} " + std::to_string(value) +
-                   "\n";
+            samples[name] += name + "{" + labels + extra + "} " +
+                             std::to_string(value) + "\n";
         };
         sample("mooncake_conductor_events_supported", supported);
-        if (supported) out += source.handler->RenderMetrics(labels);
+        if (supported) {
+            for (const auto& [name, values] :
+                 source.handler->RenderMetricFamilies(labels)) {
+                samples[name] += values;
+            }
+        }
         sample("mooncake_conductor_source_stale", source.client->IsStale());
         sample("mooncake_conductor_batch_failures_total",
                source.client->GetBatchFailures());
@@ -1092,6 +1109,12 @@ std::string EventManager::RenderMetrics() {
                source.client->GetReplaySuccesses(), ",result=\"success\"");
         sample("mooncake_conductor_replay_requests_total",
                source.client->GetReplayFailures(), ",result=\"failed\"");
+    }
+    std::string out;
+    for (const auto& family : families) {
+        out += std::string("# HELP ") + family.name + " " + family.help + "\n";
+        out += std::string("# TYPE ") + family.name + " " + family.type + "\n";
+        out += samples[family.name];
     }
     return out;
 }
