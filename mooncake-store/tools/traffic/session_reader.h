@@ -66,7 +66,7 @@ class SessionReader {
     std::size_t next_file_ = 0;
     std::filesystem::path current_path_;
     std::ifstream input_;
-    std::array<std::uint8_t, 16> uuid_{};
+    std::array<std::uint8_t, 16> session_id_{};
     std::uint8_t redaction_ = 0;
     bool footer_seen_ = false;
     bool incomplete_ = false;
