@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <thread>
 #include <unistd.h>
 
 #include "common.h"
@@ -481,7 +482,39 @@ int TransferExecutorBase::disconnect(size_t engine_idx,
     return 0;
 }
 
+void TransferExecutorBase::drainLocalCopies() {
+    // Device copies keep running until Poll() sees their completion flags or
+    // their deadline. New copies stay rejected while peers_quiesced_ is set.
+    while (true) {
+        bool pending = false;
+        for (const auto& engine : local_copy_engines_) {
+            if (engine && engine->HasPending()) {
+                pending = true;
+                break;
+            }
+        }
+        if (!pending) {
+            return;
+        }
+        pollLocalCopies();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 int TransferExecutorBase::disconnectAllPeers() {
+    // The caller may keep using this thread after the call, and the next
+    // unregister saves whatever context it finds. Put the caller's context
+    // back even though Disconnect below binds each engine's own context.
+    aclrtContext saved_ctx = nullptr;
+    if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
+        saved_ctx = nullptr;
+    }
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
+
     {
         std::unique_lock<std::mutex> lock(transfer_lifecycle_mutex_);
         peers_quiesced_ = true;
@@ -493,6 +526,7 @@ int TransferExecutorBase::disconnectAllPeers() {
     // this returns only after those Adxl calls have finished. Do not hold
     // connection_mutex_ across the wait: the query thread needs it.
     drainInFlightTransfers();
+    drainLocalCopies();
 
     int result = 0;
     {
@@ -903,6 +937,15 @@ void TransferExecutorBase::processGroupedSliceList(
                 ? local_copy_engines_[local_engine_idx].get()
                 : nullptr;
         if (need_local_copy && local_copy_engine != nullptr) {
+            {
+                std::lock_guard<std::mutex> lifecycle_lock(
+                    transfer_lifecycle_mutex_);
+                if (peers_quiesced_) {
+                    markSlicesFailed(slice_list);
+                    return;
+                }
+                ++active_sync_transfers_;
+            }
             if (VLOG_IS_ON(1)) {
                 size_t copy_bytes = 0;
                 for (auto* slice : slice_list) {
@@ -923,6 +966,12 @@ void TransferExecutorBase::processGroupedSliceList(
                            std::chrono::steady_clock::now() - start)
                            .count()
                     << "us";
+            {
+                std::lock_guard<std::mutex> lifecycle_lock(
+                    transfer_lifecycle_mutex_);
+                --active_sync_transfers_;
+            }
+            transfer_lifecycle_cv_.notify_all();
             return;
         }
 

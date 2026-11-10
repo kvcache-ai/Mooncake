@@ -659,8 +659,9 @@ disconnect_all_peers()
 
 Disconnects every peer recorded by the Ascend Direct transport. The call
 waits until transfers that have already started finish, including
-synchronous transfers and asynchronous transfers that are still being
-polled. A transfer submitted while the disconnect is in progress fails
+synchronous transfers, asynchronous transfers that are still being
+polled, and same-host device copies that have already been submitted.
+A transfer submitted while the disconnect is in progress fails
 instead of starting, and the process keeps running. After the call
 returns, new transfers can connect to peers again.
 

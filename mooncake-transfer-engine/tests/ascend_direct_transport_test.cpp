@@ -3009,6 +3009,95 @@ TEST_F(AscendDirectTransportTest,
     EXPECT_EQ(adxl_mock::get_disconnect_count(), 1);
 }
 
+TEST_F(AscendDirectTransportTest, DisconnectAllPeers_RestoresCallerContext) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_TRUE(connectOneRemotePeer(transport.get()));
+
+    const aclrtContext caller = ContextForDevice(3);
+    ASSERT_EQ(aclrtSetCurrentContext(caller), ACL_ERROR_NONE);
+    EXPECT_EQ(transport->disconnectAllPeers(), 0);
+
+    aclrtContext after = nullptr;
+    ASSERT_EQ(aclrtGetCurrentContext(&after), ACL_ERROR_NONE);
+    EXPECT_EQ(after, caller);
+}
+
+TEST_F(AscendDirectTransportTest,
+       DisconnectAllPeers_LocalDeviceCopy_WaitsUntilCopyCompletes) {
+    setenv("ASCEND_TRANSFER_TIMEOUT", "30000", 1);
+    UnsetEnv restore_timeout{"ASCEND_TRANSFER_TIMEOUT"};
+    mock_acl::set_skip_flag_copy(true);
+    mock_acl::set_pointer_location(test_buffer_src_,
+                                   ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+    mock_acl::set_pointer_location(test_buffer_dst_,
+                                   ACL_MEM_LOCATION_TYPE_DEVICE, 0);
+
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_dst_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    const size_t host_allocs_before = mock_acl::host_allocs().size();
+
+    auto batch_id = transport->allocateBatchID(1);
+    ASSERT_NE(batch_id, 0);
+    std::vector<Transport::TransferRequest> requests;
+    Transport::TransferRequest req;
+    req.opcode = Transport::TransferRequest::WRITE;
+    req.source = test_buffer_src_;
+    req.target_id = 0;
+    req.target_offset = reinterpret_cast<uint64_t>(test_buffer_dst_);
+    req.length = kTransferBufSize;
+    requests.push_back(req);
+    ASSERT_TRUE(transport->submitTransfer(batch_id, requests).ok());
+
+    bool submitted = false;
+    for (int i = 0; i < 2000; ++i) {
+        if (mock_acl::host_allocs().size() > host_allocs_before &&
+            mock_acl::memcpy_async_call_count() > 0) {
+            submitted = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(submitted);
+
+    std::thread disconnecter;
+    JoinThread join_disconnecter{disconnecter};
+    std::atomic<int> disconnect_rc{kDisconnectPending};
+    disconnecter = std::thread([&transport, &disconnect_rc] {
+        disconnect_rc = transport->disconnectAllPeers();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(disconnect_rc.load(), kDisconnectPending);
+
+    auto rejected = transport->allocateBatchID(1);
+    ASSERT_NE(rejected, 0);
+    ASSERT_TRUE(transport->submitTransfer(rejected, requests).ok());
+    auto rejected_result = waitForTransfer(transport.get(), rejected);
+    EXPECT_TRUE(rejected_result.finished);
+    EXPECT_TRUE(rejected_result.failed);
+    transport->freeBatchID(rejected);
+    ASSERT_EQ(disconnect_rc.load(), kDisconnectPending);
+
+    auto allocs = mock_acl::host_allocs();
+    ASSERT_GT(allocs.size(), host_allocs_before);
+    for (size_t i = host_allocs_before; i < allocs.size(); ++i) {
+        *static_cast<uint32_t*>(allocs[i]) = 1;
+    }
+    disconnecter.join();
+    EXPECT_EQ(disconnect_rc.load(), 0);
+
+    Transport::TransferStatus status{};
+    ASSERT_TRUE(transport->getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, Transport::COMPLETED);
+    transport->freeBatchID(batch_id);
+}
+
 // -----------------------------------------------------------------------------
 // Standalone mode tests (non-dummy-real, non-fabric-mem)
 // -----------------------------------------------------------------------------

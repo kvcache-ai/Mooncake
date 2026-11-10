@@ -163,11 +163,12 @@ class TransferExecutorBase {
     std::unordered_map<size_t, std::set<std::string>> connected_segments_;
     std::mutex connection_mutex_;
 
-    // Held only for the duration of disconnectAllPeers(). New execute() calls
-    // fail while it is set, and it is cleared before disconnectAllPeers
-    // returns.
+    // Held only for the duration of disconnectAllPeers(). New execute() and
+    // local Copy() calls fail while it is set, and it is cleared before
+    // disconnectAllPeers returns.
     std::mutex transfer_lifecycle_mutex_;
     std::condition_variable transfer_lifecycle_cv_;
+    // execute() calls and local Copy() calls still inside the caller.
     size_t active_sync_transfers_{0};
     bool peers_quiesced_{false};
 
@@ -178,6 +179,9 @@ class TransferExecutorBase {
 
     void rollbackRegisteredMem(
         const std::vector<EngineMemHandle>& registered_mem_handles);
+    // Polls device-copy groups until none remain. Call only after every
+    // Copy() counted in active_sync_transfers_ has returned.
+    void drainLocalCopies();
     std::map<void*, std::vector<EngineMemHandle>> addr_to_mem_handles_;
 };
 

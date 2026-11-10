@@ -81,6 +81,11 @@ class LocalCopyEngine {
     // no completion thread of its own.
     void Poll();
 
+    // True while a device copy submitted by Copy() has not been completed or
+    // failed by Poll(). Host-to-host copies finish inside Copy() and do not
+    // stay pending.
+    bool HasPending();
+
     // Issues the whole group and returns. Poll() marks every slice
     // success/failure when the streams finish (or the group times out).
     void Copy(TransferRequest::OpCode opcode,
