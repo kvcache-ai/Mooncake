@@ -441,7 +441,7 @@ requirement.
 
 ### Ascend Transport (ascend)
 
-**Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or direct transport.
+**Description:** Huawei Ascend NPU communication using the Ascend Direct transport (ADXL engine). The legacy HCCL transport is deprecated and is no longer built.
 
 **Use When:**
 - Working with Huawei Ascend NPUs
@@ -449,11 +449,11 @@ requirement.
 
 **Requirements:**
 - Huawei Ascend NPU hardware
-- HCCL runtime
+- Ascend CANN toolkit with ADXL/HIXL support
 
 **Documentation:**
 - [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
-- [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
+- [Ascend Direct Transport](../design/transfer-engine/transport/ascend_direct_transport.md)
 
 ### Hylink Transport (hylink)
 

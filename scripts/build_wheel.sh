@@ -190,10 +190,17 @@ if [ "${MEMFABRIC_BUILD:-0}" = "1" ]; then
     cp "${BUILD_DIR}"/mooncake-transfer-engine/tent/src/python/tent.cpython-*.so mooncake-wheel/mooncake/
 fi
 
-# Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
+# Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT or USE_ASCEND is set)
 if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
     echo "Copying ascend_transport.so..."
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
+fi
+
+# Copy ascend_allocator.so (classic store allocator, ContextManager and the
+# shared bound-runner registry). TENT links the same library.
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/allocator/ascend_allocator/ascend_allocator.so ]; then
+    echo "Copying ascend_allocator.so..."
+    cp ${BUILD_DIR}/mooncake-transfer-engine/allocator/ascend_allocator/ascend_allocator.so mooncake-wheel/mooncake/ascend_allocator.so
 fi
 
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
@@ -225,13 +232,6 @@ fi
 echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
 cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
-
-if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
-    cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
-    echo "Copying ascend_transport_mem libraries..."
-else
-    echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
-fi
 
 # EP/PG extensions are built during the CMake build according to the cached
 # component options. Host extensions are repaired by auditwheel; device
@@ -774,6 +774,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libmetadef*.so \
     --exclude libllm_datadist*.so \
     --exclude ascend_transport*.so \
+    --exclude ascend_allocator*.so \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
     --exclude libmpcomm.so* \

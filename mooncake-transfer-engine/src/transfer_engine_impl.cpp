@@ -130,11 +130,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    // The only difference in initializing the Ascend Transport is that the
-    // `local_server_name` must include the physical NPU card ID. The format
-    // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
-    // While the desc_name stored in the metadata remains in the format of
-    // ip:port.
+    // Ascend builds also accept the legacy `ip:port:npu_x` local_server_name
+    // form. The NPU id is only informational now (the Ascend Direct transport
+    // selects devices through ACL/adxl); the segment name stored in the
+    // metadata stays in the `ip:port` form.
     int devicePhyId = -1;
     auto [host_name, port] =
         parseHostNameWithPortAscend(local_server_name, &devicePhyId);
@@ -175,15 +174,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 LOG(ERROR) << "P2P: No valid port found for local TCP service.";
                 return -1;
             }
-#if defined(USE_ASCEND)
-            // The current version of Ascend Transport does not support IPv6,
-            // but it will be added in a future release.
-            local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
-#else
             local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
                                  std::to_string(desc.rpc_port);
-#endif
         }
     } else {
         rpc_binding_method = "new RPC mapping";
@@ -222,15 +214,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
               << "";
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-#ifdef USE_ASCEND
-    std::string mutable_server_name =
-        local_server_name_ + ":npu_" + std::to_string(devicePhyId);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, mutable_server_name);
-#else
     multi_transports_ =
         std::make_shared<MultiTransport>(metadata_, local_server_name_);
-#endif
     int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
     if (ret) return ret;
 
@@ -302,8 +287,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     auto_discover_config_.enabled = false;
 #endif
 
-#if defined(USE_CXL) && !defined(USE_ASCEND) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
+#if defined(USE_CXL) && !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport* cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);

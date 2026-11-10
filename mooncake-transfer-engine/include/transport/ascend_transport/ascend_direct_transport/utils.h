@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -26,6 +27,7 @@
 #include <vector>
 
 #include <acl/acl.h>
+#include "ascend_affinity.h"
 
 namespace mooncake {
 
@@ -75,13 +77,27 @@ class ScopeGuard {
     bool dismissed_ = false;
 };
 
+// Classic Ascend direct transport helpers: the ASCEND_GLOBAL_RESOURCE_CONFIG
+// parser used by the dispatcher and host allocator, and the small generation
+// helpers. The NUMA affinity plan/thread pool come from ascend_affinity.h.
 std::string GenAdxlEngineName(const std::string& ip, const uint64_t port);
 
 uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id);
 
+// True only when HCCL_INTRA_ROCE_ENABLE=1. The standalone holder's
+// RoceDummyRealSliceDispatcher is selected from this flag. roce:device and
+// roce:host in ASCEND_GLOBAL_RESOURCE_CONFIG do not set it.
+bool IsHcclIntraRoceEnabled();
+
 // True when HCCL_INTRA_ROCE_ENABLE=1 or ASCEND_GLOBAL_RESOURCE_CONFIG sets
 // comm_resource_config.protocol_desc to a roce:* entry (string or array).
 bool IsRoceModeEnabled();
+
+int SetDeviceAndGetContext(int32_t device_id, aclrtContext* out_context);
+
+// ASCEND_GLOBAL_RESOURCE_CONFIG (and protocol_desc) helpers used by the classic
+// Ascend direct transport and the classic host allocator. TENT parses its own
+// configuration copy with the vendored nlohmann JSON library instead.
 
 // Parse ASCEND_GLOBAL_RESOURCE_CONFIG JSON for roce protocol_desc only.
 bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str);
@@ -121,149 +137,6 @@ std::string ResolveAscendGlobalResourceConfig(const char* config_str);
 // A non-empty but unparsable input is returned unchanged (HIXL rejects it).
 std::string InjectNicTopoPathFromCustomTopoEnvTe(
     const std::string& resolved_config);
-
-int SetDeviceAndGetContext(int32_t device_id, aclrtContext* out_context);
-
-// CPU sets for memcpy pools and transfer pools. Affinity is the NPU's NUMA
-// node. shared_cpus is that node's cpulist when every local NPU is on the
-// same node; a single shared pool uses it and otherwise stays unpinned.
-// per_device_cpus is aligned with the logic-id list. Standalone pools use
-// that list, one pool per device, including when the NUMA nodes differ.
-struct AscendAffinityPlan {
-    std::vector<int> shared_cpus;
-    std::vector<std::vector<int>> per_device_cpus;
-};
-
-// Resolve each logic id to its NUMA node's cpulist. Never throws.
-AscendAffinityPlan BuildAscendAffinityPlan(
-    const std::vector<int32_t>& logic_device_ids);
-
-// Bind this thread to cpus. Empty cpus leave the thread on the default
-// scheduler and return false without a log. A failed pthread_setaffinity_np
-// logs and returns false.
-bool TryBindCurrentThread(const std::vector<int>& cpus);
-
-// Publish the affinity-bound pool that should run non-fabric host allocation.
-// owner is the pool pointer. A later clear from another owner is ignored.
-void SetBoundAffinityRunner(const void* owner,
-                            std::function<void(std::function<void()>)> runner);
-void ClearBoundAffinityRunner(const void* owner);
-
-// One runner per ACL logic device id. runners[i] runs work for device i.
-// owner identifies the publisher. A later clear from another owner is ignored.
-void SetPerDeviceBoundAffinityRunners(
-    const void* owner,
-    std::vector<std::function<void(std::function<void()>)>> runners);
-void ClearPerDeviceBoundAffinityRunners(const void* owner);
-
-// Run fn on the bound pool and wait. With no pool, or when already on that
-// pool, fn runs on the caller. A stopped pool also runs fn on the caller.
-void RunOnBoundAffinityThread(std::function<void()> fn);
-
-// Run fn on the pool published for device_id and wait. A missing per-device
-// runner uses the shared runner from SetBoundAffinityRunner. With neither,
-// or when already on a bound pool, fn runs on the caller.
-void RunOnDeviceBoundAffinityThread(int32_t device_id,
-                                    std::function<void()> fn);
-
-/**
- * @brief A simple thread pool for executing tasks asynchronously.
- *
- * This thread pool maintains a fixed number of worker threads that
- * execute tasks from a shared queue until the pool is stopped.
- */
-class AscendThreadPool {
-   public:
-    /**
-     * @brief Constructs a AscendThreadPool with the specified number of
-     * threads.
-     * @param num_threads The number of worker threads to create.
-     * @param affinity_cpus CPUs to pin each worker to. Empty keeps the
-     * default scheduler. A failed pin on a worker also keeps the default.
-     */
-    // thread_name_prefix plus the worker index must fit in 15 characters,
-    // the pthread name limit.
-    explicit AscendThreadPool(size_t num_threads,
-                              std::string thread_name_prefix = "ascend-wk-",
-                              std::vector<int> affinity_cpus = {});
-
-    /**
-     * @brief Destructor that stops the thread pool and waits for all threads.
-     */
-    ~AscendThreadPool();
-
-    /**
-     * @brief Stops the thread pool and waits for all threads to finish.
-     *
-     * No new tasks will be accepted after stopping. Tasks already
-     * in the queue will be processed before shutdown completes.
-     */
-    void stop();
-
-    /**
-     * @brief Checks if the thread pool is running.
-     * @return true if the pool is running, false otherwise.
-     */
-    bool isRunning() const;
-
-    /**
-     * @brief Returns the number of worker threads.
-     */
-    size_t size() const { return workers_.size(); }
-
-    /**
-     * @brief Enqueues a task to be executed by the thread pool.
-     * @tparam F The callable type.
-     * @tparam Args The argument types for the callable.
-     * @param f The callable to execute.
-     * @param args The arguments to pass to the callable.
-     *
-     * If the thread pool has been stopped, the task will not be enqueued.
-     */
-    template <class F, class... Args>
-    void enqueue(F&& f, Args&&... args);
-
-    // Queues task while the pool is running. Returns false if the pool has
-    // stopped and the task was not queued.
-    bool tryEnqueue(std::function<void()> task);
-
-   private:
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
-    std::mutex queue_mutex_;
-    std::condition_variable condition_;
-    std::atomic<bool> running_{false};
-    std::vector<int> affinity_cpus_;
-};
-
-template <class F, class... Args>
-void AscendThreadPool::enqueue(F&& f, Args&&... args) {
-    auto task = std::make_shared<std::function<void()>>(
-        [f = std::forward<F>(f),
-         ... args = std::forward<Args>(args)]() mutable {
-            std::invoke(f, args...);
-        });
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        if (!running_) {
-            return;
-        }
-        tasks_.emplace([task] { (*task)(); });
-    }
-    condition_.notify_one();
-}
-
-inline bool AscendThreadPool::tryEnqueue(std::function<void()> task) {
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        if (!running_) {
-            return false;
-        }
-        tasks_.emplace(std::move(task));
-    }
-    condition_.notify_one();
-    return true;
-}
 
 }  // namespace mooncake
 #endif  // ASCEND_DIRECT_UTIL_H

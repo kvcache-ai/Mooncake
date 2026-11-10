@@ -49,7 +49,9 @@ endif()
 
 set(TENT_FEATURE_CUDA ${USE_CUDA})
 set(TENT_FEATURE_HIP ${USE_HIP})
-set(TENT_FEATURE_ASCEND ${USE_ASCEND})
+# USE_ASCEND and USE_ASCEND_DIRECT both build the Ascend Direct backend, so the
+# diagnostics report the same features whichever spelling selected it.
+set(TENT_FEATURE_ASCEND ${USE_ASCEND_DIRECT})
 set(TENT_FEATURE_ASCEND_DIRECT ${USE_ASCEND_DIRECT})
 set(TENT_FEATURE_SUNRISE ${USE_SUNRISE})
 set(TENT_FEATURE_TPU ${USE_TPU})
