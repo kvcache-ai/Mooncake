@@ -32,6 +32,7 @@
 #include "background_worker.h"
 #include "client_liveness.h"
 #include "client_offboarding.h"
+#include "client_session_event.h"
 #include "client_session_registry.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
@@ -1174,6 +1175,7 @@ class MasterService {
     // handles stale table-wide.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+    void OnClientSessionChanged(const ClientSessionEvent& event);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1888,13 +1890,11 @@ class MasterService {
 
     ViewVersionId view_version_;
 
+    // Client session plane, declared in dependency order so the registry is
+    // destroyed before the offboarding worker its listener feeds. Resource
+    // coordination is a session listener, not a session responsibility.
+    ClientOffboardingWorker client_offboarding_worker_;
     ClientSessionRegistry client_sessions_;
-    ClientOffboardingWorker client_offboarding_worker_{this};
-    void ClientMonitorFunc();
-    void OnClientRetired(const UUID& client_id, ClientSessionSharedPtr session);
-    std::thread client_monitor_thread_;
-    std::atomic<bool> client_monitor_running_{false};
-    static constexpr uint64_t kClientMonitorSleepMs = 1000;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;

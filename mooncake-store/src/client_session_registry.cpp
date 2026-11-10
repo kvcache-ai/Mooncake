@@ -19,18 +19,44 @@ constexpr int kMaxWaitingExpiryAcquisitionsPerPass = 4;
 
 ClientSessionRegistry::ClientSessionRegistry(
     Clock::duration active_ttl, Clock::duration suspicion_ttl,
-    std::function<bool()> admits_expiry,
-    std::function<void()> reserve_retirement,
-    std::function<void(const UUID&, ClientSessionSharedPtr)> retire)
+    std::function<bool()> admits_expiry)
     : active_ttl_(active_ttl),
       suspicion_ttl_(suspicion_ttl),
-      admits_expiry_(std::move(admits_expiry)),
-      reserve_retirement_(std::move(reserve_retirement)),
-      retire_(std::move(retire)) {}
+      admits_expiry_(std::move(admits_expiry)) {}
 
 ClientSessionRegistry::~ClientSessionRegistry() {
+    Stop();
     std::unique_lock lifecycle_lock(lifecycle_mutex_);
     ClearSlots();
+}
+
+bool ClientSessionRegistry::AddListener(
+    ClientSessionEventDispatcher::Listener listener) {
+    return events_.AddListener(std::move(listener));
+}
+
+void ClientSessionRegistry::Start() {
+    CHECK(!expiry_thread_.joinable());
+    events_.Start();
+    {
+        std::lock_guard lock(expiry_mutex_);
+        expiry_stopping_ = false;
+    }
+    expiry_thread_ =
+        std::thread(&ClientSessionRegistry::ExpiryThreadFunc, this);
+}
+
+void ClientSessionRegistry::Stop() {
+    // Stop publishing before draining, so no transition loses its listeners.
+    {
+        std::lock_guard lock(expiry_mutex_);
+        expiry_stopping_ = true;
+    }
+    expiry_cv_.notify_one();
+    if (expiry_thread_.joinable()) {
+        expiry_thread_.join();
+    }
+    events_.Stop();
 }
 
 void ClientSessionRegistry::PublishTransition(const UUID& client_id,
@@ -49,10 +75,7 @@ void ClientSessionRegistry::PublishTransition(const UUID& client_id,
             metrics.client_liveness_became_offline();
             break;
     }
-    (void)slot;
-    LOG(INFO) << "client_id=" << client_id
-              << ", action=client_session_transition, previous="
-              << toString(previous) << ", current=" << toString(current);
+    events_.Publish({client_id, slot->liveness, previous, current});
 }
 
 void ClientSessionRegistry::UpdateHostId(const UUID& client_id,
@@ -382,6 +405,17 @@ void ClientSessionRegistry::Reset() {
     ClearSlots();
 }
 
+void ClientSessionRegistry::ExpiryThreadFunc() {
+    std::unique_lock lock(expiry_mutex_);
+    while (!expiry_stopping_) {
+        lock.unlock();
+        ExpireSessions(Clock::now());
+        lock.lock();
+        expiry_cv_.wait_until(lock, Clock::now() + kExpiryScanInterval,
+                              [this] { return expiry_stopping_; });
+    }
+}
+
 void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
     if (admits_expiry_ && !admits_expiry_()) {
         return;
@@ -411,12 +445,7 @@ void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
             continue;
         }
         slot->busy_expiry_passes.store(0, std::memory_order_relaxed);
-        switch (slot->liveness->EvaluateAndRetire(
-            now, active_ttl_, suspicion_ttl_,
-            [this] {
-                if (reserve_retirement_) reserve_retirement_();
-            },
-            [] {})) {
+        switch (slot->liveness->Evaluate(now, active_ttl_, suspicion_ttl_)) {
             case ClientLivenessTransition::NONE:
                 break;
             case ClientLivenessTransition::BECAME_SUSPECTED:
@@ -435,8 +464,6 @@ void ClientSessionRegistry::ExpireSessions(Clock::time_point now) {
                 PublishTransition(client_id, slot,
                                   ClientLivenessState::SUSPECTED,
                                   ClientLivenessState::OFFLINE);
-                operation.reset();
-                if (retire_) retire_(client_id, slot->liveness);
                 break;
             }
         }

@@ -201,8 +201,12 @@ TEST_F(MasterServiceTest, RestoreLifecycleMarkReadyRequiresConstructed) {
 }
 
 TEST_F(MasterServiceTest, RestoreLifecycleWorkersPausedOnlyInRestoreWindows) {
-    MasterService service(MakeStrictTenantConfig({"default"}));
+    auto config = MakeStrictTenantConfig({"default"});
+    config.client_active_ttl_sec = 1;
+    MasterService service(config);
     MasterServiceTestPeer peer(service);
+    auto& sessions = MasterServiceTestPeer::ClientSessions(service);
+    sessions.Stop();  // Drive expiry synchronously, without resource listeners.
 
     struct Case {
         RestoreLifecycleState state;
@@ -222,6 +226,24 @@ TEST_F(MasterServiceTest, RestoreLifecycleWorkersPausedOnlyInRestoreWindows) {
         EXPECT_EQ(test_case.state,
                   MasterServiceTestPeer::GetRestoreLifecycleState(service));
         EXPECT_EQ(test_case.admitted, peer.AdmitsBusinessWorkersForTesting())
+            << "state=" << static_cast<int>(test_case.state);
+
+        const UUID client_id = generate_uuid();
+        const auto observed_at = ClientSessionRegistry::Clock::now();
+        {
+            auto registration =
+                sessions.BeginRegistration(client_id, observed_at);
+            ASSERT_TRUE(registration);
+            registration->Commit();
+        }
+        ClientSessionRegistryTestPeer::ExpireSessions(
+            sessions, observed_at + std::chrono::seconds(2));
+        const auto session =
+            ClientSessionRegistryTestPeer::Find(sessions, client_id);
+        ASSERT_TRUE(session);
+        EXPECT_EQ(test_case.admitted ? ClientLivenessState::SUSPECTED
+                                     : ClientLivenessState::ACTIVE,
+                  session->state())
             << "state=" << static_cast<int>(test_case.state);
     }
 }

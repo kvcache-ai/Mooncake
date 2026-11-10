@@ -624,7 +624,10 @@ TEST_F(ClientSessionRegistryTest, RestoreWaitsWithoutBlockingRemountCommit) {
 }
 
 TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
+    std::vector<ClientSessionEvent> events;
     ClientSessionRegistry registry;
+    ASSERT_TRUE(registry.AddListener(
+        [&](const ClientSessionEvent& event) { events.push_back(event); }));
     auto existing = Register(registry);
     const UUID other{3, 4};
     {
@@ -644,6 +647,8 @@ TEST_F(ClientSessionRegistryTest, RestorePublishesOnlyCommittedStagedRecords) {
     const auto restored = Find(registry, other);
     ASSERT_TRUE(restored);
     EXPECT_EQ(restored->ClientId(), other);
+    Drain(registry);
+    EXPECT_TRUE(events.empty());
     EXPECT_EQ(registry.Ping(other), ClientStatus::NEED_REMOUNT);
 }
 
@@ -695,7 +700,10 @@ TEST_F(ClientSessionRegistryTest,
 }
 
 TEST_F(ClientSessionRegistryTest, RemovalDoesNotAddALivenessState) {
+    std::vector<ClientSessionEvent> events;
     ClientSessionRegistry registry;
+    ASSERT_TRUE(registry.AddListener(
+        [&](const ClientSessionEvent& event) { events.push_back(event); }));
     auto old = Register(registry);
     {
         auto remount = registry.BeginRemount(kClient);
@@ -714,6 +722,8 @@ TEST_F(ClientSessionRegistryTest, RemovalDoesNotAddALivenessState) {
     EXPECT_EQ(old->Observe(kInitial + 13s), Observation::RECOVERED_ACTIVE);
     auto current = Register(registry);
     EXPECT_NE(old, current);
+    Drain(registry);
+    EXPECT_TRUE(events.empty());
     EXPECT_EQ(registry.TryAcquireServingSession(kClient)->Session(), current);
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
 }
