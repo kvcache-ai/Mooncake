@@ -516,10 +516,32 @@ add_ha_test(ha_backend_availability_test
 add_ha_test(leader_label_reconciler_test
             ha/leadership/leader_label_reconciler_test.cpp)
 add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
+add_ha_test(ha_kv_backend_write_result_test
+            ha/kv/ha_kv_backend_write_result_test.cpp)
+# Exercise the actual etcd adapter with a controlled external helper. Keep this
+# target independent of the real etcd helper/client so timeouts need no server.
+add_executable(
+  etcd_ha_kv_backend_write_result_test
+  ha/kv/etcd_ha_kv_backend_write_result_test.cpp
+  ../src/ha/kv/etcd_ha_kv_backend.cpp ../src/types.cpp)
+target_include_directories(etcd_ha_kv_backend_write_result_test
+                           PRIVATE ../include)
+target_link_libraries(
+  etcd_ha_kv_backend_write_result_test
+  PRIVATE cachelib_memory_allocator
+          yalantinglibs::yalantinglibs
+          JsonCpp::JsonCpp
+          glog::glog
+          gtest
+          gtest_main
+          pthread)
+add_test(NAME etcd_ha_kv_backend_write_result_test
+         COMMAND etcd_ha_kv_backend_write_result_test)
 add_ha_test(redis_ha_kv_backend_test ha/kv/redis_ha_kv_backend_test.cpp)
 if(STORE_USE_REDIS)
-  target_sources(redis_ha_kv_backend_test
-                 PRIVATE ha/kv/redis_oplog_ha_recovery_test.cpp)
+  target_sources(
+    redis_ha_kv_backend_test PRIVATE ha/kv/redis_oplog_ha_recovery_test.cpp
+                                     ha/kv/redis_ha_kv_protocol_test.cpp)
   target_link_libraries(redis_ha_kv_backend_test PRIVATE Mooncake::hiredis)
   # gtest_main never calls gflags::ParseCommandLineFlags, so --redis_endpoint
   # would stay empty. This target provides main() instead.
