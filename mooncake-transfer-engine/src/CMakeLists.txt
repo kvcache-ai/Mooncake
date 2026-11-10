@@ -143,6 +143,11 @@ if(USE_MACA)
   target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
 endif()
 
+if(USE_ENFLAME)
+  target_include_directories(transfer_engine PRIVATE ${MC_TOPS_PATH}/include)
+  target_link_libraries(transfer_engine PUBLIC topsrt efrt rt)
+endif()
+
 if(USE_MUSA)
   target_include_directories(transfer_engine PRIVATE /usr/local/musa/include)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)

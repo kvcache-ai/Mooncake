@@ -39,6 +39,9 @@ struct TopologyEntry {
     std::string name;
     std::vector<std::string> preferred_hca;
     std::vector<std::string> avail_hca;
+    // PCI bus id of the device (e.g. "0000:17:00.0"); only populated for
+    // accelerator entries, empty for cpu:* / wildcard entries.
+    std::string pci_bus_id;
 
     bool operator==(const TopologyEntry &other) const = default;
 

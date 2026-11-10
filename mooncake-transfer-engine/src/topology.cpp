@@ -591,7 +591,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_ENFLAME)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -705,7 +705,8 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             topology.push_back(
                 TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
                               .preferred_hca = std::move(preferred_hca),
-                              .avail_hca = {}});
+                              .avail_hca = {},
+                              .pci_bus_id = pci_bus_id});
             continue;
         }
 #endif
@@ -748,7 +749,8 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         topology.push_back(
             TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
                           .preferred_hca = std::move(preferred_hca),
-                          .avail_hca = std::move(avail_hca)});
+                          .avail_hca = std::move(avail_hca),
+                          .pci_bus_id = pci_bus_id});
     }
     return topology;
 }
@@ -834,7 +836,7 @@ int Topology::discover(const std::vector<std::string> &filter,
     }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_ENFLAME)
     int cuda_rc = 0;
     for (auto &ent : discoverCudaTopology(all_hca, &cuda_rc)) {
         matrix_[ent.name] = ent;
@@ -914,7 +916,11 @@ int Topology::parse(const std::string &topology_json,
 std::string Topology::toString() const {
     Json::Value value(Json::objectValue);
     for (auto &entry : matrix_) {
-        value[entry.first] = entry.second.toJson();
+        std::string key = entry.first;
+        if (!entry.second.pci_bus_id.empty()) {
+            key += "(" + entry.second.pci_bus_id + ")";
+        }
+        value[key] = entry.second.toJson();
     }
     return value.toStyledString();
 }
