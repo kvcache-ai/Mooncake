@@ -70,7 +70,8 @@ class AllocationStrategyParameterizedTest
     // Registrations bound to the returned record are not serving.
     static std::shared_ptr<ClientLivenessRecord> MakeSuspectedRecord() {
         const auto initial = ClientLivenessRecord::TimePoint{};
-        auto record = std::make_shared<ClientLivenessRecord>(initial);
+        auto record =
+            std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
         EXPECT_EQ(
             record->Evaluate(initial + std::chrono::seconds(1),
                              std::chrono::seconds(1), std::chrono::seconds(10)),
@@ -147,12 +148,14 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
 
 TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    auto suspected = std::make_shared<ClientLivenessRecord>(initial);
+    auto suspected =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
     ASSERT_EQ(
         suspected->Evaluate(initial + std::chrono::seconds(1),
                             std::chrono::seconds(1), std::chrono::seconds(10)),
         ClientLivenessTransition::BECAME_SUSPECTED);
-    auto active = std::make_shared<ClientLivenessRecord>(initial);
+    auto active =
+        std::make_shared<ClientLivenessRecord>(generate_uuid(), initial);
 
     auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
         "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected", "tcp");

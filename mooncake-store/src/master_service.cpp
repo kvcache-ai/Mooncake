@@ -1060,7 +1060,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         auto [record_it, inserted] = client_liveness_records_.try_emplace(
             client_id, std::make_shared<ClientLivenessRecord>(
-                           ClientLivenessRecord::Clock::now()));
+                           client_id, ClientLivenessRecord::Clock::now()));
         const auto record = record_it->second;
         if (inserted) {
             MasterMetricManager::instance().client_liveness_record_created();
@@ -1074,8 +1074,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                 LOG(INFO) << "client_id=" << client_id
                           << ", action=mount_segment, segment_name="
                           << segment.name;
-                mount_result =
-                    segment_access.MountSegment(segment, client_id, record);
+                mount_result = segment_access.MountSegment(segment, record);
                 return mount_result == ErrorCode::OK ||
                        mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
             });
@@ -1178,7 +1177,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         auto [record_it, record_inserted] =
             client_liveness_records_.try_emplace(
                 client_id, std::make_shared<ClientLivenessRecord>(
-                               ClientLivenessRecord::Clock::now()));
+                               client_id, ClientLivenessRecord::Clock::now()));
         const auto record = record_it->second;
         if (record_inserted) {
             MasterMetricManager::instance().client_liveness_record_created();
@@ -1277,10 +1276,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     segment_access.GetAllocator(segments[i].id) != nullptr;
             }
 
-            remount_error =
-                segment_access.ReMountSegment(segments, client_id, record);
+            remount_error = segment_access.ReMountSegment(segments, record);
             if (remount_error == ErrorCode::OK) {
-                segment_access.BindClientLiveness(client_id, record);
+                segment_access.BindClientSession(record);
                 for (const auto& segment : segments) {
                     auto allocator = segment_access.GetAllocator(segment.id);
                     Segment authoritative;
@@ -3305,7 +3303,7 @@ std::shared_ptr<ClientLivenessRecord> MasterService::RecordRestoreKnownOwner(
     }
     auto [record, inserted] = new_known_owner_records.try_emplace(
         owner, std::make_shared<ClientLivenessRecord>(
-                   ClientLivenessRecord::Clock::now()));
+                   owner, ClientLivenessRecord::Clock::now()));
     (void)inserted;
     return record->second;
 }
@@ -5681,7 +5679,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    replica.bindClientLiveness(client_liveness);
+    replica.bindLocalDiskSession(client_liveness);
     return AddReplicaForRetainedClient(client_id, key, tenant_id, replica);
 }
 
@@ -8231,7 +8229,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
     auto [record_it, inserted] = client_liveness_records_.try_emplace(
         client_id, std::make_shared<ClientLivenessRecord>(
-                       ClientLivenessRecord::Clock::now()));
+                       client_id, ClientLivenessRecord::Clock::now()));
     const auto record = record_it->second;
     if (inserted) {
         MasterMetricManager::instance().client_liveness_record_created();
@@ -8618,7 +8616,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     bool any_enqueued = false;
     std::string client_id_str;
-    const auto liveness = replica.getClientLiveness();
+    const auto liveness = replica.getClientSession();
     if (!liveness) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -8722,7 +8720,7 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
     if (!holder_id.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const auto liveness = source_replica.getClientLiveness();
+    const auto liveness = source_replica.getClientSession();
     if (!liveness) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
@@ -9001,7 +8999,7 @@ tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
             return tl::make_unexpected(error);
         }
     }
-    const auto& liveness = plan.source_liveness;
+    const auto& liveness = plan.source_session;
     if (!liveness) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -10619,8 +10617,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::vector<
-        std::tuple<std::string, UUID, std::shared_ptr<ClientLivenessRecord>>>
+    std::vector<std::tuple<std::string, UUID, ClientSessionSharedPtr>>
         serving_sources;
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
@@ -10659,7 +10656,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
                     UUID owner;
                     if (segment_accessor.GetClientIdBySegmentName(
                             *segment_name, owner) == ErrorCode::OK) {
-                        const auto liveness = replica.getClientLiveness();
+                        const auto liveness = replica.getClientSession();
                         if (liveness) {
                             serving_sources.emplace_back(*segment_name, owner,
                                                          std::move(liveness));
@@ -10740,7 +10737,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     bool source_exists = false;
     bool source_is_serving = false;
     UUID select_client;
-    std::shared_ptr<ClientLivenessRecord> source_liveness;
+    ClientSessionSharedPtr source_liveness;
     {
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         MetadataAccessorRO accessor(this, object_id);
@@ -10777,7 +10774,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
                     source_exists = true;
                     if (IsReplicaReadable(replica)) {
                         source_is_serving = true;
-                        source_liveness = replica.getClientLiveness();
+                        source_liveness = replica.getClientSession();
                     }
                 }
             });

@@ -376,9 +376,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         auto segment_access =
             MasterServiceTestPeer::SegmentManager(service).getSegmentAccess();
         return segment_access.MountSegment(
-            segment, generate_uuid(),
-            std::make_shared<ClientLivenessRecord>(
-                ClientLivenessRecord::Clock::now()));
+            segment, std::make_shared<ClientLivenessRecord>(
+                         generate_uuid(), ClientLivenessRecord::Clock::now()));
     }
 
     bool WaitForTenantQuotaPolicyMutexContention(MasterService& service) {
