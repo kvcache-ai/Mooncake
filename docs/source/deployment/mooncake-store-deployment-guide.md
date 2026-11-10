@@ -449,6 +449,7 @@ HA leadership and metadata replication are configured separately:
 
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--etcd_max_send_message_bytes`: Outgoing gRPC message limit for the HA store etcd client, in bytes. Defaults to `2097152` (2 MiB) and must be positive. For a server configured with `--max-request-bytes=16777216`, use `--etcd_max_send_message_bytes=16777216` and keep serialized batches below that request budget. The setting is applied before the first connection and reused by reset and keepalive clients; it does not change the server limit, receive limit, Transfer Engine client, or snapshot client. The YAML/JSON configuration key is also `etcd_max_send_message_bytes`; an explicitly supplied CLI flag overrides it.
 - `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
 - With `enable_oplog_snapshot=true`, each successful publication also attempts batch OpLog pruning under the same maintenance lease. Pruning requires two independently validated snapshots: it publishes a monotonic `compaction_floor` at the fallback snapshot's batch ID before deleting covered batches. The first snapshot does not prune. GC or pruning failures keep the published snapshot successful; failed deletions can be retried after a later successful publication.
 - Before enabling this mode, every standby that may be promoted must support compaction-floor rebootstrap. Once pruning has started, rollback requires a binary that understands the batch snapshot and floor protocol. This maintenance does not perform etcd MVCC compaction/defragmentation or delete legacy snapshot/OpLog data.
@@ -876,6 +877,7 @@ mooncake_master \
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
+| `--etcd_max_send_message_bytes` | `2097152` | Positive outgoing gRPC message limit in bytes for the HA store etcd client; configure before connection and keep requests within the etcd server byte limit |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 | `--ha_leader_lease_ttl_sec` | `5` | Leadership lease TTL in seconds for `ha_backend_type=etcd` (range `2`-`60`; the JSON config key `ha_leader_lease_ttl_sec` is also accepted). Raise it to ride out etcd apply stalls longer than the default. A longer TTL delays failover: a new leader waits one full TTL before serving, and a standby waits for a crashed leader's lease to expire. Ignored by the Redis and k8s backends |
 | `--enable_oplog` | `false` | Enable the batch OpLog writer and reader; requires `enable_ha=true` and `ha_backend_type=etcd` or `redis`. etcd uses it for Primary-Standby promotion. Redis uses it as an experimental HA log store: a successful write only means Redis accepted the record |
