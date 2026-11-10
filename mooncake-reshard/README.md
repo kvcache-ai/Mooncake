@@ -370,6 +370,9 @@ Integer geometry normalization reuses exact immutable tuples only after checking
 every element and its minimum value. Lists and other supported sequences retain
 their existing normalization and validation behavior; no metadata is cached
 across bindings or generations.
+Strict geometry iteration uses the native `zip(strict=True)` implementation on
+Python 3.10 and newer, including its iterator construction and error semantics;
+the compatibility implementation remains available for older runtimes.
 End-to-end startup also includes framework initialization, model allocation,
 transport, and serving readiness; it must be measured separately from these
 CPU paths.
