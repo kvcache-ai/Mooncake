@@ -32,6 +32,7 @@
 #include "background_worker.h"
 #include "client_liveness.h"
 #include "client_offboarding.h"
+#include "client_session_registry.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "dynamic_replication_controller.h"
@@ -83,7 +84,7 @@ class PrefetchTaskMasterTest;
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
- * 1. client_mutex_
+ * 1. the session registry mutex
  * 2. the namespace policy's admission token (NamespacePolicy::AdmitWrite;
  *    the tenant quota policy's policy lock)
  * 3. master_state_mutex_
@@ -730,8 +731,8 @@ class MasterService {
      * function is idempotent.
      *
      * Drops the client's LOCAL_DISK registration and then its LOCAL_DISK
-     * replicas -- the outcome the client-expiry branch of ClientMonitorFunc
-     * reaches after one client_ttl. Exposing it as an operation lets a store
+     * replicas -- the outcome of client offboarding after liveness expiry.
+     * Exposing it as an operation lets a store
      * that is shutting down deregister while it can still serve, instead of
      * leaving the master advertising it as an owner until the TTL elapses.
      * Object metadata whose last replica was on that disk is erased, exactly
@@ -1116,13 +1117,6 @@ class MasterService {
         std::vector<PreparedObject>& objects,
         std::vector<std::pair<TenantId, route::ObjectRef>>& installed);
 
-    // A restored local-disk replica reads only while its owner has a liveness
-    // record; share the existing one or stage a fresh record for install.
-    std::shared_ptr<ClientLivenessRecord> RecordRestoreKnownOwner(
-        std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
-                           boost::hash<UUID>>& new_known_owner_records,
-        const UUID& owner);
-
     // Shared lookup path for ExistKey/ProbeKey (and their batch variants).
     // When grant_lease is false, the check acquires no read lease and is a
     // point-in-time existence probe only.
@@ -1160,30 +1154,18 @@ class MasterService {
     NamespaceEvictionResult EvictNamespaceMemory(const TenantId& tenant_id,
                                                  uint64_t target_bytes);
 
-    std::shared_ptr<ClientLivenessRecord> FindClientRecord(
-        const UUID& client_id) const;
     // Caller holds the Replica owner's retaining guard.
     auto AddReplicaForRetainedClient(const UUID& client_id,
                                      const std::string& key,
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode>;
-    // Caller must hold client_mutex_.
-    std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
-        const;
-    void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
-    std::string GetClientHostId(const UUID& client_id) const;
 
     void ClearInvalidHandles();
     // Caller owns master_state_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
-    // Clear completed LOCAL_DISK replicas owned by exactly this client, in
-    // every tenant. Owner-targeted on purpose: a liveness-complement sweep
-    // classifies by absence from a point-in-time set, so an owner that
-    // mounts and registers between taking that set and the sweep reaching
-    // its object would be swept as stale. A predicate on the owner id cannot
-    // misclassify a concurrent mount, whatever the interleaving.
+    void ClearInvalidHandlesLocked();
+    // Clear completed LOCAL_DISK replicas owned by exactly this client during
+    // explicit unmount, even if its session still retains resources.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
     // Walk shared by the two sweeps above; removes completed replicas
     // matching is_stale, erasing a key when no valid replica remains. Each
@@ -1372,9 +1354,7 @@ class MasterService {
         bool would_invalidate{false};
     };
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
-        const ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
-        const;
+        const ObjectMetadata& metadata) const;
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale) const;
@@ -1423,10 +1403,9 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client no longer retains resources.
-    bool CleanupStaleHandles(
-        const std::string& key, const TenantId& tenant_id,
-        ObjectMetadata& metadata, route::ObjectState& state,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
+    bool CleanupStaleHandles(const std::string& key, const TenantId& tenant_id,
+                             ObjectMetadata& metadata,
+                             route::ObjectState& state);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (promotion-task cancellation) instead of
     // duplicating it.
@@ -1504,9 +1483,7 @@ class MasterService {
     // replica handles and, without the oplog, the object itself when none is
     // left. With the oplog the cleanup is only queued and the write is refused
     // with OBJECT_ALREADY_EXISTS.
-    auto CleanupStaleBeforeWrite(
-        const char* why, MetadataAccessorRW& accessor,
-        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+    auto CleanupStaleBeforeWrite(const char* why, MetadataAccessorRW& accessor)
         -> tl::expected<void, ErrorCode>;
     // Runs a write's admission, which reports through its argument whether
     // DFS allocation itself ran out of capacity. Only then is the admission
@@ -1911,20 +1888,12 @@ class MasterService {
 
     ViewVersionId view_version_;
 
-    // Client related members
-    mutable std::shared_mutex client_mutex_;
-    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
-                       boost::hash<UUID>>
-        client_liveness_records_;
-    std::unordered_set<UUID, boost::hash<UUID>>
-        ok_client_;  // client with ok status
-    std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
+    ClientSessionRegistry client_sessions_;
     ClientOffboardingWorker client_offboarding_worker_{this};
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
-    static constexpr uint64_t kClientMonitorSleepMs =
-        1000;  // 1000 ms sleep between client monitor checks
+    static constexpr uint64_t kClientMonitorSleepMs = 1000;
     const int64_t client_active_ttl_sec_;
     const int64_t client_suspicion_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;

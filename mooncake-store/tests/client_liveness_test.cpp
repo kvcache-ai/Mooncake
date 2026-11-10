@@ -135,18 +135,18 @@ TEST(ClientLivenessRecordTest, LocalDiskCleanupUsesBoundIncarnation) {
                         old_session);
     Replica new_replica(client_id, 1024, "endpoint", ReplicaStatus::COMPLETE,
                         new_session);
-    EXPECT_FALSE(old_replica.has_stale_local_disk_client({}));
+    EXPECT_FALSE(old_replica.has_stale_local_disk_client());
     EXPECT_EQ(old_session->Evaluate(now, std::chrono::seconds::zero(),
                                     std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_SUSPECTED);
-    EXPECT_FALSE(old_replica.has_stale_local_disk_client({}));
+    EXPECT_FALSE(old_replica.has_stale_local_disk_client());
     EXPECT_EQ(old_session->Evaluate(now, std::chrono::seconds::zero(),
                                     std::chrono::seconds::zero()),
               ClientLivenessTransition::BECAME_OFFLINE);
-    EXPECT_TRUE(old_replica.has_stale_local_disk_client({client_id}));
-    EXPECT_FALSE(new_replica.has_stale_local_disk_client({}));
+    EXPECT_TRUE(old_replica.has_stale_local_disk_client());
+    EXPECT_FALSE(new_replica.has_stale_local_disk_client());
     Replica unbound(client_id, 1024, "endpoint", ReplicaStatus::COMPLETE);
-    EXPECT_TRUE(unbound.has_stale_local_disk_client({client_id}));
+    EXPECT_TRUE(unbound.has_stale_local_disk_client());
 }
 
 }  // namespace mooncake::test

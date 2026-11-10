@@ -618,9 +618,7 @@ class Replica {
     // Missing ownership is stale; SUSPECTED owners still retain resources.
     // Read atomic state without taking a transition guard under metadata locks.
     // OFFLINE is terminal, so a stale decision cannot race with recovery.
-    [[nodiscard]] bool has_stale_local_disk_client(
-        const std::unordered_set<
-            UUID, boost::hash<UUID>>& /*retaining_clients*/) const {
+    [[nodiscard]] bool has_stale_local_disk_client() const {
         if (!is_local_disk_replica()) {
             return false;
         }
