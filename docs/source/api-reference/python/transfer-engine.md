@@ -265,10 +265,10 @@ Submits an asynchronous write operation and returns immediately.
 transfer_check_status(batch_id)
 ```
 
-Checks the status of an asynchronous transfer operation.
+Checks, without waiting, the status of an asynchronous transfer operation. Every task in the batch counts, so a batch from `batch_transfer_async_*()` completes only when all of its buffers have. Once it returns anything but 0, the batch is freed.
 
 **Parameters:**
-- `batch_id` (int): The batch ID returned from transfer_submit_write()
+- `batch_id` (int): The batch ID returned from transfer_submit_write() or batch_transfer_async_*()
 
 **Returns:**
 - `int`:
