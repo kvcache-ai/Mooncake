@@ -870,6 +870,14 @@ class Client {
     }
 
     /**
+     * @brief Whether a DFS replica is served by an fs adapter that accepts
+     * arbitrary host read buffers, so a host destination can be read into
+     * directly without a staging buffer.
+     */
+    bool CanReadDfsReplicaIntoHostMemory(
+        const Replica::Descriptor& replica) const;
+
+    /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
      */
@@ -964,6 +972,14 @@ class Client {
     // SSD read (#3884).
     DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
 
+    // Reads one byte window of each DISK or DFS replica. `windows[i]` receives
+    // `windows[i].size` bytes starting at `value_offsets[i]` in the value.
+    std::vector<tl::expected<void, ErrorCode>> BatchReadFileReplicaRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<Slice>& windows,
+        const std::vector<uint64_t>& value_offsets);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -1038,6 +1054,9 @@ class Client {
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
+    void ReconcileMissingKvcsReplica(
+        const std::string& key, const QueryResult& query_result,
+        const Replica::Descriptor& replica_descriptor);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);

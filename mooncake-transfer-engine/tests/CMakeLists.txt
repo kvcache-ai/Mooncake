@@ -76,6 +76,15 @@ if(USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+# The timeout decision is stateful but independent of RDMA hardware; keep its
+# timing behavior covered by a deterministic unit test.
+add_executable(cq_timeout_diagnostic_test
+               ${WORKSPACE}/cq_timeout_diagnostic_test.cpp)
+target_include_directories(cq_timeout_diagnostic_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(cq_timeout_diagnostic_test PRIVATE gtest gtest_main)
+add_test(NAME cq_timeout_diagnostic_test COMMAND cq_timeout_diagnostic_test)
+
 # Hardware-free checks that updateGlobalConfig() clamps the RD-atomic depths to
 # the device's advertised limits; no RDMA device required.
 add_executable(rdma_atomic_cap_test ${WORKSPACE}/rdma_atomic_cap_test.cpp)
@@ -92,6 +101,20 @@ target_include_directories(
 target_link_libraries(flagcx_transport_internal_test PUBLIC gtest gtest_main)
 add_test(NAME flagcx_transport_internal_test
          COMMAND flagcx_transport_internal_test)
+
+if(WITH_METRICS)
+  add_executable(transfer_engine_metrics_test
+                 ${WORKSPACE}/transfer_engine_metrics_test.cpp)
+  target_link_libraries(transfer_engine_metrics_test PUBLIC transfer_engine
+                                                            gtest gtest_main)
+  add_test(NAME transfer_engine_metrics_test
+           COMMAND transfer_engine_metrics_test)
+
+  add_executable(metrics_exporter_test ${WORKSPACE}/metrics_exporter_test.cpp)
+  target_link_libraries(metrics_exporter_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+  add_test(NAME metrics_exporter_test COMMAND metrics_exporter_test)
+endif()
 
 add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
@@ -254,6 +277,12 @@ if(USE_TCP)
 endif()
 
 if(USE_NVMEOF)
+  # cuFile entry points are faked by the executable; no GPU or SSD is needed.
+  add_executable(nvmeof_request_test ${WORKSPACE}/nvmeof_request_test.cpp)
+  target_link_libraries(nvmeof_request_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+  add_test(NAME nvmeof_request_test COMMAND nvmeof_request_test)
+
   add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
                                                   gtest_main)
@@ -402,6 +431,12 @@ if(USE_EFA)
   target_compile_options(
     efa_endpoint_handshake_test
     PRIVATE -iquote${WORKSPACE}/efa_endpoint_handshake_fakes)
+  # The test builds efa_endpoint.cpp against fake EFA headers and does not link
+  # transfer_engine, so it does not inherit the include path of the generated
+  # mooncake_te_build_config.h, which transport.h includes.
+  target_include_directories(
+    efa_endpoint_handshake_test
+    PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>)
   target_link_libraries(
     efa_endpoint_handshake_test PUBLIC glog::glog gflags::gflags gtest
                                        gtest_main pthread)
@@ -547,6 +582,17 @@ target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
 
+# Connection-lifecycle tests for the redis metadata storage plugin. Uses an
+# in-process RESP fake, so no redis server is required.
+if(USE_REDIS)
+  add_executable(transfer_metadata_redis_plugin_test
+                 ${WORKSPACE}/transfer_metadata_redis_plugin_test.cpp)
+  target_link_libraries(transfer_metadata_redis_plugin_test
+                        PUBLIC transfer_engine gtest glog::glog)
+  add_test(NAME transfer_metadata_redis_plugin_test
+           COMMAND transfer_metadata_redis_plugin_test)
+endif()
+
 add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
@@ -639,8 +685,8 @@ if(USE_ASCEND_DIRECT)
            COMMAND ascend_direct_transport_test)
 endif()
 
-# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
-if(ENABLE_MULTI_PROTOCOL)
+# This multi-protocol test directly uses CxlTransport and requires its backend.
+if(ENABLE_MULTI_PROTOCOL AND USE_CXL)
   add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
   target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main)

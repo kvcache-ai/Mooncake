@@ -330,6 +330,10 @@ IOUringFileContext* IOUringTransport::findFileContext(SegmentID target_id) {
     return tl_file_context_map[target_id].get();
 }
 
+Status IOUringTransport::copyMemory(void* dst, void* src, size_t length) {
+    return Platform::getLoader().copy(dst, src, length);
+}
+
 Status IOUringTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
@@ -389,6 +393,20 @@ Status IOUringTransport::submitTransferTasks(
         return Status::TooManyRequests("Insufficient SQE space" LOC_MARK);
     }
 
+    // Finish every staged WRITE copy before the commit phase. A failed copy
+    // must leave the task list, SQ ring and file untouched so failover cannot
+    // submit uninitialized staging contents or replay an accepted WRITE.
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        const auto& request = request_list[i];
+        if (!staging_buffers[i] || request.opcode != Request::WRITE) continue;
+        auto copy_status =
+            copyMemory(staging_buffers[i], request.source, request.length);
+        if (!copy_status.ok()) {
+            releaseStagingBuffers(staging_pool_.get(), staging_buffers);
+            return copy_status;
+        }
+    }
+
     // Phase 2: commit. Tasks are appended and SQEs prepared; from here on
     // this call must not return an error. A positive short io_uring_submit()
     // means part of the batch is already in flight, and an error return
@@ -419,9 +437,6 @@ Status IOUringTransport::submitTransferTasks(
             io_uring_prep_readv(sqe, contexts[i]->getHandle(), &task.iov, 1,
                                 request.target_offset);
         } else {
-            if (task.buffer)
-                Platform::getLoader().copy(task.buffer, request.source,
-                                           request.length);
             io_uring_prep_writev(sqe, contexts[i]->getHandle(), &task.iov, 1,
                                  request.target_offset);
         }
@@ -474,18 +489,27 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
             } else {
                 const size_t completed_bytes = static_cast<size_t>(cqe->res);
                 // A nonnegative CQE may still be short, including EOF. Only
-                // copy the prefix actually read from the file.
+                // copy the prefix actually read from the file. The file I/O is
+                // complete, but a failed copyback means the caller cannot
+                // consume the requested data as a successful read.
+                Status copy_status;
                 if (cqe_task->buffer && completed_bytes != 0 &&
                     cqe_task->request.opcode == Request::READ) {
-                    Platform::getLoader().copy(cqe_task->request.source,
-                                               cqe_task->buffer,
-                                               completed_bytes);
+                    copy_status = copyMemory(cqe_task->request.source,
+                                             cqe_task->buffer, completed_bytes);
                 }
-                cqe_task->transferred_bytes = completed_bytes;
-                cqe_task->status_word =
-                    completed_bytes == cqe_task->request.length
-                        ? TransferStatusEnum::COMPLETED
-                        : TransferStatusEnum::FAILED;
+                if (!copy_status.ok()) {
+                    LOG(WARNING) << "IOUringTransport: READ copyback failed: "
+                                 << copy_status.ToString();
+                    cqe_task->transferred_bytes = 0;
+                    cqe_task->status_word = TransferStatusEnum::FAILED;
+                } else {
+                    cqe_task->transferred_bytes = completed_bytes;
+                    cqe_task->status_word =
+                        completed_bytes == cqe_task->request.length
+                            ? TransferStatusEnum::COMPLETED
+                            : TransferStatusEnum::FAILED;
+                }
             }
             cqe_task->releaseBuffer();
         }
