@@ -1,13 +1,13 @@
 import functools
 import os
-import pickle
 import socket
 from contextlib import contextmanager
-from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+
+from .mooncake_ep_tcpstore import fetch_peer_metadata
 
 if TYPE_CHECKING:
     from mooncake import ep
@@ -319,27 +319,14 @@ class Buffer:
     def _fetch_remote_metadata_from_tcp_store(self, remote_ranks: List[int]):
         if self.tcp_store_group is None:
             raise RuntimeError("Mooncake peer metadata exchange requires a TCPStore.")
-        store = self.tcp_store_group
-        outgoing_keys = [f"MOONCAKE_EP/{self.rank}/{rank}" for rank in remote_ranks]
-        incoming_keys = [f"MOONCAKE_EP/{rank}/{self.rank}" for rank in remote_ranks]
-        envelope = pickle.dumps((socket.gethostname(), self._get_local_peer_metadata()))
-        consumed_incoming_keys = []
-        try:
-            for key in outgoing_keys:
-                store.set(key, envelope)
-            if incoming_keys:
-                store.wait(
-                    incoming_keys,
-                    timedelta(milliseconds=self.metadata_timeout_ms),
-                )
-                remote_metadata = store.multi_get(incoming_keys)
-                consumed_incoming_keys.extend(incoming_keys)
-            else:
-                remote_metadata = []
-            yield [pickle.loads(metadata) for metadata in remote_metadata]
-        finally:
-            for key in consumed_incoming_keys:
-                store.delete_key(key)
+        with fetch_peer_metadata(
+            self.tcp_store_group,
+            self.rank,
+            remote_ranks,
+            self._get_local_peer_metadata(),
+            self.metadata_timeout_ms,
+        ) as metadata:
+            yield metadata
 
     def connect_ranks(self, remote_ranks: List[int], activate: bool = True) -> None:
         """Exchange peer metadata and optionally activate the connections.
@@ -632,8 +619,34 @@ class Buffer:
 
     def connect(self, is_update: bool = False):
         device = self._bootstrap_device()
-        # XPU has no RDMA path: peers are reached over Level Zero IPC only.
-        if self.device_type != "xpu" and not self._use_fallback:
+        ibgda_ready = True
+        if self.device_type != "xpu" and is_update:
+            ibgda_ready_tensor = torch.tensor(
+                [int(not self.runtime.ibgda_disabled())],
+                dtype=torch.int32,
+                device=device,
+            )
+            dist.all_reduce(ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group)
+            ibgda_ready = bool(ibgda_ready_tensor.item())
+            if ibgda_ready:
+                self.runtime.update_local_qpns()
+                ibgda_ready_tensor.fill_(int(not self.runtime.ibgda_disabled()))
+                dist.all_reduce(
+                    ibgda_ready_tensor, op=dist.ReduceOp.MIN, group=self.group
+                )
+                ibgda_ready = bool(ibgda_ready_tensor.item())
+            if not ibgda_ready:
+                # A failed update on any rank invalidates the IBGDA exchange
+                # for the whole group. Keep every rank on the same path.
+                self._use_fallback = True
+        # XPU has no IBGDA: peers on the node are reached over Level Zero IPC,
+        # others over the proxy's RDMA writes (_connect_xpu_rdma).
+        if (
+            self.device_type != "xpu"
+            and ibgda_ready
+            and not self._use_fallback
+            and not self.runtime.ibgda_disabled()
+        ):
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
 
@@ -652,9 +665,6 @@ class Buffer:
             ]
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
-
-            if is_update:
-                self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
             all_to_all_size = len(local_qpns) // self.group_size
@@ -740,6 +750,8 @@ class Buffer:
                 dist.all_gather(handles, local_handle_tensor, self.group)
                 remote_handles = [h.tolist() for h in handles]
                 active_ranks_mask = self._active_ranks_list(device)
+                if self.device_type == "xpu":
+                    self._connect_xpu_rdma(remote_handles, active_ranks_mask, device)
                 self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
             except Exception as e:
                 import warnings
@@ -759,17 +771,77 @@ class Buffer:
             ibgda_disabled = bool(self.runtime.ibgda_disabled())
             use_fast_path = not ibgda_disabled
 
-        if self.device_type == "xpu":
-            # Each rank maps its peers on its own, so one may reach them all
-            # while another cannot. Take the fast path only if every rank can;
-            # a rank in native kernels would wait forever on one that runs the
-            # fallback's collectives, and the other way round.
-            agreed = torch.tensor(
-                [int(use_fast_path)], dtype=torch.int32, device=device
-            )
-            dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
-            use_fast_path = bool(agreed.item())
+        # Each rank maps its peers on its own, so one may reach them all while
+        # another cannot. Take the fast path only if every rank can; a rank in
+        # native kernels would wait forever on one that runs fallback collectives.
+        agreed = torch.tensor([int(use_fast_path)], dtype=torch.int32, device=device)
+        dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=self.group)
+        use_fast_path = bool(agreed.item())
         self._use_fallback = not use_fast_path
+
+    def _connect_xpu_rdma(
+        self,
+        handles: List[List[int]],
+        active_ranks_mask: List[int],
+        device: torch.device,
+    ) -> None:
+        """Connect the ranks on other nodes over RDMA (XPU only).
+
+        A rank is on another node if its IPC handle comes from another host
+        or pid namespace (words 3 and 4 of the handle), or, with
+        MC_EP_RANKS_PER_NODE=n, if rank // n differs: n=4 on one 8-GPU host
+        runs two virtual nodes. If any rank cannot set up RDMA, none does, and
+        the group stays on the fallback path unless every rank shares a node.
+        """
+        import warnings
+
+        per_node = int(os.environ.get("MC_EP_RANKS_PER_NODE", "0") or 0)
+        if per_node > 0:
+            nodes = [r // per_node for r in range(self.group_size)]
+        else:
+            nodes = [tuple(h[3:5]) for h in handles]
+        remote = [int(node != nodes[self.rank]) for node in nodes]
+        if not any(remote):
+            return
+        # Every rank with a peer on another node takes part in the agreement,
+        # whether or not it can set up RDMA itself.
+        info: List[int] = []
+        if not self.runtime.rdma_available():
+            warnings.warn(
+                f"[Rank {self.rank}] ranks on other nodes need the XPU verbs "
+                "path, which this build lacks (rdma-core with "
+                "ibv_reg_dmabuf_mr)",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        else:
+            try:
+                info = list(self.runtime.init_rdma(remote))
+            except Exception as e:
+                warnings.warn(
+                    f"[Rank {self.rank}] XPU RDMA setup failed: {e}",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+        info_len = 4 + 8 * self.group_size
+        ok = torch.tensor(
+            [int(len(info) == info_len)], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=self.group)
+        if not ok.item():
+            return
+        local = torch.tensor(info, dtype=torch.int32, device=device)
+        infos = [torch.empty_like(local) for _ in range(self.group_size)]
+        dist.all_gather(infos, local, self.group)
+        try:
+            self.runtime.connect_rdma([t.tolist() for t in infos], active_ranks_mask)
+        except Exception as e:
+            # use_fast_path() then reports false, and every rank falls back.
+            warnings.warn(
+                f"[Rank {self.rank}] XPU RDMA connect failed: {e}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     def update_ep_member(self):
         self.connect(True)
@@ -1380,10 +1452,12 @@ class Buffer:
         m, n = x.shape
         x_view = x.view(m, -1, 128)
         x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-        x_fp8 = (
-            (x_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n)
-        )
-        x_scales = (x_amax / 448.0).view(m, -1)
+        # Match the native kernels bit-for-bit: true division for the scale
+        # (`448.0 / t` lowers to `t.reciprocal() * 448`) and multiply by 1/448
+        # for the inverse scale.
+        x_scale = torch.full_like(x_amax, 448.0) / x_amax
+        x_fp8 = (x_view * x_scale.unsqueeze(2)).to(torch.float8_e4m3fn).view(m, n)
+        x_scales = (x_amax * (1.0 / 448.0)).view(m, -1)
         return x_fp8, x_scales
 
     def _fallback_dispatch(

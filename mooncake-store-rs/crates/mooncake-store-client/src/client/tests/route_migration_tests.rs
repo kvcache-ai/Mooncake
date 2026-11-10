@@ -2087,12 +2087,12 @@ fn control_plane_submit_copy_task_same_key_only_one_executor_wins() {
         .expect("migration task submit to executor c should succeed");
     assert!(!execution_id_b.is_empty());
     assert!(!execution_id_c.is_empty());
-    assert!(
-        blocking.wait_until_blocked(Duration::from_secs(1)),
-        "one control-plane copy should reach the blocked CAS point"
-    );
-    sleep(Duration::from_millis(100));
+    let both_blocked = blocking.wait_until_blocked_count(2, Duration::from_secs(5));
     blocking.release_blocked_cas();
+    assert!(
+        both_blocked,
+        "both control-plane copies must reach CAS before either is released"
+    );
 
     let started = Instant::now();
     let detail_b = loop {

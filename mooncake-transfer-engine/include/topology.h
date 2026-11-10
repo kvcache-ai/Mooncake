@@ -84,6 +84,12 @@ class Topology {
 
     int parse(const std::string &topology_json);
 
+    // Parses a local topology, keeping only HCAs whose names appear in
+    // device_filter. Each entry keeps its preferred/avail order. An empty
+    // filter keeps every HCA, the same as parse(topology_json).
+    int parse(const std::string &topology_json,
+              const std::vector<std::string> &device_filter);
+
     int disableDevice(const std::string &device_name);
 
     std::string toString() const;

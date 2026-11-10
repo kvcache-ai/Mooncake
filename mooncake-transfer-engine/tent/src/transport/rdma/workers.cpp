@@ -375,8 +375,11 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
         priority = slice_list.first->priority;
     }
 
+    // A worker may finish immediately after queue publication.
+    const auto previous =
+        worker.inflight_slices.fetch_add(slice_list.num_slices);
     worker.queues[priority].push(slice_list);
-    if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
+    if (!previous) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
     }
@@ -703,6 +706,8 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
 void Workers::asyncPostSend() {
     auto& worker = worker_context_[tl_wid];
     std::vector<RdmaSliceList> result;
+    const size_t slice_budget = transport_->params_->endpoint.max_qp_wr;
+    size_t new_slices = 0;
 
     auto shared_quota =
         device_selector_ ? device_selector_->getSharedSlotManager() : nullptr;
@@ -716,8 +721,11 @@ void Workers::asyncPostSend() {
     auto& overflow = worker.requeue_overflow;
     for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
         if (shared_quota && !shared_quota->canSend(prio)) continue;
-        for (auto it = overflow.begin(); it != overflow.end();) {
+        for (auto it = overflow.begin();
+             it != overflow.end() &&
+             (deadline_bw_arbitration_ || new_slices < slice_budget);) {
             if (it->first == prio) {
+                new_slices += it->second.num_slices;
                 result.push_back(it->second);
                 it = overflow.erase(it);
             } else {
@@ -725,7 +733,18 @@ void Workers::asyncPostSend() {
             }
         }
         if (!result.empty()) break;
-        worker.queues[prio].pop(result);
+        if (deadline_bw_arbitration_) {
+            worker.queues[prio].pop(result);
+        } else {
+            // Prepare one QP window, then post and return to CQ polling. Do
+            // not wait for a full window when the producer has less ready.
+            while (new_slices < slice_budget) {
+                auto list = worker.queues[prio].pop();
+                if (!list.num_slices) break;
+                new_slices += list.num_slices;
+                result.push_back(list);
+            }
+        }
         if (!result.empty()) break;
     }
 
@@ -1811,10 +1830,9 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
     // Reactive learning in asyncPollCq still covers pairs not yet observed.
     bool gdr_excluded = false;
     if (GdrReachability::hasAnyExclusion()) {
-        int src_gpu = -1, dst_gpu = -1;
         LocationParser s(source.location), d(target.location);
-        if (s.type() == "cuda") src_gpu = s.index();
-        if (d.type() == "cuda") dst_gpu = d.index();
+        const int src_gpu = gdrOrdinal(s);
+        const int dst_gpu = gdrOrdinal(d);
         gdr_excluded = gdrPairExcluded(source, target, slice->source_dev_id,
                                        slice->target_dev_id, src_gpu, dst_gpu);
     }
@@ -1886,8 +1904,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
     int src_gpu = -1, dst_gpu = -1;
     if (gdr_learned) {
         LocationParser s(source.location), d(target.location);
-        if (s.type() == "cuda") src_gpu = s.index();
-        if (d.type() == "cuda") dst_gpu = d.index();
+        src_gpu = gdrOrdinal(s);
+        dst_gpu = gdrOrdinal(d);
     }
 
     size_t src_total = 0;
@@ -2012,8 +2030,8 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
     // handling may happen after the segment publishes a replacement snapshot.
     {
         LocationParser s(source.location), d(target.location);
-        slice->source_gpu_ordinal = (s.type() == "cuda") ? s.index() : -1;
-        slice->target_gpu_ordinal = (d.type() == "cuda") ? d.index() : -1;
+        slice->source_gpu_ordinal = gdrOrdinal(s);
+        slice->target_gpu_ordinal = gdrOrdinal(d);
         const auto* lnic = source.topo->getNicEntry(slice->source_dev_id);
         const auto* rnic = target.topo->getNicEntry(slice->target_dev_id);
         slice->source_nic_name = lnic ? lnic->name : "";

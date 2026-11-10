@@ -1991,14 +1991,23 @@ struct BatchExistenceSpec {
 BatchExistenceSpec BatchExistence(std::initializer_list<std::string> keys);
 
 // Lease-free twin of BatchExistence: BatchProbeKey reports the same hits
-// without granting or extending read leases.
+// without granting or extending read leases. LastHitOnly keeps those
+// per-key results and leases the last candidate of candidate_size
+// consecutive keys whose results are all true.
 struct BatchProbeSpec {
     std::vector<std::string> keys;
     std::string tenant{TenantId::Default().value()};
+    GrantLeasePolicy policy{};
     std::vector<bool> expected;
 
     BatchProbeSpec& ForTenant(std::string value) {
         tenant = std::move(value);
+        return *this;
+    }
+
+    BatchProbeSpec& LastHitOnly(uint64_t candidate_size) {
+        policy.lease_mode = ProbeLeaseMode::LastHitOnly;
+        policy.candidate_size = candidate_size;
         return *this;
     }
 

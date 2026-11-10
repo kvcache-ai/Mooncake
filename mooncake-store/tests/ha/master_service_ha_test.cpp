@@ -1354,8 +1354,12 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     const std::string endpoint = "checksum_restore_segment";
     auto legacy_object = MakeStandbyObject("checksum_legacy_key", endpoint);
     legacy_object.metadata.object_checksum = 0x1234;
+    legacy_object.metadata.session_id = "legacy-session";
+    legacy_object.metadata.residency_affinity_id = "legacy-affinity";
     auto batch_object = MakeStandbyObject("checksum_batch_key", endpoint);
     batch_object.metadata.object_checksum = 0;
+    batch_object.metadata.session_id = "batch-session";
+    batch_object.metadata.residency_affinity_id = "batch-affinity";
 
     MasterService legacy_service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -1370,6 +1374,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     ASSERT_TRUE(legacy_accessor.Exists());
     EXPECT_EQ(legacy_accessor.Get().GetPart(0).checksum(),
               std::optional<uint64_t>(0x1234));
+    EXPECT_EQ("legacy-session", legacy_accessor.Get().session_id);
+    EXPECT_EQ("legacy-affinity", legacy_accessor.Get().residency_affinity_id);
 
     auto source = std::make_unique<StandbyMetadataStore>();
     ASSERT_TRUE(source->PutMetadata(batch_object.tenant_id, batch_object.key,
@@ -1390,6 +1396,8 @@ TEST_F(MasterServiceHATest, PromotionRestoresObjectChecksum) {
     ASSERT_TRUE(batch_accessor.Exists());
     EXPECT_EQ(batch_accessor.Get().GetPart(0).checksum(),
               std::optional<uint64_t>(0));
+    EXPECT_EQ("batch-session", batch_accessor.Get().session_id);
+    EXPECT_EQ("batch-affinity", batch_accessor.Get().residency_affinity_id);
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
@@ -2564,6 +2572,7 @@ TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
     ASSERT_FALSE(batch_before[0].has_value());
     EXPECT_EQ(batch_before[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
     Segment segment = MakeSegment(endpoint);
+    segment.protocol = "rdma";
     ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()).has_value());
     ASSERT_TRUE(service.GetReplicaList(key, kDefaultTenant).has_value());
     auto batch_after = service.BatchGetReplicaList({key}, kDefaultTenant);
@@ -5189,6 +5198,63 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
+       StaleCleanupOpLogLeavesOutTheStaleReplica) {
+    const std::string cluster_id = "test_batch_record_stale_payload";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    auto gone = PrepareSimpleSegment(service, "stale_payload_gone");
+    ReadBatchEventually(storage, 1, batch);
+    PrepareSimpleSegment(service, "stale_payload_kept",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 2, batch);
+    const std::string key = "stale_payload_key";
+    ReplicateConfig config;
+    config.replica_num = 2;
+    ASSERT_TRUE(
+        service.PutStart(gone.client_id, key, kDefaultTenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service.PutEnd(gone.client_id, key, kDefaultTenant, ReplicaType::MEMORY)
+            .has_value());
+    ReadBatchEventually(storage, 3, batch);
+
+    ASSERT_TRUE(
+        service.UnmountSegment(gone.segment_id, gone.client_id).has_value());
+
+    bool found = false;
+    for (uint64_t id = 4; id <= 6 && !found; ++id) {
+        ReadBatchEventually(storage, id, batch);
+        for (const auto& entry : batch.entries) {
+            if (entry.op_type != OpType::PUT_END || entry.object_key != key) {
+                continue;
+            }
+            found = true;
+            MetadataPayload payload;
+            ASSERT_EQ(struct_pack::errc::ok,
+                      struct_pack::deserialize_to(payload, entry.payload));
+            ASSERT_EQ(1u, payload.replicas.size());
+            EXPECT_EQ("stale_payload_kept",
+                      payload.replicas[0]
+                          .get_memory_descriptor()
+                          .buffer_descriptor.transport_endpoint_);
+        }
+    }
+    EXPECT_TRUE(found);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
        UpsertStartStaleCleanupReleasesResourcesAfterDurable) {
     const std::string cluster_id = "test_batch_record_upsert_stale_finalize";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
@@ -7496,7 +7562,12 @@ TEST_F(MasterServiceHATest,
                       .set_enable_oplog(true)
                       .set_weight_management_oplog_capability_confirmed(true)
                       .set_cluster_id(cluster_id)
-                      .set_oplog_batch_max_entries(1)
+                      // UnmountSegment below queues one stale-handle cleanup
+                      // per object plus SEGMENT_UNMOUNT back to back, before
+                      // the writer thread can take the previous entry. With
+                      // a single slot those Reserve() calls race the writer
+                      // and fail with TASK_PENDING_LIMIT_EXCEEDED.
+                      .set_oplog_batch_max_entries(16)
                       .build();
     MasterService service(config);
     auto* writer = InstallGatedWriter(service, backend);
@@ -7533,7 +7604,7 @@ TEST_F(MasterServiceHATest,
                                      replicate));
         ASSERT_TRUE(service.PutEnd(segment.client_id, key, kDefaultTenant,
                                    ReplicaType::MEMORY));
-        // PutEnd returns before durability; drain the single-entry writer.
+        // PutEnd returns before durability; wait for this entry to land.
         ASSERT_TRUE(writer->RunCallbacksThrough(put_sequence++));
     }
     const auto ready = service.CommitWeightImport({

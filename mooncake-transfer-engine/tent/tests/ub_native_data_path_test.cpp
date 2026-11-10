@@ -27,6 +27,14 @@
 #include "tent/transport/ub/workers.h"
 
 namespace mooncake::tent::ub {
+
+class UbWorkersTestPeer {
+   public:
+    static void failSecondEnqueue() {
+        UbWorkers::fail_second_enqueue_for_test_ = true;
+    }
+};
+
 namespace {
 
 class FakeContext final : public Context {
@@ -547,6 +555,46 @@ TEST(UbNativeDataPathTest,
                           (void)endpoints.retire(endpoint);
                       });
     ASSERT_TRUE(workers.start().ok());
+
+    Request invalid_batch_request{};
+    invalid_batch_request.opcode = Request::WRITE;
+    invalid_batch_request.source = source.data();
+    invalid_batch_request.target_id = LOCAL_SEGMENT_ID;
+    invalid_batch_request.target_offset =
+        reinterpret_cast<uint64_t>(target.data());
+    invalid_batch_request.length = 16;
+    auto valid_task = UbTask::create(invalid_batch_request);
+    auto valid_slice = valid_task->addSlice(UbSliceSpec{
+        source.data(), reinterpret_cast<uint64_t>(target.data()), 16, 0, 1});
+    ASSERT_NE(valid_slice, nullptr);
+    ASSERT_TRUE(valid_task->seal());
+    auto unsealed_task = UbTask::create(invalid_batch_request);
+    ASSERT_NE(unsealed_task->addSlice(UbSliceSpec{
+                  source.data(), reinterpret_cast<uint64_t>(target.data()), 16,
+                  0, 1}),
+              nullptr);
+
+    EXPECT_FALSE(workers.submitBatch({valid_task, unsealed_task}).ok());
+    EXPECT_EQ(workers.queuedCount(), 0U);
+    EXPECT_EQ(workers.inflightCount(), 0U);
+    EXPECT_EQ(valid_slice->snapshot().state, UbSliceState::kInitial);
+
+    auto rollback_task = UbTask::create(invalid_batch_request);
+    auto rollback_slice = rollback_task->addSlice(UbSliceSpec{
+        source.data(), reinterpret_cast<uint64_t>(target.data()), 16, 0, 1});
+    ASSERT_NE(rollback_slice, nullptr);
+    ASSERT_TRUE(rollback_task->seal());
+
+    // Both slices are marked queued and the first is inserted before the
+    // second enqueue throws.
+    UbWorkersTestPeer::failSecondEnqueue();
+    EXPECT_TRUE(
+        workers.submitBatch({valid_task, rollback_task}).IsInternalError());
+    EXPECT_EQ(workers.queuedCount(), 0U);
+    EXPECT_EQ(workers.inflightCount(), 0U);
+    EXPECT_EQ(valid_slice->snapshot().state, UbSliceState::kCanceled);
+    EXPECT_EQ(rollback_slice->snapshot().state, UbSliceState::kCanceled);
+
     adapter->holdNextCompletion();
     adapter->dropNextQuiescedCompletion();
 
@@ -906,7 +954,7 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     EXPECT_TRUE(transport.freeSubBatch(rejected_batch).ok());
 
     Transport::SubBatchRef batch = nullptr;
-    ASSERT_TRUE(transport.allocateSubBatch(batch, 2).ok());
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 3).ok());
     Request request{};
     request.opcode = Request::WRITE;
     request.source = source.data();
@@ -928,10 +976,25 @@ TEST(UbNativeDataPathTest, UbTransportRunsSelfReadWriteOverNativeControlPlane) {
     EXPECT_EQ(source, target);
     EXPECT_GT(transport.getEstimatedBandwidth(), 0.0);
 
+    ASSERT_EQ(batch->size(), 1U);
+    auto single_slice_request = request;
+    single_slice_request.length = 16;
+    UbWorkersTestPeer::failSecondEnqueue();
+    EXPECT_TRUE(transport
+                    .submitTransferTasks(
+                        batch, {single_slice_request, single_slice_request})
+                    .IsInternalError());
+    EXPECT_EQ(batch->size(), 1U);
+    transfer = TransferStatus{PENDING, 0};
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, transfer).ok());
+    EXPECT_EQ(transfer.s, COMPLETED);
+    EXPECT_EQ(transfer.transferred_bytes, source.size());
+
     source.fill(0);
     Request read_request = request;
     read_request.opcode = Request::READ;
     ASSERT_TRUE(transport.submitTransferTasks(batch, {read_request}).ok());
+    EXPECT_EQ(batch->size(), 2U);
     transfer = TransferStatus{PENDING, 0};
     const auto read_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
