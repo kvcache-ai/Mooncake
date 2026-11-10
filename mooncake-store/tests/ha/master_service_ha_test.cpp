@@ -414,12 +414,18 @@ class MasterServiceHATest : public ::testing::Test {
                         .payload_count = 1,
                         .logical_bytes = 1024,
                     },
+                .policy =
+                    WeightStoragePolicy{
+                        .preferred_residency = WeightResidencyState::HOT,
+                        .migration_mode = WeightMigrationMode::MANUAL},
                 .availability = abandoned_import
                                     ? WeightAvailabilityState::IMPORTING
                                     : WeightAvailabilityState::READY,
                 .residency = abandoned_import ? WeightResidencyState::UNKNOWN
                                               : WeightResidencyState::HOT,
-                .operation = WeightOperationState::NONE,
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+                .observed_hot_ratio = abandoned_import ? 0.0 : 1.0,
                 .metadata_generation = abandoned_import ? 1u : 2u,
                 .created_at_ms = 100,
                 .updated_at_ms = 200,
@@ -3775,8 +3781,16 @@ TEST_F(MasterServiceHATest,
                     .payload_count = 1,
                     .logical_bytes = 1024,
                 },
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL,
+                },
             .availability = WeightAvailabilityState::READY,
             .residency = WeightResidencyState::HOT,
+            .affinity_count = 1,
+            .affinity_digest = std::string(64, 'c'),
+            .observed_hot_ratio = 1.0,
             .metadata_generation = 2,
             .created_at_ms = 100,
             .updated_at_ms = 200,
@@ -3794,6 +3808,16 @@ TEST_F(MasterServiceHATest,
         .identity = new_identity,
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     EXPECT_FALSE(imported.has_value());
     if (!imported) {
@@ -3851,6 +3875,11 @@ TEST_F(MasterServiceHATest,
             .payload_group_id = {},
             .expected_payload_count = 2,
             .expected_logical_bytes = 2048,
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = 2,
+                    .affinity_digest = std::string(64, 'c'),
+                },
         });
     });
 
@@ -3907,12 +3936,24 @@ TEST_F(MasterServiceHATest,
         .revision = "step-100",
         .weight_generation = 7,
     };
-    ASSERT_TRUE(service.BeginWeightImport(BeginWeightImportRequest{
+    auto begin = service.BeginWeightImport(BeginWeightImportRequest{
         .identity = identity,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
-    }));
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'a'),
+            },
+    });
+    ASSERT_TRUE(begin.has_value())
+        << "error=" << static_cast<int>(begin.error());
 
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
@@ -3949,6 +3990,11 @@ TEST_F(MasterServiceHATest,
         .payload_group_id = {},
         .expected_payload_count = 2,
         .expected_logical_bytes = 2048,
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 2,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, rejected.error());
@@ -3987,6 +4033,11 @@ TEST_F(MasterServiceHATest, WeightMetadataRejectsOpLogSubmissionFailure) {
         .payload_group_id = {},
         .expected_payload_count = 2,
         .expected_logical_bytes = 2048,
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 2,
+                .affinity_digest = std::string(64, 'c'),
+            },
     });
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(WeightManagementError::DURABILITY_FAILED, rejected.error());
@@ -4023,6 +4074,11 @@ TEST_F(MasterServiceHATest,
             .identity = identity,
             .expected_payload_count = 2,
             .expected_logical_bytes = 2048,
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = 2,
+                    .affinity_digest = std::string(64, 'c'),
+                },
         });
     });
     const bool attempted = backend->WaitForTxnCalls(1);
@@ -4072,6 +4128,12 @@ TEST_F(MasterServiceHATest, WeightDurabilityWaitDoesNotBlockTaskCleanup) {
         .identity = identity,
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL},
+        .affinity_summary = {.affinity_count = 1,
+                             .affinity_digest = std::string(64, 'c')},
     }));
     backend->BlockTxn();
     struct ReleaseOnExit {
@@ -4134,6 +4196,11 @@ TEST_F(MasterServiceHATest,
             .identity = identity,
             .expected_payload_count = 2,
             .expected_logical_bytes = 2048,
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = 2,
+                    .affinity_digest = std::string(64, 'c'),
+                },
         });
     });
     const bool blocked = backend->WaitForBlockedTxn();
@@ -4184,6 +4251,12 @@ TEST_F(MasterServiceHATest,
             .payload_group_id = {},
             .expected_payload_count = payload_count,
             .expected_logical_bytes = logical_bytes,
+            .affinity_summary =
+                WeightAffinitySummary{
+                    .affinity_count = payload_count,
+                    .affinity_digest =
+                        std::string(64, payload_count == 2 ? 'c' : 'd'),
+                },
         });
     };
 
@@ -4246,7 +4319,9 @@ TEST_F(MasterServiceHATest,
                 },
             .availability = WeightAvailabilityState::READY,
             .residency = WeightResidencyState::HOT,
-            .operation = WeightOperationState::NONE,
+            .affinity_count = 1,
+            .affinity_digest = std::string(64, 'c'),
+            .observed_hot_ratio = 1.0,
             .metadata_generation = 2,
             .created_at_ms = 100,
             .updated_at_ms = 200,
@@ -4326,8 +4401,10 @@ TEST_F(MasterServiceHATest,
                 },
             .availability = WeightAvailabilityState::READY,
             .residency = WeightResidencyState::HOT,
-            .operation = WeightOperationState::EVICTING,
             .operation_id = 3,
+            .affinity_count = 1,
+            .affinity_digest = std::string(64, 'c'),
+            .observed_hot_ratio = 1.0,
             .metadata_generation = 4,
             .created_at_ms = 100,
             .updated_at_ms = 200,
@@ -4342,13 +4419,15 @@ TEST_F(MasterServiceHATest,
         .operations = {WeightResidencyOperation{
             .operation_id = 3,
             .identity = identity,
-            .operation = WeightOperationState::EVICTING,
+            .kind = WeightOperationKind::MIGRATING,
             .target_residency = WeightResidencyState::COLD,
             .fenced_metadata_generation = 4,
             .started_at_ms = 150,
             .updated_at_ms = 200,
-            .processed_members = 0,
-            .total_members = 2,
+            .processed_units = 0,
+            .total_units = 1,
+            .processed_bytes = 0,
+            .total_bytes = 1024,
             .cursor = {},
             .message = {},
         }},
@@ -4375,6 +4454,16 @@ TEST_F(MasterServiceHATest, OldStandbyPromotionClearsWeightMetadata) {
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL,
+            },
+        .affinity_summary =
+            WeightAffinitySummary{
+                .affinity_count = 1,
+                .affinity_digest = std::string(64, 'c'),
+            },
     }));
 
     ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 7, {}));
@@ -7388,7 +7477,10 @@ TEST_F(MasterServiceHATest, WeightLeaseShorterTtlRenewalReplaysThroughReader) {
                 },
             .availability = WeightAvailabilityState::READY,
             .residency = WeightResidencyState::HOT,
-            .operation = WeightOperationState::NONE,
+            .operation_id = std::nullopt,
+            .affinity_count = 1,
+            .affinity_digest = std::string(64, 'c'),
+            .observed_hot_ratio = 1.0,
             .metadata_generation = 2,
             .created_at_ms = 100,
             .updated_at_ms = 200,
@@ -7466,7 +7558,10 @@ TEST_F(MasterServiceHATest, WeightLeaseRenewalRechecksExpiryAfterGroupWait) {
                 },
             .availability = WeightAvailabilityState::READY,
             .residency = WeightResidencyState::HOT,
-            .operation = WeightOperationState::NONE,
+            .operation_id = std::nullopt,
+            .affinity_count = 1,
+            .affinity_digest = std::string(64, 'c'),
+            .observed_hot_ratio = 1.0,
             .metadata_generation = 2,
             .created_at_ms = 100,
             .updated_at_ms = 200,
@@ -7586,6 +7681,14 @@ TEST_F(MasterServiceHATest,
         .payload_group_id = {},
         .expected_payload_count = 1,
         .expected_logical_bytes = 1024,
+        .policy =
+            WeightStoragePolicy{
+                .preferred_residency = WeightResidencyState::HOT,
+                .migration_mode = WeightMigrationMode::MANUAL},
+        .affinity_summary =
+            {.affinity_count = 1,
+             .affinity_digest = ComputeWeightAffinityMappingSha256(
+                 {{"operation-replay-payload", 1024, "affinity-a"}})},
     });
     ASSERT_TRUE(importing);
     const std::string payload_key = "operation-replay-payload";
@@ -7599,6 +7702,12 @@ TEST_F(MasterServiceHATest,
     for (const auto& key : {payload_key, manifest_key}) {
         replicate.data_type = key == payload_key ? ObjectDataType::WEIGHT
                                                  : ObjectDataType::METADATA;
+        if (key == payload_key) {
+            replicate.residency_affinity_ids =
+                std::vector<std::string>{"affinity-a"};
+        } else {
+            replicate.residency_affinity_ids.reset();
+        }
         ASSERT_TRUE(service.PutStart(segment.client_id, key, kDefaultTenant,
                                      key == payload_key ? 1024 : 128,
                                      replicate));
@@ -7654,7 +7763,7 @@ TEST_F(MasterServiceHATest,
     const auto finished =
         service.ReconcileWeightRevision({.identity = identity});
     ASSERT_TRUE(finished);
-    ASSERT_EQ(WeightOperationState::NONE, finished->operation);
+    ASSERT_FALSE(finished->operation_id.has_value());
     const auto completed = service.QueryWeightOperation({
         .operation_id = active->operation_id,
     });
@@ -7679,7 +7788,7 @@ TEST_F(MasterServiceHATest,
     ASSERT_TRUE(degraded);
     EXPECT_EQ(WeightAvailabilityState::DEGRADED, degraded->availability);
     EXPECT_EQ(WeightResidencyState::ABSENT, degraded->residency);
-    EXPECT_EQ(WeightOperationState::REHYDRATING, degraded->operation);
+    EXPECT_TRUE(degraded->operation_id.has_value());
     EXPECT_EQ(rehydrating->operation_id, degraded->operation_id);
     EXPECT_EQ(rehydrating->fenced_metadata_generation + 1,
               degraded->metadata_generation);
