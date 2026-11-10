@@ -132,7 +132,7 @@ class BuildDirectoryTest(unittest.TestCase):
                     environment.pop("FREE_BUILD_DIR", None)
                     if free_build_dir is not None:
                         environment["FREE_BUILD_DIR"] = free_build_dir
-                    environment["CUDA_EP_STAGING_DIR"] = str(build / "ep_pg_staging")
+                    environment["DEVICE_STAGING_DIR"] = str(build / "ep_pg_staging")
                     environment["CUDA_EP_JIT_DIR"] = str(build / "mooncake_ep_jit")
                     result = subprocess.run(
                         [
@@ -160,7 +160,7 @@ class BuildDirectoryTest(unittest.TestCase):
             build = root / "build"
             staging = build / "ep_pg_staging"
             staging.mkdir(parents=True)
-            (staging / "device.so").write_bytes(b"device library")
+            (staging / "libmooncake_ep_device.so").write_bytes(b"device library")
             jit = build / "mooncake_ep_jit"
             jit.mkdir()
             (jit / "kernel.cuh").write_text("kernel header")
@@ -169,8 +169,9 @@ class BuildDirectoryTest(unittest.TestCase):
                 [
                     "bash",
                     "-ec",
-                    'source "$1"; cleanup_build_directory; '
-                    'printf "%s\\n" "$CUDA_EP_STAGING_DIR" "$CUDA_EP_JIT_DIR" > "$2"',
+                    'source "$1"; DEVICE_LIBRARY_BASENAMES=(libmooncake_ep_device.so); '
+                    'cleanup_build_directory; '
+                    'printf "%s\\n" "$DEVICE_STAGING_TEMP" "$CUDA_EP_JIT_DIR" > "$2"',
                     "bash",
                     str(ROOT / "scripts/build_wheel.sh"),
                     str(paths),
@@ -181,7 +182,9 @@ class BuildDirectoryTest(unittest.TestCase):
                     "CI": "true",
                     "FREE_BUILD_DIR": "1",
                     "BUILD_DIR": str(build),
-                    "CUDA_EP_STAGING_DIR": str(staging),
+                    "DEVICE_STAGING_DIR": str(staging),
+                    "WITH_EP_BUILD": "1",
+                    "USE_XPU_BUILD": "0",
                     "CUDA_EP_JIT_DIR": str(jit),
                     "TMPDIR": str(root),
                 },
@@ -192,7 +195,9 @@ class BuildDirectoryTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(build.exists())
             staged, staged_jit = map(Path, paths.read_text().splitlines())
-            self.assertEqual((staged / "device.so").read_bytes(), b"device library")
+            self.assertEqual(
+                (staged / "libmooncake_ep_device.so").read_bytes(), b"device library"
+            )
             self.assertEqual((staged_jit / "kernel.cuh").read_text(), "kernel header")
 
 

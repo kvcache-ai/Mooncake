@@ -4450,6 +4450,12 @@ void Client::SetDfsStorageBackend(
     EnsureStorageControlPlaneStarted();
 }
 
+bool Client::CanReadDfsReplicaIntoHostMemory(
+    const Replica::Descriptor& replica) const {
+    return replica.is_dfs_replica() && dfs_storage_backend_ &&
+           dfs_storage_backend_->SupportsArbitraryHostReadBuffers();
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);

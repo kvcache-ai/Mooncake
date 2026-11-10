@@ -37,6 +37,45 @@ mod harness {
 use harness::{install_generous_quota_policy, install_tenant_quota_policy, IsolationCluster};
 
 #[test]
+fn single_put_request_preserves_namespace_qos_and_policy() {
+    let cluster = IsolationCluster::with_clients("single-put-request", 2);
+    let client = cluster.client(0);
+    let peer = cluster.client(1);
+    let policy = crate::ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(peer.runtime_id().storage_key());
+    let request = PutRequest::new("same-key", b"scoped-value")
+        .tenant("put-tenant")
+        .domain("put-domain")
+        .object_set("put-set")
+        .qos_tier("gold")
+        .replication(policy);
+    let route = client
+        .put_request(&request)
+        .expect("single put should succeed");
+    assert_eq!(
+        route.canonical_key.as_deref(),
+        Some("put-tenant/put-domain/put-set/same-key")
+    );
+    assert_eq!(route.qos_tier.as_deref(), Some("gold"));
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(&route.replicas[0].owner, peer.runtime_id());
+    let object = ObjectRef::new("same-key")
+        .tenant("put-tenant")
+        .domain("put-domain")
+        .object_set("put-set");
+    assert_eq!(
+        peer.batch_get(&[object])
+            .expect("peer scoped read should succeed"),
+        vec![b"scoped-value".to_vec()]
+    );
+    assert!(matches!(
+        peer.get_in_tenant("put-tenant", "same-key"),
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+#[test]
 fn hard_isolated_client_rejects_cross_tenant_requests() {
     use std::sync::Arc;
 
