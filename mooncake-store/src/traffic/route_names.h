@@ -62,6 +62,12 @@ class RouteNameRegistry {
 
     bool empty() const { return names_.empty(); }
 
+    // Every registered name, so a session can describe its routes before the
+    // first request arrives.
+    const std::unordered_map<std::uint32_t, std::string>& Names() const {
+        return names_;
+    }
+
     // Sorted, comma separated list for configuration error messages.
     std::string Describe() const {
         std::vector<std::string_view> names;

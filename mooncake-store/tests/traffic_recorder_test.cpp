@@ -887,6 +887,15 @@ TEST(TrafficRecorderTest, WritesRouteNamesSidecar) {
         coro_rpc::get_func_name<&WrappedMasterService::BatchGetReplicaList>());
     recorder.Install(1, {}, names);
     ASSERT_TRUE(recorder.Start());
+    // The sidecar is written at start, before any request: a recorder that is
+    // killed never reaches Stop, and its session still has to name its routes.
+    {
+        std::ifstream started(recorder.GetStatus().session_dir + "/routes.json");
+        ASSERT_TRUE(started);
+        const std::string early((std::istreambuf_iterator<char>(started)),
+                                std::istreambuf_iterator<char>());
+        EXPECT_NE(early.find("BatchGetReplicaList"), std::string::npos);
+    }
     const std::string payload = "payload";
     recorder.OnRequest(RequestView{7, payload, 1, 1, 0});
     recorder.Stop();
