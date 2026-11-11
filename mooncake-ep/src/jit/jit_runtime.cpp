@@ -250,7 +250,8 @@ struct SmEnvInfo {
     std::string env_hash;  // hash(compiler_id + headers + options)
 };
 
-const SmEnvInfo& get_sm_env_info(int sm, std::string_view target_arch) {
+const SmEnvInfo* get_sm_env_info(int sm, std::string_view target_arch,
+                                 std::string* error) {
     static std::mutex env_mutex;
     static std::unordered_map<std::string, SmEnvInfo> env_cache;
     std::lock_guard<std::mutex> lock(env_mutex);
@@ -258,7 +259,7 @@ const SmEnvInfo& get_sm_env_info(int sm, std::string_view target_arch) {
     const std::string cache_key =
         std::to_string(sm) + ":" + std::string(target_arch);
     auto it = env_cache.find(cache_key);
-    if (it != env_cache.end()) return it->second;
+    if (it != env_cache.end()) return &it->second;
 
     SmEnvInfo info;
     info.source_dir = configured_source_dir();
@@ -266,7 +267,7 @@ const SmEnvInfo& get_sm_env_info(int sm, std::string_view target_arch) {
     info.cuda_include_dir = configured_cuda_include_dir();
 
     const JitCompiler& compiler = compiler_backend();
-    info.compiler_id = compiler.compiler_id();
+    if (!compiler.probe_compiler_id(&info.compiler_id, error)) return nullptr;
     JitCompileConfig compile_config;
     compile_config.sm = sm;
     compile_config.target_arch = target_arch;
@@ -287,7 +288,7 @@ const SmEnvInfo& get_sm_env_info(int sm, std::string_view target_arch) {
 
     auto [inserted_it, ok] = env_cache.emplace(cache_key, std::move(info));
     (void)ok;
-    return inserted_it->second;
+    return &inserted_it->second;
 }
 
 std::string kernel_family(const JitKernelVariant& variant) {
@@ -725,7 +726,7 @@ JitKernelStatus ensure_cubin(const JitKernelVariant& variant,
     JitCompileOutput compile_output;
     const JitCompiler& compiler = compiler_backend();
     if (!compiler.compile_to_cubin(input, &compile_output)) {
-        cache.mark_failed(key);
+        if (compile_output.cacheable_failure) cache.mark_failed(key);
         std::error_code remove_ec;
         std::filesystem::remove(paths.tmp_cubin_path, remove_ec);
         const double jit_overhead_sec = elapsed_sec(jit_begin);
@@ -737,7 +738,8 @@ JitKernelStatus ensure_cubin(const JitKernelVariant& variant,
                                        " path=" +
                                        paths.log_path.string());
         }
-        if (!write_file_atomic(paths.failed_path, compile_output.log, false)) {
+        if (compile_output.cacheable_failure &&
+            !write_file_atomic(paths.failed_path, compile_output.log, false)) {
             log_jit_event(variant, log_prefix +
                                        " artifact=failed_marker write=failed"
                                        " path=" +
@@ -956,8 +958,14 @@ JitKernelStatus launch_jit_kernel(const JitKernelVariant& variant,
         return JitKernelStatus::kUnsupportedDevice;
     }
 
-    const SmEnvInfo& env_info = get_sm_env_info(sm, variant.target_arch);
-    const std::string key = source_fingerprint(variant, sm, env_info.env_hash);
+    const SmEnvInfo* env_info = get_sm_env_info(sm, variant.target_arch, error);
+    if (env_info == nullptr) {
+        const std::string detail =
+            (error != nullptr && !error->empty()) ? " " + *error : "";
+        log_jit_event(variant, log_prefix + " compiler_probe=failed" + detail);
+        return JitKernelStatus::kCompileFailed;
+    }
+    const std::string key = source_fingerprint(variant, sm, env_info->env_hash);
     JitCache& cache = JitCache::instance();
     if (cache.has_failed(key)) return JitKernelStatus::kCompileFailed;
     const CachePaths paths = make_cache_paths(cache, key);
@@ -969,11 +977,11 @@ JitKernelStatus launch_jit_kernel(const JitKernelVariant& variant,
                       " sm=" + std::to_string(sm) +
                       " target_arch=" + std::string(variant.target_arch) +
                       " cache_root=" + cache.root_dir().string() +
-                      " source_dir=" + env_info.source_dir.string());
+                      " source_dir=" + env_info->source_dir.string());
 
     std::string cubin;
     JitKernelStatus status =
-        ensure_cubin(variant, env_info, paths, key, log_prefix, sm, jit_begin,
+        ensure_cubin(variant, *env_info, paths, key, log_prefix, sm, jit_begin,
                      &cubin, error);
     if (status != JitKernelStatus::kLaunched) return status;
 

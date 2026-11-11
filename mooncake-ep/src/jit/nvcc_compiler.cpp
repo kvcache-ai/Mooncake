@@ -29,6 +29,8 @@ namespace {
 
 struct ProcessResult {
     int exit_code = -1;
+    bool started = false;
+    bool exited = false;
     std::string output;
 };
 
@@ -101,6 +103,8 @@ std::string command_to_string(const std::vector<std::string>& argv) {
 bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
     if (result == nullptr) return false;
     result->exit_code = -1;
+    result->started = false;
+    result->exited = false;
     result->output.clear();
     if (argv.empty()) {
         result->output = "empty command";
@@ -157,6 +161,7 @@ bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
                          environ);
     posix_spawn_file_actions_destroy(&actions);
     if (error != 0) return close_pipe_and_report_error("posix_spawnp", error);
+    result->started = true;
 
     close(pipe_fd[1]);
     char buffer[4096];
@@ -182,6 +187,7 @@ bool run_process(const std::vector<std::string>& argv, ProcessResult* result) {
     }
 
     if (WIFEXITED(status)) {
+        result->exited = true;
         result->exit_code = WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
         result->exit_code = 128 + WTERMSIG(status);
@@ -197,21 +203,30 @@ void compiler_log(const JitCompileInput& input, const std::string& message) {
 }  // namespace
 
 std::string NvccCompiler::compiler_id() const {
-    static const std::string id = [] {
-        const std::string nvcc = resolve_nvcc();
-        ProcessResult result;
-        const std::vector<std::string> argv = {nvcc, "--version"};
-        if (run_process(argv, &result)) {
-            return "nvcc=" + nvcc + "\n" + result.output;
-        }
+    std::string id;
+    std::string error;
+    if (probe_compiler_id(&id, &error)) return id;
+    return error;
+}
 
-        std::ostringstream out;
-        out << "nvcc=" << nvcc << "\nversion unavailable";
-        if (result.exit_code >= 0) out << " exit_code=" << result.exit_code;
-        if (!result.output.empty()) out << "\n" << result.output;
-        return out.str();
-    }();
-    return id;
+bool NvccCompiler::probe_compiler_id(std::string* id,
+                                     std::string* error) const {
+    if (id == nullptr) return false;
+    const std::string nvcc = resolve_nvcc();
+    ProcessResult result;
+    const std::vector<std::string> argv = {nvcc, "--version"};
+    if (run_process(argv, &result)) {
+        *id = "nvcc=" + nvcc + "\n" + result.output;
+        return true;
+    }
+
+    std::ostringstream out;
+    out << "nvcc=" << nvcc << " --version failed";
+    if (result.exit_code >= 0) out << " exit_code=" << result.exit_code;
+    if (!result.output.empty()) out << "\n" << result.output;
+    id->clear();
+    if (error != nullptr) *error = out.str();
+    return false;
 }
 
 std::vector<std::string> NvccCompiler::compile_options(
@@ -260,6 +275,7 @@ bool NvccCompiler::compile_to_cubin(const JitCompileInput& input,
     output->cubin.clear();
     output->log.clear();
     output->compiler_sec = 0.0;
+    output->cacheable_failure = false;
 
     if (input.source_path.empty() || input.cubin_path.empty()) {
         output->log =
@@ -313,6 +329,9 @@ bool NvccCompiler::compile_to_cubin(const JitCompileInput& input,
     output->log = log.str();
 
     if (!ok) {
+        output->cacheable_failure = result.started && result.exited &&
+                                    result.exit_code != 0 &&
+                                    result.exit_code != 127;
         compiler_log(input, "compiler=nvcc action=compile_failed exit_code=" +
                                 std::to_string(result.exit_code) +
                                 " nvcc_process_sec=" +
