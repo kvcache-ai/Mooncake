@@ -637,7 +637,7 @@ sum by (event) (
 increase(tent_stream_events_total{
   transport="hp_tcp",event="connect_started"
 }[5m])
--
+- ignoring(event)
 increase(tent_stream_events_total{
   transport="hp_tcp",event="connect_success"
 }[5m])
