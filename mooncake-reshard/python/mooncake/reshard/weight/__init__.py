@@ -11,6 +11,11 @@ from .tiled_coo import (
     TiledCOOTileRun,
     plan_tiled_coo_read,
 )
+from .tiled_coo_structured import (
+    TiledCOOStructuredMembers,
+    tiled_coo_directory_ranges,
+    tiled_coo_payload_ranges,
+)
 from .manifest import (
     OwnershipAxis,
     ParallelRank,
@@ -89,6 +94,9 @@ __all__ = [
     "TiledCOORecord",
     "TiledCOOTileRun",
     "plan_tiled_coo_read",
+    "TiledCOOStructuredMembers",
+    "tiled_coo_directory_ranges",
+    "tiled_coo_payload_ranges",
     "ParallelRank",
     "ParallelTopology",
     "PlacementFragment",
