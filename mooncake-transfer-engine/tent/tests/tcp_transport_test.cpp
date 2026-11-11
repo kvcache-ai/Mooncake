@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <memory>
@@ -96,6 +97,104 @@ std::shared_ptr<ControlService> startUniqueTcpService(uint16_t* port) {
     }
     return nullptr;
 }
+
+// Models an endpoint that was previously advertised by a v2 process but now
+// serves the legacy data RPCs at the same address. GetSegmentDesc can switch
+// to the new legacy snapshot while the client still holds the old v2 one.
+class LegacyTcpPeer {
+   public:
+    LegacyTcpPeer(char* target, size_t length)
+        : target_(target), length_(length), process_(makeTcpProcessIdentity()) {
+        server_.registerFunction(GetSegmentDesc, [this](const std::string_view&,
+                                                        std::string& response) {
+            nlohmann::json encoded = segment();
+            response = encoded.dump();
+        });
+        server_.registerFunction(SendData, [this](
+                                               const std::string_view& request,
+                                               std::string& response) {
+            if (request.size() < sizeof(XferDataDesc)) {
+                response = "legacy WRITE request is too short";
+                return;
+            }
+            XferDataDesc desc;
+            memcpy(&desc, request.data(), sizeof(desc));
+            const uint64_t address = le64toh(desc.peer_mem_addr);
+            const size_t length = le64toh(desc.length);
+            if (address != reinterpret_cast<uint64_t>(target_) ||
+                length != length_ || request.size() != sizeof(desc) + length) {
+                response = "legacy WRITE request is invalid";
+                return;
+            }
+            memcpy(target_, request.data() + sizeof(desc), length);
+            ++v1_writes_;
+        });
+        server_.registerFunction(
+            RecvData,
+            [this](const std::string_view& request, std::string& response) {
+                if (request.size() != sizeof(XferDataDesc)) {
+                    response = "legacy READ request is invalid";
+                    return;
+                }
+                XferDataDesc desc;
+                memcpy(&desc, request.data(), sizeof(desc));
+                const uint64_t address = le64toh(desc.peer_mem_addr);
+                const size_t length = le64toh(desc.length);
+                if (address != reinterpret_cast<uint64_t>(target_) ||
+                    length != length_) {
+                    response = "legacy READ target is invalid";
+                    return;
+                }
+                response.assign(target_, length);
+                ++v1_reads_;
+            });
+        uint16_t port = 0;
+        status_ = server_.start(port);
+        if (status_.ok()) {
+            address_ = "127.0.0.1:" + std::to_string(port);
+        }
+    }
+
+    bool available() const { return status_.ok(); }
+    const std::string& address() const { return address_; }
+    void advertiseV2(bool enabled) { advertise_v2_.store(enabled); }
+    int v1Writes() const { return v1_writes_.load(); }
+    int v1Reads() const { return v1_reads_.load(); }
+
+   private:
+    SegmentDesc segment() const {
+        SegmentDesc result;
+        result.name = address_;
+        result.type = SegmentType::Memory;
+        result.machine_id = "legacy-tcp-test-peer";
+        result.rpc_server_addr = address_;
+        result.detail = MemorySegmentDesc{};
+
+        BufferDesc buffer;
+        buffer.addr = reinterpret_cast<uint64_t>(target_);
+        buffer.length = length_;
+        buffer.permission = kGlobalReadWrite;
+        auto& memory = std::get<MemorySegmentDesc>(result.detail);
+        if (advertise_v2_.load()) {
+            memory.transport_attrs[static_cast<int>(TransportType::TCP)] =
+                encodeTcpProcessAttr(process_);
+            buffer.transport_attrs[TransportType::TCP] =
+                encodeTcpRegistrationAttr(1);
+        }
+        memory.buffers.push_back(std::move(buffer));
+        return result;
+    }
+
+    CoroRpcAgent server_;
+    char* target_;
+    size_t length_;
+    TcpProcessIdentity process_;
+    std::atomic<bool> advertise_v2_{true};
+    std::atomic<int> v1_writes_{0};
+    std::atomic<int> v1_reads_{0};
+    Status status_;
+    std::string address_;
+};
 
 TEST(TcpTransportConfigTest, InstallWithoutConfigKeepsStructDefaults) {
     TcpTransport transport;
@@ -648,6 +747,74 @@ TEST(TcpTransportIdentityTest, RefreshesStaleRegistrationBeforeWriteReplay) {
     ASSERT_TRUE(server.removeMemoryBuffer(second).ok());
     EXPECT_TRUE(client.uninstall().ok());
     EXPECT_TRUE(server.uninstall().ok());
+}
+
+TEST(TcpTransportIdentityTest,
+     RefreshesV2MetadataAfterPeerRollsBackToLegacyAtSameEndpoint) {
+    std::array<char, 8> target{};
+    LegacyTcpPeer legacy(target.data(), target.size());
+    ASSERT_TRUE(legacy.available());
+
+    uint16_t client_port = 0;
+    auto client_metadata = startUniqueTcpService(&client_port);
+    ASSERT_NE(client_metadata, nullptr);
+    TcpTransport client;
+    std::string client_name = "127.0.0.1:" + std::to_string(client_port);
+    ASSERT_TRUE(client.install(client_name, client_metadata, nullptr).ok());
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        segment.name = client_name;
+                        segment.rpc_server_addr = client_name;
+                        return Status::OK();
+                    })
+                    .ok());
+
+    SegmentID target_id = 0;
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .openRemote(target_id, legacy.address())
+                    .ok());
+    SegmentDescRef v2_snapshot;
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .getRemoteCached(v2_snapshot, target_id)
+                    .ok());
+    ASSERT_NE(v2_snapshot->getMemory().transport_attrs.find(
+                  static_cast<int>(TransportType::TCP)),
+              v2_snapshot->getMemory().transport_attrs.end());
+
+    // The cached snapshot still selects SendDataV2, but the same endpoint no
+    // longer has that handler. Its pre-dispatch rejection must invalidate the
+    // snapshot and safely replay the WRITE through SendData.
+    legacy.advertiseV2(false);
+    std::array<char, 8> written{'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k'};
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = written.data();
+    request.target_id = target_id;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = target.size();
+    ASSERT_TRUE(TcpTransportTestPeer::transfer(client, request).ok());
+    EXPECT_EQ(target, written);
+    EXPECT_EQ(legacy.v1Writes(), 1);
+
+    // Recreate a stale v2 cache entry for READ and verify the same endpoint
+    // refreshes to the legacy snapshot before copying the response.
+    legacy.advertiseV2(true);
+    ASSERT_TRUE(
+        client_metadata->segmentManager().invalidateRemote(target_id).ok());
+    ASSERT_TRUE(client_metadata->segmentManager()
+                    .getRemoteCached(v2_snapshot, target_id)
+                    .ok());
+    legacy.advertiseV2(false);
+    target = {'r', 'e', 'a', 'd', '-', 'v', 'o', 'k'};
+    std::array<char, 8> received{};
+    request.opcode = Request::READ;
+    request.source = received.data();
+    ASSERT_TRUE(TcpTransportTestPeer::transfer(client, request).ok());
+    EXPECT_EQ(received, target);
+    EXPECT_EQ(legacy.v1Reads(), 1);
+
+    EXPECT_TRUE(client_metadata->segmentManager().closeRemote(target_id).ok());
+    EXPECT_TRUE(client.uninstall().ok());
 }
 
 TEST(TcpTransportIdentityTest, RealRpcLeasesDrainRemoveAndUninstall) {

@@ -283,8 +283,16 @@ Status ControlClient::sendDataV2(const std::string& server_addr,
             loader.copy(request.data() + sizeof(desc), local_mem_addr, length));
     }
     std::string response;
-    CHECK_STATUS(tl_rpc_agent.callOwned(server_addr, SendDataV2,
-                                        std::move(request), response));
+    auto status = tl_rpc_agent.callOwned(server_addr, SendDataV2,
+                                         std::move(request), response);
+    if (status.IsRpcFunctionNotFound()) {
+        // The old peer rejected the id before entering a data handler. It is
+        // therefore safe for TcpTransport to refresh metadata and replay even
+        // a WRITE through the legacy RPC selected by the new snapshot.
+        return Status::NeedsRefreshCache(
+            "peer does not support TCP data RPC v2");
+    }
+    if (!status.ok()) return status;
     CHECK_STATUS(decodeTcpDataV2Status(response));
     return response.size() == 1 ? Status::OK()
                                 : Status::RpcServiceError(
@@ -301,7 +309,12 @@ Status ControlClient::recvDataV2(const std::string& server_addr,
     const auto desc = encodeTcpDataV2Desc(peer_mem_addr, length, identity);
     std::string request(reinterpret_cast<const char*>(&desc), sizeof(desc));
     std::string response;
-    CHECK_STATUS(tl_rpc_agent.call(server_addr, RecvDataV2, request, response));
+    auto status = tl_rpc_agent.call(server_addr, RecvDataV2, request, response);
+    if (status.IsRpcFunctionNotFound()) {
+        return Status::NeedsRefreshCache(
+            "peer does not support TCP data RPC v2");
+    }
+    if (!status.ok()) return status;
     CHECK_STATUS(decodeTcpDataV2Status(response));
     if (response.size() != length + 1) {
         return Status::RpcServiceError("TCP data v2 response length mismatch");
