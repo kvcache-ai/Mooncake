@@ -57,6 +57,12 @@ jobs:
             exit 1
           fi
 
+      - name: Checkout EP test sources for indexed-wheel validation
+        if: ${{ inputs.testpypi_version != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_sha || github.sha }}
+
       - name: Set up Python for TestPyPI download
         if: ${{ inputs.testpypi_version != '' }}
         uses: actions/setup-python@v5
@@ -76,6 +82,8 @@ jobs:
             --pre \
             --dest integration-wheel \
             "mooncake-transfer-engine-cuda13==${TESTPYPI_VERSION}"
+          tar -czf integration-wheel/mooncake-ep-tests.tar.gz \
+            python/tests/ep/*.py mooncake-ep/benchmarks/ep_benchmark/*.py
 
       - name: Stage the indexed wheel for T-one
         if: ${{ inputs.testpypi_version != '' }}
@@ -83,7 +91,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mooncake-testpypi-tone-${{ inputs.testpypi_version }}
-          path: integration-wheel/*.whl
+          path: |
+            integration-wheel/*.whl
+            integration-wheel/mooncake-ep-tests.tar.gz
           if-no-files-found: error
           retention-days: 14
 

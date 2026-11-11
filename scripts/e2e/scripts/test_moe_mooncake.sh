@@ -29,6 +29,18 @@ run_ep_tests()
 {
     local source_root
     source_root=$(cd "${E2E_DIR:-${BASE_DIR}/../e2e}/../.." && pwd) || return 1
+    if [ ! -f "$source_root/python/tests/ep/test_ep_grid.py" ]; then
+        # TONE stages scripts separately from the checkout. The exact-wheel
+        # artifact also carries the matching test sources.
+        local archive="${BASE_DIR}/run/whls/mooncake-ep-tests.tar.gz"
+        if [ ! -f "$archive" ]; then
+            echo "ERROR: EP test source bundle is missing from the wheel artifact: $archive" >&2
+            return 1
+        fi
+        source_root="${BASE_DIR}/run/ep-test-sources"
+        mkdir -p "$source_root" || return 1
+        tar -xzf "$archive" -C "$source_root" || return 1
+    fi
 
     # Copy tests only: imports of mooncake still resolve to the installed wheel.
     docker cp "${source_root}/python/tests/ep" \
