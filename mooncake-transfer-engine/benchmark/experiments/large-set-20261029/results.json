@@ -1,0 +1,164 @@
+{
+  "active_bytes": 8589934592,
+  "per_thread_bytes": 1073741824,
+  "submission_threads": 8,
+  "nic_count": 8,
+  "authorized_logical_cpus_per_host": 16,
+  "units": "decimal GB/s",
+  "measurement_seconds": 20,
+  "ddio_changed": false,
+  "saturated_400_GBps": false,
+  "repeated": {
+    "repeat_baseline": {
+      "n": 3,
+      "mean_GBps": 278.00292336258775,
+      "min_GBps": 277.7019123879082,
+      "max_GBps": 278.3596924911637,
+      "runs": [
+        278.3596924911637,
+        277.7019123879082,
+        277.9471652086914
+      ]
+    },
+    "repeat_candidate": {
+      "n": 3,
+      "mean_GBps": 281.0744072776601,
+      "min_GBps": 280.93805017798627,
+      "max_GBps": 281.18392947169116,
+      "runs": [
+        281.18392947169116,
+        280.93805017798627,
+        281.10124218330293
+      ]
+    },
+    "cycle256k_depth64": {
+      "n": 3,
+      "mean_GBps": 276.21875,
+      "min_GBps": 276.08750000000003,
+      "max_GBps": 276.46625,
+      "runs": [
+        276.08750000000003,
+        276.46625,
+        276.1025
+      ]
+    }
+  },
+  "screening": [
+    {
+      "case": "counter_only",
+      "GBps": 280.4987850505958,
+      "seconds": 20
+    },
+    {
+      "case": "fast_both",
+      "GBps": 281.4142600756807,
+      "seconds": 20
+    },
+    {
+      "case": "fast_disabled",
+      "GBps": 280.51109416211034,
+      "seconds": 20
+    },
+    {
+      "case": "fresh_baseline",
+      "GBps": 277.1803906151806,
+      "seconds": 20
+    },
+    {
+      "case": "notify_only",
+      "GBps": 281.557020320285,
+      "seconds": 20
+    },
+    {
+      "case": "peer_only",
+      "GBps": 279.1215551046566,
+      "seconds": 20
+    },
+    {
+      "case": "peer_q2_w128_s16",
+      "GBps": 275.3888768969446,
+      "seconds": 10
+    },
+    {
+      "case": "peer_q2_w512_s16",
+      "GBps": 275.0395992421811,
+      "seconds": 10
+    },
+    {
+      "case": "peer_q4_w128_s16",
+      "GBps": 274.7856142647584,
+      "seconds": 10
+    },
+    {
+      "case": "peer_q4_w512_s16",
+      "GBps": 272.7084819829051,
+      "seconds": 10
+    },
+    {
+      "case": "peer_q8_w4096_s16",
+      "GBps": 272.6613453304712,
+      "seconds": 10
+    },
+    {
+      "case": "peer_q8_w512_s16",
+      "GBps": 270.26581325321007,
+      "seconds": 10
+    },
+    {
+      "case": "pin_disabled",
+      "GBps": 278.2810451991925,
+      "seconds": 20
+    },
+    {
+      "case": "pin_enabled",
+      "GBps": 278.0805727646467,
+      "seconds": 20
+    },
+    {
+      "case": "pin_peer",
+      "GBps": 281.1251411336506,
+      "seconds": 20
+    },
+    {
+      "case": "source_s0_a1",
+      "GBps": 281.1107685392215,
+      "seconds": 10
+    },
+    {
+      "case": "source_s0_a1_v2",
+      "GBps": 280.1447911083893,
+      "seconds": 10
+    },
+    {
+      "case": "source_s256_a1_v2",
+      "GBps": 74.03390683681513,
+      "seconds": 10
+    },
+    {
+      "case": "source_s512_a1_v2",
+      "GBps": 173.63969600871735,
+      "seconds": 10
+    },
+    {
+      "case": "source_s64_a0_v2",
+      "GBps": 52.2204213688169,
+      "seconds": 10
+    },
+    {
+      "case": "source_s64_a16_v2",
+      "GBps": 86.04254238631687,
+      "seconds": 10
+    },
+    {
+      "case": "source_s64_a1_v2",
+      "GBps": 51.059821903701256,
+      "seconds": 10
+    }
+  ],
+  "binary_sha256": {
+    "baseline": "dacf64d0bb69fdd9a2e0422627eb4d5b7a84b2d5b86094f8cf00cc50853c862b",
+    "candidate": "b9e27249269ab76b317110f6c858a23c47084bc65dacab10f5541fd318fcdfdf",
+    "cyclic_perftest": "3ccc4ba31270249214f9e8bf8d7976e9852603e35c6a43b5d71b91a32b73595f"
+  },
+  "source_scope": "Archived experiment; extra patches preserved in this directory, not ported into production source or measured on this PR head."
+}

@@ -103,6 +103,14 @@ class TEBenchRunner : public BenchRunner {
                              uint64_t batch_size, OpCode opcode,
                              uint64_t deadline_ns, IntentType intent_type);
 
+    // Experimental rolling window: total_batch_size is the fixed working set,
+    // split into non-overlapping slots. Latencies are per completed slot.
+    int runRollingTransfers(uint64_t local_addr, uint64_t target_id,
+                            uint64_t target_addr, uint64_t block_size,
+                            uint64_t total_batch_size, OpCode opcode,
+                            uint32_t inflight, uint64_t duration_us,
+                            std::vector<double>& latencies);
+
    private:
     int allocateBuffers();
 

@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
+#include <string_view>
 #include <cerrno>
 #include <cstddef>
 #include <chrono>
@@ -1369,14 +1371,22 @@ int RdmaEndPoint::submitPostSend(
     size_t total_posted = 0;
     size_t cursor = 0;
 
-    for (size_t qp_index = 0;
-         qp_index < num_qp && cq_remaining > 0 && cursor < requested;
-         ++qp_index) {
+    // Experimental opt-in, to compare against the historical QP-0-first
+    // policy. Tiny replenishments must not permanently favor the first QPs.
+    static const bool rotate_qps = [] {
+        const char *value = std::getenv("MC_EXPERIMENTAL_RR_QP");
+        return value && std::string_view(value) == "1";
+    }();
+    const size_t start_qp = rotate_qps && num_qp ? next_post_qp_ % num_qp : 0;
+    for (size_t qp_offset = 0;
+         qp_offset < num_qp && cq_remaining > 0 && cursor < requested;
+         ++qp_offset) {
+        const size_t qp_index = (start_qp + qp_offset) % num_qp;
         int qp_avail = max_wr_depth_ -
                        wr_depth_list_[qp_index].load(std::memory_order_relaxed);
         if (qp_avail <= 0) continue;
 
-        size_t remaining_qps = num_qp - qp_index;
+        size_t remaining_qps = num_qp - qp_offset;
         size_t remaining_slices = requested - cursor;
         size_t chunk = (remaining_slices + remaining_qps - 1) / remaining_qps;
         size_t start = cursor;
@@ -1424,6 +1434,7 @@ int RdmaEndPoint::submitPostSend(
         // be polled before the diagnostic registry sees the slice.
         context_.trackPostedSlices(slice_list, start, wr_count);
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
+        if (rotate_qps) next_post_qp_ = (qp_index + 1) % num_qp;
         size_t posted = static_cast<size_t>(wr_count);
         if (rc) {
             LOG(ERROR) << "Failed to ibv_post_send: " << strerror(rc);

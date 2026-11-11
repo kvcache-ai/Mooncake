@@ -1,0 +1,201 @@
+--- a/mooncake-transfer-engine/benchmark/te_backend.cpp
++++ b/mooncake-transfer-engine/benchmark/te_backend.cpp
+@@ -68,6 +68,7 @@
+ }
+
+ thread_local int experimental_thread_nic_hint = -1;
++thread_local int experimental_submission_thread_id = -1;
+ }
+
+
+@@ -481,6 +482,61 @@
+         LOG(ERROR) << "Target cannot start: initialization failed";
+         return -1;
+     }
++    const char* assist_env = std::getenv("MC_EXPERIMENTAL_PROGRESS_PREFETCH");
++    if (assist_env && std::strcmp(assist_env, "1") == 0) {
++        CHECK_EQ(XferBenchConfig::seg_type, "DRAM");
++        CHECK_EQ(pinned_buffer_list_.size(), 2u);
++        CHECK_EQ(XferBenchConfig::total_buffer_size, 8589934592ull);
++        const uint64_t active_bytes = 1073741824ull;
++        const uint64_t slot_bytes = 524288ull;
++        const uint64_t chunk_count = active_bytes / slot_bytes;
++        const char* stride_env = std::getenv("MC_EXPERIMENTAL_PROGRESS_STRIDE");
++        const uint64_t stride = stride_env ? std::strtoull(stride_env, nullptr, 10) : 256;
++        const char* ahead_env = std::getenv("MC_EXPERIMENTAL_PROGRESS_AHEAD");
++        const uint64_t ahead = ahead_env ? std::strtoull(ahead_env, nullptr, 10) : 16;
++        const char* span_env = std::getenv("MC_EXPERIMENTAL_PROGRESS_SPAN");
++        const uint64_t span = span_env ? std::strtoull(span_env, nullptr, 10) : 4;
++        CHECK(stride == 64 || stride == 128 || stride == 256 || stride == 512);
++        CHECK_LT(ahead, chunk_count); CHECK_GT(span, 0u); CHECK_LE(span, 64u);
++        CHECK(std::getenv("MC_EXPERIMENTAL_SUBMIT_CPUS"));
++        std::vector<std::thread> helpers;
++        for (int nic = 0; nic < 8; ++nic) {
++            helpers.emplace_back([&, nic] {
++                const int node = nic / 4, rank = nic % 4;
++                experimentalPinCpu("MC_EXPERIMENTAL_SUBMIT_CPUS", 2 * rank + node);
++                auto* region = static_cast<unsigned char*>(pinned_buffer_list_[node]) + rank * active_bytes;
++                auto* cursor = reinterpret_cast<volatile const uint64_t*>(
++                    static_cast<unsigned char*>(pinned_buffer_list_[node]) +
++                    XferBenchConfig::total_buffer_size - 131072 + nic * 64);
++                uint64_t last = 0, hints = 0;
++                while (g_te_running) {
++                    const uint64_t value = *cursor;
++                    if (value != last && value > 0 && value <= chunk_count) {
++                        last = value;
++                        // Potentially stale/torn hints are bounded and only
++                        // affect prefetch performance, never payload correctness.
++                        for (uint64_t j = 0; j < span; ++j) {
++                            const uint64_t chunk = (value - 1 + ahead + j) % chunk_count;
++                            for (uint64_t off = 0; off < slot_bytes; off += stride)
++                                __builtin_prefetch(region + chunk * slot_bytes + off, 0, 1);
++                        }
++                        ++hints;
++                    } else {
++#if defined(__x86_64__) || defined(__i386__)
++                        __asm__ volatile("pause" ::: "memory");
++#else
++                        std::this_thread::yield();
++#endif
++                    }
++                }
++                LOG(INFO) << "Experimental progress prefetch nic=" << nic
++                          << " hints=" << hints << " stride=" << stride
++                          << " ahead=" << ahead << " span=" << span;
++            });
++        }
++        for (auto& helper : helpers) helper.join();
++        return 0;
++    }
+     const char* warm_env = std::getenv("MC_EXPERIMENTAL_TARGET_WARM_BYTES");
+     const uint64_t warm_bytes = warm_env ? std::strtoull(warm_env, nullptr, 10) : 0;
+     if (!warm_bytes) {
+@@ -588,6 +644,7 @@
+ }
+
+ void TEBenchRunner::pinThread(int thread_id) {
++    experimental_submission_thread_id = thread_id;
+     experimental_thread_nic_hint = -1;
+     if (const char* value = std::getenv("MC_EXPERIMENTAL_THREAD_NICS")) {
+         const auto names = splitCommaSeparated(value);
+@@ -793,6 +850,35 @@
+     return -1.0;
+ }
+
++
++std::pair<uint64_t, uint64_t> TEBenchRunner::experimentalControlAddresses(
++    uint64_t local_addr, uint64_t target_addr, uint64_t target_id) const {
++    CHECK_EQ(XferBenchConfig::seg_type, "DRAM");
++    CHECK_EQ(XferBenchConfig::total_buffer_size, 8589934592ull);
++    CHECK_EQ(pinned_buffer_list_.size(), 2u);
++    CHECK_EQ(target_infos_.size(), 1u);
++    CHECK_EQ(target_handles_[0], target_id);
++    CHECK_GE(experimental_thread_nic_hint, 0);
++    CHECK_LT(experimental_thread_nic_hint, 8);
++    // nic_hint is an index in the discovered HCA list, not mlx5_N's N.
++    // Buffer placement is based on the submission thread, independent of it.
++    CHECK_GE(experimental_submission_thread_id, 0);
++    CHECK_LT(experimental_submission_thread_id, 8);
++    CHECK_EQ(current_task_.size(), 8u);
++    const uint64_t active_bytes = 1073741824ull;
++    const uint64_t node = experimental_submission_thread_id % 2;
++    const uint64_t rank = experimental_submission_thread_id / 2;
++    const uint64_t nic = node * 4 + rank;
++    const uint64_t local_base = reinterpret_cast<uint64_t>(pinned_buffer_list_[node]);
++    CHECK_EQ(local_addr, local_base + rank * active_bytes);
++    const auto& info = target_infos_[0];
++    CHECK_EQ(info->buffers.size(), 2u);
++    const auto& target = info->buffers[node];
++    CHECK_EQ(target.length, XferBenchConfig::total_buffer_size);
++    CHECK_EQ(target_addr, target.addr + rank * active_bytes);
++    return {local_base + XferBenchConfig::total_buffer_size - 131072 + nic * 4096,
++            target.addr + target.length - 131072 + nic * 64};
++}
+
+ int TEBenchRunner::runRollingTransfers(
+     uint64_t local_addr, uint64_t target_id, uint64_t target_addr,
+@@ -856,6 +942,17 @@
+         CHECK_EQ(XferBenchConfig::xport_type, "rdma");
+         CHECK_LE(globalConfig().slice_timeout, 0);
+     }
++    const char* progress_env = std::getenv("MC_EXPERIMENTAL_PROGRESS_PREFETCH");
++    const bool progress = opcode == WRITE && progress_env &&
++        std::strcmp(progress_env, "1") == 0;
++    std::pair<uint64_t, uint64_t> control{0, 0};
++    if (progress) {
++        CHECK_EQ(block_size * total_batch_size, 1073741824ull);
++        CHECK_EQ(slot_bytes, 524288ull); CHECK_LE(inflight, 64u);
++        CHECK_EQ(chunk_stride, 1u); CHECK_EQ(phase_chunks, 0u);
++        control = experimentalControlAddresses(local_addr, target_addr, target_id);
++    }
++    uint64_t progress_posts = 0;
+     XferBenchTimer clock;
+     const char* initiator_warm_env = std::getenv("MC_EXPERIMENTAL_INITIATOR_WARM_US");
+     const uint64_t initiator_warm_us = initiator_warm_env ? std::strtoull(initiator_warm_env, nullptr, 10) : 0;
+@@ -880,13 +977,13 @@
+         if (!visited[slot.chunk]) { visited[slot.chunk] = true; ++visited_count; }
+         next_chunk = (next_chunk + chunk_stride) % chunk_count;
+         slot.submitted_us = clock.lap_us(false);
+-        slot.id = engine_->allocateBatchID(slot_batch_size);
++        slot.id = engine_->allocateBatchID(slot_batch_size + (progress ? 1 : 0));
+         slot.active = true;
+         ++active;
+         std::vector<TransferRequest> temporary_requests;
+         auto& requests = reuse_requests ? slot.requests : temporary_requests;
+         if (requests.empty()) {
+-            if (reuse_requests) requests.reserve(slot_batch_size);
++            if (reuse_requests) requests.reserve(slot_batch_size + (progress ? 1 : 0));
+             for (uint64_t i = 0; i < slot_batch_size; ++i) {
+                 const uint64_t offset = slot.chunk * slot_bytes + i * block_size;
+                 TransferRequest entry;
+@@ -908,6 +1005,21 @@
+                 requests[i].source = reinterpret_cast<void*>(local_addr + offset);
+                 requests[i].target_offset = target_addr + offset;
+             }
++        }
++        if (progress) {
++            // Per-slot source is not reused until all requests, including this
++            // hint, have completed. The cursor is outside the 8 GiB payload.
++            const uint64_t source = control.first + index * 64;
++            std::memset(reinterpret_cast<void*>(source), 0, 64);
++            *reinterpret_cast<uint64_t*>(source) = slot.chunk + 1;
++            TransferRequest hint;
++            hint.nic_hint = experimental_thread_nic_hint;
++            hint.opcode = TransferRequest::WRITE;
++            hint.length = 64; hint.source = reinterpret_cast<void*>(source);
++            hint.target_id = target_id; hint.target_offset = control.second;
++            if (requests.size() == slot_batch_size) requests.push_back(hint);
++            else requests[slot_batch_size] = hint;
++            ++progress_posts;
+         }
+         // Prefetch only inside this thread's unchanged source working set.
+         // No payload modification, repeated hot-range transfer, or extra RDMA
+@@ -1003,6 +1115,8 @@
+         }
+         slot.active = false;
+     }
++    if (progress) LOG(INFO) << "Experimental progress control posted_bytes="
++                           << progress_posts * 64 << " excluded_from_payload_GBps=1";
+     LOG(INFO) << "Rolling address coverage=" << visited_count << "/" << chunk_count
+               << " footprint_bytes=" << block_size * total_batch_size
+               << " window_bytes=" << block_size * window;
+--- a/mooncake-transfer-engine/benchmark/te_backend.h
++++ b/mooncake-transfer-engine/benchmark/te_backend.h
+@@ -16,6 +16,7 @@
+ #define TEV0_BACKEND_H
+
+ #include "bench_runner.h"
++#include <utility>
+ #include "utils.h"
+
+ #include <string>
+@@ -118,6 +119,9 @@
+                             std::vector<double>& latencies);
+
+    private:
++    std::pair<uint64_t, uint64_t> experimentalControlAddresses(
++        uint64_t local_addr, uint64_t target_addr, uint64_t target_id) const;
++
+     int allocateBuffers();
+
+     int freeBuffers();

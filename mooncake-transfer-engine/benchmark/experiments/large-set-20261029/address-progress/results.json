@@ -1,0 +1,1602 @@
+{
+  "status": "NOT 400 GB/s; no new repeated improvement",
+  "units": "decimal GB/s; completed payload only; control excluded",
+  "tested_binary_sha256": {
+    "address": "89c359052e06ad0f1d423738f81482d9d61d3b510966558462be8b6cfdc21cae",
+    "progress": "1151f01cea6310759097aaa40bf4a5f65bf8c81548289fb876c35d921ddb8690",
+    "coarse": "3210b001e92dece246d0e49cb87ebac0ca47c792bae95bd27bd1ea399fe721dc"
+  },
+  "rows": [
+    {
+      "round": "address",
+      "case": "assist_off",
+      "runtime_stage": "runtime-assist",
+      "GBps": 280.0074775114593,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2803691421696,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "0",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "4"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "assist_off_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "assist_off_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "address",
+      "case": "fresh_baseline",
+      "runtime_stage": "runtime-baseline",
+      "GBps": 281.2008217055084,
+      "duration_s": 20,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 5629284450304,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "fresh_baseline_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "fresh_baseline_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "address",
+      "case": "gap_both_2048",
+      "runtime_stage": "runtime-address",
+      "GBps": 280.3534376020415,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2806730194944,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_SOURCE_THREAD_GAP": "2048",
+        "MC_EXPERIMENTAL_TARGET_THREAD_GAP": "2048"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "address",
+      "case": "gap_both_4096",
+      "runtime_stage": "runtime-address",
+      "GBps": 280.26462008181494,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2806006153216,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_SOURCE_THREAD_GAP": "4096",
+        "MC_EXPERIMENTAL_TARGET_THREAD_GAP": "4096"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "address",
+      "case": "gap_both_64",
+      "runtime_stage": "runtime-address",
+      "GBps": 279.58202031701484,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2799303131136,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_SOURCE_THREAD_GAP": "64",
+        "MC_EXPERIMENTAL_TARGET_THREAD_GAP": "64"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "gap_both_64_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "gap_both_64_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "address",
+      "case": "gap_both_65536",
+      "runtime_stage": "runtime-address",
+      "GBps": 280.7599209874343,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2811175108608,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_SOURCE_THREAD_GAP": "65536",
+        "MC_EXPERIMENTAL_TARGET_THREAD_GAP": "65536"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "address",
+      "case": "gap_source_4096",
+      "runtime_stage": "runtime-address",
+      "GBps": 280.41229329495997,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2807357243392,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_SOURCE_THREAD_GAP": "4096"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "address",
+      "case": "gap_target_4096",
+      "runtime_stage": "runtime-address",
+      "GBps": 279.0858507667823,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2794078076928,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_TARGET_THREAD_GAP": "4096"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "gap_target_4096_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "gap_target_4096_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "address",
+      "case": "phase_83",
+      "runtime_stage": "runtime-address",
+      "GBps": 279.3956870946831,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2797621215232,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PHASE_CHUNKS": "83"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "phase_83_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "phase_83_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "address",
+      "case": "stride17_gap4096",
+      "runtime_stage": "runtime-address",
+      "GBps": 280.63551847994387,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2809515737088,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_CHUNK_STRIDE": "17",
+        "MC_EXPERIMENTAL_PHASE_CHUNKS": "83",
+        "MC_EXPERIMENTAL_SOURCE_THREAD_GAP": "4096",
+        "MC_EXPERIMENTAL_TARGET_THREAD_GAP": "4096"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "address",
+      "case": "stride_127_phase83",
+      "runtime_stage": "runtime-address",
+      "GBps": 280.0798670343298,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2803935739904,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_CHUNK_STRIDE": "127",
+        "MC_EXPERIMENTAL_PHASE_CHUNKS": "83"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "address",
+      "case": "stride_17_phase83",
+      "runtime_stage": "runtime-address",
+      "GBps": 280.11205564185855,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2804087783424,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_CHUNK_STRIDE": "17",
+        "MC_EXPERIMENTAL_PHASE_CHUNKS": "83"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "stride_17_phase83_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "stride_17_phase83_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "address",
+      "case": "stride_3_phase83",
+      "runtime_stage": "runtime-address",
+      "GBps": 279.8726760648299,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2801869520896,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_CHUNK_STRIDE": "3",
+        "MC_EXPERIMENTAL_PHASE_CHUNKS": "83"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "address",
+      "case": "walk_control",
+      "runtime_stage": "runtime-address",
+      "GBps": 281.25767949713935,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2815593283584,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "assist_off",
+      "runtime_stage": "runtime-assist",
+      "GBps": 279.3581316102505,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2796619300864,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "0",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "4"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "assist_off_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "assist_off_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "progress",
+      "case": "assist_s128_a16_w2",
+      "runtime_stage": "runtime-assist",
+      "GBps": 193.1359682993131,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 1932914065408,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "128",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "2"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "assist_s256_a16_w2",
+      "runtime_stage": "runtime-assist",
+      "GBps": 192.92556916735384,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 1931291394048,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "2"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "assist_s512_a16_w2",
+      "runtime_stage": "runtime-assist",
+      "GBps": 192.9805914366751,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 1931424563200,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "512",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "2"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "assist_s512_a16_w2_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "assist_s512_a16_w2_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "progress",
+      "case": "coarse_hint_only",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 280.24077207423926,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2805611888640,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "16",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "32",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "16"
+      },
+      "env_override": {
+        "A": {},
+        "B": {
+          "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "0"
+        }
+      },
+      "payload_checks": [
+        {
+          "id": "coarse_hint_only_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "coarse_hint_only_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "progress",
+      "case": "coarse_off",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 280.9834803853668,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2813274357760,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "0",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "16",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "32",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "16"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s128_e16_a32_w16",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 267.24584628290347,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2675333660672,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "16",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "128",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "32",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "16"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s128_e32_a64_w32",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 267.02478809522444,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2673348706304,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "32",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "128",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "64",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "32"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s256_e16_a16_w16",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 266.08833913788703,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2663916765184,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "16",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "16"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s256_e16_a32_w16",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 268.5272529718664,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2688965148672,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "16",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "32",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "16"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": [
+        {
+          "id": "coarse_s256_e16_a32_w16_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "coarse_s256_e16_a32_w16_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s256_e32_a64_w32",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 265.692752404297,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2660076879872,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "32",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "64",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "32"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s256_e4_a16_w4",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 270.8014373691418,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2711886495744,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "4",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "4"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s256_e8_a16_w8",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 268.01127485636613,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2683113570304,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "8",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "8"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s512_e16_a32_w16",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 271.30237811049165,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2715950252032,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "16",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "512",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "32",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "16"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s64_e16_a32_w16",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 262.152323541641,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2624471433216,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "16",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "64",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "32",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "16"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "coarse_s64_e32_a64_w32",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 263.22757972489427,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2635529191424,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "32",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "64",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "64",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "32"
+      },
+      "env_override": {
+        "A": {},
+        "B": {}
+      },
+      "payload_checks": []
+    },
+    {
+      "round": "progress",
+      "case": "hint_only",
+      "runtime_stage": "runtime-assist",
+      "GBps": 192.89270271320552,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 1930892410880,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "16",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "4"
+      },
+      "env_override": {
+        "A": {},
+        "B": {
+          "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "0"
+        }
+      },
+      "payload_checks": [
+        {
+          "id": "hint_only_write_seed",
+          "rc": 0
+        },
+        {
+          "id": "hint_only_read_verify",
+          "rc": 0
+        }
+      ]
+    },
+    {
+      "round": "progress",
+      "case": "target_spin_only",
+      "runtime_stage": "runtime-coarse",
+      "GBps": 280.68945839040845,
+      "duration_s": 10,
+      "active_bytes": 8589934592,
+      "payload_bytes_completed": 2812728573952,
+      "block_bytes": 262144,
+      "requests_per_thread": 4096,
+      "threads": 8,
+      "slots": 16,
+      "extra_args": [
+        "--experimental_window_requests=32"
+      ],
+      "env_both": {
+        "MC_WORKERS_PER_CTX": "1",
+        "MC_NUM_QP_PER_EP": "2",
+        "MC_MAX_WR": "1024",
+        "MC_MAX_CQE_PER_CTX": "32768",
+        "MC_RDMA_SIGNAL_INTERVAL": "32",
+        "MC_RDMA_WORKER_IDLE_SPIN_US": "1000",
+        "MC_MLX5_QP_LAG_PORT_BALANCE": "1",
+        "MC_SLICE_SIZE": "262144",
+        "MC_EXPERIMENTAL_RR_QP": "1",
+        "MC_EXPERIMENTAL_SPLIT_CPU": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_BYTES": "0",
+        "MC_EXPERIMENTAL_TARGET_WARM_US": "0",
+        "MC_EXPERIMENTAL_INITIATOR_WARM_US": "0",
+        "MC_EXPERIMENTAL_THREAD_NICS": "mlx5_0,mlx5_4,mlx5_1,mlx5_5,mlx5_2,mlx5_6,mlx5_3,mlx5_7",
+        "MC_EXPERIMENTAL_REUSE_REQUESTS": "1",
+        "MC_ENABLE_DEST_DEVICE_AFFINITY": "1",
+        "MC_EXPERIMENTAL_COUNTER_POLL": "1",
+        "MC_EXPERIMENTAL_SKIP_UNUSED_NOTIFY_LOCK": "1",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_STRIDE": "0",
+        "MC_EXPERIMENTAL_SOURCE_PREFETCH_CHUNKS": "1",
+        "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "0",
+        "MC_EXPERIMENTAL_PROGRESS_EVERY": "16",
+        "MC_EXPERIMENTAL_PROGRESS_STRIDE": "256",
+        "MC_EXPERIMENTAL_PROGRESS_AHEAD": "32",
+        "MC_EXPERIMENTAL_PROGRESS_SPAN": "16"
+      },
+      "env_override": {
+        "A": {},
+        "B": {
+          "MC_EXPERIMENTAL_PROGRESS_PREFETCH": "1"
+        }
+      },
+      "payload_checks": []
+    }
+  ]
+}
