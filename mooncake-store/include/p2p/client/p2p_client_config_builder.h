@@ -63,12 +63,12 @@ struct P2PClientConfig : RealClientConfigBase {
     // pending-write/pinned-key lease shards). Higher values reduce contention.
     size_t lock_shard_count = 1024;
 
-    // RouteCache configuration
+    // RouteCache is disabled by default
     // each size of route entry is about 240B:
     // Aligned Node(64B) + hash_bucket(8B) + Key(assume 64B)
     // + P2PRouteData(each item is 96B and count is 8B)
-    size_t route_cache_max_memory_bytes = 300 * 1024 * 1024;  // 300MB
-    uint64_t route_cache_ttl_ms = 60 * 1000;                  // 1min
+    size_t route_cache_max_memory_bytes = 0;  // 0 disables RouteCache.
+    uint64_t route_cache_ttl_ms = 60 * 1000;  // 1min
 
     // Async route notification.
     // async_sender_thread_count > 0 enables async notifier.
@@ -128,8 +128,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         const std::string& ipc_socket_path = "",
         uint16_t client_rpc_port = 12345, uint32_t rpc_thread_num = 2,
-        size_t lock_shard_count = 1024,
-        size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
+        size_t lock_shard_count = 1024, size_t route_cache_max_memory_bytes = 0,
         uint64_t route_cache_ttl_ms = 60 * 1000,
         const std::string& local_transfer_mode = "te",
         size_t local_io_worker_num = 32, uint16_t http_port = 9003,
@@ -351,8 +350,7 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         static constexpr uint16_t kDefaultClientRpcPort = 12345;
         static constexpr uint32_t kDefaultRpcThreadNum = 2;
         static constexpr size_t kDefaultLockShardCount = 1024;
-        static constexpr size_t kDefaultRouteCacheMaxMemoryBytes =
-            300ULL * 1024 * 1024;
+        static constexpr size_t kDefaultRouteCacheMaxMemoryBytes = 0;
         static constexpr uint64_t kDefaultRouteCacheTtlMs = 1ULL * 60 * 1000;
         static constexpr const char* kDefaultLocalTransferMode = "te";
         static constexpr size_t kDefaultLocalIoWorkerNum = 32;

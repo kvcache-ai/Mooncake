@@ -44,8 +44,8 @@ DEFINE_string(p2p_local_transfer_mode, "te",
               "Local transfer mode for P2P local Get/Put path: memcpy|te");
 DEFINE_uint64(local_io_worker_num, 32,
               "Local I/O worker count (V1: memcpy only; V2: both modes)");
-DEFINE_uint64(route_cache_max_memory_mb, 300,
-              "Max memory for RouteCache in MB (P2P mode)");
+DEFINE_uint64(route_cache_max_memory_mb, 0,
+              "Max memory for RouteCache in MB (P2P mode; 0 disables it)");
 DEFINE_uint64(route_cache_ttl_ms, 60000,
               "TTL for RouteCache entries in ms (P2P mode)");
 namespace mooncake {
