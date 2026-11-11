@@ -9,11 +9,9 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   add_compile_definitions(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL=1)
 endif()
 
-if(NOT GLOBAL_CONFIG)
-  if(USE_ETCD)
-    message(
-      FATAL_ERROR
-        "Cannot enable USE_ETCD while building transfer engine independently")
+if (NOT GLOBAL_CONFIG)
+  if (USE_ETCD)
+    message(FATAL_ERROR "Cannot enable USE_ETCD while building transfer engine independently")
   endif()
   include(../mooncake-common/FindJsonCpp.cmake)
   include(../mooncake-common/FindGLOG.cmake)
@@ -39,7 +37,7 @@ if(NOT GLOBAL_CONFIG)
                    ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
 endif() # GLOBAL_CONFIG
 
-if(USE_CUDA)
+if (USE_CUDA)
   set(CMAKE_REQUIRED_LIBRARIES mlx5)
   check_cxx_source_compiles(
     "#include <infiniband/mlx5dv.h>
@@ -55,22 +53,21 @@ if(USE_CUDA)
     MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
   unset(CMAKE_REQUIRED_LIBRARIES)
 
-  if(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+  if (MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
     add_compile_definitions(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
     message(STATUS "CUDA IBGDA DMA-BUF DevX UMEM support enabled")
   else()
-    message(
-      WARNING
-        "CUDA IBGDA DMA-BUF DevX UMEM support disabled: the installed mlx5 headers or libmlx5 do not provide MLX5DV_UMEM_MASK_DMABUF, mlx5dv_devx_umem_in::dmabuf_fd, and mlx5dv_devx_umem_reg_ex. Update rdma-core/libmlx5 to enable DMA-BUF control memory; Device API will use GPU-VA and host-mapped fallback."
-    )
+    message(WARNING
+      "CUDA IBGDA DMA-BUF DevX UMEM support disabled: the installed mlx5 headers or libmlx5 do not provide MLX5DV_UMEM_MASK_DMABUF, mlx5dv_devx_umem_in::dmabuf_fd, and mlx5dv_devx_umem_reg_ex. Update rdma-core/libmlx5 to enable DMA-BUF control memory; Device API will use GPU-VA and host-mapped fallback.")
   endif()
 endif()
 
-if(USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT
-       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if (USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
-  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR})
+  include_directories(/usr/local/include
+                      /usr/include
+                      ${ASCEND_INCLUDE_DIR})
 endif()
 
 include_directories(../mooncake-common/include)
@@ -85,19 +82,19 @@ add_subdirectory(allocator)
 
 add_subdirectory(src)
 
-if(BUILD_UNIT_TESTS)
+if (BUILD_UNIT_TESTS)
   add_subdirectory(tests)
 endif()
 
-if(BUILD_EXAMPLES)
+if (BUILD_EXAMPLES)
   add_subdirectory(example)
 endif()
 
-if(WITH_RUST_EXAMPLE)
+if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
 
-if(USE_TENT)
+if (USE_TENT)
   add_subdirectory(tent)
 endif()
 
@@ -105,6 +102,6 @@ endif()
 # backend; the TENT backend is compiled in conditionally (see benchmark/
 # CMakeLists.txt and main.cpp). Keep it gated solely on BUILD_BENCHMARK so it
 # can be built without enabling USE_TENT.
-if(BUILD_BENCHMARK)
+if (BUILD_BENCHMARK)
   add_subdirectory(benchmark)
 endif()

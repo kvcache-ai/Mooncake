@@ -203,7 +203,7 @@ if [ -f ${BUILD_DIR}/mooncake-transfer-engine/allocator/ascend_allocator/ascend_
     cp ${BUILD_DIR}/mooncake-transfer-engine/allocator/ascend_allocator/ascend_allocator.so mooncake-wheel/mooncake/ascend_allocator.so
 fi
 
-# Copy nvlink_allocator.so to mooncake directory (only if it exists - CUDA builds only)
+# Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
 if [ -f ${BUILD_DIR}/mooncake-transfer-engine/allocator/nvlink_allocator/nvlink_allocator.so ] \
    || [ -f /usr/lib/libaccl_barex.so ] \
    || [ -f /usr/lib64/libaccl_barex.so ]; then

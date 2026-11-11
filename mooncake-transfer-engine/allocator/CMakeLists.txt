@@ -8,10 +8,6 @@ if(USE_MEMFABRIC AND USE_TENT)
   add_subdirectory(memfabric_allocator)
 endif()
 
-if(USE_SUNRISE)
-  add_subdirectory(sunrise_allocator)
-endif()
-
 if(USE_UB)
   add_subdirectory(ub_allocator)
 endif()
