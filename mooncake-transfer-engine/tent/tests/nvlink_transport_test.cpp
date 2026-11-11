@@ -41,15 +41,40 @@ class NVLinkTransportTestPeer {
    public:
     static Status relocate(NVLinkTransport& transport, uint64_t& address,
                            uint64_t length, SegmentID target_id) {
-        return transport.relocateSharedMemoryAddress(address, length,
-                                                     target_id);
+        // Open the mapping on the calling thread's current device, matching
+        // the pre-fix behavior the cache-reuse tests assert.
+        int src_device = 0;
+        cudaGetDevice(&src_device);
+        return transport.relocateSharedMemoryAddress(address, length, target_id,
+                                                     src_device);
     }
 
+    static Status relocateOnDevice(NVLinkTransport& transport,
+                                   uint64_t& address, uint64_t length,
+                                   SegmentID target_id, int src_device) {
+        return transport.relocateSharedMemoryAddress(address, length, target_id,
+                                                     src_device);
+    }
+
+    // Number of distinct peer buffer addresses with at least one open mapping.
     static size_t mappingCount(NVLinkTransport& transport,
                                SegmentID target_id) {
         RWSpinlock::ReadGuard guard(transport.relocate_lock_);
         auto it = transport.relocate_map_.find(target_id);
         return it == transport.relocate_map_.end() ? 0 : it->second.size();
+    }
+
+    // Total number of open (address, opening-device) mappings. The cache is
+    // keyed per (target, address, opening device), so relocating the same
+    // peer buffer from two different source devices must yield two entries.
+    static size_t deviceMappingCount(NVLinkTransport& transport,
+                                     SegmentID target_id) {
+        RWSpinlock::ReadGuard guard(transport.relocate_lock_);
+        auto it = transport.relocate_map_.find(target_id);
+        if (it == transport.relocate_map_.end()) return 0;
+        size_t total = 0;
+        for (auto& by_addr : it->second) total += by_addr.second.size();
+        return total;
     }
 };
 
@@ -73,6 +98,12 @@ constexpr uint32_t kPattern = 0x5a3c69e7;
 // the initialized runtime and its own CUDA calls would be unreliable. The
 // parent's first CUDA call therefore happens inside
 // relocateSharedMemoryAddress(), well after fork().
+//
+// The exporter is therefore created ONCE for the whole suite, before any
+// test has touched CUDA. A per-test PeerExporter would fork after earlier
+// tests already initialized CUDA in the parent (gtest runs tests in one
+// process), making every exporter after the first test unreliable and the
+// later tests silently skip.
 class PeerExporter {
    public:
     PeerExporter() {
@@ -103,6 +134,9 @@ class PeerExporter {
         if (ready_pipe_[0] >= 0) close(ready_pipe_[0]);
         if (stop_pipe_[1] >= 0) close(stop_pipe_[1]);
     }
+
+    PeerExporter(const PeerExporter&) = delete;
+    PeerExporter& operator=(const PeerExporter&) = delete;
 
     bool forkOk() const { return child_pid_ > 0; }
     // 0 = handle exported fine; 1 = no CUDA device in the child.
@@ -176,6 +210,36 @@ class PeerExporter {
     bool valid() const { return valid_; }
 };
 
+// One exporter for the whole suite: forked in SetUpTestSuite(), before any
+// test (and thus the parent process) has initialized CUDA. See PeerExporter.
+class NVLinkIpcRelocateTest : public ::testing::Test {
+   protected:
+    static void SetUpTestSuite() {
+        exporter_ = std::make_unique<PeerExporter>();
+    }
+
+    static void TearDownTestSuite() { exporter_.reset(); }
+
+    static const PeerExporter& exporter() { return *exporter_; }
+
+   private:
+    static std::unique_ptr<PeerExporter> exporter_;
+};
+
+std::unique_ptr<PeerExporter> NVLinkIpcRelocateTest::exporter_;
+
+// GTEST_SKIP() returns from the test body, so it must stay a macro invoked
+// inside the TEST_F body rather than a helper function.
+#define SKIP_IF_EXPORTER_UNUSABLE()                                 \
+    do {                                                            \
+        if (!exporter().forkOk() || !exporter().valid()) {          \
+            GTEST_SKIP() << "Peer export failed (fork/pipe error)"; \
+        }                                                           \
+        if (exporter().childStatus() != 0) {                        \
+            GTEST_SKIP() << "No CUDA device available";             \
+        }                                                           \
+    } while (0)
+
 Status installLocalSegmentWithIpcHandle(ControlService& metadata,
                                         const std::string& serialized_handle,
                                         const std::string& peer_location,
@@ -210,21 +274,15 @@ void verifyRelocatedData(uint64_t address, size_t length) {
 
 }  // namespace
 
-TEST(NVLinkTransportTest, RelocateToleratesOutOfRangePeerDeviceOrdinal) {
-    PeerExporter exporter;
-    if (!exporter.forkOk() || !exporter.valid()) {
-        GTEST_SKIP() << "Peer export failed (fork/pipe error)";
-    }
-    if (exporter.childStatus() != 0) {
-        GTEST_SKIP() << "No CUDA device available";
-    }
+TEST_F(NVLinkIpcRelocateTest, RelocateToleratesOutOfRangePeerDeviceOrdinal) {
+    SKIP_IF_EXPORTER_UNUSABLE();
 
     // The peer claims its buffer lives on cuda:99 — an ordinal that is out
     // of range in this process, exactly what a peer with a larger
     // CUDA_VISIBLE_DEVICES produces.
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
     ASSERT_TRUE(installLocalSegmentWithIpcHandle(
-                    *metadata, exporter.serializedHandle(), "cuda:99",
+                    *metadata, exporter().serializedHandle(), "cuda:99",
                     kRemoteAddress, kBufferLength)
                     .ok());
 
@@ -247,15 +305,9 @@ TEST(NVLinkTransportTest, RelocateToleratesOutOfRangePeerDeviceOrdinal) {
     ASSERT_TRUE(transport.uninstall().ok());
 }
 
-TEST(NVLinkTransportTest,
-     RelocateCachesSingleMappingForConcurrentPeersWithBogusOrdinal) {
-    PeerExporter exporter;
-    if (!exporter.forkOk() || !exporter.valid()) {
-        GTEST_SKIP() << "Peer export failed (fork/pipe error)";
-    }
-    if (exporter.childStatus() != 0) {
-        GTEST_SKIP() << "No CUDA device available";
-    }
+TEST_F(NVLinkIpcRelocateTest,
+       RelocateCachesSingleMappingForConcurrentPeersWithBogusOrdinal) {
+    SKIP_IF_EXPORTER_UNUSABLE();
 
     int device_count = 0;
     ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
@@ -263,7 +315,7 @@ TEST(NVLinkTransportTest,
         "cuda:" + std::to_string(device_count + 8);
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
     ASSERT_TRUE(installLocalSegmentWithIpcHandle(
-                    *metadata, exporter.serializedHandle(), bogus_location,
+                    *metadata, exporter().serializedHandle(), bogus_location,
                     kRemoteAddress, kBufferLength)
                     .ok());
 
@@ -303,7 +355,80 @@ TEST(NVLinkTransportTest,
     for (uint64_t address : relocated) EXPECT_EQ(address, relocated.front());
     EXPECT_EQ(
         NVLinkTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID), 1u);
+    // All workers relocate from the same (current) device, so the device-keyed
+    // cache must also hold exactly one entry for this buffer.
+    EXPECT_EQ(NVLinkTransportTestPeer::deviceMappingCount(transport,
+                                                          LOCAL_SEGMENT_ID),
+              1u);
     verifyRelocatedData(relocated.front(), kBufferLength);
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+// Regression guard for issue #4986: the same peer buffer reached from two
+// different source devices needs TWO independent IPC mappings, each opened
+// on the source buffer's device so cudaIpcMemLazyEnablePeerAccess establishes
+// the direct source->peer P2P path. A cache keyed by address only (the
+// pre-fix layout) would reuse the device-0 mapping for the device-1 caller.
+TEST_F(NVLinkIpcRelocateTest, RelocateKeysPeerMappingsBySourceDevice) {
+    SKIP_IF_EXPORTER_UNUSABLE();
+
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count < 2) {
+        GTEST_SKIP() << "Needs at least 2 CUDA devices";
+    }
+
+    // The child allocated on its default device (0). The peer ordinal in the
+    // location is deliberately valid-but-not-the-opening-device here; the
+    // mapping must be opened on the SOURCE device, not this ordinal.
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithIpcHandle(
+                    *metadata, exporter().serializedHandle(), "cuda:0",
+                    kRemoteAddress, kBufferLength)
+                    .ok());
+
+    NVLinkTransport transport;
+    std::string local_segment_name = "nvlink_test_segment";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, metadata, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+
+    uint64_t addr_from_dev0 = kRemoteAddress + 32;
+    uint64_t addr_from_dev1 = kRemoteAddress + 32;
+    ASSERT_TRUE(
+        NVLinkTransportTestPeer::relocateOnDevice(
+            transport, addr_from_dev0, kBufferLength - 32, LOCAL_SEGMENT_ID, 0)
+            .ok());
+    ASSERT_TRUE(
+        NVLinkTransportTestPeer::relocateOnDevice(
+            transport, addr_from_dev1, kBufferLength - 32, LOCAL_SEGMENT_ID, 1)
+            .ok());
+
+    // Independent mappings for the same peer buffer: distinct pointers, one
+    // address entry, two (address, device) entries.
+    EXPECT_NE(addr_from_dev0, addr_from_dev1);
+    EXPECT_EQ(
+        NVLinkTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID), 1u);
+    EXPECT_EQ(NVLinkTransportTestPeer::deviceMappingCount(transport,
+                                                          LOCAL_SEGMENT_ID),
+              2u);
+
+    // Both mappings alias the child's allocation, from either device.
+    verifyRelocatedData(addr_from_dev0, kBufferLength - 32);
+    verifyRelocatedData(addr_from_dev1, kBufferLength - 32);
+
+    // Re-relocating from either device must reuse the cached mapping without
+    // opening new ones.
+    uint64_t again_dev1 = kRemoteAddress + 32;
+    ASSERT_TRUE(NVLinkTransportTestPeer::relocateOnDevice(transport, again_dev1,
+                                                          kBufferLength - 32,
+                                                          LOCAL_SEGMENT_ID, 1)
+                    .ok());
+    EXPECT_EQ(again_dev1, addr_from_dev1);
+    EXPECT_EQ(NVLinkTransportTestPeer::deviceMappingCount(transport,
+                                                          LOCAL_SEGMENT_ID),
+              2u);
     ASSERT_TRUE(transport.uninstall().ok());
 }
 

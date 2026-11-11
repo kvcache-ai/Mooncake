@@ -15,6 +15,7 @@
 #ifndef NVLINK_TRANSPORT_H_
 #define NVLINK_TRANSPORT_H_
 
+#include <atomic>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -96,7 +97,7 @@ class NVLinkTransport : public Transport {
     void *createSharedMemory(const std::string &path, size_t size);
 
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
-                                       uint64_t target_id);
+                                       uint64_t target_id, int src_device);
 
     Status setPeerAccess();
 
@@ -115,12 +116,34 @@ class NVLinkTransport : public Transport {
         int cuda_id;
     };
 
-    using HashMap =
-        std::unordered_map<SegmentID,
-                           std::unordered_map<uint64_t, OpenedShmEntry>>;
+    // OpenedShmEntry::shm_addr comes from cudaIpcOpenMemHandle, which is only
+    // valid in the CUDA context of the device it was opened on. The same peer
+    // buffer can therefore need independent mappings when reached from
+    // different source devices, so the per-address map is keyed again by the
+    // opening device (cuda_id).
+    using HashMap = std::unordered_map<
+        SegmentID,
+        std::unordered_map<uint64_t, std::unordered_map<int, OpenedShmEntry>>>;
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;
+
+    // Thread-local relocate caches (built inside
+    // relocateSharedMemoryAddress) outlive the transport object: a cache a
+    // thread built for a previous instance, or for this instance before an
+    // uninstall(), must never be reused, or it hands out pointers to IPC
+    // mappings that were already closed via cudaIpcCloseMemHandle in
+    // uninstall(). instance_id_ tells caches apart across transport
+    // objects; relocate_generation_ is bumped by uninstall() so a
+    // re-installed instance does not trust a pre-uninstall cache either.
+    static uint64_t nextInstanceId() {
+        static std::atomic<uint64_t> counter{1};
+        return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const uint64_t instance_id_ = nextInstanceId();
+    std::atomic<uint64_t> relocate_generation_{0};
+
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;
