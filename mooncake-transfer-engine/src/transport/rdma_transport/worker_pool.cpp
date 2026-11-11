@@ -28,6 +28,7 @@
 
 #include "config.h"
 #include "memory_location.h"
+#include "transport/rdma_transport/connect_pause_tracker.h"
 #include "cq_timeout_diagnostic.h"
 #include "transport/rdma_transport/rdma_batch_cache.h"
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
@@ -284,7 +285,15 @@ static const std::string &sourceLocationOrUnknown(Transport::Slice *slice) {
 struct ActiveEndpointSetupResult {
     int ret = 0;
     bool endpoint_current = false;
+    bool pending = false;
 };
+
+static bool isHandshakeRpcFailure(int ret) {
+    return ret == ERR_SOCKET || ret == ERR_DNS || ret == ERR_MALFORMED_JSON;
+}
+
+// Shared by all local RNICs; pruned alongside the existing connection pauses.
+static ConnectPauseTracker active_endpoint_connect_pause(getCurrentTimeInNano);
 
 class ActiveEndpointSetupExecutor {
    public:
@@ -307,22 +316,63 @@ class ActiveEndpointSetupExecutor {
     }
 
     std::future<int> submit(const std::shared_ptr<RdmaEndPoint> &endpoint) {
-        std::packaged_task<int()> task(
-            [endpoint] { return endpoint->setupConnectionsByActive(); });
-        auto future = task.get_future();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!running_) {
-                task();
-                return future;
+        const auto server = getServerNameFromNicPath(endpoint->peerNicPath());
+        return submit(
+            server, [endpoint] { return endpoint->setupConnectionsByActive(); },
+            ERR_SOCKET);
+    }
+
+    std::future<int> submit(const std::string &server,
+                            std::function<int()> operation,
+                            int exception_error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!running_ || active_endpoint_connect_pause.isPaused(server)) {
+            std::promise<int> rejected;
+            rejected.set_value(ERR_SOCKET);
+            return rejected.get_future();
+        }
+        // One RPC per server; an invalid future defers admission without
+        // queuing.
+        if (in_flight_.size() >= workers_.size() || in_flight_.count(server))
+            return {};
+        std::packaged_task<int()> task([this, operation = std::move(operation),
+                                        server, exception_error]() mutable {
+            // Release captured resources before the future becomes ready.
+            auto owned_operation = std::move(operation);
+            int ret;
+            try {
+                ret = owned_operation();
+            } catch (...) {
+                complete(server, exception_error);
+                throw;
             }
+            complete(server, ret);
+            return ret;
+        });
+        auto future = task.get_future();
+        in_flight_.insert(server);
+        try {
             tasks_.emplace(std::move(task));
+        } catch (...) {
+            in_flight_.erase(server);
+            throw;
         }
         cv_.notify_one();
         return future;
     }
 
    private:
+    void complete(const std::string &server, int ret) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        in_flight_.erase(server);
+        const auto &config = globalConfig();
+        if (isHandshakeRpcFailure(ret) && config.conn_pause_ttl_ms > 0) {
+            const std::chrono::nanoseconds pause =
+                std::chrono::milliseconds(config.conn_pause_ttl_ms);
+            active_endpoint_connect_pause.pauseFor(server, pause.count());
+        }
+    }
+
     void run() {
         while (true) {
             std::packaged_task<int()> task;
@@ -342,6 +392,7 @@ class ActiveEndpointSetupExecutor {
     std::mutex mutex_;
     std::condition_variable cv_;
     bool running_;
+    std::unordered_set<std::string> in_flight_;
 };
 
 static ActiveEndpointSetupExecutor &activeEndpointSetupExecutor() {
@@ -351,42 +402,40 @@ static ActiveEndpointSetupExecutor &activeEndpointSetupExecutor() {
     return executor;
 }
 
+static int consumeRpcResult(std::future<int> &result) {
+    try {
+        return result.get();
+    } catch (const std::exception &ex) {
+        LOG(ERROR) << "Worker: Background peer RPC threw: " << ex.what();
+    } catch (...) {
+        LOG(ERROR) << "Worker: Background peer RPC threw an unknown exception";
+    }
+    return ERR_ENDPOINT;
+}
+
 static ActiveEndpointSetupResult setupEndpointByActiveOutsideLifecycleGate(
     RdmaContext &context, const std::string &peer_nic_path,
     const std::shared_ptr<RdmaEndPoint> &endpoint,
     std::unique_lock<std::mutex> &endpoint_lifecycle_lock,
+    std::future<int> &setup_future,
     const std::function<int()> &drain_cq_while_waiting) {
     const bool had_lifecycle_gate = endpoint_lifecycle_lock.owns_lock();
     if (had_lifecycle_gate) endpoint_lifecycle_lock.unlock();
 
-    // The owner worker also polls this peer's CQ. Keep it draining while the
-    // active handshake can block on TCP connect/read timeouts.
+    // A pending RPC must not hold up this worker's other peers or CQ polling.
     int ret = ERR_ENDPOINT;
     try {
-        auto setup_future = activeEndpointSetupExecutor().submit(endpoint);
-        auto wait_period = std::chrono::milliseconds(1);
-        constexpr auto kMaxWaitPeriod = std::chrono::milliseconds(25);
-        while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
-               std::future_status::ready) {
-            bool made_progress = false;
-            while (setup_future.wait_for(std::chrono::milliseconds(0)) !=
-                   std::future_status::ready) {
-                const int drained = drain_cq_while_waiting();
-                if (drained <= 0) break;
-                made_progress = true;
-            }
-            if (setup_future.wait_for(std::chrono::milliseconds(0)) ==
+        if (!setup_future.valid())
+            setup_future = activeEndpointSetupExecutor().submit(endpoint);
+        if (!setup_future.valid() ||
+            setup_future.wait_for(std::chrono::milliseconds(0)) !=
                 std::future_status::ready) {
-                break;
-            }
-            if (made_progress) {
-                wait_period = std::chrono::milliseconds(1);
-            } else {
-                if (setup_future.wait_for(wait_period) ==
+            drain_cq_while_waiting();
+            if (!setup_future.valid() ||
+                setup_future.wait_for(std::chrono::milliseconds(0)) !=
                     std::future_status::ready) {
-                    break;
-                }
-                wait_period = std::min(wait_period * 2, kMaxWaitPeriod);
+                if (had_lifecycle_gate) endpoint_lifecycle_lock.lock();
+                return {0, false, true};
             }
         }
         ret = setup_future.get();
@@ -467,6 +516,8 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
 #endif
 {
     collective_slice_queue_.resize(worker_count_);
+    pending_setups_.resize(worker_count_);
+    pending_redispatch_.resize(worker_count_);
     for (int i = 0; i < worker_count_; ++i)
         worker_thread_.emplace_back(
             std::thread(std::bind(&WorkerPool::transferWorker, this, i)));
@@ -522,6 +573,13 @@ WorkerPool::~WorkerPool() {
         workers_running_.store(false);
         for (auto &entry : worker_thread_) entry.join();
     }
+    // The RPC holds an endpoint referencing this context's verbs resources.
+    for (auto &owner : pending_setups_)
+        for (auto &entry : owner)
+            if (entry.second.result.valid()) entry.second.result.wait();
+    for (auto &owner : pending_redispatch_)
+        for (auto &entry : owner)
+            if (entry.second.result.valid()) entry.second.result.wait();
 }
 
 int WorkerPool::submitPostSend(
@@ -813,16 +871,65 @@ void WorkerPool::untrackPostedSlices(
 
 void WorkerPool::performPostSend(int thread_id) {
     auto &local_slice_queue = collective_slice_queue_[thread_id];
+    auto &pending_setups = pending_setups_[thread_id];
+    std::unordered_map<std::string, SliceList> incoming;
+    std::chrono::steady_clock::time_point incoming_cutoff;
     {
         std::lock_guard<std::mutex> lock(worker_slice_queue_lock_[thread_id]);
-        for (auto &entry : worker_slice_queue_[thread_id]) {
-            if (entry.second.empty()) continue;
-            auto &local_entry = local_slice_queue[entry.first];
-            local_entry.insert(local_entry.end(), entry.second.begin(),
-                               entry.second.end());
-        }
-        worker_slice_queue_[thread_id].clear();
+        incoming.swap(worker_slice_queue_[thread_id]);
+        incoming_cutoff = std::chrono::steady_clock::now();
     }
+
+    // Process the old batch before merging submissions taken above. No slice
+    // submitted after an admission deadline may inherit that expired deadline.
+    for (auto it = pending_setups.begin(); it != pending_setups.end();) {
+        auto queued = local_slice_queue.find(it->first);
+        const bool idle =
+            queued == local_slice_queue.end() || queued->second.empty();
+        auto &setup = it->second;
+        if (!setup.result.valid() &&
+            (idle || incoming_cutoff >= setup.deadline)) {
+            auto gate = context_.lockEndpointLifecycle(it->first);
+            auto endpoint = context_.findEndpoint(it->first);
+            if (!idle && (!endpoint || !endpoint->connected())) {
+                for (auto *slice : queued->second) slice->markFailed();
+                processed_slice_count_.fetch_add(queued->second.size());
+                queued->second.clear();
+            }
+            it = pending_setups.erase(it);
+            continue;
+        }
+        if (idle && setup.result.valid() &&
+            setup.result.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+            const int ret = consumeRpcResult(setup.result);
+            if (ret && !isHandshakeRpcFailure(ret)) {
+                auto gate = context_.lockEndpointLifecycle(it->first);
+                auto current = context_.findEndpoint(it->first);
+                if (current && current.get() == setup.endpoint.get() &&
+                    !current->retired()) {
+                    // No old slices remain to select an alternate rail. Count
+                    // the failure without forcing a pause on a single rail.
+                    markRailFailed(it->first);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                    adaptive_congestion_control_.retireEndpoint(it->first,
+                                                                current.get());
+#endif
+                    context_.deleteEndpointByPtr(current.get());
+                }
+            }
+            it = pending_setups.erase(it);
+            continue;
+        }
+        ++it;
+    }
+    for (auto &entry : incoming) {
+        if (entry.second.empty()) continue;
+        auto &local_entry = local_slice_queue[entry.first];
+        local_entry.insert(local_entry.end(), entry.second.begin(),
+                           entry.second.end());
+    }
+    performPendingRedispatch(thread_id);
 
     // If this local RNIC is inactive/unhealthy, the remote rail is not the
     // problem. Move queued work to another local RNIC while preserving the
@@ -897,14 +1004,49 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
-        if (!endpoint->connected()) {
+        auto pending = pending_setups.find(entry.first);
+        // Passive setup can connect an endpoint before active admission.
+        // Only a submitted RPC needs to be consumed before using the QPs.
+        if (pending != pending_setups.end() &&
+            !pending->second.result.valid() && endpoint->connected()) {
+            pending_setups.erase(pending);
+        }
+        if (!endpoint->connected() || pending_setups.count(entry.first)) {
+            auto fail_queued = [&] {
+                for (auto *slice : entry.second) slice->markFailed();
+                processed_slice_count_.fetch_add(entry.second.size());
+                entry.second.clear();
+            };
+            auto &setup = pending_setups[entry.first];
+            if (!setup.endpoint) {
+                setup.deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(
+                                     globalConfig().handshake_connect_timeout);
+            }
+            if (!setup.result.valid()) {
+                if (std::chrono::steady_clock::now() >= setup.deadline) {
+                    fail_queued();
+                    pending_setups.erase(entry.first);
+                    continue;
+                }
+                setup.endpoint = endpoint;
+            }
             auto setup_result = setupEndpointByActiveOutsideLifecycleGate(
-                context_, entry.first, endpoint, endpoint_lifecycle_lock,
-                [this, thread_id] {
+                context_, entry.first, setup.endpoint, endpoint_lifecycle_lock,
+                setup.result, [this, thread_id] {
                     if (!hasOutstandingCq(thread_id)) return 0;
                     return performPollCq(thread_id, true);
                 });
-            if (!setup_result.endpoint_current) {
+            if (setup_result.pending) continue;
+            const bool endpoint_current =
+                setup_result.endpoint_current &&
+                endpoint.get() == setup.endpoint.get();
+            pending_setups.erase(entry.first);
+            if (isHandshakeRpcFailure(setup_result.ret)) {
+                fail_queued();
+                continue;
+            }
+            if (!endpoint_current) {
                 LOG(WARNING)
                     << "Worker: Endpoint changed while active handshake was "
                        "outstanding: "
@@ -1325,7 +1467,32 @@ void WorkerPool::recordAutoGidDataPathSuccess(Transport::Slice *slice) {
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                             int thread_id, bool handoff_to_local_worker,
-                            bool defer_local_redispatch) {
+                            bool defer_local_redispatch, bool metadata_ready) {
+    if (!handoff_to_local_worker && !metadata_ready) {
+        auto &pending = pending_redispatch_[thread_id];
+        for (auto *slice : slice_list) {
+            if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
+                slice->markFailed();
+                processed_slice_count_++;
+                continue;
+            }
+            auto old = pending.find(slice->target_id);
+            if (old != pending.end() && !old->second.result.valid() &&
+                std::chrono::steady_clock::now() >= old->second.deadline) {
+                for (auto *expired : old->second.slices) expired->markFailed();
+                processed_slice_count_.fetch_add(old->second.slices.size());
+                pending.erase(old);
+            }
+            auto &retry = pending[slice->target_id];
+            if (retry.slices.empty()) {
+                retry.deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(
+                                     globalConfig().handshake_connect_timeout);
+            }
+            retry.slices.push_back(slice);
+        }
+        return;
+    }
     std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
         segment_desc_map;
     int shared_redispatch_count = 0;
@@ -1337,8 +1504,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             auto target_id = slice->target_id;
             if (!segment_desc_map.count(target_id)) {
                 segment_desc_map[target_id] =
-                    context_.engine().meta()->getSegmentDescByID(target_id,
-                                                                 true);
+                    context_.engine().meta()->getCachedSegmentDescByID(
+                        target_id);
             }
         }
     }
@@ -1452,6 +1619,42 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         parked_worker_count_.load(std::memory_order_acquire) > 0) {
         std::lock_guard<std::mutex> lock(cond_mutex_);
         cond_var_.notify_all();
+    }
+}
+
+void WorkerPool::performPendingRedispatch(int thread_id) {
+    auto &pending = pending_redispatch_[thread_id];
+    for (auto it = pending.begin(); it != pending.end();) {
+        auto &retry = it->second;
+        if (!retry.result.valid()) {
+            if (std::chrono::steady_clock::now() >= retry.deadline) {
+                for (auto *slice : retry.slices) slice->markFailed();
+                processed_slice_count_.fetch_add(retry.slices.size());
+                it = pending.erase(it);
+                continue;
+            }
+            retry.result = activeEndpointSetupExecutor().submit(
+                getServerNameFromNicPath(retry.slices.front()->peerNicPath()),
+                [metadata = context_.engine().meta(), target = it->first] {
+                    return metadata->getSegmentDescByID(target, true)
+                               ? 0
+                               : ERR_METADATA;
+                },
+                ERR_METADATA);
+        }
+        if (!retry.result.valid() ||
+            retry.result.wait_for(std::chrono::milliseconds(0)) !=
+                std::future_status::ready) {
+            ++it;
+            continue;
+        }
+        consumeRpcResult(retry.result);
+        // A failed fetch leaves the cache intact. Retry with the descriptor
+        // still in the map, never a snapshot of a concurrently removed segment.
+        auto slices = std::move(retry.slices);
+        it = pending.erase(it);
+        redispatch(slices, thread_id, !context_.active(),
+                   /*defer_local_redispatch=*/false, /*metadata_ready=*/true);
     }
 }
 
@@ -1801,7 +2004,7 @@ void WorkerPool::resumePausedContext() {
 bool WorkerPool::hasAvailablePeerRailAlternative(
     Transport::Slice *slice, const std::string &failed_peer_path) {
     auto peer_segment_desc =
-        context_.engine().meta()->getSegmentDescByID(slice->target_id, false);
+        context_.engine().meta()->getCachedSegmentDescByID(slice->target_id);
     if (!peer_segment_desc) return false;
 
     int buffer_id = -1;
@@ -1893,6 +2096,7 @@ void WorkerPool::monitorWorker() {
             // Drop expired active-connect pause entries so the map doesn't grow
             // for peers that are never re-attempted after their pause lapses.
             context_.pruneConnectPause();
+            active_endpoint_connect_pause.prune();
             // Safety net for a recovery event that never reached us. See
             // issue #4694; TENT's equivalent is Workers::resumePausedContexts.
             resumePausedContext();
