@@ -1097,5 +1097,18 @@ TEST_F(RdmaWorkerIdleSpinEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.rdma_worker_idle_spin_us, 19u);
 }
 
+TEST(GlobalConfigTest, RdmaHostOnlyIsReadFromEnvironment) {
+    unsetenv("MOONCAKE_RDMA_HOST_ONLY");
+    GlobalConfig defaults;
+    loadGlobalConfig(defaults);
+    EXPECT_FALSE(defaults.rdma_host_only);
+
+    setenv("MOONCAKE_RDMA_HOST_ONLY", "1", 1);
+    GlobalConfig enabled;
+    loadGlobalConfig(enabled);
+    unsetenv("MOONCAKE_RDMA_HOST_ONLY");
+    EXPECT_TRUE(enabled.rdma_host_only);
+}
+
 }  // namespace
 }  // namespace mooncake

@@ -21,6 +21,8 @@
 //   - exportDmabuf: host memory always yields kHostReg / fd == -1 on every
 //     build (CUDA, HIP, or non-GPU), so those cases run in CI without hardware.
 
+#include "config.h"
+#include "error.h"
 #include "transport/rdma_transport/rdma_context.h"
 
 #include <fcntl.h>
@@ -234,3 +236,49 @@ TEST(ExportDmabuf, GpuWholeAllocationWithUnalignedSize) {
 #endif
 
 }  // namespace
+
+// ── MOONCAKE_RDMA_HOST_ONLY (host-staged RDMA) ───────────────────────────────
+
+namespace {
+
+// Enables rdma_host_only for one test and restores the previous value.
+class HostOnlyScope {
+   public:
+    HostOnlyScope() : saved_(mooncake::globalConfig().rdma_host_only) {
+        mooncake::globalConfig().rdma_host_only = true;
+    }
+    ~HostOnlyScope() { mooncake::globalConfig().rdma_host_only = saved_; }
+
+   private:
+    bool saved_;
+};
+
+}  // namespace
+
+TEST(ExportDmabuf, HostOnlyKeepsHostMemoryOnHostReg) {
+    std::vector<char> buf(4096);
+    HostOnlyScope scope;
+    DmabufExport exp;
+    EXPECT_EQ(RdmaContext::exportDmabuf(buf.data(), buf.size(), exp), 0);
+    EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
+    EXPECT_EQ(exp.fd, -1);
+}
+
+#if defined(USE_CUDA)
+TEST(ExportDmabuf, HostOnlyRejectsGpuMemory) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    void *dev = nullptr;
+    ASSERT_EQ(cudaMalloc(&dev, 1 << 20), cudaSuccess);
+    {
+        HostOnlyScope scope;
+        DmabufExport exp;
+        EXPECT_EQ(RdmaContext::exportDmabuf(dev, 1 << 20, exp),
+                  ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(exp.fd, -1);
+    }
+    cudaFree(dev);
+}
+#endif
