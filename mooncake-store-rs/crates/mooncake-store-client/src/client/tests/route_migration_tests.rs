@@ -17,8 +17,8 @@ use mooncake_store_test_utils::transport::TestTransport;
 use parking_lot::Mutex;
 
 use crate::{
-    MooncakeCompatibilityFacade, ObjectRef, PutRequest, RouteControlMode, StoreClient,
-    StoreClientBuilder, StoreTransport, StoreTransportFactory,
+    MooncakeCompatibilityFacade, ObjectRef, PutRequest, ReplicationPolicy, RouteControlMode,
+    StoreClient, StoreClientBuilder, StoreTransport, StoreTransportFactory,
 };
 
 use super::super::{
@@ -26,6 +26,16 @@ use super::super::{
     MigrationService, MigrationWorkItem, ReplicaReadSelector,
 };
 use super::*;
+
+/// Seed a route with the writer owning the replica. The compatibility facade
+/// defaults to the C++ Store placement (`prefer_local` is false), but these
+/// tests reason about the seeded source replica, so pin the local placement
+/// the migration paths assume.
+fn seed_put(client: &StoreClient, key: &str, payload: &[u8]) {
+    client
+        .put_with_policy(key, payload, &ReplicationPolicy::new().prefer_local(true))
+        .expect("seed put should succeed");
+}
 
 struct CasErrorRouteDirectory {
     inner: Arc<dyn RouteDirectory>,
@@ -459,7 +469,7 @@ fn explicit_copy_migration_keeps_source_and_adds_target_replica() {
 
     let key = "explicit-copy-key";
     let payload = b"explicit-copy-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -570,7 +580,7 @@ fn explicit_copy_migration_supports_multiple_targets_on_same_storage_runtime() {
 
     let key = "explicit-copy-same-owner-key";
     let payload = b"explicit-copy-same-owner-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -670,7 +680,7 @@ fn explicit_copy_migration_with_one_invalid_target_keeps_route_unchanged() {
 
     let key = "explicit-copy-invalid-key";
     let payload = b"explicit-copy-invalid-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -774,7 +784,7 @@ fn explicit_copy_migration_releases_target_allocation_when_route_cas_errors() {
 
     let key = "explicit-copy-cas-error-key";
     let payload = b"explicit-copy-cas-error-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -890,7 +900,7 @@ fn explicit_move_migration_replaces_source_with_target_replica() {
 
     let key = "explicit-move-key";
     let payload = b"explicit-move-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -1025,7 +1035,7 @@ fn explicit_copy_migration_same_key_same_source_only_one_concurrent_commit_wins(
 
     let key = "explicit-copy-race-key";
     let payload = b"explicit-copy-race-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -1201,7 +1211,7 @@ fn control_plane_submit_migration_task_executes_explicit_move() {
 
     let key = "cp-move-key";
     let payload = b"cp-move-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -1342,7 +1352,7 @@ fn control_plane_submit_migration_task_executes_explicit_copy_to_multiple_target
 
     let key = "cp-copy-key";
     let payload = b"cp-copy-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -1501,7 +1511,7 @@ fn control_plane_submit_migration_task_executes_explicit_copy_to_multiple_target
 
     let key = "cp-copy-same-owner-key";
     let payload = b"cp-copy-same-owner-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -1648,7 +1658,7 @@ fn control_plane_submit_migration_task_surfaces_failed_execution_status_detail()
 
     let key = "cp-failed-key";
     let payload = b"cp-failed-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -1829,7 +1839,7 @@ fn control_plane_submit_migration_task_recovers_after_executor_panic() {
 
     let key = "cp-panic-key";
     let payload = b"cp-panic-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")
@@ -2029,7 +2039,7 @@ fn control_plane_submit_copy_task_same_key_only_one_executor_wins() {
 
     let key = "cp-concurrent-key";
     let payload = b"cp-concurrent-payload";
-    store_a.put(key, payload).expect("seed put should succeed");
+    seed_put(&store_a, key, payload);
     let current = store_a
         .query_route(key)
         .expect("initial route query should succeed")

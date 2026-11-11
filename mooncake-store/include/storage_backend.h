@@ -953,9 +953,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param buckets_keys Output: bucketized keys; each inner vector is a
      * bucket.
      * @param deferred_keys Optional output: keys moved to the internal
-     * ungrouped pool this call (the tail partial bucket, deferred so the next
-     * call can write them as part of a full bucket). These keys are NOT in
-     * buckets_keys now but WILL be emitted in a bucket by a later call. The
+     * ungrouped pool this call (the tail partial bucket). These keys are NOT
+     * in buckets_keys now. FileStorage replays carried keys on the next pass,
+     * which may emit a partial bucket; empty backend input does not flush. The
      * caller must keep their offload tasks alive across the deferral — a key
      * re-emitted from the pool arrives without a task otherwise
      * (neuralwatt: the silent deferred-tail loss, upstream #3006).

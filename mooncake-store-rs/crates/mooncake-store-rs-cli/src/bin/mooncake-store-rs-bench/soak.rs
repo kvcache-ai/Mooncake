@@ -8,6 +8,7 @@ use mooncake_store_client::{
 };
 use tracing::{debug, error, info, warn};
 
+use crate::aligned_buffer::AlignedBuffer;
 use crate::cli::{GlobalArgs, ReadInterface, SoakArgs, WriteInterface};
 use crate::datagen::{ensure_payload, make_key, make_seed, payload};
 use crate::fault::FaultInjector;
@@ -44,7 +45,7 @@ fn soak_keys(start: usize, width: usize, key_space_size: usize) -> Vec<String> {
 
 struct RegisteredWriteBuffers {
     client: *const StoreClient,
-    storage: Vec<u8>,
+    storage: AlignedBuffer,
     slot_size: usize,
 }
 
@@ -55,7 +56,7 @@ impl RegisteredWriteBuffers {
         slot_size: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let total_bytes = slots.saturating_mul(slot_size);
-        let mut storage = vec![0u8; total_bytes];
+        let mut storage = AlignedBuffer::zeroed(total_bytes);
         client.register_buffer(storage.as_mut_ptr().cast(), storage.len())?;
         Ok(Self {
             client,
@@ -67,7 +68,7 @@ impl RegisteredWriteBuffers {
     fn fill_slot(&mut self, slot: usize, value: &[u8]) {
         let start = slot * self.slot_size;
         let end = start + self.slot_size;
-        self.storage[start..end].copy_from_slice(value);
+        self.storage.as_mut_slice()[start..end].copy_from_slice(value);
     }
 
     fn request<'b>(&'b self, slot: usize, key: &'b str, tenant: &'b str) -> PutFromRequest<'b> {
@@ -95,15 +96,15 @@ impl Drop for RegisteredWriteBuffers {
 }
 
 struct ReadBuffers {
-    slots: Vec<Vec<u8>>,
-    slot_size: usize,
+    slots: Vec<AlignedBuffer>,
 }
 
 impl ReadBuffers {
     fn new(slots: usize, slot_size: usize) -> Self {
         Self {
-            slots: (0..slots).map(|_| vec![0u8; slot_size]).collect(),
-            slot_size,
+            slots: (0..slots)
+                .map(|_| AlignedBuffer::zeroed(slot_size))
+                .collect(),
         }
     }
 
@@ -186,13 +187,10 @@ fn execute_soak_read(
                 .iter_mut()
                 .take(keys.len())
                 .zip(sizes)
-                .map(|(buffer, size)| {
-                    buffer.truncate(size);
-                    buffer.clone()
-                })
+                .map(|(buffer, size)| buffer.as_mut_slice()[..size].to_vec())
                 .collect::<Vec<_>>();
             for buffer in buffers.slots.iter_mut().take(keys.len()) {
-                buffer.resize(buffers.slot_size, 0);
+                buffer.as_mut_slice().fill(0);
             }
             Ok(values)
         }

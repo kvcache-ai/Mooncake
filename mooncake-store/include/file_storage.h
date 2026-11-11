@@ -360,9 +360,10 @@ class FileStorage {
      * A key absent from all_bucket_keys was either deliberately skipped by
      * the backend (size over bucket limit / already on disk) — those must be
      * NACKed so the master releases the task and source-replica refcount — or
-     * DEFERRED to the backend's ungrouped pool to be written as part of a
-     * full bucket next cycle. Deferred keys must NOT be NACKed: the backend
-     * carries only key+size across the deferral, so their tasks must be
+     * DEFERRED to the backend's ungrouped pool. FileStorage replays carried
+     * keys next cycle and may flush a partial bucket. Deferred keys must NOT
+     * be NACKed: the backend carries only key+size across the deferral, so
+     * their tasks must be
      * carried here or the re-emitted keys arrive task-less and are silently
      * dropped (upstream #3006 — measured as ~12% of pool entries never
      * reaching the SSD tier).

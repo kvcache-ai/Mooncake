@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,34 +26,32 @@ class RdmaRoute : public RouteProvider {
     static constexpr std::string_view kRouteKey = "rdma";
     static constexpr uint32_t kEndpointVersion = 1;
 
-    RdmaRoute(GlobalRank self_rank, uint32_t max_world_size,
-              RdmaRouteOptions options);
+    [[nodiscard]] static PGResult<std::unique_ptr<RdmaRoute>> create(
+        int device_index, cudaStream_t stream, GlobalRank self_rank,
+        uint32_t max_world_size, const RdmaRouteOptions& options);
     ~RdmaRoute() noexcept override;
 
-    [[nodiscard]] PGResult<void> initialize(int device_index,
-                                            cudaStream_t stream);
-
-    [[nodiscard]] DeviceRdmaContext deviceContext() const noexcept;
-
-    [[nodiscard]] std::string_view routeKey() const noexcept override;
-    [[nodiscard]] uint32_t routeVersion() const noexcept override;
     PGResult<void> registerRegion(DeviceRegionKind kind, void* addr,
                                   size_t size) override;
     PGResult<void> unregisterRegion(DeviceRegionKind kind, void* addr,
                                     size_t size) override;
     [[nodiscard]] std::optional<RouteEndpoint> localEndpoint() override;
-    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> resolveRoutes(
-        std::span<const std::optional<DeviceTransferEndpoint>> endpoints)
+    PGResult<void> installEndpoints(const DeviceTransferSnapshot& snapshot,
+                                    uint64_t reclaim_before_version) override;
+    [[nodiscard]] PGResult<std::vector<DeviceTransferRoute>> updateRoutes()
         override;
+    void fillDeviceContext(DeviceRouteContext& context) const noexcept override;
 
     PGResult<void> shutdown() override;
 
    private:
     struct State;
 
+    RdmaRoute(GlobalRank self_rank, uint32_t max_world_size,
+              std::unique_ptr<State> state);
+
     GlobalRank self_rank_ = kInvalidGlobalRank;
     uint32_t max_world_size_ = 0;
-    RdmaRouteOptions options_;
     std::unique_ptr<State> state_;
     bool shutdown_requested_ = false;
 };
