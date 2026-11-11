@@ -2,6 +2,8 @@
 
 set -e
 
+source "$(dirname "$(readlink -f "$0")")/../../scripts/allocator_build_common.sh"
+
 # Check for flags
 USE_NVCC=false
 USE_HIPCC=false
@@ -36,11 +38,7 @@ fi
 # Get output directory from command line argument, default to current directory
 OUTPUT_DIR=${1:-.}
 
-SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "$0")")" &>/dev/null && pwd)
-ALLOCATOR_INCLUDE_LIST=${2:-}
-ALLOCATOR_INCLUDE_LIST="${ALLOCATOR_INCLUDE_LIST:+${ALLOCATOR_INCLUDE_LIST} }${SCRIPT_DIR}/../../include"
-INCLUDE_FLAGS=$(printf '%s\n' "$ALLOCATOR_INCLUDE_LIST" | tr ' ' '\n' | sed '/^$/d; s/^/-I/' | paste -sd' ' -)
-mkdir -p "$OUTPUT_DIR"
+prepare_allocator_build_env "$OUTPUT_DIR" "${2:-}"
 
 echo "Building nvlink allocator to: $OUTPUT_DIR"
 

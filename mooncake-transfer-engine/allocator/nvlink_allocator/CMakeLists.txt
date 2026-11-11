@@ -32,6 +32,7 @@ if(USE_CUDA
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/build.sh
             ${CMAKE_CURRENT_SOURCE_DIR}/nvlink_allocator.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../include/cuda_alike.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/allocator_build_common.sh
             ${_extra_build_depends}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Building nvlink allocator to ${CMAKE_CURRENT_BINARY_DIR}"

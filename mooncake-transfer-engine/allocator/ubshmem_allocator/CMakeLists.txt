@@ -10,6 +10,7 @@ if(USE_UBSHMEM)
             ${CMAKE_CURRENT_SOURCE_DIR}/ubshmem_fabric_allocator.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../../include/cuda_alike.h
             ${CMAKE_CURRENT_SOURCE_DIR}/../../include/gpu_vendor/ubshmem.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/allocator_build_common.sh
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Building ubshmem allocator to ${CMAKE_CURRENT_BINARY_DIR}"
     VERBATIM)
