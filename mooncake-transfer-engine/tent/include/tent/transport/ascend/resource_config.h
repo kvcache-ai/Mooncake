@@ -84,7 +84,8 @@ std::map<std::string, std::string> WithHixlListenPort(
 
 std::string HostIpFromSegmentName(const std::string& segment_name);
 std::string MakeHixlEngineName(const std::string& host_ip, uint16_t port);
-uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id);
+uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports = {});
 
 std::vector<std::string> ParseHixlNames(const MemorySegmentDesc& detail);
 std::string ResolveRemoteHixlName(const MemorySegmentDesc& detail,
