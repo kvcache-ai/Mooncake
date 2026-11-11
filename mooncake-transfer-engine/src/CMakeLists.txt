@@ -135,6 +135,10 @@ if(USE_SUPA)
   target_link_libraries(transfer_engine PUBLIC ${SUPA_LIBRARIES})
 endif()
 
+if(USE_SUNRISE)
+  target_link_libraries(transfer_engine PUBLIC sunrise_allocator)
+endif()
+
 if(USE_MACA)
   if(NOT DEFINED MACA_RUNTIME_LIBS)
     set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)

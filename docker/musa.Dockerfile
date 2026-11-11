@@ -43,9 +43,9 @@ RUN mkdir -p build && \
     cmake --build . -j"$(nproc)"
 
 # Build nvlink allocator to make wheel self-contained for MUSA paths
-RUN mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
-    cd mooncake-transfer-engine/nvlink-allocator && \
-    bash build.sh --use-mcc ../../build/mooncake-transfer-engine/nvlink-allocator/
+RUN mkdir -p build/mooncake-transfer-engine/allocator/nvlink_allocator && \
+    cd mooncake-transfer-engine/allocator/nvlink_allocator && \
+    bash build.sh --use-mcc ../../../build/mooncake-transfer-engine/allocator/nvlink_allocator/
 
 # Build the Python wheel from local sources
 RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh

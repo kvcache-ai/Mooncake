@@ -568,13 +568,8 @@ if(USE_SUNRISE)
            COMMAND sunrise_link_transport_unit_test)
 
   add_executable(sunrise_allocator_test ${WORKSPACE}/sunrise_allocator_test.cpp)
-  target_include_directories(sunrise_allocator_test
-                             PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(
-    sunrise_allocator_test
-    PUBLIC transfer_engine gtest gtest_main
-           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(sunrise_allocator_test PUBLIC sunrise_allocator gtest
+                                                      gtest_main)
   add_test(NAME sunrise_allocator_test COMMAND sunrise_allocator_test)
 
   add_executable(sunrise_link_copy_test ${WORKSPACE}/sunrise_link_copy_test.cpp)

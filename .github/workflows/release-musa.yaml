@@ -143,9 +143,9 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-          cd mooncake-transfer-engine/nvlink-allocator
-          bash build.sh --use-mcc ../../build/mooncake-transfer-engine/nvlink-allocator/
+          mkdir -p build/mooncake-transfer-engine/allocator/nvlink_allocator
+          cd mooncake-transfer-engine/allocator/nvlink_allocator
+          bash build.sh --use-mcc ../../../build/mooncake-transfer-engine/allocator/nvlink_allocator/
 
       - name: Install project
         shell: bash
