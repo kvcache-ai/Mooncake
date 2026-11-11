@@ -130,6 +130,7 @@ add_p2p_store_test(v2_metrics_test v2/metrics_test.cpp)
 add_p2p_store_test(v2_event_center_test v2/event_center_test.cpp)
 add_p2p_store_test(v2_movement_consumers_test v2/movement_consumers_test.cpp)
 add_p2p_store_test(v2_migration_engine_test v2/migration_engine_test.cpp)
+set_tests_properties(v2_migration_engine_test PROPERTIES TIMEOUT 60)
 add_p2p_store_test(v2_evict_engine_test v2/evict_engine_test.cpp)
 add_p2p_store_test(route_cache_test route_cache_test.cpp)
 add_p2p_store_test(async_metadata_notifier_test async_metadata_notifier_test.cpp)
@@ -209,11 +210,19 @@ add_executable(redis_election_helper_test redis_election_helper_test.cpp)
 target_link_libraries(redis_election_helper_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
     add_test(NAME redis_election_helper_test COMMAND redis_election_helper_test)
     add_p2p_store_test(redis_oplog_store_test ha/oplog/redis_oplog_store_test.cpp)
+    add_p2p_store_test(redis_oplog_trim_worker_test
+        ha/oplog/redis_oplog_trim_worker_test.cpp)
     foreach(target p2p_client_ha_test redis_election_helper_test redis_oplog_store_test)
         target_link_libraries(${target} PRIVATE ${HIREDIS_LIB})
     endforeach()
+    target_include_directories(redis_oplog_store_test PRIVATE ${XXHASH_INCLUDE_DIR})
+    target_link_libraries(redis_oplog_store_test PRIVATE ${XXHASH_LIBRARY})
+    target_link_options(redis_oplog_store_test PRIVATE
+        "LINKER:--wrap=redisCommand"
+        "LINKER:--wrap=redisAppendCommand"
+        "LINKER:--wrap=redisGetReply")
     set_tests_properties(redis_election_helper_test redis_oplog_store_test
-        PROPERTIES LABELS "p2p;ha;redis")
+        redis_oplog_trim_worker_test PROPERTIES LABELS "p2p;ha;redis")
 endif()
 
 add_p2p_store_test(v2_review_regression_test v2/review_regression_test.cpp)

@@ -85,15 +85,32 @@ class P2PRouteHandle {
  * @brief Client-side route cache for P2P read operations.
  *
  * This implementation uses an Atomic Bucket Array with Epoch-Based Reclamation
- * (EBR) to achieve lock-free reads while maintaining consistency under
- * concurrent writes. It uses a Clock algorithm (Second Chance) for O(1)
- * eviction.
+ * (EBR) for lock-free reads and a Clock algorithm (Second Chance) for eviction.
  *
- * PROTECTION MODEL:
- * 1. [Node Metadata]: Protected by EBR. Readers enter an epoch guard before
- *    traversing bucket chains. Nodes are only recycled after all readers that
- *    observed the node have left their epoch — providing a deterministic
- *    safety guarantee
+ * Attention!!!!!
+ * In Future, we will consider removing this module if workload evidence does
+ * not justify it.
+ *
+ * TODO(route-cache): Keep disabled by default pending safety and value review.
+ * Known bugs reproduced on 2026-11-10:
+ * - EpochGuard hashes threads into shared reader slots. Overlapping readers
+ *   can overwrite or clear another reader's epoch, allowing early reclamation.
+ * - InnerPut retains the old node and predecessor across acquireResource(),
+ *   whose eviction/GC can unlink or reuse them. retireNode() enqueues even if
+ *   unlinking fails, causing duplicate retirement and free-list corruption.
+ * - ComputeSafeEpoch() returns 0 for an active epoch-0 reader, while SyncGC()
+ *   reclaims retire_epoch <= safe_epoch, prematurely reclaiming epoch-0 nodes.
+ * These bugs can recycle nodes still in use and cause invalid memory access,
+ * including a null-pointer memcmp. They have not been fixed by disabling the
+ * default configuration.
+ * Representative batch/local-first workloads have not established a net
+ * benefit from this cache. Validate master load and end-to-end latency savings
+ * against client memory/CPU and invalidation costs before enabling by default.
+ *
+ * INTENDED PROTECTION MODEL (currently violated by the bugs above):
+ * 1. [Node Metadata]: Readers enter an epoch guard before traversing bucket
+ *    chains. Nodes must only be recycled after all readers that observed them
+ *    have left their epoch.
  * 2. [Data Memory]: Protected by shared_ptr within P2PRouteHandle. Even after
  *    the Node is recycled, the underlying P2PRouteData remains valid as long
  *    as the caller holds the handle.

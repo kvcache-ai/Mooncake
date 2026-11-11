@@ -7,11 +7,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
@@ -19,6 +21,7 @@
 
 namespace mooncake {
 
+class P2PMasterService;
 class P2PHotStandbyService;
 
 inline constexpr uint32_t kMaxStandbySnapshotChunkSize = 4096;
@@ -78,7 +81,22 @@ struct EndStandbySnapshotRequest {
 
 class P2PStandbySnapshotService {
    public:
+    struct Source {
+        std::function<std::string()> get_cluster_id;
+        std::function<bool()> is_ready;
+        std::function<uint64_t()> get_baseline_sequence_id;
+        std::function<std::vector<std::string>()> list_object_keys;
+        std::function<std::vector<UUID>()> list_client_ids;
+        std::function<std::optional<P2PStandbyRouteEntry>(
+            const std::string& key)>
+            get_object_metadata;
+        std::function<std::optional<P2PStandbyClientInfo>(
+            const UUID& client_id)>
+            get_client_info;
+    };
+
     explicit P2PStandbySnapshotService(P2PHotStandbyService* standby);
+    explicit P2PStandbySnapshotService(Source source);
     ~P2PStandbySnapshotService();
 
     P2PStandbySnapshotService(const P2PStandbySnapshotService&) = delete;
@@ -102,7 +120,7 @@ class P2PStandbySnapshotService {
     void CleanupExpiredSessionsLocked();
     void CleanupLoop();
 
-    P2PHotStandbyService* standby_;
+    Source source_;
     std::mutex mutex_;
     std::condition_variable cleanup_cv_;
     std::unordered_map<std::string, Session> sessions_;
@@ -110,6 +128,11 @@ class P2PStandbySnapshotService {
     bool stopping_{false};
     std::thread cleanup_thread_;
 };
+
+P2PStandbySnapshotService::Source MakeP2PPrimarySnapshotSource(
+    std::string cluster_id, P2PMasterService* master_service);
+void RegisterP2PStandbySnapshotRpcHandlers(coro_rpc::coro_rpc_server& server,
+                                           P2PStandbySnapshotService* service);
 
 class P2PStandbySnapshotClient {
    public:

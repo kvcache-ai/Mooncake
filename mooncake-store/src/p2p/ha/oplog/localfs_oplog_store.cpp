@@ -33,7 +33,7 @@ LocalFsOpLogStore::LocalFsOpLogStore(const std::string& cluster_id,
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for LocalFsOpLogStore: '"
                    << cluster_id
-                   << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
+                   << "'. Allowed chars: [A-Za-z0-9_.-/], max_len=128.";
     }
     // Rebuild cluster_dir_ after normalization.
     cluster_dir_ = root_dir_ + "/" + cluster_id_;
@@ -780,9 +780,9 @@ ErrorCode LocalFsOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
 // ============================================================
 
 std::unique_ptr<OpLogChangeNotifier> LocalFsOpLogStore::CreateChangeNotifier(
-    const std::string& /*cluster_id*/) {
-    return std::make_unique<PollingOpLogChangeNotifier>(this,
-                                                        poll_interval_ms_);
+    const std::string& /*cluster_id*/, size_t poll_batch_size) {
+    return std::make_unique<PollingOpLogChangeNotifier>(this, poll_interval_ms_,
+                                                        poll_batch_size);
 }
 
 }  // namespace mooncake

@@ -39,11 +39,7 @@ class FailingP2PMasterView : public P2PMasterView {
 
 #ifdef STORE_USE_REDIS
 std::string RedisMasterViewKey(const std::string& cluster_id) {
-    std::string normalized_cluster_id = cluster_id;
-    if (!normalized_cluster_id.empty() && normalized_cluster_id.back() != '/') {
-        normalized_cluster_id += '/';
-    }
-    return "mooncake:{" + normalized_cluster_id + "}master_view";
+    return "mooncake:{" + cluster_id + "}:master_view";
 }
 
 void WriteRedisMasterViewOrSkip(const std::string& cluster_id,

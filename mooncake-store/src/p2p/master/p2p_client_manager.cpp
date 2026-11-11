@@ -267,6 +267,10 @@ void P2PClientManager::SetSegmentRemovalCallback(SegmentRemovalCallback cb) {
     segment_removal_cb_ = std::move(cb);
 }
 
+void P2PClientManager::SetClientCrashedCallback(ClientCrashedCallback cb) {
+    client_crashed_cb_ = std::move(cb);
+}
+
 auto P2PClientManager::RegisterClient(const P2PRegisterClientRequest& req)
     -> tl::expected<ViewVersionId, ErrorCode> {
     const auto& client_id = req.client_id;
@@ -487,6 +491,9 @@ void P2PClientManager::ClientMonitorFunc() {
             auto [old_status, new_status] = meta->CheckHealth();
             if (old_status != new_status &&
                 new_status == P2PClientStatus::CRASHED) {
+                if (client_crashed_cb_) {
+                    client_crashed_cb_(client_id);
+                }
                 newly_crashed.push_back(meta);
             }
         }

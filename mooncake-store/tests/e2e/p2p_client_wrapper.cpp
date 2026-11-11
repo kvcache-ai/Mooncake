@@ -38,7 +38,7 @@ ClientTestWrapper::CreateClientWrapper(
         master_server_entry, kP2PTierConfig, local_buffer_size, nullptr, "",
         p2p_client_rpc_port, /*rpc_thread_num=*/2,
         /*lock_shard_count=*/1024,
-        /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
+        /*route_cache_max_memory_bytes=*/0,
         /*route_cache_ttl_ms=*/60 * 1000, p2p_local_transfer_mode,
         /*local_io_worker_num=*/32, /*http_port=*/9003, enable_http_server);
     if (!redis_cluster_id.empty()) {

@@ -72,8 +72,11 @@ tl::expected<std::unique_ptr<DataManager>, ErrorCode> CreateV2(
     if (!v2_config) {
         return tl::make_unexpected(v2_config.error());
     }
+    // Either the outer caller or a local-only tier file may opt out. Do not
+    // overwrite the parsed file value with the outer config's default true.
     v2_config->register_tiers_with_transfer_engine =
-        config.register_tiers_with_transfer_engine;
+        config.register_tiers_with_transfer_engine &&
+        v2_config->register_tiers_with_transfer_engine;
     // Only when the caller asked for it. ParseDataManagerV2Config has already
     // read and validated the tier configuration's own value; overwriting it
     // unconditionally is what made that knob dead.

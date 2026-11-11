@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -144,6 +145,19 @@ class P2PMasterService final {
     ErrorCode RestoreFromStandbyMetadata(
         const P2PStandbyMetadataStore::ExportedMetadata& metadata,
         uint64_t last_applied_sequence_id = 0);
+    P2PStandbyMetadataStore::ExportedMetadata ExportMetadataForStandby() const;
+    tl::expected<P2PStandbyMetadataStore::ExportedMetadata, ErrorCode>
+    ExportLocalCommittedMetadataForStandby(
+        uint64_t local_committed_sequence_id) const;
+
+    uint64_t GetLatestOpLogSequenceId() const;
+    tl::expected<uint64_t, ErrorCode> GetLocalCommittedOpLogSequenceId() const;
+    std::vector<std::string> ListSnapshotObjectKeys() const;
+    std::vector<UUID> ListSnapshotClientIds() const;
+    std::optional<P2PStandbyRouteEntry> GetSnapshotObjectMetadata(
+        const std::string& key) const;
+    std::optional<P2PStandbyClientInfo> GetSnapshotClientInfo(
+        const UUID& client_id) const;
 
     ErrorCode RecordOplog(OpType type, const std::string& key,
                           const std::string& payload = std::string());

@@ -1,6 +1,7 @@
 #include "p2p/master/p2p_master.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include "utils.h"
 #ifdef STORE_USE_REDIS
 #include "p2p/ha/oplog/redis_oplog_store.h"
+#include "p2p/ha/oplog/redis_oplog_trim_worker.h"
 #endif
 
 namespace mooncake {
@@ -119,6 +121,11 @@ std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     return service;
 }
 
+struct P2PPrimaryDemotionHandoff {
+    P2PStandbyMetadataStore::ExportedMetadata metadata;
+    uint64_t sequence_id{0};
+};
+
 }  // namespace
 
 int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
@@ -175,6 +182,7 @@ int P2PMaster::RunStandalone() {
 int P2PMaster::RunWithHA() {
     const std::string local_endpoint =
         config_.rpc.address + ":" + std::to_string(config_.rpc.port);
+    std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
     while (true) {
         auto server = CreateRpcServer(config_);
         std::unique_ptr<P2PMasterView> master_view;
@@ -208,15 +216,17 @@ int P2PMaster::RunWithHA() {
 #ifdef STORE_USE_REDIS
         std::unique_ptr<RedisMasterRegistryHeartbeat> master_registry_heartbeat;
         std::string master_instance_id;
+        std::string p2p_snapshot_endpoint;
         if (config_.oplog.enabled &&
             config_.ha.election_backend == ElectionBackend::REDIS) {
             master_instance_id = GenerateMasterInstanceId();
             RedisMasterRegistryEntry entry;
             entry.instance_id = master_instance_id;
             entry.master_endpoint = local_endpoint;
-            entry.snapshot_endpoint = BuildSnapshotEndpoint(
+            p2p_snapshot_endpoint = BuildSnapshotEndpoint(
                 local_endpoint, config_.ha.snapshot_service_port,
                 config_.ha.snapshot_service_endpoint);
+            entry.snapshot_endpoint = p2p_snapshot_endpoint;
             entry.role = "starting";
             entry.snapshot_ready = false;
             master_registry_heartbeat =
@@ -252,14 +262,36 @@ int P2PMaster::RunWithHA() {
                 static_cast<uint16_t>(config_.ha.snapshot_service_port);
 #ifdef STORE_USE_REDIS
             standby_config.master_instance_id = master_instance_id;
+            standby_config.local_master_endpoint = local_endpoint;
+            standby_config.local_snapshot_endpoint = p2p_snapshot_endpoint;
 #endif
+            standby_config.oplog_pending_max_entries =
+                config_.ha.standby_oplog_pending_max_entries;
+            standby_config.oplog_poll_batch_size =
+                config_.ha.standby_oplog_poll_batch_size;
             standby_config.snapshot_chunk_size = config_.ha.snapshot_chunk_size;
             if (!config_.ha.snapshot_sources.empty()) {
                 standby_config.snapshot_source_endpoints = splitString(
                     config_.ha.snapshot_sources, ',', /*trim=*/true);
             }
             standby = std::make_unique<P2PHotStandbyService>(standby_config);
-            auto start_result = standby->Start();
+            uint64_t standby_baseline_sequence_id = 0;
+            std::optional<P2PStandbyMetadataStore::ExportedMetadata>
+                standby_initial_metadata;
+            if (demoted_primary_handoff.has_value()) {
+                standby_baseline_sequence_id =
+                    demoted_primary_handoff->sequence_id;
+                standby_initial_metadata =
+                    std::move(demoted_primary_handoff->metadata);
+                demoted_primary_handoff.reset();
+                LOG(INFO) << "Starting P2P standby from demoted primary "
+                             "handoff"
+                          << ", baseline_sequence_id="
+                          << standby_baseline_sequence_id;
+            }
+            auto start_result =
+                standby->Start(standby_baseline_sequence_id,
+                               std::move(standby_initial_metadata));
             if (start_result != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to start P2P standby: "
                            << toString(start_result);
@@ -279,10 +311,23 @@ int P2PMaster::RunWithHA() {
         EtcdLeaseId lease_id = 0;
         ViewVersionId view_version = 0;
         master_view->ElectLeader(local_endpoint, view_version, lease_id);
-        auto keep_leader_thread = std::thread(
-            [server = server.get(), view = master_view.get(), lease_id] {
+
+        std::atomic<bool> leadership_lost{false};
+        std::atomic<OpLogManager*> primary_oplog_manager{nullptr};
+        auto stop_primary_rpc = [&server, &leadership_lost,
+                                 &primary_oplog_manager] {
+            leadership_lost.store(true, std::memory_order_release);
+            if (auto* manager =
+                    primary_oplog_manager.load(std::memory_order_acquire)) {
+                manager->RequestStopWriting();
+            }
+            server->stop();
+        };
+        auto keep_leader_thread =
+            std::thread([view = master_view.get(), lease_id, &stop_primary_rpc,
+                         &leadership_lost] {
                 view->KeepLeader(lease_id);
-                server->stop();
+                stop_primary_rpc();
             });
         std::this_thread::sleep_for(
             std::chrono::seconds(master_view->GetLeaderLeaseTTLSeconds()));
@@ -314,6 +359,17 @@ int P2PMaster::RunWithHA() {
         }
 
         auto active_service = CreateActiveService(config_, view_version);
+        {
+            auto* manager =
+                active_service->GetMasterService().GetOpLogManager();
+            primary_oplog_manager.store(manager, std::memory_order_release);
+            // Handle a leader loss that races with service publication. The
+            // keep-leader callback either reads the published manager or sees
+            // leadership_lost here and requests the stop itself.
+            if (leadership_lost.load(std::memory_order_acquire) && manager) {
+                manager->RequestStopWriting();
+            }
+        }
         if (promoted_metadata.has_value()) {
             auto restore_result =
                 active_service->GetMasterService().RestoreFromStandbyMetadata(
@@ -327,20 +383,174 @@ int P2PMaster::RunWithHA() {
             }
         }
 
+        std::unique_ptr<P2PStandbySnapshotService> primary_snapshot_service;
+        std::unique_ptr<coro_rpc::coro_rpc_server> primary_snapshot_server;
 #ifdef STORE_USE_REDIS
-        auto mark_primary = [&master_registry_heartbeat] {
+        const bool redis_election =
+            config_.ha.election_backend == ElectionBackend::REDIS;
+        const bool dedicated_heartbeat = config_.rpc.heartbeat_port > 0;
+        const bool invalid_snapshot_port =
+            config_.ha.snapshot_service_port == config_.rpc.port ||
+            (dedicated_heartbeat &&
+             config_.ha.snapshot_service_port == config_.rpc.heartbeat_port);
+        if (redis_election && config_.oplog.enabled &&
+            config_.ha.snapshot_service_port > 0 && invalid_snapshot_port) {
+            LOG(ERROR) << "P2P primary snapshot fallback port conflicts with "
+                          "active RPC port";
+            master_view->CancelKeepAlive(lease_id);
+            keep_leader_thread.join();
+            return -1;
+        }
+        if (redis_election && config_.oplog.enabled &&
+            config_.ha.snapshot_service_port > 0) {
+            auto* primary_service = &active_service->GetMasterService();
+            primary_snapshot_service =
+                std::make_unique<P2PStandbySnapshotService>(
+                    MakeP2PPrimarySnapshotSource(config_.cluster_id,
+                                                 primary_service));
+            primary_snapshot_server =
+                std::make_unique<coro_rpc::coro_rpc_server>(
+                    1, config_.ha.snapshot_service_port, config_.rpc.address);
+            RegisterP2PStandbySnapshotRpcHandlers(
+                *primary_snapshot_server, primary_snapshot_service.get());
+            auto snapshot_result = primary_snapshot_server->async_start();
+            if (snapshot_result.hasResult()) {
+                LOG(ERROR) << "P2P primary snapshot fallback server failed"
+                           << ", port=" << config_.ha.snapshot_service_port;
+                primary_snapshot_server->stop();
+                primary_snapshot_server.reset();
+                primary_snapshot_service.reset();
+                master_view->CancelKeepAlive(lease_id);
+                keep_leader_thread.join();
+                return -1;
+            }
+            LOG(INFO) << "P2P primary snapshot fallback server started"
+                      << ", port=" << config_.ha.snapshot_service_port;
+        }
+#endif
+
+#ifdef STORE_USE_REDIS
+        std::unique_ptr<RedisOpLogTrimWorker> redis_oplog_trim_worker;
+        if (config_.oplog.enable_auto_trim) {
+            RedisOpLogTrimWorkerConfig trim_config;
+            trim_config.cluster_id = config_.cluster_id;
+            trim_config.self_instance_id = master_instance_id;
+            trim_config.redis_endpoint = config_.redis.endpoint;
+            trim_config.redis_username = config_.redis.username;
+            trim_config.redis_password = config_.redis.password;
+            trim_config.redis_db_index = config_.redis.db_index;
+            trim_config.registry_ttl = std::chrono::seconds(10);
+            trim_config.interval =
+                std::chrono::seconds(config_.oplog.auto_trim_interval_sec);
+            trim_config.retention_entries =
+                config_.oplog.trim_retention_entries;
+            trim_config.delete_batch_size =
+                config_.oplog.trim_delete_batch_size;
+            trim_config.min_snapshot_ready_standby_count =
+                config_.oplog.trim_min_snapshot_ready_standby_count;
+            redis_oplog_trim_worker =
+                std::make_unique<RedisOpLogTrimWorker>(std::move(trim_config));
+            auto trim_start = redis_oplog_trim_worker->Start();
+            if (trim_start != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to start Redis OpLog auto trim worker: "
+                           << toString(trim_start);
+                redis_oplog_trim_worker.reset();
+                master_view->CancelKeepAlive(lease_id);
+                keep_leader_thread.join();
+                return -1;
+            }
+        }
+
+        auto mark_primary = [&master_registry_heartbeat,
+                             primary_service =
+                                 &active_service->GetMasterService()] {
             if (master_registry_heartbeat) {
+                master_registry_heartbeat->SetAppliedSequenceProvider(
+                    [primary_service] {
+                        return primary_service->GetLatestOpLogSequenceId();
+                    });
+                master_registry_heartbeat->SetSnapshotReadyProvider({});
                 master_registry_heartbeat->UpdateRole("primary", false);
             }
         };
         const int run_result = RunActiveRpcServers(*server, *active_service,
                                                    std::move(mark_primary));
+        redis_oplog_trim_worker.reset();
 #else
         const int run_result = RunActiveRpcServers(*server, *active_service);
 #endif
-        active_service.reset();
+        if (auto* manager =
+                primary_oplog_manager.load(std::memory_order_acquire)) {
+            manager->StopWriting();
+        }
+        if (primary_snapshot_server) {
+            primary_snapshot_server->stop();
+        }
+        primary_snapshot_server.reset();
+        primary_snapshot_service.reset();
+#ifdef STORE_USE_REDIS
+        if (master_registry_heartbeat) {
+            master_registry_heartbeat->SetAppliedSequenceProvider({});
+            master_registry_heartbeat->SetSnapshotReadyProvider({});
+        }
+#endif
+        auto* active_p2p_service = &active_service->GetMasterService();
+        if (config_.oplog.enabled &&
+            leadership_lost.load(std::memory_order_acquire)) {
+            const uint64_t local_assigned_sequence_id =
+                active_p2p_service->GetLatestOpLogSequenceId();
+            auto local_committed_sequence_id =
+                active_p2p_service->GetLocalCommittedOpLogSequenceId();
+            demoted_primary_handoff.reset();
+            if (!local_committed_sequence_id.has_value()) {
+                LOG(WARNING)
+                    << "Skip P2P primary demotion handoff because local "
+                       "committed OpLog sequence is unavailable"
+                    << ", local_assigned_sequence_id="
+                    << local_assigned_sequence_id << ", error="
+                    << toString(local_committed_sequence_id.error());
+            } else {
+                auto metadata =
+                    active_p2p_service->ExportLocalCommittedMetadataForStandby(
+                        local_committed_sequence_id.value());
+                if (!metadata.has_value()) {
+                    LOG(WARNING) << "Skip P2P primary demotion handoff because "
+                                    "uncommitted metadata rollback failed"
+                                 << ", local_committed_sequence_id="
+                                 << local_committed_sequence_id.value()
+                                 << ", local_assigned_sequence_id="
+                                 << local_assigned_sequence_id
+                                 << ", error=" << toString(metadata.error());
+                } else {
+                    demoted_primary_handoff.emplace();
+                    demoted_primary_handoff->sequence_id =
+                        local_committed_sequence_id.value();
+                    // TODO(P2P HA): Avoid a full metadata copy on demotion by
+                    // moving primary metadata into the next standby or by
+                    // supporting an in-place role transition.
+                    demoted_primary_handoff->metadata =
+                        std::move(metadata.value());
+                    LOG(INFO)
+                        << "Captured P2P primary demotion handoff"
+                        << ", baseline_sequence_id="
+                        << demoted_primary_handoff->sequence_id
+                        << ", local_committed_sequence_id="
+                        << local_committed_sequence_id.value()
+                        << ", local_assigned_sequence_id="
+                        << local_assigned_sequence_id << ", routes="
+                        << demoted_primary_handoff->metadata.routes.size()
+                        << ", clients="
+                        << demoted_primary_handoff->metadata.clients.size();
+                }
+            }
+        } else {
+            demoted_primary_handoff.reset();
+            LOG(WARNING) << "Skip P2P primary demotion handoff because master "
+                            "service stopped without losing leadership";
+        }
         master_view->CancelKeepAlive(lease_id);
         keep_leader_thread.join();
+        active_service.reset();
         if (run_result != 0) {
             return run_result;
         }

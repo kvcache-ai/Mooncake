@@ -23,6 +23,9 @@ constexpr OpType OpType_MOUNT_SEGMENT = static_cast<OpType>(12);
 constexpr OpType OpType_UNMOUNT_SEGMENT = static_cast<OpType>(13);
 constexpr OpType OpType_REGISTER_CLIENT = static_cast<OpType>(15);
 constexpr OpType OpType_UNREGISTER_CLIENT = static_cast<OpType>(16);
+// Transient marker for a confirmed gap read from a committed OpLog range.
+// It is delivered to the in-process applier and never persisted to the store.
+constexpr OpType OpType_NOOP = static_cast<OpType>(17);
 
 inline bool IsBestEffortP2POpLog(OpType type) {
     return type == OpType_PUBLISH_ROUTE;

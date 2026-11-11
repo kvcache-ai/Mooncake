@@ -71,20 +71,12 @@ std::pair<std::string, int> ParseRedisEndpoint() {
     return {host, port};
 }
 
-std::string RedisClusterIdWithSlash() {
-    std::string cluster_id = FLAGS_redis_cluster_id;
-    if (!cluster_id.empty() && cluster_id.back() != '/') {
-        cluster_id += '/';
-    }
-    return cluster_id;
-}
-
 std::string MasterViewKey() {
-    return "mooncake:{" + RedisClusterIdWithSlash() + "}master_view";
+    return "mooncake:{" + FLAGS_redis_cluster_id + "}:master_view";
 }
 
 std::string MasterEpochKey() {
-    return "mooncake:{" + RedisClusterIdWithSlash() + "}master_epoch";
+    return "mooncake:{" + FLAGS_redis_cluster_id + "}:master_epoch";
 }
 
 bool DeleteRedisKey(const std::string& key) {
@@ -580,6 +572,27 @@ class RedisChaosTest : public ::testing::Test {
         return false;
     }
 
+    bool WaitForSnapshotObject(int source_index, const std::string& key,
+                               std::chrono::seconds timeout) {
+        const std::string endpoint =
+            "127.0.0.1:" + std::to_string(kSnapshotPortBase + source_index);
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            P2PStandbyMetadataStore metadata;
+            P2PStandbySnapshotClient snapshot_client;
+            uint64_t baseline_sequence_id = 0;
+            if (snapshot_client.Bootstrap(endpoint, FLAGS_redis_cluster_id,
+                                          &metadata, baseline_sequence_id,
+                                          /*chunk_size=*/256) ==
+                    ErrorCode::OK &&
+                metadata.RouteExists(key)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return false;
+    }
+
     bool WaitForSnapshotBaseline(int source_index, uint64_t expected_sequence,
                                  std::chrono::seconds timeout) {
         const std::string endpoint =
@@ -692,6 +705,71 @@ TEST_F(RedisChaosTest, LeaderKeyDeletedTriggersReElection) {
     EXPECT_GE(next_leader_index, 0);
     EXPECT_LT(next_leader_index, kMasterNum);
     EXPECT_GT(next_version, version);
+}
+
+TEST_F(RedisChaosTest, DemotedPrimaryCatchesUpFromOplogWithoutSnapshot) {
+    int leader_index = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader_index, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+
+    ClientCtlProcess client(/*index=*/21, FLAGS_out_dir);
+    ASSERT_TRUE(client.Start());
+    ASSERT_TRUE(client.SendAndWait(
+        "create c_handoff " + std::to_string(kClientPortBase + 21),
+        "Successfully created client: c_handoff", std::chrono::seconds(30)));
+
+    const std::string before_key = "demotion_handoff_before";
+    const std::string before_value = "before_value";
+    ASSERT_TRUE(
+        client.SendAndWait("put c_handoff " + before_key + " " + before_value,
+                           "Successfully put value for key: " + before_key,
+                           std::chrono::seconds(10)));
+    ASSERT_TRUE(WaitForReplicaOpLog(before_key, std::chrono::seconds(10)));
+
+    auto demoted_log_offset = MasterLogEndOffset(leader_index);
+    ASSERT_TRUE(masters_[leader_index]->suspend());
+
+    int new_leader_index = -1;
+    ViewVersionId new_version = 0;
+    ASSERT_TRUE(
+        WaitForNewLeader(leader_index, version, new_leader_index, new_version));
+    WaitForLeaderServiceReady();
+
+    ClientCtlProcess after_client(/*index=*/22, FLAGS_out_dir);
+    ASSERT_TRUE(after_client.Start());
+    ASSERT_TRUE(after_client.SendAndWait(
+        "create c_handoff_after " + std::to_string(kClientPortBase + 22),
+        "Successfully created client: c_handoff_after",
+        std::chrono::seconds(30)));
+
+    const std::string after_key = "demotion_handoff_after";
+    const std::string after_value = "after_value";
+    ASSERT_TRUE(WaitForClientCtlCommand(
+        after_client, "put c_handoff_after " + after_key + " " + after_value,
+        "Successfully put value for key: " + after_key,
+        std::chrono::seconds(60)));
+    ASSERT_TRUE(WaitForReplicaOpLog(after_key, std::chrono::seconds(10)));
+
+    ASSERT_TRUE(masters_[leader_index]->resume());
+    ASSERT_TRUE(WaitForMasterLogSince(
+        leader_index, "Captured P2P primary demotion handoff",
+        demoted_log_offset, std::chrono::seconds(30)));
+    ASSERT_TRUE(WaitForMasterLogSince(
+        leader_index, "local_committed_sequence_id=", demoted_log_offset,
+        std::chrono::seconds(30)));
+    ASSERT_TRUE(WaitForMasterLogSince(
+        leader_index, "Starting P2P standby from demoted primary handoff",
+        demoted_log_offset, std::chrono::seconds(30)));
+    ASSERT_TRUE(WaitForMasterLogSince(
+        leader_index,
+        "P2PHotStandbyService: continuing from initial metadata via OpLog "
+        "without snapshot",
+        demoted_log_offset, std::chrono::seconds(30)));
+    ASSERT_TRUE(WaitForSnapshotObject(leader_index, before_key,
+                                      std::chrono::seconds(30)));
+    ASSERT_TRUE(WaitForSnapshotObject(leader_index, after_key,
+                                      std::chrono::seconds(30)));
 }
 
 TEST_F(RedisChaosTest, ClientRedisDiscoverySurvivesLeaderFailover) {

@@ -65,6 +65,12 @@ HAMetricManager::HAMetricManager()
           "Total number of failed OpLog persistence operations"),
       oplog_write_retries_total_("ha_oplog_write_retries_total",
                                  "Total number of OpLog write retry attempts"),
+      oplog_redis_pipeline_batch_failures_total_(
+          "ha_oplog_redis_pipeline_batch_failures_total",
+          "Redis OpLog SET pipeline attempts with at least one failed entry"),
+      oplog_redis_pipeline_batch_retries_total_(
+          "ha_oplog_redis_pipeline_batch_retries_total",
+          "Redis OpLog SET pipeline attempts with entries requeued for retry"),
       election_attempts_total_("ha_election_attempts_total",
                                "Total number of election attempts"),
       election_failures_total_("ha_election_failures_total",
@@ -110,7 +116,8 @@ HAMetricManager::HAMetricManager()
           "Total number of failed best-effort entries skipped by Standby"),
       oplog_confirmed_holes_total_(
           "ha_oplog_confirmed_holes_total",
-          "Total number of confirmed sparse OpLog sequence IDs"),
+          "Total missing OpLog ID observations in scanned ranges; rereads "
+          "may count the same ID again"),
       force_promotions_total_("ha_force_promotions_total",
                               "Total number of forced P2P promotions"),
       promotion_catchup_incomplete_total_(
@@ -143,6 +150,9 @@ HAMetricManager::HAMetricManager()
       oplog_applied_entries_total_(
           "ha_oplog_applied_entries_total",
           "Total number of OpLog entries successfully applied"),
+      oplog_applied_noop_entries_total_(
+          "ha_oplog_applied_noop_entries_total",
+          "Total number of NOOP OpLog entries processed by the applier"),
       oplog_dropped_put_end_total_("ha_oplog_dropped_put_end_total",
                                    "Total number of dropped PUT_END operations "
                                    "due to late arrival after "
@@ -161,6 +171,11 @@ HAMetricManager::HAMetricManager()
           "Latency of OpLog persistence operations in microseconds",
           {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000,
            5000000}),
+      oplog_redis_pipeline_batch_size_(
+          "ha_oplog_redis_pipeline_batch_size",
+          "Number of entries selected for each Redis OpLog SET pipeline "
+          "attempt",
+          {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}),
       election_duration_ms_(
           "ha_election_duration_ms",
           "Time spent waiting to acquire leadership in milliseconds",
@@ -318,6 +333,24 @@ int64_t HAMetricManager::get_oplog_write_retries_total() {
     return static_cast<int64_t>(oplog_write_retries_total_.value());
 }
 
+void HAMetricManager::inc_oplog_redis_pipeline_batch_failures(int64_t val) {
+    oplog_redis_pipeline_batch_failures_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_redis_pipeline_batch_failures_total() {
+    return static_cast<int64_t>(
+        oplog_redis_pipeline_batch_failures_total_.value());
+}
+
+void HAMetricManager::inc_oplog_redis_pipeline_batch_retries(int64_t val) {
+    oplog_redis_pipeline_batch_retries_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_redis_pipeline_batch_retries_total() {
+    return static_cast<int64_t>(
+        oplog_redis_pipeline_batch_retries_total_.value());
+}
+
 void HAMetricManager::inc_election_attempts(int64_t val) {
     election_attempts_total_.inc(val);
 }
@@ -417,6 +450,14 @@ int64_t HAMetricManager::get_oplog_applied_entries_total() {
     return static_cast<int64_t>(oplog_applied_entries_total_.value());
 }
 
+void HAMetricManager::inc_oplog_applied_noop_entries(int64_t val) {
+    oplog_applied_noop_entries_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_applied_noop_entries_total() {
+    return static_cast<int64_t>(oplog_applied_noop_entries_total_.value());
+}
+
 void HAMetricManager::inc_oplog_dropped_put_end(int64_t val) {
     oplog_dropped_put_end_total_.inc(val);
 }
@@ -445,6 +486,11 @@ int64_t HAMetricManager::get_oplog_sync_batch_commits_total() {
 
 void HAMetricManager::observe_oplog_write_latency_us(int64_t latency_us) {
     oplog_write_latency_us_.observe(latency_us);
+}
+
+void HAMetricManager::observe_oplog_redis_pipeline_batch_size(
+    int64_t batch_size) {
+    oplog_redis_pipeline_batch_size_.observe(batch_size);
 }
 
 void HAMetricManager::observe_election_duration_ms(int64_t duration_ms) {
@@ -507,6 +553,8 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_gap_resolve_success_total_);
     serialize_metric(oplog_write_failures_total_);
     serialize_metric(oplog_write_retries_total_);
+    serialize_metric(oplog_redis_pipeline_batch_failures_total_);
+    serialize_metric(oplog_redis_pipeline_batch_retries_total_);
     serialize_metric(election_attempts_total_);
     serialize_metric(election_failures_total_);
     serialize_metric(election_leadership_lost_total_);
@@ -535,6 +583,7 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(p2p_snapshot_resync_failures_total_);
     serialize_metric(oplog_watch_disconnections_total_);
     serialize_metric(oplog_applied_entries_total_);
+    serialize_metric(oplog_applied_noop_entries_total_);
     serialize_metric(oplog_dropped_put_end_total_);
     serialize_metric(oplog_batch_commits_total_);
     serialize_metric(oplog_sync_batch_commits_total_);
@@ -542,6 +591,7 @@ std::string HAMetricManager::serialize_metrics() {
 
     // Histograms
     serialize_metric(oplog_write_latency_us_);
+    serialize_metric(oplog_redis_pipeline_batch_size_);
     serialize_metric(election_duration_ms_);
     serialize_metric(oplog_apply_latency_us_);
 

@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stop_token>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +18,7 @@
 
 #include "p2p/ha/oplog/oplog_store.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
+#include "p2p/ha/oplog/redis_oplog_limits.h"
 #include "mutex.h"
 #include "p2p/ha/redis_util.h"
 
@@ -26,15 +28,15 @@ enum class OpLogAsyncQueueOverflowMode { REJECT, BYPASS };
 
 class RedisOpLogStore : public OpLogStore {
    public:
-    RedisOpLogStore(const std::string& cluster_id,
-                    const std::string& redis_endpoint, bool enable_write,
-                    int poll_interval_ms = 1000,
-                    const std::string& password = "",
-                    const std::string& username = "", int db_index = 0,
-                    size_t async_queue_max_entries = 100000,
-                    OpLogAsyncQueueOverflowMode async_queue_overflow_mode =
-                        OpLogAsyncQueueOverflowMode::REJECT,
-                    size_t best_effort_max_retries = 3);
+    RedisOpLogStore(
+        const std::string& cluster_id, const std::string& redis_endpoint,
+        bool enable_write, int poll_interval_ms = 1000,
+        const std::string& password = "", const std::string& username = "",
+        int db_index = 0, size_t async_queue_max_entries = 100000,
+        OpLogAsyncQueueOverflowMode async_queue_overflow_mode =
+            OpLogAsyncQueueOverflowMode::REJECT,
+        size_t best_effort_max_retries = 3,
+        size_t async_write_batch_size = kDefaultRedisOpLogWriteBatchSize);
     ~RedisOpLogStore() override;
 
     RedisOpLogStore(const RedisOpLogStore&) = delete;
@@ -42,6 +44,11 @@ class RedisOpLogStore : public OpLogStore {
 
     ErrorCode Init() override;
     ErrorCode WriteOpLog(const OpLogEntry& entry, bool sync = true) override;
+    // Signal cancellation without waiting for the queue lock or Redis I/O.
+    // Commands already in progress may finish.
+    void RequestStopWriting() override;
+    // Once this returns, all workers have exited and no async writes remain.
+    void StopWriting() override;
     ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) override;
     ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,
                              std::vector<OpLogEntry>& entries) override;
@@ -50,16 +57,18 @@ class RedisOpLogStore : public OpLogStore {
                                          std::vector<OpLogEntry>& entries,
                                          OpLogReadProgress& progress) override;
     ErrorCode GetLatestSequenceId(uint64_t& sequence_id) override;
+    ErrorCode GetLocalCommittedSequenceId(uint64_t& sequence_id) override;
     ErrorCode GetMaxSequenceId(uint64_t& sequence_id) override;
     ErrorCode GetTrimmedSequenceId(uint64_t& sequence_id) override;
     ErrorCode UpdateLatestSequenceId(uint64_t sequence_id) override;
+    ErrorCode SetLocalCommittedSequenceId(uint64_t sequence_id) override;
     ErrorCode RecordSnapshotSequenceId(const std::string& snapshot_id,
                                        uint64_t sequence_id) override;
     ErrorCode GetSnapshotSequenceId(const std::string& snapshot_id,
                                     uint64_t& sequence_id) override;
     ErrorCode CleanupOpLogBefore(uint64_t before_sequence_id) override;
     std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
-        const std::string& cluster_id) override;
+        const std::string& cluster_id, size_t poll_batch_size = 1000) override;
 
    private:
     struct PendingWrite {
@@ -73,18 +82,31 @@ class RedisOpLogStore : public OpLogStore {
         size_t attempts{0};
     };
 
+    struct WriteResult {
+        ErrorCode error{ErrorCode::INTERNAL_ERROR};
+        int64_t latency_us{0};
+    };
+
     redisContext* CreateConnection() const;
     ErrorCode EnsureConnectedUnlocked();
     ErrorCode ReadOpLogUnlocked(uint64_t sequence_id, OpLogEntry& entry);
     bool IsValidSnapshotId(const std::string& snapshot_id) const;
     ErrorCode EnqueueWrite(const OpLogEntry& entry, bool sync);
     void StartAsyncWorkers();
-    void StopAsyncWorkers();
+    bool WaitForPendingWrites(
+        std::vector<std::shared_ptr<PendingWrite>>& batch);
     void AsyncWriteLoop(size_t worker_id);
-    ErrorCode PersistEntryNoLatest(redisContext* ctx, const OpLogEntry& entry);
+    bool FinishOrRetryWrite(redisContext*& ctx,
+                            const std::shared_ptr<PendingWrite>& pending,
+                            ErrorCode err, size_t worker_id,
+                            int64_t write_latency_us);
+    std::vector<WriteResult> PersistEntriesNoLatest(
+        redisContext* ctx,
+        const std::vector<std::shared_ptr<PendingWrite>>& batch);
+    uint64_t MaxKnownSequenceUnlocked() const;
+    bool HasCommittableLatestUnlocked() const;
     ErrorCode AdvanceCommittedLatestUnlocked(redisContext* ctx);
-    void CompleteWrite(redisContext* ctx,
-                       const std::shared_ptr<PendingWrite>& pending,
+    void CompleteWrite(const std::shared_ptr<PendingWrite>& pending,
                        ErrorCode result);
 
     std::string EntryKey(uint64_t sequence_id) const;
@@ -105,7 +127,7 @@ class RedisOpLogStore : public OpLogStore {
     // while best-effort entries use bounded retries.
     //
     // Redis oplog key model:
-    // - latest: committed progress watermark; dropped entries may leave holes
+    // - latest: committed progress watermark; dropped entries may bridge holes
     // - trimmed: highest sequence already removed by cleanup
     // - entry:<seq>: serialized oplog payload
     // OpLog keys intentionally avoid Redis Cluster hash tags so
@@ -118,8 +140,9 @@ class RedisOpLogStore : public OpLogStore {
     redisContext* ctx_ GUARDED_BY(mutex_) = nullptr;
 
     mutable std::mutex async_mutex_;
-    std::condition_variable async_cv_;
-    std::condition_variable sync_cv_;
+    std::condition_variable_any async_cv_;
+    std::condition_variable_any sync_cv_;
+    std::stop_source async_stop_source_;
     std::deque<std::shared_ptr<PendingWrite>> pending_writes_
         GUARDED_BY(async_mutex_);
     std::map<uint64_t, std::shared_ptr<PendingWrite>> inflight_writes_
@@ -129,9 +152,11 @@ class RedisOpLogStore : public OpLogStore {
     uint64_t committed_sequence_id_ GUARDED_BY(async_mutex_) = 0;
     std::atomic<bool> async_running_{false};
     std::vector<std::thread> async_workers_;
+    std::mutex async_stop_mutex_;
     size_t async_queue_max_entries_;
     OpLogAsyncQueueOverflowMode async_queue_overflow_mode_;
     size_t best_effort_max_retries_;
+    size_t async_write_batch_size_;
 
     static constexpr size_t kAsyncWorkerCount = 4;
     static constexpr size_t kCleanupBatchSize = 1000;

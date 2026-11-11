@@ -10,8 +10,11 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <xxhash.h>
+#include <ylt/util/utils.hpp>
 
 #include "p2p/ha/oplog/localfs_oplog_store.h"
 #include "mock_oplog_store.h"
@@ -20,6 +23,34 @@
 #include "p2p/common/p2p_rpc_types.h"
 
 namespace mooncake::test {
+
+struct P2PHotStandbyServiceTestAccess {
+    static void StartRecoveryWorker(P2PHotStandbyService& service) {
+        std::lock_guard<std::mutex> lock(service.mutex_);
+        service.StartRecoveryWorker();
+    }
+
+    static std::unique_lock<std::mutex> StartWorkerWithMetadataLocked(
+        P2PHotStandbyService& service) {
+        std::unique_lock<std::mutex> lock(service.mutex_);
+        service.StartRecoveryWorker();
+        return lock;
+    }
+
+    static bool RecoveryRequested(P2PHotStandbyService& service) {
+        std::lock_guard<std::mutex> lock(service.recovery_mutex_);
+        return service.recovery_requested_;
+    }
+
+    static void StopRecoveryWorker(P2PHotStandbyService& service) {
+        service.StopRecoveryWorker();
+    }
+
+    static bool RecoveryStopping(P2PHotStandbyService& service) {
+        return service.recovery_stopping_.load();
+    }
+};
+
 namespace {
 
 struct ControlledNotifierState {
@@ -27,6 +58,7 @@ struct ControlledNotifierState {
     std::condition_variable cv;
     OpLogChangeNotifier::ErrorCallback on_error;
     uint64_t start_sequence_id{0};
+    size_t poll_batch_size{0};
     int active_callbacks{0};
     bool healthy_on_start{true};
     bool healthy{false};
@@ -68,7 +100,9 @@ class ControlledReaderStore : public MockOpLogStore {
         : state_(std::move(state)) {}
 
     std::unique_ptr<OpLogChangeNotifier> CreateChangeNotifier(
-        const std::string&) override {
+        const std::string&, size_t poll_batch_size) override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->poll_batch_size = poll_batch_size;
         return std::make_unique<ControlledNotifier>(state_);
     }
 
@@ -102,6 +136,79 @@ void InjectNotifierErrors(const std::shared_ptr<ControlledNotifierState>& state,
     }
     state->cv.notify_all();
 }
+
+class FlakySnapshotRpcService {
+   public:
+    BeginStandbySnapshotResponse BeginSnapshot(
+        const BeginStandbySnapshotRequest& request) {
+        BeginStandbySnapshotResponse response;
+        if (request.cluster_id != kClusterId) {
+            response.error_code = toInt(ErrorCode::INVALID_PARAMS);
+            return response;
+        }
+        response.session_id = kSessionId;
+        response.baseline_sequence_id = kBaselineSequenceId;
+        response.object_count = 1;
+        response.client_count = 1;
+        return response;
+    }
+
+    StandbySnapshotChunkResponse GetSnapshotChunk(
+        const StandbySnapshotChunkRequest& request) {
+        EXPECT_EQ(request.session_id, kSessionId);
+        EXPECT_EQ(request.object_offset, 0u);
+        EXPECT_EQ(request.client_offset, 0u);
+        ++chunk_requests;
+        if (fail_first_chunk.exchange(false)) {
+            StandbySnapshotChunkResponse response;
+            response.error_code = toInt(ErrorCode::INTERNAL_ERROR);
+            return response;
+        }
+
+        StandbySnapshotChunkResponse response;
+        response.done = true;
+        response.next_object_offset = 1;
+        response.next_client_offset = 1;
+
+        P2PStandbyClientInfo client;
+        client.client_id = kClientId;
+        client.ip_address = "127.0.0.1";
+        client.rpc_port = 50051;
+        client.segments.push_back(kSegment);
+        response.clients.push_back({kClientId, std::move(client)});
+
+        P2PStandbyRouteEntry route;
+        route.object_size = kObjectSize;
+        route.last_sequence_id = kBaselineSequenceId;
+        response.objects.push_back({kObjectKey, std::move(route)});
+        return response;
+    }
+
+    int32_t EndSnapshot(const EndStandbySnapshotRequest& request) {
+        EXPECT_EQ(request.session_id, kSessionId);
+        ++end_requests;
+        return toInt(ErrorCode::OK);
+    }
+
+    static constexpr const char* kClusterId = "p2p-hot-standby-test";
+    static constexpr uint64_t kBaselineSequenceId = 123;
+    static constexpr size_t kObjectSize = 8192;
+    static inline const std::string kSessionId = "flaky-session";
+    static inline const std::string kObjectKey = "flaky-snapshot-key";
+    static inline const UUID kClientId{101, 101};
+    static inline const UUID kSegmentId{102, 102};
+    static inline const P2PSegment kSegment{
+        .id = kSegmentId,
+        .name = "segment-102-102",
+        .size = 1024 * 1024,
+        .priority = 1,
+        .tags = {},
+    };
+
+    std::atomic<bool> fail_first_chunk{true};
+    std::atomic<int> chunk_requests{0};
+    std::atomic<int> end_requests{0};
+};
 
 // Bind once on port 0 and keep the listener alive for the entire test. A
 // PID-derived port can be in use by another test or an outgoing connection.
@@ -235,6 +342,21 @@ class P2PHotStandbyServiceTest : public ::testing::Test {
     std::filesystem::path test_dir_;
 };
 
+TEST_F(P2PHotStandbyServiceTest, UsesConfiguredOpLogPollBatchSize) {
+    auto state = std::make_shared<ControlledNotifierState>();
+    auto config = MakeStandbyConfig();
+    config.oplog_poll_batch_size = 7;
+    P2PHotStandbyService standby(
+        config, [&] { return std::make_unique<ControlledReaderStore>(state); });
+
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        EXPECT_EQ(7u, state->poll_batch_size);
+    }
+    standby.Stop();
+}
+
 TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POplog) {
     P2PMasterService master(MakeMasterConfig());
     const UUID client_id{1, 1};
@@ -298,6 +420,44 @@ TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
 }
 
 TEST_F(P2PHotStandbyServiceTest,
+       SnapshotBootstrapSucceedsAfterTransientChunkError) {
+    FlakySnapshotRpcService rpc_service;
+    coro_rpc::coro_rpc_server server(1, 0, "127.0.0.1");
+    server.register_handler<&FlakySnapshotRpcService::BeginSnapshot>(
+        &rpc_service,
+        coro_rpc::func_id<&P2PStandbySnapshotService::BeginSnapshot>());
+    server.register_handler<&FlakySnapshotRpcService::GetSnapshotChunk>(
+        &rpc_service,
+        coro_rpc::func_id<&P2PStandbySnapshotService::GetSnapshotChunk>());
+    server.register_handler<&FlakySnapshotRpcService::EndSnapshot>(
+        &rpc_service,
+        coro_rpc::func_id<&P2PStandbySnapshotService::EndSnapshot>());
+    auto start_result = server.async_start();
+    ASSERT_FALSE(start_result.hasResult());
+
+    P2PStandbyMetadataStore target;
+    uint64_t baseline_sequence_id = 0;
+    P2PStandbySnapshotClient client;
+    const auto result = client.Bootstrap(
+        "127.0.0.1:" + std::to_string(server.port()), kClusterId, &target,
+        baseline_sequence_id, /*chunk_size=*/1);
+    server.stop();
+
+    EXPECT_EQ(result, ErrorCode::OK);
+    EXPECT_EQ(baseline_sequence_id,
+              FlakySnapshotRpcService::kBaselineSequenceId);
+    EXPECT_EQ(rpc_service.chunk_requests.load(), 2);
+    EXPECT_EQ(rpc_service.end_requests.load(), 1);
+
+    auto exported = target.ExportMetadata();
+    ASSERT_NE(exported.clients.find(FlakySnapshotRpcService::kClientId),
+              exported.clients.end());
+    auto object = exported.routes.find(FlakySnapshotRpcService::kObjectKey);
+    ASSERT_NE(object, exported.routes.end());
+    EXPECT_EQ(object->second.object_size, FlakySnapshotRpcService::kObjectSize);
+}
+
+TEST_F(P2PHotStandbyServiceTest,
        SnapshotKeepsFixedInventoryWhileSourceContinuesApplying) {
     P2PMasterService master(MakeMasterConfig());
     const UUID client_id{21, 21};
@@ -328,6 +488,141 @@ TEST_F(P2PHotStandbyServiceTest,
     EXPECT_EQ(chunk.objects.front().key, "before-snapshot");
     EXPECT_EQ(snapshot.EndSnapshot({begin.session_id}), toInt(ErrorCode::OK));
 }
+
+TEST_F(P2PHotStandbyServiceTest, PrimarySnapshotSourceServesCurrentMetadata) {
+    P2PMasterService master(MakeMasterConfig());
+    const UUID client_id{23, 23};
+    const UUID segment_id{24, 24};
+    RegisterClient(master, client_id, MakeSegment(segment_id));
+    PublishRoute(master, "primary-snapshot-key", client_id, segment_id, 16384);
+
+    P2PStandbySnapshotService::Source source =
+        MakeP2PPrimarySnapshotSource(kClusterId, &master);
+    P2PStandbySnapshotService snapshot(std::move(source));
+    auto begin = snapshot.BeginSnapshot({kClusterId});
+    ASSERT_EQ(fromInt(begin.error_code), ErrorCode::OK);
+    EXPECT_EQ(begin.baseline_sequence_id, 2);
+    EXPECT_EQ(begin.object_count, 1);
+    EXPECT_EQ(begin.client_count, 1);
+
+    auto chunk = snapshot.GetSnapshotChunk(
+        {begin.session_id, /*object_offset=*/0, /*client_offset=*/0,
+         /*limit=*/1});
+    ASSERT_EQ(fromInt(chunk.error_code), ErrorCode::OK);
+    ASSERT_TRUE(chunk.done);
+    ASSERT_EQ(chunk.clients.size(), 1);
+    EXPECT_EQ(chunk.clients.front().client_id, client_id);
+    EXPECT_EQ(chunk.clients.front().info.ip_address, "127.0.0.1");
+    EXPECT_EQ(chunk.clients.front().info.rpc_port, 50051);
+    ASSERT_EQ(chunk.clients.front().info.segments.size(), 1);
+    EXPECT_EQ(chunk.clients.front().info.segments.front().id, segment_id);
+
+    ASSERT_EQ(chunk.objects.size(), 1);
+    EXPECT_EQ(chunk.objects.front().key, "primary-snapshot-key");
+    EXPECT_EQ(chunk.objects.front().route.object_size, 16384);
+    ASSERT_EQ(chunk.objects.front().route.locations.size(), 1);
+    EXPECT_EQ(chunk.objects.front().route.locations.front().client_id,
+              client_id);
+    EXPECT_EQ(chunk.objects.front().route.locations.front().segment_id,
+              segment_id);
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       StartsFromDemotedPrimaryMetadataAndCatchesUpFromOplog) {
+    P2PMasterService primary(MakeMasterConfig());
+    const UUID client_id{25, 25};
+    const UUID segment_id{26, 26};
+    RegisterClient(primary, client_id, MakeSegment(segment_id));
+    PublishRoute(primary, "handoff-before", client_id, segment_id, 4096);
+
+    auto handoff_metadata = primary.ExportMetadataForStandby();
+    const uint64_t handoff_sequence_id = primary.GetLatestOpLogSequenceId();
+    ASSERT_GT(handoff_sequence_id, 0u);
+    ASSERT_NE(handoff_metadata.clients.find(client_id),
+              handoff_metadata.clients.end());
+    ASSERT_NE(handoff_metadata.routes.find("handoff-before"),
+              handoff_metadata.routes.end());
+
+    PublishRoute(primary, "handoff-after", client_id, segment_id, 8192);
+    const uint64_t catch_up_target = primary.GetLatestOpLogSequenceId();
+    ASSERT_GT(catch_up_target, handoff_sequence_id);
+
+    P2PHotStandbyService standby(MakeStandbyConfig());
+    ASSERT_EQ(standby.Start(handoff_sequence_id, std::move(handoff_metadata)),
+              ErrorCode::OK);
+    ASSERT_TRUE(standby.WaitForAppliedSequence(
+        catch_up_target, std::chrono::milliseconds(2000)));
+
+    auto exported = standby.ExportMetadata();
+    ASSERT_NE(exported.clients.find(client_id), exported.clients.end());
+    auto before = exported.routes.find("handoff-before");
+    ASSERT_NE(before, exported.routes.end());
+    EXPECT_EQ(before->second.object_size, 4096);
+    auto after = exported.routes.find("handoff-after");
+    ASSERT_NE(after, exported.routes.end());
+    EXPECT_EQ(after->second.object_size, 8192);
+
+    standby.Stop();
+}
+
+#ifdef STORE_USE_REDIS
+TEST_F(P2PHotStandbyServiceTest,
+       SelectSnapshotSourcesPrefersStandbyAndFallsBackToPrimary) {
+    auto make_source = [](std::string instance_id, std::string role,
+                          bool snapshot_ready, uint64_t applied_sequence_id,
+                          std::string snapshot_endpoint) {
+        RedisMasterRegistryEntry entry;
+        entry.instance_id = std::move(instance_id);
+        entry.master_endpoint = entry.instance_id + ":50051";
+        entry.snapshot_endpoint = std::move(snapshot_endpoint);
+        entry.role = std::move(role);
+        entry.snapshot_ready = snapshot_ready;
+        entry.applied_sequence_id = applied_sequence_id;
+        return entry;
+    };
+
+    auto standby_selection = SelectP2PSnapshotSources(
+        {make_source("primary-high", "primary", false, 900, "primary:52051"),
+         make_source("standby-low", "standby", true, 300, "standby-low:52051"),
+         make_source("standby-high", "standby", true, 500,
+                     "standby-high:52051"),
+         make_source("self", "standby", true, 700, "self:52051"),
+         make_source("standby-not-ready", "standby", false, 800,
+                     "not-ready:52051"),
+         make_source("standby-stale", "standby", true, 99, "stale:52051")},
+        "self", "self:50051", "self:52051", 100);
+    EXPECT_FALSE(standby_selection.used_primary_fallback);
+    EXPECT_EQ(
+        standby_selection.endpoints,
+        (std::vector<std::string>{"standby-high:52051", "standby-low:52051"}));
+
+    auto primary_selection = SelectP2PSnapshotSources(
+        {make_source("primary-low", "primary", false, 200, "primary-low:52051"),
+         make_source("primary-high", "primary", false, 600,
+                     "primary-high:52051"),
+         make_source("self", "primary", false, 800, "self:52051"),
+         make_source("standby-not-ready", "standby", false, 900,
+                     "not-ready:52051"),
+         make_source("standby-no-endpoint", "standby", true, 1000, ""),
+         make_source("standby-stale", "standby", true, 99, "stale:52051")},
+        "self", "self:50051", "self:52051", 100);
+    EXPECT_TRUE(primary_selection.used_primary_fallback);
+    EXPECT_EQ(
+        primary_selection.endpoints,
+        (std::vector<std::string>{"primary-high:52051", "primary-low:52051"}));
+
+    auto restarted_self_by_endpoint =
+        make_source("previous-self", "primary", false, 1000, "self:52051");
+    restarted_self_by_endpoint.master_endpoint = "self:50051";
+    auto restart_selection = SelectP2PSnapshotSources(
+        {restarted_self_by_endpoint,
+         make_source("remote-primary", "primary", false, 900, "remote:52051")},
+        "new-self", "self:50051", "self:52051", 100);
+    EXPECT_TRUE(restart_selection.used_primary_fallback);
+    EXPECT_EQ(restart_selection.endpoints,
+              (std::vector<std::string>{"remote:52051"}));
+}
+#endif
 
 TEST_F(P2PHotStandbyServiceTest,
        SnapshotRejectsInvalidChunksAndLimitsSessions) {
@@ -430,6 +725,117 @@ TEST_F(P2PHotStandbyServiceTest, TrimSignalSwitchesToSnapshotResync) {
     EXPECT_EQ(target.GetState(), StandbyState::WATCHING);
     auto exported = target.ExportMetadata();
     EXPECT_NE(exported.routes.find("trim-resync-key"), exported.routes.end());
+}
+
+TEST_F(P2PHotStandbyServiceTest, RestartedWorkerResumesPendingSnapshotResync) {
+    P2PMasterService master(MakeMasterConfig());
+    const UUID client_id{35, 35};
+    const UUID segment_id{36, 36};
+    RegisterClient(master, client_id, MakeSegment(segment_id));
+    PublishRoute(master, "before-resync", client_id, segment_id);
+
+    P2PHotStandbyService source(MakeStandbyConfig());
+    ASSERT_EQ(source.Start(), ErrorCode::OK);
+    ASSERT_TRUE(source.WaitForAppliedSequence(2));
+    SnapshotServer snapshot(source);
+    ASSERT_TRUE(snapshot.Start());
+
+    auto initial_state = std::make_shared<ControlledNotifierState>();
+    auto config = MakeStandbyConfig();
+    config.snapshot_source_endpoints = {snapshot.Endpoint()};
+    P2PHotStandbyService standby(config, [&] {
+        return std::make_unique<ControlledReaderStore>(initial_state);
+    });
+    ASSERT_EQ(standby.Start(), ErrorCode::OK);
+    ASSERT_TRUE(standby.GetMetadataStore()->RouteExists("before-resync"));
+
+    // A trim event can arrive while promotion has stopped the recovery worker.
+    // Restart must recover from the retained state without another
+    // notification.
+    P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby);
+    PublishRoute(master, "after-resync", client_id, segment_id);
+    ASSERT_TRUE(source.WaitForAppliedSequence(3));
+    InjectNotifierErrors(initial_state, ErrorCode::OPLOG_TRIMMED);
+    ASSERT_EQ(standby.GetState(), StandbyState::SYNCING);
+    ASSERT_FALSE(standby.GetMetadataStore()->RouteExists("after-resync"));
+    P2PHotStandbyServiceTestAccess::StartRecoveryWorker(standby);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (standby.GetState() != StandbyState::WATCHING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    EXPECT_EQ(standby.GetLatestAppliedSequenceId(), 3);
+    EXPECT_TRUE(standby.GetMetadataStore()->RouteExists("before-resync"));
+    EXPECT_TRUE(standby.GetMetadataStore()->RouteExists("after-resync"));
+}
+
+TEST_F(P2PHotStandbyServiceTest, RestartedWorkerResumesPendingReconnect) {
+    auto initial_state = std::make_shared<ControlledNotifierState>();
+    std::atomic<int> readers_created{0};
+    P2PHotStandbyService standby(MakeStandbyConfig(), [&] {
+        ++readers_created;
+        return std::make_unique<ControlledReaderStore>(initial_state);
+    });
+    ASSERT_EQ(standby.Start(/*baseline_sequence_id=*/7), ErrorCode::OK);
+    P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby);
+    EXPECT_EQ(readers_created.load(), 1);
+    InjectNotifierErrors(initial_state, ErrorCode::INTERNAL_ERROR);
+    ASSERT_EQ(standby.GetState(), StandbyState::RECONNECTING);
+    P2PHotStandbyServiceTestAccess::StartRecoveryWorker(standby);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (standby.GetState() != StandbyState::WATCHING &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(standby.GetState(), StandbyState::WATCHING);
+    EXPECT_EQ(readers_created.load(), 2);
+    std::lock_guard<std::mutex> lock(initial_state->mutex);
+    EXPECT_EQ(initial_state->start_sequence_id, 7);
+    EXPECT_TRUE(initial_state->healthy);
+}
+
+TEST_F(P2PHotStandbyServiceTest, StopBeforeRecoveryAcquiresMetadataLock) {
+    auto initial_state = std::make_shared<ControlledNotifierState>();
+    std::atomic<int> readers_created{0};
+    P2PHotStandbyService standby(MakeStandbyConfig(), [&] {
+        ++readers_created;
+        return std::make_unique<ControlledReaderStore>(initial_state);
+    });
+    ASSERT_EQ(standby.Start(/*baseline_sequence_id=*/7), ErrorCode::OK);
+    P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby);
+    InjectNotifierErrors(initial_state, ErrorCode::INTERNAL_ERROR);
+    ASSERT_EQ(standby.GetState(), StandbyState::RECONNECTING);
+
+    auto wait_until = [](auto predicate) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return predicate();
+    };
+    auto metadata_lock =
+        P2PHotStandbyServiceTestAccess::StartWorkerWithMetadataLocked(standby);
+    ASSERT_TRUE(wait_until([&] {
+        return !P2PHotStandbyServiceTestAccess::RecoveryRequested(standby);
+    }));
+    // The worker consumed its startup request but cannot begin recovery yet.
+    std::thread stop_worker(
+        [&] { P2PHotStandbyServiceTestAccess::StopRecoveryWorker(standby); });
+    EXPECT_TRUE(wait_until([&] {
+        return P2PHotStandbyServiceTestAccess::RecoveryStopping(standby);
+    }));
+    metadata_lock.unlock();
+    stop_worker.join();
+
+    EXPECT_EQ(readers_created.load(), 1);
+    EXPECT_EQ(standby.GetState(), StandbyState::RECONNECTING);
+    EXPECT_EQ(standby.GetLatestAppliedSequenceId(), 7);
 }
 
 TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
@@ -795,6 +1201,28 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
     WithdrawRoute(restored_master, "key-after-restore", client_id, segment_id);
     EXPECT_EQ(restored_master.GetOpLogManager()->GetLastSequenceId(),
               promoted_sequence_id + 2);
+}
+
+TEST_F(P2PHotStandbyServiceTest, LatestReadFailureAbortsBeforeMetadataRestore) {
+    class FailedLatestStore : public MockOpLogStore {
+       public:
+        ErrorCode GetLatestSequenceId(uint64_t&) override {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+    };
+
+    P2PMasterService source(MakeMasterConfig());
+    RegisterClient(source, UUID{71, 71}, MakeSegment(UUID{72, 72}));
+    const auto metadata = source.ExportMetadataForStandby();
+    ASSERT_EQ(metadata.clients.size(), 1);
+
+    P2PMasterService promoted(MakeMasterConfig());
+    promoted.GetOpLogManager()->SetOpLogStore(
+        std::make_shared<FailedLatestStore>());
+    EXPECT_EQ(promoted.RestoreFromStandbyMetadata(metadata, 1),
+              ErrorCode::INTERNAL_ERROR);
+    EXPECT_TRUE(promoted.GetClientManager().GetAllClients().empty());
+    EXPECT_EQ(promoted.GetOpLogManager()->GetLastSequenceId(), 0);
 }
 
 TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {

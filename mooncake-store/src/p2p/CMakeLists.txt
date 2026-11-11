@@ -86,7 +86,9 @@ if(STORE_USE_REDIS)
     list(APPEND MOONCAKE_STORE_P2P_SHARED_SOURCES
         ha/redis_util.cpp
         ha/redis_election_helper.cpp)
-    list(APPEND MOONCAKE_STORE_P2P_MASTER_SOURCES ha/oplog/redis_oplog_store.cpp)
+    list(APPEND MOONCAKE_STORE_P2P_MASTER_SOURCES
+        ha/oplog/redis_oplog_store.cpp
+        ha/oplog/redis_oplog_trim_worker.cpp)
 endif()
 
 if(USE_ASCEND_CACHE_TIER)

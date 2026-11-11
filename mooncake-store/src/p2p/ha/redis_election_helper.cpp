@@ -46,6 +46,28 @@ std::string GenerateCandidateId() {
     return stream.str();
 }
 
+std::string FormatPollLeaderError(const redisContext* context,
+                                  const redisReply* reply) {
+    std::ostringstream stream;
+    if (!reply) {
+        stream << "null reply";
+    } else {
+        stream << "reply_type=" << reply->type;
+        if (reply->type == REDIS_REPLY_ERROR && reply->str) {
+            stream << ", redis_error=" << std::string(reply->str, reply->len);
+        }
+    }
+    if (context) {
+        stream << ", ctx_err=" << context->err;
+        if (context->errstr[0] != '\0') {
+            stream << ", ctx_errstr=" << context->errstr;
+        }
+    } else {
+        stream << ", ctx=null";
+    }
+    return stream.str();
+}
+
 bool ParseElectionValue(const std::string& value, std::string& address,
                         ViewVersionId& epoch, std::string* candidate_id) {
     Json::Value root;
@@ -93,13 +115,10 @@ RedisElectionHelper::RedisElectionHelper(const std::string& cluster_id,
       ttl_sec_(ttl_sec),
       heartbeat_interval_sec_(heartbeat_interval_sec),
       cluster_id_(cluster_id) {
-    std::string cid = cluster_id;
-    if (!cid.empty() && cid.back() != '/') {
-        cid += '/';
-    }
+    const std::string& cid = cluster_id_;
     // Use {cid} with braces as hash tag for Redis cluster slot affinity
-    master_view_key_ = "mooncake:{" + cid + "}master_view";
-    master_epoch_key_ = "mooncake:{" + cid + "}master_epoch";
+    master_view_key_ = "mooncake:{" + cid + "}:master_view";
+    master_epoch_key_ = "mooncake:{" + cid + "}:master_epoch";
     leader_event_channel_ = "mooncake:" + cid + "leader_event";
     LOG(INFO) << "RedisElectionHelper created, master_view_key="
               << master_view_key_ << " epoch_key=" << master_epoch_key_
@@ -413,18 +432,11 @@ bool RedisElectionHelper::WatchLeaderSubscribe() {
     }
 
     // Polling thread: check if key still exists periodically.
-    std::thread polling_thread([this, &leader_lost, polling_ctx]() {
+    // Only this thread accesses the connection until it has been joined.
+    std::thread polling_thread([this, &leader_lost, &polling_ctx]() {
         auto interval = std::chrono::seconds(ttl_sec_);
         while (!leader_lost && !cancel_election_) {
-            RedisReplyPtr r((redisReply*)redisCommand(polling_ctx, "GET %b",
-                                                      master_view_key_.data(),
-                                                      master_view_key_.size()));
-            if (!r) {
-                LOG(WARNING) << "WatchLeaderSubscribe: polling GET failed "
-                                "(connection error), exiting polling thread";
-                break;
-            }
-            if (r->type == REDIS_REPLY_NIL) {
+            if (PollLeaderOnce(polling_ctx)) {
                 leader_lost = true;
                 cancel_cv_.notify_all();
                 break;
@@ -514,23 +526,8 @@ void RedisElectionHelper::WatchLeaderPolling() {
     redisContext* polling_ctx = CreateConnection();
     auto interval = std::chrono::seconds(ttl_sec_);
     while (!cancel_election_) {
-        if (!polling_ctx) {
-            // Connection was never established or previously lost — retry
-            polling_ctx = CreateConnection();
-        } else {
-            RedisReplyPtr reply((redisReply*)redisCommand(
-                polling_ctx, "GET %b", master_view_key_.data(),
-                master_view_key_.size()));
-            if (reply) {
-                if (reply->type == REDIS_REPLY_NIL) {
-                    redisFree(polling_ctx);
-                    return;  // Key expired
-                }
-            } else {
-                // Connection error — reconnect on the next iteration.
-                redisFree(polling_ctx);
-                polling_ctx = nullptr;
-            }
+        if (PollLeaderOnce(polling_ctx)) {
+            break;  // Key expired.
         }
 
         if (WaitForElectionCancellation(interval)) {
@@ -538,6 +535,30 @@ void RedisElectionHelper::WatchLeaderPolling() {
         }
     }
     if (polling_ctx) redisFree(polling_ctx);
+}
+
+bool RedisElectionHelper::PollLeaderOnce(redisContext*& context) {
+    if (!context) {
+        context = CreateConnection();
+        if (!context) {
+            // CreateConnection logs the underlying connection/auth failure.
+            return false;
+        }
+    }
+
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        context, "GET %b", master_view_key_.data(), master_view_key_.size()));
+    if (!reply ||
+        (reply->type != REDIS_REPLY_STRING && reply->type != REDIS_REPLY_NIL)) {
+        const auto error = FormatPollLeaderError(context, reply.get());
+        LOG_EVERY_N(WARNING, 30)
+            << "WatchLeader: polling GET failed; reconnecting on next poll"
+            << ", key=" << master_view_key_ << ", error=" << error;
+        redisFree(context);
+        context = nullptr;
+        return false;
+    }
+    return reply->type == REDIS_REPLY_NIL;
 }
 
 // ============================================================

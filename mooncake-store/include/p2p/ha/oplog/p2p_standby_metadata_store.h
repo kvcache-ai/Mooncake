@@ -69,6 +69,7 @@ class P2PStandbyMetadataStore final {
     };
 
     ExportedMetadata ExportMetadata() const;
+    void RestoreMetadata(ExportedMetadata metadata);
 
     std::vector<std::string> ListRouteKeys() const;
     std::vector<UUID> ListClientIds() const;

@@ -12,18 +12,67 @@
 
 namespace mooncake {
 
+#ifdef STORE_USE_REDIS
+P2PSnapshotSourceSelection SelectP2PSnapshotSources(
+    std::vector<RedisMasterRegistryEntry> masters,
+    const std::string& self_instance_id,
+    const std::string& self_master_endpoint,
+    const std::string& self_snapshot_endpoint, uint64_t trimmed_sequence_id) {
+    std::sort(masters.begin(), masters.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.applied_sequence_id > rhs.applied_sequence_id;
+              });
+    auto is_self =
+        [&self_instance_id, &self_master_endpoint,
+         &self_snapshot_endpoint](const RedisMasterRegistryEntry& master) {
+            return master.instance_id == self_instance_id ||
+                   (!self_master_endpoint.empty() &&
+                    master.master_endpoint == self_master_endpoint) ||
+                   (!self_snapshot_endpoint.empty() &&
+                    master.snapshot_endpoint == self_snapshot_endpoint);
+        };
+    auto eligible_source = [&is_self, trimmed_sequence_id](
+                               const RedisMasterRegistryEntry& master) {
+        return !is_self(master) &&
+               master.applied_sequence_id >= trimmed_sequence_id &&
+               !master.snapshot_endpoint.empty();
+    };
+
+    P2PSnapshotSourceSelection selection;
+    for (const auto& master : masters) {
+        if (eligible_source(master) && master.role == "standby" &&
+            master.snapshot_ready) {
+            selection.endpoints.push_back(master.snapshot_endpoint);
+        }
+    }
+    if (!selection.endpoints.empty()) {
+        return selection;
+    }
+    for (const auto& master : masters) {
+        if (eligible_source(master) && master.role == "primary") {
+            selection.endpoints.push_back(master.snapshot_endpoint);
+        }
+    }
+    selection.used_primary_fallback = !selection.endpoints.empty();
+    return selection;
+}
+#endif
+
 P2PHotStandbyService::P2PHotStandbyService(
     P2PHotStandbyConfig config, ReaderStoreFactory reader_store_factory)
     : config_(std::move(config)),
       reader_store_factory_(std::move(reader_store_factory)) {
     metadata_store_ = std::make_unique<P2PStandbyMetadataStore>();
-    oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
-                                                       config_.cluster_id);
+    oplog_applier_ = std::make_unique<P2POpLogApplier>(
+        metadata_store_.get(), config_.cluster_id, nullptr,
+        config_.oplog_pending_max_entries);
 }
 
 P2PHotStandbyService::~P2PHotStandbyService() { Stop(); }
 
-ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
+ErrorCode P2PHotStandbyService::Start(
+    uint64_t baseline_sequence_id,
+    std::optional<P2PStandbyMetadataStore::ExportedMetadata> initial_metadata) {
     std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (state_machine_.IsRunning()) {
@@ -40,9 +89,17 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
 
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
     snapshot_resync_required_.store(false);
-    metadata_store_->RemoveAllMetadata();
-    oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
-                                                       config_.cluster_id);
+    const bool has_initial_metadata = initial_metadata.has_value();
+    if (has_initial_metadata) {
+        metadata_store_->RestoreMetadata(std::move(*initial_metadata));
+        LOG(INFO) << "P2PHotStandbyService: restored initial standby metadata"
+                  << ", baseline_sequence_id=" << baseline_sequence_id;
+    } else {
+        metadata_store_->RemoveAllMetadata();
+    }
+    oplog_applier_ = std::make_unique<P2POpLogApplier>(
+        metadata_store_.get(), config_.cluster_id, nullptr,
+        config_.oplog_pending_max_entries);
 
     uint64_t initial_sync_target = baseline_sequence_id;
     uint64_t trimmed_sequence_id = 0;
@@ -54,13 +111,19 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
         return ErrorCode::INTERNAL_ERROR;
     }
     std::vector<std::string> discovered_snapshot_sources;
-    if (config_.snapshot_source_endpoints.empty()) {
+    if (!has_initial_metadata && config_.snapshot_source_endpoints.empty()) {
         discovered_snapshot_sources = DiscoverSnapshotSources();
     }
     const bool bootstrap_requested =
         !config_.snapshot_source_endpoints.empty() ||
         !discovered_snapshot_sources.empty() ||
         baseline_sequence_id < trimmed_sequence_id;
+    if (has_initial_metadata && !bootstrap_requested) {
+        LOG(INFO) << "P2PHotStandbyService: continuing from initial metadata "
+                     "via OpLog without snapshot"
+                  << ", baseline_sequence_id=" << baseline_sequence_id
+                  << ", trimmed_sequence_id=" << trimmed_sequence_id;
+    }
     bool snapshot_bootstrap_succeeded = false;
     if (bootstrap_requested) {
         ErrorCode bootstrap_err = ErrorCode::INTERNAL_ERROR;
@@ -183,14 +246,15 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
     }
 
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
-    StartRecoveryWorker();
     auto snapshot_server_err = StartSnapshotServer();
     if (snapshot_server_err != ErrorCode::OK) {
-        StopRecoveryWorker();
         ResetOplogFollowingLocked();
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         return snapshot_server_err;
     }
+    // Finish fallible setup before the worker can wait for mutex_: startup
+    // failure must not join that worker while still holding the same mutex.
+    StartRecoveryWorker();
     LOG(INFO) << "P2PHotStandbyService started"
               << ", cluster_id=" << config_.cluster_id
               << ", baseline_sequence_id=" << baseline_sequence_id;
@@ -213,8 +277,8 @@ ErrorCode P2PHotStandbyService::StartOplogFollowingLocked(
     }
 
     oplog_applier_->SetOpLogStore(watcher_oplog_store_.get());
-    oplog_change_notifier_ =
-        watcher_oplog_store_->CreateChangeNotifier(config_.cluster_id);
+    oplog_change_notifier_ = watcher_oplog_store_->CreateChangeNotifier(
+        config_.cluster_id, config_.oplog_poll_batch_size);
     if (!oplog_change_notifier_) {
         LOG(ERROR)
             << "P2PHotStandbyService: failed to create OpLogChangeNotifier"
@@ -311,7 +375,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
         LOG(ERROR) << "P2PHotStandbyService: not ready for promotion"
                    << ", state=" << StandbyStateToString(GetState())
                    << ", apply_healthy=" << !apply_failed;
-        RestoreRecoveryWorker();
+        StartRecoveryWorker();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
@@ -321,7 +385,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
     if (!promote_result.allowed) {
         LOG(ERROR) << "P2PHotStandbyService: cannot promote: "
                    << promote_result.reason;
-        RestoreRecoveryWorker();
+        StartRecoveryWorker();
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
@@ -622,8 +686,9 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
         return ErrorCode::OPLOG_TRIMMED;
     }
 
-    oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
-                                                       config_.cluster_id);
+    oplog_applier_ = std::make_unique<P2POpLogApplier>(
+        metadata_store_.get(), config_.cluster_id, nullptr,
+        config_.oplog_pending_max_entries);
     oplog_applier_->Recover(baseline_sequence_id);
 
     uint64_t catch_up_target = baseline_sequence_id;
@@ -706,14 +771,8 @@ ErrorCode P2PHotStandbyService::StartSnapshotServer() {
     snapshot_service_ = std::make_unique<P2PStandbySnapshotService>(this);
     snapshot_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         1, config_.snapshot_service_port);
-    snapshot_server_
-        ->register_handler<&P2PStandbySnapshotService::BeginSnapshot>(
-            snapshot_service_.get());
-    snapshot_server_
-        ->register_handler<&P2PStandbySnapshotService::GetSnapshotChunk>(
-            snapshot_service_.get());
-    snapshot_server_->register_handler<&P2PStandbySnapshotService::EndSnapshot>(
-        snapshot_service_.get());
+    RegisterP2PStandbySnapshotRpcHandlers(*snapshot_server_,
+                                          snapshot_service_.get());
 
     auto start_result = snapshot_server_->async_start();
     if (start_result.hasResult()) {
@@ -761,17 +820,16 @@ std::vector<std::string> P2PHotStandbyService::DiscoverSnapshotSources() const {
         endpoints.clear();
         return endpoints;
     }
-    std::sort(masters.begin(), masters.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs.applied_sequence_id > rhs.applied_sequence_id;
-              });
-    for (const auto& master : masters) {
-        if (master.instance_id != config_.master_instance_id &&
-            master.role == "standby" && master.snapshot_ready &&
-            master.applied_sequence_id >= trimmed_sequence_id &&
-            !master.snapshot_endpoint.empty()) {
-            endpoints.push_back(master.snapshot_endpoint);
-        }
+    auto selection = SelectP2PSnapshotSources(
+        std::move(masters), config_.master_instance_id,
+        config_.local_master_endpoint, config_.local_snapshot_endpoint,
+        trimmed_sequence_id);
+    endpoints = std::move(selection.endpoints);
+    if (selection.used_primary_fallback) {
+        LOG(INFO) << "P2PHotStandbyService: using primary snapshot fallback"
+                  << ", cluster_id=" << config_.cluster_id
+                  << ", source_count=" << endpoints.size()
+                  << ", trimmed_sequence_id=" << trimmed_sequence_id;
     }
 #endif
     return endpoints;
@@ -800,14 +858,17 @@ void P2PHotStandbyService::StartRecoveryWorker() {
     if (recovery_thread_.joinable()) {
         return;
     }
-    recovery_stopping_ = false;
+    recovery_stopping_.store(false);
+    // Recheck pending reconnect/snapshot recovery on every worker start.
+    // RecoveryLoop leaves a healthy reader running and waits for new events.
+    recovery_requested_ = true;
     recovery_thread_ = std::thread(&P2PHotStandbyService::RecoveryLoop, this);
 }
 
 void P2PHotStandbyService::StopRecoveryWorker() {
     {
         std::lock_guard<std::mutex> lock(recovery_mutex_);
-        recovery_stopping_ = true;
+        recovery_stopping_.store(true);
         recovery_requested_ = false;
     }
     recovery_cv_.notify_all();
@@ -816,17 +877,10 @@ void P2PHotStandbyService::StopRecoveryWorker() {
     }
 }
 
-void P2PHotStandbyService::RestoreRecoveryWorker() {
-    StartRecoveryWorker();
-    if (state_machine_.GetState() == StandbyState::RECONNECTING) {
-        RequestRecovery();
-    }
-}
-
 void P2PHotStandbyService::RequestRecovery() {
     {
         std::lock_guard<std::mutex> lock(recovery_mutex_);
-        if (recovery_stopping_) {
+        if (recovery_stopping_.load()) {
             return;
         }
         recovery_requested_ = true;
@@ -838,9 +892,9 @@ void P2PHotStandbyService::RecoveryLoop() {
     std::unique_lock<std::mutex> recovery_lock(recovery_mutex_);
     while (true) {
         recovery_cv_.wait(recovery_lock, [this] {
-            return recovery_stopping_ || recovery_requested_;
+            return recovery_stopping_.load() || recovery_requested_;
         });
-        if (recovery_stopping_) {
+        if (recovery_stopping_.load()) {
             return;
         }
         recovery_requested_ = false;
@@ -849,7 +903,7 @@ void P2PHotStandbyService::RecoveryLoop() {
         int backoff_ms = std::min(
             std::max(1, config_.reconnect_initial_backoff_ms), max_backoff_ms);
 
-        while (!recovery_stopping_) {
+        while (!recovery_stopping_.load()) {
             recovery_lock.unlock();
 
             ErrorCode err = ErrorCode::INTERNAL_ERROR;
@@ -857,6 +911,9 @@ void P2PHotStandbyService::RecoveryLoop() {
             bool attempted_snapshot_resync = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                // Stop may arrive while we wait for metadata access. Check
+                // again before reconnecting or fetching a snapshot.
+                if (recovery_stopping_.load()) return;
                 const bool snapshot_resync = snapshot_resync_required_.load();
                 if (!snapshot_resync &&
                     state_machine_.GetState() != StandbyState::RECONNECTING) {
@@ -923,7 +980,7 @@ void P2PHotStandbyService::RecoveryLoop() {
             }
 
             recovery_lock.lock();
-            if (recovery_stopping_) {
+            if (recovery_stopping_.load()) {
                 return;
             }
             if (err == ErrorCode::OK) {
@@ -949,7 +1006,7 @@ void P2PHotStandbyService::RecoveryLoop() {
                          << ", retry_in_ms=" << backoff_ms;
             recovery_cv_.wait_for(recovery_lock,
                                   std::chrono::milliseconds(backoff_ms),
-                                  [this] { return recovery_stopping_; });
+                                  [this] { return recovery_stopping_.load(); });
             backoff_ms += std::min(backoff_ms, max_backoff_ms - backoff_ms);
         }
     }
