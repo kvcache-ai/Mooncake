@@ -2187,14 +2187,15 @@ void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
     // Gate the snapshot on the publisher being live: this runs on every
     // read-write metadata access, and the VisitReplicas walk plus vector
     // allocation is pure overhead when KV events are off (the default).
-    const auto previous_kv_media = KvMediaSnapshot(metadata, true);
+    const auto is_invalid_memory = [](const Replica& replica) {
+        return replica.has_invalid_mem_handle();
+    };
+    const auto previous_kv_media = KvMediaSnapshot(metadata, is_invalid_memory);
     // Erase invalid memory replicas (those with unmounted segments). No
     // client_mutex_ needed since we only check memory replicas.
     std::vector<ReplicaID> removed_replica_ids;
-    EraseReplicasWithCacheTotalAccounting(
-        metadata,
-        [](const Replica& replica) { return replica.has_invalid_mem_handle(); },
-        &removed_replica_ids);
+    EraseReplicasWithCacheTotalAccounting(metadata, is_invalid_memory,
+                                          &removed_replica_ids);
     CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetState(),
                                           removed_replica_ids);
     SyncKvObjectState(accessor.GetKey(), metadata, tenant_id,
@@ -7776,7 +7777,7 @@ bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id, ObjectMetadata& metadata,
     route::ObjectState& state,
     const std::function<bool(const Replica&)>& is_stale) {
-    const auto previous_kv_media = KvMediaSnapshot(metadata, true);
+    const auto previous_kv_media = KvMediaSnapshot(metadata, is_stale);
     std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(metadata, is_stale,
                                           &removed_replica_ids);
@@ -11439,19 +11440,20 @@ KvEventConfig MasterService::BuildKvEventConfig(
 // Every non-memory replica type, including DFS, is normalized to the "disk"
 // medium so subscribers see one logical tier per storage class.
 std::vector<std::string> MasterService::KvMediaForMetadata(
-    const ObjectMetadata& metadata, bool include_invalid_handles) {
+    const ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& include_invalid) {
     bool has_cpu = false;
     bool has_disk = false;
     metadata.VisitReplicas(
         [](const Replica& replica) { return replica.is_completed(); },
         [&](const Replica& replica) {
             if (replica.is_memory_replica() &&
-                (include_invalid_handles ||
-                 !replica.has_invalid_mem_handle())) {
+                (!replica.has_invalid_mem_handle() ||
+                 (include_invalid && include_invalid(replica)))) {
                 has_cpu = true;
             } else if (replica.is_nof_replica() &&
-                       (include_invalid_handles ||
-                        !replica.has_invalid_nof_handle())) {
+                       (!replica.has_invalid_nof_handle() ||
+                        (include_invalid && include_invalid(replica)))) {
                 has_disk = true;
             } else if (replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
