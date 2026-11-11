@@ -1,6 +1,8 @@
 #pragma once
 
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <unordered_set>
 
@@ -42,8 +44,9 @@ class FileStorage {
      * holds across its master RPCs, so a tick that read the latch before it
      * was set cannot resume after the deregistration and re-mount: it either
      * finished before the drain latched, or it re-checks the latch when it
-     * acquires the lock. The latch is not reversible on success; the process
-     * is expected to exit.
+     * acquires the lock. The latch is never reversed; the process is
+     * expected to exit. If the unmount RPC fails, the latch stays and every
+     * heartbeat tick retries the unmount until the master acknowledges it.
      */
     tl::expected<void, ErrorCode> DrainLocalDiskSegment(
         uint64_t grace_period_ms);
@@ -117,6 +120,10 @@ class FileStorage {
      * divergence a dangling-replica probe needs to detect.
      */
     tl::expected<bool, ErrorCode> Exists(const std::string& key);
+
+    // What one failed disk syscall's errno means for the disk tier.
+    enum class DiskErrorAction { kIgnore, kCheckFilesystem, kFence };
+    static DiskErrorAction ClassifyDiskErrno(int err);
 
     FileStorageConfig config_;
 
@@ -304,6 +311,31 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
+    // Backend disk-error observer. Runs inline on the failing I/O thread, so
+    // it makes no RPC and takes no lock that I/O or the heartbeat holds.
+    void OnDiskError(int err, const char* op);
+    struct DiskFailure {
+        int err;
+        const char* op;  // string literal naming the failed syscall
+    };
+    // Checks the filesystem for this failure, then for the failures other
+    // threads queued while a check ran. Returns the failure whose check found
+    // the filesystem down, with that check's errno in check_err.
+    std::optional<DiskFailure> RunFilesystemChecks(DiskFailure failure,
+                                                   int& check_err);
+    // errno of the first offload root whose filesystem is down, 0 if all are
+    // up; sync_first runs syncfs on each root before fstat.
+    int CheckFilesystem(bool sync_first) const;
+    // Heartbeat: latch the drain and hand pending offload work back.
+    void ApplyDiskFence();
+    // Heartbeat thread: NACK the tasks carried for the backend's ungrouped
+    // pool and drop the pool (see deferred_task_by_storage_key_).
+    void NackCarriedOffloadTasks();
+    // Heartbeat, while draining_: unmount until the master acknowledges it
+    // (the master treats an already-unmounted segment as success).
+    void UnmountLocalDiskIfPending();
+    void WakeHeartbeat();
+
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
@@ -313,6 +345,9 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
+    // which the destructor must unregister before the buffer is freed.
+    bool uring_buffer_registered_ = false;
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
@@ -325,9 +360,10 @@ class FileStorage {
      * A key absent from all_bucket_keys was either deliberately skipped by
      * the backend (size over bucket limit / already on disk) — those must be
      * NACKed so the master releases the task and source-replica refcount — or
-     * DEFERRED to the backend's ungrouped pool to be written as part of a
-     * full bucket next cycle. Deferred keys must NOT be NACKed: the backend
-     * carries only key+size across the deferral, so their tasks must be
+     * DEFERRED to the backend's ungrouped pool. FileStorage replays carried
+     * keys next cycle and may flush a partial bucket. Deferred keys must NOT
+     * be NACKed: the backend carries only key+size across the deferral, so
+     * their tasks must be
      * carried here or the re-emitted keys arrive task-less and are silently
      * dropped (upstream #3006 — measured as ~12% of pool entries never
      * reaching the SSD tier).
@@ -398,6 +434,28 @@ class FileStorage {
     // again under offloading_mutex_ before the heartbeat RPC, because a tick
     // parked on that lock passed the entry check before the drain latched.
     std::atomic<bool> draining_{false};
+    bool GUARDED_BY(offloading_mutex_) local_disk_unmounted_{false};
+
+    // Set on the first disk failure retry cannot fix; cleared only by a
+    // store restart. Reads and offload stop as soon as it is set.
+    std::atomic<bool> disk_fenced_{false};
+    // The offload roots (storage_filepath may list several disks), each held
+    // open for CheckFilesystem; fd is -1 where the open failed.
+    struct DiskRoot {
+        std::string path;
+        int fd;
+    };
+    std::vector<DiskRoot> disk_roots_;
+    // One filesystem check runs at a time; a failure that arrives during it
+    // is queued for the running thread to check next.
+    Mutex filesystem_check_mutex_;
+    bool GUARDED_BY(filesystem_check_mutex_) filesystem_check_running_{false};
+    std::optional<DiskFailure> GUARDED_BY(filesystem_check_mutex_)
+        queued_disk_failure_;
+    // Test-only replacement for CheckFilesystem; returns errno.
+    std::function<int(bool sync_first)> test_filesystem_check_;
+    std::mutex heartbeat_wake_mutex_;
+    std::condition_variable heartbeat_wake_cv_;
 };
 
 }  // namespace mooncake

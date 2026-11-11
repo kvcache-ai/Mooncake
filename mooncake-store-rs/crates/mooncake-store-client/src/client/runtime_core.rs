@@ -1137,6 +1137,37 @@ impl StoreClient {
             }
         }
 
+        // C++ Store always has a master-chosen segment; a masterless client
+        // can race peer announcements, so keep the local segment as a last
+        // resort regardless of the prefer-local policy.
+        if !excluded.contains(&self.lease.runtime)
+            && self.can_prefer_local_storage_for_write_mode()
+        {
+            let candidate = ReplicaPlacementCandidate {
+                target: ReplicaPlacementTarget::StorageRuntime(self.lease.runtime.clone()),
+                soft: true,
+            };
+            match self.reserve_candidate(&candidate.target, length_bytes) {
+                Ok((target, reservation)) => {
+                    excluded.insert(self.lease.runtime.clone());
+                    targets.push(target);
+                    reservations.push(reservation);
+                    if targets.len() == policy.replica_count {
+                        return Ok((targets, reservations));
+                    }
+                }
+                Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    debug!(
+                        tenant,
+                        key,
+                        error = %error,
+                        "skipping local last-resort owner after reservation failure"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
         rollback(self, &targets, &reservations);
         Err(StoreError::InvalidState(format!(
             "not enough writable placement targets: reserved={} need={}",

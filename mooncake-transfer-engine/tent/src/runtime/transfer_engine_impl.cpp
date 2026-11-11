@@ -47,6 +47,11 @@
 #include "tent/transport/xpu/xpu_transport.h"
 #endif
 
+#ifdef USE_CUDA
+#include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -301,6 +306,10 @@ TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf,
       ipv6_(false),
       merge_requests_(true) {
     if (!config_loaded) return;
+    if (!conf_) {
+        LOG(ERROR) << "Cannot construct Transfer Engine with a null config";
+        return;
+    }
     auto preserved = captureExplicitTransferEngineConfig(*conf_);
     // Allow MC_TENT_CONF to supply shared defaults while keeping the caller's
     // explicit metadata identity intact.
@@ -975,6 +984,16 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc.addr = (uint64_t)addr_list[i];
         desc.length = size_list[i];
 
+        auto& platform = Platform::getLoader();
+#ifdef USE_CUDA
+        // Warm-up can register memory temporarily, so validate it first.
+        auto* cuda = dynamic_cast<CudaPlatform*>(&platform);
+        CudaPointerInfo pointer_info;
+        if (cuda)
+            CHECK_STATUS(
+                cuda->validateMemoryRegistration(addr_list[i], pointer_info));
+#endif
+
         // MR warm-up: pin pages via temp ibv_reg_mr, benefits both
         // subsequent RDMA registration and NUMA probing
         bool pages_pinned = false;
@@ -987,8 +1006,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         }
 
         // NUMA probe: skip prefault if warm-up already pinned pages
-        auto entries = Platform::getLoader().getLocation(
-            addr_list[i], size_list[i], pages_pinned);
+        std::vector<RangeLocation> entries;
+#ifdef USE_CUDA
+        if (cuda) {
+            entries = cuda->getLocation(addr_list[i], size_list[i],
+                                        pages_pinned, pointer_info);
+        } else
+#endif
+        {
+            entries =
+                platform.getLocation(addr_list[i], size_list[i], pages_pinned);
+        }
         if (entries.empty())
             return Status::InvalidArgument(
                 "Unable to locate registered memory range" LOC_MARK);
@@ -1549,23 +1577,23 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
-    bool xpu_direct = false;
+    bool device_direct = false;
     auto result =
-        planTransport(request, transport_index, true, true, &xpu_direct);
-    // The direct plan left the XPU buffers unstaged, but the selector policy
+        planTransport(request, transport_index, true, true, &device_direct);
+    // The direct plan left device buffers unstaged, but the selector policy
     // admitted no transport able to address device memory (e.g. a policy that
     // permits only host transports). Fall back to the staged plan, where the
     // host stage buffers can be carried by any host-DRAM transport.
-    if (result.transport == UNSPEC && xpu_direct)
+    if (result.transport == UNSPEC && device_direct)
         result = planTransport(request, transport_index, false, true, nullptr);
     return result;
 }
 
 SelectionResult TransferEngineImpl::planTransport(const Request& request,
                                                   int transport_index,
-                                                  bool allow_xpu_direct,
+                                                  bool allow_device_direct,
                                                   bool allow_xpu_ipc,
-                                                  bool* xpu_direct) {
+                                                  bool* device_direct) {
     // Owning reference: keeps the snapshot alive while we read through it.
     SegmentDescRef desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
@@ -1580,7 +1608,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     const TransportType hint = request.transport_hint;
 
     // Plan XPU/MLU staging before selecting a host-only network transport.
-    // XPU can bypass staging through verified dma-buf RDMA, in which case
+    // Both can bypass staging through verified dma-buf RDMA, in which case
     // nothing is staged. A same-host peer's XPU buffer can also be reached
     // through an IPC mapping, but that route exists on XpuTransport alone:
     // XPU is then offered first, unstaged, ahead of the staged network
@@ -1588,7 +1616,7 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     // explicit transports list does not name "xpu". The peer buffer is
     // mapped only once XPU is actually selected; if that fails, the request
     // is planned again without IPC. Other transport hints or a policy
-    // rejecting direct access require staging; MLU always requires it. XPU
+    // rejecting direct access require staging. XPU
     // staging needs the local XpuTransport; without it, selection is left to
     // transport capabilities (e.g. TCP copies device memory itself). Keep the
     // original memory types for policy matching.
@@ -1606,15 +1634,17 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
             local_mtype == MTYPE_XPU || remote_mtype == MTYPE_XPU;
         const bool mlu_side =
             local_mtype == MTYPE_MLU || remote_mtype == MTYPE_MLU;
-        direct = xpu_side && !mlu_side && allow_xpu_direct &&
-                 (hint == UNSPEC || hint == RDMA) &&
-                 xpuDirectRdmaReady(request, entry, local_mtype, remote_mtype);
+        direct =
+            (xpu_side || mlu_side) && allow_device_direct &&
+            (hint == UNSPEC || hint == RDMA) &&
+            deviceDirectRdmaReady(request, entry, local_mtype, remote_mtype);
         xpu_ipc = xpu_side && !mlu_side && allow_xpu_ipc &&
                   (hint == UNSPEC || hint == XPU) &&
                   xpuIpcCandidate(request, desc.get(), entry);
         if (xpu_ipc) ipc_entry = entry;
-        if (xpu_direct) *xpu_direct = direct;
-        if ((xpu_side && !direct && transport_list_[XPU]) || mlu_side) {
+        if (device_direct) *device_direct = direct;
+        if ((xpu_side && !direct && transport_list_[XPU]) ||
+            (mlu_side && !direct)) {
             findStagingPolicy(request, host_staging_params);
             if (host_staging_params.empty() && !xpu_ipc)
                 return SelectionResult{};
@@ -1663,8 +1693,8 @@ SelectionResult TransferEngineImpl::planTransport(const Request& request,
     auto finish = [&](SelectionResult result) {
         if (result.transport != XPU || !xpu_ipc) return result;
         if (!xpuIpcReady(request, desc.get(), ipc_entry))
-            return planTransport(request, transport_index, allow_xpu_direct,
-                                 false, xpu_direct);
+            return planTransport(request, transport_index, allow_device_direct,
+                                 false, device_direct);
         result.staging_params.clear();
         return result;
     };
@@ -2036,10 +2066,10 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     return boundaries;
 }
 
-bool TransferEngineImpl::xpuDirectRdmaReady(const Request& request,
-                                            const BufferDesc* remote_entry,
-                                            MemoryType local_mtype,
-                                            MemoryType remote_mtype) {
+bool TransferEngineImpl::deviceDirectRdmaReady(const Request& request,
+                                               const BufferDesc* remote_entry,
+                                               MemoryType local_mtype,
+                                               MemoryType remote_mtype) {
     if (!remote_entry || !transport_list_[RDMA]) return false;
     const auto& caps = transport_list_[RDMA]->capabilities();
     const bool local_gpu = isGpuType(local_mtype);
@@ -2205,7 +2235,7 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     // needs its copy transport; a host-only caller can delegate a peer's MLU
     // copy to that peer. Each device side needs a resolvable host stage. Fail
     // closed when topology or the local copy transport is unavailable.
-    // planTransport bypasses this policy for a verified XPU dma-buf RDMA
+    // planTransport bypasses this policy for a verified dma-buf RDMA
     // route; otherwise, when XpuTransport is present, every device side,
     // including a mixed-vendor peer, must stage rather than exposing device
     // memory to a host-only transport.

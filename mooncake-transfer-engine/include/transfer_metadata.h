@@ -254,6 +254,15 @@ class TransferMetadata {
     std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
                                                     bool force_update = false);
 
+    // Transfer workers must never perform metadata RPCs, even with metacache
+    // off.
+    std::shared_ptr<SegmentDesc> getCachedSegmentDescByID(
+        SegmentID segment_id) {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(segment_id);
+        return it == segment_id_to_desc_map_.end() ? nullptr : it->second;
+    }
+
     int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
 
     int updateSegmentDesc(const std::string &segment_name,
@@ -279,6 +288,13 @@ class TransferMetadata {
     // publish the updated descriptor rather than remove the entry again.
     // ERR_ADDRESS_NOT_REGISTERED means no matching local entry was present.
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+
+    // Removes the buffer at addr only when pred accepts the entry, so
+    // transports sharing an address in the local buffer list remove only
+    // their own entries.
+    int removeLocalMemoryBuffer(
+        void *addr, const std::function<bool(const BufferDesc &)> &pred,
+        bool update_metadata);
 
     // Rebuilds interned NIC paths on `desc` before insert. The caller must
     // exclusively own `desc`; do not pass a live descriptor from the metadata

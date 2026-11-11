@@ -16,6 +16,7 @@ from dataclasses import replace
 import pytest
 from mooncake.reshard.kv_cache import (
     KVCacheCompletion,
+    KVCacheComponent,
     KVCacheRuntimeTransferPlan,
     KVCacheTargetReceipt,
     KVCacheTransferEngineExecutor,
@@ -28,6 +29,7 @@ from mooncake.reshard.kv_cache import (
     kv_cache_writer_receipt_to_json,
     plan_kv_cache_transfer_to_local_target,
 )
+from test_cache_components import resource
 from test_kv_cache_reshard import _placement, _snapshot
 from test_runtime_transfer import assert_content, memory_binding
 
@@ -37,11 +39,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _worker(connection, role, tp, rank, protocol, use_cuda):
+def _native_placement(role, tp, component):
+    if component is None:
+        return _placement(role, ((0, 1),), tp)
+    return resource(
+        role,
+        tp,
+        component,
+        heads=1 if component is KVCacheComponent.LATENT else 4,
+        dtype="float32" if component is KVCacheComponent.SSM else "bfloat16",
+        itemsize=4 if component is KVCacheComponent.SSM else 2,
+    )
+
+
+def _worker(connection, role, tp, rank, protocol, use_cuda, component):
     try:
         from mooncake.engine import TransferEngine
 
-        placement = _placement(role, ((0, 1),), tp)
+        placement = _native_placement(role, tp, component)
         part = placement.parts[rank]
         snapshot = _snapshot(token_start=13, token_count=5)
         engine = TransferEngine()
@@ -127,14 +142,24 @@ def _receive(connection, expected, timeout=90):
 
 
 @pytest.mark.parametrize(
-    "source_tp,target_tp,kill_peer", [(2, 1, False), (1, 2, False), (1, 1, True)]
+    "source_tp,target_tp,kill_peer,component",
+    [
+        (2, 1, False, None),
+        (1, 2, False, None),
+        (1, 1, True, None),
+        (1, 2, False, KVCacheComponent.LATENT),
+        (2, 1, False, KVCacheComponent.SSM),
+        (1, 2, False, KVCacheComponent.SSM),
+        (1, 2, False, KVCacheComponent.CONV),
+        (2, 1, False, KVCacheComponent.CONV),
+    ],
 )
-def test_native_content_and_peer_failure(source_tp, target_tp, kill_peer):
+def test_native_content_and_peer_failure(source_tp, target_tp, kill_peer, component):
     protocol = os.environ.get("MC_R2R_PROTOCOL", "tcp")
     use_cuda = os.environ.get("MC_R2R_CUDA") == "1"
     context = mp.get_context("spawn")
-    source = _placement("source", ((0, 1),), source_tp)
-    target = _placement("target", ((0, 1),), target_tp)
+    source = _native_placement("source", source_tp, component)
+    target = _native_placement("target", target_tp, component)
     snapshot = _snapshot(token_start=13, token_count=5)
     processes, sources, targets = [], [], []
     try:
@@ -145,7 +170,8 @@ def test_native_content_and_peer_failure(source_tp, target_tp, kill_peer):
             for rank in range(tp):
                 parent, child = context.Pipe()
                 process = context.Process(
-                    target=_worker, args=(child, role, tp, rank, protocol, use_cuda)
+                    target=_worker,
+                    args=(child, role, tp, rank, protocol, use_cuda, component),
                 )
                 process.start()
                 child.close()

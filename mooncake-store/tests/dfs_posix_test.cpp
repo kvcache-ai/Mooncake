@@ -1216,6 +1216,15 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     void SetSupportsFdReopen(bool v) { supports_reopen_ = v; }
     bool SupportsFdReopen() const override { return supports_reopen_; }
 
+    // Models an adapter that keeps the "posix" name but constrains read
+    // buffers (e.g. an O_DIRECT mode).
+    void SetSupportsArbitraryHostReadBuffers(bool v) {
+        arbitrary_host_read_buffers_ = v;
+    }
+    bool SupportsArbitraryHostReadBuffers() const override {
+        return arbitrary_host_read_buffers_;
+    }
+
     std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
         std::span<const FdIoRequest> requests) override {
         ADD_FAILURE() << "POSIX shard writes must retain per-request I/O";
@@ -1281,6 +1290,7 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int64_t short_read_offset_ = -1;
     std::atomic<int64_t> fail_write_offset_once_{-1};
     bool supports_reopen_ = true;
+    bool arbitrary_host_read_buffers_ = true;
 };
 
 // Builds a backend backed by a ControlledPosixFsAdapter pointed at an existing
@@ -1353,6 +1363,22 @@ class BlockingShardFsAdapter : public PosixFsAdapter {
     std::promise<void> release_signal_;
     std::shared_future<void> released_{release_signal_.get_future().share()};
 };
+
+TEST_F(DfsBackendTest, PosixAdapterAcceptsArbitraryHostReadBuffers) {
+    EXPECT_TRUE(PosixFsAdapter().SupportsArbitraryHostReadBuffers());
+    EXPECT_TRUE(backend_->SupportsArbitraryHostReadBuffers());
+}
+
+TEST_F(DfsBackendTest, HostReadBufferCapabilityIgnoresAdapterName) {
+    ControlledPosixFsAdapter* controlled = nullptr;
+    auto backend = MakeControlledBackend(tmp_->path(), &controlled);
+    ASSERT_TRUE(backend->Init().has_value());
+    ASSERT_STREQ(controlled->GetName(), "posix");
+    EXPECT_TRUE(backend->SupportsArbitraryHostReadBuffers());
+
+    controlled->SetSupportsArbitraryHostReadBuffers(false);
+    EXPECT_FALSE(backend->SupportsArbitraryHostReadBuffers());
+}
 
 TEST_F(DfsBackendTest, SlowShardInitializationDoesNotBlockOtherShards) {
     for (bool block_file_size : {false, true}) {
@@ -2158,8 +2184,9 @@ TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
     std::atomic<int> failures{0};
     for (int i = 0; i < kThreads; ++i) {
         threads.emplace_back([&, i]() {
-            const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
-                                               kBlock, 0};
+            const DistributedFSDescriptor desc{
+                ShardPath(0), static_cast<uint64_t>(i * kBlock), kBlock, kBlock,
+                0};
             auto results = backend->BatchWrite(
                 {{"key_" + std::to_string(i),
                   desc,
@@ -2177,8 +2204,8 @@ TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
     for (int i = 0; i < kThreads; ++i) {
         AlignedBuffer read_buf(kBlock);
         ASSERT_NE(read_buf.data(), nullptr);
-        const DistributedFSDescriptor desc{ShardPath(0), i * kBlock, kBlock,
-                                           kBlock, 0};
+        const DistributedFSDescriptor desc{
+            ShardPath(0), static_cast<uint64_t>(i * kBlock), kBlock, kBlock, 0};
         auto read_results =
             backend->BatchRead({{"key_" + std::to_string(i),
                                  desc,

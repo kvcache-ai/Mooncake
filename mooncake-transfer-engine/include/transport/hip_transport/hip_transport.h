@@ -9,6 +9,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -65,24 +67,23 @@ class HipTransport : public Transport {
     const char* getName() const override { return "hip"; }
 
    private:
+    friend class HipTransportTestPeer;
+
     struct OpenedShmEntry {
         void* shm_addr;
         uint64_t length;
     };
 
-    struct PendingTransfer {
-        hipEvent_t event;
-        int device_id;
-        Slice* slice;
-    };
+    // Enqueue the copies without waiting for them; getTransferStatus() polls
+    // the recorded events.
+    Status submitTasks(
+        const std::vector<std::pair<TransferTask*, const TransferRequest*>>&
+            tasks);
 
-    // Start async transfer and return pending transfer info
-    Status startAsyncTransfer(const TransferRequest& request,
-                              TransferTask& task, PendingTransfer& pending);
-
-    // Synchronize pending transfers
-    void synchronizePendingTransfers(
-        std::vector<PendingTransfer>& pending_transfers);
+    // Enqueue one device's copies on one stream, followed by one event.
+    // Slices that could not be enqueued are failed and reported in the
+    // returned status; the others stay tracked by the event.
+    Status submitDeviceCopies(int device_id, const std::vector<Slice*>& slices);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
@@ -90,6 +91,14 @@ class HipTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+    // Registered sub-range address → its hipMalloc base; base → live alias
+    // count. One IPC registration per base, removed by the last unregister.
+    std::unordered_map<uint64_t, uint64_t> registered_addr_to_base_;
+    std::unordered_map<uint64_t, size_t> registered_base_refs_;
+    // Addresses registerLocalMemory deliberately skipped (e.g. host memory
+    // left to other transports), distinguishing them from never-registered
+    // ones at unregister time.
+    std::unordered_set<uint64_t> skipped_addrs_;
 
     // Stream and event pools for async operations
     StreamPool stream_pool_;
