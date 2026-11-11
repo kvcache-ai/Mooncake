@@ -4,7 +4,6 @@
 #include <functional>
 #include <mutex>
 #include <optional>
-#include <mutex>
 #include <unordered_set>
 
 #include "client_service.h"

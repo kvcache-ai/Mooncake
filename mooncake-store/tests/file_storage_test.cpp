@@ -127,6 +127,86 @@ class FailingReadBackend : public BucketStorageBackend {
     DiskErrorObserver observer_;
 };
 
+// Hold an in-flight reservation (FIFO/LRU), or registration with eviction
+// disabled (NONE), until another writer has tested admission. Quota, I/O and
+// rollback run through the actual backend.
+class CapacityOffloadBackend : public BucketStorageBackend {
+   public:
+    enum class Mode { Ack, Rollback, Full };
+    CapacityOffloadBackend(const FileStorageConfig& config,
+                           const BucketBackendConfig& bucket_config, Mode mode)
+        : BucketStorageBackend(config, bucket_config),
+          mode_(mode),
+          eviction_enabled_(bucket_config.eviction_policy !=
+                            BucketEvictionPolicy::NONE),
+          notification_ready_(notification_.get_future().share()),
+          contender_ready_(contender_.get_future().share()) {}
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>
+            complete,
+        EvictionHandler eviction = nullptr) override {
+        const int attempt = attempts.fetch_add(1);
+        if (mode_ == Mode::Full || attempt > 1) {
+            return BucketStorageBackend::BatchOffload(
+                batch, std::move(complete), std::move(eviction));
+        }
+        if (attempt == 0) {
+            auto wait_for_contender = [&] {
+                notification_.set_value();
+                if (contender_ready_.wait_for(std::chrono::seconds(5)) !=
+                    std::future_status::ready) {
+                    ADD_FAILURE() << "Contender did not reach admission";
+                    return ErrorCode::RPC_FAIL;
+                }
+                return mode_ == Mode::Rollback ? ErrorCode::RPC_FAIL
+                                               : ErrorCode::OK;
+            };
+            if (eviction_enabled_) {
+                return BucketStorageBackend::BatchOffload(
+                    batch, std::move(complete),
+                    [&](const auto& keys) -> tl::expected<void, ErrorCode> {
+                        auto error = wait_for_contender();
+                        if (error != ErrorCode::OK)
+                            return tl::make_unexpected(error);
+                        return eviction(keys);
+                    });
+            }
+            return BucketStorageBackend::BatchOffload(
+                batch,
+                [&](const auto& keys, auto& metadata) {
+                    auto error = wait_for_contender();
+                    return error != ErrorCode::OK ? error
+                                                  : complete(keys, metadata);
+                },
+                std::move(eviction));
+        }
+        if (notification_ready_.wait_for(std::chrono::seconds(5)) !=
+            std::future_status::ready) {
+            ADD_FAILURE() << "First writer did not reach admission gate";
+            contender_.set_value();
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        auto result = BucketStorageBackend::BatchOffload(
+            batch, std::move(complete), std::move(eviction));
+        EXPECT_FALSE(result);
+        if (!result) blocked_error = result.error();
+        contender_.set_value();
+        return result;
+    }
+
+    std::atomic<int> attempts{0};
+    ErrorCode blocked_error = ErrorCode::OK;
+
+   private:
+    Mode mode_;
+    bool eviction_enabled_;
+    std::promise<void> notification_, contender_;
+    std::shared_future<void> notification_ready_, contender_ready_;
+};
+
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -544,6 +624,10 @@ class FileStorageTest : public ::testing::Test {
                   capacity_limit ? 0u : 1u);
         EXPECT_EQ(backend->UngroupedOffloadingObjectsSize(),
                   capacity_limit ? 0u : 1u);
+        if (capacity_limit) {
+            ASSERT_TRUE(file_storage.Heartbeat());
+            EXPECT_FALSE(file_storage.enable_offloading_);
+        }
 
         size_t persisted_count = 0;
         for (const auto& task : tasks) {
@@ -697,6 +781,142 @@ class FileStorageTest : public ::testing::Test {
         allocator.deallocate(overwrite_buffer, values.front().size());
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    void RunCapacityRecoveryScenario(uint32_t workers,
+                                     BucketEvictionPolicy policy,
+                                     CapacityOffloadBackend::Mode mode,
+                                     bool key_limit = false) {
+        SCOPED_TRACE(workers);
+        SCOPED_TRACE(static_cast<int>(policy));
+        SCOPED_TRACE(key_limit);
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t bytes = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> memory(
+            std::aligned_alloc(4096, bytes), &std::free);
+        ASSERT_NE(memory.get(), nullptr);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountSegment(memory.get(), bytes, "tcp"));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/capacity_" +
+                                  std::to_string(workers) + "_" +
+                                  std::to_string(static_cast<int>(policy)) +
+                                  "_" + std::to_string(key_limit);
+        config.local_buffer_size = 1024 * 1024;
+        config.offload_write_workers = workers;
+        config.enable_disk_watermark_eviction = false;
+        config.total_size_limit = key_limit ? 1024 * 1024 : 48 * 1024;
+        config.total_keys_limit = key_limit ? 1 : 100;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 1;
+        bucket_config.bucket_size_limit = 40 * 1024;
+        bucket_config.max_total_size =
+            mode == CapacityOffloadBackend::Mode::Full ? 1 : 48 * 1024;
+        // NONE uses the node limit in this scenario, not a per-disk limit.
+        if (policy == BucketEvictionPolicy::NONE)
+            bucket_config.max_total_size = 0;
+        bucket_config.eviction_policy = policy;
+        auto backend = std::make_shared<CapacityOffloadBackend>(
+            config, bucket_config, mode);
+        storage.storage_backend_ = backend;
+        ASSERT_TRUE(backend->Init());
+        ASSERT_TRUE(storage.RegisterLocalMemory());
+        storage.enable_offloading_ = true;
+        std::string value(32 * 1024, 'C');
+        std::vector<Slice> slices{{value.data(), value.size()}};
+        const bool seed_bucket = policy != BucketEvictionPolicy::NONE &&
+                                 mode != CapacityOffloadBackend::Mode::Full;
+        if (seed_bucket) {
+            // Gate eviction of this existing bucket before the first writer
+            // commits. The contender must account for its reservation without
+            // depending on the separate registration/eviction guard.
+            ASSERT_TRUE(backend->BucketStorageBackend::BatchOffload(
+                {{TenantId::Default().MakeScopedKey("capacity_seed"), slices}},
+                nullptr));
+        }
+        for (const auto& key : {"capacity_a", "capacity_b"})
+            ASSERT_TRUE(client->Put(key, slices, ReplicateConfig{}));
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(tasks.size(), 2u);
+
+        auto result = storage.OffloadObjects(tasks);
+        if (mode == CapacityOffloadBackend::Mode::Rollback) {
+            EXPECT_FALSE(result);
+            EXPECT_EQ(backend->blocked_error,
+                      policy == BucketEvictionPolicy::NONE
+                          ? ErrorCode::KEYS_ULTRA_LIMIT
+                          : ErrorCode::NO_AVAILABLE_DISK);
+            EXPECT_EQ(storage.enable_offloading_,
+                      policy != BucketEvictionPolicy::NONE);
+            EXPECT_EQ(backend->attempts.load(), 2);
+            EXPECT_EQ(backend->GetStoreMetadata()->total_keys,
+                      seed_bucket ? 1 : 0);
+            if (seed_bucket) {
+                EXPECT_TRUE(backend
+                                ->IsExist(TenantId::Default().MakeScopedKey(
+                                    "capacity_seed"))
+                                .value());
+            } else {
+                // The failed notification freed capacity after the other worker
+                // disabled offload. A later heartbeat must resume admission.
+                ASSERT_TRUE(storage.Heartbeat());
+                EXPECT_TRUE(storage.enable_offloading_);
+                ASSERT_TRUE(client->Put("capacity_recovered", slices,
+                                        ReplicateConfig{}));
+                ASSERT_TRUE(storage.Heartbeat());
+                EXPECT_TRUE(backend
+                                ->IsExist(TenantId::Default().MakeScopedKey(
+                                    "capacity_recovered"))
+                                .value());
+                EXPECT_EQ(backend->attempts.load(), 3);
+            }
+        } else if (mode == CapacityOffloadBackend::Mode::Ack) {
+            ASSERT_TRUE(result);
+            EXPECT_EQ(backend->blocked_error, ErrorCode::NO_AVAILABLE_DISK);
+            EXPECT_EQ(backend->attempts.load(), 3);
+            EXPECT_TRUE(storage.enable_offloading_);
+            int disk_replicas = 0;
+            for (const auto& task : tasks) {
+                auto query = client->Query(task.key);
+                ASSERT_TRUE(query);
+                for (const auto& replica : query->replicas)
+                    disk_replicas += replica.is_local_disk_replica();
+                const auto key =
+                    TenantId(task.tenant_id).MakeScopedKey(task.key);
+                if (backend->IsExist(key).value()) {
+                    auto loaded = storage.BatchGet({key}, {task.size});
+                    ASSERT_TRUE(loaded);
+                    EXPECT_EQ(std::string(reinterpret_cast<const char*>(
+                                              loaded->pointers.front()),
+                                          value.size()),
+                              value);
+                }
+            }
+            EXPECT_EQ(disk_replicas,
+                      1);  // The retry safely evicted the ACKed bucket.
+        } else {
+            ASSERT_TRUE(result);
+            EXPECT_EQ(backend->attempts.load(), 4);  // One retry per bucket.
+            EXPECT_TRUE(storage.enable_offloading_);
+            EXPECT_EQ(backend->GetStoreMetadata()->total_keys, 0);
+        }
+        // Neither rejected nor completed tasks may retain source references.
+        for (const auto& task : tasks)
+            EXPECT_TRUE(client->Upsert(task.key, slices, ReplicateConfig{}));
+        ASSERT_TRUE(client->UnmountSegment(memory.get(), bytes));
     }
 
     void RunParallelOffloadReadback(uint32_t workers, bool use_uring = false,
@@ -2944,6 +3164,39 @@ TEST_F(FileStorageTest, OffloadWriteAbortedEmittedCarryIsNotRetained) {
 
 TEST_F(FileStorageTest, OffloadWriteParallelRegistersReplicasAndReadsBack) {
     RunParallelOffloadReadback(4);
+}
+
+TEST_F(FileStorageTest, OffloadCapacityRetriesAfterReservation) {
+    for (uint32_t workers : {2u, 4u}) {
+        for (auto policy :
+             {BucketEvictionPolicy::FIFO, BucketEvictionPolicy::LRU}) {
+            ASSERT_NO_FATAL_FAILURE(RunCapacityRecoveryScenario(
+                workers, policy, CapacityOffloadBackend::Mode::Ack));
+        }
+    }
+}
+
+TEST_F(FileStorageTest, OffloadCapacityResumesAfterRegistrationRollback) {
+    for (uint32_t workers : {2u, 4u}) {
+        for (bool key_limit : {false, true}) {
+            ASSERT_NO_FATAL_FAILURE(RunCapacityRecoveryScenario(
+                workers, BucketEvictionPolicy::NONE,
+                CapacityOffloadBackend::Mode::Rollback, key_limit));
+        }
+    }
+}
+
+TEST_F(FileStorageTest, OffloadCapacityRetryIsBoundedAndReleasesTasks) {
+    for (uint32_t workers : {1u, 4u}) {
+        ASSERT_NO_FATAL_FAILURE(
+            RunCapacityRecoveryScenario(workers, BucketEvictionPolicy::FIFO,
+                                        CapacityOffloadBackend::Mode::Full));
+    }
+}
+
+TEST_F(FileStorageTest, OffloadCapacityDoesNotRetryAfterHardFailure) {
+    RunCapacityRecoveryScenario(4, BucketEvictionPolicy::FIFO,
+                                CapacityOffloadBackend::Mode::Rollback);
 }
 
 #ifdef USE_URING

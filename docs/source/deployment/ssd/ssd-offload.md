@@ -181,6 +181,20 @@ are aliases) require `MOONCAKE_OFFLOAD_WRITE_WORKERS=1`. Combining packed
 io_uring writes with multiple offload workers is rejected during backend
 initialization, before storage files are created.
 
+Capacity admission counts all in-flight write reservations on the selected
+disk. With eviction disabled (`none`), writes must also fit the node-wide
+`MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` and key limit as well as any configured
+per-disk quota. These checks apply even with one offload worker. Physical-space
+accounting is conservative while partially written files still hold reservations.
+
+An admission rejection (`NO_AVAILABLE_DISK`) does not stop other buckets. Blocked
+buckets are retried once after the current workers finish. Requests that still cannot fit
+are reported as unsuccessful to release their source references; there is no
+unbounded wait. If a capacity check paused offloading (`KEYS_ULTRA_LIMIT`), later heartbeats
+recheck capacity so registration rollback or removal can restore admission.
+Actual I/O failures still stop the cycle, and each bucket's data is synchronized
+before its metadata is written.
+
 For `packed` direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
 that grows to fit its largest bucket and is released when the thread exits.
 Only the end of the data file is zero-padded to a 4096-byte boundary; key order,

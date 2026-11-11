@@ -3606,7 +3606,8 @@ BucketStorageBackend::PrepareEviction(
                             file_storage_config_.total_keys_limit) ||
                     reserved_size + required_size >
                         file_storage_config_.total_size_limit) {
-                    return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+                    // Reservations may be released by another writer.
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_DISK);
                 }
             }
             result.write_size = required_size;
@@ -3758,13 +3759,13 @@ BucketStorageBackend::PrepareEviction(
                                     synthetic_required_size >
                                 quota_limit;
     // Physical cap still exceeded after evicting up to kMaxEvictionBuckets:
-    // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
+    // reject admission without reporting an I/O failure
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     disk.pending_eviction_size += result.evicted_size;
     if (!result.write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_DISK);
     }
 
     if (!result.buckets.empty()) {

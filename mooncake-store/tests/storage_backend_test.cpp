@@ -4077,7 +4077,7 @@ TEST_F(StorageBackendTest,
 
     ASSERT_TRUE(concurrent_result.has_value());
     ASSERT_FALSE(concurrent_result->has_value());
-    EXPECT_EQ(concurrent_result->error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_EQ(concurrent_result->error(), ErrorCode::NO_AVAILABLE_DISK);
     ASSERT_FALSE(failed_eviction_result.has_value());
     EXPECT_EQ(failed_eviction_result.error(), ErrorCode::INTERNAL_ERROR);
 
@@ -6973,7 +6973,8 @@ TEST_F(StorageBackendTest, OffloadWriteNonePolicyRespectsConcurrentLimits) {
                 if (result) {
                     ++succeeded;
                 } else {
-                    EXPECT_EQ(result.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+                    EXPECT_TRUE(result.error() == ErrorCode::KEYS_ULTRA_LIMIT ||
+                                result.error() == ErrorCode::NO_AVAILABLE_DISK);
                 }
             }
             EXPECT_EQ(succeeded, 1);
@@ -7022,7 +7023,7 @@ TEST_F(StorageBackendTest, OffloadWritePhysicalCapCountsPendingWriters) {
     if (status == std::future_status::ready) {
         auto blocked = backend.BatchOffload(second, nullptr);
         EXPECT_FALSE(blocked);
-        if (!blocked) EXPECT_EQ(blocked.error(), ErrorCode::FILE_WRITE_FAIL);
+        if (!blocked) EXPECT_EQ(blocked.error(), ErrorCode::NO_AVAILABLE_DISK);
     }
     release.set_value();
     auto failed = writing.get();
@@ -7031,6 +7032,42 @@ TEST_F(StorageBackendTest, OffloadWritePhysicalCapCountsPendingWriters) {
     EXPECT_TRUE(backend.IsExist("old").value());
     // Failed notification must release the reservation, allowing a small write.
     EXPECT_TRUE(backend.BatchOffload(second, nullptr));
+}
+
+TEST_F(StorageBackendTest, NonePolicyEnforcesGlobalAndPerDiskLimits) {
+    for (bool global_limit : {false, true}) {
+        SCOPED_TRACE(global_limit);
+        FileStorageConfig config;
+        config.storage_filepath =
+            data_path + "/quota0," + data_path + "/quota1";
+        config.total_size_limit = (global_limit ? 88 : 256) * 1024;
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 1;
+        bucket_config.bucket_size_limit = 32 * 1024;
+        bucket_config.eviction_policy = BucketEvictionPolicy::NONE;
+        const int64_t quota = (global_limit ? 96 : 40) * 1024;
+        bucket_config.max_total_size_per_disk = {quota, quota};
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        int succeeded = 0;
+        for (int i = 0; i < 8; ++i) {
+            auto result =
+                OffloadOneKey(backend, "key" + std::to_string(i), 24 * 1024);
+            if (result) {
+                ++succeeded;
+            } else {
+                EXPECT_TRUE(result.error() == ErrorCode::NO_AVAILABLE_DISK ||
+                            result.error() == ErrorCode::KEYS_ULTRA_LIMIT);
+            }
+        }
+        EXPECT_EQ(succeeded, global_limit ? 3 : 2);
+        const auto metadata = backend.GetStoreMetadata();
+        ASSERT_TRUE(metadata);
+        EXPECT_LE(metadata->total_size, config.total_size_limit);
+        EXPECT_LE(DirectoryBytes(data_path + "/quota0"), quota);
+        EXPECT_LE(DirectoryBytes(data_path + "/quota1"), quota);
+        backend.RemoveAll();
+    }
 }
 
 }  // namespace mooncake::test

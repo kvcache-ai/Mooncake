@@ -637,6 +637,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     struct BucketOutcome {
         std::unordered_set<std::string> unreported_keys;
         std::optional<ErrorCode> error;
+        bool capacity_blocked = false;
     };
     std::vector<BucketOutcome> outcomes(buckets_keys.size());
     for (size_t i = 0; i < buckets_keys.size(); ++i) {
@@ -646,6 +647,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     }
     auto process_bucket = [&](size_t index) -> bool {
         auto& outcome = outcomes[index];
+        outcome.capacity_blocked = false;
         const auto& keys = buckets_keys[index];
         if (disk_fenced_.load()) {
             outcome.error = ErrorCode::FILE_WRITE_FAIL;
@@ -791,13 +793,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
 
             if (!offload_res) {
+                if (offload_res.error() == ErrorCode::NO_AVAILABLE_DISK) {
+                    outcome.capacity_blocked = true;
+                    return true;
+                }
                 LOG(ERROR) << "Failed to store objects with error: "
                            << offload_res.error();
                 // The coordinator reports this bucket's unreported keys
                 // after joining the in-flight workers.
                 if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
-                    // Disk is over the key-count limit: stop offloading
-                    // entirely.
+                    // Pause admission until a heartbeat observes capacity.
                     MutexLocker locker(&offloading_mutex_);
                     enable_offloading_ = false;
                 }
@@ -829,6 +834,18 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     } catch (...) {
         LOG(ERROR) << "Offload worker dispatch threw an unknown exception";
         abort_error = ErrorCode::INTERNAL_ERROR;
+    }
+    // Joining lets this cycle's reservations and notification pins drain.
+    // Retry admission once, without waiting under a backend lock. A bucket
+    // that still cannot fit is NACKed below; real failures retain their
+    // semantics.
+    if (!abort_error &&
+        std::none_of(outcomes.begin(), outcomes.end(), [](const auto& outcome) {
+            return outcome.error.has_value();
+        })) {
+        for (size_t i = 0; i < outcomes.size(); ++i) {
+            if (outcomes[i].capacity_blocked && !process_bucket(i)) break;
+        }
     }
     for (const auto& outcome : outcomes) {
         if (outcome.error &&
@@ -1015,6 +1032,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         // drain just deregistered.
         if (draining_.load()) {
             return {};
+        }
+        // A quota stop can outlive a failed registration or a later removal.
+        if (!enable_offloading_) {
+            auto available = IsEnableOffloading();
+            if (!available) return tl::make_unexpected(available.error());
+            enable_offloading_ = *available;
         }
         auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
             return client_->OffloadObjectHeartbeat(enable_offloading_,
