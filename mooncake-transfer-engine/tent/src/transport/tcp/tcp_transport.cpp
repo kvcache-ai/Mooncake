@@ -199,8 +199,11 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status.s = task.status_word.load(std::memory_order_acquire);
     status.transferred_bytes =
         task.transferred_bytes.load(std::memory_order_acquire);
-    if (status.s == TransferStatusEnum::FAILED && task.non_replayable_failure)
-        return Status::RpcServiceError("TCP WRITE outcome is unknown" LOC_MARK);
+    if (status.s == TransferStatusEnum::FAILED &&
+        task.non_replayable_error != Status::Code::kOk)
+        return Status(
+            task.non_replayable_error,
+            "TCP data RPC failed; automatic replay suppressed" LOC_MARK);
     return Status::OK();
 }
 
@@ -311,9 +314,10 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         LOG_EVERY_N(WARNING, 1000) << "TCP transfer attempt " << attempt
                                    << " failed: " << status.ToString();
 
-        if (task->request.opcode == Request::WRITE &&
-            status.IsRpcServiceError() && !status.IsRpcConnectionError()) {
-            task->non_replayable_failure = true;
+        if (status.IsRpcUnknownEffect() ||
+            (task->request.opcode == Request::WRITE &&
+             status.IsRpcServiceError() && !status.IsRpcConnectionError())) {
+            task->non_replayable_error = status.code();
             return status;
         }
 

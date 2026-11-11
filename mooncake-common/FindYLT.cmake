@@ -38,6 +38,10 @@ FetchContent_Populate(yalantinglibs)
 add_subdirectory(${yalantinglibs_SOURCE_DIR} ${yalantinglibs_BINARY_DIR}
                  EXCLUDE_FROM_ALL)
 
+if(USE_TENT)
+  include(${CMAKE_CURRENT_LIST_DIR}/../cmake/YltRpcIdleSocket.cmake)
+endif()
+
 # Suppress warnings for CMake before 3.25
 get_target_property(YLT_INCL_DIRS yalantinglibs INTERFACE_INCLUDE_DIRECTORIES)
 set_target_properties(

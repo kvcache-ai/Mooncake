@@ -109,6 +109,9 @@ class Status final {
         kRpcServiceError = 132,
         kMalformedJson = 133,
         kRpcConnectionError = 134,  // Failed before dispatching the request.
+        // Dispatch started, but no complete peer reply establishes the outcome.
+        // The request may have taken effect and must not be replayed.
+        kRpcUnknownEffect = 136,
         kInternalError = 199,
 
         kNotImplemented = 200,
@@ -163,6 +166,7 @@ class Status final {
     TYPE_CHECK(CudaError);
     TYPE_CHECK(MetadataError);
     TYPE_CHECK(RpcConnectionError);
+    TYPE_CHECK(RpcUnknownEffect);
     [[nodiscard]] bool IsRpcServiceError() const {
         return code_ == Code::kRpcServiceError || IsRpcConnectionError();
     }

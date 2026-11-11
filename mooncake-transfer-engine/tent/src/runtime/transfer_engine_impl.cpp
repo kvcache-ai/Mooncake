@@ -3347,8 +3347,8 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     Status result =
         transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
     if (task.type == TCP && task_status.s == FAILED &&
-        result.IsRpcServiceError()) {
-        // Standard TCP reports an uncertain WRITE through this error result.
+        (result.IsRpcUnknownEffect() || result.IsRpcServiceError())) {
+        // Do not replay an uncertain data RPC through another transport.
         finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
         task.suppress_failover = true;
         return Status::OK();

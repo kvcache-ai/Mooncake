@@ -53,7 +53,9 @@ struct TcpTask {
     std::function<void(BatchID)> notify_progress;
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
-    bool non_replayable_failure{false};  // Published by status_word.
+    // Published by status_word; preserve the distinction between a peer error
+    // and a missing reply without allowing either uncertain WRITE to replay.
+    Status::Code non_replayable_error{Status::Code::kOk};
     uint64_t target_addr = 0;
 
     TcpTask() = default;
@@ -64,7 +66,7 @@ struct TcpTask {
           status_word(other.status_word.load(std::memory_order_relaxed)),
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),
-          non_replayable_failure(other.non_replayable_failure),
+          non_replayable_error(other.non_replayable_error),
           target_addr(other.target_addr) {}
     TcpTask(const TcpTask &) = delete;
     TcpTask &operator=(const TcpTask &) = delete;

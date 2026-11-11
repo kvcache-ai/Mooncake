@@ -159,7 +159,8 @@ Status ControlClient::recvData(const std::string& server_addr,
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc));
     memcpy(&request[0], &desc, sizeof(desc));
-    auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
+    auto status = tl_rpc_agent.callOwned(server_addr, RecvData,
+                                         std::move(request), response);
     if (!status.ok()) return status;
     if (response.size() != length)
         return Status::RpcServiceError(

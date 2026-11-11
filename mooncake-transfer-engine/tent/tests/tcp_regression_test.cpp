@@ -24,12 +24,14 @@
 #include <endian.h>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "tent/common/config.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/tcp/tcp_transport.h"
+#include "rpc_fault_peer.h"
 
 namespace {
 thread_local size_t fail_allocation_size = 0;
@@ -77,6 +79,9 @@ class TcpTransportTestPeer {
     static void drain(TcpTransport& tcp) {
         tcp.thread_pool_->enqueue([] {}).get();
     }
+    static void retries(TcpTransport& tcp, size_t count) {
+        tcp.params_.max_retry_count = count;
+    }
 };
 
 namespace {
@@ -119,12 +124,14 @@ class TcpRegression : public testing::Test {
     std::shared_ptr<ControlledTcp> tcp;
     std::shared_ptr<ControlService> metadata;
 
-    void SetUp() override {
+    void SetUp() override { startEngine(); }
+
+    void startEngine(const std::string& port = "0") {
         auto config = std::make_shared<Config>();
         config->set("metadata_type", "p2p");
         config->set("metadata_servers", "");
         config->set("rpc_server_hostname", "127.0.0.1");
-        config->set("rpc_server_port", "0");
+        config->set("rpc_server_port", port);
         config->set("rpc_server_threads", 2);
         config->set("enable_progress_worker", true);
         config->set("enable_auto_failover_on_poll", false);
@@ -326,6 +333,173 @@ TEST_F(TcpRegression, MalformedWriteLengthCannotOverflowOrModifyTarget) {
         EXPECT_EQ(response, "SendData failed: invalid request size");
         EXPECT_EQ(data, original);
     }
+}
+
+TEST_F(TcpRegression, FirstDataRpcAfterSamePortRestartSucceeds) {
+    std::array<char, 16> local;
+    for (auto opcode : {Request::WRITE, Request::READ}) {
+        SCOPED_TRACE(opcode);
+        const auto address = engine->getSegmentName();
+        local.fill('W');
+        ASSERT_TRUE(ControlClient::sendData(
+                        address, reinterpret_cast<uint64_t>(data.data()),
+                        local.data(), local.size())
+                        .ok());
+
+        ASSERT_TRUE(tcp->uninstall().ok());
+        ASSERT_TRUE(
+            engine->unregisterLocalMemory(data.data(), data.size()).ok());
+        engine.reset();
+        tcp.reset();
+        metadata.reset();
+        // As in rpc_reconnect_test, allow the FIN to reach the idle socket.
+        std::this_thread::sleep_for(100ms);
+        data.fill('N');
+        startEngine(address.substr(address.rfind(':') + 1));
+        ASSERT_EQ(engine->getSegmentName(), address) << "port drifted";
+
+        auto call = opcode == Request::WRITE ? ControlClient::sendData
+                                             : ControlClient::recvData;
+        auto status = call(address, reinterpret_cast<uint64_t>(data.data()),
+                           local.data(), local.size());
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        EXPECT_TRUE(std::all_of(local.begin(), local.end(), [&](char c) {
+            return c == (opcode == Request::WRITE ? 'W' : 'N');
+        }));
+        EXPECT_TRUE(
+            std::all_of(data.begin(), data.begin() + local.size(), [&](char c) {
+                return c == (opcode == Request::WRITE ? 'W' : 'N');
+            }));
+        EXPECT_TRUE(std::all_of(data.begin() + local.size(), data.end(),
+                                [](char c) { return c == 'N'; }));
+    }
+}
+
+TEST_F(TcpRegression, LostOrTruncatedDataReplyIsUnknownAndNeverReplayed) {
+    for (auto fault :
+         {RpcFaultPeer::Fault::Eof, RpcFaultPeer::Fault::Reset,
+          RpcFaultPeer::Fault::ShortHeader, RpcFaultPeer::Fault::ShortBody}) {
+        SCOPED_TRACE(static_cast<int>(fault));
+        for (auto opcode : {Request::WRITE, Request::READ}) {
+            SCOPED_TRACE(opcode);
+            RpcFaultPeer peer(fault);
+            ASSERT_TRUE(peer.available());
+            ASSERT_TRUE(
+                ControlClient::sendData(peer.address(), 0, data.data(), 1)
+                    .ok());
+            auto call = opcode == Request::WRITE ? ControlClient::sendData
+                                                 : ControlClient::recvData;
+            auto status = call(peer.address(), 0, data.data(), 1);
+            EXPECT_TRUE(status.IsRpcUnknownEffect()) << status.ToString();
+            EXPECT_FALSE(status.IsRpcServiceError());
+            EXPECT_EQ(peer.requests.load(), 2);
+            EXPECT_EQ(peer.connections.load(), 1);
+            // The uncertain call retired its socket. A new explicit request
+            // reconnects, rather than returning the broken stream to the pool.
+            ASSERT_TRUE(
+                ControlClient::sendData(peer.address(), 0, data.data(), 1)
+                    .ok());
+            EXPECT_EQ(peer.requests.load(), 3);
+            EXPECT_EQ(peer.connections.load(), 2);
+        }
+    }
+}
+
+TEST_F(TcpRegression, UnknownEffectSuppressesTcpRetryAndEngineFailover) {
+    TcpTransportTestPeer::retries(*tcp, 3);
+    Config config;
+    config.set("enable_auto_failover_on_poll", true);
+    config.set("max_failover_attempts", 3);
+    ASSERT_TRUE(engine
+                    ->publishRuntimeConfigForTest(
+                        buildTentConfigBundle(config, 1).runtime)
+                    .ok());
+    for (auto opcode : {Request::READ, Request::WRITE}) {
+        SCOPED_TRACE(opcode);
+        RpcFaultPeer peer(RpcFaultPeer::Fault::Eof);
+        ASSERT_TRUE(peer.available());
+        ASSERT_TRUE(metadata->segmentManager()
+                        .updateLocal([&](SegmentDesc& desc) {
+                            desc.rpc_server_addr = peer.address();
+                            return Status::OK();
+                        })
+                        .ok());
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            // Warm the production worker's thread-local connection pool.
+            auto request = writeRequest();
+            if (attempt == 1) request.opcode = opcode;
+            auto batch = engine->allocateBatch(1);
+            ASSERT_TRUE(engine->submitTransfer(batch, {request}).ok());
+            TcpTransportTestPeer::drain(*tcp);
+            TransferStatus status{};
+            ASSERT_TRUE(engine->getTransferStatus(batch, status).ok());
+            EXPECT_EQ(status.s, attempt == 0 ? COMPLETED : FAILED);
+            if (attempt == 1) {
+                auto error = tcp->getTransferStatus(tcp->last_batch, 0, status);
+                EXPECT_TRUE(error.IsRpcUnknownEffect()) << error.ToString();
+                EXPECT_EQ(status.transferred_bytes, 0u);
+                EXPECT_TRUE(engine->progressBatch(batch, status).ok());
+                EXPECT_EQ(status.s, FAILED);
+            }
+            EXPECT_TRUE(engine->freeBatch(batch).ok());
+        }
+        EXPECT_EQ(peer.requests.load(), 2);
+        EXPECT_EQ(peer.connections.load(), 1);
+    }
+}
+
+TEST(DataRpcDeadline, ExpiredBeforeDispatchSendsNothing) {
+    RpcFaultPeer peer(RpcFaultPeer::Fault::Eof);
+    ASSERT_TRUE(peer.available());
+    CoroRpcAgent client;
+    std::string response = "unchanged";
+    auto status = client.callOwned(peer.address(), SendData, "unused", response,
+                                   std::chrono::steady_clock::now());
+    EXPECT_TRUE(status.IsRpcConnectionError()) << status.ToString();
+    EXPECT_FALSE(status.IsRpcUnknownEffect());
+    EXPECT_EQ(response, "unchanged");
+    EXPECT_EQ(peer.requests.load(), 0);
+    EXPECT_EQ(peer.connections.load(), 0);
+}
+
+TEST(DataRpcDeadline, TimeoutAfterDispatchIsUnknownAndNeverReplayed) {
+    RpcFaultPeer peer(RpcFaultPeer::Fault::Timeout);
+    ASSERT_TRUE(peer.available());
+    CoroRpcAgent client;
+    std::string response;
+    ASSERT_TRUE(
+        client.callOwned(peer.address(), SendData, "warm", response).ok());
+    response = "unchanged";
+    const auto start = std::chrono::steady_clock::now();
+    auto status = client.callOwned(peer.address(), SendData, "once", response,
+                                   start + 50ms);
+    EXPECT_TRUE(status.IsRpcUnknownEffect()) << status.ToString();
+    EXPECT_FALSE(status.IsRpcServiceError());
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+    EXPECT_EQ(response, "unchanged");
+    EXPECT_EQ(peer.requests.load(), 2);
+    EXPECT_EQ(peer.connections.load(), 1);
+}
+
+TEST(DataRpcReply, AnsweredHandlerErrorIsDistinctAndNeverReplayed) {
+    CoroRpcAgent server, client;
+    std::atomic<int> side_effects{0};
+    ASSERT_TRUE(server
+                    .registerFunction(SendData,
+                                      [&](const auto&, auto&) {
+                                          ++side_effects;
+                                          throw std::runtime_error(
+                                              "after the WRITE");
+                                      })
+                    .ok());
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+    std::string response;
+    auto status = client.callOwned("127.0.0.1:" + std::to_string(port),
+                                   SendData, "once", response);
+    EXPECT_EQ(status.code(), Status::Code::kRpcServiceError);
+    EXPECT_FALSE(status.IsRpcUnknownEffect());
+    EXPECT_EQ(side_effects.load(), 1);
 }
 
 }  // namespace
