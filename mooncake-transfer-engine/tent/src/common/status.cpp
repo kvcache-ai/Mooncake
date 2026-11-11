@@ -79,6 +79,20 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "MalformedJson";
         case Code::kInternalError:
             return "InternalError";
+        case Code::kMemoryEngineNotJoined:
+            return "MemoryEngineNotJoined";
+        case Code::kMemoryEngineAlreadyJoined:
+            return "MemoryEngineAlreadyJoined";
+        case Code::kMemoryEngineNoSpace:
+            return "MemoryEngineNoSpace";
+        case Code::kMemoryEngineTimeout:
+            return "MemoryEngineTimeout";
+        case Code::kMemoryEngineUnsupported:
+            return "MemoryEngineUnsupported";
+        case Code::kMemoryEngineBackendError:
+            return "MemoryEngineBackendError";
+        case Code::kMemoryEngineDisabled:
+            return "MemoryEngineDisabled";
         case Code::kNotImplemented:
             return "NotImplemented";
         default:
