@@ -890,23 +890,17 @@ void TransferEngineOperationState::check_task_status() {
             }
         }
 
-        switch (status.s) {
-            case TransferStatusEnum::COMPLETED:
-                // This transfer is done successfully
-                break;
-            case TransferStatusEnum::FAILED:
-            case TransferStatusEnum::CANCELED:
-            case TransferStatusEnum::INVALID:
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            // This transfer is done successfully.
+        } else if (IsTerminalTransferFailure(status.s)) {
 #ifndef USE_ASCEND_DIRECT
-                VLOG(1) << "Transfer failed for batch " << batch_id_ << " task "
-                        << i << " with status " << static_cast<int>(status.s);
+            VLOG(1) << "Transfer failed for batch " << batch_id_ << " task "
+                    << i << " with status " << static_cast<int>(status.s);
 #endif
-                failed_task_ids.push_back(i);
-                break;
-            default:
-                // Transfer is still in progress (WAITING, PENDING, etc.)
-                all_terminated = false;
-                break;
+            failed_task_ids.push_back(i);
+        } else {
+            // Transfer is still in progress (WAITING, PENDING, etc.).
+            all_terminated = false;
         }
     }
 

@@ -119,9 +119,11 @@ Status ControlClient::bootstrapUb(const std::string& server_addr,
     return Status::OK();
 }
 
-Status ControlClient::sendData(const std::string& server_addr,
-                               uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+namespace {
+
+Status sendDataImpl(const std::string& server_addr, uint64_t peer_mem_addr,
+                    void* local_mem_addr, size_t length,
+                    std::optional<std::chrono::milliseconds> call_timeout) {
     // Check before addition/allocation or reading the caller's source buffer.
     if (length > kTcpMaxWriteBytes)
         return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
@@ -143,28 +145,68 @@ Status ControlClient::sendData(const std::string& server_addr,
         CHECK_STATUS(
             loader.copy(request.data() + sizeof(desc), local_mem_addr, length));
     }
-    auto status = tl_rpc_agent.callOwned(server_addr, SendData,
-                                         std::move(request), response);
+    auto status = call_timeout.has_value()
+                      ? tl_rpc_agent.callOwnedWithTimeout(
+                            server_addr, SendData, std::move(request), response,
+                            *call_timeout)
+                      : tl_rpc_agent.callOwned(server_addr, SendData,
+                                               std::move(request), response);
     if (!status.ok()) return status;
     if (!response.empty()) return Status::RpcServiceError(response);
     return Status::OK();
 }
 
-Status ControlClient::recvData(const std::string& server_addr,
-                               uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+Status recvDataImpl(const std::string& server_addr, uint64_t peer_mem_addr,
+                    void* local_mem_addr, size_t length,
+                    std::optional<std::chrono::milliseconds> call_timeout) {
     if (length > kTcpMaxReadBytes)
         return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc));
     memcpy(&request[0], &desc, sizeof(desc));
-    auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
+    auto status =
+        call_timeout.has_value()
+            ? tl_rpc_agent.callWithTimeout(server_addr, RecvData, request,
+                                           response, *call_timeout)
+            : tl_rpc_agent.call(server_addr, RecvData, request, response);
     if (!status.ok()) return status;
     if (response.size() != length)
         return Status::RpcServiceError(
             response.empty() ? "RecvData failed: empty response" : response);
     return Platform::getLoader().copy(local_mem_addr, response.data(), length);
+}
+
+}  // namespace
+
+Status ControlClient::sendData(const std::string& server_addr,
+                               uint64_t peer_mem_addr, void* local_mem_addr,
+                               size_t length) {
+    return sendDataImpl(server_addr, peer_mem_addr, local_mem_addr, length,
+                        std::nullopt);
+}
+
+Status ControlClient::sendDataWithTimeout(
+    const std::string& server_addr, uint64_t peer_mem_addr,
+    void* local_mem_addr, size_t length,
+    std::chrono::milliseconds call_timeout) {
+    return sendDataImpl(server_addr, peer_mem_addr, local_mem_addr, length,
+                        call_timeout);
+}
+
+Status ControlClient::recvData(const std::string& server_addr,
+                               uint64_t peer_mem_addr, void* local_mem_addr,
+                               size_t length) {
+    return recvDataImpl(server_addr, peer_mem_addr, local_mem_addr, length,
+                        std::nullopt);
+}
+
+Status ControlClient::recvDataWithTimeout(
+    const std::string& server_addr, uint64_t peer_mem_addr,
+    void* local_mem_addr, size_t length,
+    std::chrono::milliseconds call_timeout) {
+    return recvDataImpl(server_addr, peer_mem_addr, local_mem_addr, length,
+                        call_timeout);
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {

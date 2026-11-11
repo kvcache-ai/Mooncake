@@ -81,9 +81,16 @@ Status TcpTransport::install(std::string &local_segment_name,
             "transports/tcp/retry_base_delay_ms", params_.retry_base_delay_ms);
         params_.retry_max_delay_ms = conf->get(
             "transports/tcp/retry_max_delay_ms", params_.retry_max_delay_ms);
+        params_.data_rpc_timeout_ms = conf->get(
+            "transports/tcp/data_rpc_timeout_ms", params_.data_rpc_timeout_ms);
         params_.max_concurrent_tasks =
             conf->get("transports/tcp/max_concurrent_tasks",
                       params_.max_concurrent_tasks);
+    }
+
+    if (params_.data_rpc_timeout_ms <= 0) {
+        return Status::InvalidArgument(
+            "transports/tcp/data_rpc_timeout_ms must be positive" LOC_MARK);
     }
 
     if (params_.max_concurrent_tasks == 0) {
@@ -112,6 +119,7 @@ Status TcpTransport::install(std::string &local_segment_name,
 
     LOG(INFO) << "TCP transport installed: max_retry_count="
               << params_.max_retry_count
+              << " data_rpc_timeout_ms=" << params_.data_rpc_timeout_ms
               << " max_concurrent_tasks=" << params_.max_concurrent_tasks;
     return Status::OK();
 }
@@ -220,6 +228,7 @@ void TcpTransport::startTransfer(TcpTask *task) {
     auto notify_progress = std::move(task->notify_progress);
     const auto progress_batch_id = task->progress_batch_id;
     bool completed = false;
+    auto terminal_status = TransferStatusEnum::FAILED;
     try {
         if (task->request.target_id == LOCAL_SEGMENT_ID &&
             IsLoopbackEndpoint(local_segment_name_)) {
@@ -234,6 +243,9 @@ void TcpTransport::startTransfer(TcpTask *task) {
         auto status = doTransferWithRetry(task);
         completed = status.ok();
         if (!completed) {
+            if (status.IsTimeout()) {
+                terminal_status = TransferStatusEnum::TIMEOUT;
+            }
             VLOG(1) << "TCP transfer failed: " << status.ToString();
             LOG_EVERY_N(WARNING, 100)
                 << "TCP transfer failed: " << status.ToString();
@@ -253,8 +265,7 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::COMPLETED,
                                 std::memory_order_release);
     } else {
-        task->status_word.store(TransferStatusEnum::FAILED,
-                                std::memory_order_release);
+        task->status_word.store(terminal_status, std::memory_order_release);
     }
     if (notify_progress) notify_progress(progress_batch_id);
 }
@@ -271,6 +282,8 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
 
     Status last_error;
     uint64_t delay_ms = params_.retry_base_delay_ms;
+    const std::chrono::milliseconds data_rpc_timeout{
+        params_.data_rpc_timeout_ms};
 
     for (size_t attempt = 0; attempt <= params_.max_retry_count; ++attempt) {
         if (shutting_down_.load(std::memory_order_acquire))
@@ -294,13 +307,13 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         }
 
         if (task->request.opcode == Request::WRITE) {
-            status = ControlClient::sendData(
+            status = ControlClient::sendDataWithTimeout(
                 rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+                task->request.source, task->request.length, data_rpc_timeout);
         } else {
-            status = ControlClient::recvData(
+            status = ControlClient::recvDataWithTimeout(
                 rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+                task->request.source, task->request.length, data_rpc_timeout);
         }
 
         if (status.ok()) return Status::OK();
@@ -312,12 +325,16 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
                                    << " failed: " << status.ToString();
 
         if (task->request.opcode == Request::WRITE &&
-            status.IsRpcServiceError() && !status.IsRpcConnectionError()) {
+            (status.IsTimeout() ||
+             (status.IsRpcServiceError() && !status.IsRpcConnectionError()))) {
             task->non_replayable_failure = true;
             return status;
         }
 
-        if (!status.IsRpcServiceError() && !status.IsInternalError()) {
+        const bool retryable_read_timeout =
+            task->request.opcode == Request::READ && status.IsTimeout();
+        if (!retryable_read_timeout && !status.IsRpcServiceError() &&
+            !status.IsInternalError()) {
             return status;
         }
 
