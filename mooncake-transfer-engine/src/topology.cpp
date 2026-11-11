@@ -705,8 +705,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             topology.push_back(
                 TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
                               .preferred_hca = std::move(preferred_hca),
-                              .avail_hca = {},
-                              .pci_bus_id = pci_bus_id});
+                              .avail_hca = {}});
             continue;
         }
 #endif
@@ -749,8 +748,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         topology.push_back(
             TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
                           .preferred_hca = std::move(preferred_hca),
-                          .avail_hca = std::move(avail_hca),
-                          .pci_bus_id = pci_bus_id});
+                          .avail_hca = std::move(avail_hca)});
     }
     return topology;
 }
@@ -916,11 +914,7 @@ int Topology::parse(const std::string &topology_json,
 std::string Topology::toString() const {
     Json::Value value(Json::objectValue);
     for (auto &entry : matrix_) {
-        std::string key = entry.first;
-        if (!entry.second.pci_bus_id.empty()) {
-            key += "(" + entry.second.pci_bus_id + ")";
-        }
-        value[key] = entry.second.toJson();
+        value[entry.first] = entry.second.toJson();
     }
     return value.toStyledString();
 }
