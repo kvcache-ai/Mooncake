@@ -33,6 +33,7 @@ next phase continues.
 | `mixed_metadata` | Seeded operation mix using `put/get/exist/remove`, with one operation per object ID and a lane-local presence model. |
 | `remove_perf` | Always performs strict `prepare_write`, then removes each prepared key and checks that it is absent. |
 | `replay` | Replays operations from a metadata journal, preserving each lane's file order. |
+| `capabilities` | Reports reserved NoF scenario capabilities as JSON without creating a client or running I/O. |
 
 Write budget means `write-objects` when positive, otherwise `nr-objects`.
 Prepare budget means `prepare-objects` when positive, otherwise `nr-objects`.
@@ -43,6 +44,55 @@ Strict prepare/write phases abort if any requested object cannot be written.
 The benchmark does not automatically remove keys after performance phases;
 `metadata_smoke`, `remove_perf`, and explicit replayed removes delete keys as
 part of their workload. Use fresh prefixes to avoid existing-key collisions.
+
+## NoF capabilities and skipped workloads
+
+Inspect the reserved NoF scenarios without a master, metadata service, or target:
+
+```bash
+python3 mooncake-store/benchmarks/store_kv_bench.py \
+  --scenario capabilities --store-backend rs --output-dir /tmp/rs-capabilities
+```
+
+The report is printed to stdout and written to `summary.json` when an output
+directory is provided. `--summary-json` selects an explicit destination instead.
+Each entry has `capability`, `result`, and a human-readable `reason`:
+
+| Capability | Meaning | Result in the capability report |
+|---|---|---|
+| `supported` | The implementation and supplied configuration support the scenario. | `null`: discovery does not execute a workload. |
+| `not_configured` | The implementation supports it, but the build or benchmark setup is not configured for it. | `SKIP_NOT_CONFIGURED` |
+| `not_implemented` | The backend or dedicated workload does not implement it. | `SKIP_NOT_IMPLEMENTED` |
+
+The matrix covers NoF replica count, promotion, zero-copy reads, and zero-copy
+writes. Store-RS has NoF copy I/O, but the benchmark's Python setup adapter does
+not configure its NoF replicas. It reports that row as `not_configured` and
+promotion / NoF zero-copy reads as `not_implemented`. Neither backend has a
+dedicated NoF zero-copy write workload. Registered-buffer I/O over TCP remains
+available; it is separate from NoF zero copy.
+
+For C++, use `--nof-replica-num > 0` to inspect the installed binding's
+`mooncake.store.NOF_ENABLED` build flag. A build with `USE_NOF=OFF`, or an older
+binding that cannot report the flag, yields `not_configured`. NoF promotion
+also requires a positive memory replica count; NoF zero-copy reads require
+`--io-api zcopy`. Discovery checks configuration only: it does not verify that
+a remote target is reachable, register a namespace, or measure performance.
+
+When a normal workload requests unavailable NoF support, the driver skips it
+before client setup and exits with status 0. For example:
+
+```bash
+python3 mooncake-store/benchmarks/store_kv_bench.py \
+  --scenario read_perf --store-backend rs --io-api zcopy \
+  --memory-replica-num 0 --nof-replica-num 1 \
+  --summary-json /tmp/rs-nof-read.json
+```
+
+The summary reports `result: "SKIP_NOT_IMPLEMENTED"`, the capability and reason,
+`ok: null`, empty `phases`, and `overall: null`. A skip has no throughput or
+latency measurements and is not a passing run. Configured workloads still run
+normally, with `result: "PASS"` or `"FAIL"` derived from their actual I/O results.
+Setup, import, and runtime errors remain errors; they are not converted to skips.
 
 ## APIs
 
@@ -199,7 +249,8 @@ transport metadata, routing mode, keyspace, tenant, and replica count.
 - The same `key-prefix`, `key-size`, and `object-id-start` produce the same key sequence
 - `verify` currently requires `pattern`
 - Any write-involved scenario requires `value-size` to be 512-byte aligned
-- `memory-replica-num`, `nof-replica-num`, and `dfs-replica-num` cannot all be `0`.
+- Replica counts must be non-negative. For I/O workloads,
+  `memory-replica-num`, `nof-replica-num`, and `dfs-replica-num` cannot all be `0`.
 - `dfs-replica-num` requests a DFS replica; supported Store values are `0` or `1`.
   Set memory and NoF counts to `0` and the DFS count to `1` for DFS-only placement.
 - Any process that writes or reads DFS replicas must pass `--enable-ssd-offload`,
@@ -610,10 +661,11 @@ percentiles, `dataset_exhausted`, and aggregated errors.
 When requested, the benchmark writes:
 
 - `summary.json` under `output-dir`, or the explicit `summary-json` path.
-  It contains `schema_version: 1`, `scenario`, `ok`, a `phases` object keyed by
-  phase name, `overall`, and `journal_records`. `ok` is false if any KV operation
-  failed or verification failed. The summary is replaced atomically via a
-  temporary file.
+  It contains `schema_version: 1`, `scenario`, `ok`, `result`, `capability`, a
+  `phases` object keyed by phase name, `overall`, and `journal_records`. `ok` is
+  false if any KV operation failed or verification failed. Skipped workloads
+  and capability reports use the format described above. The summary is
+  replaced atomically via a temporary file.
 - `journal.jsonl` under `output-dir`, unless `journal=none`. Records are sorted
   by invocation time, lane, and operation ID. Each record contains
   `schema_version`, `op_id`, `lane`, `op`, `object_id`, `key`, `invoke_ns`,
@@ -629,7 +681,7 @@ different output directories when retaining multiple runs or replay inputs.
 
 | Code | Meaning |
 |---|---|
-| `0` | Completed without one of the exit conditions below. This does not guarantee all performance operations succeeded. |
+| `0` | Completed or skipped without one of the exit conditions below. Check JSON `result` to distinguish a skip from an executed workload. This does not guarantee all performance operations succeeded. |
 | `1` | Setup, validation, strict-write, worker, or output exception. `metadata_smoke` also raises on failed operations. |
 | `2` | Argument-parser error, such as a missing required scenario or invalid choice. |
 | `20` | At least one payload verification failure in a completed run. |

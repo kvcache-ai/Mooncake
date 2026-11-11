@@ -1,5 +1,6 @@
 import ctypes
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -77,6 +78,17 @@ class StoreModuleCompatibilityTest(unittest.TestCase):
 
 
 class ReplicaConfigTest(unittest.TestCase):
+    def test_rejects_negative_replica_counts(self):
+        for kind in ("memory", "nof", "dfs"):
+            with self.subTest(kind=kind):
+                args = bench.build_parser().parse_args(
+                    ["--scenario=read_perf", f"--{kind}-replica-num=-1"]
+                )
+                with self.assertRaisesRegex(ValueError, "replica counts must be >= 0"):
+                    bench.BenchmarkRunner(args)
+                with self.assertRaisesRegex(ValueError, "replica counts must be >= 0"):
+                    bench.report_capabilities(args)
+
     def test_rejects_all_replica_counts_zero(self):
         args = bench.build_parser().parse_args(
             [
@@ -591,10 +603,189 @@ class StoreBackendTest(unittest.TestCase):
         self.assertEqual(summary["routing"], "metadata_only")
         self.assertEqual(summary["keyspace"], "mc/test")
 
-    def test_rs_backend_rejects_nof_replica_num(self):
+    def test_rs_backend_skips_unconfigured_nof_replica_num(self):
         args = self._args(["--store-backend=rs", "--nof-replica-num=1"])
-        with self.assertRaisesRegex(ValueError, "does not support --nof-replica-num"):
-            bench.BenchmarkRunner(args)
+        runner = bench.BenchmarkRunner(args)
+        with patch.object(bench, "load_store_module") as load:
+            self.assertEqual(runner.run(), [])
+        load.assert_not_called()
+        self.assertEqual(runner.capability["result"], "SKIP_NOT_CONFIGURED")
+
+
+class NofCapabilityTest(unittest.TestCase):
+    def _args(self, *extra):
+        return bench.build_parser().parse_args(["--scenario=capabilities", *extra])
+
+    def test_rs_matrix_distinguishes_unwired_copy_from_missing_operations(self):
+        with patch.object(bench, "load_store_module") as load:
+            capabilities = bench.probe_nof_capabilities(
+                self._args("--store-backend=rs", "--nof-replica-num=1")
+            )
+        load.assert_not_called()
+        self.assertEqual(
+            capabilities["nof_replica_count"]["result"], "SKIP_NOT_CONFIGURED"
+        )
+        for name in ("nof_promotion", "nof_zero_copy_read", "nof_zero_copy_write"):
+            self.assertEqual(capabilities[name]["capability"], "not_implemented")
+            self.assertEqual(capabilities[name]["result"], "SKIP_NOT_IMPLEMENTED")
+            self.assertTrue(capabilities[name]["reason"])
+
+    def test_cpp_default_report_does_not_need_a_native_module_or_target(self):
+        with patch.object(bench, "load_store_module") as load:
+            capabilities = bench.probe_nof_capabilities(self._args())
+        load.assert_not_called()
+        self.assertEqual(
+            capabilities["nof_replica_count"]["result"], "SKIP_NOT_CONFIGURED"
+        )
+        self.assertEqual(
+            capabilities["nof_zero_copy_write"]["result"], "SKIP_NOT_IMPLEMENTED"
+        )
+
+    def test_cpp_build_flag_is_required_even_when_config_exposes_nof(self):
+        args = self._args("--nof-replica-num=1", "--io-api=zcopy")
+        for enabled in (True, False, None):
+            with self.subTest(enabled=enabled):
+                module = SimpleNamespace(
+                    NOF_ENABLED=enabled,
+                    ReplicateConfig=store_module.ReplicateConfig,
+                    MooncakeDistributedStore=Mock(),
+                )
+                with patch.object(bench, "load_store_module", return_value=module):
+                    capabilities = bench.probe_nof_capabilities(args)
+                module.MooncakeDistributedStore.assert_not_called()
+                for name in (
+                    "nof_replica_count",
+                    "nof_promotion",
+                    "nof_zero_copy_read",
+                ):
+                    self.assertEqual(
+                        capabilities[name]["capability"],
+                        "supported" if enabled else "not_configured",
+                    )
+                    # Discovering support is not a successful benchmark run.
+                    self.assertEqual(
+                        capabilities[name]["result"],
+                        None if enabled else "SKIP_NOT_CONFIGURED",
+                    )
+
+    def test_cpp_promotion_and_registered_reads_require_their_configuration(self):
+        args = self._args("--nof-replica-num=1", "--memory-replica-num=0")
+        with patch.object(
+            bench, "load_store_module", return_value=SimpleNamespace(NOF_ENABLED=True)
+        ):
+            capabilities = bench.probe_nof_capabilities(args)
+        self.assertEqual(capabilities["nof_replica_count"]["capability"], "supported")
+        self.assertIn("memory-replica-num", capabilities["nof_promotion"]["reason"])
+        self.assertIn("io-api=zcopy", capabilities["nof_zero_copy_read"]["reason"])
+
+    def test_report_cli_writes_only_capabilities_without_performance_results(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.json"
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "store_kv_bench.py",
+                        "--scenario=capabilities",
+                        "--store-backend=rs",
+                        f"--output-dir={directory}",
+                    ],
+                ),
+                patch.object(bench, "load_store_module") as load,
+                patch.object(sys, "stdout", new_callable=io.StringIO) as output,
+            ):
+                self.assertEqual(bench.main(), 0)
+            load.assert_not_called()
+            summary = json.loads(path.read_text())
+            self.assertEqual(json.loads(output.getvalue()), summary)
+            self.assertEqual(len(summary["capabilities"]), 4)
+            self.assertNotIn("overall", summary)
+            self.assertNotIn("ok", summary)
+
+    def test_skipped_cli_writes_no_throughput_or_success_and_never_sets_up(self):
+        for backend, enabled, io_api, expected in (
+            ("rs", None, "plain", "SKIP_NOT_CONFIGURED"),
+            ("rs", None, "zcopy", "SKIP_NOT_IMPLEMENTED"),
+            ("cpp", False, "plain", "SKIP_NOT_CONFIGURED"),
+        ):
+            with self.subTest(
+                backend=backend, io_api=io_api
+            ), TemporaryDirectory() as root:
+                module = SimpleNamespace(
+                    NOF_ENABLED=enabled, MooncakeDistributedStore=Mock()
+                )
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "store_kv_bench.py",
+                            "--scenario=read_perf",
+                            f"--store-backend={backend}",
+                            f"--io-api={io_api}",
+                            "--nof-replica-num=1",
+                            "--memory-replica-num=0",
+                            f"--summary-json={root}/result.json",
+                        ],
+                    ),
+                    patch.object(bench, "load_store_module", return_value=module),
+                ):
+                    self.assertEqual(bench.main(), 0)
+                module.MooncakeDistributedStore.assert_not_called()
+                summary = json.loads((Path(root) / "result.json").read_text())
+                self.assertEqual(summary["result"], expected)
+                self.assertIsNone(summary["ok"])
+                self.assertIsNone(summary["overall"])
+                self.assertEqual(summary["phases"], {})
+                self.assertTrue(summary["capability"]["reason"])
+
+    def test_configured_cpp_executes_io_and_reports_real_success_or_failure(self):
+        for put_result in (0, -800):
+            with self.subTest(put_result=put_result), TemporaryDirectory() as root:
+                store = Mock()
+                store.setup.return_value = 0
+                store.put.return_value = put_result
+                module = SimpleNamespace(
+                    NOF_ENABLED=True,
+                    MooncakeDistributedStore=Mock(return_value=store),
+                    ReplicateConfig=store_module.ReplicateConfig,
+                )
+                with (
+                    patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "store_kv_bench.py",
+                            "--scenario=write_perf",
+                            "--nr-objects=1",
+                            "--nof-replica-num=1",
+                            f"--output-dir={root}",
+                        ],
+                    ),
+                    patch.object(bench, "load_store_module", return_value=module),
+                ):
+                    self.assertEqual(bench.main(), 0)
+                store.put.assert_called_once()
+                self.assertEqual(
+                    store.put.call_args.kwargs["config"].nof_replica_num, 1
+                )
+                store.close.assert_called_once()
+                summary = json.loads((Path(root) / "summary.json").read_text())
+                self.assertEqual(
+                    summary["result"], "PASS" if put_result == 0 else "FAIL"
+                )
+                self.assertEqual(summary["overall"]["requests"], 1)
+
+    def test_broken_native_module_is_not_hidden_as_a_skip(self):
+        args = self._args("--nof-replica-num=1")
+        with (
+            patch.object(
+                bench, "load_store_module", side_effect=ImportError("libasio")
+            ),
+            self.assertRaisesRegex(ImportError, "libasio"),
+        ):
+            bench.probe_nof_capabilities(args)
 
 
 class ZcopyBufferPoolTest(unittest.TestCase):

@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
             "mixed_metadata",
             "remove_perf",
             "replay",
+            "capabilities",
         ],
         help="Benchmark scenario to execute.",
     )
@@ -156,6 +157,88 @@ def setup_logging(level: str) -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+
+def capability_status(state: str, reason: str) -> dict:
+    return {
+        "capability": state,
+        "result": {
+            "not_configured": "SKIP_NOT_CONFIGURED",
+            "not_implemented": "SKIP_NOT_IMPLEMENTED",
+        }.get(state),
+        "reason": reason,
+    }
+
+
+def probe_nof_capabilities(args: argparse.Namespace) -> dict:
+    """Report NoF support without setting up a client or contacting a target."""
+    if args.store_backend == "rs":
+        return {
+            "nof_replica_count": capability_status(
+                "not_configured",
+                "Store-RS supports NoF copy I/O, but this benchmark's Python "
+                "setup adapter does not configure NoF replicas.",
+            ),
+            "nof_promotion": capability_status(
+                "not_implemented", "Store-RS does not implement NoF promotion."
+            ),
+            "nof_zero_copy_read": capability_status(
+                "not_implemented", "Store-RS does not implement NoF zero-copy reads."
+            ),
+            "nof_zero_copy_write": capability_status(
+                "not_implemented", "No dedicated NoF zero-copy write workload exists."
+            ),
+        }
+
+    state = "not_configured"
+    reason = "Set --nof-replica-num > 0 and install a USE_NOF=ON C++ Store build."
+    if args.nof_replica_num > 0:
+        module = load_store_module(args.store_backend)
+        nof_enabled = getattr(module, "NOF_ENABLED", None)
+        if nof_enabled is True:
+            state = "supported"
+            reason = "The C++ Store build enables NoF and NoF replicas are requested."
+        elif nof_enabled is False:
+            reason = "The C++ Store was built with USE_NOF=OFF."
+        else:
+            reason = "This C++ Store binding does not report NOF_ENABLED; rebuild it."
+
+    promotion = capability_status(state, reason)
+    if state == "supported" and args.memory_replica_num == 0:
+        promotion = capability_status(
+            "not_configured", "NoF promotion requires --memory-replica-num > 0."
+        )
+    zero_copy_read = capability_status(state, reason)
+    if state == "supported" and args.io_api != "zcopy":
+        zero_copy_read = capability_status(
+            "not_configured", "NoF zero-copy reads require --io-api=zcopy."
+        )
+    return {
+        "nof_replica_count": capability_status(state, reason),
+        "nof_promotion": promotion,
+        "nof_zero_copy_read": zero_copy_read,
+        "nof_zero_copy_write": capability_status(
+            "not_implemented", "No dedicated NoF zero-copy write workload exists."
+        ),
+    }
+
+
+def report_capabilities(args: argparse.Namespace) -> None:
+    if min(args.memory_replica_num, args.nof_replica_num, args.dfs_replica_num) < 0:
+        raise ValueError("replica counts must be >= 0")
+    report = {
+        "schema_version": 1,
+        "scenario": "capabilities",
+        "backend": summarize_backend(args),
+        "capabilities": probe_nof_capabilities(args),
+    }
+    # A supported capability has no result until an I/O workload actually runs.
+    print(json.dumps(report, indent=2))
+    path = args.summary_json
+    if not path and args.output_dir:
+        path = os.path.join(args.output_dir, "summary.json")
+    if path:
+        write_json_atomic(path, report)
 
 
 @dataclass
@@ -846,6 +929,9 @@ def summarize_backend(args: argparse.Namespace) -> dict:
         "protocol": args.protocol,
         "tenant": args.tenant_id,
         "replica_num": args.memory_replica_num,
+        "nof_replica_num": args.nof_replica_num,
+        "dfs_replica_num": args.dfs_replica_num,
+        "io_api": args.io_api,
         "global_segment_size": args.global_segment_size,
         "local_buffer_size": args.local_buffer_size,
     }
@@ -980,10 +1066,20 @@ class BenchmarkRunner:
         self.lane_count = args.numjobs * args.iodepth
         self._sessions: Optional[List[StoreSession]] = None
         self._runtime: Optional[StoreRuntime] = None
+        self.capability: Optional[dict] = None
         self._journal_records: List[List[dict]] = [[] for _ in range(self.lane_count)]
         self._validate_args()
 
     def _validate_args(self) -> None:
+        if (
+            min(
+                self.args.memory_replica_num,
+                self.args.nof_replica_num,
+                self.args.dfs_replica_num,
+            )
+            < 0
+        ):
+            raise ValueError("replica counts must be >= 0")
         if self.args.numjobs <= 0 or self.args.iodepth <= 0:
             raise ValueError("numjobs and iodepth must be > 0")
         if self.args.batch_size <= 0:
@@ -1025,8 +1121,6 @@ class BenchmarkRunner:
         if self.args.store_backend == "rs":
             if not self.args.rs_metadata_url:
                 raise ValueError("rs backend requires --rs-metadata-url")
-            if self.args.nof_replica_num != 0:
-                raise ValueError("rs backend does not support --nof-replica-num")
         if self.args.phase_gap_mode == "sleep" and self.args.phase_gap_sec <= 0:
             raise ValueError("phase-gap-sec must be > 0 when phase-gap-mode=sleep")
         if self.args.phase_gap_mode == "file" and not self.args.phase_gap_file:
@@ -1311,15 +1405,23 @@ class BenchmarkRunner:
             summary_path = os.path.join(self.args.output_dir, "summary.json")
         if summary_path:
             overall = merge_stats("overall", phases)
+            skipped = (
+                self.capability is not None and self.capability["result"] is not None
+            )
+            ok = overall.failed_kvs == 0 and overall.verify_failures == 0
             write_json_atomic(
                 summary_path,
                 {
                     "schema_version": 1,
                     "scenario": self.args.scenario,
                     "backend": summarize_backend(self.args),
-                    "ok": overall.failed_kvs == 0 and overall.verify_failures == 0,
+                    "ok": None if skipped else ok,
+                    "result": self.capability["result"]
+                    if skipped
+                    else ("PASS" if ok else "FAIL"),
+                    "capability": self.capability,
                     "phases": {phase.name: summarize_stats(phase) for phase in phases},
-                    "overall": summarize_stats(overall),
+                    "overall": None if skipped else summarize_stats(overall),
                     "journal_records": len(records),
                 },
             )
@@ -1523,6 +1625,22 @@ class BenchmarkRunner:
         return None
 
     def run(self) -> List[PhaseStats]:
+        if self.args.nof_replica_num > 0:
+            capabilities = probe_nof_capabilities(self.args)
+            name = (
+                "nof_zero_copy_read"
+                if self.args.scenario == "read_perf" and self.args.io_api == "zcopy"
+                else "nof_replica_count"
+            )
+            self.capability = {"name": name, **capabilities[name]}
+            if self.capability["result"] is not None:
+                LOG.info(
+                    "%s capability=%s: %s",
+                    self.capability["result"],
+                    self.capability["capability"],
+                    self.capability["reason"],
+                )
+                return []
         LOG.info(
             "scenario=%s io_api=%s numjobs=%d iodepth=%d lanes=%d batch_size=%d value_size=%d nr_objects=%d prepare_objects=%d write_objects=%d memory_replica_num=%d nof_replica_num=%d dfs_replica_num=%d verify=%s",
             self.args.scenario,
@@ -1633,9 +1751,13 @@ def main() -> int:
     setup_logging(args.log_level)
     runner: Optional[BenchmarkRunner] = None
     try:
+        if args.scenario == "capabilities":
+            report_capabilities(args)
+            return 0
         runner = BenchmarkRunner(args)
         phases = runner.run()
-        log_overall_summary(phases)
+        if phases:
+            log_overall_summary(phases)
         runner.write_outputs(phases)
         if any(phase.verify_failures > 0 for phase in phases):
             return 20
