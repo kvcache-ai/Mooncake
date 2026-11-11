@@ -359,6 +359,8 @@ AttemptResult RestorePointer(
             metrics.chunk_bytes + manifest.segments.stored_size +
             (manifest.weight_metadata ? manifest.weight_metadata->stored_size
                                       : 0) +
+            (manifest.object_storage ? manifest.object_storage->stored_size
+                                     : 0) +
             descriptor.manifest_size + pointer_bytes.size();
     });
     return {AttemptDisposition::kSuccess,

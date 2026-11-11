@@ -47,7 +47,7 @@ bool ValidateObjectUploadRecord(const ObjectUploadRecord& record) {
 bool StandbyMetadataStore::ApplyObjectReplicaMutation(
     const std::string& tenant_id, const std::string& key,
     const ObjectReplicaMutation& mutation) {
-    if (!ValidTarget(mutation.target) ||
+    if (key.empty() || !ValidTarget(mutation.target) ||
         (mutation.records.empty() && mutation.forget.empty()) ||
         (mutation.remove_value && !mutation.metadata_payload.empty())) {
         return false;
