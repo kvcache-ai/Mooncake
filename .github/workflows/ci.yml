@@ -265,6 +265,7 @@ jobs:
           -DSTORE_USE_ETCD=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=ON \
+          -DENABLE_DEBUG_SYMBOLS=OFF \
           -DENABLE_SCCACHE=ON
       shell: bash
 
@@ -273,7 +274,7 @@ jobs:
 
     - name: Build project and unit tests
       run: |
-        cmake --build build --parallel 128
+        cmake --build build --parallel 2
         sudo -E cmake --install build
       shell: bash
 
