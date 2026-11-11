@@ -34,6 +34,10 @@ tl::expected<int32_t, ErrorCode> ResolveCudaDevice(
         return handle.device_id;
     }
 
+    if (cuInit(0) != CUDA_SUCCESS) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     int device_count = 0;
     if (cuDeviceGetCount(&device_count) != CUDA_SUCCESS) {
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
