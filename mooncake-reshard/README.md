@@ -359,8 +359,10 @@ encoding retains the existing identity fields and serialized representation.
 
 Segment iteration advances N-dimensional offsets incrementally, with a direct
 range iterator for eligible one-dimensional regions. Batch lowering constructs
-bounded innermost runs for eligible canonical regions, retaining prefix order
-and the configured batch size. Custom region subclasses and unsupported stride
+bounded innermost runs for eligible canonical regions, advancing prefixes lazily
+and accumulating short runs within one operation up to the configured batch
+size. It preserves segment order and keeps different operations' allocation
+ranges separate. Custom region subclasses and unsupported stride
 or loop shapes continue through the segment iterator. Segment-budget rejection
 still occurs before a batch is produced; batching does not raise the budget.
 

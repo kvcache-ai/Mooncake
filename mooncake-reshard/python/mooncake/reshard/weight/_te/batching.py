@@ -45,6 +45,8 @@ def iter_transfer_batches(
             prefix_target_offset = (
                 target.storage_offset_bytes + operation.target_base_offset
             )
+            source_offsets = []
+            target_offsets = []
             while True:
                 remaining = operation.outer_loop_counts[-1]
                 source_offset = prefix_source_offset
@@ -53,26 +55,37 @@ def iter_transfer_batches(
                     count = min(remaining, max_batch_operations - batch_operation_count)
                     source_stop = source_offset + count * source_stride
                     target_stop = target_offset + count * target_stride
-                    ranges.append(
-                        TransferBatchRange(
-                            source_base_address=source.storage_address,
-                            source_capacity=source.storage_nbytes,
-                            target_base_address=target.storage_address,
-                            target_capacity=target.storage_nbytes,
-                            source_offsets=tuple(
-                                range(source_offset, source_stop, source_stride)
-                            ),
-                            target_offsets=tuple(
-                                range(target_offset, target_stop, target_stride)
-                            ),
-                            sizes=(operation.inner_bytes,) * count,
-                        )
+                    source_run: Iterable[int] = range(
+                        source_offset, source_stop, source_stride
                     )
+                    target_run: Iterable[int] = range(
+                        target_offset, target_stop, target_stride
+                    )
+                    # Accumulate short runs; full runs convert directly to tuples.
+                    if (
+                        source_offsets
+                        or count < max_batch_operations - batch_operation_count
+                    ):
+                        source_offsets.extend(source_run)
+                        target_offsets.extend(target_run)
+                        source_run = source_offsets
+                        target_run = target_offsets
                     remaining -= count
                     source_offset = source_stop
                     target_offset = target_stop
                     batch_operation_count += count
                     if batch_operation_count == max_batch_operations:
+                        ranges.append(
+                            _range_from_storage_offsets(
+                                source,
+                                target,
+                                source_run,
+                                target_run,
+                                operation.inner_bytes,
+                            )
+                        )
+                        source_offsets = []
+                        target_offsets = []
                         yield TransferBatch.from_ranges(
                             endpoint=endpoint, ranges=tuple(ranges)
                         )
@@ -94,6 +107,16 @@ def iter_transfer_batches(
                     )
                 else:
                     break
+            if source_offsets:
+                ranges.append(
+                    _range_from_storage_offsets(
+                        source,
+                        target,
+                        source_offsets,
+                        target_offsets,
+                        operation.inner_bytes,
+                    )
+                )
             continue
         source_offsets: list[int] = []
         target_offsets: list[int] = []
@@ -164,4 +187,23 @@ def _range_from_fragments(
             target.storage_offset_bytes + offset for offset in target_offsets
         ),
         sizes=tuple(sizes),
+    )
+
+
+def _range_from_storage_offsets(
+    source: BoundWeightFragment,
+    target: BoundWeightFragment,
+    source_offsets: Iterable[int],
+    target_offsets: Iterable[int],
+    inner_bytes: int,
+) -> TransferBatchRange:
+    source_offsets = tuple(source_offsets)
+    return TransferBatchRange(
+        source_base_address=source.storage_address,
+        source_capacity=source.storage_nbytes,
+        target_base_address=target.storage_address,
+        target_capacity=target.storage_nbytes,
+        source_offsets=source_offsets,
+        target_offsets=tuple(target_offsets),
+        sizes=(inner_bytes,) * len(source_offsets),
     )

@@ -114,3 +114,82 @@ def test_prefix_subclass_retains_custom_segment_iterator():
     (batch,) = tuple(_batches(custom))
     assert batch.source_addresses == (region.source.address + 7,)
     assert batch.target_addresses == (region.target.address + 9,)
+
+
+def test_short_prefix_runs_accumulate_once_per_batch():
+    region = _region((10000, 2))
+    batches = tuple(
+        iter_transfer_batches(
+            region.target.endpoint,
+            ((region, region.source, region.target),),
+            max_batch_operations=8192,
+            max_region_segments=region.segment_count,
+        )
+    )
+    assert [batch.operation_count for batch in batches] == [8192, 8192, 3616]
+    assert sum(len(batch.ranges) for batch in batches) == 3
+    assert tuple(
+        address for batch in batches for address in batch.source_addresses
+    ) == tuple(region.source.address + 2 + i * 4 for i in range(20000))
+
+
+@pytest.mark.parametrize("limit", [5, 64])
+def test_partial_prefix_batches_preserve_operation_allocation_boundaries(limit):
+    first = _region((2, 3))
+    owner = object()
+    second_source = replace(
+        first.source,
+        owner=owner,
+        binding=replace(
+            first.source.binding,
+            owner=owner,
+            storage_nbytes=first.source.storage_nbytes + 8,
+        ),
+    )
+    second_target = replace(
+        first.target,
+        owner=owner,
+        binding=replace(
+            first.target.binding,
+            owner=owner,
+            storage_nbytes=first.target.storage_nbytes + 8,
+        ),
+    )
+    second = replace(first, source=second_source, target=second_target)
+    batches = tuple(
+        iter_transfer_batches(
+            first.target.endpoint,
+            (
+                (first, first.source, first.target),
+                (second, second.source, second.target),
+            ),
+            max_batch_operations=limit,
+            max_region_segments=first.segment_count,
+        )
+    )
+    expected = tuple(first.iter_segments(max_segments=first.segment_count)) * 2
+    assert (
+        tuple(
+            (source - first.source.address, target - first.target.address, size)
+            for batch in batches
+            for source, target, size in zip(
+                batch.source_addresses, batch.target_addresses, batch.sizes
+            )
+        )
+        == expected
+    )
+    ranges = tuple(r for batch in batches for r in batch.ranges)
+    expected_ranges = 4 if limit == 5 else 2
+    assert len(ranges) == expected_ranges
+    assert all(r.source_base_address == first.source.storage_address for r in ranges)
+    assert all(r.target_base_address == first.target.storage_address for r in ranges)
+    assert {r.source_capacity for r in ranges} == {
+        first.source.storage_nbytes,
+        second.source.storage_nbytes,
+    }
+    assert {r.target_capacity for r in ranges} == {
+        first.target.storage_nbytes,
+        second.target.storage_nbytes,
+    }
+    assert ranges[0].source_offsets[0] == 18
+    assert ranges[0].target_offsets[0] == 34
