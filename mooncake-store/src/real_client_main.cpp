@@ -34,6 +34,34 @@ DEFINE_bool(start_offload_rpc_server, true,
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
+namespace {
+
+// string_to_byte_size() maps input it cannot parse to 0, and a global segment
+// size of 0 means "pure client". Reject bad size flags at parse time instead.
+bool ValidateByteSizeFlag(const char *flagname, const std::string &value) {
+    if (!try_string_to_byte_size(value).has_value()) {
+        LOG(ERROR) << "Invalid value for --" << flagname << ": '" << value
+                   << "'. Expected a byte count, optionally followed by "
+                      "B, K/KB, M/MB, G/GB or T/TB (case-insensitive, "
+                      "1 KB = 1024 B), e.g. 4GB.";
+        return false;
+    }
+    return true;
+}
+
+size_t ParseByteSizeFlagOrDie(const char *flag_name, const std::string &value) {
+    auto parsed = try_string_to_byte_size(value);
+    if (!parsed.has_value()) {
+        LOG(FATAL) << "Invalid value for --" << flag_name << ": " << value;
+    }
+    return static_cast<size_t>(parsed.value());
+}
+
+}  // namespace
+
+DEFINE_validator(global_segment_size, ValidateByteSizeFlag);
+DEFINE_validator(local_buffer_size, ValidateByteSizeFlag);
+
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
                               RealClient &real_client) {
@@ -136,8 +164,10 @@ int main(int argc, char *argv[]) {
     LOG(INFO) << "Mooncake real client version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
 
-    size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
-    size_t local_buffer_size = string_to_byte_size(FLAGS_local_buffer_size);
+    size_t global_segment_size = ParseByteSizeFlagOrDie(
+        "global_segment_size", FLAGS_global_segment_size);
+    size_t local_buffer_size =
+        ParseByteSizeFlagOrDie("local_buffer_size", FLAGS_local_buffer_size);
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.
     globalConfig().ascend_agent_mode = true;
