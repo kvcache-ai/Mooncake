@@ -1,5 +1,17 @@
+#if defined(MOONCAKE_EP_USE_XPU)
+// Intel XPU: the SYCL buffer in xpu/ has the methods mooncake_ep_buffer.Buffer
+// uses, under the same Python names.
+#include "xpu/mooncake_ep_xpu_buffer.h"
+#include "xpu/mooncake_ep_xpu_elastic_buffer.h"
+#else
 #include <mooncake_ep_buffer.h>
+#endif
+// No elastic buffer on MACA; XPU binds its own below.
+#if !defined(MOONCAKE_EP_USE_MACA) && !defined(MOONCAKE_EP_USE_XPU)
+#define MOONCAKE_EP_HAS_ELASTIC 1
 #include <elastic/mooncake_ep_elastic_buffer.h>
+#endif
+#include <pybind11/pybind11.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
@@ -9,13 +21,31 @@ namespace py = pybind11;
 
 namespace mooncake {
 
+#if defined(MOONCAKE_EP_USE_XPU)
+using EpBuffer = xpu_ep::MooncakeEpXpuBuffer;
+using EpEventHandle = xpu_ep::XpuEventHandle;
+using xpu_ep::get_ep_buffer_size_hint;
+constexpr const char* kEpDeviceType = "xpu";
+#else
 void bind_legacy_buffer_perf(py::module_& module);
+using EpBuffer = MooncakeEpBuffer;
+using EpEventHandle = EventHandle;
+// CUDA-dialect builds (CUDA, MUSA, MACA) are all driven through torch.cuda.
+constexpr const char* kEpDeviceType = "cuda";
+#endif
 
 PYBIND11_MODULE(_ep, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
+#ifdef MOONCAKE_EP_HAS_ELASTIC
+    m.def("get_ep_elastic_buffer_size_hint", &get_ep_elastic_buffer_size_hint);
     m.def("calculate_elastic_buffer_size",
           &MooncakeElasticBuffer::calculate_buffer_size);
     m.def("create_nccl_unique_id", &create_elastic_nccl_unique_id);
+#endif
+#if defined(MOONCAKE_EP_USE_XPU)
+    m.def("calculate_elastic_buffer_size",
+          &xpu_ep::MooncakeEpXpuElasticBuffer::calculate_buffer_size);
+#endif
     m.def("has_nccl_device_support", []() {
 #ifdef USE_NCCL_DEVICE
         return true;
@@ -23,36 +53,94 @@ PYBIND11_MODULE(_ep, m) {
         return false;
 #endif
     });
+    m.attr("DEVICE_TYPE") = py::str(kEpDeviceType);
 
-    py::class_<EventHandle>(m, "EventHandle")
+    py::class_<EpEventHandle>(m, "EventHandle")
         .def(py::init<uint64_t>(), py::arg("stream_ptr") = 0)
-        .def("current_stream_wait", &EventHandle::current_stream_wait,
+        .def("current_stream_wait", &EpEventHandle::current_stream_wait,
              py::arg("stream_ptr"))
-        .def("synchronize", &EventHandle::synchronize);
+        .def("synchronize", &EpEventHandle::synchronize);
 
+#if !defined(MOONCAKE_EP_USE_XPU)
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
     bind_legacy_buffer_perf(m);
+#endif
 
-    py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t, bool>(), py::arg("rank"),
-             py::arg("num_ranks"), py::arg("num_ep_buffer_bytes"),
-             py::arg("disable_p2p") = false)
-        .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
-        .def("p2p_enabled", &MooncakeEpBuffer::p2p_enabled)
-        .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)
-        .def("update_local_qpns", &MooncakeEpBuffer::update_local_qpns)
-        .def("is_roce", &MooncakeEpBuffer::is_roce)
-        .def("sync_ibgda_peers", &MooncakeEpBuffer::sync_ibgda_peers)
-        .def("get_mr_info", &MooncakeEpBuffer::get_mr_info)
-        .def("get_gid", &MooncakeEpBuffer::get_gid)
-        .def("get_local_qpns", &MooncakeEpBuffer::get_local_qpns)
-        .def("get_local_lids", &MooncakeEpBuffer::get_local_lids)
-        .def("get_ipc_handle", &MooncakeEpBuffer::get_ipc_handle)
-        .def("sync_nvlink_ipc_handles",
-             &MooncakeEpBuffer::sync_nvlink_ipc_handles)
-        .def("dispatch", &MooncakeEpBuffer::dispatch)
+    py::class_<EpBuffer> buffer(m, "Buffer");
+#if defined(MOONCAKE_EP_USE_XPU)
+    // The XPU buffer allocates on, and launches into, the caller's queue.
+    buffer.def(py::init<int, int, int64_t, bool, uint64_t>(), py::arg("rank"),
+               py::arg("num_ranks"), py::arg("num_ep_buffer_bytes"),
+               py::arg("disable_p2p") = false, py::arg("stream_ptr") = 0);
+#else
+    buffer.def(py::init<int, int, int64_t, bool>(), py::arg("rank"),
+               py::arg("num_ranks"), py::arg("num_ep_buffer_bytes"),
+               py::arg("disable_p2p") = false);
+#endif
+    buffer.def("ibgda_disabled", &EpBuffer::ibgda_disabled)
+        .def("p2p_enabled", &EpBuffer::p2p_enabled)
+        .def("use_fast_path", &EpBuffer::use_fast_path)
+        .def("is_roce", &EpBuffer::is_roce)
+        .def("get_ipc_handle", &EpBuffer::get_ipc_handle)
+        .def("sync_nvlink_ipc_handles", &EpBuffer::sync_nvlink_ipc_handles);
+#if !defined(MOONCAKE_EP_USE_XPU)
+    // RDMA (IBGDA) bootstrap; XPU uses init_rdma and connect_rdma below.
+    buffer.def("update_local_qpns", &EpBuffer::update_local_qpns)
+        .def("sync_ibgda_peers", &EpBuffer::sync_ibgda_peers)
+        .def("get_mr_info", &EpBuffer::get_mr_info)
+        .def("get_gid", &EpBuffer::get_gid)
+        .def("get_local_qpns", &EpBuffer::get_local_qpns)
+        .def("get_local_lids", &EpBuffer::get_local_lids);
+#ifdef MOONCAKE_EP_HAS_ELASTIC
+    buffer.def("_configure_elastic", &MooncakeEpBuffer::configure_elastic)
+        .def("_set_explicit_destroy", &MooncakeEpBuffer::set_explicit_destroy)
+        .def("_validate_connect_ranks",
+             &MooncakeEpBuffer::validate_connect_ranks)
+        .def("_stage_peer",
+             [](MooncakeEpBuffer& native_buffer, int peer_rank, int64_t raddr,
+                int32_t rkey, int64_t subnet_prefix, int64_t interface_id,
+                const std::vector<int32_t>& qpns,
+                const std::vector<int32_t>& lids,
+                const std::vector<int32_t>& ipc_handle) {
+                 py::gil_scoped_release release;
+                 native_buffer.stage_peer(peer_rank, raddr, rkey, subnet_prefix,
+                                          interface_id, qpns, lids, ipc_handle);
+             })
+        .def("_disconnect_ranks", &MooncakeEpBuffer::disconnect_ranks)
+        .def("_update_mask_buffer", &MooncakeEpBuffer::update_mask_buffer)
+        .def("_query_mask_buffer", &MooncakeEpBuffer::query_mask_buffer)
+        .def("_clean_mask_buffer", &MooncakeEpBuffer::clean_mask_buffer)
+        .def("_barrier", &MooncakeEpBuffer::barrier)
+        .def("_get_active_rank_bound", &MooncakeEpBuffer::get_active_rank_bound)
+        .def("_get_comm_stream", &MooncakeEpBuffer::get_comm_stream)
+        .def("_get_local_buffer_descriptor",
+             &MooncakeEpBuffer::get_local_buffer_descriptor)
+        .def("destroy", &MooncakeEpBuffer::destroy);
+#endif
+    buffer
+        .def("dispatch", &MooncakeEpBuffer::dispatch, py::arg("x_ptr"),
+             py::arg("topk_idx_ptr"), py::arg("active_ranks_ptr"),
+             py::arg("num_tokens"), py::arg("hidden"), py::arg("num_topk"),
+             py::arg("num_max_dispatch_tokens_per_rank"),
+             py::arg("num_experts"), py::arg("timeout_us"), py::arg("use_fp8"),
+             py::arg("packed_recv_x_ptr"), py::arg("packed_recv_x_scales_ptr"),
+             py::arg("packed_recv_count_ptr"),
+             py::arg("packed_recv_src_info_ptr"),
+             py::arg("packed_recv_layout_range_ptr"), py::arg("async"),
+             py::arg("return_recv_hook"), py::arg("compute_stream_ptr"),
+             py::arg("cumulative_local_expert_recv_stats_ptr") = 0)
         .def("combine", &MooncakeEpBuffer::combine);
+#else
+    buffer.def("dispatch", &EpBuffer::dispatch)
+        .def("combine", &EpBuffer::combine)
+        // Ranks on other nodes: a host proxy's RDMA writes, not IBGDA.
+        .def_static("rdma_available", &EpBuffer::rdma_available)
+        .def("init_rdma", &EpBuffer::init_rdma, py::arg("remote"))
+        .def("connect_rdma", &EpBuffer::connect_rdma, py::arg("infos"),
+             py::arg("active_ranks_mask"));
+#endif
 
+#ifdef MOONCAKE_EP_HAS_ELASTIC
     py::class_<MooncakeElasticBuffer>(m, "ElasticBuffer")
         .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,
                       bool, bool, bool, int, int, int, int, std::string,
@@ -91,6 +179,49 @@ PYBIND11_MODULE(_ep, m) {
              &MooncakeElasticBuffer::sync_nvlink_ipc_handles)
         .def("dispatch", &MooncakeElasticBuffer::dispatch)
         .def("combine", &MooncakeElasticBuffer::combine);
+#endif
+
+#if defined(MOONCAKE_EP_USE_XPU)
+    // Level Zero IPC on the node and RDMA across nodes through a host proxy,
+    // as in the XPU Buffer, which it also follows in allocating on the
+    // caller's queue: it takes stream_ptr as well.
+    using xpu_ep::MooncakeEpXpuElasticBuffer;
+    py::class_<MooncakeEpXpuElasticBuffer>(m, "ElasticBuffer")
+        .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,
+                      bool, bool, bool, int, int, int, int, std::string,
+                      std::vector<int32_t>, uint64_t>(),
+             py::arg("rank"), py::arg("num_ranks"), py::arg("num_buffer_bytes"),
+             py::arg("num_max_tokens_per_rank"), py::arg("hidden"),
+             py::arg("num_topk"), py::arg("use_fp8_dispatch"),
+             py::arg("deterministic"), py::arg("allow_hybrid_mode"),
+             py::arg("allow_multiple_reduction"),
+             py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
+             py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
+             py::arg("num_gpu_timeout_secs"), py::arg("transport") = "ipc",
+             py::arg("nccl_unique_id") = std::vector<int32_t>{},
+             py::arg("stream_ptr") = 0)
+        .def("destroy", &MooncakeEpXpuElasticBuffer::destroy)
+        .def("using_nccl", &MooncakeEpXpuElasticBuffer::using_nccl)
+        .def_static("calculate_buffer_size",
+                    &MooncakeEpXpuElasticBuffer::calculate_buffer_size)
+        .def("get_physical_domain_size",
+             &MooncakeEpXpuElasticBuffer::get_physical_domain_size)
+        .def("get_logical_domain_size",
+             &MooncakeEpXpuElasticBuffer::get_logical_domain_size)
+        .def("ibgda_disabled", &MooncakeEpXpuElasticBuffer::ibgda_disabled)
+        .def("use_fast_path", &MooncakeEpXpuElasticBuffer::use_fast_path)
+        .def("get_ipc_handle", &MooncakeEpXpuElasticBuffer::get_ipc_handle)
+        .def("sync_nvlink_ipc_handles",
+             &MooncakeEpXpuElasticBuffer::sync_nvlink_ipc_handles)
+        .def_static("rdma_available",
+                    &MooncakeEpXpuElasticBuffer::rdma_available)
+        .def("init_rdma", &MooncakeEpXpuElasticBuffer::init_rdma,
+             py::arg("remote"))
+        .def("connect_rdma", &MooncakeEpXpuElasticBuffer::connect_rdma,
+             py::arg("infos"), py::arg("active_ranks_mask"))
+        .def("dispatch", &MooncakeEpXpuElasticBuffer::dispatch)
+        .def("combine", &MooncakeEpXpuElasticBuffer::combine);
+#endif
 }
 
 }  // namespace mooncake

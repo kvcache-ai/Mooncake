@@ -55,6 +55,7 @@ add_library(
   src/common/utils.cpp
   src/client/types.cpp
   src/client/conductor_client.cpp
+  src/client/conductor_c.cpp
   src/prefixindex/hash_strategy.cpp
   src/prefixindex/prefix_indexer.cpp
   src/zmq/msg_decoder.cpp

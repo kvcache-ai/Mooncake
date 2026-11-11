@@ -105,6 +105,21 @@ std::optional<WeightRevisionMetadata> StandbyMetadataStore::GetWeightMetadata(
                : std::optional<WeightRevisionMetadata>(it->second);
 }
 
+bool StandbyMetadataStore::PutWeightMetadataAndOperation(
+    const WeightRevisionMetadata& metadata,
+    const std::optional<WeightResidencyOperation>& operation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    weight_metadata_[metadata.identity] = metadata;
+    if (operation.has_value()) {
+        weight_operations_[operation->operation_id] = *operation;
+        if (operation->operation_id < std::numeric_limits<uint64_t>::max()) {
+            next_weight_operation_id_ = std::max(next_weight_operation_id_,
+                                                 operation->operation_id + 1);
+        }
+    }
+    return true;
+}
+
 std::optional<uint64_t>
 StandbyMetadataStore::GetWeightMetadataTombstoneGeneration(
     const WeightRevisionIdentity& identity) const {
@@ -171,6 +186,26 @@ bool StandbyMetadataStore::RemoveWeightLease(
     return true;
 }
 
+bool StandbyMetadataStore::PutWeightOperation(
+    const WeightResidencyOperation& operation) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    weight_operations_[operation.operation_id] = operation;
+    if (operation.operation_id < std::numeric_limits<uint64_t>::max()) {
+        next_weight_operation_id_ =
+            std::max(next_weight_operation_id_, operation.operation_id + 1);
+    }
+    return true;
+}
+
+std::optional<WeightResidencyOperation>
+StandbyMetadataStore::GetWeightOperation(uint64_t operation_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = weight_operations_.find(operation_id);
+    return it == weight_operations_.end()
+               ? std::nullopt
+               : std::optional<WeightResidencyOperation>(it->second);
+}
+
 bool StandbyMetadataStore::RestoreWeightMetadata(
     const WeightMetadataSnapshot& snapshot) {
     if (!ValidateWeightMetadataSnapshot(snapshot)) {
@@ -204,7 +239,7 @@ bool StandbyMetadataStore::RestoreWeightMetadata(
 WeightMetadataSnapshot StandbyMetadataStore::SnapshotWeightMetadata() const {
     std::lock_guard<std::mutex> lock(mutex_);
     WeightMetadataSnapshot snapshot{
-        .schema_version = 1,
+        .schema_version = kWeightMetadataSchemaVersion,
         .metadata = {},
         .leases = {},
         .operations = {},

@@ -114,7 +114,8 @@ EngineRegistration RegistrationFor(const ServiceConfig& service) {
             .instance_id = service.instance_id,
             .dp_rank = service.dp_rank,
             .effective_block_size = service.block_size,
-            .cache_group = service.cache_group};
+            .cache_group = service.cache_group,
+            .publisher_kind = service.publisher_kind};
 }
 
 ServiceConfig VllmService(const std::string& instance_id = "instance-1",
@@ -301,8 +302,8 @@ Json::Value QueryJson(const ContextKey& context,
 void ExpectRankMapsAligned(const Json::Value& instance) {
     EXPECT_EQ(
         instance.getMemberNames(),
-        (std::vector<std::string>{"cpu_local", "cpu_share", "disk", "dp",
-                                  "longest_matched", "npu", "rank_matches"}));
+        (std::vector<std::string>{"cpu_local", "cpu_share", "device", "disk",
+                                  "dp", "longest_matched", "rank_matches"}));
     ASSERT_TRUE(instance["dp"].isObject());
     ASSERT_TRUE(instance["rank_matches"].isObject());
     const auto ranks = instance["dp"].getMemberNames();
@@ -311,9 +312,9 @@ void ExpectRankMapsAligned(const Json::Value& instance) {
         const Json::Value& match = instance["rank_matches"][rank];
         ASSERT_TRUE(match.isObject());
         EXPECT_EQ(match.getMemberNames(),
-                  (std::vector<std::string>{"cpu_local", "cpu_share", "disk",
-                                            "npu"}));
-        EXPECT_EQ(instance["dp"][rank].asInt64(), match["npu"].asInt64());
+                  (std::vector<std::string>{"cpu_local", "cpu_share", "device",
+                                            "disk"}));
+        EXPECT_EQ(instance["dp"][rank].asInt64(), match["device"].asInt64());
     }
 }
 
@@ -412,6 +413,29 @@ TEST(EventManager, InitialState) {
     EXPECT_NE(manager.GetIndexer(), nullptr);
     EXPECT_EQ(EventManagerTestPeer::ServicesLen(manager), 0u);
     EXPECT_FALSE(manager.IsStopped());
+}
+
+TEST(EventManager, AppliesMaxBlocksPerContextToTheIndex) {
+    EventManager manager({}, /*http_server_port=*/0, /*rpc_server_port=*/0,
+                         /*max_blocks_per_context=*/4);
+    const ServiceConfig service = VllmService();
+    PrefixCacheTable* index = manager.GetIndexer();
+    ASSERT_EQ(index->Register(RegistrationFor(service)).error, "");
+    for (uint64_t value = 1; value <= 10; ++value) {
+        ASSERT_EQ(
+            index->StoreEngine({.context = ContextFor(service),
+                                .prefixes = {{.value = value}},
+                                .owner = {.source_stream = "stream",
+                                          .instance_id = service.instance_id,
+                                          .dp_rank = service.dp_rank},
+                                .effective_block_size = service.block_size,
+                                .cache_group = service.cache_group}),
+            "");
+    }
+    const auto sizes =
+        PrefixCacheTableTestPeer::Order(*index, ContextFor(service));
+    EXPECT_LE(sizes.blocks, 4u);
+    EXPECT_GT(sizes.evicted_by_capacity, 0);
 }
 
 TEST(SubscribeToService, ExactDuplicateIsIdempotent) {
@@ -643,7 +667,7 @@ class QueryHttpTest : public ::testing::Test {
     std::vector<int32_t> tokens_;
 };
 
-TEST_F(QueryHttpTest, FourTierResponseSeparatesLocalAndSharedCpu) {
+TEST_F(QueryHttpTest, VllmSharedCpuSuppressesLocalInHttpResponse) {
     const auto context = ContextFor(instance_one_);
     const auto prefixes =
         ProjectedFor(context, instance_one_.hash_profile, tokens_);
@@ -662,18 +686,21 @@ TEST_F(QueryHttpTest, FourTierResponseSeparatesLocalAndSharedCpu) {
     const auto result = ParseMsgpackResponse(response);
     const auto& one = result["instances"]["1"];
     const auto& two = result["instances"]["2"];
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Presence(*manager_->GetIndexer(),
+                                                   context, prefixes[2])
+                    ->cpu_local_owners.empty());
     for (const auto* value : {&one, &two}) {
         EXPECT_FALSE(value->isMember("gpu"));
         EXPECT_FALSE(value->isMember("cpu"));
-        EXPECT_TRUE(value->isMember("npu"));
+        EXPECT_TRUE(value->isMember("device"));
         EXPECT_TRUE(value->isMember("cpu_local"));
         EXPECT_TRUE(value->isMember("cpu_share"));
         EXPECT_EQ((*value)["cpu_share"].asInt64(), 48);
         EXPECT_EQ((*value)["disk"].asInt64(), 48);
     }
-    EXPECT_EQ(one["cpu_local"].asInt64(), 48);
+    EXPECT_EQ(one["cpu_local"].asInt64(), 32);
     EXPECT_EQ(two["cpu_local"].asInt64(), 0);
-    EXPECT_EQ(one["rank_matches"]["0"]["cpu_local"].asInt64(), 48);
+    EXPECT_EQ(one["rank_matches"]["0"]["cpu_local"].asInt64(), 32);
     EXPECT_EQ(two["rank_matches"]["1"]["cpu_share"].asInt64(), 48);
 }
 
@@ -685,7 +712,7 @@ TEST_F(QueryHttpTest, ReturnsExactSharedCacheResponse) {
     Json::Value expected;
     std::string errors;
     ASSERT_TRUE(ParseJsonDocument(
-        R"({"instances":{"1":{"longest_matched":48,"npu":32,"cpu_local":32,"dp":{"0":32},"cpu_share":48,"disk":48,"rank_matches":{"0":{"npu":32,"cpu_local":32,"cpu_share":48,"disk":48}}},"2":{"longest_matched":48,"npu":0,"cpu_local":0,"dp":{"1":0},"cpu_share":48,"disk":48,"rank_matches":{"1":{"npu":0,"cpu_local":0,"cpu_share":48,"disk":48}}}}})",
+        R"({"instances":{"1":{"longest_matched":48,"device":32,"cpu_local":32,"dp":{"0":32},"cpu_share":48,"disk":48,"rank_matches":{"0":{"device":32,"cpu_local":32,"cpu_share":48,"disk":48}}},"2":{"longest_matched":48,"device":0,"cpu_local":0,"dp":{"1":0},"cpu_share":48,"disk":48,"rank_matches":{"1":{"device":0,"cpu_local":0,"cpu_share":48,"disk":48}}}}})",
         &expected, &errors))
         << errors;
     EXPECT_EQ(body, expected);
@@ -723,7 +750,7 @@ TEST_F(QueryHttpTest, PickleProfileResolvesQueryHashes) {
     ASSERT_TRUE(body["instances"].isMember("pickle"));
     const Json::Value& instance = body["instances"]["pickle"];
     EXPECT_EQ(instance["longest_matched"].asInt64(), 32);
-    EXPECT_EQ(instance["npu"].asInt64(), 32);
+    EXPECT_EQ(instance["device"].asInt64(), 32);
     EXPECT_EQ(instance["dp"]["0"].asInt64(), 32);
     ASSERT_NO_FATAL_FAILURE(ExpectRankMapsAligned(instance));
 
@@ -732,7 +759,7 @@ TEST_F(QueryHttpTest, PickleProfileResolvesQueryHashes) {
     Json::Value cbor_body;
     ASSERT_NO_FATAL_FAILURE(
         ExpectMsgpackStatus(Post(ValidQuery()), 200, &cbor_body));
-    EXPECT_EQ(cbor_body["instances"]["1"]["npu"].asInt64(), 32);
+    EXPECT_EQ(cbor_body["instances"]["1"]["device"].asInt64(), 32);
 }
 
 TEST_F(QueryHttpTest, ReturnsOrderedFourBlockTierBoundaries) {
@@ -778,7 +805,7 @@ TEST_F(QueryHttpTest, ReturnsOrderedFourBlockTierBoundaries) {
     Json::Value expected;
     std::string errors;
     ASSERT_TRUE(ParseJsonDocument(
-        R"({"instances":{"ordered":{"longest_matched":64,"npu":32,"cpu_local":32,"dp":{"0":32},"cpu_share":48,"disk":64,"rank_matches":{"0":{"npu":32,"cpu_local":32,"cpu_share":48,"disk":64}}}}})",
+        R"({"instances":{"ordered":{"longest_matched":64,"device":32,"cpu_local":32,"dp":{"0":32},"cpu_share":48,"disk":64,"rank_matches":{"0":{"device":32,"cpu_local":32,"cpu_share":48,"disk":64}}}}})",
         &expected, &errors))
         << errors;
     EXPECT_EQ(body, expected);
@@ -815,11 +842,11 @@ TEST_F(QueryHttpTest, KeepsZeroHitRegisteredRanksInBothRankMaps) {
         const Json::Value& instance = body["instances"][instance_id];
         ASSERT_NO_FATAL_FAILURE(ExpectRankMapsAligned(instance));
         EXPECT_EQ(instance["longest_matched"].asInt64(), 0);
-        EXPECT_EQ(instance["npu"].asInt64(), 0);
+        EXPECT_EQ(instance["device"].asInt64(), 0);
         EXPECT_EQ(instance["cpu_share"].asInt64(), 0);
         EXPECT_EQ(instance["disk"].asInt64(), 0);
         EXPECT_EQ(instance["dp"][rank].asInt64(), 0);
-        EXPECT_EQ(instance["rank_matches"][rank]["npu"].asInt64(), 0);
+        EXPECT_EQ(instance["rank_matches"][rank]["device"].asInt64(), 0);
         EXPECT_EQ(instance["rank_matches"][rank]["cpu_share"].asInt64(), 0);
         EXPECT_EQ(instance["rank_matches"][rank]["disk"].asInt64(), 0);
     }
@@ -865,20 +892,20 @@ TEST_F(QueryHttpTest, SaltIsRequestOnlyAndNullEmptyOmittedMeanNoSalt) {
 
     Json::Value query = QueryJson(ContextFor(salted_service), tokens);
     query["cache_salt"] = "pepper";
-    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["npu"]
+    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["device"]
                   .asInt64(),
               8);
 
     query.removeMember("cache_salt");
-    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["npu"]
+    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["device"]
                   .asInt64(),
               0);
     query["cache_salt"] = "";
-    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["npu"]
+    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["device"]
                   .asInt64(),
               0);
     query["cache_salt"] = Json::Value(Json::nullValue);
-    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["npu"]
+    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["device"]
                   .asInt64(),
               0);
 }
@@ -1538,7 +1565,7 @@ TEST(KVEventHandlerTest, SglangLocalAndMooncakeSharedLifecyclesAreIndependent) {
         auto expect = [&](int64_t host, int64_t share, int64_t disk) {
             const auto hits =
                 manager.GetIndexer()->Query(ContextFor(engine), tokens);
-            EXPECT_EQ(hits.at("p0").npu, 0);
+            EXPECT_EQ(hits.at("p0").device, 0);
             EXPECT_EQ(hits.at("p0").cpu_local, host);
             EXPECT_EQ(hits.at("p0").cpu_share, std::max(host, share));
             EXPECT_EQ(hits.at("p1").cpu_local, 0);
@@ -1849,7 +1876,7 @@ TEST(KVEventHandlerTest, VllmBatchDpConflictRejectsEveryEvent) {
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(service), tokens)
                   .at("engine")
-                  .npu,
+                  .device,
               0);
 }
 
@@ -1879,7 +1906,7 @@ TEST(KVEventHandlerTest, VllmAdmissionFailureDoesNotBlockValidSiblings) {
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(service), tokens)
                   .at("engine")
-                  .npu,
+                  .device,
               4);
 
     VllmRemovedEvent removed{
@@ -1888,7 +1915,7 @@ TEST(KVEventHandlerTest, VllmAdmissionFailureDoesNotBlockValidSiblings) {
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(service), tokens)
                   .at("engine")
-                  .npu,
+                  .device,
               0);
 }
 
@@ -1969,7 +1996,7 @@ TEST(KVEventHandlerTest, VllmNamedLoraLifecycleKeepsContextsIsolated) {
             return manager.GetIndexer()
                 ->Query(ContextFor(registered), tokens)
                 .at(registered.instance_id)
-                .npu;
+                .device;
         };
         EXPECT_EQ(matched(service), 8);
         EXPECT_EQ(matched(other), 8);
@@ -2048,7 +2075,7 @@ TEST(KVEventHandlerTest, VllmNamedLoraRejectsAmbiguousAndConflictingIdentity) {
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(service), tokens)
                   .at(service.instance_id)
-                  .npu,
+                  .device,
               4);
 }
 
@@ -2076,7 +2103,7 @@ TEST(KVEventHandlerTest, VllmFullPrefixSpecsSupportStoreRemoveAndClear) {
             return manager.GetIndexer()
                 ->Query(ContextFor(service), tokens)
                 .at(service.instance_id)
-                .npu;
+                .device;
         };
         EXPECT_EQ(matched(), 8);
         VllmRemovedEvent first{.block_hashes = {prefixes[0].value},
@@ -2148,7 +2175,7 @@ TEST(KVEventHandlerTest, VllmFullPrefixSpecsKeepLayoutAndWindowGuards) {
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(service), tokens)
                   .at(service.instance_id)
-                  .npu,
+                  .device,
               4);
 }
 
@@ -2180,11 +2207,11 @@ TEST(KVEventHandlerTest, VllmBinaryHashUsesFinalEightBytesWithoutRehashing) {
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(service), tokens)
                   .at("engine")
-                  .npu,
+                  .device,
               4);
 }
 
-TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
+TEST(KVEventHandlerTest, VllmCpuAndGpuAreIndexedWhileDiskIsIgnored) {
     EventManager manager({}, 0);
     const auto service = VllmService("engine", "default", 0, 4);
     ASSERT_TRUE(
@@ -2194,28 +2221,21 @@ TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
     const auto prefixes =
         ProjectedFor(ContextFor(service), TestProfile(), tokens);
 
-    const std::array<std::string, 4> ignored_media = {"CPU", "cpu", "DISK",
-                                                      "disk"};
-    std::vector<VllmEvent> events;
+    const std::array<std::string, 2> ignored_media = {"DISK", "disk"};
+    std::vector<VllmEvent> events{VllmStored(prefixes[0].value, 4, "CPU"),
+                                  VllmStored(prefixes[0].value, 4, "cpu"),
+                                  VllmStored(prefixes[0].value, 4, "GPU")};
     for (const auto& medium : ignored_media) {
         events.emplace_back(VllmStored(prefixes[0].value, 4, medium));
     }
-    events.emplace_back(VllmStored(prefixes[0].value, 4, "GPU"));
-    for (const auto& medium : ignored_media) {
-        events.emplace_back(
-            VllmRemovedEvent{.block_hashes = {prefixes[0].value},
-                             .medium = medium,
-                             .group_idx = 0});
-    }
 
-    // Expected non-GPU traffic is traced at VLOG(1) (reported to sinks as
-    // GLOG_INFO), not at WARNING: this test would emit eight warnings.
     InfoSink info;
     WarningSink warnings;
     EXPECT_TRUE(DispatchVllm(handler, service, std::move(events), 0).empty());
-    const auto result =
+    auto result =
         manager.GetIndexer()->Query(ContextFor(service), tokens).at("engine");
-    EXPECT_EQ(result.npu, 4);
+    EXPECT_EQ(result.device, 4);
+    EXPECT_EQ(result.cpu_local, 4);
     EXPECT_EQ(result.cpu_share, 4);
     EXPECT_EQ(result.disk, 4);
 
@@ -2223,9 +2243,32 @@ TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
         PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
     const auto& presence =
         snapshot.contexts.at(ContextFor(service)).blocks.at(prefixes[0]);
-    EXPECT_FALSE(presence.npu_owners.empty());
+    EXPECT_FALSE(presence.device_owners.empty());
+    EXPECT_EQ(presence.cpu_local_owners.size(), 1u);
     EXPECT_TRUE(presence.cpu_share_owners.empty());
     EXPECT_TRUE(presence.disk_owners.empty());
+
+    std::vector<VllmEvent> removals{
+        VllmRemovedEvent{.block_hashes = {prefixes[0].value},
+                         .medium = "CPU",
+                         .group_idx = 0},
+        VllmRemovedEvent{.block_hashes = {prefixes[0].value},
+                         .medium = "cpu",
+                         .group_idx = 0}};
+    for (const auto& medium : ignored_media) {
+        removals.emplace_back(
+            VllmRemovedEvent{.block_hashes = {prefixes[0].value},
+                             .medium = medium,
+                             .group_idx = 0});
+    }
+    EXPECT_TRUE(DispatchVllm(handler, service, std::move(removals), 0).empty());
+    result =
+        manager.GetIndexer()->Query(ContextFor(service), tokens).at("engine");
+    EXPECT_EQ(result.device, 4);
+    EXPECT_EQ(result.cpu_local, 4);
+    EXPECT_TRUE(PrefixCacheTableTestPeer::Presence(
+                    *manager.GetIndexer(), ContextFor(service), prefixes[0])
+                    ->cpu_local_owners.empty());
     if (VLOG_IS_ON(1)) {
         EXPECT_TRUE(info.Contains("endpoint=" + service.endpoint));
         EXPECT_TRUE(info.Contains("publisher_kind=vLLM"));
@@ -2239,13 +2282,76 @@ TEST(KVEventHandlerTest, VllmCpuDiskAreNoOpsAndGpuSiblingContinues) {
         }
         EXPECT_TRUE(info.Contains("hash_count=1"));
     }
-    // Non-GPU events never reach the tier-ignore warning path.
     for (const auto& medium : ignored_media) {
         EXPECT_FALSE(
             warnings.Contains("event_type=BlockStored medium=" + medium));
         EXPECT_FALSE(
             warnings.Contains("event_type=BlockRemoved medium=" + medium));
     }
+}
+
+TEST(KVEventHandlerTest, VllmCpuLocalYieldsToMooncakeAndClearPreservesShared) {
+    EventManager manager({}, 0);
+    const auto engine_a = VllmService("engine-a", "default", 0, 4);
+    const auto engine_b = VllmService("engine-b", "default", 0, 4);
+    for (const auto& service : {engine_a, engine_b}) {
+        ASSERT_TRUE(manager.GetIndexer()
+                        ->Register(RegistrationFor(service))
+                        .error.empty());
+    }
+    KVEventHandler handler_a(&manager, engine_a);
+    KVEventHandler handler_b(&manager, engine_b);
+    const auto pool = MooncakeService(engine_a);
+    KVEventHandler pool_handler(&manager, pool);
+    const auto tokens = Sequence(1, 4);
+    const auto prefix =
+        ProjectedFor(ContextFor(engine_a), TestProfile(), tokens).front();
+    const auto local = VllmStored(prefix.value, 4, "CPU");
+    const auto shared = MooncakeStored(engine_a, prefix.value, "shared-object");
+
+    ASSERT_TRUE(DispatchVllm(handler_a, engine_a,
+                             {local, VllmStored(prefix.value, 4)}, 0)
+                    .empty());
+    ASSERT_TRUE(DispatchVllm(handler_b, engine_b, {local}, 0).empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_a), tokens)
+                  .at("engine-b")
+                  .cpu_local,
+              4);
+    ASSERT_TRUE(DispatchMooncake(pool_handler, pool, {shared}).empty());
+    auto presence = PrefixCacheTableTestPeer::Presence(
+        *manager.GetIndexer(), ContextFor(engine_a), prefix);
+    ASSERT_TRUE(presence.has_value());
+    EXPECT_TRUE(presence->cpu_local_owners.empty());
+    EXPECT_EQ(presence->device_owners.size(), 1u);
+    EXPECT_EQ(presence->cpu_share_owners.size(), 1u);
+
+    ASSERT_TRUE(DispatchVllm(handler_b, engine_b, {local}, 0).empty());
+    ASSERT_TRUE(
+        DispatchVllm(handler_a, engine_a, {VllmClearedEvent{}}, 0).empty());
+    auto hits = manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
+    EXPECT_EQ(hits.at("engine-a").device, 0);
+    EXPECT_EQ(hits.at("engine-a").cpu_local, 0);
+    EXPECT_EQ(hits.at("engine-b").cpu_local, 0);
+    EXPECT_EQ(hits.at("engine-b").cpu_share, 4);
+
+    ASSERT_TRUE(DispatchMooncake(pool_handler, pool, {MooncakeRemoved(shared)})
+                    .empty());
+    hits = manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
+    EXPECT_EQ(hits.at("engine-b").cpu_local, 0);
+    EXPECT_EQ(hits.at("engine-b").cpu_share, 0);
+    ASSERT_TRUE(DispatchVllm(handler_b, engine_b, {local}, 0).empty());
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_a), tokens)
+                  .at("engine-b")
+                  .cpu_local,
+              4);
+    handler_b.OnSourceStale("test", MetadataFor(engine_b), "source stale");
+    EXPECT_EQ(manager.GetIndexer()
+                  ->Query(ContextFor(engine_a), tokens)
+                  .at("engine-b")
+                  .cpu_local,
+              0);
 }
 
 TEST(KVEventHandlerTest, VllmClearPreservesOtherEngineAndSharedOwners) {
@@ -2283,10 +2389,10 @@ TEST(KVEventHandlerTest, VllmClearPreservesOtherEngineAndSharedOwners) {
     const auto results =
         manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
     ASSERT_EQ(results.size(), 2u);
-    EXPECT_EQ(results.at("engine-a").npu, 0);
+    EXPECT_EQ(results.at("engine-a").device, 0);
     EXPECT_EQ(results.at("engine-a").cpu_share, 4);
     EXPECT_EQ(results.at("engine-a").disk, 4);
-    EXPECT_EQ(results.at("engine-b").npu, 4);
+    EXPECT_EQ(results.at("engine-b").device, 4);
     EXPECT_EQ(results.at("engine-b").cpu_share, 4);
     EXPECT_EQ(results.at("engine-b").disk, 4);
     EXPECT_FALSE(results.contains(pool.instance_id));
@@ -2295,8 +2401,8 @@ TEST(KVEventHandlerTest, VllmClearPreservesOtherEngineAndSharedOwners) {
         PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
     const auto& presence =
         snapshot.contexts.at(ContextFor(engine_a)).blocks.at(prefix);
-    ASSERT_EQ(presence.npu_owners.size(), 1u);
-    EXPECT_EQ(presence.npu_owners.begin()->instance_id, "engine-b");
+    ASSERT_EQ(presence.device_owners.size(), 1u);
+    EXPECT_EQ(presence.device_owners.begin()->instance_id, "engine-b");
     EXPECT_FALSE(presence.cpu_share_owners.empty());
     EXPECT_TRUE(presence.disk_owners.empty());
 }
@@ -2395,13 +2501,13 @@ TEST(KVEventHandlerTest, MooncakeMediumMigrationAndTenantClearAreScoped) {
     auto result_a = manager.GetIndexer()
                         ->Query(ContextFor(tenant_a), tokens)
                         .at("engine-a");
-    EXPECT_EQ(result_a.npu, 4);
+    EXPECT_EQ(result_a.device, 4);
     EXPECT_EQ(result_a.cpu_share, 4);
     EXPECT_EQ(result_a.disk, 4);
     auto snapshot = PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
     const auto& before_clear =
         snapshot.contexts.at(ContextFor(tenant_a)).blocks.at(prefix_a);
-    EXPECT_FALSE(before_clear.npu_owners.empty());
+    EXPECT_FALSE(before_clear.device_owners.empty());
     EXPECT_FALSE(before_clear.cpu_share_owners.empty());
     EXPECT_FALSE(before_clear.disk_owners.empty());
 
@@ -2413,7 +2519,7 @@ TEST(KVEventHandlerTest, MooncakeMediumMigrationAndTenantClearAreScoped) {
     const auto result_b = manager.GetIndexer()
                               ->Query(ContextFor(tenant_b), tokens)
                               .at("engine-b");
-    EXPECT_EQ(result_a.npu, 4);
+    EXPECT_EQ(result_a.device, 4);
     EXPECT_EQ(result_a.cpu_share, 4);
     EXPECT_EQ(result_a.disk, 4);
     EXPECT_EQ(result_b.cpu_share, 4);
@@ -2421,7 +2527,7 @@ TEST(KVEventHandlerTest, MooncakeMediumMigrationAndTenantClearAreScoped) {
     snapshot = PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
     const auto& after_clear =
         snapshot.contexts.at(ContextFor(tenant_a)).blocks.at(prefix_a);
-    EXPECT_FALSE(after_clear.npu_owners.empty());
+    EXPECT_FALSE(after_clear.device_owners.empty());
     EXPECT_FALSE(after_clear.cpu_share_owners.empty());
     EXPECT_TRUE(after_clear.disk_owners.empty());
     EXPECT_FALSE(snapshot.contexts.at(ContextFor(tenant_b))
@@ -2621,7 +2727,7 @@ TEST(KVEventHandlerTest, UnsupportedGroupsAreEventLocalForBothSources) {
     EXPECT_EQ(manager.GetIndexer()
                   ->Query(ContextFor(engine), tokens)
                   .at("engine")
-                  .npu,
+                  .device,
               4);
 
     auto pool = MooncakeService(engine);
@@ -2659,14 +2765,14 @@ TEST(KVEventHandlerTest, MooncakeUnsupportedMediaAreWarningsAndNoOps) {
     EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 1u);
     const auto result =
         manager.GetIndexer()->Query(ContextFor(engine), tokens).at("engine");
-    EXPECT_EQ(result.npu, 0);
+    EXPECT_EQ(result.device, 0);
     EXPECT_EQ(result.cpu_share, 4);
     EXPECT_EQ(result.disk, 4);
     const auto snapshot =
         PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
     const auto& presence =
         snapshot.contexts.at(ContextFor(engine)).blocks.at(prefix);
-    EXPECT_TRUE(presence.npu_owners.empty());
+    EXPECT_TRUE(presence.device_owners.empty());
     EXPECT_FALSE(presence.cpu_share_owners.empty());
     EXPECT_TRUE(presence.disk_owners.empty());
     EXPECT_TRUE(warnings.Contains("event_type=stored"));
@@ -2694,12 +2800,12 @@ TEST(KVEventHandlerTest, MooncakeDiskOnlyHitUsesDiskBoundary) {
     EXPECT_EQ(KVEventHandlerTestPeer::BindingCount(handler), 1u);
     const auto result =
         manager.GetIndexer()->Query(ContextFor(engine), tokens).at("engine");
-    EXPECT_EQ(result.npu, 0);
+    EXPECT_EQ(result.device, 0);
     EXPECT_EQ(result.cpu_share, 0);
     EXPECT_EQ(result.disk, 4);
     EXPECT_EQ(result.longest_match_tokens, 4);
     ASSERT_TRUE(result.rank_matches.contains(0));
-    EXPECT_EQ(result.rank_matches.at(0).npu, 0);
+    EXPECT_EQ(result.rank_matches.at(0).device, 0);
     EXPECT_EQ(result.rank_matches.at(0).cpu_share, 0);
     EXPECT_EQ(result.rank_matches.at(0).disk, 4);
 
@@ -2707,7 +2813,7 @@ TEST(KVEventHandlerTest, MooncakeDiskOnlyHitUsesDiskBoundary) {
         PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
     const auto& presence =
         snapshot.contexts.at(ContextFor(engine)).blocks.at(prefix);
-    EXPECT_TRUE(presence.npu_owners.empty());
+    EXPECT_TRUE(presence.device_owners.empty());
     EXPECT_TRUE(presence.cpu_share_owners.empty());
     EXPECT_FALSE(presence.disk_owners.empty());
 }
@@ -2902,14 +3008,14 @@ TEST(RegistrationLifecycle, VllmUnregisterPreservesOtherAndSharedOwners) {
     EXPECT_TRUE(removed.second.empty());
     auto results = manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
     ASSERT_EQ(results.size(), 1u);
-    EXPECT_EQ(results.at("engine-b").npu, 4);
+    EXPECT_EQ(results.at("engine-b").device, 4);
     EXPECT_EQ(results.at("engine-b").cpu_share, 4);
     const auto snapshot =
         PrefixCacheTableTestPeer::Snapshot(*manager.GetIndexer());
     const auto& presence =
         snapshot.contexts.at(ContextFor(engine_a)).blocks.at(prefix);
-    ASSERT_EQ(presence.npu_owners.size(), 1u);
-    EXPECT_EQ(presence.npu_owners.begin()->instance_id, "engine-b");
+    ASSERT_EQ(presence.device_owners.size(), 1u);
+    EXPECT_EQ(presence.device_owners.begin()->instance_id, "engine-b");
     EXPECT_FALSE(presence.cpu_share_owners.empty());
     EXPECT_TRUE(presence.disk_owners.empty());
     EXPECT_FALSE(
@@ -2919,9 +3025,9 @@ TEST(RegistrationLifecycle, VllmUnregisterPreservesOtherAndSharedOwners) {
     EXPECT_TRUE(EventManagerTestPeer::Register(manager, engine_a).first);
     results = manager.GetIndexer()->Query(ContextFor(engine_a), tokens);
     ASSERT_EQ(results.size(), 2u);
-    EXPECT_EQ(results.at("engine-a").npu, 0);
+    EXPECT_EQ(results.at("engine-a").device, 0);
     EXPECT_EQ(results.at("engine-a").cpu_share, 4);
-    EXPECT_EQ(results.at("engine-b").npu, 4);
+    EXPECT_EQ(results.at("engine-b").device, 4);
 }
 
 class ConfigEnvGuard {
@@ -3221,6 +3327,60 @@ TEST(ParseConfigDeathTest, MalformedJsonExits) {
     std::remove(path.c_str());
 }
 
+TEST(ParseConfig, MaxBlocksPerContextKeepsDefaultAndParsesOverrides) {
+    ConfigEnvGuard guard;
+    const std::string path = ::testing::TempDir() + "conductor_cfg_blocks.json";
+    guard.SetPath(path);
+    int port = 0;
+    int rpc_port = 0;
+    size_t max_blocks = 200000;
+
+    {
+        std::ofstream out(path);
+        out << R"({"kvevent_instance": {}})";
+    }
+    mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port, &max_blocks);
+    EXPECT_EQ(max_blocks, 200000u);
+
+    {
+        std::ofstream out(path);
+        out << R"({"max_blocks_per_context": 5000, "kvevent_instance": {}})";
+    }
+    mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port, &max_blocks);
+    EXPECT_EQ(max_blocks, 5000u);
+
+    {
+        std::ofstream out(path);
+        out << R"({"max_blocks_per_context": 0, "kvevent_instance": {}})";
+    }
+    mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port, &max_blocks);
+    EXPECT_EQ(max_blocks, 0u);
+    std::remove(path.c_str());
+}
+
+TEST(ParseConfigDeathTest, InvalidMaxBlocksPerContextExits) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ConfigEnvGuard guard;
+    const std::string path =
+        ::testing::TempDir() + "conductor_cfg_blocks_bad.json";
+    guard.SetPath(path);
+    int port = 0;
+    int rpc_port = 0;
+    size_t max_blocks = 0;
+    for (const char* value : {"-1", "1.5", "\"5000\""}) {
+        SCOPED_TRACE(value);
+        {
+            std::ofstream out(path);
+            out << R"({"max_blocks_per_context": )" << value
+                << R"(, "kvevent_instance": {}})";
+        }
+        EXPECT_EXIT(mooncake::conductor::kvevent::ParseConfig(&port, &rpc_port,
+                                                              &max_blocks),
+                    ::testing::ExitedWithCode(1), "");
+    }
+    std::remove(path.c_str());
+}
+
 // Real upstream msgspec bytes and hashes traverse ZMQ, the handler and HTTP.
 // This tests the event-to-query contract without starting an inference engine.
 class RealZmqPublisher {
@@ -3323,14 +3483,15 @@ TEST(SglangIngestToQuery, UpstreamMapsPreserveLocalLifecycle) {
     ASSERT_TRUE(wait_for(
         [&] { return query(engine.instance_id)["disk"] == expected["disk"]; }));
     const auto before = query(engine.instance_id);
-    for (const auto* field : {"npu", "cpu_local", "cpu_share", "disk"}) {
+    for (const auto* field : {"device", "cpu_local", "cpu_share", "disk"}) {
         EXPECT_EQ(before[field], expected[field]) << field;
     }
     // Local Host/disk presence must not leak to another registered engine.
     EXPECT_EQ(query(sibling.instance_id)["disk"].asInt64(), 0);
     sibling_publisher.Publish(tiers[0]["payload_hex"].asString());
     ASSERT_TRUE(wait_for([&] {
-        return query(sibling.instance_id)["npu"].asInt64() == engine.block_size;
+        return query(sibling.instance_id)["device"].asInt64() ==
+               engine.block_size;
     }));
 
     for (const auto& tier : tiers) {
@@ -3340,7 +3501,7 @@ TEST(SglangIngestToQuery, UpstreamMapsPreserveLocalLifecycle) {
     // a fixed sleep plus unchanged counts, it proves the stream progressed.
     publisher.Publish(data["remove_first_block_hex"].asString());
     ASSERT_TRUE(wait_for(
-        [&] { return query(engine.instance_id)["npu"].asInt64() == 0; }));
+        [&] { return query(engine.instance_id)["device"].asInt64() == 0; }));
     const auto removed = query(engine.instance_id);
     for (const auto* field : {"cpu_local", "cpu_share", "disk"}) {
         EXPECT_EQ(removed[field], before[field]) << field;
@@ -3350,10 +3511,11 @@ TEST(SglangIngestToQuery, UpstreamMapsPreserveLocalLifecycle) {
     ASSERT_TRUE(wait_for(
         [&] { return query(engine.instance_id)["disk"].asInt64() == 0; }));
     const auto cleared = query(engine.instance_id);
-    for (const auto* field : {"npu", "cpu_local", "cpu_share", "disk"}) {
+    for (const auto* field : {"device", "cpu_local", "cpu_share", "disk"}) {
         EXPECT_EQ(cleared[field].asInt64(), 0) << field;
     }
-    EXPECT_EQ(query(sibling.instance_id)["npu"].asInt64(), engine.block_size);
+    EXPECT_EQ(query(sibling.instance_id)["device"].asInt64(),
+              engine.block_size);
 }
 
 }  // namespace

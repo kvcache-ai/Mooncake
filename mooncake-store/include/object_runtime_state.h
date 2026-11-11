@@ -34,7 +34,6 @@ struct ReplicationTask {
     } type;
     ReplicaID source_id;
     std::vector<ReplicaID> replica_ids;
-    uint64_t pending_quota_charge_bytes{0};
     UUID dynamic_replication_lease_id{};
     uint64_t dynamic_replication_version_epoch{0};
     bool durable_cleanup_pending{false};
@@ -99,8 +98,8 @@ struct PromotionCandidate {
 // and reset at PromotionAllocStart so each phase (queue-wait and
 // active-transfer) gets its own full put_start_release_timeout_sec_
 // window. Without the reset a backlogged task could enter active
-// transfer with little TTL left, and the reaper could free the
-// staged replica via EraseReplicaByID mid-RDMA-write.
+// transfer with little TTL left, and the reaper could erase the
+// staged replica by its allocation id mid-RDMA-write.
 //
 // holder_id is the client owning the source LOCAL_DISK segment and
 // the only one authorized to commit (NotifyPromotionSuccess) or
@@ -112,7 +111,6 @@ struct PromotionTask {
     ReplicaID source_id;    // the LOCAL_DISK replica being promoted
     ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
     uint64_t object_size;
-    uint64_t pending_quota_charge_bytes{0};
     std::chrono::system_clock::time_point start_time;
     UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
     // Execution failures so far in this admission chain. Read by
@@ -122,6 +120,9 @@ struct PromotionTask {
     // copies candidate -> task verbatim, failure re-record writes
     // task+1 -> candidate.
     uint32_t execution_failures{0};
+    // SSD prefetch admission. NotifyPromotionSuccess grants a read lease
+    // so the promoted replica survives until the follow-up get.
+    bool from_prefetch{false};
 };
 
 }  // namespace mooncake

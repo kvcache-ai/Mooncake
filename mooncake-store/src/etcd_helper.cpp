@@ -13,6 +13,19 @@ std::mutex EtcdHelper::etcd_mutex_;
 bool EtcdHelper::etcd_connected_ = false;
 
 #ifdef STORE_USE_ETCD
+ErrorCode EtcdHelper::SetMaxSendMessageBytes(int32_t max_bytes) {
+    std::lock_guard<std::mutex> lock(etcd_mutex_);
+    char* err_msg = nullptr;
+    const int ret = SetStoreEtcdMaxSendMessageBytes(max_bytes, &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to configure etcd store send limit: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        free(err_msg);
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     const std::string& etcd_endpoints) {
     std::lock_guard<std::mutex> lock(etcd_mutex_);
@@ -560,6 +573,11 @@ ErrorCode EtcdHelper::WaitWatchWithPrefixStopped(const char* prefix,
     return ErrorCode::OK;
 }
 #else
+ErrorCode EtcdHelper::SetMaxSendMessageBytes(int32_t max_bytes) {
+    (void)max_bytes;
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+}
+
 ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     const std::string& etcd_endpoints) {
     (void)etcd_endpoints;

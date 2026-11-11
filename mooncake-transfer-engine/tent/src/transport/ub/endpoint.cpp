@@ -4,6 +4,7 @@
 #include "tent/transport/ub/endpoint.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <exception>
 #include <iterator>
@@ -107,14 +108,44 @@ Status UbEndpoint::resetAndUnbindLocked() {
 
 Status UbEndpoint::deleteJettysLocked() {
     Status first_error = Status::OK();
-    if (adapter_) {
-        for (auto it = jetties_.rbegin(); it != jetties_.rend(); ++it) {
-            if (!*it) continue;
-            rememberFirstError(adapter_->deleteJetty(*it), first_error);
-        }
+    if (!adapter_ && !jetties_.empty()) {
+        return Status::InternalError(
+            "UB endpoint cannot delete Jettys without an adapter" LOC_MARK);
     }
-    jetties_.clear();
-    jfc_indices_.clear();
+
+    // A provider may reject deletion transiently (for example while a Jetty
+    // is still busy). Remove only handles whose deletion succeeded. Failed
+    // handles and their JFC association remain owned by this endpoint so the
+    // next retire()/clear()/uninstall() attempt can retry the exact resource.
+    std::vector<bool> deleted(jetties_.size(), false);
+    for (size_t index = jetties_.size(); index > 0; --index) {
+        auto& jetty = jetties_[index - 1];
+        if (!jetty) {
+            deleted[index - 1] = true;
+            continue;
+        }
+        auto status = adapter_->deleteJetty(jetty);
+        rememberFirstError(status, first_error);
+        deleted[index - 1] = status.ok();
+    }
+
+    std::vector<JettyPtr> retained_jetties;
+    std::vector<size_t> retained_jfc_indices;
+    retained_jetties.reserve(jetties_.size());
+    retained_jfc_indices.reserve(jfc_indices_.size());
+    for (size_t index = 0; index < jetties_.size(); ++index) {
+        if (deleted[index]) continue;
+        // Both arrays are appended together, so a missing index means the
+        // bookkeeping is already corrupt. Fail loudly instead of silently
+        // rebinding a retained Jetty to JFC 0; the guard keeps release builds
+        // memory-safe.
+        assert(index < jfc_indices_.size());
+        retained_jetties.push_back(std::move(jetties_[index]));
+        retained_jfc_indices.push_back(
+            index < jfc_indices_.size() ? jfc_indices_[index] : size_t{0});
+    }
+    jetties_ = std::move(retained_jetties);
+    jfc_indices_ = std::move(retained_jfc_indices);
     return first_error;
 }
 
@@ -181,9 +212,24 @@ Status UbEndpoint::prepare() {
         JettyPtr jetty;
         auto status = adapter_->createJetty(context_->handle(), jfc->handle(),
                                             jetty_options_, jetty);
-        if (!status.ok()) return failLocked(std::move(status));
+        if (!status.ok()) {
+            // A provider may fail after returning a partially allocated
+            // Jetty. Adopt it before entering the retryable failure cleanup.
+            if (jetty) {
+                jetties_.push_back(std::move(jetty));
+                jfc_indices_.push_back(jfc_index);
+            }
+            return failLocked(std::move(status));
+        }
         if (!jetty || !jetty->valid() || jetty->id() == 0) {
-            if (jetty) jetties_.push_back(std::move(jetty));
+            if (jetty) {
+                // Adopt the invalid Jetty together with its JFC index: the
+                // cleanup path walks jetties_ and jfc_indices_ in lockstep, so
+                // appending to only one of them would misalign every later
+                // entry.
+                jetties_.push_back(std::move(jetty));
+                jfc_indices_.push_back(jfc_index);
+            }
             return failLocked(Status::InternalError(
                 "URMA adapter returned an invalid Jetty" LOC_MARK));
         }

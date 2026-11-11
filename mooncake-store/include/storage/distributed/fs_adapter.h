@@ -35,23 +35,6 @@ class FileSystemAdapter {
    public:
     virtual ~FileSystemAdapter() = default;
 
-    // === File I/O ===
-
-    virtual tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& path, std::span<const char> data) = 0;
-
-    // Read file into a pre-allocated buffer (zero-copy into Slice.ptr)
-    virtual tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
-                                                     void* buf, size_t len) = 0;
-
-    virtual tl::expected<size_t, ErrorCode> VectorWriteFile(
-        const std::string& path, const iovec* iov, int iovcnt,
-        off_t offset) = 0;
-
-    virtual tl::expected<size_t, ErrorCode> VectorReadFile(
-        const std::string& path, const iovec* iov, int iovcnt,
-        off_t offset) = 0;
-
     // === File management ===
 
     virtual tl::expected<void, ErrorCode> DeleteFile(
@@ -140,10 +123,26 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    // Whether a hard WriteAt/ReadAt failure can be recovered by closing and
+    // reopening the fd (stale-fd self-healing). Only meaningful for adapters
+    // backed by a plain long-lived positional fd (POSIX). Adapters whose I/O
+    // failures are unrelated to the file fd (e.g. 3FS USRBIO submit/completion
+    // or per-thread ior/iov state) must leave this false so the backend does
+    // not perform a pointless close/reopen/retry under the shard lock.
+    virtual bool SupportsFdReopen() const { return false; }
+
     // Opt in to backend batching and concurrent positional I/O on cached
     // shard fds. Other adapters retain per-request bucket handles and
     // serialized shard I/O.
     virtual bool SupportsBatchIo() const { return false; }
+
+    // Whether ReadAt/BatchReadAt accept iovecs pointing at arbitrary writable
+    // host memory, with any length and file offset, without caller-side
+    // alignment, padding or buffer registration. Callers may then read
+    // straight into user destinations instead of an intermediate buffer.
+    // Adapters with such constraints (e.g. O_DIRECT, registered iov memory)
+    // must leave this false unless they satisfy them internally.
+    virtual bool SupportsArbitraryHostReadBuffers() const { return false; }
 
     // Batched positional I/O. Adapters may override these to keep several
     // requests in flight; the defaults issue one WriteAt/ReadAt per request,

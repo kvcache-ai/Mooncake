@@ -77,6 +77,14 @@ mooncake::RealClient *as_client(mooncake_store_t store) {
     return as_handle(store)->client.get();
 }
 
+mooncake::ExistOptions to_exist_options(
+    const mooncake_exist_options_t *c_options) {
+    mooncake::ExistOptions options;
+    if (!c_options) return options;
+    options.prefetch_to_memory = c_options->prefetch_to_memory != 0;
+    return options;
+}
+
 }  // namespace
 
 extern "C" {
@@ -258,6 +266,88 @@ int mooncake_store_batch_get_into(mooncake_store_t store, const char **keys,
 }
 
 // ---------------------------------------------------------------------------
+// Multi-buffer batch operations
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Nest the flat buffers and sizes per key by `counts`. Empty when a key or
+// a non-empty slice is null.
+struct NestedBuffers {
+    std::vector<std::string> keys;
+    std::vector<std::vector<void *>> buffers;
+    std::vector<std::vector<size_t>> sizes;
+};
+
+std::optional<NestedBuffers> nest_buffers(const char **keys, void **buffers,
+                                          const size_t *sizes,
+                                          const size_t *counts, size_t count) {
+    NestedBuffers out;
+    out.keys.reserve(count);
+    out.buffers.reserve(count);
+    out.sizes.reserve(count);
+    size_t at = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!keys[i]) return std::nullopt;
+        for (size_t j = at; j < at + counts[i]; ++j) {
+            if (!buffers[j] && sizes[j] > 0) return std::nullopt;
+        }
+        out.keys.emplace_back(keys[i]);
+        out.buffers.emplace_back(buffers + at, buffers + at + counts[i]);
+        out.sizes.emplace_back(sizes + at, sizes + at + counts[i]);
+        at += counts[i];
+    }
+    return out;
+}
+
+}  // namespace
+
+int mooncake_store_batch_put_from_multi_buffers(
+    mooncake_store_t store, const char **keys, void **buffers,
+    const size_t *sizes, const size_t *counts, size_t count,
+    const mooncake_replicate_config_t *config, int *results_out) {
+    if (!store || !keys || !buffers || !sizes || !counts || !results_out)
+        return -1;
+    try {
+        auto nested = nest_buffers(keys, buffers, sizes, counts, count);
+        if (!nested) return -1;
+        auto rc = to_replicate_config(config);
+        if (!rc) return -1;
+        auto results = as_client(store)->batch_put_from_multi_buffers(
+            nested->keys, nested->buffers, nested->sizes, *rc);
+
+        for (size_t i = 0; i < count; ++i) {
+            results_out[i] = (i < results.size()) ? results[i] : -1;
+        }
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_batch_get_into_multi_buffers(
+    mooncake_store_t store, const char **keys, void **buffers,
+    const size_t *sizes, const size_t *counts, size_t count,
+    int prefer_alloc_in_same_node, int64_t *results_out) {
+    if (!store || !keys || !buffers || !sizes || !counts || !results_out)
+        return -1;
+    try {
+        auto nested = nest_buffers(keys, buffers, sizes, counts, count);
+        if (!nested) return -1;
+        auto results = as_client(store)->batch_get_into_multi_buffers(
+            nested->keys, nested->buffers, nested->sizes,
+            prefer_alloc_in_same_node != 0);
+
+        for (size_t i = 0; i < count; ++i) {
+            results_out[i] = (i < results.size()) ? results[i] : -1;
+        }
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Existence / size / hostname
 // ---------------------------------------------------------------------------
 
@@ -284,6 +374,44 @@ int mooncake_store_batch_is_exist(mooncake_store_t store, const char **keys,
         }
 
         auto results = as_client(store)->batchIsExist(key_vec);
+
+        for (size_t i = 0; i < count; ++i) {
+            results_out[i] = (i < results.size()) ? results[i] : -1;
+        }
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_is_exist_with_options(
+    mooncake_store_t store, const char *key,
+    const mooncake_exist_options_t *options) {
+    if (!store || !key) return -1;
+    try {
+        return as_client(store)->isExist(std::string(key),
+                                         to_exist_options(options));
+    } catch (...) {
+        return -1;
+    }
+}
+
+int mooncake_store_batch_is_exist_with_options(
+    mooncake_store_t store, const char **keys, size_t count, int *results_out,
+    const mooncake_exist_options_t *options) {
+    if (!store || !keys || !results_out) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (!keys[i]) return -1;
+    }
+    try {
+        std::vector<std::string> key_vec;
+        key_vec.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            key_vec.emplace_back(keys[i]);
+        }
+
+        auto results =
+            as_client(store)->batchIsExist(key_vec, to_exist_options(options));
 
         for (size_t i = 0; i < count; ++i) {
             results_out[i] = (i < results.size()) ? results[i] : -1;

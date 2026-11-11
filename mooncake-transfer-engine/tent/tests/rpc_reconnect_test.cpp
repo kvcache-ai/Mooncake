@@ -180,7 +180,9 @@ TEST_F(RpcReconnectTest, HandlerFailureLeavesThePoolAlone) {
     ASSERT_NO_FATAL_FAILURE(FillPool(client));
 
     std::string response;
-    EXPECT_FALSE(client.call(addr_, kThrowFunc, "boom", response).ok());
+    auto failed = client.call(addr_, kThrowFunc, "boom", response);
+    EXPECT_TRUE(failed.IsRpcServiceError()) << failed.ToString();
+    EXPECT_FALSE(failed.IsRpcFunctionNotFound()) << failed.ToString();
 
     // The pooled connections are still good, and the server is still up.
     for (int i = 0; i < kPooled; ++i) {
@@ -189,6 +191,21 @@ TEST_F(RpcReconnectTest, HandlerFailureLeavesThePoolAlone) {
         EXPECT_TRUE(status.ok()) << status.ToString();
         EXPECT_EQ(response, "still-fine");
     }
+}
+
+TEST_F(RpcReconnectTest, MissingFunctionIsReportedAsPreDispatchRejection) {
+    StartServer(0);
+    CoroRpcAgent client;
+
+    std::string response;
+    auto missing = client.call(addr_, 5999, "unused", response);
+    EXPECT_TRUE(missing.IsRpcFunctionNotFound()) << missing.ToString();
+    EXPECT_FALSE(missing.IsRpcServiceError()) << missing.ToString();
+
+    // A peer-reported dispatch rejection does not poison future RPCs.
+    auto after = client.call(addr_, kEchoFunc, "still-fine", response);
+    EXPECT_TRUE(after.ok()) << after.ToString();
+    EXPECT_EQ(response, "still-fine");
 }
 
 // Guard, not a regression test: a peer that is genuinely gone must keep

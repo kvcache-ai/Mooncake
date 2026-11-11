@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "kv_event/kv_event_publisher.h"
+#include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #if defined(MOONCAKE_ENABLE_KV_EVENTS) && MOONCAKE_ENABLE_KV_EVENTS
 #include <msgpack.hpp>
@@ -23,6 +25,10 @@ TEST(KvEventPublisherTest, DisabledPublisherIsNoop) {
     KvEventPublisher publisher(config);
     EXPECT_FALSE(publisher.enabled());
     publisher.PublishStored("42", "cpu");
+    publisher.PublishStored("42", "cpu", TenantId::Default(), "", "session");
+    publisher.PublishCommitted("42", {"cpu"}, "default", "", "session");
+    publisher.SyncObjectState("42", {"disk"}, "default", "", {"cpu"},
+                              "session");
     publisher.PublishRemoved("42", "cpu");
     publisher.PublishCleared("tenant-a");
     const auto stats = publisher.GetStats();
@@ -181,6 +187,50 @@ struct ScopedSubscriber {
 };
 
 }  // namespace
+
+TEST(KvEventPublisherTest, SessionTagIsStoredAttributionOnly) {
+    for (bool legacy : {false, true}) {
+        auto endpoint = MakeIpcEndpoint();
+        auto config = MakeEnabledConfig(endpoint);
+        config.emit_legacy_compat_fields = legacy;
+        KvEventPublisher publisher(config);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+        std::string session = "session-a";
+        publisher.PublishStored("a", "cpu", "default", "group", session);
+        session = "changed-after-enqueue";
+        publisher.PublishCommitted("b", {"cpu", "disk"}, "default", "",
+                                   "session-b");
+        publisher.SyncObjectState("c", {"disk"}, "default", "", {"cpu"},
+                                  "session-c");
+        publisher.PublishStored("untagged", "cpu");
+        publisher.PublishCleared();
+        size_t received = 0;
+        while (received < 7) {
+            msgpack::object_handle payload;
+            ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+            for (uint32_t i = 0; i < EventCount(payload); ++i) {
+                const auto& event = EventAt(payload, i);
+                const auto* tag = FindMapValue(event, "session_id");
+                const auto kind =
+                    MsgpackString(*FindMapValue(event, "event_type"));
+                if (kind == "stored") {
+                    ASSERT_NE(tag, nullptr);
+                    const auto key =
+                        MsgpackString(*FindMapValue(event, "object_key"));
+                    if (key == "untagged")
+                        EXPECT_EQ(tag->type, msgpack::type::NIL);
+                    else
+                        EXPECT_EQ(MsgpackString(*tag), "session-" + key);
+                } else {
+                    EXPECT_EQ(tag, nullptr);
+                }
+                ++received;
+            }
+        }
+        EXPECT_EQ(received, 7u);
+    }
+}
 
 TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     const std::string endpoint = MakeIpcEndpoint();
@@ -435,6 +485,57 @@ TEST(KvEventPublisherTest, RemovalEmitsEveryMediumFromCaller) {
               "cpu");
     EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 1), "medium")),
               "disk");
+}
+
+TEST(KvEventPublisherTest, MemoryEvictionRetractsLastReplica) {
+    for (bool grouped : {false, true}) {
+        SCOPED_TRACE(grouped);
+        const std::string endpoint = MakeIpcEndpoint();
+        MasterServiceConfig config;
+        config.enable_kv_events = true;
+        config.kv_events_bind_endpoint = endpoint;
+        config.kv_events_backend_id = "eviction-test";
+        config.default_kv_lease_ttl = 0;
+        MasterService service(config);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = "kv_event_eviction_segment";
+        segment.te_endpoint = segment.name;
+        segment.base = 0x300000000;
+        segment.size = 16 * 1024 * 1024;
+        const UUID client = generate_uuid();
+        ASSERT_TRUE(service.MountSegment(segment, client));
+
+        const std::string key = "kv_event_eviction_key";
+        ReplicateConfig replication;
+        if (grouped) {
+            replication.group_ids = std::vector<std::string>{"event-group"};
+        }
+        ASSERT_TRUE(service.PutStart(client, key, TenantId::Default(), 1024,
+                                     replication));
+        ASSERT_TRUE(service.PutEnd(client, key, TenantId::Default(),
+                                   ReplicaType::MEMORY));
+        msgpack::object_handle payload;
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "stored", key);
+
+        test::MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+        const auto replicas =
+            service.GetReplicaListForAdmin(key, TenantId::Default());
+        ASSERT_FALSE(replicas.has_value());
+        ASSERT_EQ(replicas.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "removed", key);
+        EXPECT_EQ(MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
+                  "cpu");
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+    }
 }
 
 // A medium that survives the mutation must not be announced as removed, even
