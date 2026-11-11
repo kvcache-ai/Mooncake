@@ -30,11 +30,10 @@ struct ObjectMetadata {
 
     ObjectMetadata() = delete;
 
-    ObjectMetadata(
-        const UUID& client_id_,
-        const std::chrono::steady_clock::time_point put_start_time_,
-        size_t value_length, std::vector<Replica>&& reps,
-        bool enable_soft_pin)
+    ObjectMetadata(const UUID& client_id_,
+                   const std::chrono::steady_clock::time_point put_start_time_,
+                   size_t value_length, std::vector<Replica>&& reps,
+                   bool enable_soft_pin)
         : client_id(client_id_),
           put_start_time(put_start_time_),
           size(value_length),
@@ -68,18 +67,15 @@ struct ObjectMetadata {
                                             // set for vip objects
 
     void AddReplicas(std::vector<Replica>&& replicas) {
-        replicas_.insert(replicas_.end(),
-                         std::move_iterator(replicas.begin()),
+        replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
                          std::move_iterator(replicas.end()));
     }
 
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
-        auto partition_point =
-            std::partition(replicas_.begin(), replicas_.end(),
-                           [pred_fn](const Replica& replica) {
-                               return !pred_fn(replica);
-                           });
+        auto partition_point = std::partition(
+            replicas_.begin(), replicas_.end(),
+            [pred_fn](const Replica& replica) { return !pred_fn(replica); });
 
         std::vector<Replica> popped_replicas;
         if (partition_point != replicas_.end()) {
@@ -95,8 +91,7 @@ struct ObjectMetadata {
 
     std::vector<Replica> PopReplicas() { return std::move(replicas_); }
 
-    size_t EraseReplicas(
-        const std::function<bool(const Replica&)>& pred_fn) {
+    size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
         auto erased_replicas = PopReplicas(pred_fn);
         return erased_replicas.size();
     }
@@ -135,13 +130,11 @@ struct ObjectMetadata {
         return num_visited;
     }
 
-    bool HasReplica(
-        const std::function<bool(const Replica&)>& pred_fn) const {
+    bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
         return std::any_of(replicas_.begin(), replicas_.end(), pred_fn);
     }
 
-    bool AllReplicas(
-        const std::function<bool(const Replica&)>& pred_fn) const {
+    bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
         return std::all_of(replicas_.begin(), replicas_.end(), pred_fn);
     }
 
@@ -191,9 +184,8 @@ struct ObjectMetadata {
         lease_timeout =
             std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
         if (soft_pin_timeout) {
-            soft_pin_timeout =
-                std::max(*soft_pin_timeout,
-                         now + std::chrono::milliseconds(soft_ttl));
+            soft_pin_timeout = std::max(
+                *soft_pin_timeout, now + std::chrono::milliseconds(soft_ttl));
         }
     }
 

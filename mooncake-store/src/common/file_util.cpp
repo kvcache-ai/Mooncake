@@ -24,8 +24,8 @@ std::string SanitizeKey(const std::string& key) {
 }  // namespace
 
 std::string FileUtil::ResolvePathFromKey(const std::string& key,
-                                       const std::string& root_dir,
-                                       const std::string& fsdir) {
+                                         const std::string& root_dir,
+                                         const std::string& fsdir) {
     const size_t hash = std::hash<std::string>{}(key);
     const char dir1 = static_cast<char>('a' + (hash & 0x0F));
     const char dir2 = static_cast<char>('a' + ((hash >> 4) & 0x0F));
