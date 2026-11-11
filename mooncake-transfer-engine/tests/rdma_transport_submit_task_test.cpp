@@ -161,8 +161,9 @@ class SubmitTransferTaskTest : public ::testing::Test {
 
 TEST_F(SubmitTransferTaskTest, NicHintUsesExistingTailPadding) {
     // Mirror the current request layout without nic_hint. The upstream
-    // intent_type field grew the baseline from 64 to 72 bytes; nic_hint must
-    // fit in its existing tail padding rather than grow every request again.
+    // intent_type field grew the baseline from 64 to 72 bytes, and the TENT
+    // producer_event pointer grows it to 80; nic_hint must fit in its existing
+    // tail padding rather than grow every request again.
     struct RequestWithoutNicHint {
         Transport::TransferRequest::OpCode opcode;
         void *source;
@@ -171,6 +172,7 @@ TEST_F(SubmitTransferTaskTest, NicHintUsesExistingTailPadding) {
         size_t length;
         int advise_retry_cnt;
         int transport_hint;
+        void *producer_event;
         int intent_type;
         uint64_t task_group_id;
         int priority;

@@ -90,6 +90,9 @@ Blog = "https://kvcache.ai/blog"
 Changelog = "https://github.com/kvcache-ai/Mooncake/releases"
 Slack = "https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA"
 
+[project.entry-points."sglang.srt.plugins"]
+mooncake_engram = "mooncake.engram_plugins:register_sglang"
+
 [project.scripts]
 mooncake_master = "mooncake.cli:main"
 mooncake_client = "mooncake.cli_client:main"

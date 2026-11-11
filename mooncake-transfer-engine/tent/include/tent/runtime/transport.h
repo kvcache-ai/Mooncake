@@ -130,6 +130,10 @@ class Transport {
     // task reaches a terminal state.
     virtual bool supportsCancellation() const { return false; }
 
+    // True when submitTransferTasks() orders each copy after
+    // Request::producer_event on the device.
+    virtual bool supportsProducerEvent() const { return false; }
+
     virtual Status cancelTransferTask(SubBatchRef batch, int task_id) {
         return Status::NotImplemented(
             "cancelTransferTask not implemented" LOC_MARK);

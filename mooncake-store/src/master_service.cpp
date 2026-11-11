@@ -4974,7 +4974,8 @@ auto MasterService::AllocateReplicas(const std::string& key,
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
-            if (!writer_host_id.empty()) {
+            if (!writer_host_id.empty() && !config.fabric_domain &&
+                !config.requester_placement && !config.requester_self_id) {
                 auto host_ordered_segments =
                     allocator_access.GetHostOrderedSegments(writer_host_id,
                                                             key);
@@ -4996,9 +4997,8 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 config.preferred_hca_names.value_or(
                     std::vector<std::string>{}));
         }
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_snapshot, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
+        auto allocation_result = allocation_strategy_->AllocateForRequest(
+            allocator_snapshot, value_length, config, preferred_segments);
 
         // Only failed or short allocations need this eviction hint. Count on
         // the retained snapshot after releasing the segment read lock.
@@ -5970,6 +5970,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    auto placement = AllocationStrategy::ResolvePlacement(config);
+    if (!placement) return tl::make_unexpected(placement.error());
     auto plan = PrepareWriteStart(client_id, key, object_id.tenant_id,
                                   slice_length, config, "upsert_start");
     if (!plan) {
@@ -6086,6 +6088,32 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     })) {
                     return tl::make_unexpected(
                         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                }
+
+                // In-place reuse must obey the same fabric boundary as fresh
+                // allocation. Reject a domain change before preempting writes
+                // or modifying metadata; callers can explicitly replace
+                // instead.
+                if (metadata.TotalLength() == slice_length) {
+                    AllocatorManager snapshot;
+                    {
+                        auto access = segment_manager_.getAllocatorAccess();
+                        snapshot = access.SnapshotAllocatorManager();
+                    }
+                    if (metadata.HasReplica([&](const Replica& replica) {
+                            if (!replica.is_completed() ||
+                                !replica.is_memory_replica())
+                                return false;
+                            for (const auto& name :
+                                 replica.get_segment_names()) {
+                                if (name &&
+                                    !snapshot.IsFabricEligible(
+                                        *name, placement->fabric_domain))
+                                    return true;
+                            }
+                            return false;
+                        }))
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
 
                 // Cancel a still-queued offload so the upsert can take the key
@@ -6713,10 +6741,14 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
-        allocator_snapshot = allocator_access.SnapshotAllocatorManager();
+        allocator_snapshot =
+            allocator_access.SnapshotAllocatorManager(src_segment);
     }
 
-    for (auto& tgt_segment : tgt_segments) {
+    for (const auto& tgt_segment : tgt_segments) {
+        if (!allocator_snapshot.CanCopyWithinFabric(src_segment, tgt_segment)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         if (metadata.GetReplicaBySegmentName(tgt_segment) != nullptr) {
             // Skip used segments.
             continue;
@@ -7082,6 +7114,13 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     // be nested under the source executor's guard. The key's lock keeps
     // terminal cleanup ordered after this already-admitted MoveStart.
     serving_guard.reset();
+    AllocatorManager allocator_snapshot;
+    {
+        auto access = segment_manager_.getAllocatorAccess();
+        allocator_snapshot = access.SnapshotAllocatorManager(src_segment);
+    }
+    if (!allocator_snapshot.CanCopyWithinFabric(src_segment, tgt_segment))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     const bool needs_target =
         metadata.GetReplicaBySegmentName(tgt_segment) == nullptr;
     if (auto grown = accessor.Grow(
@@ -7090,12 +7129,6 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         return tl::make_unexpected(grown.error());
     }
     if (needs_target) {
-        AllocatorManager allocator_snapshot;
-        {
-            ScopedAllocatorAccess allocator_access =
-                segment_manager_.getAllocatorAccess();
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
-        }
         auto replica = allocation_strategy_->AllocateFrom(
             allocator_snapshot, metadata.TotalLength(), tgt_segment);
         if (!replica.has_value()) {
@@ -9384,8 +9417,8 @@ auto MasterService::PromotionAllocStart(
             segment_manager_.getAllocatorAccess();
         allocator_snapshot = allocator_access.SnapshotAllocatorManager();
     }
-    auto allocation_result = allocation_strategy_->Allocate(
-        allocator_snapshot, size, config.replica_num, preferred_segments);
+    auto allocation_result = allocation_strategy_->AllocateForRequest(
+        allocator_snapshot, size, config, preferred_segments);
     if (!allocation_result) {
         return tl::make_unexpected(allocation_result.error());
     }
@@ -11085,7 +11118,8 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
                       candidate) != existing_segments.end()) {
             continue;
         }
-        if (!segment_access.IsSegmentAllocatable(candidate)) {
+        if (!segment_access.IsSegmentAllocatable(candidate) ||
+            !segment_access.CanCopyWithinFabric(source_segment, candidate)) {
             continue;
         }
         size_t used = 0, capacity = 0;

@@ -53,9 +53,27 @@ Status HttpMetaStore::disconnect() {
 namespace {
 struct ScopedCurl {
     CURL *h{nullptr};
-    ScopedCurl() : h(curl_easy_init()) {}
+    curl_slist *headers{nullptr};
+    ScopedCurl() : h(curl_easy_init()) {
+        if (!h) return;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        if (const char *token = std::getenv("MC_METADATA_HTTP_TOKEN");
+            token && *token) {
+            std::string authorization =
+                std::string("Authorization: Bearer ") + token;
+            auto *updated = curl_slist_append(headers, authorization.c_str());
+            if (!updated) {
+                curl_easy_cleanup(h);
+                h = nullptr;
+                return;
+            }
+            headers = updated;
+        }
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+    }
     ~ScopedCurl() {
         if (h) curl_easy_cleanup(h);
+        curl_slist_free_all(headers);
     }
     ScopedCurl(const ScopedCurl &) = delete;
     ScopedCurl &operator=(const ScopedCurl &) = delete;
@@ -130,12 +148,7 @@ Status HttpMetaStore::set(const std::string &key, const std::string &value) {
     std::string readBuffer;
     curl_easy_setopt(client.h, CURLOPT_WRITEDATA, &readBuffer);
 
-    // set content-type to application/json
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(client.h, CURLOPT_HTTPHEADER, headers);
     CURLcode res = curl_easy_perform(client.h);
-    curl_slist_free_all(headers);  // free headers
     if (res != CURLE_OK) {
         return Status::MetadataError(
             std::string("HTTP failed to post request: ") +

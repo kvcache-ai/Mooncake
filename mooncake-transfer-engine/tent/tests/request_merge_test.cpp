@@ -185,7 +185,7 @@ TEST(RequestMergeTest, KeepsDifferentSelectionAttributesSplit) {
         const char* name;
         void (*set_different)(Request&, Request&);
     };
-    const std::array<AttributeCase, 3> cases = {{
+    const std::array<AttributeCase, 4> cases = {{
         {"priority",
          [](Request& first, Request& second) {
              first.priority = PRIO_HIGH;
@@ -200,6 +200,11 @@ TEST(RequestMergeTest, KeepsDifferentSelectionAttributesSplit) {
          [](Request& first, Request& second) {
              first.intent_type = IntentType::FOREGROUND_GET;
              second.intent_type = IntentType::MIGRATION;
+         }},
+        {"producer_event",
+         [](Request& first, Request& second) {
+             first.producer_event = reinterpret_cast<void*>(uintptr_t{1});
+             second.producer_event = reinterpret_cast<void*>(uintptr_t{2});
          }},
     }};
 
@@ -236,6 +241,7 @@ TEST(RequestMergeTest, MergesMatchingSelectionAttributes) {
         request.priority = PRIO_LOW;
         request.policy_name = "background";
         request.intent_type = IntentType::MIGRATION;
+        request.producer_event = reinterpret_cast<void*>(uintptr_t{1});
     }
     std::vector<RequestBoundaryInfo> boundaries = {
         {makeBufferKey(source_addr, source.size()), makeBufferKey(4096, 2048)},
@@ -246,6 +252,8 @@ TEST(RequestMergeTest, MergesMatchingSelectionAttributes) {
 
     ASSERT_EQ(merged.request_list.size(), 1u);
     EXPECT_EQ(merged.request_list[0].length, 2048u);
+    EXPECT_EQ(merged.request_list[0].producer_event,
+              reinterpret_cast<void*>(uintptr_t{1}));
     EXPECT_EQ(merged.task_lookup.at(0), merged.task_lookup.at(1));
 }
 

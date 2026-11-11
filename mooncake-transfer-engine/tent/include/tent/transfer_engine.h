@@ -245,6 +245,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
+#include "tent/common/mapped_memory.h"
 
 namespace mooncake {
 class TransferEngine;
@@ -294,11 +295,25 @@ class TransferEngine {
 
     Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
 
+    // Strict FABRIC EGM only; the mapping API accepts a complete published
+    // arena.
+    Status getMnnvlEgmInfo(std::vector<EgmNumaInfo>& info, bool nearest = true);
+    Status acquireMnnvlMemory(SegmentID segment, uint64_t address,
+                              size_t length, int device,
+                              std::shared_ptr<MappedMemory>& mapping);
+
    public:
     Status allocateLocalMemory(void** addr, size_t size,
                                Location location = kWildcardLocation);
 
     Status freeLocalMemory(void* addr);
+
+    bool isStrictMnnvlEgm() const;
+    Status getEgmNumaNodes(std::vector<int>& nodes, bool nearest = false);
+    Status getEgmGranularity(int node, size_t& granularity);
+    bool isMnnvlExported(void* addr, size_t size) const;
+    // Caller must prevent concurrent submissions until memory is released.
+    Status quiesce();
 
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);

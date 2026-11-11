@@ -47,6 +47,12 @@ class FakeAcceleratorDevice final : public AcceleratorDevice {
         return PinnedHostBuffer();
     }
 
+    bool SynchronizeEvent(void* event) const override {
+        last_event_ = event;
+        return event_succeeds_;
+    }
+    void set_event_succeeds(bool succeeds) { event_succeeds_ = succeeds; }
+    void* last_event() const { return last_event_; }
     void set_copy_succeeds(bool succeeds) { copy_succeeds_ = succeeds; }
     int32_t current_device_id() const { return current_device_id_; }
     CopyDirection last_direction() const { return last_direction_; }
@@ -60,7 +66,25 @@ class FakeAcceleratorDevice final : public AcceleratorDevice {
     mutable CopyDirection last_direction_ = CopyDirection::kAuto;
     mutable bool copy_succeeds_ = true;
     mutable int query_count_ = 0;
+    bool event_succeeds_ = false;
+    mutable void* last_event_ = nullptr;
 };
+
+TEST(RuntimeAcceleratorTest, ProducerEventRequiresARecognizingRuntime) {
+    char buffer = 0;
+    char event = 0;
+    FakeAcceleratorDevice first(AcceleratorVendor::kNvidia, &buffer, 0);
+    FakeAcceleratorDevice second(AcceleratorVendor::kAscend, &buffer, 0);
+    RuntimeAccelerator runtime({&first, &second});
+    EXPECT_FALSE(runtime.SynchronizeEvent(nullptr));
+    EXPECT_EQ(first.last_event(), nullptr);
+    EXPECT_FALSE(runtime.SynchronizeEvent(&event));
+    EXPECT_EQ(first.last_event(), &event);
+    EXPECT_EQ(second.last_event(), &event);
+    second.set_event_succeeds(true);
+    EXPECT_TRUE(runtime.SynchronizeEvent(&event));
+    EXPECT_FALSE(RuntimeAccelerator{}.SynchronizeEvent(&event));
+}
 
 TEST(RuntimeAcceleratorTest, FindDeviceForPointerReturnsMatchingDevice) {
     char device_byte = 'd';

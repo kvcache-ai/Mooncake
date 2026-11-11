@@ -21,6 +21,7 @@
 #include <thread>
 #include <unordered_map>
 #include "error.h"
+#include "integer_parser.h"
 
 namespace mooncake {
 namespace {
@@ -30,6 +31,16 @@ bool isTransferEngineEnvEnabled(const char* name) {
     if (value == nullptr) return false;
     return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
            std::strcmp(value, "off") != 0 && std::strcmp(value, "no") != 0;
+}
+
+// Producer events are only ordered by TENT transports; the classic engine
+// would silently drop the dependency.
+template <typename Requests>
+bool hasProducerEvent(const Requests& entries) {
+    for (const auto& entry : entries) {
+        if (entry.producer_event) return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -139,6 +150,8 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
+    if (protocol == "mnnvl" || protocol == "nvlink_host")
+        return ERR_NOT_IMPLEMENTED;
     impl_->applyProtocolHint(protocol);
     return init(metadata_conn_string, local_server_name, ip_or_host_name,
                 rpc_port);
@@ -212,17 +225,23 @@ int TransferEngine::freeSharedMemory(void* addr) {
 
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->submitTransfer(batch_id, entries);
 }
 
 Status TransferEngine::submitScatterTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->submitTransfer(batch_id, entries);
 }
 
 Status TransferEngine::submitTransferWithNotify(
     BatchID batch_id, const std::vector<TransferRequest>& entries,
     TransferMetadata::NotifyDesc notify_msg) {
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
 }
 
@@ -556,6 +575,7 @@ Status TransferEngine::submitScatterTransfer(
             req.target_offset = item.target_offset;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
+            req.producer_event = item.producer_event;
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransferRequiringPostSubmitCancellation(
@@ -565,6 +585,8 @@ Status TransferEngine::submitScatterTransfer(
             return Status::NotImplemented(status.message());
         return Status::Context(status.ToString());
     }
+    if (hasProducerEvent(entries))
+        return Status::NotImplemented("producer_event requires TENT");
     return impl_->submitTransfer(batch_id, entries);
 }
 
@@ -671,6 +693,8 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
+    const bool store_egm = protocol == "mnnvl" || protocol == "nvlink_host";
+    if (store_egm && !use_tent_) return ERR_NOT_IMPLEMENTED;
     if (!use_tent_) {
         impl_->applyProtocolHint(protocol);
         const int result = impl_->init(metadata_conn_string, local_server_name,
@@ -679,6 +703,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         return result;
     } else {
         auto config = buildTentConfig(metadata_conn_string, local_server_name);
+        if (store_egm) mooncake::tent::ConfigHelper::forceMnnvlEgm(*config);
         if (protocol == "tcp") {
             mooncake::tent::ConfigHelper::forceTcp(*config);
             if (!std::getenv("MC_FORCE_TCP")) {
@@ -823,7 +848,9 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         bool remote_accessible,
                                         bool update_metadata) {
     if (use_tent_) {
+        if (!impl_tent_ || !impl_tent_->available()) return ERR_CONTEXT;
         mooncake::tent::MemoryOptions option;
+        if (isStrictMnnvlEgm()) option.type = mooncake::tent::MNNVL;
         option.perm = remote_accessible ? mooncake::tent::kGlobalReadWrite
                                         : mooncake::tent::kLocalReadWrite;
         if (!location.empty() && location != kWildcardLocation)
@@ -937,6 +964,7 @@ Status TransferEngine::submitTransfer(
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
             req.intent_type = *intent;
+            req.producer_event = item.producer_event;
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransfer(batch_id, requests);
@@ -945,6 +973,8 @@ Status TransferEngine::submitTransfer(
         else
             return Status::OK();
     } else {
+        if (hasProducerEvent(entries))
+            return Status::NotImplemented("producer_event requires TENT");
         return impl_->submitTransfer(batch_id, entries);
     }
 }
@@ -969,6 +999,7 @@ Status TransferEngine::submitTransferWithNotify(
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
             req.intent_type = *intent;
+            req.producer_event = item.producer_event;
             requests.push_back(req);
         }
         mooncake::tent::Notification notifi;
@@ -980,6 +1011,8 @@ Status TransferEngine::submitTransferWithNotify(
         else
             return Status::OK();
     } else {
+        if (hasProducerEvent(entries))
+            return Status::NotImplemented("producer_event requires TENT");
         return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
     }
 }
@@ -1911,6 +1944,82 @@ Status TransferEngine::transferScatter(
     const std::vector<ScatterTransferRange>& ranges) {
     auto operation = submitScatter(ranges);
     return operation.wait();
+}
+
+bool TransferEngine::isStrictMnnvlEgm() const {
+#ifdef USE_TENT
+    return use_tent_ && impl_tent_ && impl_tent_->isStrictMnnvlEgm();
+#else
+    return false;
+#endif
+}
+
+int TransferEngine::allocateLocalMemory(void** addr, size_t length,
+                                        const std::string& location) {
+    if (!addr) return ERR_INVALID_ARGUMENT;
+    *addr = nullptr;
+#ifdef USE_TENT
+    if (isStrictMnnvlEgm()) {
+        if (!length || (location != kWildcardLocation && location != "cpu" &&
+                        location.rfind("cpu:", 0) != 0))
+            return ERR_INVALID_ARGUMENT;
+        if (location.rfind("cpu:", 0) == 0) {
+            auto node =
+                TryParseInteger<int>(std::string_view(location).substr(4));
+            if (!node || *node < 0) return ERR_INVALID_ARGUMENT;
+        }
+        mooncake::tent::MemoryOptions options;
+        options.type = mooncake::tent::MNNVL;
+        options.location = location;
+        return tentToClassicError(
+            impl_tent_->allocateLocalMemory(addr, length, options).code());
+    }
+#endif
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int TransferEngine::freeLocalMemory(void* addr) {
+#ifdef USE_TENT
+    if (isStrictMnnvlEgm())
+        return tentToClassicError(impl_tent_->freeLocalMemory(addr).code());
+#endif
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int TransferEngine::getEgmNumaNodes(std::vector<int>& nodes, bool nearest) {
+    nodes.clear();
+#ifdef USE_TENT
+    if (isStrictMnnvlEgm())
+        return tentToClassicError(
+            impl_tent_->getEgmNumaNodes(nodes, nearest).code());
+#endif
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int TransferEngine::getEgmGranularity(int node, size_t& granularity) {
+    granularity = 0;
+#ifdef USE_TENT
+    if (isStrictMnnvlEgm())
+        return tentToClassicError(
+            impl_tent_->getEgmGranularity(node, granularity).code());
+#endif
+    return ERR_NOT_IMPLEMENTED;
+}
+
+bool TransferEngine::isMnnvlExported(void* addr, size_t length) const {
+#ifdef USE_TENT
+    return isStrictMnnvlEgm() && impl_tent_->isMnnvlExported(addr, length);
+#else
+    return false;
+#endif
+}
+
+int TransferEngine::quiesce() {
+#ifdef USE_TENT
+    if (use_tent_ && impl_tent_ && impl_tent_->available())
+        return tentToClassicError(impl_tent_->quiesce().code());
+#endif
+    return ERR_NOT_IMPLEMENTED;
 }
 
 }  // namespace mooncake

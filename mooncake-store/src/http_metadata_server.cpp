@@ -58,6 +58,18 @@ void HttpMetadataServer::init_server() {
             {
                 std::lock_guard<std::mutex> lock(store_mutex_);
                 std::string key_str(key);
+                if (req.get_header_value("If-None-Match") == "*") {
+                    resp.add_header("X-Mooncake-Conditional-Put", "1");
+                    if (store_.find(key_str) != store_.end()) {
+                        // yalantinglibs has no 412 entry in its status-line
+                        // table and would emit 501 instead, so report the
+                        // failed precondition as 409.
+                        resp.set_status_and_content(
+                            status_type::conflict,
+                            "metadata already exists");
+                        return;
+                    }
+                }
                 if (key_str.find("rpc_meta") != std::string::npos) {
                     auto it = store_.find(key_str);
                     if (it != store_.end()) {

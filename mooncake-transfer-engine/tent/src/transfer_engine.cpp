@@ -84,6 +84,17 @@ Status TransferEngine::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
     return impl_->getSegmentInfo(handle, info);
 }
 
+Status TransferEngine::getMnnvlEgmInfo(std::vector<EgmNumaInfo>& info,
+                                       bool nearest) {
+    return impl_->getMnnvlEgmInfo(info, nearest);
+}
+
+Status TransferEngine::acquireMnnvlMemory(
+    SegmentID segment, uint64_t address, size_t length, int device,
+    std::shared_ptr<MappedMemory>& mapping) {
+    return impl_->acquireMnnvlMemory(segment, address, length, device, mapping);
+}
+
 Status TransferEngine::allocateLocalMemory(void** addr, size_t size,
                                            Location location) {
     return impl_->allocateLocalMemory(addr, size, location);
@@ -97,6 +108,24 @@ Status TransferEngine::allocateLocalMemory(void** addr, size_t size,
 Status TransferEngine::freeLocalMemory(void* addr) {
     return impl_->freeLocalMemory(addr);
 }
+
+bool TransferEngine::isStrictMnnvlEgm() const {
+    return impl_->isStrictMnnvlEgm();
+}
+
+Status TransferEngine::getEgmNumaNodes(std::vector<int>& nodes, bool nearest) {
+    return impl_->getEgmNumaNodes(nodes, nearest);
+}
+
+Status TransferEngine::getEgmGranularity(int node, size_t& granularity) {
+    return impl_->getEgmGranularity(node, granularity);
+}
+
+bool TransferEngine::isMnnvlExported(void* addr, size_t size) const {
+    return impl_->isMnnvlExported(addr, size);
+}
+
+Status TransferEngine::quiesce() { return impl_->quiesce(); }
 
 Status TransferEngine::registerLocalMemory(void* addr, size_t size,
                                            Permission permission) {

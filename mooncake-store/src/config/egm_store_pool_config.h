@@ -12,9 +12,14 @@
 
 namespace mooncake {
 
+inline std::string NormalizeEgmStoreProtocol(const std::string& protocol) {
+    return protocol == "nvlink_host" ? "mnnvl" : protocol;
+}
+
 struct EgmStorePoolConfig {
     bool enabled = false;
     bool auto_numa_nodes = true;
+    bool nearest_numa_node = false;
     std::vector<int> numa_nodes;
 };
 

@@ -71,5 +71,13 @@ bool RuntimeAccelerator::CopyAuto(void* dst, const void* src,
     return accelerator->Copy(dst, src, size, CopyDirection::kAuto);
 }
 
+bool RuntimeAccelerator::SynchronizeEvent(void* event) const {
+    if (!event) return false;
+    for (auto* accelerator : devices_) {
+        if (accelerator->SynchronizeEvent(event)) return true;
+    }
+    return false;
+}
+
 }  // namespace device
 }  // namespace mooncake

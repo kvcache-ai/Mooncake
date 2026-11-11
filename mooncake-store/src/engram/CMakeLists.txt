@@ -17,3 +17,7 @@ target_include_directories(
 target_link_libraries(_engram_cuda PRIVATE CUDA::cudart)
 install(TARGETS _engram_cuda LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                                      COMPONENT python)
+
+if(WITH_TE AND USE_TENT)
+  add_subdirectory(mnnvl)
+endif()

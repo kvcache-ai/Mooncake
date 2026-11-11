@@ -48,6 +48,38 @@ class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
 
+// Store owns the lifecycle; TENT alone owns the VMM allocation implementation.
+class EngineEgmAllocation {
+   public:
+    explicit EngineEgmAllocation(std::shared_ptr<TransferEngine> engine)
+        : engine_(std::move(engine)) {}
+    ~EngineEgmAllocation();
+    int Allocate(int node, size_t size);
+    int Release();
+    void *base() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return base_;
+    }
+    size_t length() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return size_;
+    }
+    std::shared_ptr<Client::MnnvlMountState> mount_state() const {
+        return mount_state_;
+    }
+
+   private:
+    friend class EgmStoreLifecycleTestPeer;
+    std::shared_ptr<TransferEngine> engine_;
+    void *base_ = nullptr;
+    size_t size_ = 0;
+    std::shared_ptr<Client::MnnvlMountState> mount_state_ =
+        std::make_shared<Client::MnnvlMountState>();
+    mutable std::mutex mutex_;
+    std::function<int()> drain_for_test_;
+    std::function<int(void *)> free_for_test_;
+};
+
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
    public:
@@ -264,6 +296,9 @@ class RealClient : public PyClient {
      * @note The buffer addresses must resolve to Store-managed registered
      * memory, either explicit register_buffer() regions or the setup-time local
      * buffer
+     * @note producer_event is an optional in-process runtime event (e.g.
+     * cudaEvent_t) recorded after the buffers were produced; see
+     * Client::BatchPut. It must stay valid until the call returns.
      */
     std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,
@@ -274,7 +309,8 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const ReplicateConfig &config, bool stage_nonlocal);
+        const ReplicateConfig &config, bool stage_nonlocal,
+        void *producer_event = nullptr);
 
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
@@ -833,7 +869,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{},
-        bool stage_nonlocal = false);
+        bool stage_nonlocal = false, void *producer_event = nullptr);
 
     tl::expected<void, ErrorCode> put_parts_internal(
         const std::string &key,
@@ -1067,9 +1103,10 @@ class RealClient : public PyClient {
         size_t size = 0;
         std::string protocol;
         std::shared_ptr<RegisteredPinnedRegion> pinned_region;
+        std::shared_ptr<EngineEgmAllocation> egm_owner;
     };
 
-    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
+    bool FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
 
     std::vector<tl::expected<void, ErrorCode>>
     batch_write_from_cuda_ipc_dummy_helper(
@@ -1348,6 +1385,7 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    bool HasMnnvlSetupConflict(const std::string &requested_protocol) const;
     tl::expected<std::string, ErrorCode> StartEmbeddedMaster(
         bool enable_ssd_offload);
 
@@ -1476,6 +1514,12 @@ class RealClient : public PyClient {
 
     // Owners awaiting teardown, including mounts without a Client record.
     std::vector<std::unique_ptr<NvlinkHostNumaAllocation>> egm_segment_ptrs_;
+    // Includes failed/uncertain setup and dynamic mounts awaiting
+    // reconciliation.
+    std::vector<std::shared_ptr<EngineEgmAllocation>> engine_egm_segment_ptrs_;
+    std::vector<int> engine_egm_numa_nodes_;
+    bool engine_egm_nearest_ = false;
+    friend class EgmStoreLifecycleTestPeer;
 
     void ReleaseMountedSegmentRecord(const std::string &segment_id);
     void ReleaseAllMountedSegmentRecords();
