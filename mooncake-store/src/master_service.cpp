@@ -2187,7 +2187,7 @@ void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
     // Gate the snapshot on the publisher being live: this runs on every
     // read-write metadata access, and the VisitReplicas walk plus vector
     // allocation is pure overhead when KV events are off (the default).
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
+    const auto previous_kv_media = KvMediaSnapshot(metadata, true);
     // Erase invalid memory replicas (those with unmounted segments). No
     // client_mutex_ needed since we only check memory replicas.
     std::vector<ReplicaID> removed_replica_ids;
@@ -7776,7 +7776,7 @@ bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id, ObjectMetadata& metadata,
     route::ObjectState& state,
     const std::function<bool(const Replica&)>& is_stale) {
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
+    const auto previous_kv_media = KvMediaSnapshot(metadata, true);
     std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(metadata, is_stale,
                                           &removed_replica_ids);
@@ -11439,17 +11439,19 @@ KvEventConfig MasterService::BuildKvEventConfig(
 // Every non-memory replica type, including DFS, is normalized to the "disk"
 // medium so subscribers see one logical tier per storage class.
 std::vector<std::string> MasterService::KvMediaForMetadata(
-    const ObjectMetadata& metadata) {
+    const ObjectMetadata& metadata, bool include_invalid_handles) {
     bool has_cpu = false;
     bool has_disk = false;
     metadata.VisitReplicas(
         [](const Replica& replica) { return replica.is_completed(); },
         [&](const Replica& replica) {
             if (replica.is_memory_replica() &&
-                !replica.has_invalid_mem_handle()) {
+                (include_invalid_handles ||
+                 !replica.has_invalid_mem_handle())) {
                 has_cpu = true;
             } else if (replica.is_nof_replica() &&
-                       !replica.has_invalid_nof_handle()) {
+                       (include_invalid_handles ||
+                        !replica.has_invalid_nof_handle())) {
                 has_disk = true;
             } else if (replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||
@@ -11477,10 +11479,16 @@ std::vector<std::string> MasterService::KvMediaForRemoval(
     // can run after a replica has moved to PROCESSING or REMOVED, and both
     // states still had their medium announced to subscribers, so both must
     // appear in the removal delta or the tier is never retracted.
+    // Segment teardown also invalidates allocation handles before metadata is
+    // swept. Such COMPLETE replicas have already disappeared from the readable
+    // media set, but their formerly announced tier still needs a retraction.
     metadata.VisitReplicas(
         [](const Replica& replica) {
             return replica.status() == ReplicaStatus::REMOVED ||
-                   replica.status() == ReplicaStatus::PROCESSING;
+                   replica.status() == ReplicaStatus::PROCESSING ||
+                   (replica.is_completed() &&
+                    (replica.has_invalid_mem_handle() ||
+                     replica.has_invalid_nof_handle()));
         },
         [&](const Replica& replica) {
             if (replica.is_memory_replica()) {

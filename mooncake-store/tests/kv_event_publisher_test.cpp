@@ -538,6 +538,64 @@ TEST(KvEventPublisherTest, MemoryEvictionRetractsLastReplica) {
     }
 }
 
+TEST(KvEventPublisherTest, SegmentUnmountRetractsOnlyLastCpuReplica) {
+    for (int replica_count : {1, 2}) {
+        SCOPED_TRACE(replica_count);
+        const std::string endpoint = MakeIpcEndpoint();
+        MasterServiceConfig config;
+        config.enable_kv_events = true;
+        config.kv_events_bind_endpoint = endpoint;
+        config.kv_events_backend_id = "unmount-test";
+        MasterService service(config);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+
+        std::vector<Segment> segments;
+        std::vector<UUID> clients;
+        for (int i = 0; i < replica_count; ++i) {
+            Segment segment;
+            segment.id = generate_uuid();
+            segment.name = "kv_event_unmount_segment_" + std::to_string(i);
+            segment.te_endpoint = segment.name;
+            segment.base = 0x300000000 + i * 0x10000000;
+            segment.size = 16 * 1024 * 1024;
+            clients.push_back(generate_uuid());
+            ASSERT_TRUE(service.MountSegment(segment, clients.back()));
+            segments.push_back(segment);
+        }
+        const std::string key = "kv_event_unmount_key";
+        ReplicateConfig replication;
+        replication.replica_num = replica_count;
+        ASSERT_TRUE(service.PutStart(clients[0], key, TenantId::Default(), 1024,
+                                     replication));
+        ASSERT_TRUE(service.PutEnd(clients[0], key, TenantId::Default(),
+                                   ReplicaType::MEMORY));
+        msgpack::object_handle payload;
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "stored", key);
+
+        for (int i = 0; i < replica_count; ++i) {
+            ASSERT_TRUE(service.UnmountSegment(segments[i].id, clients[i]));
+            const auto exists = service.ExistKey(key, TenantId::Default());
+            ASSERT_TRUE(exists.has_value());
+            EXPECT_EQ(*exists, i + 1 < replica_count);
+            if (i + 1 < replica_count) {
+                EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+            }
+        }
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "removed", key);
+        EXPECT_EQ(MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
+                  "cpu");
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+        // Repeated unmount is idempotent, including its event side effects.
+        ASSERT_TRUE(service.UnmountSegment(segments.back().id, clients.back()));
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+    }
+}
+
 // A medium that survives the mutation must not be announced as removed, even
 // though the caller lists it as previously present. This is what keeps a
 // partial eviction from retracting the tier that still holds a replica.
