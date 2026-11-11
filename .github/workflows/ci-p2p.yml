@@ -228,7 +228,7 @@ jobs:
     - name: Verify wheel file exists
       run: |
         ls -la mooncake-wheel/dist/
-        if [ ! -f mooncake-wheel/dist/*.whl ]; then
+        if ! compgen -G "mooncake-wheel/dist/*.whl" >/dev/null; then
           echo "ERROR: No wheel file found in mooncake-wheel/dist/"
           exit 1
         fi
@@ -524,6 +524,10 @@ jobs:
         name: mooncake-wheel-ubuntu-p2p-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
+  # TODO: During UPG1-F22-B04 (CI/nightly migration), move this legacy Docker
+  # check to U's nightly flow. Remove this job and its Buildx setup after the
+  # replacement validates P2P image builds. Keep Buildx setup wherever the
+  # replacement still uses docker buildx build.
   build-docker-p2p:
     name: Build Docker Image (P2P)
     if: >-
@@ -535,7 +539,7 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      uses: docker/setup-buildx-action@v3
 
     - name: Build Docker image
       run: docker build --build-arg MOONCAKE_STORE_CLIENT_ARCH=p2p -t mooncake-app-p2p .
