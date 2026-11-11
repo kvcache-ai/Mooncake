@@ -117,8 +117,7 @@ bool ShmHelper::cleanup() {
     std::lock_guard<std::mutex> lock(shm_mutex_);
     bool ret = true;
     for (auto& shm : shms_) {
-        std::lock_guard<std::mutex> registration_lock(
-            shm->registration_mutex);
+        std::lock_guard<std::mutex> registration_lock(shm->registration_mutex);
         if (shm->fd != -1) {
             close(shm->fd);
             shm->fd = -1;

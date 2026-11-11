@@ -1206,8 +1206,7 @@ std::optional<BufferHandle> DummyClient::allocate_shared_buffer(size_t size) {
         {
             std::lock_guard<std::mutex> lock(shm->registration_mutex);
             if (shm->registered) {
-                LOG(ERROR) << "Retaining registered BufferPool SHM at "
-                           << ptr;
+                LOG(ERROR) << "Retaining registered BufferPool SHM at " << ptr;
                 return;
             }
         }
@@ -2184,8 +2183,7 @@ void DummyClient::ping_thread_main() {
                 for (const auto& shm_ptr : shms) {
                     std::lock_guard<std::mutex> registration_lock(
                         shm_ptr->registration_mutex);
-                    if (shm_ptr->base_addr != nullptr &&
-                        shm_ptr->registered) {
+                    if (shm_ptr->base_addr != nullptr && shm_ptr->registered) {
                         if (globalConfig().ascend_agent_mode) {
                             if (register_ascend_shm(shm_ptr.get(),
                                                     shm_ptr->is_local) != 0) {

@@ -410,8 +410,9 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
             handle = std::make_shared<BufferHandle>(std::move(*allocation));
             overflow_registered = true;
         } else if (auto alloc_result =
-                py_client_->client_buffer_allocator_->allocate(allocation_size);
-            alloc_result.has_value()) {
+                       py_client_->client_buffer_allocator_->allocate(
+                           allocation_size);
+                   alloc_result.has_value()) {
             handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
         } else {
             handle = allocate_overflow_unlocked(allocation_size);
@@ -481,8 +482,8 @@ void BufferPoolNative::unregister_overflow_unlocked(const Region &region) {
         reinterpret_cast<uintptr_t>(region.handle->ptr())));
     if (ret != 0) {
         auto dummy = std::dynamic_pointer_cast<DummyClient>(py_client_);
-        if (dummy && dummy->shared_buffer_is_unregistered(
-                         region.handle->ptr())) {
+        if (dummy &&
+            dummy->shared_buffer_is_unregistered(region.handle->ptr())) {
             return;
         }
         throw std::runtime_error("overflow buffer unregistration failed");
