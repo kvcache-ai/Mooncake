@@ -10822,11 +10822,22 @@ fn default_put_spills_to_remote_after_local_capacity_is_exhausted() {
         .build(test_future_expiry_ms())
         .expect("client build should succeed");
 
+    // The compatibility facade defaults to the C++ Store placement
+    // (prefer_local = false); pin the writer's own segment so the local tier
+    // fills first and the second put exercises the spill path.
     let first = client
-        .put("spill-a", b"abcdefgh")
+        .put_with_policy(
+            "spill-a",
+            b"abcdefgh",
+            &ReplicationPolicy::new().prefer_local(true),
+        )
         .expect("first put should succeed");
     let second = client
-        .put("spill-b", b"ijklmnop")
+        .put_with_policy(
+            "spill-b",
+            b"ijklmnop",
+            &ReplicationPolicy::new().prefer_local(true),
+        )
         .expect("second put should succeed");
 
     assert_eq!(first.replicas[0].owner, client.runtime_id().clone());
@@ -17449,8 +17460,13 @@ fn hot_upgrade_evacuation_pins_owned_routes_to_successor() {
         .register_local_memory()
         .expect("reader memory should register");
 
+    // Own the seeded replica so the handoff has an owned route to pin.
     predecessor
-        .put("pin-upgrade-key", b"pin-upgrade-payload")
+        .put_with_policy(
+            "pin-upgrade-key",
+            b"pin-upgrade-payload",
+            &ReplicationPolicy::new().prefer_local(true),
+        )
         .expect("seed put should succeed");
     let initial = predecessor
         .query_route("pin-upgrade-key")

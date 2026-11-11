@@ -785,6 +785,7 @@ fn protocol_name(protocol: &Protocol) -> &'static str {
     match protocol {
         Protocol::Tcp => "tcp",
         Protocol::Rdma => "rdma",
+        Protocol::Ascend => "ascend",
     }
 }
 
