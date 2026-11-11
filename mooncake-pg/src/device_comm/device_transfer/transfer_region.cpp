@@ -102,9 +102,9 @@ PGResult<void> DeviceTransferRegion::allocateBacking(size_t bytes) {
 #if CUDA_VERSION >= 12030
     // FABRIC VMM lets TE P2P and NCCL share the same allocation.
     int fabric_supported = 0;
-    cuDeviceGetAttribute(&fabric_supported,
-                         CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                         device_index_);
+    MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
+        &fabric_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+        device_index_);
     if (fabric_supported) {
         CUmemAllocationProp prop{};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -114,7 +114,7 @@ PGResult<void> DeviceTransferRegion::allocateBacking(size_t bytes) {
             CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR |
             CU_MEM_HANDLE_TYPE_FABRIC);
         int rdma_supported = 0;
-        PG_TRY_CU(cuDeviceGetAttribute(
+        PG_TRY_CU(MOONCAKE_CUDA_SYMBOL(cuDeviceGetAttribute)(
             &rdma_supported,
             CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
             device_index_));
@@ -122,7 +122,7 @@ PGResult<void> DeviceTransferRegion::allocateBacking(size_t bytes) {
 
         // Match NCCL's user-buffer requirements without depending on libnccl.
         size_t granularity = 0;
-        PG_TRY_CU(cuMemGetAllocationGranularity(
+        PG_TRY_CU(MOONCAKE_CUDA_SYMBOL(cuMemGetAllocationGranularity)(
             &granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
         PG_VALIDATE_STATE(granularity != 0,
                           "VMM allocation granularity is zero");
@@ -132,19 +132,23 @@ PGResult<void> DeviceTransferRegion::allocateBacking(size_t bytes) {
                         "device region size overflows VMM alignment");
         size_ = bytes + padding;
 
-        const auto result = cuMemCreate(&handle_, size_, &prop, 0);
+        const auto result =
+            MOONCAKE_CUDA_SYMBOL(cuMemCreate)(&handle_, size_, &prop, 0);
         if (result != CUDA_ERROR_NOT_PERMITTED &&
             result != CUDA_ERROR_NOT_SUPPORTED) {
             PG_TRY_CU(result);
             CUdeviceptr address = 0;
-            PG_TRY_CU(cuMemAddressReserve(&address, size_, granularity, 0, 0));
+            PG_TRY_CU(MOONCAKE_CUDA_SYMBOL(cuMemAddressReserve)(
+                &address, size_, granularity, 0, 0));
             addr_ = reinterpret_cast<void*>(address);
-            PG_TRY_CU(cuMemMap(address, size_, 0, handle_, 0));
+            PG_TRY_CU(
+                MOONCAKE_CUDA_SYMBOL(cuMemMap)(address, size_, 0, handle_, 0));
             mapped_ = true;
             CUmemAccessDesc access{};
             access.location = prop.location;
             access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            PG_TRY_CU(cuMemSetAccess(address, size_, &access, 1));
+            PG_TRY_CU(MOONCAKE_CUDA_SYMBOL(cuMemSetAccess)(address, size_,
+                                                           &access, 1));
             return {};
         }
     }
@@ -218,15 +222,16 @@ PGResult<void> DeviceTransferRegion::release() {
         addr_ = nullptr;
     } else {
         if (mapped_) {
-            PG_TRY_CU(cuMemUnmap(reinterpret_cast<CUdeviceptr>(addr_), size_));
+            PG_TRY_CU(MOONCAKE_CUDA_SYMBOL(cuMemUnmap)(
+                reinterpret_cast<CUdeviceptr>(addr_), size_));
             mapped_ = false;
         }
         if (addr_) {
-            PG_TRY_CU(
-                cuMemAddressFree(reinterpret_cast<CUdeviceptr>(addr_), size_));
+            PG_TRY_CU(MOONCAKE_CUDA_SYMBOL(cuMemAddressFree)(
+                reinterpret_cast<CUdeviceptr>(addr_), size_));
             addr_ = nullptr;
         }
-        PG_TRY_CU(cuMemRelease(handle_));
+        PG_TRY_CU(MOONCAKE_CUDA_SYMBOL(cuMemRelease)(handle_));
         handle_ = 0;
     }
     size_ = 0;
