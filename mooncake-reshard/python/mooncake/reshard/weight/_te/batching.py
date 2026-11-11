@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from itertools import product
 
 from ...transfer_engine import TransferBatch, TransferBatchRange
 from ..planner import BoundWeightFragment, LiveTransferOperation, TransferRegion
@@ -38,26 +37,18 @@ def iter_transfer_batches(
             next(iter(operation.iter_segments(max_segments=max_region_segments)))
             source_stride = operation.source_strides[-1]
             target_stride = operation.target_strides[-1]
-            for prefix in product(
-                *(range(count) for count in operation.outer_loop_counts[:-1])
-            ):
+            prefix_counts = operation.outer_loop_counts[:-1]
+            prefix_indices = [0] * len(prefix_counts)
+            prefix_source_offset = (
+                source.storage_offset_bytes + operation.source_base_offset
+            )
+            prefix_target_offset = (
+                target.storage_offset_bytes + operation.target_base_offset
+            )
+            while True:
                 remaining = operation.outer_loop_counts[-1]
-                source_offset = (
-                    source.storage_offset_bytes
-                    + operation.source_base_offset
-                    + sum(
-                        index * stride
-                        for index, stride in zip(prefix, operation.source_strides)
-                    )
-                )
-                target_offset = (
-                    target.storage_offset_bytes
-                    + operation.target_base_offset
-                    + sum(
-                        index * stride
-                        for index, stride in zip(prefix, operation.target_strides)
-                    )
-                )
+                source_offset = prefix_source_offset
+                target_offset = prefix_target_offset
                 while remaining:
                     count = min(remaining, max_batch_operations - batch_operation_count)
                     source_stop = source_offset + count * source_stride
@@ -87,6 +78,22 @@ def iter_transfer_batches(
                         )
                         ranges = []
                         batch_operation_count = 0
+                # Carry the prefix without materializing any dimension's pool.
+                for dim in range(len(prefix_indices) - 1, -1, -1):
+                    prefix_indices[dim] += 1
+                    prefix_source_offset += operation.source_strides[dim]
+                    prefix_target_offset += operation.target_strides[dim]
+                    if prefix_indices[dim] < prefix_counts[dim]:
+                        break
+                    prefix_indices[dim] = 0
+                    prefix_source_offset -= (
+                        prefix_counts[dim] * operation.source_strides[dim]
+                    )
+                    prefix_target_offset -= (
+                        prefix_counts[dim] * operation.target_strides[dim]
+                    )
+                else:
+                    break
             continue
         source_offsets: list[int] = []
         target_offsets: list[int] = []
