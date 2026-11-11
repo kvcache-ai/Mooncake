@@ -92,10 +92,12 @@ int main() {
     }
     if (exported != 0 || !waited || !WIFEXITED(status) ||
         WEXITSTATUS(status) != 0) {
-        std::fprintf(stderr, "CUDA IPC failed: exporter=%d importer_status=%d\n",
+        std::fprintf(stderr,
+                     "CUDA IPC failed: exporter=%d importer_status=%d\n",
                      exported, status);
         return 1;
     }
-    std::puts("PASS: uninitialized importer resolved UUID and read exact bytes");
+    std::puts(
+        "PASS: uninitialized importer resolved UUID and read exact bytes");
     return 0;
 }
