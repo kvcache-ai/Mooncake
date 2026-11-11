@@ -123,7 +123,7 @@ TEST(TcpTransportConfigTest, RejectsZeroWorkersAndAllowsRetry) {
 }
 
 TEST(TcpTransportConfigTest, RejectsInvalidDataRpcTimeout) {
-    for (int64_t timeout_ms : {0LL, -2LL}) {
+    for (int64_t timeout_ms : {0LL, -1LL, -2LL}) {
         auto conf = std::make_shared<Config>();
         conf->set("transports/tcp/data_rpc_timeout_ms", timeout_ms);
 
@@ -135,18 +135,6 @@ TEST(TcpTransportConfigTest, RejectsInvalidDataRpcTimeout) {
         EXPECT_TRUE(status.IsInvalidArgument())
             << "timeout_ms=" << timeout_ms << ": " << status.ToString();
     }
-}
-
-TEST(TcpTransportConfigTest, AllowsDisabledDataRpcTimeout) {
-    auto conf = std::make_shared<Config>();
-    conf->set("transports/tcp/data_rpc_timeout_ms", -1LL);
-
-    TcpTransport transport;
-    auto metadata = makeP2PMetadata();
-    std::string name = "tcp-config-disabled-timeout";
-    ASSERT_TRUE(transport.install(name, metadata, nullptr, conf).ok());
-    EXPECT_EQ(TcpTransportTestPeer::params(transport).data_rpc_timeout_ms, -1);
-    EXPECT_TRUE(transport.uninstall().ok());
 }
 
 TEST(TcpTransportConfigTest, DataRpcTimeoutBoundsSlowSendAndRecv) {

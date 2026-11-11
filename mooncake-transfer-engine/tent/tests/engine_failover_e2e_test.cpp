@@ -394,7 +394,10 @@ TransferStatus pollUntilDone(
             return ts;
         }
         if (ts.s == TransferStatusEnum::COMPLETED ||
-            ts.s == TransferStatusEnum::FAILED) {
+            ts.s == TransferStatusEnum::FAILED ||
+            ts.s == TransferStatusEnum::TIMEOUT ||
+            ts.s == TransferStatusEnum::CANCELED ||
+            ts.s == TransferStatusEnum::INVALID) {
             return ts;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -697,6 +700,86 @@ TEST(EngineFailoverE2E, StatusCorruptionTriggersFailoverToSecondary) {
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(EngineFailoverE2E, TcpReadTimeoutFailsOverToSecondary) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto timeout_tcp = std::make_shared<FakeTransport>(TCP, [](const Request&) {
+        return TransferStatus{TransferStatusEnum::TIMEOUT, 0};
+    });
+    auto fallback_rdma = std::make_shared<FakeTransport>(RDMA);
+
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(timeout_tcp->install(segment_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(fallback_rdma->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, timeout_tcp);
+    engine.swapTransportForTest(RDMA, fallback_rdma);
+
+    std::vector<uint8_t> buffer(4096, 0xCE);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+
+    Request request{};
+    request.opcode = Request::READ;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = TCP;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {request}).ok());
+
+    const auto final_status = pollUntilDone(engine, batch_id, 0);
+    EXPECT_EQ(final_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(timeout_tcp->submit_calls.load(), 1);
+    EXPECT_EQ(fallback_rdma->submit_calls.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, TcpWriteTimeoutDoesNotReplayOnSecondary) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto timeout_tcp = std::make_shared<FakeTransport>(TCP, [](const Request&) {
+        return TransferStatus{TransferStatusEnum::TIMEOUT, 0};
+    });
+    auto fallback_rdma = std::make_shared<FakeTransport>(RDMA);
+
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(timeout_tcp->install(segment_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(fallback_rdma->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, timeout_tcp);
+    engine.swapTransportForTest(RDMA, fallback_rdma);
+
+    std::vector<uint8_t> buffer(4096, 0xCF);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = TCP;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {request}).ok());
+
+    const auto final_status = pollUntilDone(engine, batch_id, 0);
+    EXPECT_EQ(final_status.s, TransferStatusEnum::TIMEOUT);
+    EXPECT_EQ(timeout_tcp->submit_calls.load(), 1);
+    EXPECT_EQ(fallback_rdma->submit_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledLeavesTaskFailed) {

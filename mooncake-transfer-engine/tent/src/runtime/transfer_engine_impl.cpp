@@ -3386,14 +3386,22 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
         task_status.s == CANCELED) {
         if (task.failure_stage < 0) task.failure_stage = 1;
     }
+    // A standard-TCP READ is safe to replay after its per-attempt budget is
+    // exhausted.  A WRITE timeout remains non-replayable because the remote
+    // side may already have applied it even when the acknowledgement is lost.
+    const bool retryable_tcp_read_timeout =
+        task_status.s == TIMEOUT && task.type == TCP &&
+        task.request.opcode == Request::READ;
     if (!allow_failover || task.cancel_requested || task.suppress_failover ||
-        task_status.s != FAILED || task.type == UNSPEC)
+        (task_status.s != FAILED && !retryable_tcp_read_timeout) ||
+        task.type == UNSPEC)
         return;
 
     // The current physical transport attempt has failed even if the logical
     // request will recover through failover. Close it before task.type is
     // overwritten by resubmitTransferTask().
-    finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+    finishTransportAttempt(task, task_status.s,
+                           std::chrono::steady_clock::now());
     // A synchronous rejection dispatches no work, so keep trying candidates
     // within the original budget. An accepted attempt is polled on the next
     // progress step, rather than spinning here until it completes.

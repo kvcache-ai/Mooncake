@@ -62,6 +62,18 @@ inline std::optional<TransferIntent> TransferIntentFromInt(int intent) {
     }
 }
 
+inline bool IsTerminalTransferFailure(TransferStatusEnum status) {
+    switch (status) {
+        case TransferStatusEnum::FAILED:
+        case TransferStatusEnum::CANCELED:
+        case TransferStatusEnum::INVALID:
+        case TransferStatusEnum::TIMEOUT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /**
  * @brief Stream operator for TransferStrategy
  */

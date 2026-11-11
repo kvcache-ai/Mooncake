@@ -91,6 +91,15 @@ TEST(TransferIntentTest, ParsesLegacyIntegerValues) {
     EXPECT_FALSE(TransferIntentFromInt(4).has_value());
 }
 
+TEST(TransferStatusTest, ClassifiesTimeoutAsTerminalFailure) {
+    EXPECT_TRUE(IsTerminalTransferFailure(TransferStatusEnum::FAILED));
+    EXPECT_TRUE(IsTerminalTransferFailure(TransferStatusEnum::CANCELED));
+    EXPECT_TRUE(IsTerminalTransferFailure(TransferStatusEnum::INVALID));
+    EXPECT_TRUE(IsTerminalTransferFailure(TransferStatusEnum::TIMEOUT));
+    EXPECT_FALSE(IsTerminalTransferFailure(TransferStatusEnum::COMPLETED));
+    EXPECT_FALSE(IsTerminalTransferFailure(TransferStatusEnum::WAITING));
+}
+
 TEST(TransferScatterApiTest, SubmitterOwnsScatterOperation) {
     using ScatterRanges = std::vector<TransferEngine::ScatterTransferRange>;
     static_assert(std::is_same_v<

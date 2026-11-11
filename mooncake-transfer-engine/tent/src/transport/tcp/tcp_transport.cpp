@@ -88,10 +88,9 @@ Status TcpTransport::install(std::string &local_segment_name,
                       params_.max_concurrent_tasks);
     }
 
-    if (params_.data_rpc_timeout_ms == 0 || params_.data_rpc_timeout_ms < -1) {
+    if (params_.data_rpc_timeout_ms <= 0) {
         return Status::InvalidArgument(
-            "transports/tcp/data_rpc_timeout_ms must be positive, or -1 to "
-            "disable the per-attempt timeout" LOC_MARK);
+            "transports/tcp/data_rpc_timeout_ms must be positive" LOC_MARK);
     }
 
     if (params_.max_concurrent_tasks == 0) {

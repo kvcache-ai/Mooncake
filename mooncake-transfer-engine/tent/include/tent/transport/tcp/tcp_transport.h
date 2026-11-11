@@ -36,7 +36,7 @@ struct TcpParams {
     size_t max_retry_count = 3;
     uint64_t retry_base_delay_ms = 100;    // 100ms initial backoff
     uint64_t retry_max_delay_ms = 2'000;   // 2s max backoff
-    int64_t data_rpc_timeout_ms = 30'000;  // -1 disables the attempt timeout
+    int64_t data_rpc_timeout_ms = 30'000;  // Per-attempt timeout; must be > 0.
     size_t max_concurrent_tasks = 16;      // worker thread pool size
 };
 
