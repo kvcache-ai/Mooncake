@@ -4960,6 +4960,74 @@ RealClient::resolve_ranged_read_metadata(
                                                         client_->Query(key));
 }
 
+RealClient::RangedReadMetadataPlan
+RealClient::resolve_ranged_read_metadata_batch(
+    const std::vector<std::string> &keys,
+    const QueryResultCache *query_result_cache, RangedReadMetadataMode mode) {
+    RangedReadMetadataPlan plan{
+        .entries = {}, .resolved_at = std::chrono::steady_clock::now()};
+
+    std::vector<std::string> query_keys;
+    query_keys.reserve(keys.size());
+    // A caller-supplied cache is the request's own view of the key set, so a
+    // live entry -- success or cached error -- is reused as-is.
+    for (const auto &key : keys) {
+        if (plan.entries.contains(key)) continue;
+        if (query_result_cache) {
+            auto cached = query_result_cache->find(key);
+            if (cached != query_result_cache->end() &&
+                (!cached->second || !cached->second->IsLeaseExpired())) {
+                plan.entries.emplace(
+                    key, build_ranged_read_metadata_from_query_result(
+                             key, cached->second));
+                continue;
+            }
+            if (mode == RangedReadMetadataMode::kSnapshot) {
+                // The caller owns a fixed snapshot; report why the entry
+                // cannot be served instead of reaching the Master.
+                plan.entries.emplace(
+                    key, tl::unexpected(cached == query_result_cache->end()
+                                            ? ErrorCode::INVALID_PARAMS
+                                            : ErrorCode::LEASE_EXPIRED));
+                continue;
+            }
+            query_keys.push_back(key);
+            continue;
+        }
+        if (mode == RangedReadMetadataMode::kSnapshot) {
+            plan.entries.emplace(key,
+                                 tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        query_keys.push_back(key);
+    }
+
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        for (const auto &key : query_keys) {
+            plan.entries.emplace(key,
+                                 tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        return plan;
+    }
+    if (query_keys.empty()) return plan;
+
+    // Client::BatchQuery is the generic batching layer: it owns any payload
+    // splitting and already reports one result per requested key, so a ranged
+    // read issues a single planning request regardless of key count.
+    auto queries = client_->BatchQuery(query_keys);
+    for (size_t i = 0; i < query_keys.size(); ++i) {
+        auto query_result = i < queries.size()
+                                ? std::move(queries[i])
+                                : tl::expected<QueryResult, ErrorCode>(
+                                      tl::unexpected(ErrorCode::RPC_FAIL));
+        plan.entries.emplace(query_keys[i],
+                             build_ranged_read_metadata_from_query_result(
+                                 query_keys[i], std::move(query_result)));
+    }
+    return plan;
+}
+
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, const RangedReadMetadata &metadata,
@@ -5310,69 +5378,86 @@ RealClient::get_into_ranges_internal(
                all_dst_offsets[i][j].size() == all_sizes[i][j].size();
     };
 
-    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
-        metadata_cache;
     std::unordered_set<std::string_view> seen_keys;
-    std::vector<std::string> query_keys;
-    // Resolve each structurally valid key once before planning transfers.
-    // Reuse cached errors and live descriptors, and never query the Master
-    // for a snapshot read, even when its entry is missing or expired.
+    std::vector<std::string> plan_keys;
+    // Resolve every structurally valid key once, in first-seen order, before
+    // planning transfers. Duplicate keys across buffers share one entry. A
+    // snapshot read resolves without ever touching the Master.
     for (size_t i = 0; i < buffer_count; ++i) {
         if (!buffer_is_readable(i)) continue;
         const auto &keys = all_keys[i];
         for (size_t j = 0; j < keys.size(); ++j) {
-            if (!key_ranges_match(i, j) || !seen_keys.emplace(keys[j]).second) {
-                continue;
+            if (key_ranges_match(i, j) && seen_keys.emplace(keys[j]).second) {
+                plan_keys.push_back(keys[j]);
             }
-            if (query_result_cache) {
-                auto cached = query_result_cache->find(keys[j]);
-                if (cached != query_result_cache->end() &&
-                    (!cached->second || !cached->second->IsLeaseExpired())) {
-                    metadata_cache.emplace(
-                        keys[j], build_ranged_read_metadata_from_query_result(
-                                     keys[j], cached->second));
-                    continue;
-                }
-            }
-            if (!allow_query_refresh) {
-                metadata_cache.emplace(keys[j],
-                                       resolve_ranged_read_metadata(
-                                           keys[j], query_result_cache, false));
-                continue;
-            }
-            query_keys.push_back(keys[j]);
         }
     }
 
-    constexpr size_t kMetadataQueryBatchSize = 128;
-    for (size_t offset = 0; offset < query_keys.size();
-         offset += kMetadataQueryBatchSize) {
-        const size_t end =
-            std::min(offset + kMetadataQueryBatchSize, query_keys.size());
-        std::vector<std::string> chunk(query_keys.begin() + offset,
-                                       query_keys.begin() + end);
-        auto queries = client_->BatchQuery(chunk);
-        if (queries.size() != chunk.size()) {
-            LOG(ERROR) << "Ranged read BatchQuery response size mismatch: "
-                       << "expected=" << chunk.size()
-                       << ", got=" << queries.size();
-            for (const auto &key : chunk) {
-                metadata_cache.emplace(key,
-                                       tl::unexpected(ErrorCode::RPC_FAIL));
-            }
-            continue;
+    auto metadata_plan = resolve_ranged_read_metadata_batch(
+        plan_keys, query_result_cache,
+        allow_query_refresh ? RangedReadMetadataMode::kRefreshable
+                            : RangedReadMetadataMode::kSnapshot);
+    auto &metadata_cache = metadata_plan.entries;
+
+    // A ranged read resolves all of its metadata before any range runs, so a
+    // descriptor can be most of a lease old by the time its ranges execute --
+    // and the file-backed paths only reject an expired lease after the read
+    // has already been served. Renew halfway through the lease counted from
+    // when it was obtained (the plan time for a planned entry, the renewal
+    // time for a renewed one), so resolving every key up front never makes a
+    // later range more likely to fail with LEASE_EXPIRED.
+    auto ranged_read_refresh_at =
+        [](std::chrono::steady_clock::time_point obtained_at,
+           const QueryResult &query_result) {
+            const auto lease = query_result.lease_timeout - obtained_at;
+            if (lease <= std::chrono::nanoseconds::zero()) return obtained_at;
+            return obtained_at + lease / 2;
+        };
+
+    // An operation-owned lease for one key's ranges. It borrows the planned
+    // descriptor until the operation renews it, so a snapshot read pays
+    // neither a copy nor an RPC.
+    struct RangedReadLease {
+        const RangedReadMetadata *metadata;
+        std::optional<RangedReadMetadata> renewal;
+        std::chrono::steady_clock::time_point refresh_at;
+    };
+    auto acquire_ranged_read_lease = [&](const RangedReadMetadata &metadata) {
+        return RangedReadLease{
+            .metadata = &metadata,
+            .renewal = std::nullopt,
+            .refresh_at = ranged_read_refresh_at(metadata_plan.resolved_at,
+                                                 metadata.query_result)};
+    };
+    // Returns the error that made the descriptor unusable, or nullopt when it
+    // is still fresh enough to serve the next range. A snapshot read never
+    // renews: the caller owns its lease and the request stays off the Master.
+    auto renew_ranged_read_lease =
+        [&](const std::string &key,
+            RangedReadLease &lease) -> std::optional<ErrorCode> {
+        if (!allow_query_refresh ||
+            std::chrono::steady_clock::now() < lease.refresh_at) {
+            return std::nullopt;
         }
-        for (size_t j = 0; j < chunk.size(); ++j) {
-            metadata_cache.emplace(chunk[j],
-                                   build_ranged_read_metadata_from_query_result(
-                                       chunk[j], std::move(queries[j])));
-        }
-    }
+        auto renewed = resolve_ranged_read_metadata(key);
+        if (!renewed) return renewed.error();
+        const auto renewed_at = std::chrono::steady_clock::now();
+        // Replica descriptors are not assignable, so construct in place.
+        lease.renewal.reset();
+        lease.renewal.emplace(std::move(*renewed));
+        lease.metadata = &*lease.renewal;
+        lease.refresh_at =
+            ranged_read_refresh_at(renewed_at, lease.metadata->query_result);
+        return std::nullopt;
+    };
 
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     struct ScatterLease {
         std::chrono::steady_clock::time_point expires_at;
+        // When this lease must be renewed: the midpoint of the lease measured
+        // from the plan time, matching the ranged-read renewal policy above.
+        std::chrono::steady_clock::time_point refresh_at;
         std::optional<ErrorCode> error;
     };
     std::unordered_map<std::string, ScatterLease> scatter_leases;
@@ -5441,57 +5526,38 @@ RealClient::get_into_ranges_internal(
                         }
                         continue;
                     }
-                    // Planning cache entries may be close to expiry. Renew and
-                    // reselect the replica before copying into device memory.
-                    auto refresh_result = resolve_ranged_read_metadata(keys[j]);
-                    if (!refresh_result) {
-                        std::fill(range_results.begin(), range_results.end(),
-                                  tl::unexpected(refresh_result.error()));
-                        continue;
-                    }
-                    std::optional<RangedReadMetadata> refreshed_metadata;
-                    refreshed_metadata.emplace(std::move(*refresh_result));
-                    auto lease_refresh_at =
-                        [](const RangedReadMetadata &value) {
-                            const auto now = std::chrono::steady_clock::now();
-                            return now +
-                                   (value.query_result.lease_timeout - now) / 2;
-                        };
-                    auto refresh_at = lease_refresh_at(*refreshed_metadata);
+                    // Copying into device memory never re-checks the lease, so
+                    // keep the operation-owned renewal here too.
+                    auto lease = acquire_ranged_read_lease(metadata);
                     for (size_t k = 0; k < range_results.size(); ++k) {
-                        // Renew halfway through the remaining lease in long
-                        // batches.
                         const size_t dst_offset = dst_offsets[k];
                         if (dst_offset > capacities[i] ||
                             sizes[k] > capacities[i] - dst_offset) {
                             continue;
                         }
-                        if (std::chrono::steady_clock::now() >= refresh_at) {
-                            auto next_refresh_result =
-                                resolve_ranged_read_metadata(keys[j]);
-                            if (!next_refresh_result) {
-                                std::fill(range_results.begin() + k,
-                                          range_results.end(),
-                                          tl::unexpected(
-                                              next_refresh_result.error()));
-                                break;
-                            }
-                            refreshed_metadata.emplace(
-                                std::move(*next_refresh_result));
-                            refresh_at = lease_refresh_at(*refreshed_metadata);
+                        if (auto error =
+                                renew_ranged_read_lease(keys[j], lease);
+                            error.has_value()) {
+                            std::fill(range_results.begin() + k,
+                                      range_results.end(),
+                                      tl::unexpected(*error));
+                            break;
                         }
                         range_results[k] = execute_ranged_read(
                             keys[j], buffers[i], dst_offset, src_offsets[k],
-                            sizes[k], *refreshed_metadata, false, false);
+                            sizes[k], *lease.metadata, false, false);
                     }
                     continue;
                 }
                 const auto &handle =
                     metadata.replica.get_memory_descriptor().buffer_descriptor;
                 auto [lease_it, inserted] = scatter_leases.try_emplace(keys[j]);
-                if (inserted)
+                if (inserted) {
                     lease_it->second.expires_at =
                         metadata.query_result.lease_timeout;
+                    lease_it->second.refresh_at = ranged_read_refresh_at(
+                        metadata_plan.resolved_at, metadata.query_result);
+                }
                 auto transfer = TransferEngine::ScatterTransferRange{
                     .opcode = TransferRequest::READ,
                     .remote_segment = handle.transport_endpoint_,
@@ -5569,18 +5635,30 @@ RealClient::get_into_ranges_internal(
                 continue;
             }
 
+            // File-backed replicas (LOCAL_DISK / DISK / DFS) reject a lease
+            // that expired while the read was in flight, so renew before the
+            // descriptor is spent rather than letting the whole key fail.
+            auto lease = acquire_ranged_read_lease(metadata);
             for (size_t k = 0; k < range_results.size(); ++k) {
                 const size_t dst_offset = dst_offsets[k];
                 if (dst_offset > capacities[i] ||
                     sizes[k] > capacities[i] - dst_offset) {
                     continue;
                 }
+                if (auto error = renew_ranged_read_lease(keys[j], lease);
+                    error.has_value()) {
+                    std::fill(range_results.begin() + k, range_results.end(),
+                              tl::unexpected(*error));
+                    break;
+                }
 
                 range_results[k] = execute_ranged_read(
                     keys[j], buffers[i], dst_offset, src_offsets[k], sizes[k],
-                    metadata, false, false);
+                    *lease.metadata, false, false);
+                // A snapshot read must report the caller's own lease, not a
+                // renewed one.
                 if (!allow_query_refresh && range_results[k] &&
-                    metadata.query_result.IsLeaseExpired()) {
+                    lease.metadata->query_result.IsLeaseExpired()) {
                     range_results[k] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
                 }
             }
@@ -5593,11 +5671,11 @@ RealClient::get_into_ranges_internal(
         for (const auto &[key, lease] : scatter_leases) {
             (void)key;
             if (lease.error.has_value()) continue;
-            const auto remaining =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    lease.expires_at - now);
-            delay = std::min(delay, std::max(remaining / 2,
-                                             std::chrono::nanoseconds::zero()));
+            delay = std::min(
+                delay,
+                std::max(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             lease.refresh_at - now),
+                         std::chrono::nanoseconds::zero()));
         }
         return delay;
     };
@@ -5606,6 +5684,7 @@ RealClient::get_into_ranges_internal(
         keys.reserve(scatter_leases.size());
         for (const auto &[key, lease] : scatter_leases)
             if (!lease.error.has_value()) keys.push_back(key);
+        const auto renewed_at = std::chrono::steady_clock::now();
         auto refreshed = client_->BatchQuery(keys);
         for (size_t i = 0; i < refreshed.size(); ++i) {
             auto &lease = scatter_leases.at(keys[i]);
@@ -5614,11 +5693,32 @@ RealClient::get_into_ranges_internal(
                 continue;
             }
             lease.expires_at = refreshed[i]->lease_timeout;
+            if (lease.expires_at <= renewed_at) {
+                // Nothing to wait on: a lease already spent at the moment it
+                // was issued cannot be refreshed, so stop waiting on it.
+                lease.error = ErrorCode::LEASE_EXPIRED;
+                continue;
+            }
+            lease.refresh_at =
+                ranged_read_refresh_at(renewed_at, *refreshed[i]);
         }
     };
 
-    // Planning may consume most of a short lease; renew before submission.
-    if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
+    // The same operation-owned policy as the ranged-read passes: a planned
+    // descriptor whose lease is already past its midpoint is renewed before
+    // submission, and a long transfer renews again whenever the wait loop
+    // reaches the next refresh point.
+    auto lease_due = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto &[key, lease] : scatter_leases) {
+            (void)key;
+            if (!lease.error.has_value() && now >= lease.refresh_at) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (allow_query_refresh && lease_due()) refresh_leases();
     auto operation = client_->SubmitScatterNative(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
