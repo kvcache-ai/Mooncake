@@ -21,7 +21,8 @@ class P2PMaster {
     int RunWithHA();
     int RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                             P2PMasterRpcService& service,
-                            std::function<void()> before_start = {});
+                            std::function<void()> before_start = {},
+                            std::function<void()> after_stop = {});
 
     P2PMasterConfig config_;
 };

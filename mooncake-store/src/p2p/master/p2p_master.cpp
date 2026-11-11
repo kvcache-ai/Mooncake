@@ -171,7 +171,8 @@ struct P2PPrimaryDemotionHandoff {
 
 int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                                    P2PMasterRpcService& p2p_service,
-                                   std::function<void()> before_start) {
+                                   std::function<void()> before_start,
+                                   std::function<void()> after_stop) {
     const bool dedicated_heartbeat = config_.rpc.heartbeat_port > 0;
     RegisterP2PRpcService(server, p2p_service,
                           /*include_heartbeat=*/!dedicated_heartbeat);
@@ -191,6 +192,9 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
         if (heartbeat_result.hasResult()) {
             LOG(ERROR) << "Failed to start heartbeat RPC server: "
                        << heartbeat_result.result().value();
+            if (after_stop) {
+                after_stop();
+            }
             return -1;
         }
     }
@@ -201,16 +205,30 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                    << server_result.result().value();
         // A concurrent stop can also complete the future during startup.
         server.stop();
-        heartbeat_server.reset();
+        if (heartbeat_server) {
+            heartbeat_server->stop();
+            heartbeat_server.reset();
+        }
+        if (after_stop) {
+            after_stop();
+        }
         return -1;
     }
     auto error = std::move(server_result).get();
     LOG(ERROR) << "P2P master RPC server stopped: " << error;
-    // The start future only waits for the accept loop. Drain in-flight RPCs
-    // before callers can destroy the service, including when another thread
-    // is already stopping the server after losing the leader lease.
+    // The start futures only wait for accept loops. Stop and destroy each
+    // server so every in-flight RPC returns before callers drain OpLog state.
     server.stop();
-    heartbeat_server.reset();
+    if (heartbeat_server) {
+        heartbeat_server->stop();
+        heartbeat_server.reset();
+    }
+    // Stepdown drains the OpLog only after this point, when no active RPC
+    // handler can admit or mutate metadata. This preserves kvpool's shutdown
+    // ordering without stopping the writer before confirmed writes drain.
+    if (after_stop) {
+        after_stop();
+    }
     return 0;
 }
 
@@ -385,21 +403,20 @@ int P2PMaster::RunWithHA() {
         master_view->ElectLeader(local_endpoint, view_version, lease_id);
 
         std::atomic<bool> leadership_lost{false};
+        std::atomic<bool> stepdown_requested{false};
         std::atomic<OpLogManager*> primary_oplog_manager{nullptr};
-        auto stop_primary_rpc = [&server, &leadership_lost,
-                                 &primary_oplog_manager] {
+        auto stop_primary_server = [&server, &leadership_lost,
+                                    &stepdown_requested] {
+            // Close the write request entry first. RunActiveRpcServers joins
+            // accepted main and heartbeat handlers before OpLog draining.
+            stepdown_requested.store(true, std::memory_order_release);
             leadership_lost.store(true, std::memory_order_release);
-            if (auto* manager =
-                    primary_oplog_manager.load(std::memory_order_acquire)) {
-                manager->RequestStopWriting();
-            }
             server->stop();
         };
-        auto keep_leader_thread =
-            std::thread([view = master_view.get(), lease_id, &stop_primary_rpc,
-                         &leadership_lost] {
+        auto keep_leader_thread = std::thread(
+            [view = master_view.get(), lease_id, stop_primary_server] {
                 view->KeepLeader(lease_id);
-                stop_primary_rpc();
+                stop_primary_server();
             });
         std::this_thread::sleep_for(
             std::chrono::seconds(master_view->GetLeaderLeaseTTLSeconds()));
@@ -433,7 +450,11 @@ int P2PMaster::RunWithHA() {
         }
 
         HAStatusManager::instance().SetRoleState("primary", "STARTING");
-        auto stepdown_callback = [&stop_primary_rpc, &primary_oplog_manager] {
+        auto drain_after_stepdown = [&stepdown_requested,
+                                     &primary_oplog_manager] {
+            if (!stepdown_requested.load(std::memory_order_acquire)) {
+                return;
+            }
             if (auto* manager =
                     primary_oplog_manager.load(std::memory_order_acquire)) {
                 auto drain = manager->DrainWriting(3000);
@@ -454,8 +475,8 @@ int P2PMaster::RunWithHA() {
                               << drain.max_known_sequence_id;
                 }
             }
-            stop_primary_rpc();
         };
+        auto stepdown_callback = stop_primary_server;
         // The active service serves the full HTTP surface (including
         // business endpoints) on the same metrics port, so hand it over now.
         status_http_server.Stop();
@@ -466,10 +487,10 @@ int P2PMaster::RunWithHA() {
                 active_service->GetMasterService().GetOpLogManager();
             primary_oplog_manager.store(manager, std::memory_order_release);
             // Handle a leader loss that races with service publication. The
-            // keep-leader callback either reads the published manager or sees
-            // leadership_lost here and requests the stop itself.
-            if (leadership_lost.load(std::memory_order_acquire) && manager) {
-                manager->RequestStopWriting();
+            // keep-leader callback either stops the listener itself or
+            // leadership_lost is observed here and the stop is replayed.
+            if (leadership_lost.load(std::memory_order_acquire)) {
+                stop_primary_server();
             }
         }
         if (promoted_metadata.has_value()) {
@@ -597,8 +618,9 @@ int P2PMaster::RunWithHA() {
 #else
         auto mark_primary = std::move(mark_primary_running);
 #endif
-        const int run_result = RunActiveRpcServers(*server, *active_service,
-                                                   std::move(mark_primary));
+        const int run_result = RunActiveRpcServers(
+            *server, *active_service, std::move(mark_primary),
+            std::move(drain_after_stepdown));
 #ifdef STORE_USE_REDIS
         redis_oplog_trim_worker.reset();
 #endif

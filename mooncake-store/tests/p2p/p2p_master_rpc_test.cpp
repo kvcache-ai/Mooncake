@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -17,6 +18,8 @@
 
 #include "p2p/master/p2p_master_client.h"
 #include "p2p/master/p2p_master_metric_manager.h"
+#include "ha/oplog/mock_oplog_store.h"
+#include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "utils.h"
 
@@ -31,6 +34,18 @@ namespace {
 
 // Exercise the concrete client/server boundary without the public Client
 // facade or client data path in the link graph.
+struct TestHttpResponse {
+    int status;
+    std::string body;
+};
+
+TestHttpResponse HttpPostForTest(const std::string& url) {
+    coro_http::coro_http_client client;
+    auto response =
+        client.post(url, "", coro_http::req_content_type::octet_stream);
+    return {response.status, std::string(response.resp_body)};
+}
+
 class P2PMasterRpcTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -401,6 +416,93 @@ TEST_F(P2PMasterRpcTest, BatchWriteReturnsAlignedCandidateAndValidationErrors) {
               failed_items + 3);
 }
 
+class GatedOpLogStore final : public mooncake::test::MockOpLogStore {
+   public:
+    GatedOpLogStore()
+        : release_(release_promise_.get_future().share()),
+          write_entered_(write_entered_promise_.get_future()),
+          second_write_(second_write_promise_.get_future()) {}
+
+    ErrorCode WriteOpLog(const OpLogEntry& entry, bool sync) override {
+        bool block = false;
+        {
+            std::lock_guard<std::mutex> lock(event_mutex_);
+            ++write_events_;
+            if (entry.op_type == OpType_PUBLISH_ROUTE) {
+                ++publish_write_events_;
+            }
+            if (draining_) {
+                ++writes_after_drain_;
+            }
+            if (entry.op_type == OpType_PUBLISH_ROUTE &&
+                !first_write_entered_) {
+                first_write_entered_ = true;
+                block = true;
+                write_entered_promise_.set_value();
+            } else if (entry.op_type == OpType_PUBLISH_ROUTE &&
+                       publish_write_events_ == 2) {
+                second_write_promise_.set_value();
+            }
+        }
+        if (block) {
+            release_.wait();
+        }
+        return mooncake::test::MockOpLogStore::WriteOpLog(entry, sync);
+    }
+
+    OpLogDrainResult DrainWriting(uint32_t timeout_ms) override {
+        {
+            std::lock_guard<std::mutex> lock(event_mutex_);
+            ++drain_events_;
+            draining_ = true;
+        }
+        return mooncake::test::MockOpLogStore::DrainWriting(timeout_ms);
+    }
+
+    void Release() {
+        std::call_once(release_once_, [this] { release_promise_.set_value(); });
+    }
+
+    std::future_status WaitForFirstWrite(std::chrono::seconds timeout) {
+        return write_entered_.wait_for(timeout);
+    }
+
+    std::future_status WaitForSecondWrite(std::chrono::seconds timeout) {
+        return second_write_.wait_for(timeout);
+    }
+
+    size_t Drains() const {
+        std::lock_guard<std::mutex> lock(event_mutex_);
+        return drain_events_;
+    }
+
+    size_t Writes() const {
+        std::lock_guard<std::mutex> lock(event_mutex_);
+        return write_events_;
+    }
+
+    size_t WritesAfterDrain() const {
+        std::lock_guard<std::mutex> lock(event_mutex_);
+        return writes_after_drain_;
+    }
+
+   private:
+    std::promise<void> release_promise_;
+    std::shared_future<void> release_;
+    std::promise<void> write_entered_promise_;
+    std::promise<void> second_write_promise_;
+    std::shared_future<void> write_entered_;
+    std::shared_future<void> second_write_;
+    std::once_flag release_once_;
+    mutable std::mutex event_mutex_;
+    size_t write_events_{0};
+    size_t publish_write_events_{0};
+    size_t drain_events_{0};
+    size_t writes_after_drain_{0};
+    bool first_write_entered_{false};
+    bool draining_{false};
+};
+
 class GatedRpcHandler {
    public:
     GatedRpcHandler()
@@ -585,6 +687,140 @@ TEST_P(P2PMasterRpcShutdownTest, RunnerWaitsForInFlightRpcAfterListenerCloses) {
 
 INSTANTIATE_TEST_SUITE_P(HeartbeatModes, P2PMasterRpcShutdownTest,
                          ::testing::Bool());
+
+TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
+    constexpr auto kTimeout = std::chrono::seconds(5);
+
+    P2PMasterConfig config;
+    config.rpc.address = "127.0.0.1";
+    config.rpc.port = 0;
+    config.rpc.thread_num = 2;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    config.routes.max_clients_per_key = 0;
+    config.oplog.enabled = true;
+    config.oplog.store_type = "localfs";
+    config.oplog.data_dir =
+        "/tmp/mooncake_p2p_rpc_stepdown_" + std::to_string(::getpid()) + "_" +
+        std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+    config.cluster_id = "p2p_rpc_stepdown";
+
+    P2PMaster master(config);
+    auto service = std::make_unique<P2PMasterRpcService>(config, kViewVersion);
+    auto oplog_store = std::make_shared<GatedOpLogStore>();
+    auto* oplog_manager = service->GetMasterService().GetOpLogManager();
+    ASSERT_NE(oplog_manager, nullptr);
+    oplog_manager->SetOpLogStore(oplog_store);
+    service->init();
+
+    const int port = getFreeTcpPort();
+    ASSERT_GT(port, 0);
+    auto server = std::make_unique<coro_rpc::coro_rpc_server>(
+        2, port, "127.0.0.1", std::chrono::seconds(0), false);
+    std::atomic<bool> stepdown_requested{false};
+    service->SetStepdownCallback([&server, &stepdown_requested] {
+        stepdown_requested.store(true, std::memory_order_seq_cst);
+        server->stop();
+    });
+
+    std::packaged_task<int()> run([&master, &server, &service, &oplog_store] {
+        return master.RunActiveRpcServers(
+            *server, *service, /*before_start=*/{},
+            [&oplog_store] { (void)oplog_store->DrainWriting(3000); });
+    });
+    auto run_result = run.get_future();
+    std::thread run_thread(std::move(run));
+    while (server->port() == 0 && run_result.wait_for(std::chrono::milliseconds(
+                                      1)) == std::future_status::timeout) {
+    }
+    ASSERT_NE(server->port(), 0);
+
+    std::array<UUID, 2> client_ids{};
+    std::array<std::unique_ptr<P2PMasterClient>, 2> clients;
+    std::array<P2PSegment, 2> segments;
+    for (size_t i = 0; i < clients.size(); ++i) {
+        client_ids[i] = generate_uuid();
+        clients[i] = std::make_unique<P2PMasterClient>(client_ids[i]);
+        ASSERT_EQ(clients[i]->Connect("127.0.0.1:" + std::to_string(port)),
+                  ErrorCode::OK);
+        segments[i] = MakeSegment("stepdown-oplog-" + std::to_string(i));
+        ASSERT_TRUE(clients[i]
+                        ->RegisterClient({.client_id = client_ids[i],
+                                          .segments = {segments[i]},
+                                          .ip_address = "127.0.0.1",
+                                          .rpc_port = kClientPort})
+                        .has_value());
+        ASSERT_TRUE(
+            clients[i]
+                ->Heartbeat({.client_id = client_ids[i],
+                             .service_state = P2PClientServiceState::ONLINE})
+                .has_value());
+    }
+
+    // The first oplog write blocks inside the accepted RPC. A second writer is
+    // dispatched before stepdown so it is also an accepted, in-flight handler.
+    std::vector<std::thread> writers;
+    writers.emplace_back([&clients, &client_ids, &segments] {
+        for (int i = 0;; ++i) {
+            if (!clients[0]
+                     ->PublishRoute({.key = "stepdown-0-" + std::to_string(i),
+                                     .object_size = 1024,
+                                     .client_id = client_ids[0],
+                                     .segment_id = segments[0].id})
+                     .has_value()) {
+                break;
+            }
+        }
+    });
+    EXPECT_EQ(oplog_store->WaitForFirstWrite(kTimeout),
+              std::future_status::ready);
+    writers.emplace_back([&clients, &client_ids, &segments] {
+        for (int i = 0;; ++i) {
+            if (!clients[1]
+                     ->PublishRoute({.key = "stepdown-1-" + std::to_string(i),
+                                     .object_size = 1024,
+                                     .client_id = client_ids[1],
+                                     .segment_id = segments[1].id})
+                     .has_value()) {
+                break;
+            }
+        }
+    });
+
+    EXPECT_EQ(oplog_store->WaitForSecondWrite(kTimeout),
+              std::future_status::ready);
+
+    std::thread stepdown([&service] {
+        const auto response = HttpPostForTest(
+            "http://127.0.0.1:" + std::to_string(service->GetHttpPort()) +
+            "/ha/stepdown");
+        EXPECT_EQ(response.status, 200);
+    });
+    while (!stepdown_requested.load(std::memory_order_seq_cst) &&
+           run_result.wait_for(std::chrono::milliseconds(1)) ==
+               std::future_status::timeout) {
+    }
+    EXPECT_TRUE(stepdown_requested.load(std::memory_order_seq_cst));
+
+    // The blocked RPC handlers must keep the runner active; drain must not
+    // start until every accepted write handler has returned.
+    EXPECT_EQ(run_result.wait_for(std::chrono::milliseconds(200)),
+              std::future_status::timeout);
+    EXPECT_EQ(oplog_store->Drains(), 0u);
+    oplog_store->Release();
+
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    stepdown.join();
+    EXPECT_EQ(run_result.get(), 0);
+    EXPECT_GT(oplog_store->Drains(), 0u);
+    EXPECT_GT(oplog_store->Writes(), 0u);
+    EXPECT_EQ(oplog_store->WritesAfterDrain(), 0u);
+
+    run_thread.join();
+}
 
 }  // namespace
 }  // namespace mooncake::testing
