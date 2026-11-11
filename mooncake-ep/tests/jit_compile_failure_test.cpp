@@ -289,6 +289,39 @@ TEST(JitCompileFailureTest, MissingCubinIsRetriedByTheNextProcess) {
     EXPECT_EQ(AttemptCount(item.count), 2);
 }
 
+TEST(JitCompileFailureTest, LegacyTransientMarkerDoesNotBlockRetry) {
+    TestDirectory directory;
+    const ChildCase item = MakeCase(directory.path());
+    WriteNvcc(item.nvcc);
+
+    ASSERT_EQ(RunChild(item.cache, item.nvcc, "missing_cubin", item.count,
+                       item.source, item.log),
+              kCompileFailedExit);
+    EXPECT_EQ(AttemptCount(item.count), 1);
+
+    fs::path legacy_marker;
+    std::error_code ec;
+    fs::recursive_directory_iterator it(item.cache, ec);
+    const fs::recursive_directory_iterator end;
+    while (!ec && it != end) {
+        if (it->path().filename() == "compile.log") {
+            legacy_marker = it->path().parent_path() / "compile.failed";
+            break;
+        }
+        it.increment(ec);
+    }
+    ASSERT_FALSE(legacy_marker.empty());
+    {
+        std::ofstream marker(legacy_marker, std::ios::trunc);
+        marker << "NVCC compile failed: cubin was not produced\nexit_code=0\n";
+    }
+
+    ASSERT_EQ(RunChild(item.cache, item.nvcc, "success", item.count,
+                       item.source, item.log),
+              0);
+    EXPECT_EQ(AttemptCount(item.count), 2);
+}
+
 TEST(JitCompileFailureTest, ExecFailureIsRetriedByTheNextProcess) {
     TestDirectory directory;
     const ChildCase item = MakeCase(directory.path());

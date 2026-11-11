@@ -636,6 +636,11 @@ CachePaths make_cache_paths(const JitCache& cache, const std::string& key) {
     return paths;
 }
 
+// Legacy markers cannot distinguish compiler errors from transient failures.
+bool is_cacheable_failure_marker(const std::string& contents) {
+    return contents.rfind("cacheable_failure=1\n", 0) == 0;
+}
+
 JitKernelStatus ensure_cubin(const JitKernelVariant& variant,
                              const SmEnvInfo& env_info, const CachePaths& paths,
                              const std::string& key,
@@ -649,7 +654,7 @@ JitKernelStatus ensure_cubin(const JitKernelVariant& variant,
     if (cubin->empty()) {
         const std::string cached_failure =
             read_file_or_empty(paths.failed_path);
-        if (!cached_failure.empty()) {
+        if (is_cacheable_failure_marker(cached_failure)) {
             cache.mark_failed(key);
             if (error != nullptr) *error = cached_failure;
             log_jit_event(variant,
@@ -704,7 +709,7 @@ JitKernelStatus ensure_cubin(const JitKernelVariant& variant,
     }
 
     const std::string cached_failure = read_file_or_empty(paths.failed_path);
-    if (!cached_failure.empty()) {
+    if (is_cacheable_failure_marker(cached_failure)) {
         cache.mark_failed(key);
         if (error != nullptr) *error = cached_failure;
         log_jit_event(
@@ -738,8 +743,13 @@ JitKernelStatus ensure_cubin(const JitKernelVariant& variant,
                                        " path=" +
                                        paths.log_path.string());
         }
+        if (!compile_output.cacheable_failure) {
+            std::filesystem::remove(paths.failed_path, remove_ec);
+        }
         if (compile_output.cacheable_failure &&
-            !write_file_atomic(paths.failed_path, compile_output.log, false)) {
+            !write_file_atomic(paths.failed_path,
+                               "cacheable_failure=1\n" + compile_output.log,
+                               false)) {
             log_jit_event(variant, log_prefix +
                                        " artifact=failed_marker write=failed"
                                        " path=" +
