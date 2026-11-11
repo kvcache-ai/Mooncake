@@ -2,6 +2,7 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 #include <gtest/gtest.h>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 
@@ -44,16 +45,25 @@ class EmptyBackend final : public HaKvBackend {
 
     ErrorCode Range(std::string_view begin, std::string_view end, size_t limit,
                     std::vector<KvPair>& output) override {
-        if (begin == fail_range_begin) return ErrorCode::ETCD_OPERATION_ERROR;
-        output.clear();
-        for (const auto& [key, value] : values_) {
-            if (key >= begin && key < end &&
-                (limit == 0 || output.size() < limit)) {
-                output.push_back({key, value});
-            }
-        }
-        return ErrorCode::OK;
+        ++range_calls_;
+        return RangeFrom(begin, end, limit, output);
     }
+
+    ErrorCode RangeSerializable(std::string_view begin, std::string_view end,
+                                size_t limit,
+                                std::vector<KvPair>& output) override {
+        ++serializable_range_calls_;
+        if (stale_serializable_ranges_ > 0) {
+            --stale_serializable_ranges_;
+            output.clear();
+            return ErrorCode::OK;
+        }
+        return RangeFrom(begin, end, limit, output);
+    }
+
+    void StaleNextSerializableRange() { stale_serializable_ranges_ = 1; }
+    int range_calls() const { return range_calls_; }
+    int serializable_range_calls() const { return serializable_range_calls_; }
 
     bool SupportsTxn() const override { return true; }
 
@@ -67,7 +77,22 @@ class EmptyBackend final : public HaKvBackend {
     std::string fail_range_begin;
 
    private:
+    ErrorCode RangeFrom(std::string_view begin, std::string_view end,
+                        size_t limit, std::vector<KvPair>& output) {
+        if (begin == fail_range_begin) return ErrorCode::ETCD_OPERATION_ERROR;
+        output.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin && key < end &&
+                (limit == 0 || output.size() < limit)) {
+                output.push_back({key, value});
+            }
+        }
+        return ErrorCode::OK;
+    }
     std::map<std::string, std::string> values_;
+    size_t stale_serializable_ranges_{0};
+    int range_calls_{0};
+    int serializable_range_calls_{0};
 };
 
 class BatchOpLogSnapshotProviderTest : public ::testing::Test {
@@ -357,9 +382,11 @@ TEST_F(BatchOpLogSnapshotProviderTest,
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
                           EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    backend.StaleNextSerializableRange();
 
-    BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
-                                        "snapshots");
+    BatchOpLogSnapshotProvider provider(
+        "clusterA", backend, object_store, "snapshots", 1024,
+        std::chrono::milliseconds(0), std::chrono::milliseconds(0));
     StandbyMetadataStore metadata;
     StandbySegmentRegistry registry;
     auto result = provider.RestoreBaseline(metadata, registry);
@@ -367,6 +394,8 @@ TEST_F(BatchOpLogSnapshotProviderTest,
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(2u, result->last_applied_seq);
     EXPECT_EQ(2u, result->last_applied_batch_id);
+    EXPECT_EQ(1, backend.serializable_range_calls());
+    EXPECT_GT(backend.range_calls(), 0);
 }
 
 }  // namespace mooncake::test

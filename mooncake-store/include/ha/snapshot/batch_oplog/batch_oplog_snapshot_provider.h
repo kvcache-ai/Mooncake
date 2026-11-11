@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -29,10 +30,13 @@ struct BatchOpLogSnapshotRestoreResult {
 // state. Legacy catalog snapshots intentionally do not use this provider.
 class BatchOpLogSnapshotProvider final {
    public:
-    BatchOpLogSnapshotProvider(std::string cluster_id, HaKvBackend& backend,
-                               SnapshotObjectStore& object_store,
-                               std::string snapshot_root,
-                               size_t max_batches_per_poll = 1024);
+    BatchOpLogSnapshotProvider(
+        std::string cluster_id, HaKvBackend& backend,
+        SnapshotObjectStore& object_store, std::string snapshot_root,
+        size_t max_batches_per_poll = 1024,
+        std::chrono::milliseconds poll_interval = std::chrono::seconds(1),
+        std::chrono::milliseconds no_progress_timeout =
+            std::chrono::seconds(180));
 
     tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode> RestoreBaseline(
         StandbyMetadataStore& metadata, StandbySegmentRegistry& registry,
@@ -45,6 +49,8 @@ class BatchOpLogSnapshotProvider final {
     SnapshotObjectStore& object_store_;
     std::string snapshot_root_;
     size_t max_batches_per_poll_;
+    std::chrono::milliseconds poll_interval_;
+    std::chrono::milliseconds no_progress_timeout_;
 };
 
 }  // namespace mooncake

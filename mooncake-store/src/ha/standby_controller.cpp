@@ -1,5 +1,7 @@
 #include "ha/standby_controller.h"
 
+#include <algorithm>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -144,7 +146,11 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                     std::make_unique<BatchOpLogSnapshotProvider>(
                         config_.cluster_id, *batch_backend_,
                         *snapshot_object_store_, snapshot_root,
-                        config_.oplog_standby_max_batches_per_poll));
+                        config_.oplog_standby_max_batches_per_poll,
+                        std::chrono::milliseconds(
+                            std::max(config_.oplog_poll_interval_ms, 1)),
+                        std::chrono::seconds(
+                            config_.batch_oplog_retry_timeout_sec)));
                 batch_oplog_snapshot_coordinator_ =
                     std::make_unique<BatchOpLogSnapshotCoordinator>(
                         *standby_service_, *batch_backend_,

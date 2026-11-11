@@ -1,8 +1,11 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -133,6 +136,8 @@ void CopyRegistry(const StandbySegmentRegistry& source,
 AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
                            OpLogApplier& applier, const DurablePrefix* baseline,
                            size_t max_batches_per_poll,
+                           std::chrono::milliseconds poll_interval,
+                           std::chrono::milliseconds no_progress_timeout,
                            const std::function<bool()>& cancelled) {
     HAMetricManager::SnapshotOperationTimer metric_timer(
         HAMetricManager::SnapshotOperation::Replay);
@@ -145,11 +150,18 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
 
     HAMetricManager::instance().update_snapshot_runtime(
         [](auto& metrics) { metrics.suffix_batches = 0; });
+    std::optional<std::chrono::steady_clock::time_point> no_progress_since;
     for (;;) {
         if (cancelled && cancelled()) {
             return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
         }
-        auto poll = reader.PollOnce(max_batches_per_poll);
+        const auto poll_started = std::chrono::steady_clock::now();
+        const auto read_mode =
+            no_progress_since &&
+                    poll_started - *no_progress_since >= no_progress_timeout
+                ? OpLogBatchStandbyReadMode::LINEARIZABLE
+                : OpLogBatchStandbyReadMode::SERIALIZABLE;
+        auto poll = reader.PollOnce(max_batches_per_poll, read_mode);
         HAMetricManager::instance().update_snapshot_runtime([&](auto& metrics) {
             metrics.suffix_batches += poll.applied_batches;
             if (poll.durable_prefix_present)
@@ -176,6 +188,28 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
                     {.last_included_seq = poll.durable_prefix.last_seq,
                      .last_included_batch_id = poll.durable_prefix.batch_id}};
         }
+        if (poll.disposition ==
+            OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX) {
+            if (poll.applied_batches != 0 || !no_progress_since) {
+                no_progress_since = std::chrono::steady_clock::now();
+            }
+            auto delay = poll_interval;
+            if (no_progress_timeout > std::chrono::milliseconds::zero()) {
+                const auto elapsed =
+                    std::chrono::steady_clock::now() - *no_progress_since;
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        no_progress_timeout - elapsed);
+                delay = std::min(
+                    delay,
+                    std::max(remaining, std::chrono::milliseconds::zero()));
+            }
+            if (delay > std::chrono::milliseconds::zero()) {
+                std::this_thread::sleep_for(delay);
+            }
+            continue;
+        }
+        if (poll.error == ErrorCode::OK) no_progress_since.reset();
         if (poll.applied_entries == 0) {
             return Invalid(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
         }
@@ -187,7 +221,9 @@ AttemptResult RestorePointer(
     SnapshotObjectStore& object_store, const std::string& snapshot_root,
     std::string_view pointer_bytes, StandbyMetadataStore& metadata,
     StandbySegmentRegistry& registry, OpLogApplier* supplied_applier,
-    size_t max_batches_per_poll, const std::function<bool()>& cancelled) {
+    size_t max_batches_per_poll, std::chrono::milliseconds poll_interval,
+    std::chrono::milliseconds no_progress_timeout,
+    const std::function<bool()>& cancelled) {
     if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     auto decoded_descriptor =
         ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
@@ -325,7 +361,8 @@ AttemptResult RestorePointer(
     }
 
     auto suffix = ReplaySuffix(cluster_id, backend, *applier, &baseline,
-                               max_batches_per_poll, cancelled);
+                               max_batches_per_poll, poll_interval,
+                               no_progress_timeout, cancelled);
     if (suffix.disposition != AttemptDisposition::kSuccess) {
         return suffix;
     }
@@ -356,13 +393,13 @@ AttemptResult RestorePointer(
              .max_replica_id = live_max_replica_id}};
 }
 
-AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
-                                   HaKvBackend& backend,
-                                   StandbyMetadataStore& metadata,
-                                   StandbySegmentRegistry& registry,
-                                   OpLogApplier* supplied_applier,
-                                   size_t max_batches_per_poll,
-                                   const std::function<bool()>& cancelled) {
+AttemptResult RestoreCompleteOpLog(
+    const std::string& cluster_id, HaKvBackend& backend,
+    StandbyMetadataStore& metadata, StandbySegmentRegistry& registry,
+    OpLogApplier* supplied_applier, size_t max_batches_per_poll,
+    std::chrono::milliseconds poll_interval,
+    std::chrono::milliseconds no_progress_timeout,
+    const std::function<bool()>& cancelled) {
     if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
@@ -380,7 +417,8 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
                                                    : Invalid(init_error);
     }
     auto replay = ReplaySuffix(cluster_id, backend, *applier, nullptr,
-                               max_batches_per_poll, cancelled);
+                               max_batches_per_poll, poll_interval,
+                               no_progress_timeout, cancelled);
     if (replay.disposition != AttemptDisposition::kSuccess) {
         return replay;
     }
@@ -400,12 +438,15 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
 BatchOpLogSnapshotProvider::BatchOpLogSnapshotProvider(
     std::string cluster_id, HaKvBackend& backend,
     SnapshotObjectStore& object_store, std::string snapshot_root,
-    size_t max_batches_per_poll)
+    size_t max_batches_per_poll, std::chrono::milliseconds poll_interval,
+    std::chrono::milliseconds no_progress_timeout)
     : cluster_id_(std::move(cluster_id)),
       backend_(backend),
       object_store_(object_store),
       snapshot_root_(std::move(snapshot_root)),
-      max_batches_per_poll_(max_batches_per_poll) {}
+      max_batches_per_poll_(max_batches_per_poll),
+      poll_interval_(poll_interval),
+      no_progress_timeout_(no_progress_timeout) {}
 
 tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode>
 BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
@@ -475,7 +516,8 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
         }
         auto attempt = RestorePointer(
             cluster_id_, backend_, object_store_, snapshot_root_, pointer_bytes,
-            metadata, registry, applier, max_batches_per_poll_, cancelled);
+            metadata, registry, applier, max_batches_per_poll_, poll_interval_,
+            no_progress_timeout_, cancelled);
         if (attempt.disposition == AttemptDisposition::kSuccess) {
             return metric_timer.Success(attempt.value);
         }
@@ -493,9 +535,9 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
     if (minimum_snapshot_batch != 0) {
         return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
     }
-    auto full_replay =
-        RestoreCompleteOpLog(cluster_id_, backend_, metadata, registry, applier,
-                             max_batches_per_poll_, cancelled);
+    auto full_replay = RestoreCompleteOpLog(
+        cluster_id_, backend_, metadata, registry, applier,
+        max_batches_per_poll_, poll_interval_, no_progress_timeout_, cancelled);
     if (full_replay.disposition != AttemptDisposition::kSuccess) {
         metadata.Clear();
         registry.Clear();

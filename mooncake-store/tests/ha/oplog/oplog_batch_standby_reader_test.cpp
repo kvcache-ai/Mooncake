@@ -280,7 +280,8 @@ TEST(OpLogBatchStandbyReaderTest,
     OpLogBatchStandbyReader reader("clusterA", backend, applier);
 
     const auto stale = reader.PollOnce(8);
-    EXPECT_EQ(OpLogBatchStandbyPollDisposition::OK, stale.disposition);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX,
+              stale.disposition);
     EXPECT_EQ(ErrorCode::OK, stale.error);
     EXPECT_EQ(1u, stale.applied_batches);
     EXPECT_FALSE(stale.has_more_pages);
@@ -304,7 +305,36 @@ TEST(OpLogBatchStandbyReaderTest,
     const auto steady = reader.PollOnce(8);
     EXPECT_EQ(ErrorCode::OK, steady.error);
     EXPECT_EQ(2, backend.serializable_range_calls());
+    EXPECT_EQ(0, backend.range_calls());
     EXPECT_EQ(0, backend.batch_get_calls());
+}
+
+TEST(OpLogBatchStandbyReaderTest,
+     StrongRevalidationFailsWhenDurableSuffixIsActuallyMissing) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey("clusterA", 1),
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+
+    MockMetadataStore metadata;
+    OpLogApplier applier(&metadata, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    auto waiting = reader.PollOnce(8);
+    ASSERT_EQ(OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX,
+              waiting.disposition);
+    EXPECT_EQ(ErrorCode::OK, waiting.error);
+    ASSERT_EQ(1u, waiting.applied_batches);
+
+    auto verified = reader.PollOnce(8, OpLogBatchStandbyReadMode::LINEARIZABLE);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL, verified.disposition);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, verified.error);
+    EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(1, backend.serializable_range_calls());
+    EXPECT_EQ(1, backend.range_calls());
 }
 
 TEST(OpLogBatchStandbyReaderTest,
@@ -416,7 +446,8 @@ TEST(OpLogBatchStandbyReaderTest, RangeTransportErrorIsRetryable) {
     EXPECT_EQ(OpLogBatchStandbyPollDisposition::RETRYABLE, result.disposition);
 }
 
-TEST(OpLogBatchStandbyReaderTest, WaitsWhenSerializableRangeHasNotCaughtUp) {
+TEST(OpLogBatchStandbyReaderTest,
+     ReportsWaitingWhenSerializableRangeHasNotCaughtUp) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
@@ -427,7 +458,8 @@ TEST(OpLogBatchStandbyReaderTest, WaitsWhenSerializableRangeHasNotCaughtUp) {
 
     auto result = reader.PollOnce();
 
-    EXPECT_EQ(OpLogBatchStandbyPollDisposition::OK, result.disposition);
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX,
+              result.disposition);
     EXPECT_EQ(ErrorCode::OK, result.error);
     EXPECT_EQ(0u, result.applied_batches);
     EXPECT_EQ(1u, applier.GetExpectedSequenceId());

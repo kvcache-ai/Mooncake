@@ -50,7 +50,7 @@ ErrorCode OpLogBatchStandbyReader::SetBaselineCursor(
 }
 
 OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
-    size_t max_batches) {
+    size_t max_batches, OpLogBatchStandbyReadMode read_mode) {
     OpLogBatchStandbyPollResult result;
     uint64_t floor = 0;
     ErrorCode err = storage_.ReadCompactionFloor(floor);
@@ -65,7 +65,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         return result;
     }
-    result = PollBatches(max_batches, floor);
+    result = PollBatches(max_batches, floor, read_mode);
     if (result.disposition == OpLogBatchStandbyPollDisposition::FATAL) {
         // Pruning may advance after the initial floor read. Classify missing
         // history against the current floor before declaring corruption.
@@ -79,7 +79,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         } else if (err == ErrorCode::OK && current_floor > floor &&
                    current_floor == last_applied_batch_id_) {
             const auto applied_batches = result.applied_batches;
-            result = PollBatches(max_batches, current_floor);
+            result = PollBatches(max_batches, current_floor, read_mode);
             result.applied_batches += applied_batches;
         } else if (err != ErrorCode::OK &&
                    err != ErrorCode::ETCD_KEY_NOT_EXIST) {
@@ -94,7 +94,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
 }
 
 OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
-    size_t max_batches, uint64_t floor) {
+    size_t max_batches, uint64_t floor, OpLogBatchStandbyReadMode read_mode) {
     OpLogBatchStandbyPollResult result;
     result.compaction_floor = floor;
     DurablePrefix prefix;
@@ -164,8 +164,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
 
     std::vector<OpLogBatchRecord> batches;
     TestFailPoint::Wait("standby_prefix_read_before_batch");
+    const bool serializable =
+        read_mode == OpLogBatchStandbyReadMode::SERIALIZABLE;
     err = storage_.ReadBatchesAfter(last_applied_batch_id_, max_batches,
-                                    batches, /*serializable=*/true);
+                                    batches, serializable);
     if (err != ErrorCode::OK) {
         SetPollError(result, err, IsRetryableBackendError(err));
         return result;
@@ -238,9 +240,14 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
     result.has_more_pages = max_batches != 0 && batches.size() >= max_batches &&
                             last_applied_batch_id_ < prefix.batch_id;
     if (!result.has_more_pages && last_applied_batch_id_ < prefix.batch_id) {
-        // A local serializable Range may trail the linearizable durable prefix.
-        // Keep the cursor at the last contiguous batch and wait for a later
-        // poll to observe the immutable suffix; never skip a batch or fail HA.
+        // A serializable Range can lag the durable prefix. Keep the cursor at
+        // the last contiguous batch until another poll observes the suffix.
+        if (read_mode == OpLogBatchStandbyReadMode::LINEARIZABLE) {
+            SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
+        } else {
+            result.disposition =
+                OpLogBatchStandbyPollDisposition::WAITING_FOR_SUFFIX;
+        }
         return result;
     }
     if (!result.has_more_pages &&
