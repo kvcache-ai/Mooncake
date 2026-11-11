@@ -157,6 +157,8 @@ class MasterService {
     WeightMetadataStore::Result<ListWeightRevisionsResponse>
     ListWeightRevisions(const ListWeightRevisionsRequest& request) const;
 
+    // The writer holds one terminal callback and the supervisor installs its
+    // own; the internal wake-up is composed with it so both always run.
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
@@ -1174,9 +1176,12 @@ class MasterService {
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
-    void ClearInvalidHandles();
+    // Fails when any cleanup entry could not be persisted; callers that gate
+    // on a completed sweep (the segment cleanup barrier) must not treat a
+    // partial sweep as done.
+    tl::expected<void, ErrorCode> ClearInvalidHandles();
     // Caller owns master_state_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandles(
+    tl::expected<void, ErrorCode> ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // every tenant. Owner-targeted on purpose: a liveness-complement sweep
@@ -1192,6 +1197,80 @@ class MasterService {
     // handles stale table-wide.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+
+    // Mount admission barrier for reused transfer endpoints, active with HA
+    // and the OpLog. A segment's endpoint stays closed to new mounts until the
+    // unmount that invalidated it has both enqueued its SEGMENT_UNMOUNT and
+    // been covered by a successful stale-handle sweep. Without that, the
+    // standby can still carry descriptors of the old segment on that endpoint
+    // when the new one mounts, and a promotion would bind them to it.
+    //
+    // One responsibility per segment: the same endpoint can carry several
+    // segments over time, and one unmount completing must not release the
+    // others. `outstanding` counts what is left for an endpoint.
+    struct EndpointCleanup {
+        UUID segment_id;
+        std::string endpoint;
+        uint64_t seq{0};
+        bool unmount_logged{false};
+        bool swept{false};
+    };
+    struct EndpointCleanupState {
+        size_t outstanding{0};
+    };
+    // The client does not retry a failed initial MountSegment, so the mount
+    // waits; the budget bounds that wait and is kept well below the client's
+    // RPC timeout. A mount that gives up never mounts.
+    static constexpr std::chrono::milliseconds kMountCleanupWaitBudget{3000};
+    static constexpr std::chrono::milliseconds kMountCleanupWaitSlice{100};
+    static constexpr std::chrono::milliseconds kReplicaCleanupRetryDelay{1000};
+
+    bool CleanupBarrierEnabled() const;
+    // Records the responsibility. The caller holds the segment lock that
+    // ordered the invalidation (PrepareUnmountSegment already released the
+    // allocator), so a sweep that takes its sequence afterwards sees it.
+    std::shared_ptr<SegmentUnmountLogState> PublishSegmentCleanup(
+        const UUID& segment_id, const std::string& endpoint);
+    void MarkSegmentCleanupLogged(const UUID& segment_id, bool logged);
+    // Every SEGMENT_UNMOUNT submission goes through a claim, so one token has
+    // exactly one submitter: the unmount RPC, the offboarding retry and the
+    // background flush cannot append the same entry twice, which would let a
+    // late duplicate delete a segment that reused the endpoint.
+    // Returns true when the caller owns the submission; false when the token
+    // is already logged or another thread holds the claim.
+    bool TryClaimSegmentUnmount(
+        const UUID& segment_id, const std::string& endpoint,
+        const std::string& payload,
+        std::shared_ptr<SegmentUnmountLogState>* held_state);
+    void CompleteSegmentUnmountLog(
+        const UUID& segment_id,
+        const std::shared_ptr<SegmentUnmountLogState>& state);
+    void ReleaseSegmentUnmountClaim(
+        const UUID& segment_id,
+        const std::shared_ptr<SegmentUnmountLogState>& state);
+    // Retries every claimed-and-failed SEGMENT_UNMOUNT entry; reschedules
+    // itself while one is still refused.
+    void FlushPendingSegmentUnmounts();
+    void MarkCleanupSwept(
+        uint64_t sweep_seq,
+        const std::unordered_set<UUID, boost::hash<UUID>>* tokens);
+    // Caller holds barrier_mutex_.
+    bool EndpointCleanupPendingLocked(const std::string& endpoint) const;
+    void MaybeClearCleanupLocked();
+    // True when the endpoint is clear, false when the wait gave up (a sweep
+    // that cannot run, or `deadline` passed). The deadline belongs to the
+    // whole mount, so a mount that waits twice still spends one budget.
+    bool WaitForEndpointCleanup(const std::string& endpoint,
+                                std::chrono::steady_clock::time_point deadline);
+    void RunReplicaCleanupSweep();
+    void StallCleanupWaiters();
+
+    // Prepares what a retired client's segments need and publishes each
+    // prepared segment's cleanup responsibility. The client monitor calls
+    // this before scheduling the job; tests drive the same function.
+    ClientOffboardingJob BuildClientOffboardingJob(
+        const UUID& client_id,
+        const std::shared_ptr<ClientLivenessRecord>& record);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1579,6 +1658,38 @@ class MasterService {
     BackgroundWorker kvcs_capacity_refresh_worker_;
     const bool enable_async_segment_cleanup_;
 
+    // Segment cleanup barrier state, guarded by barrier_mutex_ (see
+    // EndpointCleanup). Published under the segment lock, so a sweep that
+    // takes barrier_seq_ after a publication always sees the invalidation.
+    std::mutex barrier_mutex_;
+    std::condition_variable barrier_cv_;
+    uint64_t barrier_seq_{0};
+    std::unordered_map<UUID, EndpointCleanup, boost::hash<UUID>>
+        pending_cleanup_;
+    std::unordered_map<std::string, EndpointCleanupState> pending_by_endpoint_;
+    OrderedOpLogWriter::TerminalCallback MakeComposedTerminalCallback();
+    std::mutex terminal_callback_mutex_;
+    OrderedOpLogWriter::TerminalCallback external_terminal_callback_;
+
+    // Two reasons a sweep may not run, kept apart because only one is final:
+    // gate_closed tracks the restore lifecycle and clears itself, while
+    // unrecoverable covers shutdown and a writer that passed its terminal
+    // state and never clears.
+    bool cleanup_gate_closed_{false};
+    bool cleanup_unrecoverable_{false};
+    // One shared submission state per token (see SegmentUnmountLogState).
+    // The index holds it while the entry is pending or in flight; a holder
+    // (the offboarding job, an in-flight submitter) keeps it alive after the
+    // index drops it, so "already logged" outlives the responsibility without
+    // any history to prune.
+    std::unordered_map<UUID, std::shared_ptr<SegmentUnmountLogState>,
+                       boost::hash<UUID>>
+        unmount_log_states_;
+    // Test-only pause point between the segment commit and the unmount-log
+    // submission, so a suite can pin the interleaving where another submitter
+    // logs the token first.
+    std::function<void()> unmount_after_commit_hook_;
+
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
      * task into the holder client's LocalSSD mailbox.
@@ -1631,9 +1742,9 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;             // in range [0.0, 1.0]
+    const double eviction_ratio_;                     // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Memory eviction (see eviction::Evictor) and what it is built from: the
@@ -2365,14 +2476,24 @@ class MasterService {
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
-     * Appends a SEGMENT_MOUNT / SEGMENT_UNMOUNT entry without waiting for it
-     * to become durable. The local segment change has already happened and
-     * cannot be rolled back, so a failed append is only logged; nothing
-     * retries it.
+     * Segment lifecycle persist helper. Tries to enqueue the
+     * SEGMENT_MOUNT / SEGMENT_UNMOUNT entry up-front; on failure enqueues
+     * the same OpLogEntry (with its already-allocated sequence_id) for
+     * background retry so the standby segment registry eventually
+     * converges. Suitable for paths where the local segment commit has
+     * already happened (UnmountSegment) and rolling back is impossible.
+     *
+     * The result reports whether the entry was accepted by the writer, not
+     * whether it is durable. The segment cleanup barrier needs that
+     * distinction: order in the log follows the enqueue, durability does not
+     * gate the standby's apply order either way.
      */
-    void PersistSegmentOpForHA(const char* why, OpType type,
-                               const std::string& key,
-                               const std::string& payload);
+    tl::expected<void, ErrorCode> PersistSegmentOpForHAOrEnqueue(
+        const char* why, OpType type, const std::string& key,
+        const std::string& payload);
+    tl::expected<void, ErrorCode> PersistSegmentOpForHAOrEnqueue(
+        const char* why, OpType type, const TenantId& tenant_id,
+        const std::string& key, const std::string& payload);
 
     /**
      * Appends a REMOVE entry for the key, without waiting for it to become
