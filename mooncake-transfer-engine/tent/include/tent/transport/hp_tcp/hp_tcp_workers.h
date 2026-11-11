@@ -5,6 +5,7 @@
 #include <asio.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -56,11 +57,15 @@ class HighPerformanceTcpWorkers {
         size_t worker_count{16};
     };
 
-    using Task = std::function<void(size_t)>;
+    using QueueTime = std::chrono::steady_clock::time_point;
+    using Task = std::function<void(size_t, QueueTime)>;
     struct Command {
         size_t worker_id{0};
         Task run;
         std::function<void()> cancel;
+#if TENT_METRICS_ENABLED
+        QueueTime enqueue_time{};
+#endif
     };
 
     HighPerformanceTcpWorkers();

@@ -51,10 +51,27 @@
 #include "tent/runtime/transport.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
+#include "metrics_test_utils.h"
+
 namespace mooncake {
 namespace tent {
 
 #if TENT_METRICS_ENABLED
+
+static_assert(noexcept(std::declval<TentMetrics&>().recordStreamEvent(
+    TCP, Request::READ, TentMetrics::StreamEvent::RetryIssued)));
+static_assert(noexcept(
+    std::declval<TentMetrics&>().recordStreamAttempt(TCP, Request::READ, 1.0)));
+static_assert(noexcept(std::declval<TentMetrics&>().recordStreamQueueWait(
+    TCP, Request::READ, 1.0)));
+static_assert(
+    noexcept(std::declval<TentMetrics&>().recordStreamAdmission(HP_TCP, 1, 1)));
+static_assert(noexcept(std::declval<TentMetrics&>().recordStreamConnection(
+    HP_TCP, TentMetrics::StreamConnectionRole::Client, 1)));
+static_assert(noexcept(std::declval<TentMetrics&>().recordProtocolError(
+    HP_TCP, TentMetrics::ProtocolErrorKind::Frame)));
+static_assert(noexcept(std::declval<TentMetrics&>().recordTcpSocketSample(
+    HP_TCP, TentMetrics::StreamConnectionRole::Client, 1)));
 
 class TentMetricsTestPeer {
    public:
@@ -137,18 +154,7 @@ class MetricsSnapshot {
     // label set, for example:
     // tent_transport_attempts_total{transport="rdma",operation="write"}
     double series(const std::string& series) const {
-        std::istringstream input(prometheus_);
-        std::string line;
-        const std::string prefix = series + " ";
-        while (std::getline(input, line)) {
-            if (line.rfind(prefix, 0) != 0) continue;
-            try {
-                return std::stod(line.substr(prefix.size()));
-            } catch (...) {
-                return 0.0;
-            }
-        }
-        return 0.0;
+        return test::PrometheusSeriesValue(prometheus_, series);
     }
 
     // Counter value (0 if absent).
@@ -441,6 +447,20 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordDeadlineInfeasible(TCP);
     metrics.recordBatchQuarantined();
     metrics.recordTaskFailure(RDMA, TentMetrics::TaskFailureReason::Timeout);
+    metrics.recordStreamEvent(TCP, Request::READ,
+                              TentMetrics::StreamEvent::RetryIssued);
+    metrics.recordStreamAttempt(HP_TCP, Request::WRITE, 45.0);
+    metrics.recordStreamQueueWait(TCP, Request::READ, 12.0);
+    metrics.recordStreamAdmission(HP_TCP, 2, 4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 1);
+    metrics.recordStreamAdmission(HP_TCP, -2, -4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
+    metrics.recordProtocolError(HP_TCP,
+                                TentMetrics::ProtocolErrorKind::Correlation);
+    metrics.recordTcpSocketSample(HP_TCP,
+                                  TentMetrics::StreamConnectionRole::Client, 2);
     metrics.recordInflightAttemptStarted(RDMA);
     metrics.recordInflightAttemptFinished(RDMA);
     metrics.recordRegisteredBufferBytes(RDMA, 4096);
@@ -450,7 +470,7 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     metrics.recordStageLatency(TentMetrics::Stage::Transport, RDMA, 30.0);
 
     const std::string body = metrics.getPrometheusMetrics();
-    const std::array<std::pair<std::string_view, std::string_view>, 34>
+    const std::array<std::pair<std::string_view, std::string_view>, 42>
         expected_types{{
             {"tent_read_bytes_total", "counter"},
             {"tent_write_bytes_total", "counter"},
@@ -467,8 +487,14 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_task_failures_total", "counter"},
             {"tent_deadline_infeasible_total", "counter"},
             {"tent_quarantined_batches_total", "counter"},
+            {"tent_stream_events_total", "counter"},
+            {"tent_protocol_errors_total", "counter"},
+            {"tent_tcp_retransmissions_total", "counter"},
             {"tent_inflight_attempts", "gauge"},
             {"tent_logical_requests_inflight", "gauge"},
+            {"tent_stream_admitted_tasks", "gauge"},
+            {"tent_stream_admitted_bytes", "gauge"},
+            {"tent_stream_connections", "gauge"},
             {"tent_registered_buffer_bytes", "gauge"},
             {"tent_read_latency_us", "histogram"},
             {"tent_write_latency_us", "histogram"},
@@ -479,6 +505,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
             {"tent_stage_dispatch_us", "histogram"},
             {"tent_stage_transport_us", "histogram"},
             {"tent_transport_attempt_latency_us", "histogram"},
+            {"tent_stream_attempt_latency_us", "histogram"},
+            {"tent_stream_queue_wait_us", "histogram"},
             {"tent_metrics_build_info", "gauge"},
             {"tent_metrics_runtime_enabled", "gauge"},
             {"tent_metrics_http_server_up", "gauge"},
@@ -494,6 +522,8 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
                   std::string::npos)
             << "missing or changed Prometheus contract for " << name;
     }
+    EXPECT_EQ(body.find("tent_stream_events_total{transport=\"rdma\""),
+              std::string::npos);
     EXPECT_NE(body.find("tent_metrics_build_info{version=\""),
               std::string::npos);
     EXPECT_EQ(body.find("compile_time_enabled"), std::string::npos);
@@ -503,6 +533,70 @@ TEST_F(MetricsRecordingTest, PrometheusMetricFamilyContract) {
     EXPECT_NE(body.find("tent_metrics_serialization_attempts_total{format=\""
                         "json\"}"),
               std::string::npos);
+}
+
+TEST_F(MetricsRecordingTest,
+       StreamEventsStayDistinctFromPhysicalAttemptCompletions) {
+    auto& metrics = TentMetrics::instance();
+    auto before = MetricsSnapshot(metrics);
+
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::ConnectStarted, 2);
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::ConnectSuccess);
+    metrics.recordStreamEvent(HP_TCP, Request::READ,
+                              TentMetrics::StreamEvent::RetryIssued);
+    metrics.recordStreamAttempt(HP_TCP, Request::READ, 51.0);
+    metrics.recordStreamQueueWait(HP_TCP, Request::READ, 17.0);
+
+    auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                     "operation=\"read\",event=\"connect_started\"}") -
+            before.series("tent_stream_events_total{transport=\"hp_tcp\","
+                          "operation=\"read\",event=\"connect_started\"}"),
+        2);
+    EXPECT_EQ(
+        after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                     "operation=\"read\",event=\"connect_success\"}") -
+            before.series("tent_stream_events_total{transport=\"hp_tcp\","
+                          "operation=\"read\",event=\"connect_success\"}"),
+        1);
+    EXPECT_EQ(after.series("tent_stream_events_total{transport=\"hp_tcp\","
+                           "operation=\"read\",event=\"retry_issued\"}") -
+                  before.series("tent_stream_events_total{transport=\"hp_tcp\","
+                                "operation=\"read\",event=\"retry_issued\"}"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_stream_attempt_latency_us") -
+                  before.histogramCount("tent_stream_attempt_latency_us"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_stream_queue_wait_us") -
+                  before.histogramCount("tent_stream_queue_wait_us"),
+              1);
+}
+
+TEST_F(MetricsRecordingTest, NetworkAndProtocolSignalsUseBoundedLabels) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    metrics.recordProtocolError(HP_TCP,
+                                TentMetrics::ProtocolErrorKind::Correlation);
+    metrics.recordTcpSocketSample(HP_TCP,
+                                  TentMetrics::StreamConnectionRole::Server, 3);
+
+    const auto after = MetricsSnapshot(metrics);
+    EXPECT_EQ(
+        after.series("tent_protocol_errors_total{transport=\"hp_tcp\","
+                     "kind=\"correlation\"}") -
+            before.series("tent_protocol_errors_total{transport=\"hp_tcp\","
+                          "kind=\"correlation\"}"),
+        1);
+    EXPECT_EQ(
+        after.series("tent_tcp_retransmissions_total{transport=\"hp_tcp\","
+                     "role=\"server\"}") -
+            before.series("tent_tcp_retransmissions_total{transport=\"hp_tcp\","
+                          "role=\"server\"}"),
+        3);
 }
 
 TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {
@@ -527,6 +621,28 @@ TEST_F(MetricsRecordingTest, SelfMetricsRemainVisibleWhenRuntimeDisabled) {
               0);
 
     TentMetrics::setEnabled(true);
+}
+
+TEST_F(MetricsRecordingTest, StreamStateGaugesSurviveEnableToggle) {
+    auto& metrics = TentMetrics::instance();
+    const auto before = MetricsSnapshot(metrics);
+
+    TentMetrics::setEnabled(true);
+    metrics.recordStreamAdmission(HP_TCP, 2, 4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, 1);
+    TentMetrics::setEnabled(false);
+    metrics.recordStreamAdmission(HP_TCP, -2, -4096);
+    metrics.recordStreamConnection(
+        HP_TCP, TentMetrics::StreamConnectionRole::Client, -1);
+    TentMetrics::setEnabled(true);
+
+    const auto after = MetricsSnapshot(metrics);
+    for (const char* family :
+         {"tent_stream_admitted_tasks", "tent_stream_admitted_bytes",
+          "tent_stream_connections"}) {
+        EXPECT_EQ(after.counter(family) - before.counter(family), 0) << family;
+    }
 }
 
 TEST_F(MetricsRecordingTest,
@@ -1882,6 +1998,14 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_deadline_infeasible_total"));
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
     EXPECT_TRUE(json.contains("tent_task_failures_total"));
+    EXPECT_TRUE(json.contains("tent_stream_events_total"));
+    EXPECT_TRUE(json.contains("tent_stream_attempt_latency_us"));
+    EXPECT_TRUE(json.contains("tent_stream_queue_wait_us"));
+    EXPECT_TRUE(json.contains("tent_stream_admitted_tasks"));
+    EXPECT_TRUE(json.contains("tent_stream_admitted_bytes"));
+    EXPECT_TRUE(json.contains("tent_stream_connections"));
+    EXPECT_TRUE(json.contains("tent_protocol_errors_total"));
+    EXPECT_TRUE(json.contains("tent_tcp_retransmissions_total"));
     EXPECT_TRUE(json.contains("tent_metrics_build_info"));
     EXPECT_FALSE(
         json["tent_metrics_build_info"].contains("compile_time_enabled"));

@@ -267,9 +267,15 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_task_failures_total` | Counter | `transport`, `reason` | Task failures grouped by terminal transport and failure reason |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_quarantined_batches_total` | Counter | - | Batches abandoned after repeated reclaim failures and retained until engine teardown |
+| `tent_stream_events_total` | Counter | `transport`, `operation`, `event` | TCP software retries and HP-TCP connection-establishment events |
+| `tent_protocol_errors_total` | Counter | `transport`, `kind` | Malformed HP-TCP frames or response-correlation failures |
+| `tent_tcp_retransmissions_total` | Counter | `transport`, `role` | Delta of Linux `TCP_INFO.tcpi_total_retrans` sampled from HP-TCP sockets |
 | `tent_inflight_attempts` | Gauge | `transport` | Physical transport attempts submitted but not yet finished |
 | `tent_logical_requests_inflight` | Gauge | `operation` | Counted logical requests without a terminal outcome |
 | `tent_registered_buffer_bytes` | Gauge | `transport` | Currently registered local buffer bytes |
+| `tent_stream_admitted_tasks` | Gauge | `transport` | HP-TCP tasks currently reserved by admission control |
+| `tent_stream_admitted_bytes` | Gauge | `transport` | HP-TCP bytes currently reserved by admission control |
+| `tent_stream_connections` | Gauge | `transport`, `role` | Open stream connections split by client and server role |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
 | `tent_read_size_bytes` | Histogram | `transport` | Read request size distribution in bytes |
@@ -279,6 +285,8 @@ Metrics HTTP: up (start failures: 0) | Read: 1.00 MB (100 reqs, 2 fails) | Write
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
 | `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
+| `tent_stream_attempt_latency_us` | Histogram | `transport`, `operation` | End-to-end latency of each started TCP or HP-TCP network attempt; its `_count` is the canonical attempt-completion count |
+| `tent_stream_queue_wait_us` | Histogram | `transport`, `operation` | Queue wait observed only when a TCP logical task or HP-TCP physical slice actually starts an attempt |
 
 ### Metrics pipeline self-observability
 
@@ -318,6 +326,28 @@ visible when runtime transfer recording is disabled.
   closed exactly once even if recording is disabled before completion. A
   request that starts while disabled emits neither side of the pair.
 - `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
+- State gauges ignore the runtime sampling switch. Every admission and
+  connection increment is paired with a decrement on success, cancellation,
+  timeout, dispatch failure, and shutdown paths.
+- `tent_tcp_retransmissions_total` reports kernel TCP retransmissions sampled
+  through TCP_INFO; it is different from TENT software retry events. TCP_INFO
+  is sampled every 256 completed HP-TCP operations and once before a
+  connection closes. The classic RPC-backed TCP transport does not expose its
+  socket handle here; pair TENT metrics with host TCP telemetry for that
+  transport.
+- `tent_protocol_errors_total` separates malformed frames from response
+  correlation failures such as a mismatched request ID or committed length.
+  Header details are deliberately not exported as metric labels. A rising
+  protocol counter is not ordinary packet loss because TCP already provides
+  an ordered byte stream.
+- Stream recording is a non-interfering side channel: every bounded stream
+  label and histogram bucket is resolved during initialization, and hot-path
+  updates are `noexcept` relaxed atomic operations. If initialization did not
+  publish a cell, the sample is dropped without changing transfer control
+  flow.
+- Queue wait is recorded only as an attempt starts. Work canceled or rejected
+  before execution has no queue-wait observation, so the histogram does not
+  pretend those samples reached the network.
 - `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
 - Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
@@ -336,16 +366,19 @@ Transfer and attempt metrics carry a `transport` label (the
 can be sliced by transport without grepping logs. Attempt and logical
 accounting carry an `operation` label; terminal accounting also carries the
 four-valued `outcome` label. Task failures add a closed-set `reason` label and
-metrics serialization adds a two-valued `format` label. Label values come from
-bounded sets; no request IDs, addresses, segment names, or other unbounded
-values are accepted.
+metrics serialization adds a two-valued `format` label.
+Label values come from bounded sets; no request IDs, addresses, segment names,
+or other unbounded values are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
 | `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu`, `ub`, `mpcomm`, `hp_tcp`, `xpu`, `hylink`, `fabric`, `mlu`, `memfabric` | The transport that handled the transfer |
 | `operation` | `read`, `write` | Attempt operation |
-| `outcome` | `success`, `failed`, `timeout`, `canceled` | Bounded terminal outcome |
+| `outcome` | `success`, `failed`, `timeout`, `canceled` | Bounded accounting terminal outcome |
 | `reason` | `submit`, `poll`, `timeout`, `canceled` | Task failure classification |
+| `event` | `connect_started`, `connect_success`, `retry_issued`, `retry_exhausted` | Bounded connection or software-retry event |
+| `role` | `client`, `server` | Stream connection endpoint role |
+| `kind` | `frame`, `correlation` | Bounded HP-TCP protocol error classification |
 | `format` | `prometheus`, `json` | Serialization output format |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
@@ -364,6 +397,16 @@ attempt outcomes have at most 19x2x4 = 152, task failures have at most 19x4 =
 labels are constant for the life of the process; a served
 `tent_metrics_build_info` series itself confirms that metrics were compiled
 in. Total series across all metrics is bounded by these closed sets.
+
+Stream metrics are emitted only for `tcp` and `hp_tcp`. A classic TCP retry is
+counted when another control-plane data RPC is issued; `retry_exhausted` marks
+the terminal exhaustion of that loop. HP-TCP emits connection-establishment
+events and counts a retry only after the replacement task is admitted. Queue
+wait and attempt latency each have at most 2x2 = 4 transport/operation series,
+and the event counter has at most 2x2x4 = 16 series. HP-TCP adds two connection
+series, two retransmission series, two protocol-error series, and one series
+for each admission gauge. Peer identity, socket address, lane and request ID
+are never metric labels.
 
 ### Per-rail load (`getNicLoadStats`)
 
@@ -577,6 +620,57 @@ histogram_quantile(
   sum by (le) (
     rate(tent_transport_attempt_latency_us_bucket{
       transport="rdma",operation="write"
+    }[5m])
+  )
+) / 1000000
+
+# Classic TCP software retries and exhausted retry loops
+sum by (event) (
+  rate(tent_stream_events_total{
+    transport="tcp",event=~"retry_issued|retry_exhausted"
+  }[5m])
+)
+
+# HP-TCP connection attempts that have not completed successfully in the
+# selected window. Interpret positive values together with current connections
+# and protocol errors because attempts can straddle the window boundary.
+increase(tent_stream_events_total{
+  transport="hp_tcp",event="connect_started"
+}[5m])
+- ignoring(event)
+increase(tent_stream_events_total{
+  transport="hp_tcp",event="connect_success"
+}[5m])
+
+# HP-TCP kernel retransmissions by endpoint role
+sum by (role) (
+  rate(tent_tcp_retransmissions_total{transport="hp_tcp"}[5m])
+)
+
+# HP-TCP protocol failures: malformed frames versus response correlation
+sum by (kind) (
+  rate(tent_protocol_errors_total{transport="hp_tcp"}[5m])
+)
+
+# HP-TCP admission pressure and live connections
+tent_stream_admitted_tasks{transport="hp_tcp"}
+tent_stream_admitted_bytes{transport="hp_tcp"}
+tent_stream_connections{transport="hp_tcp"}
+
+# P99 queue wait and started-attempt latency for HP-TCP writes
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(tent_stream_queue_wait_us_bucket{
+      transport="hp_tcp",operation="write"
+    }[5m])
+  )
+) / 1000000
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(tent_stream_attempt_latency_us_bucket{
+      transport="hp_tcp",operation="write"
     }[5m])
   )
 ) / 1000000

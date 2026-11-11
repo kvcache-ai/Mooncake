@@ -115,6 +115,40 @@ const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
     }
     return "unknown";
 }
+
+const char* streamEventName(TentMetrics::StreamEvent event) {
+    switch (event) {
+        case TentMetrics::StreamEvent::ConnectStarted:
+            return "connect_started";
+        case TentMetrics::StreamEvent::ConnectSuccess:
+            return "connect_success";
+        case TentMetrics::StreamEvent::RetryIssued:
+            return "retry_issued";
+        case TentMetrics::StreamEvent::RetryExhausted:
+            return "retry_exhausted";
+    }
+    return "unknown";
+}
+
+const char* streamConnectionRoleName(TentMetrics::StreamConnectionRole role) {
+    switch (role) {
+        case TentMetrics::StreamConnectionRole::Client:
+            return "client";
+        case TentMetrics::StreamConnectionRole::Server:
+            return "server";
+    }
+    return "unknown";
+}
+
+const char* protocolErrorKindName(TentMetrics::ProtocolErrorKind kind) {
+    switch (kind) {
+        case TentMetrics::ProtocolErrorKind::Frame:
+            return "frame";
+        case TentMetrics::ProtocolErrorKind::Correlation:
+            return "correlation";
+    }
+    return "frame";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -339,11 +373,14 @@ void TentMetrics::registerMetrics() {
         &task_failures_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
+        &stream_events_total_,
+        &protocol_errors_total_,
+        &tcp_retransmissions_total_,
     };
 
     gauges_ = {
-        &inflight_attempts_,
-        &logical_requests_inflight_,
+        &inflight_attempts_,       &logical_requests_inflight_,
+        &stream_admitted_tasks_,   &stream_admitted_bytes_,
         &registered_buffer_bytes_,
     };
 
@@ -379,6 +416,14 @@ void TentMetrics::preResolveAccountingMetrics() {
         Request::READ, Request::WRITE};
     constexpr std::array<TransferStatusEnum, kOutcomeValueDomain> outcomes{
         COMPLETED, FAILED, TIMEOUT, CANCELED};
+    constexpr std::array<StreamEvent, kStreamEventValueDomain> stream_events{
+        StreamEvent::ConnectStarted, StreamEvent::ConnectSuccess,
+        StreamEvent::RetryIssued, StreamEvent::RetryExhausted};
+    constexpr std::array<StreamConnectionRole, 2> connection_roles{
+        StreamConnectionRole::Client, StreamConnectionRole::Server};
+    constexpr std::array<ProtocolErrorKind, kProtocolErrorKindDomain>
+        protocol_errors{ProtocolErrorKind::Frame,
+                        ProtocolErrorKind::Correlation};
 
     for (Request::OpCode operation : operations) {
         const size_t operation_slot = operationSlot(operation);
@@ -416,6 +461,46 @@ void TentMetrics::preResolveAccountingMetrics() {
                                                outcomeName(outcome)});
             }
         }
+    }
+
+    constexpr std::array<TransportType, 2> stream_transports{TCP, HP_TCP};
+    for (TransportType tp : stream_transports) {
+        for (Request::OpCode operation : operations) {
+            const size_t slot = streamOperationSlot(tp, operation);
+            const std::array<std::string, 2> labels{transportTypeName(tp),
+                                                    operationName(operation)};
+            stream_attempt_latency_.preResolve(slot, labels);
+            stream_queue_wait_.preResolve(slot, labels);
+            for (StreamEvent event : stream_events) {
+                stream_events_total_.preResolve(
+                    streamEventSlot(tp, operation, event),
+                    std::array<std::string, 3>{transportTypeName(tp),
+                                               operationName(operation),
+                                               streamEventName(event)});
+            }
+        }
+    }
+
+    constexpr TransportType stream_state_transport = HP_TCP;
+    const size_t state_slot = transportSlot(stream_state_transport);
+    const std::array<std::string, 1> state_label{
+        transportTypeName(stream_state_transport)};
+    stream_admitted_tasks_.preResolve(state_slot, state_label);
+    stream_admitted_bytes_.preResolve(state_slot, state_label);
+    for (StreamConnectionRole role : connection_roles) {
+        const size_t slot = streamConnectionSlot(stream_state_transport, role);
+        const std::array<std::string, 2> labels{
+            transportTypeName(stream_state_transport),
+            streamConnectionRoleName(role)};
+        stream_connections_.preResolve(slot, labels);
+        tcp_retransmissions_total_.preResolve(slot, labels);
+    }
+    for (ProtocolErrorKind kind : protocol_errors) {
+        protocol_errors_total_.preResolve(
+            protocolErrorSlot(stream_state_transport, kind),
+            std::array<std::string, 2>{
+                transportTypeName(stream_state_transport),
+                protocolErrorKindName(kind)});
     }
 }
 
@@ -513,6 +598,72 @@ void TentMetrics::recordLogicalRequestFinished(
     logical_request_outcomes_total_.incResolved(
         logicalOutcomeSlot(operation, status));
     logical_requests_inflight_.incResolved(operationSlot(operation), -1);
+}
+
+void TentMetrics::recordStreamEvent(TransportType transport,
+                                    Request::OpCode operation,
+                                    StreamEvent event, int64_t count) noexcept {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        count <= 0)
+        return;
+    stream_events_total_.incResolved(
+        streamEventSlot(transport, operation, event), count);
+}
+
+void TentMetrics::recordStreamAttempt(TransportType transport,
+                                      Request::OpCode operation,
+                                      double latency_us) noexcept {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    if (latency_us < 0.0) return;
+    stream_attempt_latency_.observeResolved(
+        streamOperationSlot(transport, operation),
+        static_cast<int64_t>(latency_us));
+}
+
+void TentMetrics::recordStreamQueueWait(TransportType transport,
+                                        Request::OpCode operation,
+                                        double latency_us) noexcept {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed) ||
+        latency_us < 0.0)
+        return;
+    stream_queue_wait_.observeResolved(
+        streamOperationSlot(transport, operation),
+        static_cast<int64_t>(latency_us));
+}
+
+void TentMetrics::recordStreamAdmission(TransportType transport,
+                                        int64_t task_delta,
+                                        int64_t byte_delta) noexcept {
+    if (!initialized_) return;
+    const size_t slot = transportSlot(transport);
+    if (task_delta != 0) stream_admitted_tasks_.incResolved(slot, task_delta);
+    if (byte_delta != 0) stream_admitted_bytes_.incResolved(slot, byte_delta);
+}
+
+void TentMetrics::recordStreamConnection(TransportType transport,
+                                         StreamConnectionRole role,
+                                         int64_t delta) noexcept {
+    if (!initialized_ || delta == 0) return;
+    stream_connections_.incResolved(streamConnectionSlot(transport, role),
+                                    delta);
+}
+
+void TentMetrics::recordProtocolError(TransportType transport,
+                                      ProtocolErrorKind kind) noexcept {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    protocol_errors_total_.incResolved(protocolErrorSlot(transport, kind));
+}
+
+void TentMetrics::recordTcpSocketSample(TransportType transport,
+                                        StreamConnectionRole role,
+                                        uint32_t retransmit_delta) noexcept {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    if (retransmit_delta == 0) return;
+    tcp_retransmissions_total_.incResolved(
+        streamConnectionSlot(transport, role), retransmit_delta);
 }
 
 // Gauge updates below deliberately ignore runtime_enabled_: gauges track
@@ -676,11 +827,14 @@ bool TentMetrics::tryGetPrometheusMetrics(std::string& result) {
             // N=2 transport-attempt latency histogram (labels: transport,
             // operation) goes through the same helper, instantiated for N=2.
             serializeHistogramPrometheus(transport_attempt_latency_, output);
+            serializeHistogramPrometheus(stream_attempt_latency_, output);
+            serializeHistogramPrometheus(stream_queue_wait_, output);
 
             // Gauges: current value per label.
             for (auto* gauge : gauges_) {
                 serializeGaugePrometheus(*gauge, output);
             }
+            serializeGaugePrometheus(stream_connections_, output);
 
             appendSelfMetricsPrometheus(output, success_timestamp);
         });
@@ -849,8 +1003,9 @@ void TentMetrics::serializeHistogramPrometheus(
     }
 }
 
+template <uint8_t N>
 void TentMetrics::serializeGaugePrometheus(
-    metrics::CachedDynamicCounter<1>& gauge, std::string& out) const {
+    metrics::CachedDynamicCounter<N>& gauge, std::string& out) const {
     auto cells = gauge.copy();
     if (cells.empty()) return;
     const std::string& name = gauge.str_name();
@@ -861,12 +1016,15 @@ void TentMetrics::serializeGaugePrometheus(
         .append("\n");
     out.append("# TYPE ").append(name).append(" gauge\n");
     for (auto& e : cells) {
-        out.append(name)
-            .append("{")
-            .append(gauge.labels_name()[0])
-            .append("=\"")
-            .append(e->label[0])
-            .append("\"} ")
+        out.append(name).append("{");
+        for (uint8_t i = 0; i < N; ++i) {
+            if (i != 0) out.append(",");
+            out.append(gauge.labels_name()[i])
+                .append("=\"")
+                .append(escapePrometheusLabelValue(e->label[i]))
+                .append("\"");
+        }
+        out.append("} ")
             .append(std::to_string(e->value.load(std::memory_order_relaxed)))
             .append("\n");
     }
@@ -998,6 +1156,12 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&deadline_infeasible_total_);
             root[quarantined_batches_total_.str_name()] =
                 static_cast<int64_t>(quarantined_batches_total_.value());
+            root[stream_events_total_.str_name()] =
+                sumCounterValues(&stream_events_total_);
+            root[protocol_errors_total_.str_name()] =
+                sumCounterValues(&protocol_errors_total_);
+            root[tcp_retransmissions_total_.str_name()] =
+                sumCounterValues(&tcp_retransmissions_total_);
 
             // Gauges: aggregate across transport labels (total in-flight
             // attempts / total registered bytes). Per-transport breakdown is
@@ -1008,6 +1172,12 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
                 sumCounterValues(&logical_requests_inflight_);
             root[registered_buffer_bytes_.str_name()] =
                 sumCounterValues(&registered_buffer_bytes_);
+            root[stream_admitted_tasks_.str_name()] =
+                sumCounterValues(&stream_admitted_tasks_);
+            root[stream_admitted_bytes_.str_name()] =
+                sumCounterValues(&stream_admitted_bytes_);
+            root[stream_connections_.str_name()] =
+                sumCounterValues(&stream_connections_);
 
             // Histograms: sum bucket counts across all transport labels. The
             // templated helper also reads back the histogram's sum counter so
@@ -1022,6 +1192,8 @@ bool TentMetrics::tryGetJsonMetrics(std::string& result) {
             serializeHistogramToJson(root, stage_dispatch_);
             serializeHistogramToJson(root, stage_transport_);
             serializeHistogramToJson(root, transport_attempt_latency_);
+            serializeHistogramToJson(root, stream_attempt_latency_);
+            serializeHistogramToJson(root, stream_queue_wait_);
 
             root["tent_metrics_build_info"] = {
                 {"version", TENT_BUILD_VERSION},
@@ -1161,6 +1333,20 @@ void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
+void TentMetrics::recordStreamEvent(TransportType, Request::OpCode, StreamEvent,
+                                    int64_t) noexcept {}
+void TentMetrics::recordStreamAttempt(TransportType, Request::OpCode,
+                                      double) noexcept {}
+void TentMetrics::recordStreamQueueWait(TransportType, Request::OpCode,
+                                        double) noexcept {}
+void TentMetrics::recordStreamAdmission(TransportType, int64_t,
+                                        int64_t) noexcept {}
+void TentMetrics::recordStreamConnection(TransportType, StreamConnectionRole,
+                                         int64_t) noexcept {}
+void TentMetrics::recordProtocolError(TransportType,
+                                      ProtocolErrorKind) noexcept {}
+void TentMetrics::recordTcpSocketSample(TransportType, StreamConnectionRole,
+                                        uint32_t) noexcept {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}
 void TentMetrics::recordInflightAttemptFinished(TransportType) {}
 void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}

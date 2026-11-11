@@ -5,6 +5,7 @@
 #include <asio.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,9 @@ class HighPerformanceTcpClient {
         uint64_t length{0};
         HighPerformanceTcpOpcode opcode{HighPerformanceTcpOpcode::kRead};
         uint64_t request_id{0};
+#if TENT_METRICS_ENABLED
+        std::chrono::steady_clock::time_point enqueue_time{};
+#endif
         std::function<void(TransferStatusEnum, size_t,
                            std::optional<HighPerformanceTcpStatus>)>
             complete;

@@ -10,7 +10,9 @@
 
 #include <glog/logging.h>
 
+#include "tent/metrics/tent_metrics.h"
 #include "tent/transport/hp_tcp/hp_tcp_protocol.h"
+#include "tent/transport/hp_tcp/hp_tcp_socket_observability.h"
 
 namespace mooncake::tent {
 
@@ -32,6 +34,9 @@ class HighPerformanceTcpServer::Session
     void cancel() {
         forced_close_ = true;
         cancelTimer();
+#if TENT_METRICS_ENABLED
+        sampleSocket(true);
+#endif
         std::error_code ignored;
         socket_->cancel(ignored);
         socket_->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
@@ -60,6 +65,9 @@ class HighPerformanceTcpServer::Session
             finishClosed();
             return;
         }
+#if TENT_METRICS_ENABLED
+        if (request_epoch_ != 0) sampleSocket(false);
+#endif
         lease_.reset();
         body_offset_ = 0;
         header_offset_ = 0;
@@ -109,11 +117,19 @@ class HighPerformanceTcpServer::Session
             request_bytes_.data(), request_bytes_.size(), &request_,
             &wire_error);
         if (!decoded.ok()) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordProtocolError(
+                TransportType::HP_TCP, TentMetrics::ProtocolErrorKind::Frame);
+#endif
             request_.request_id = 0;
             sendResponse(wire_error, 0, true);
             return;
         }
         if (request_.length > config_.max_transfer_bytes) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordProtocolError(
+                TransportType::HP_TCP, TentMetrics::ProtocolErrorKind::Frame);
+#endif
             sendResponse(HighPerformanceTcpStatus::kBadLength, 0, true);
             return;
         }
@@ -292,6 +308,9 @@ class HighPerformanceTcpServer::Session
                     return;
                 }
                 self->forced_close_ = true;
+#if TENT_METRICS_ENABLED
+                self->sampleSocket(true);
+#endif
                 std::error_code ignored;
                 self->socket_->cancel(ignored);
                 self->socket_->shutdown(asio::ip::tcp::socket::shutdown_both,
@@ -313,6 +332,9 @@ class HighPerformanceTcpServer::Session
         if (closed_) return;
         closed_ = true;
         cancelTimer();
+#if TENT_METRICS_ENABLED
+        sampleSocket(true);
+#endif
         std::error_code ignored;
         socket_->cancel(ignored);
         socket_->shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
@@ -320,6 +342,26 @@ class HighPerformanceTcpServer::Session
         lease_.reset();
         parent_->onSessionClosed(worker_id_, shared_from_this());
     }
+
+#if TENT_METRICS_ENABLED
+    void sampleSocket(bool force) {
+        constexpr uint64_t kSampleInterval = 256;
+        if (force && socket_observation_finalized_) return;
+        if (!force && ++socket_sample_tick_ % kSampleInterval != 0) return;
+        if (force) socket_observation_finalized_ = true;
+        TcpSocketObservation observation;
+        if (!ReadTcpSocketObservation(*socket_, &observation)) return;
+        const uint32_t retransmit_delta =
+            observation.total_retransmissions >= last_total_retransmissions_
+                ? observation.total_retransmissions -
+                      last_total_retransmissions_
+                : observation.total_retransmissions;
+        last_total_retransmissions_ = observation.total_retransmissions;
+        TentMetrics::instance().recordTcpSocketSample(
+            TransportType::HP_TCP, TentMetrics::StreamConnectionRole::Server,
+            retransmit_delta);
+    }
+#endif
 
     HighPerformanceTcpServer* parent_;
     size_t worker_id_;
@@ -339,6 +381,11 @@ class HighPerformanceTcpServer::Session
     uint64_t timer_generation_{0};
     bool forced_close_{false};
     bool closed_{false};
+#if TENT_METRICS_ENABLED
+    uint32_t last_total_retransmissions_{0};
+    uint64_t socket_sample_tick_{0};
+    bool socket_observation_finalized_{false};
+#endif
 };
 
 HighPerformanceTcpServer::HighPerformanceTcpServer(
@@ -361,10 +408,36 @@ bool HighPerformanceTcpServer::reserveConnection() {
         if (active_sessions_.compare_exchange_weak(current, current + 1,
                                                    std::memory_order_acq_rel,
                                                    std::memory_order_acquire)) {
+#if TENT_METRICS_ENABLED
+            TentMetrics::instance().recordStreamConnection(
+                TransportType::HP_TCP,
+                TentMetrics::StreamConnectionRole::Server, 1);
+#endif
             return true;
         }
     }
     return false;
+}
+
+void HighPerformanceTcpServer::releaseConnection() {
+    size_t previous = active_sessions_.load(std::memory_order_acquire);
+    while (previous != 0 &&
+           !active_sessions_.compare_exchange_weak(previous, previous - 1,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+    }
+    if (previous == 0) {
+        LOG(ERROR) << "HP TCP active-session accounting underflow";
+        return;
+    }
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordStreamConnection(
+        TransportType::HP_TCP, TentMetrics::StreamConnectionRole::Server, -1);
+#endif
+    if (previous == 1) {
+        std::lock_guard<std::mutex> lock(sessions_wait_mutex_);
+        sessions_wait_cv_.notify_all();
+    }
 }
 
 Status HighPerformanceTcpServer::start(uint16_t* bound_port) {
@@ -452,18 +525,12 @@ Status HighPerformanceTcpServer::startAccept() {
                     } catch (const std::exception& post_error) {
                         LOG(ERROR) << "HP TCP accepted-socket dispatch failed: "
                                    << post_error.what();
-                        if (active_sessions_.fetch_sub(
-                                1, std::memory_order_acq_rel) == 1) {
-                            sessions_wait_cv_.notify_all();
-                        }
+                        releaseConnection();
                         std::error_code ignored;
                         socket->close(ignored);
                     } catch (...) {
                         LOG(ERROR) << "HP TCP accepted-socket dispatch failed";
-                        if (active_sessions_.fetch_sub(
-                                1, std::memory_order_acq_rel) == 1) {
-                            sessions_wait_cv_.notify_all();
-                        }
+                        releaseConnection();
                         std::error_code ignored;
                         socket->close(ignored);
                     }
@@ -500,9 +567,7 @@ void HighPerformanceTcpServer::installAcceptedSocket(
     if (stopping_.load(std::memory_order_acquire)) {
         std::error_code ignored;
         socket->close(ignored);
-        if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            sessions_wait_cv_.notify_all();
-        }
+        releaseConnection();
         return;
     }
     std::shared_ptr<Session> session;
@@ -521,28 +586,21 @@ void HighPerformanceTcpServer::installAcceptedSocket(
         std::error_code ignored;
         socket->cancel(ignored);
         socket->close(ignored);
-        if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            sessions_wait_cv_.notify_all();
-        }
+        releaseConnection();
     } catch (...) {
         LOG(ERROR) << "HP TCP server session start failed";
         if (session) sessions_[worker_id].erase(session);
         std::error_code ignored;
         socket->cancel(ignored);
         socket->close(ignored);
-        if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            sessions_wait_cv_.notify_all();
-        }
+        releaseConnection();
     }
 }
 
 void HighPerformanceTcpServer::onSessionClosed(
     size_t worker_id, const std::shared_ptr<Session>& session) {
     if (worker_id < sessions_.size()) sessions_[worker_id].erase(session);
-    if (active_sessions_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        std::lock_guard<std::mutex> lock(sessions_wait_mutex_);
-        sessions_wait_cv_.notify_all();
-    }
+    releaseConnection();
 }
 
 Status HighPerformanceTcpServer::stopAccepting() {

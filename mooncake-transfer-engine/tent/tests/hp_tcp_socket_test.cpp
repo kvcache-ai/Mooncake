@@ -10,8 +10,12 @@
 #include <optional>
 #include <thread>
 
+#include "tent/metrics/config_loader.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/transport/hp_tcp/hp_tcp_client.h"
 #include "tent/transport/hp_tcp/hp_tcp_server.h"
+
+#include "metrics_test_utils.h"
 
 namespace mooncake::tent {
 namespace {
@@ -94,14 +98,20 @@ class Runtime {
         const size_t owner =
             workers.affinityOwner(operation.peer_id, operation.lane_id);
         std::vector<HighPerformanceTcpWorkers::Command> commands;
-        commands.push_back({.worker_id = owner,
-                            .run =
-                                [this, owner, operation = std::move(operation)](
-                                    size_t) mutable {
-                                    client.enqueueOnOwner(owner,
-                                                          std::move(operation));
-                                },
-                            .cancel = {}});
+        HighPerformanceTcpWorkers::Command command;
+        command.worker_id = owner;
+        command.run =
+            [this, owner, operation = std::move(operation)](
+                size_t,
+                HighPerformanceTcpWorkers::QueueTime queued_at) mutable {
+#if TENT_METRICS_ENABLED
+                operation.enqueue_time = queued_at;
+#else
+                (void)queued_at;
+#endif
+                client.enqueueOnOwner(owner, std::move(operation));
+            };
+        commands.push_back(std::move(command));
         return workers.tryCommitBatch(commands, nullptr, 0, 0, [] {});
     }
 
@@ -172,6 +182,92 @@ TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
     EXPECT_TRUE(SocketOrderedEqual(destination, source));
     EXPECT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
 }
+
+#if TENT_METRICS_ENABLED
+TEST(HighPerformanceTcpSocketTest,
+     QueueWaitIsRecordedOnlyWhenCommittedOperationStarts) {
+    auto& metrics = TentMetrics::instance();
+    metrics.shutdown();
+    struct MetricsShutdownGuard {
+        ~MetricsShutdownGuard() { TentMetrics::instance().shutdown(); }
+    } metrics_guard;
+
+    asio::io_context port_io;
+    asio::ip::tcp::acceptor port_reservation(
+        port_io, {asio::ip::make_address("127.0.0.1"), 0});
+    MetricsConfig metrics_config;
+    metrics_config.http_host = "127.0.0.1";
+    metrics_config.http_port = port_reservation.local_endpoint().port();
+    metrics_config.report_interval_seconds = 0;
+    port_reservation.close();
+    ASSERT_TRUE(metrics.initialize(metrics_config).ok());
+    TentMetrics::setEnabled(true);
+
+    Runtime runtime(/*max_connections=*/16, /*timeout_ms=*/1000);
+    runtime.start();
+    std::array<uint8_t, 64> remote{};
+    std::array<uint8_t, 64> source{};
+    source.fill(0x5a);
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration)
+                    .ok());
+
+    const size_t owner = runtime.workers.affinityOwner(7, 0);
+    std::atomic<bool> blocker_entered{false};
+    std::atomic<bool> release_blocker{false};
+    struct WorkerReleaseGuard {
+        std::atomic<bool>& release;
+        ~WorkerReleaseGuard() {
+            release.store(true, std::memory_order_release);
+        }
+    } release_guard{release_blocker};
+    asio::post(runtime.workers.ioContext(owner), [&] {
+        blocker_entered.store(true, std::memory_order_release);
+        while (!release_blocker.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+    ASSERT_TRUE(WaitUntil(
+        [&] { return blocker_entered.load(std::memory_order_acquire); }));
+
+    const std::string before = metrics.getPrometheusMetrics();
+    Completion completion;
+    ASSERT_TRUE(runtime
+                    .submit(Operation(source.data(), source.size(),
+                                      reinterpret_cast<uint64_t>(remote.data()),
+                                      registration, 100,
+                                      HighPerformanceTcpOpcode::kWrite,
+                                      &completion, runtime.port))
+                    .ok());
+
+    const std::string blocked = metrics.getPrometheusMetrics();
+    const std::string queue_count =
+        "tent_stream_queue_wait_us_count{transport=\"hp_tcp\","
+        "operation=\"write\"}";
+    EXPECT_EQ(test::PrometheusSeriesValue(blocked, queue_count) -
+                  test::PrometheusSeriesValue(before, queue_count),
+              0);
+    std::this_thread::sleep_for(100ms);
+    release_blocker.store(true, std::memory_order_release);
+
+    ASSERT_TRUE(completion.wait());
+    ASSERT_EQ(completion.status, COMPLETED);
+    EXPECT_TRUE(SocketOrderedEqual(remote, source));
+    const std::string after = metrics.getPrometheusMetrics();
+
+    const std::string queue_sum =
+        "tent_stream_queue_wait_us_sum{transport=\"hp_tcp\","
+        "operation=\"write\"}";
+    EXPECT_EQ(test::PrometheusSeriesValue(after, queue_count) -
+                  test::PrometheusSeriesValue(before, queue_count),
+              1);
+    EXPECT_GE(test::PrometheusSeriesValue(after, queue_sum) -
+                  test::PrometheusSeriesValue(before, queue_sum),
+              50000);
+}
+#endif
 
 TEST(HighPerformanceTcpSocketTest, IdleClientsReleaseCapacityAndReconnect) {
     std::array<uint8_t, 4> remote{};
@@ -370,12 +466,17 @@ TEST(HighPerformanceTcpSocketTest, ClientProgressTimeoutCompletesTask) {
                                HighPerformanceTcpOpcode::kRead, &completion,
                                acceptor.local_endpoint().port());
     std::vector<HighPerformanceTcpWorkers::Command> commands;
-    commands.push_back({.worker_id = 0,
-                        .run =
-                            [&](size_t) mutable {
-                                client.enqueueOnOwner(0, std::move(operation));
-                            },
-                        .cancel = {}});
+    HighPerformanceTcpWorkers::Command command;
+    command.worker_id = 0;
+    command.run = [&](size_t, HighPerformanceTcpWorkers::QueueTime queued_at) {
+#if TENT_METRICS_ENABLED
+        operation.enqueue_time = queued_at;
+#else
+        (void)queued_at;
+#endif
+        client.enqueueOnOwner(0, std::move(operation));
+    };
+    commands.push_back(std::move(command));
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
     EXPECT_EQ(completion.status, TIMEOUT);
@@ -538,12 +639,17 @@ TEST(HighPerformanceTcpSocketTest, ClientBindsConfiguredSourceAddress) {
                                acceptor.local_endpoint().port());
     operation.local_host = "127.0.0.2";
     std::vector<HighPerformanceTcpWorkers::Command> commands;
-    commands.push_back({.worker_id = 0,
-                        .run =
-                            [&](size_t) mutable {
-                                client.enqueueOnOwner(0, std::move(operation));
-                            },
-                        .cancel = {}});
+    HighPerformanceTcpWorkers::Command command;
+    command.worker_id = 0;
+    command.run = [&](size_t, HighPerformanceTcpWorkers::QueueTime queued_at) {
+#if TENT_METRICS_ENABLED
+        operation.enqueue_time = queued_at;
+#else
+        (void)queued_at;
+#endif
+        client.enqueueOnOwner(0, std::move(operation));
+    };
+    commands.push_back(std::move(command));
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
     EXPECT_EQ(completion.status, COMPLETED);
@@ -577,12 +683,17 @@ TEST(HighPerformanceTcpSocketTest,
                                HighPerformanceTcpOpcode::kWrite, &completion,
                                acceptor.local_endpoint().port());
     std::vector<HighPerformanceTcpWorkers::Command> commands;
-    commands.push_back({.worker_id = 0,
-                        .run =
-                            [&](size_t) mutable {
-                                client.enqueueOnOwner(0, std::move(operation));
-                            },
-                        .cancel = {}});
+    HighPerformanceTcpWorkers::Command command;
+    command.worker_id = 0;
+    command.run = [&](size_t, HighPerformanceTcpWorkers::QueueTime queued_at) {
+#if TENT_METRICS_ENABLED
+        operation.enqueue_time = queued_at;
+#else
+        (void)queued_at;
+#endif
+        client.enqueueOnOwner(0, std::move(operation));
+    };
+    commands.push_back(std::move(command));
     ASSERT_TRUE(workers.tryCommitBatch(commands, nullptr, 0, 0, [] {}).ok());
     ASSERT_TRUE(completion.wait());
     EXPECT_EQ(completion.status, FAILED);

@@ -27,9 +27,12 @@
 #include <vector>
 
 #include "tent/common/config.h"
+#include "tent/metrics/tent_metrics.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/transport/tcp/tcp_transport.h"
+
+#include "metrics_test_utils.h"
 
 namespace {
 thread_local size_t fail_allocation_size = 0;
@@ -128,6 +131,7 @@ class TcpRegression : public testing::Test {
         config->set("rpc_server_threads", 2);
         config->set("enable_progress_worker", true);
         config->set("enable_auto_failover_on_poll", false);
+        config->set("metrics/report_interval_seconds", 0);
         config->set("transports/tcp/enable", true);
         config->set("transports/rdma/enable", false);
         config->set("transports/shm/enable", false);
@@ -233,6 +237,38 @@ TEST_F(TcpRegression, WorkerThrowFailsBatchAndNextRequestCompletes) {
         EXPECT_EQ(engine->aliveBatchCountForTest(), 0u);
     }
 }
+
+#if TENT_METRICS_ENABLED
+TEST_F(TcpRegression, RealTransferRecordsStreamMetrics) {
+    auto& metrics = TentMetrics::instance();
+    ASSERT_TRUE(metrics.isInitialized());
+    TentMetrics::setEnabled(true);
+    const std::string before = metrics.getPrometheusMetrics();
+
+    std::fill_n(data.data(), 4096, 'M');
+    auto batch = engine->allocateBatch(1);
+    ASSERT_TRUE(engine->submitTransfer(batch, {writeRequest(4096)}).ok());
+    TcpTransportTestPeer::drain(*tcp);
+    TransferStatus status{};
+    ASSERT_TRUE(engine->getTransferStatus(batch, status).ok());
+    ASSERT_EQ(status.s, COMPLETED);
+    ASSERT_EQ(status.transferred_bytes, 4096u);
+    ASSERT_EQ(data[4096], 'M');
+    ASSERT_TRUE(engine->freeBatch(batch).ok());
+
+    const std::string after = metrics.getPrometheusMetrics();
+    const auto delta = [&](std::string_view series) {
+        return test::PrometheusSeriesValue(after, series) -
+               test::PrometheusSeriesValue(before, series);
+    };
+    EXPECT_EQ(delta("tent_stream_queue_wait_us_count{transport=\"tcp\","
+                    "operation=\"write\"}"),
+              1);
+    EXPECT_EQ(delta("tent_stream_attempt_latency_us_count{transport=\"tcp\","
+                    "operation=\"write\"}"),
+              1);
+}
+#endif
 
 TEST_F(TcpRegression, ServerChecksEveryRegistrationPermission) {
     ASSERT_TRUE(engine->unregisterLocalMemory(data.data(), data.size()).ok());
