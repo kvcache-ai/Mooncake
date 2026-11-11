@@ -16,6 +16,7 @@
 #define TENT_WORKERS_H
 
 #include <future>
+#include <map>
 #include <memory>
 #include <queue>
 #include <shared_mutex>
@@ -308,7 +309,21 @@ class Workers {
         }
     };
 
-    std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path);
+    std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path,
+                                              Status* failure = nullptr);
+
+    // Admission overload is retried without consuming a data-path retry.
+    // Quiescing workers fail it immediately so accepted tasks can settle.
+    bool handleBootstrapAdmissionFailure(WorkerContext& worker,
+                                         RdmaSlice* slice,
+                                         const Status& failure,
+                                         uint64_t now_ns);
+    bool expireBootstrapAdmissionRetry(WorkerContext& worker, RdmaSlice* slice,
+                                       uint64_t now_ns);
+    bool parkBootstrapAdmissionRetry(WorkerContext& worker, RdmaSlice* slice,
+                                     const Status& failure, uint64_t now_ns);
+    void drainBootstrapAdmissionRetries(WorkerContext& worker, uint64_t now_ns,
+                                        bool force = false);
 
     void disableEndpoint(RdmaSlice* slice);
 
@@ -393,6 +408,13 @@ class Workers {
         // asyncPostSend drain consumes this list before the shared queues,
         // so parked entries can never starve behind contending producers.
         std::vector<std::pair<int, RdmaSliceList>> requeue_overflow;
+
+        // Parked admission retries are deliberately excluded from
+        // inflight_slices. The worker sleeps until the earliest key, then
+        // submitFromTick() restores the count before making it runnable.
+        std::mutex bootstrap_retry_mutex;
+        std::multimap<uint64_t, RdmaSlice*> delayed_bootstrap_retries;
+        std::atomic<bool> bootstrap_retry_cancel_scan_requested{false};
 
         // Shared ownership keeps the monitor alive while a slice is retained
         // by an endpoint through delayed teardown.
