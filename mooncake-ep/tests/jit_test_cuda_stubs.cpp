@@ -69,7 +69,9 @@ CUresult cuModuleGetFunction(CUfunction* function, CUmodule, const char*) {
 
 CUresult cuModuleUnload(CUmodule) { return CUDA_SUCCESS; }
 
-CUresult cuFuncSetAttribute(CUfunction, int, int) { return CUDA_SUCCESS; }
+CUresult cuFuncSetAttribute(CUfunction, CUfunction_attribute, int) {
+    return CUDA_SUCCESS;
+}
 
 CUresult cuLaunchKernel(CUfunction, unsigned int, unsigned int, unsigned int,
                         unsigned int, unsigned int, unsigned int, unsigned int,

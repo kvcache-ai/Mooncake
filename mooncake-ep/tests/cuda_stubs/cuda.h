@@ -15,7 +15,9 @@ using CUlaunchAttributeID = int;
 
 constexpr CUlaunchAttributeID CU_LAUNCH_ATTRIBUTE_COOPERATIVE = 1;
 constexpr CUlaunchAttributeID CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION = 2;
-constexpr int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
+enum CUfunction_attribute {
+    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
+};
 
 #define CU_LAUNCH_PARAM_BUFFER_POINTER reinterpret_cast<void*>(1)
 #define CU_LAUNCH_PARAM_BUFFER_SIZE reinterpret_cast<void*>(2)
@@ -60,7 +62,8 @@ CUresult cuModuleLoadDataEx(CUmodule* module, const void* image,
 CUresult cuModuleGetFunction(CUfunction* function, CUmodule module,
                              const char* name);
 CUresult cuModuleUnload(CUmodule module);
-CUresult cuFuncSetAttribute(CUfunction function, int attribute, int value);
+CUresult cuFuncSetAttribute(CUfunction function, CUfunction_attribute attribute,
+                            int value);
 CUresult cuLaunchKernel(CUfunction function, unsigned int grid_x,
                         unsigned int grid_y, unsigned int grid_z,
                         unsigned int block_x, unsigned int block_y,
