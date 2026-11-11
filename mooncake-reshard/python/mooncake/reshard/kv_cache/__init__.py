@@ -1,5 +1,6 @@
 """Framework-neutral KV-cache reshard contracts and planning API."""
 
+from ._store.backend import KVCacheStoreError
 from ._store.binding import KVCacheStoreRuntimeBinding
 from ._store.manifest import (
     KVCacheStoreFormat,
@@ -8,6 +9,7 @@ from ._store.manifest import (
     KVCacheStoreManifest,
     KVCacheStoreShard,
 )
+from ._store.multipart import MultipartKVCacheStore, MultipartReadContext
 from ._store.planner import (
     KVCacheStoreLoadPlan,
     KVCacheStoreLoadRange,
@@ -110,6 +112,7 @@ __all__ = [
     "KVCacheRuntimeBuffer",
     "KVCacheRuntimeTransferPlan",
     "KVCacheSnapshotDescriptor",
+    "KVCacheStoreError",
     "KVCacheStoreFormat",
     "KVCacheStoreFragment",
     "KVCacheStoreLayout",
@@ -128,6 +131,8 @@ __all__ = [
     "KVCacheTransferLimits",
     "KVCacheWrite",
     "KVCacheWriterReceipt",
+    "MultipartKVCacheStore",
+    "MultipartReadContext",
     "SnapshotId",
     "assemble_kv_cache_placement",
     "kv_cache_logical_plan_from_json",
