@@ -93,11 +93,14 @@ class TestSuiteLayout(unittest.TestCase):
         )
 
         regular_cases = regular.splitlines()
+        vllm_index = regular_cases.index("test_vllm_1p1d_erdma.sh")
+        self.assertIn("test_moe_mooncake.sh", regular_cases[:vllm_index])
+        self.assertIn("test_mooncake_ep.sh", regular_cases[:vllm_index])
         self.assertEqual(
             store_rs_job.splitlines(),
-            regular_cases[:5]
+            regular_cases[:vllm_index]
             + ["test_hicache_storage_mooncake_store_rs.sh"]
-            + regular_cases[5:],
+            + regular_cases[vllm_index:],
         )
         self.assertNotIn("mooncake_store_rs", regular)
 

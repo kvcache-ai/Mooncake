@@ -9,16 +9,24 @@ BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
 
 run_test()
 {
-    echo "===== Running native Mooncake EP smoke ====="
+    echo "===== Running pytest tests ====="
     local log_file="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${test_case_name}.log"
 
     echo "Running tests in container and saving output to: $log_file"
 
+    if ! ${docker_exec} "command -v sgl-eval >/dev/null 2>&1"; then
+        echo "ERROR: sgl-eval is missing from the SGLang test container" >&2
+        echo "The T-One setup must install the pinned sgl-eval dependency before pytest." >&2
+        return 1
+    fi
+
+    # Use local HF cache (offline) when the model is already downloaded.
+    local offline_prefix=$(hf_offline_prefix "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
+
     ${docker_exec} "\
+        export PYTHONPATH=/sgl-workspace/sglang:\$PYTHONPATH && \
         cd /test_run/e2e/python && \
-        timeout --signal=TERM --kill-after=30s 600s \
-        python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
-        --max-restarts=0 test_mooncake_ep_smoke.py" \
+        ${offline_prefix}python3 -m pytest test_moe_mooncake.py -v -s --tb=long" \
         2>&1 | tee "$log_file"
 
     return ${PIPESTATUS[0]}
