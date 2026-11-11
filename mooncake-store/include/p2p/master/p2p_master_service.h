@@ -150,7 +150,11 @@ class P2PMasterService final {
     ExportLocalCommittedMetadataForStandby(
         uint64_t local_committed_sequence_id) const;
 
+    // Locally assigned OpLog sequence ID; this is not a store read.
     uint64_t GetLatestOpLogSequenceId() const;
+
+    // Latest OpLog sequence ID actually read from the shared store.
+    tl::expected<uint64_t, ErrorCode> ReadLatestOpLogSequenceId() const;
     tl::expected<uint64_t, ErrorCode> GetLocalCommittedOpLogSequenceId() const;
     std::vector<std::string> ListSnapshotObjectKeys() const;
     std::vector<UUID> ListSnapshotClientIds() const;

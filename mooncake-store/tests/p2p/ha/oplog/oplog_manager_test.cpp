@@ -111,6 +111,20 @@ TEST_F(OpLogManagerTest, SetInitialSequenceIdRejectsUsedManager) {
     EXPECT_EQ(id1, M().GetLastSequenceId());
 }
 
+TEST_F(OpLogManagerTest, ReadLatestSequenceIdUsesStoreWatermark) {
+    auto store = std::make_shared<MockOpLogStore>();
+    M().SetOpLogStore(store);
+
+    ASSERT_EQ(store->UpdateLatestSequenceId(100), ErrorCode::OK);
+    const uint64_t assigned_sequence_id =
+        M().AllocateEntry(OpType::PUT_END, "new-key").sequence_id;
+    const auto latest_sequence_id = M().ReadLatestOpLogSequenceId();
+
+    ASSERT_TRUE(latest_sequence_id.has_value());
+    EXPECT_EQ(1u, assigned_sequence_id);
+    EXPECT_EQ(100u, *latest_sequence_id);
+}
+
 TEST_F(OpLogManagerTest, InitialSequenceUsesBothWatermarks) {
     for (const uint64_t restored : {0, 50, 100, 200}) {
         OpLogManager manager;

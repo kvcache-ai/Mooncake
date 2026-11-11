@@ -61,6 +61,17 @@ void UpdateHAOpLogProgress(uint64_t applied_sequence_id,
         NonNegativeSequenceMetric(metrics.get_oplog_gc_cursor_sequence_id()));
 }
 
+uint64_t UpdatePrimaryHAOpLogProgress(P2PMasterService& primary_service) {
+    const uint64_t local_sequence_id =
+        primary_service.GetLatestOpLogSequenceId();
+    const auto latest_sequence_id = primary_service.ReadLatestOpLogSequenceId();
+    UpdateHAOpLogProgress(local_sequence_id,
+                          latest_sequence_id.has_value()
+                              ? std::optional<uint64_t>(*latest_sequence_id)
+                              : std::nullopt);
+    return local_sequence_id;
+}
+
 #ifdef STORE_USE_REDIS
 std::string GenerateMasterInstanceId() {
     std::random_device random;
@@ -587,9 +598,7 @@ int P2PMaster::RunWithHA() {
 #endif
         auto mark_primary_running = [primary_service =
                                          &active_service->GetMasterService()] {
-            const uint64_t latest_sequence_id =
-                primary_service->GetLatestOpLogSequenceId();
-            UpdateHAOpLogProgress(latest_sequence_id, latest_sequence_id);
+            UpdatePrimaryHAOpLogProgress(*primary_service);
             HAStatusManager::instance().SetRoleState("primary", "RUNNING");
         };
 #ifdef STORE_USE_REDIS
@@ -601,10 +610,7 @@ int P2PMaster::RunWithHA() {
             }
             master_registry_heartbeat->SetAppliedSequenceProvider(
                 [primary_service] {
-                    const uint64_t sequence_id =
-                        primary_service->GetLatestOpLogSequenceId();
-                    UpdateHAOpLogProgress(sequence_id, sequence_id);
-                    return sequence_id;
+                    return UpdatePrimaryHAOpLogProgress(*primary_service);
                 });
             master_registry_heartbeat->SetSnapshotReadyProvider({});
             master_registry_heartbeat->UpdateRole("primary", false);

@@ -138,6 +138,23 @@ uint64_t OpLogManager::GetLastSequenceId() const {
     return last_seq_id_;
 }
 
+tl::expected<uint64_t, ErrorCode> OpLogManager::ReadLatestOpLogSequenceId()
+    const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto store = oplog_store_;
+    lock.unlock();
+    if (!store) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    uint64_t sequence_id = 0;
+    ErrorCode err = store->GetLatestSequenceId(sequence_id);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return sequence_id;
+}
+
 tl::expected<uint64_t, ErrorCode> OpLogManager::GetLocalCommittedSequenceId()
     const {
     std::shared_lock<std::shared_mutex> lock(mutex_);

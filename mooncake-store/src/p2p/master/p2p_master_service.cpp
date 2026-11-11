@@ -441,6 +441,15 @@ uint64_t P2PMasterService::GetLatestOpLogSequenceId() const {
     return manager ? manager->GetLastSequenceId() : 0;
 }
 
+tl::expected<uint64_t, ErrorCode> P2PMasterService::ReadLatestOpLogSequenceId()
+    const {
+    auto* manager = GetOpLogManager();
+    if (manager == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return manager->ReadLatestOpLogSequenceId();
+}
+
 tl::expected<uint64_t, ErrorCode>
 P2PMasterService::GetLocalCommittedOpLogSequenceId() const {
     auto* manager = GetOpLogManager();

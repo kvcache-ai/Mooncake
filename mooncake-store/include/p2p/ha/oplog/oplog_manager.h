@@ -117,6 +117,11 @@ class OpLogManager {
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;
 
+    // Read the latest sequence ID from the shared OpLogStore backend.
+    // Unlike GetLastSequenceId(), this performs a real store read and can
+    // fail when the backend is unavailable.
+    tl::expected<uint64_t, ErrorCode> ReadLatestOpLogSequenceId() const;
+
     // Get the latest sequence id locally committed by this OpLog store
     // instance.
     tl::expected<uint64_t, ErrorCode> GetLocalCommittedSequenceId() const;
