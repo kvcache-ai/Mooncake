@@ -1406,15 +1406,21 @@ Status RdmaTransport::submitTransferTask(
                     last_local_device_buffer_id == last_local_buffer_id
                 ? last_local_device_id
                 : -1;
-        if (local_device_cache.select(
-                local_segment_desc, (uint64_t)request.source, request.length,
-                request_buffer_id, request_device_id, [&] {
-                    return selectDevice(
-                        local_segment_desc.get(), (uint64_t)request.source,
-                        request.length, request_hint, request_buffer_id,
-                        request_device_id, 0, last_local_buffer_id,
-                        local_hint_device_id);
-                })) {
+        auto select_request_device = [&] {
+            return selectDevice(local_segment_desc.get(),
+                                (uint64_t)request.source, request.length,
+                                request_hint, request_buffer_id,
+                                request_device_id, 0, last_local_buffer_id,
+                                local_hint_device_id);
+        };
+        // The cache assumes a fixed hint; the destination hint follows each
+        // request's target GPU, so those requests select uncached.
+        if (destination_hint.empty()
+                ? local_device_cache.select(
+                      local_segment_desc, (uint64_t)request.source,
+                      request.length, request_buffer_id, request_device_id,
+                      select_request_device)
+                : select_request_device()) {
             request_buffer_id = -1;
             request_device_id = -1;
         } else {
