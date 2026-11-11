@@ -669,6 +669,11 @@ jobs:
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
+  build-wheel-xpu:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/ci_xpu.yml
+
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
     if: needs.check-paths.outputs.tent == 'true'
@@ -1023,6 +1028,7 @@ jobs:
       - build-wheel-cu13-arm64
       - build-wheel-efa
       - build-wheel-rocm
+      - build-wheel-xpu
       - tent-ci
       - store-rs-ci
     runs-on: ubuntu-latest
@@ -1056,6 +1062,7 @@ jobs:
             ${{ needs.build-wheel-cu13-arm64.result }}
             ${{ needs.build-wheel-efa.result }}
             ${{ needs.build-wheel-rocm.result }}
+            ${{ needs.build-wheel-xpu.result }}
         run: |
           for result in $RESULTS; do
             test "$result" = "$EXPECTED" || exit 1
