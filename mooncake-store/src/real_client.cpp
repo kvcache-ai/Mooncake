@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "offload_io_executor.h"
 #include "embedded_master.h"
 #include "environ.h"
 #include "environment_variables.h"
@@ -1945,6 +1946,14 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     if (prefetcher_) {
         prefetcher_->Shutdown();
     }
+
+    // Callers quiesce requests before close. Stop accepting owner RPC work,
+    // then drain SSD jobs and release their thread-local rings before storage.
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+    }
+    if (offload_io_executor_) offload_io_executor_->Stop();
 
     stop_ipc_server();
     stop_dummy_client_monitor();
@@ -9255,6 +9264,13 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     const UUID &task_id) {
     return client_->QueryTask(task_id);
 }
+OffloadIoExecutor &RealClient::GetOffloadIoExecutor() {
+    std::call_once(offload_io_executor_once_, [this] {
+        offload_io_executor_ = std::make_unique<OffloadIoExecutor>();
+    });
+    return *offload_io_executor_;
+}
+
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
@@ -9272,7 +9288,8 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
     state->file_storage = file_storage_;
     auto *s = state.get();
     auto try_result = co_await coro_io::post(
-        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
+        [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); },
+        GetOffloadIoExecutor().GetExecutor());
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
@@ -9304,10 +9321,12 @@ RealClient::batch_get_offload_object_ranges(
     state->object_sizes = object_sizes;
     state->file_storage = file_storage_;
     auto *s = state.get();
-    auto try_result = co_await coro_io::post([s]() {
-        return s->file_storage->BatchGetRanges(s->keys, s->offsets, s->sizes,
-                                               s->object_sizes);
-    });
+    auto try_result = co_await coro_io::post(
+        [s]() {
+            return s->file_storage->BatchGetRanges(s->keys, s->offsets,
+                                                   s->sizes, s->object_sizes);
+        },
+        GetOffloadIoExecutor().GetExecutor());
     auto result = try_result.value();
     if (!result) {
         LOG(ERROR) << "Batch get offload object range failed, err_code = "

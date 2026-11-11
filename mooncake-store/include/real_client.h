@@ -45,6 +45,7 @@ class PrefetchTeardownTest;
 class NvlinkHostNumaAllocation;
 struct EgmStorePoolConfig;
 class RegisteredPinnedRegion;
+class OffloadIoExecutor;
 class UdsAcceptor;
 class UdsConnection;
 
@@ -1177,6 +1178,9 @@ class RealClient : public PyClient {
     // the config dict in setup_internal. See
     // docs/source/design/store/ssd-prefetch.md.
     std::unique_ptr<SsdPrefetcher> prefetcher_;
+    std::unique_ptr<OffloadIoExecutor> offload_io_executor_;
+    std::once_flag offload_io_executor_once_;
+    OffloadIoExecutor &GetOffloadIoExecutor();
     bool enable_ssd_prefetch_ = false;
     int64_t ssd_prefetch_cooldown_sec_ = DEFAULT_SSD_PREFETCH_COOLDOWN_SEC;
     int64_t ssd_prefetch_dedup_ttl_sec_ = DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC;

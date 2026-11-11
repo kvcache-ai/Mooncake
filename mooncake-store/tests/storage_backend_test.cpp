@@ -5535,4 +5535,47 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     EXPECT_FALSE(exists.value());
 }
 
+#ifdef USE_URING
+TEST_F(StorageBackendTest, UringCrossBucketFullAndSpanReads) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+    BucketBackendConfig buckets;
+    buckets.bucket_keys_limit = 1;  // Force every value into a separate file.
+    BucketStorageBackend backend(config, buckets);
+    ASSERT_TRUE(backend.Init());
+    std::unordered_map<std::string, std::string> values;
+    std::unordered_map<std::string, std::vector<Slice>> writes;
+    for (int i = 0; i < 65; ++i) {
+        auto key = "cross-" + std::to_string(i);
+        auto& value = values[key];
+        value.assign(6003 + i, static_cast<char>('A' + i % 26));
+        writes[key] = {Slice{value.data(), value.size()}};
+    }
+    ASSERT_TRUE(backend.BatchOffload(
+        writes, [](const auto&, auto&) { return ErrorCode::OK; }));
+    std::vector<std::unique_ptr<void, decltype(&std::free)>> buffers;
+    std::unordered_map<std::string, Slice> full;
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    for (const auto& [key, value] : values) {
+        void* raw = nullptr;
+        ASSERT_EQ(posix_memalign(&raw, 4096, 12288), 0);
+        buffers.emplace_back(raw, &std::free);
+        full[key] = Slice{raw, value.size()};
+        spans[key] =
+            StorageValueSpan{13, value.size(), Slice{raw, value.size() - 29}};
+    }
+    ASSERT_TRUE(backend.BatchLoad(full));
+    for (const auto& [key, value] : values)
+        EXPECT_EQ(
+            std::string(static_cast<char*>(full.at(key).ptr), value.size()),
+            value);
+    ASSERT_TRUE(backend.BatchLoadSpans(spans));
+    for (const auto& [key, value] : values)
+        EXPECT_EQ(std::string(static_cast<char*>(spans.at(key).slice.ptr),
+                              spans.at(key).slice.size),
+                  value.substr(13, value.size() - 29));
+}
+#endif
+
 }  // namespace mooncake::test

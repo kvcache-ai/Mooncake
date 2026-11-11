@@ -224,8 +224,16 @@ class UringFile : public StorageFile {
         size_t bytes_read = 0;
         ErrorCode error = ErrorCode::OK;
         bool completed = false;
+        int fd = -1;  // Only used by batch_read_files; caller retains the file.
     };
     tl::expected<void, ErrorCode> batch_read(ReadDesc *descs, int cnt);
+
+    // All descriptors and buffers remain owned by the caller until this
+    // returns. Each descriptor may refer to a different file; completions are
+    // drained before returning an I/O error, as for the single-file batch API.
+    static tl::expected<void, ErrorCode> batch_read_files(ReadDesc *descs,
+                                                          int cnt);
+    int native_handle() const { return fd_; }
 
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.

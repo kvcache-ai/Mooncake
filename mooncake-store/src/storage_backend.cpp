@@ -1,5 +1,6 @@
 #include "serializer.h"
 #include "storage_backend.h"
+#include "environ.h"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -1917,6 +1918,74 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     // Lock released here - bucket files protected by BucketReadGuards
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
+
+#ifdef USE_URING
+    if (file_storage_config_.use_uring &&
+        Environ::ReadOr(
+            EnvironmentVariable<bool>{"MOONCAKE_OFFLOAD_CROSS_BUCKET_READ"},
+            true)) {
+        // Fill each ring submission across bucket boundaries. Bound both the
+        // number of live fds and the batch to the ring depth. BucketReadGuards
+        // above remain alive across every window, including error cleanup.
+        constexpr size_t kReadWindow = 32;
+        std::vector<const ReadPlan*> plans;
+        plans.reserve(spans.size());
+        for (const auto& [bucket_id, reads] : bucket_read_plans) {
+            for (const auto& plan : reads) plans.push_back(&plan);
+        }
+        for (size_t begin = 0; begin < plans.size(); begin += kReadWindow) {
+            const size_t end = std::min(begin + kReadWindow, plans.size());
+            std::unordered_map<int64_t, std::unique_ptr<StorageFile>> files;
+            std::vector<UringFile::ReadDesc> descs;
+            std::vector<size_t> offsets;
+            descs.reserve(end - begin);
+            offsets.reserve(end - begin);
+            for (size_t i = begin; i < end; ++i) {
+                const auto& plan = *plans[i];
+                auto& file = files[plan.bucket_id];
+                if (!file) {
+                    auto path = GetBucketDataPath(plan.bucket_id);
+                    if (!path) return tl::make_unexpected(path.error());
+                    auto opened = OpenFile(*path, FileMode::Read);
+                    if (!opened) return tl::make_unexpected(opened.error());
+                    file = std::move(*opened);
+                }
+                auto* uring = dynamic_cast<UringFile*>(file.get());
+                if (!uring)
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                const int64_t actual =
+                    plan.offset + plan.key_size + plan.value_offset;
+                const int64_t aligned = align_down(actual, kDirectIOAlignment);
+                const size_t aligned_end =
+                    align_up(static_cast<size_t>(actual) + plan.dest_slice.size,
+                             kDirectIOAlignment);
+                UringFile::ReadDesc desc{plan.dest_slice.ptr,
+                                         aligned_end - aligned, aligned};
+                desc.fd = uring->native_handle();
+                descs.push_back(desc);
+                offsets.push_back(static_cast<size_t>(actual - aligned));
+            }
+            // No reads were submitted during planning: early errors above can
+            // safely close files. After submission, batch_read_files drains
+            // completions before these file/buffer owners can be released.
+            auto loaded =
+                UringFile::batch_read_files(descs.data(), descs.size());
+            if (!loaded) return tl::make_unexpected(loaded.error());
+            for (size_t i = 0; i < descs.size(); ++i) {
+                const auto& plan = *plans[begin + i];
+                const auto& desc = descs[i];
+                if (!desc.completed ||
+                    desc.bytes_read < offsets[i] + plan.dest_slice.size) {
+                    LOG(ERROR) << "Incomplete bucket read for key " << plan.key;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                spans.at(plan.key).slice.ptr =
+                    static_cast<char*>(plan.dest_slice.ptr) + offsets[i];
+            }
+        }
+        return {};
+    }
+#endif
 
     // Step 2: Perform IO without holding any locks
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {

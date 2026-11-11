@@ -176,10 +176,12 @@ class SharedUringRing {
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
                 auto& d = descs[idx + i];
+                const int read_fd = fd >= 0 ? fd : d.fd;
                 if (buf_registered_ && in_registered_buf(d.buf, d.len))
-                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off, 0);
+                    io_uring_prep_read_fixed(sqe, read_fd, d.buf, d.len, d.off,
+                                             0);
                 else
-                    io_uring_prep_read(sqe, fd, d.buf, d.len, d.off);
+                    io_uring_prep_read(sqe, read_fd, d.buf, d.len, d.off);
                 sqe->user_data = op | static_cast<uint64_t>(i + 1);
             }
 
@@ -783,6 +785,23 @@ tl::expected<void, ErrorCode> UringFile::batch_read(ReadDesc* descs, int cnt) {
     }
 
     return SharedUringRing::instance().batch_read(fd_, descs, cnt);
+}
+
+tl::expected<void, ErrorCode> UringFile::batch_read_files(ReadDesc* descs,
+                                                          int cnt) {
+    if (!descs || cnt <= 0)
+        return tl::make_unexpected(ErrorCode::FILE_INVALID_BUFFER);
+    // Validate the whole batch before preparing any SQEs. Storage-backend
+    // callers use O_DIRECT, so require its alignment for every file.
+    for (int i = 0; i < cnt; ++i) {
+        const auto& d = descs[i];
+        if (d.fd < 0) return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+        if (!d.buf || !d.len || d.off < 0 ||
+            reinterpret_cast<uintptr_t>(d.buf) % ALIGNMENT_ ||
+            d.len % ALIGNMENT_ || d.off % ALIGNMENT_)
+            return tl::make_unexpected(ErrorCode::FILE_INVALID_BUFFER);
+    }
+    return SharedUringRing::instance().batch_read(-1, descs, cnt);
 }
 
 // ---------------------------------------------------------------------------

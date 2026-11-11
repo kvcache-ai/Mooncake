@@ -291,6 +291,62 @@ TEST_F(PosixFileTest, FileLocking) {
 }
 
 #ifdef USE_URING
+TEST_F(PosixFileTest, UringReadsAcrossFilesAndQueueDepth) {
+    constexpr size_t kPage = 4096;
+    constexpr size_t kCount = 65;
+    void* allocation = nullptr;
+    ASSERT_EQ(posix_memalign(&allocation, kPage, kPage * kCount), 0);
+    std::unique_ptr<void, decltype(&std::free)> buffer(allocation, &std::free);
+    auto* bytes = static_cast<char*>(buffer.get());
+    std::vector<std::unique_ptr<UringFile>> files;
+    std::vector<UringFile::ReadDesc> descs;
+    for (size_t i = 0; i < kCount; ++i) {
+        char path[] = "/tmp/mooncake-cross-file-XXXXXX";
+        int fd = mkstemp(path);
+        ASSERT_GE(fd, 0);
+        unlink(path);
+        std::array<char, kPage> expected;
+        expected.fill(static_cast<char>('A' + i % 26));
+        ASSERT_EQ(pwrite(fd, expected.data(), kPage, 0), kPage);
+        files.push_back(std::make_unique<UringFile>(path, fd));
+        UringFile::ReadDesc d{bytes + i * kPage, kPage, 0};
+        d.fd = files.back()->native_handle();
+        descs.push_back(d);
+    }
+    ASSERT_TRUE(UringFile::batch_read_files(descs.data(), descs.size()));
+    for (size_t i = 0; i < kCount; ++i) {
+        EXPECT_TRUE(descs[i].completed);
+        EXPECT_EQ(descs[i].bytes_read, kPage);
+        EXPECT_EQ(descs[i].error, ErrorCode::OK);
+        for (size_t j = 0; j < kPage; ++j)
+            ASSERT_EQ(bytes[i * kPage + j], static_cast<char>('A' + i % 26));
+    }
+
+    // A failing file must not leave outstanding work on the shared ring.
+    int bad_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    ASSERT_GE(bad_fd, 0);
+    UringFile bad_file("/dev/null", bad_fd);
+    descs[1].fd = bad_fd;
+    EXPECT_FALSE(UringFile::batch_read_files(descs.data(), 2));
+    EXPECT_TRUE(descs[0].completed);
+    EXPECT_TRUE(descs[1].completed);
+    EXPECT_NE(descs[1].error, ErrorCode::OK);
+    descs[1].fd = files[1]->native_handle();
+    ASSERT_TRUE(UringFile::batch_read_files(descs.data(), descs.size()));
+    EXPECT_EQ(descs.back().bytes_read, kPage);
+
+    // EOF is reported as a short completion; the backend enforces value size.
+    descs[0].off = kPage;
+    ASSERT_TRUE(UringFile::batch_read_files(descs.data(), 1));
+    EXPECT_TRUE(descs[0].completed);
+    EXPECT_EQ(descs[0].bytes_read, 0);
+    descs[0].off = 0;
+    descs[1].buf = bytes + 1;
+    EXPECT_FALSE(UringFile::batch_read_files(descs.data(), 2));
+    descs[1].buf = bytes + kPage;
+    ASSERT_TRUE(UringFile::batch_read_files(descs.data(), 2));
+}
+
 TEST_F(PosixFileTest, UringBatchReadReportsPerRequestResultsAcrossQueueDepth) {
     constexpr size_t kBlockSize = 128;
     constexpr int kRequestCount = 40;
