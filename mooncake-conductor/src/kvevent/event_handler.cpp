@@ -50,8 +50,21 @@ std::optional<prefixindex::StorageTier> SharedTier(
     return std::nullopt;
 }
 
-bool IsSglangGpuMedium(const std::optional<std::string>& medium) {
+std::optional<prefixindex::StorageTier> VllmTier(
+    const std::optional<std::string>& medium) {
+    const std::string normalized = AsciiToLower(medium.value_or(""));
+    if (normalized == "gpu") {
+        return prefixindex::StorageTier::kDevice;
+    }
+    if (normalized == "cpu") {
+        return prefixindex::StorageTier::kCpuLocal;
+    }
+    return std::nullopt;
+}
+
+bool IsSglangDeviceMedium(const std::optional<std::string>& medium) {
     // SGLang's base radix caches omit medium for their engine-local cache.
+    // The upstream wire name remains GPU on both GPU and NPU platforms.
     // Explicit CPU_PINNED and DISK values identify HiCache tiers instead.
     return !medium.has_value() || AsciiToLower(*medium) == "gpu";
 }
@@ -459,7 +472,7 @@ std::string KVEventHandler::HandleSglangStored(
         return "SGLang stored event has no block hashes";
     }
 
-    if (IsSglangGpuMedium(event.medium)) {
+    if (IsSglangDeviceMedium(event.medium)) {
         return manager_->GetIndexer()->StoreEngine({
             .context = ContextFromService(service_),
             .prefixes = std::move(prefixes),
@@ -495,7 +508,7 @@ std::string KVEventHandler::HandleSglangRemoved(
     if (prefixes.empty()) {
         return "";
     }
-    if (IsSglangGpuMedium(event.medium)) {
+    if (IsSglangDeviceMedium(event.medium)) {
         return manager_->GetIndexer()->RemoveEngine({
             .context = ContextFromService(service_),
             .prefixes = std::move(prefixes),
@@ -763,11 +776,10 @@ std::string KVEventHandler::HandleVllmStored(
         !error.empty()) {
         return error;
     }
-    const std::string medium = AsciiToLower(event.medium.value_or(""));
-    if (medium != "gpu") {
-        // This adapter indexes GPU ownership; other tiers are expected no-ops.
-        VLOG(1) << "Ignoring vLLM non-GPU event endpoint=" << service_.endpoint
-                << " publisher_kind="
+    const auto tier = VllmTier(event.medium);
+    if (!tier.has_value()) {
+        VLOG(1) << "Ignoring vLLM unsupported-medium event endpoint="
+                << service_.endpoint << " publisher_kind="
                 << common::PublisherKindName(metadata.publisher_kind)
                 << " instance=" << service_.instance_id
                 << " dp_rank=" << service_.dp_rank
@@ -789,6 +801,7 @@ std::string KVEventHandler::HandleVllmStored(
         .owner = EngineOwnerFromService(service_),
         .effective_block_size = service_.block_size,
         .cache_group = service_.cache_group,
+        .tier = *tier,
     });
 }
 
@@ -798,10 +811,10 @@ std::string KVEventHandler::HandleVllmRemoved(
         !error.empty()) {
         return error;
     }
-    const std::string medium = AsciiToLower(event.medium.value_or(""));
-    if (medium != "gpu") {
-        VLOG(1) << "Ignoring vLLM non-GPU event endpoint=" << service_.endpoint
-                << " publisher_kind="
+    const auto tier = VllmTier(event.medium);
+    if (!tier.has_value()) {
+        VLOG(1) << "Ignoring vLLM unsupported-medium event endpoint="
+                << service_.endpoint << " publisher_kind="
                 << common::PublisherKindName(metadata.publisher_kind)
                 << " instance=" << service_.instance_id
                 << " dp_rank=" << service_.dp_rank
@@ -823,6 +836,7 @@ std::string KVEventHandler::HandleVllmRemoved(
         .owner = EngineOwnerFromService(service_),
         .effective_block_size = service_.block_size,
         .cache_group = service_.cache_group,
+        .tier = *tier,
     });
 }
 
@@ -839,6 +853,7 @@ std::string KVEventHandler::HandleVllmCleared(
         .owner = EngineOwnerFromService(service_),
         .effective_block_size = service_.block_size,
         .cache_group = service_.cache_group,
+        .tier = std::nullopt,
     });
 }
 

@@ -3,24 +3,25 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-
-from mooncake.reshard.weight.te import (
-    MooncakeTransferEngineReader,
-    TransferCompletionFailedError,
-    MooncakeTransferEngineSink,
-    TransferCompletionUnknownError,
-    TransferEngineError,
-    TransferRegistrationCleanupPendingError,
-)
+from mooncake.reshard.transfer_engine import TransferCompletionInterrupted
 from mooncake.reshard.transfer_engine.lifetime import TerminalTransferState
 from mooncake.reshard.weight.lifetime import (
     AcquiredWeightBinding,
     weight_allocation_fence,
 )
+from mooncake.reshard.weight.te import (
+    MooncakeTransferEngineReader,
+    MooncakeTransferEngineSink,
+    TransferCompletionFailedError,
+    TransferCompletionUnknownError,
+    TransferEngineError,
+    TransferRegistrationCleanupPendingError,
+)
 
 from .helpers import (
-    FakeBatchTransferTicket,
     FakeAllocationLifetimeToken,
+    FakeBatchTransferTicket,
+    FakeScatterTransferEngine,
     FakeTransferEngine,
     allocation_guards,
     execute_reader,
@@ -530,6 +531,7 @@ def test_acquisition_duplicate_token_ids_release_each_distinct_pin() -> None:
 @pytest.mark.parametrize("executor_name", ("sink", "reader"))
 def test_interruption_after_physical_io_reports_failed_drained(
     executor_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = manifests(tp=1, prefix="source", address_base=0x10000)
     target = manifests(tp=1, prefix="target", address_base=0x40000)
@@ -539,13 +541,6 @@ def test_interruption_after_physical_io_reports_failed_drained(
 
     if executor_name == "sink":
         executor = MooncakeTransferEngineSink(engine)
-        original_transfer = executor._transfer_batch
-
-        def interrupt_after_transfer(*args, **kwargs):
-            original_transfer(*args, **kwargs)
-            raise KeyboardInterrupt("interrupted after physical I/O")
-
-        executor._transfer_batch = interrupt_after_transfer
 
         def execute() -> None:
             execute_sink(
@@ -560,13 +555,6 @@ def test_interruption_after_physical_io_reports_failed_drained(
 
     else:
         executor = MooncakeTransferEngineReader(engine)
-        original_transfer = executor._transfer_batch
-
-        def interrupt_after_transfer(*args, **kwargs):
-            original_transfer(*args, **kwargs)
-            raise KeyboardInterrupt("interrupted after physical I/O")
-
-        executor._transfer_batch = interrupt_after_transfer
 
         def execute() -> None:
             execute_reader(
@@ -579,6 +567,18 @@ def test_interruption_after_physical_io_reports_failed_drained(
                 target_allocation_guards=target_guards,
             )
 
+    original_receipt = executor.transfer_executor._receipt
+
+    def interrupt_after_receipt(prepared):
+        original_receipt(prepared)
+        raise KeyboardInterrupt("interrupted after physical I/O")
+
+    monkeypatch.setattr(
+        executor.transfer_executor,
+        "_receipt",
+        interrupt_after_receipt,
+    )
+
     with pytest.raises(KeyboardInterrupt, match="after physical I/O"):
         execute()
 
@@ -587,3 +587,65 @@ def test_interruption_after_physical_io_reports_failed_drained(
         token.released_states == [TerminalTransferState.FAILED_DRAINED]
         for token in _all_tokens(source_guards, target_guards)
     )
+
+
+def test_receipt_interruption_retains_later_unknown_ticket_resources() -> None:
+    class Engine(FakeScatterTransferEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.tickets: list[FakeBatchTransferTicket] = []
+
+        def submit_scatter_write(self, *args):
+            statuses = (
+                ["COMPLETION_UNKNOWN", "COMPLETED"]
+                if not self.tickets
+                else ["COMPLETION_UNKNOWN"]
+            )
+            ticket = FakeBatchTransferTicket(statuses)
+            self.tickets.append(ticket)
+            return ticket
+
+    source = manifests(tp=1, prefix="source", address_base=0x10000)
+    target = manifests(tp=2, prefix="target", address_base=0x40000)
+    source_guards = allocation_guards(source)
+    target_guards = allocation_guards(target)
+    engine = Engine()
+    sink = MooncakeTransferEngineSink(
+        engine,
+        max_batch_operations=1,
+        max_inflight_batches=2,
+        max_completion_drain_attempts=1,
+    )
+
+    def interrupt_receipt(prepared):
+        raise KeyboardInterrupt("receipt interrupted")
+
+    sink.transfer_executor._receipt = interrupt_receipt
+
+    with pytest.raises(TransferCompletionInterrupted) as raised:
+        execute_sink(
+            sink,
+            plan_transfer(source, target),
+            source,
+            target,
+            target_registrations=registration_leases(target),
+            source_allocation_guards=source_guards,
+            target_allocation_guards=target_guards,
+        )
+
+    tokens = _all_tokens(source_guards, target_guards)
+    assert sink.pending_transfer_ids() == (raised.value.pending_transfer_id,)
+    assert engine.tickets[1].status.name == "COMPLETION_UNKNOWN"
+    assert all(not token.released_states for token in tokens)
+    assert engine.unregister_calls == []
+
+    for ticket in engine.tickets:
+        ticket._statuses[:] = ["COMPLETED"]
+    assert sink.drain_pending_transfer(raised.value.pending_transfer_id) == (
+        "FAILED_DRAINED"
+    )
+    assert all(
+        token.released_states == [TerminalTransferState.FAILED_DRAINED]
+        for token in tokens
+    )
+    assert engine.unregister_calls == [0x10000]

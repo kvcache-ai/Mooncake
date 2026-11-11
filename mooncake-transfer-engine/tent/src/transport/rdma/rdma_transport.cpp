@@ -184,6 +184,7 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(endpoint_store_cap, params->endpoint.endpoint_store_cap);
     SET_ENDPOINT(max_sge, params->endpoint.max_sge);
     SET_ENDPOINT(max_qp_wr, params->endpoint.max_qp_wr);
+    SET_ENDPOINT(signal_interval, params->endpoint.signal_interval);
     SET_ENDPOINT(max_inline_bytes, params->endpoint.max_inline_bytes);
     SET_ENDPOINT(pkey_index, params->endpoint.pkey_index);
     SET_ENDPOINT(hop_limit, params->endpoint.hop_limit);
@@ -200,6 +201,14 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(send_retry_count, params->endpoint.send_retry_count);
     SET_ENDPOINT(send_rnr_count, params->endpoint.send_rnr_count);
     SET_ENDPOINT(max_rd_atomic, params->endpoint.max_rd_atomic);
+
+    if (params->endpoint.signal_interval <= 0) {
+        std::stringstream ss;
+        ss << "Invalid RDMA endpoint.signal_interval: "
+           << params->endpoint.signal_interval
+           << ", expected a positive integer";
+        return Status::InvalidArgument(ss.str() + LOC_MARK);
+    }
 
     size_t mtu_val = conf->get("transports/rdma/endpoint/path_mtu", 4096);
     if (mtu_val == 4096)
@@ -262,6 +271,13 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
         conf->get("transports/rdma/disable_gpu_direct_rdma", false);
     if (disable_gpu_direct) {
         return false;
+    }
+    // Intel XPU and Cambricon MLU export device buffers as dma-bufs. Buffers
+    // that fail export or registration are not offered on RDMA and get staged.
+    const auto platform_type = Platform::getLoader().type();
+    if (platform_type == "xpu" || platform_type == "mlu") {
+        auto& loader = IbvLoader::Instance();
+        return loader.available() && loader.sym().ibv_reg_dmabuf_mr != nullptr;
     }
     // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
@@ -521,15 +537,46 @@ Status RdmaTransport::submitTransferTasks(
 
     const size_t default_block_size = params_->workers.block_size;
     const int num_workers = params_->workers.num_workers;
+    const size_t steady_watermark = params_->endpoint.max_qp_wr;
+    // Lower first-flush watermark to reduce worker first-post latency
+    const size_t first_watermark =
+        steady_watermark / num_workers + (steady_watermark % num_workers != 0);
+    std::vector<size_t> watermarks(num_workers, first_watermark);
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice*> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
+
+    auto flush_lane = [&](int lane) {
+        auto& list = slice_lists[lane];
+        if (!list.first) return;
+        rdma_batch->slice_chain.push_back(list.first);
+        auto status = workers_->submit(list, lane);
+        if (status.ok()) {
+            watermarks[lane] = steady_watermark;
+        } else {
+            // Earlier chunks may already be posted. Resolve only this rejected
+            // chunk. Otherwise, a synchronous group failure would resubmit that
+            // prefix.
+            LOG(ERROR) << "Unable to enqueue RDMA slices: "
+                       << status.ToString();
+            for (auto* slice = list.first; slice; slice = slice->next) {
+                const int dev = slice->charged_dev.exchange(-1);
+                if (dev >= 0)
+                    workers_->getDeviceSelector()->release(dev, slice->length,
+                                                           0.0);
+                updateSliceStatus(slice, FAILED);
+            }
+        }
+        list = {};
+        slice_tails[lane] = nullptr;
+    };
 
     // Distribute starting worker across threads to avoid contention
     static std::atomic<int> g_caller_threads(0);
     thread_local int tl_caller_id = g_caller_threads.fetch_add(1);
     int next_worker_idx = tl_caller_id;
     for (auto& request : request_list) {
+        bool flush_ready = false;
         auto opcode = request.opcode;
         auto type = Platform::getLoader().getMemoryType(request.source);
         size_t max_slice_count = 64;
@@ -557,22 +604,12 @@ Status RdmaTransport::submitTransferTasks(
         std::vector<int> slice_dev_ids;
         // Only if a single request is enough, we perform aggregated allocation
         if (num_slices >= max_slice_count / 2) {
-            std::string source_location = kWildcardLocation;
-            auto source_locations =
-                Platform::getLoader().getLocation(request.source, 1, true);
-            if (!source_locations.empty()) {
-                source_location = source_locations[0].location;
-            }
-            auto device_selector = workers_->getDeviceSelector();
-            if (device_selector) {
-                auto status = device_selector->allocate(
-                    request.length, static_cast<uint32_t>(num_slices),
-                    block_size, source_location, slice_dev_ids,
-                    request.priority, batch->device_mask);
-                if (!status.ok() || slice_dev_ids.empty()) {
-                    LOG(WARNING) << "Device quota allocation failed: "
-                                 << status.message();
-                }
+            auto status = workers_->allocateDevices(
+                request, static_cast<uint32_t>(num_slices), block_size,
+                task->device_mask, slice_dev_ids);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Device quota allocation failed: " << status.message();
             }
         }
 
@@ -610,6 +647,8 @@ Status RdmaTransport::submitTransferTasks(
             auto& list = slice_lists[part_id];
             auto& tail = slice_tails[part_id];
             list.num_slices++;
+            if (static_cast<size_t>(list.num_slices) >= watermarks[part_id])
+                flush_ready = true;
             next_worker_idx++;
             if (list.first) {
                 tail->next = slice;
@@ -618,14 +657,19 @@ Status RdmaTransport::submitTransferTasks(
                 list.first = tail = slice;
             }
         }
-    }
-
-    for (int i = 0; i < num_workers; ++i) {
-        if (slice_lists[i].first) {
-            rdma_batch->slice_chain.push_back(slice_lists[i].first);
-            workers_->submit(slice_lists[i], i);
+        // Flush a chunk to pipeline task slice submission and worker posting
+        // Publish only after this task's slice count and references are
+        // finalized
+        if (flush_ready) {
+            for (int i = 0; i < num_workers; ++i) {
+                if (static_cast<size_t>(slice_lists[i].num_slices) >=
+                    watermarks[i])
+                    flush_lane(i);
+            }
         }
     }
+
+    for (int i = 0; i < num_workers; ++i) flush_lane(i);
     return Status::OK();
 }
 
@@ -713,6 +757,9 @@ Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {
     if (length < kMrWarmupMinBytes) return false;
+    // Warm-up is a plain ibv_reg_mr; dma-buf device memory has no host pages.
+    const auto memory_type = Platform::getLoader().getMemoryType(addr);
+    if (memory_type == MTYPE_XPU || memory_type == MTYPE_MLU) return false;
     unsigned hwc = std::thread::hardware_concurrency();
     if (hwc < 4) return false;
     RdmaContext* warmup_ctx = nullptr;

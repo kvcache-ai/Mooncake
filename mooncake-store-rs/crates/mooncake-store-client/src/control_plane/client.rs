@@ -1,0 +1,1413 @@
+use super::codec::*;
+use super::*;
+use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
+
+impl RouteControlTransport for ControlPlaneClient {
+    fn send_route_control(
+        &self,
+        lease: &ClientLease,
+        request: RouteControlRequest,
+    ) -> Result<RouteControlResponse> {
+        let operation = request.operation();
+        let tracker = OperationTracker::new(operation);
+        let result = request
+            .empty_response()
+            .map(Ok)
+            .unwrap_or_else(|| self.send_route_control_request(lease, request));
+        tracker.finish(&result, 0);
+        result
+    }
+}
+
+fn decode_route_batch_get_reply(reply: pb::BatchGetRoutesReply) -> Result<RouteControlResponse> {
+    Ok(RouteControlResponse::BatchGet(
+        reply
+            .replies
+            .into_iter()
+            .map(|entry| {
+                decode_error(entry.error)?;
+                entry.route.map(try_object_route).transpose()
+            })
+            .collect(),
+    ))
+}
+
+fn decode_route_batch_contains_reply(
+    reply: pb::BatchContainsRoutesReply,
+) -> Result<RouteControlResponse> {
+    Ok(RouteControlResponse::BatchContains(
+        reply
+            .replies
+            .into_iter()
+            .map(|entry| {
+                decode_error(entry.error)?;
+                Ok(entry.exists)
+            })
+            .collect(),
+    ))
+}
+
+fn decode_route_batch_cas_reply(
+    reply: pb::BatchCompareAndSwapRoutesReply,
+    context: &str,
+) -> Result<RouteControlResponse> {
+    Ok(RouteControlResponse::BatchCompareAndSwap(
+        reply
+            .replies
+            .into_iter()
+            .map(|entry| {
+                decode_error(entry.error)?;
+                let result = entry.result.ok_or_else(|| {
+                    StoreError::Transport(format!("{context} reply is missing result"))
+                })?;
+                try_cas_result(result)
+            })
+            .collect(),
+    ))
+}
+
+fn decode_route_batch_replace_reply(
+    reply: pb::BatchReplaceRoutesReply,
+) -> Result<RouteControlResponse> {
+    Ok(RouteControlResponse::BatchReplace(
+        reply
+            .replies
+            .into_iter()
+            .map(|entry| decode_error(entry.error))
+            .collect(),
+    ))
+}
+
+fn decode_route_list_by_replica_owner_reply(
+    reply: pb::ListRoutesByReplicaOwnerReply,
+) -> Result<RouteControlResponse> {
+    decode_error(reply.error)?;
+    if reply.routes.len() > mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE {
+        return Err(StoreError::Transport(format!(
+            "control plane owner-route page exceeds the {}-route limit",
+            mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE
+        )));
+    }
+    let routes = reply
+        .routes
+        .into_iter()
+        .map(try_object_route)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RouteControlResponse::ListByReplicaOwner(
+        mooncake_store_route::RouteOwnerPage {
+            routes,
+            next_cursor: reply.next_cursor,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod owner_page_decode_tests {
+    use super::*;
+
+    #[test]
+    fn owner_route_reply_rejects_oversized_pages_before_decoding() {
+        let routes = (0..=mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE)
+            .map(|_| pb::ObjectRoute::default())
+            .collect();
+        let error = decode_route_list_by_replica_owner_reply(pb::ListRoutesByReplicaOwnerReply {
+            routes,
+            error: None,
+            next_cursor: None,
+        })
+        .expect_err("an oversized transport page must fail closed");
+        assert!(matches!(error, StoreError::Transport(_)));
+    }
+}
+
+impl ControlPlaneClient {
+    pub(crate) fn new() -> Result<Self> {
+        Self::with_request_timeout(control_request_timeout_from_env())
+    }
+
+    pub(crate) fn with_request_timeout(request_timeout: Duration) -> Result<Self> {
+        let worker_threads = control_plane_runtime_threads_from_env();
+        let runtime = RuntimeBuilder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("mooncake-control-client")
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                StoreError::Transport(format!("control plane runtime init failed: {error}"))
+            })?;
+        Ok(Self {
+            runtime: Some(runtime),
+            channels: Mutex::new(BTreeMap::new()),
+            streams: Mutex::new(BTreeMap::new()),
+            request_timeout: request_timeout.max(Duration::from_millis(1)),
+        })
+    }
+
+    pub(super) fn with_runtime<T>(&self, f: impl FnOnce(&Runtime) -> T) -> T {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("control plane runtime should remain available while client is alive");
+        f(runtime)
+    }
+
+    fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.runtime
+            .as_ref()
+            .expect("control plane runtime should remain available while client is alive")
+            .handle()
+            .clone()
+    }
+
+    fn block_on_control<Fut, T>(&self, future: Fut) -> T
+    where
+        Fut: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let handle = self.runtime_handle();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let thread = std::thread::Builder::new()
+                .name("mooncake-control-client-block-on".to_string())
+                .spawn(move || handle.block_on(future))
+                .expect("control plane blocking bridge thread should spawn");
+            return match thread.join() {
+                Ok(output) => output,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+        }
+        handle.block_on(future)
+    }
+
+    fn send_route_control_request(
+        &self,
+        lease: &ClientLease,
+        request: RouteControlRequest,
+    ) -> Result<RouteControlResponse> {
+        match request {
+            RouteControlRequest::BatchGet {
+                namespace,
+                authority,
+                keys,
+            } => self.send_route_batch_get(lease, namespace, authority, keys),
+            RouteControlRequest::BatchContains {
+                namespace,
+                authority,
+                keys,
+            } => self.send_route_batch_contains(lease, namespace, authority, keys),
+            RouteControlRequest::BatchCompareAndSwap {
+                namespace,
+                authority,
+                requests,
+            } => self.send_route_batch_cas(lease, namespace, authority, requests),
+            RouteControlRequest::BatchReplace {
+                namespace,
+                authority,
+                requests,
+            } => self.send_route_batch_replace(lease, namespace, authority, requests),
+            RouteControlRequest::ListByReplicaOwner {
+                namespace,
+                authority,
+                owner,
+                cursor,
+                limit,
+            } => self.send_route_list_by_replica_owner(
+                lease, namespace, authority, owner, cursor, limit,
+            ),
+        }
+    }
+
+    fn send_route_batch_contains(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        keys: Vec<ObjectKey>,
+    ) -> Result<RouteControlResponse> {
+        let request = pb::BatchContainsRoutesRequest {
+            namespace,
+            authority: authority.0.clone(),
+            keys: keys.iter().map(|key| key.0.clone()).collect(),
+        };
+        match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+            request_id,
+            body: Some(pb::control_stream_request::Body::RouteContains(
+                request.clone(),
+            )),
+        }) {
+            Ok(reply) => {
+                decode_error(reply.error)?;
+                let pb::control_stream_reply::Body::RouteContains(reply) =
+                    reply.body.ok_or_else(|| {
+                        StoreError::Transport(
+                            "control stream batch_contains_routes reply is missing body"
+                                .to_string(),
+                        )
+                    })?
+                else {
+                    return Err(StoreError::Transport(
+                        "control stream batch_contains_routes reply type mismatch".to_string(),
+                    ));
+                };
+                return decode_route_batch_contains_reply(reply);
+            }
+            Err(error) => {
+                warn!(
+                    authority = %authority,
+                    items = keys.len(),
+                    error = %error,
+                    "control stream batch_contains_routes failed; falling back to unary batch rpc"
+                );
+            }
+        }
+        let reply = self.rpc_for_lease(lease, move |mut client| async move {
+            client.batch_contains_routes(Request::new(request)).await
+        })?;
+        decode_route_batch_contains_reply(reply)
+    }
+
+    fn send_route_batch_get(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        keys: Vec<ObjectKey>,
+    ) -> Result<RouteControlResponse> {
+        let request = pb::BatchGetRoutesRequest {
+            namespace,
+            authority: authority.0.clone(),
+            keys: keys.iter().map(|key| key.0.clone()).collect(),
+        };
+        match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+            request_id,
+            body: Some(pb::control_stream_request::Body::RouteGet(request.clone())),
+        }) {
+            Ok(reply) => {
+                decode_error(reply.error)?;
+                let pb::control_stream_reply::Body::RouteGet(reply) =
+                    reply.body.ok_or_else(|| {
+                        StoreError::Transport(
+                            "control stream batch_get_routes reply is missing body".to_string(),
+                        )
+                    })?
+                else {
+                    return Err(StoreError::Transport(
+                        "control stream batch_get_routes reply type mismatch".to_string(),
+                    ));
+                };
+                return decode_route_batch_get_reply(reply);
+            }
+            Err(error) => {
+                warn!(
+                    authority = %authority,
+                    items = keys.len(),
+                    error = %error,
+                    "control stream batch_get_routes failed; falling back to unary batch rpc"
+                );
+            }
+        }
+        let reply = self.rpc_for_lease(lease, move |mut client| async move {
+            client.batch_get_routes(Request::new(request)).await
+        })?;
+        decode_route_batch_get_reply(reply)
+    }
+
+    fn send_route_batch_cas(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        requests: Vec<RouteCasRequest>,
+    ) -> Result<RouteControlResponse> {
+        let request = pb::BatchCompareAndSwapRoutesRequest {
+            namespace,
+            authority: authority.0.clone(),
+            entries: requests
+                .iter()
+                .map(|request| pb::RouteCasEntry {
+                    key: request.key.0.clone(),
+                    expected_version: request.expected.map(|version| version.0),
+                    next: request.next.as_ref().map(pb_object_route),
+                })
+                .collect(),
+        };
+        match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+            request_id,
+            body: Some(pb::control_stream_request::Body::RouteCas(request.clone())),
+        }) {
+            Ok(reply) => {
+                decode_error(reply.error)?;
+                let pb::control_stream_reply::Body::RouteCas(reply) =
+                    reply.body.ok_or_else(|| {
+                        StoreError::Transport(
+                            "control stream batch_compare_and_swap_routes reply is missing body"
+                                .to_string(),
+                        )
+                    })?
+                else {
+                    return Err(StoreError::Transport(
+                        "control stream batch_compare_and_swap_routes reply type mismatch"
+                            .to_string(),
+                    ));
+                };
+                return decode_route_batch_cas_reply(reply, "control stream batch cas");
+            }
+            Err(error) => {
+                warn!(
+                    authority = %authority,
+                    items = requests.len(),
+                    error = %error,
+                    "control stream batch_compare_and_swap_routes failed; falling back to unary batch rpc"
+                );
+            }
+        }
+        let reply = self.rpc_for_lease(lease, move |mut client| async move {
+            client
+                .batch_compare_and_swap_routes(Request::new(request))
+                .await
+        })?;
+        decode_route_batch_cas_reply(reply, "control plane batch cas")
+    }
+
+    fn send_route_list_by_replica_owner(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        owner: ClientRuntimeId,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<RouteControlResponse> {
+        let request = pb::ListRoutesByReplicaOwnerRequest {
+            namespace,
+            authority: authority.0.clone(),
+            owner: Some(pb_runtime_id(&owner)),
+            cursor,
+            limit: limit.try_into().unwrap_or(u32::MAX),
+        };
+        match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+            request_id,
+            body: Some(pb::control_stream_request::Body::RouteListByReplicaOwner(
+                request.clone(),
+            )),
+        }) {
+            Ok(reply) => {
+                decode_error(reply.error)?;
+                let pb::control_stream_reply::Body::RouteListByReplicaOwner(reply) =
+                    reply.body.ok_or_else(|| {
+                        StoreError::Transport(
+                            "control stream list_routes_by_replica_owner reply is missing body"
+                                .to_string(),
+                        )
+                    })?
+                else {
+                    return Err(StoreError::Transport(
+                        "control stream list_routes_by_replica_owner reply type mismatch"
+                            .to_string(),
+                    ));
+                };
+                return decode_route_list_by_replica_owner_reply(reply);
+            }
+            Err(error) => {
+                warn!(
+                    authority = %authority,
+                    owner = %owner,
+                    error = %error,
+                    "control stream list_routes_by_replica_owner failed; falling back to unary rpc"
+                );
+            }
+        }
+        let reply = self.rpc_for_lease(lease, move |mut client| async move {
+            client
+                .list_routes_by_replica_owner(Request::new(request))
+                .await
+        })?;
+        decode_route_list_by_replica_owner_reply(reply)
+    }
+
+    fn send_route_batch_replace(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        requests: Vec<RouteCasRequest>,
+    ) -> Result<RouteControlResponse> {
+        let request = pb::BatchReplaceRoutesRequest {
+            namespace,
+            authority: authority.0.clone(),
+            entries: requests
+                .iter()
+                .map(|request| pb::RouteReplaceEntry {
+                    key: request.key.0.clone(),
+                    next: request.next.as_ref().map(pb_object_route),
+                })
+                .collect(),
+        };
+        match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+            request_id,
+            body: Some(pb::control_stream_request::Body::RouteReplace(
+                request.clone(),
+            )),
+        }) {
+            Ok(reply) => {
+                decode_error(reply.error)?;
+                let pb::control_stream_reply::Body::RouteReplace(reply) =
+                    reply.body.ok_or_else(|| {
+                        StoreError::Transport(
+                            "control stream batch_replace_routes reply is missing body".to_string(),
+                        )
+                    })?
+                else {
+                    return Err(StoreError::Transport(
+                        "control stream batch_replace_routes reply type mismatch".to_string(),
+                    ));
+                };
+                return decode_route_batch_replace_reply(reply);
+            }
+            Err(error) => {
+                warn!(
+                    authority = %authority,
+                    items = requests.len(),
+                    error = %error,
+                    "control stream batch_replace_routes failed; falling back to unary batch rpc"
+                );
+            }
+        }
+        let reply = self.rpc_for_lease(lease, move |mut client| async move {
+            client.batch_replace_routes(Request::new(request)).await
+        })?;
+        decode_route_batch_replace_reply(reply)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_get_routes(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
+        let response = self.send_route_control(
+            lease,
+            RouteControlRequest::BatchGet {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                keys: keys.to_vec(),
+            },
+        )?;
+        match response {
+            RouteControlResponse::BatchGet(replies) => Ok(replies),
+            _ => Err(StoreError::Transport(
+                "test batch_get_routes returned non-get route response".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_compare_and_swap_routes(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        requests: &[RouteCasRequest],
+    ) -> Result<Vec<Result<CasResult>>> {
+        let response = self.send_route_control(
+            lease,
+            RouteControlRequest::BatchCompareAndSwap {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                requests: requests.to_vec(),
+            },
+        )?;
+        match response {
+            RouteControlResponse::BatchCompareAndSwap(replies) => Ok(replies),
+            _ => Err(StoreError::Transport(
+                "test batch_compare_and_swap_routes returned non-cas route response".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_replace_routes(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        requests: &[RouteCasRequest],
+    ) -> Result<Vec<Result<()>>> {
+        let response = self.send_route_control(
+            lease,
+            RouteControlRequest::BatchReplace {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                requests: requests.to_vec(),
+            },
+        )?;
+        match response {
+            RouteControlResponse::BatchReplace(replies) => Ok(replies),
+            _ => Err(StoreError::Transport(
+                "test batch_replace_routes returned non-replace route response".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_routes_by_replica_owner(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+    ) -> Result<Vec<ObjectRoute>> {
+        let response = self.send_route_control(
+            lease,
+            RouteControlRequest::ListByReplicaOwner {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                owner: owner.clone(),
+                cursor: None,
+                limit: mooncake_store_route::DEFAULT_ROUTE_OWNER_PAGE_SIZE,
+            },
+        )?;
+        let RouteControlResponse::ListByReplicaOwner(page) = response else {
+            return Err(StoreError::Transport(
+                "test list_routes_by_replica_owner returned non-list route response".to_string(),
+            ));
+        };
+        if page.next_cursor.is_some() {
+            return Err(StoreError::Unsupported(
+                "test complete owner-route listing exceeds the bounded compatibility page"
+                    .to_string(),
+            ));
+        }
+        Ok(page.routes)
+    }
+
+    pub(crate) fn batch_report_route_hits(
+        &self,
+        lease: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<usize> {
+        let tracker = OperationTracker::new("control_eviction_batch_report_route_hits");
+        let result = (|| {
+            if keys.is_empty() {
+                return Ok(0);
+            }
+            let request = pb::BatchReportRouteHitsRequest {
+                keys: keys.iter().map(|key| key.0.clone()).collect(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(pb::control_stream_request::Body::EvictionReportRouteHits(
+                    request.clone(),
+                )),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::EvictionReportRouteHits(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_report_route_hits reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_report_route_hits reply type mismatch"
+                                .to_string(),
+                        ));
+                    };
+                    decode_error(reply.error)?;
+                    return Ok(reply.accepted as usize);
+                }
+                Err(error) => {
+                    warn!(
+                        items = keys.len(),
+                        error = %error,
+                        "control stream batch_report_route_hits failed; falling back to unary rpc"
+                    );
+                }
+            }
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client.batch_report_route_hits(Request::new(request)).await
+            })?;
+            decode_error(reply.error)?;
+            Ok(reply.accepted as usize)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn batch_track_replica_routes(
+        &self,
+        lease: &ClientLease,
+        routes: &[ObjectRoute],
+    ) -> Result<usize> {
+        let tracker = OperationTracker::new("control_eviction_batch_track_replica_routes");
+        let result = (|| {
+            if routes.is_empty() {
+                return Ok(0);
+            }
+            let request = pb::BatchTrackReplicaRoutesRequest {
+                routes: routes.iter().map(pb_object_route).collect(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(
+                    pb::control_stream_request::Body::EvictionTrackReplicaRoutes(request.clone()),
+                ),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::EvictionTrackReplicaRoutes(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_track_replica_routes reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_track_replica_routes reply type mismatch"
+                                .to_string(),
+                        ));
+                    };
+                    decode_error(reply.error)?;
+                    return Ok(reply.accepted as usize);
+                }
+                Err(error) => {
+                    warn!(
+                        items = routes.len(),
+                        error = %error,
+                        "control stream batch_track_replica_routes failed; falling back to unary rpc"
+                    );
+                }
+            }
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client
+                    .batch_track_replica_routes(Request::new(request))
+                    .await
+            })?;
+            decode_error(reply.error)?;
+            Ok(reply.accepted as usize)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn submit_migration_task(
+        &self,
+        lease: &ClientLease,
+        request: pb::SubmitMigrationTaskRequest,
+    ) -> Result<String> {
+        let tracker = OperationTracker::new("control_migration_submit");
+        let result = (|| {
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client.submit_migration_task(Request::new(request)).await
+            })?;
+            decode_error(reply.error)?;
+            if reply.execution_id.trim().is_empty() {
+                return Err(StoreError::Transport(
+                    "control plane submit_migration_task reply is missing execution_id".to_string(),
+                ));
+            }
+            Ok(reply.execution_id)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn get_migration_execution_status_detail(
+        &self,
+        lease: &ClientLease,
+        request: pb::GetMigrationExecutionStatusRequest,
+    ) -> Result<pb::GetMigrationExecutionStatusReply> {
+        let tracker = OperationTracker::new("control_migration_status_detail");
+        let result = (|| {
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client
+                    .get_migration_execution_status(Request::new(request))
+                    .await
+            })?;
+            decode_error(reply.error.clone())?;
+            Ok(reply)
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn get_migration_execution_status(
+        &self,
+        lease: &ClientLease,
+        request: pb::GetMigrationExecutionStatusRequest,
+    ) -> Result<pb::MigrationExecutionState> {
+        let tracker = OperationTracker::new("control_migration_status");
+        let result = self
+            .get_migration_execution_status_detail(lease, request)
+            .and_then(|reply| {
+                pb::MigrationExecutionState::try_from(reply.state).map_err(|_| {
+                    StoreError::Transport(format!(
+                        "control plane get_migration_execution_status reply has invalid state: {}",
+                        reply.state
+                    ))
+                })
+            });
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn get_route(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectRoute>> {
+        let response = self.send_route_control(
+            lease,
+            RouteControlRequest::BatchGet {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                keys: vec![key.clone()],
+            },
+        )?;
+        let RouteControlResponse::BatchGet(mut replies) = response else {
+            return Err(StoreError::Transport(
+                "control plane get_route transport returned non-route reply".to_string(),
+            ));
+        };
+        replies.pop().ok_or_else(|| {
+            StoreError::Transport("control plane get_route reply is missing batch item".to_string())
+        })?
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn release_cached_channel(&self, lease: &ClientLease) {
+        if let Ok(address) = control_address(lease) {
+            self.streams.lock().remove(&address);
+            self.channels.lock().remove(&address);
+        }
+    }
+
+    pub(crate) fn reserve_any(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+    ) -> Result<SegmentReservation> {
+        let mut replies = self.batch_reserve_any(lease, owner, &[length_bytes])?;
+        replies.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane reserve_any reply is missing batch item".to_string(),
+            )
+        })?
+    }
+
+    pub(crate) fn batch_reserve_any(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        let tracker = OperationTracker::new("control_allocator_batch_reserve_any");
+        let result = (|| {
+            if length_bytes.is_empty() {
+                return Ok(Vec::new());
+            }
+            let request = pb::BatchReserveAnyRequest {
+                owner: Some(pb_runtime_id(owner)),
+                length_bytes: length_bytes.to_vec(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(pb::control_stream_request::Body::AllocatorReserveAny(
+                    request.clone(),
+                )),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::AllocatorReserveAny(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_reserve_any reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_reserve_any reply type mismatch".to_string(),
+                        ));
+                    };
+                    ensure_batch_len("batch_reserve_any", length_bytes.len(), reply.replies.len())?;
+                    return Ok(reply
+                        .replies
+                        .into_iter()
+                        .map(|entry| {
+                            decode_error(entry.error)?;
+                            let reservation = entry.reservation.ok_or_else(|| {
+                                StoreError::Transport(
+                                    "control stream batch reserve_any reply is missing reservation"
+                                        .to_string(),
+                                )
+                            })?;
+                            try_segment_reservation(reservation)
+                        })
+                        .collect());
+                }
+                Err(error) => {
+                    warn!(
+                        owner = %owner,
+                        items = length_bytes.len(),
+                        error = %error,
+                        "control stream batch_reserve_any failed; falling back to unary batch rpc"
+                    );
+                }
+            }
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client.batch_reserve_any(Request::new(request)).await
+            })?;
+            ensure_batch_len("batch_reserve_any", length_bytes.len(), reply.replies.len())?;
+            Ok(reply
+                .replies
+                .into_iter()
+                .map(|entry| {
+                    decode_error(entry.error)?;
+                    let reservation = entry.reservation.ok_or_else(|| {
+                        StoreError::Transport(
+                            "control plane batch reserve_any reply is missing reservation"
+                                .to_string(),
+                        )
+                    })?;
+                    try_segment_reservation(reservation)
+                })
+                .collect())
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn reserve_specific(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> Result<SegmentReservation> {
+        let mut results = self.batch_reserve_specific(
+            lease,
+            owner,
+            &[ReserveSpecificOp {
+                segment_name: segment_name.clone(),
+                length_bytes,
+            }],
+        )?;
+        results.pop().ok_or_else(|| {
+            StoreError::Transport(
+                "control plane reserve_specific reply is missing batch item".to_string(),
+            )
+        })?
+    }
+
+    pub(crate) fn batch_reserve_specific(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Result<Vec<Result<SegmentReservation>>> {
+        let tracker = OperationTracker::new("control_allocator_batch_reserve_specific");
+        let result = (|| {
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            let request = pb::BatchReserveSpecificRequest {
+                owner: Some(pb_runtime_id(owner)),
+                entries: requests
+                    .iter()
+                    .map(|request| pb::ReserveSpecificEntry {
+                        segment_name: request.segment_name.0.clone(),
+                        length_bytes: request.length_bytes,
+                    })
+                    .collect(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(pb::control_stream_request::Body::AllocatorReserveSpecific(
+                    request.clone(),
+                )),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::AllocatorReserveSpecific(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_reserve_specific reply is missing body"
+                                    .to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_reserve_specific reply type mismatch".to_string(),
+                        ));
+                    };
+                    ensure_batch_len(
+                        "batch_reserve_specific",
+                        requests.len(),
+                        reply.replies.len(),
+                    )?;
+                    return Ok(reply
+                        .replies
+                        .into_iter()
+                        .map(|entry| {
+                            decode_error(entry.error)?;
+                            let reservation = entry.reservation.ok_or_else(|| {
+                                StoreError::Transport(
+                                    "control stream batch reserve_specific reply is missing reservation"
+                                        .to_string(),
+                                )
+                            })?;
+                            try_segment_reservation(reservation)
+                        })
+                        .collect());
+                }
+                Err(error) => {
+                    warn!(
+                        owner = %owner,
+                        items = requests.len(),
+                        error = %error,
+                        "control stream batch_reserve_specific failed; falling back to unary batch rpc"
+                    );
+                }
+            }
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client.batch_reserve_specific(Request::new(request)).await
+            })?;
+            ensure_batch_len(
+                "batch_reserve_specific",
+                requests.len(),
+                reply.replies.len(),
+            )?;
+            Ok(reply
+                .replies
+                .into_iter()
+                .map(|entry| {
+                    decode_error(entry.error)?;
+                    let reservation = entry.reservation.ok_or_else(|| {
+                        StoreError::Transport(
+                            "control plane batch reserve_specific reply is missing reservation"
+                                .to_string(),
+                        )
+                    })?;
+                    try_segment_reservation(reservation)
+                })
+                .collect())
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn batch_release(
+        &self,
+        lease: &ClientLease,
+        owner: &ClientRuntimeId,
+        requests: &[ReleaseOp],
+    ) -> Result<Vec<Result<()>>> {
+        let tracker = OperationTracker::new("control_allocator_batch_release");
+        let result = (|| {
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            let request = pb::BatchReleaseRequest {
+                owner: Some(pb_runtime_id(owner)),
+                entries: requests
+                    .iter()
+                    .map(|request| pb::ReleaseEntry {
+                        segment_name: request.segment_name.0.clone(),
+                        offset_bytes: request.offset_bytes,
+                        length_bytes: request.length_bytes,
+                    })
+                    .collect(),
+            };
+            match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+                request_id,
+                body: Some(pb::control_stream_request::Body::AllocatorRelease(
+                    request.clone(),
+                )),
+            }) {
+                Ok(reply) => {
+                    decode_error(reply.error)?;
+                    let pb::control_stream_reply::Body::AllocatorRelease(reply) =
+                        reply.body.ok_or_else(|| {
+                            StoreError::Transport(
+                                "control stream batch_release reply is missing body".to_string(),
+                            )
+                        })?
+                    else {
+                        return Err(StoreError::Transport(
+                            "control stream batch_release reply type mismatch".to_string(),
+                        ));
+                    };
+                    ensure_batch_len("batch_release", requests.len(), reply.replies.len())?;
+                    return Ok(reply
+                        .replies
+                        .into_iter()
+                        .map(|entry| decode_error(entry.error))
+                        .collect());
+                }
+                Err(error) => {
+                    warn!(
+                        owner = %owner,
+                        items = requests.len(),
+                        error = %error,
+                        "control stream batch_release failed; falling back to unary batch rpc"
+                    );
+                }
+            }
+            let reply = self.rpc_for_lease(lease, move |mut client| async move {
+                client.batch_release(Request::new(request)).await
+            })?;
+            ensure_batch_len("batch_release", requests.len(), reply.replies.len())?;
+            Ok(reply
+                .replies
+                .into_iter()
+                .map(|entry| decode_error(entry.error))
+                .collect())
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    fn stream_session_for(
+        &self,
+        lease: &ClientLease,
+        address: &str,
+    ) -> Result<Arc<ControlStreamSession>> {
+        let cached_session = {
+            let streams = self.streams.lock();
+            streams.get(address).cloned()
+        };
+        if let Some(session) = cached_session {
+            if !session.closed.load(Ordering::Relaxed) {
+                return Ok(session);
+            }
+            self.streams.lock().remove(address);
+        }
+
+        let channel = self.channel_for(lease)?;
+        let request_timeout = self.request_timeout;
+        let session = self.block_on_control(async move {
+            tokio::time::timeout(request_timeout, async move {
+                let (sender, receiver) = mpsc::channel(128);
+                let outbound = ReceiverStream::new(receiver);
+                let mut client =
+                    pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
+                let inbound = client
+                    .control_stream(Request::new(outbound))
+                    .await
+                    .map(Response::into_inner)
+                    .map_err(status_to_store_error)?;
+                let session = Arc::new(ControlStreamSession {
+                    sender,
+                    pending: Arc::new(Mutex::new(BTreeMap::new())),
+                    next_request_id: AtomicU64::new(1),
+                    closed: AtomicBool::new(false),
+                });
+                spawn_stream_reader(session.clone(), inbound);
+                Ok::<_, StoreError>(session)
+            })
+            .await
+            .map_err(|_| control_timeout_error("control stream open", request_timeout))?
+        })?;
+        self.streams
+            .lock()
+            .insert(address.to_string(), session.clone());
+        Ok(session)
+    }
+
+    fn invalidate_stream_session(&self, address: &str) {
+        self.streams.lock().remove(address);
+    }
+
+    fn invalidate_channel(&self, address: &str) {
+        if self.channels.lock().remove(address).is_some() {
+            debug!(address, "invalidated stale control plane channel");
+        }
+    }
+
+    fn invalidate_on_transport_error<T>(&self, lease: &ClientLease, result: &Result<T>) {
+        if matches!(result, Err(StoreError::Transport(_))) {
+            if let Ok(address) = control_address(lease) {
+                self.invalidate_channel(&address);
+                self.invalidate_stream_session(&address);
+            }
+        }
+    }
+
+    fn stream_request(
+        &self,
+        lease: &ClientLease,
+        build: impl Fn(u64) -> pb::ControlStreamRequest,
+    ) -> Result<pb::ControlStreamReply> {
+        let address = control_address(lease)?;
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let session = self.stream_session_for(lease, &address)?;
+            let request_id = session.next_request_id.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = oneshot::channel();
+            session.pending.lock().insert(request_id, tx);
+            let request = build(request_id);
+            let sender = session.sender.clone();
+            let send_result = self
+                .block_on_control(async move { sender.send(request).await })
+                .map_err(|error| {
+                    StoreError::Transport(format!("control stream send failed: {error}"))
+                });
+            if let Err(error) = send_result {
+                session.pending.lock().remove(&request_id);
+                session.closed.store(true, Ordering::Relaxed);
+                self.invalidate_stream_session(&address);
+                debug!(
+                    address,
+                    request_id,
+                    attempt,
+                    error = %error,
+                    "control stream send failed; invalidating session"
+                );
+                last_error = Some(error);
+                continue;
+            }
+            let request_timeout = self.request_timeout;
+            let reply = self
+                .block_on_control(async move { tokio::time::timeout(request_timeout, rx).await });
+            let reply = match reply {
+                Ok(reply) => reply.map_err(|_| {
+                    StoreError::Transport("control stream response channel closed".to_string())
+                })?,
+                Err(_) => {
+                    session.pending.lock().remove(&request_id);
+                    session.closed.store(true, Ordering::Relaxed);
+                    self.invalidate_stream_session(&address);
+                    let error = control_timeout_error("control stream request", request_timeout);
+                    debug!(
+                        address,
+                        request_id,
+                        attempt,
+                        error = %error,
+                        "control stream request timed out; invalidating session"
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            match reply {
+                Ok(reply) => return Ok(reply),
+                Err(error) => {
+                    session.closed.store(true, Ordering::Relaxed);
+                    self.invalidate_stream_session(&address);
+                    debug!(
+                        address,
+                        request_id,
+                        attempt,
+                        error = %error,
+                        "control stream reply failed; invalidating session"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| StoreError::Transport("control stream request failed".to_string())))
+    }
+
+    pub(super) fn channel_for(&self, lease: &ClientLease) -> Result<Channel> {
+        let address = control_address(lease)?;
+        if let Some(channel) = self.channels.lock().get(&address).cloned() {
+            return Ok(channel);
+        }
+
+        let uri = normalize_control_uri(&address);
+        let endpoint = Endpoint::from_shared(uri.clone())
+            .map_err(|error| {
+                StoreError::Transport(format!("invalid control plane uri {uri}: {error}"))
+            })?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(KEEPALIVE_TIMEOUT);
+        let channel = self
+            .block_on_control(async move { endpoint.connect().await })
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "control plane connect to {address} failed: {error}"
+                ))
+            })?;
+        trace!(address, "opened new control plane channel");
+        self.channels.lock().insert(address, channel.clone());
+        Ok(channel)
+    }
+
+    pub(super) fn rpc_for_lease<F, Fut, T>(&self, lease: &ClientLease, f: F) -> Result<T>
+    where
+        F: FnOnce(pb::control_plane_service_client::ControlPlaneServiceClient<Channel>) -> Fut
+            + Send
+            + 'static,
+        Fut:
+            std::future::Future<Output = std::result::Result<Response<T>, Status>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let channel = self.channel_for(lease)?;
+        let result = self.rpc(f, channel);
+        self.invalidate_on_transport_error(lease, &result);
+        result
+    }
+
+    pub(super) fn rpc<F, Fut, T>(&self, f: F, channel: Channel) -> Result<T>
+    where
+        F: FnOnce(pb::control_plane_service_client::ControlPlaneServiceClient<Channel>) -> Fut
+            + Send
+            + 'static,
+        Fut:
+            std::future::Future<Output = std::result::Result<Response<T>, Status>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let client = pb::control_plane_service_client::ControlPlaneServiceClient::new(channel);
+        let request_timeout = self.request_timeout;
+        self.block_on_control(async move {
+            tokio::time::timeout(request_timeout, f(client))
+                .await
+                .map_err(|_| control_timeout_error("control unary rpc", request_timeout))?
+                .map(Response::into_inner)
+                .map_err(status_to_store_error)
+        })
+    }
+
+    pub(crate) fn clear_channels(&self) {
+        self.streams.lock().clear();
+        self.channels.lock().clear();
+    }
+
+    pub(crate) fn probe_reachability(&self, lease: &ClientLease) -> ControlPlaneReachability {
+        self.probe_reachability_with_timeout(lease, CONNECT_TIMEOUT)
+    }
+
+    pub(crate) fn probe_reachability_with_timeout(
+        &self,
+        lease: &ClientLease,
+        timeout: Duration,
+    ) -> ControlPlaneReachability {
+        let address = match control_address(lease) {
+            Ok(address) => address,
+            Err(error) => return ControlPlaneReachability::Unknown(error),
+        };
+
+        let uri = normalize_control_uri(&address);
+        let endpoint = match Endpoint::from_shared(uri.clone()) {
+            Ok(endpoint) => endpoint
+                .connect_timeout(timeout)
+                .tcp_nodelay(true)
+                .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+                .keep_alive_timeout(KEEPALIVE_TIMEOUT),
+            Err(error) => {
+                return ControlPlaneReachability::Unknown(StoreError::Transport(format!(
+                    "invalid control plane uri {uri}: {error}"
+                )));
+            }
+        };
+
+        let timeout = timeout.max(Duration::from_millis(1));
+        let result = self.block_on_control(async move {
+            tokio::time::timeout(timeout, endpoint.connect()).await
+        });
+        match result {
+            Ok(Ok(_)) => ControlPlaneReachability::Reachable,
+            Ok(Err(_)) | Err(_) => ControlPlaneReachability::Unreachable,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn active_stream_sessions(&self) -> usize {
+        self.streams.lock().len()
+    }
+}
+
+fn control_plane_runtime_threads_from_env() -> usize {
+    const DEFAULT_CONTROL_PLANE_THREADS: usize = 2;
+
+    let Some(raw) = std::env::var(CONTROL_PLANE_THREADS_ENV).ok() else {
+        return DEFAULT_CONTROL_PLANE_THREADS;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_CONTROL_PLANE_THREADS;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(threads) if threads > 0 => threads,
+        _ => {
+            warn!(
+                env = CONTROL_PLANE_THREADS_ENV,
+                value = trimmed,
+                default = DEFAULT_CONTROL_PLANE_THREADS,
+                "invalid control-plane runtime thread count; falling back to default"
+            );
+            DEFAULT_CONTROL_PLANE_THREADS
+        }
+    }
+}
+
+fn control_request_timeout_from_env() -> Duration {
+    crate::client::duration_from_env_ms(&[CONTROL_REQUEST_TIMEOUT_ENV])
+        .unwrap_or(DEFAULT_CONTROL_REQUEST_TIMEOUT)
+}
+
+fn control_timeout_error(context: &'static str, timeout: Duration) -> StoreError {
+    StoreError::Transport(format!(
+        "{context} timed out after {}ms",
+        timeout.as_millis()
+    ))
+}
+
+impl Drop for ControlPlaneClient {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+fn spawn_stream_reader(
+    session: Arc<ControlStreamSession>,
+    mut inbound: tonic::Streaming<pb::ControlStreamReply>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match inbound.next().await {
+                Some(Ok(reply)) => {
+                    if let Some(tx) = session.pending.lock().remove(&reply.request_id) {
+                        let _ = tx.send(Ok(reply));
+                    }
+                }
+                Some(Err(status)) => {
+                    fail_stream_session(
+                        &session,
+                        format!("control stream receive failed: {status}"),
+                    );
+                    break;
+                }
+                None => {
+                    fail_stream_session(
+                        &session,
+                        "control stream closed by remote peer".to_string(),
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+pub(super) fn fail_stream_session(session: &ControlStreamSession, message: String) {
+    session.closed.store(true, Ordering::Relaxed);
+    let pending = std::mem::take(&mut *session.pending.lock());
+    for (_, tx) in pending {
+        let _ = tx.send(Err(StoreError::Transport(message.clone())));
+    }
+}

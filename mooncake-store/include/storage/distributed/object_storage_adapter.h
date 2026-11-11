@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sys/types.h>
 #include <sys/uio.h>
 
 #include <span>
@@ -29,6 +30,8 @@ struct ObjectGetRequest {
     size_t size = 0;
 };
 
+using ObjectStorageIoResults = std::vector<tl::expected<void, ErrorCode>>;
+
 /**
  * @brief Adapts object storage services to the distributed backend's
  * key-value I/O contract.
@@ -45,13 +48,22 @@ class ObjectStorageAdapter {
     virtual tl::expected<void, ErrorCode> Put(const std::string& logical_key,
                                               std::span<const char> data) = 0;
 
-    // Atomic multi-region write: one commit and one result.
+    // Atomic, synchronous multi-region write: one commit and one result.
+    // Iovecs and payloads must remain valid and unchanged until return.
     virtual tl::expected<void, ErrorCode> PutV(const std::string& logical_key,
                                                const iovec* iov,
                                                int iovcnt) = 0;
 
     virtual tl::expected<size_t, ErrorCode> Get(const std::string& logical_key,
                                                 void* buf, size_t len) = 0;
+
+    // Read exactly len bytes starting at offset. Implementations must reject
+    // short or mismatched ranges. An error may leave buf partially written.
+    // Optional so existing whole-object adapters remain source compatible.
+    virtual tl::expected<size_t, ErrorCode> GetRange(
+        const std::string& logical_key, void* buf, size_t len, off_t offset) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     // Batch methods may be overridden by concurrent adapters. The default
     // implementation preserves compatibility by executing requests serially.
@@ -86,6 +98,14 @@ class ObjectStorageAdapter {
     virtual tl::expected<void, ErrorCode> Delete(
         const std::string& logical_key) = 0;
 
+    virtual ObjectStorageIoResults DeleteBatch(
+        std::span<const std::string> logical_keys) {
+        ObjectStorageIoResults results;
+        results.reserve(logical_keys.size());
+        for (const auto& key : logical_keys) results.emplace_back(Delete(key));
+        return results;
+    }
+
     // Pagination is an implementation detail. Returns decoded logical keys
     // from the adapter's configured physical namespace.
     virtual tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() = 0;
@@ -101,6 +121,31 @@ class ObjectStorageAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     virtual const char* GetName() const = 0;
+
+    // Single-attempt entry points for the immutable-object backend. Support
+    // must be advertised separately for each path. Never resend an ambiguous
+    // upload: a delayed retry could materialize after object deletion.
+    // Legacy adapters can reuse
+    // Put/PutV only when those operations already avoid retries.
+    virtual bool SupportsSinglePutAttempt() const { return false; }
+    virtual bool SupportsSinglePutVAttempt() const { return false; }
+
+    virtual tl::expected<void, ErrorCode> PutOnce(
+        const std::string& logical_key, std::span<const char> data) {
+        if (!SupportsSinglePutAttempt()) {
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+        return Put(logical_key, data);
+    }
+
+    // Same synchronous buffer lifetime contract as PutV, including empty data.
+    virtual tl::expected<void, ErrorCode> PutVOnce(
+        const std::string& logical_key, const iovec* iov, int iovcnt) {
+        if (!SupportsSinglePutVAttempt()) {
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+        return PutV(logical_key, iov, iovcnt);
+    }
 };
 
 }  // namespace mooncake

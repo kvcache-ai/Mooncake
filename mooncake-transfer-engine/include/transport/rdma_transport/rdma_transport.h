@@ -35,6 +35,7 @@
 
 namespace mooncake {
 
+struct DmabufExport;
 class RdmaContext;
 class RdmaEndPoint;
 class TransferMetadata;
@@ -47,6 +48,7 @@ class RdmaTransport : public Transport {
     friend class RdmaTransportTestPeer;
     friend class RdmaNotificationTestPeer;
     friend class WorkerPool;
+    friend class TransferEngineImpl;
 
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
@@ -63,6 +65,8 @@ class RdmaTransport : public Transport {
                 std::shared_ptr<Topology> topo) override;
 
     const char *getName() const override { return "rdma"; }
+
+    bool supportsBatchCompletionCounter() const override { return true; }
 
     // Ordinary RDMA's native notification channel. Success means the SEND
     // was posted locally, not that the remote application consumed it.
@@ -91,6 +95,20 @@ class RdmaTransport : public Transport {
 
     int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
                                       bool force_sequential);
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // Called by the engine when it releases the registration, after all
+    // transports finish unregistering or a registration is rolled back.
+    void clearSkipRegistration(void *addr);
+#endif
+
+    // amdgpu before 6.19.14 charges a NIC's dma-buf pin of KFD-allocated VRAM
+    // against the KFD free pool a second time; only pins taken through its
+    // peer-memory client are offset. Holding one such pin per allocation keeps
+    // hipMemGetInfo and later device allocations exact while the data MRs stay
+    // on dma-buf. MC_HIP_KFD_PIN_FIX and a probe at the first registration
+    // decide whether the driver needs it.
+    bool acquireKfdPinAnchor(void *addr, const DmabufExport &exp);
+    void releaseKfdPinAnchor(void *addr);
 
    public:
     // TRANSFER
@@ -99,6 +117,11 @@ class RdmaTransport : public Transport {
 
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
+
+    // Submit fresh tasks without an external submission seal owner. No slices
+    // may have been published before this call; all return statuses seal tasks.
+    Status submitTransferTaskWithSeal(
+        const std::vector<TransferTask *> &task_list);
 
     bool supportsGroupedScatter() const override { return true; }
 
@@ -178,6 +201,29 @@ class RdmaTransport : public Transport {
     // start-addresses for cleanup.
     std::mutex chunk_map_mutex_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
+
+    // Single-buffer counterpart of chunk_map_'s pending bookkeeping: base
+    // addresses whose metadata was removed but whose MR deregistration has
+    // not completed. Gates the metadata-missing fall-through so only a known
+    // pending cleanup retries the per-context deregistration — an address
+    // that was never a registration base must not reach the containing-range
+    // MR lookup.
+    std::mutex pending_dereg_mutex_;
+    std::unordered_set<uint64_t> pending_dereg_;
+
+    struct KfdPinAnchor {
+        ibv_mr *mr = nullptr;
+        size_t refs = 0;
+    };
+    std::mutex kfd_pin_anchor_mutex_;
+    std::unordered_map<uintptr_t, KfdPinAnchor> kfd_pin_anchors_;
+    std::unordered_map<uintptr_t, uintptr_t> kfd_pin_anchor_of_buffer_;
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // Keep delegated registrations until the engine releases the region.
+    // A different transport may fail after RDMA has already returned success.
+    std::mutex skipped_hylink_fabric_mutex_;
+    std::unordered_set<uint64_t> skipped_hylink_fabric_addrs_;
+#endif
 };
 
 using TransferRequest = Transport::TransferRequest;

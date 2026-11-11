@@ -59,6 +59,7 @@ struct GdsSubBatch : public Transport::SubBatch {
     BatchHandle* batch_handle;  // Pointer to reusable handle from pool
     std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
+    std::vector<std::shared_ptr<GdsFileContext>> file_contexts;
     // Scratch buffer populated by cuFileBatchIOGetStatus().
     std::vector<CUfileIOEvents_t> io_events;
     // Stable per-slice status cache indexed by the cookie carried in each IO.
@@ -120,7 +121,10 @@ class GdsTransport : public Transport {
 
     std::string getGdsFilePath(SegmentID handle);
 
-    GdsFileContext* findFileContext(SegmentID target_id);
+    std::shared_ptr<GdsFileContext> getOrCreateFileContext(
+        SegmentID target_id, const std::string& path);
+
+    std::shared_ptr<GdsFileContext> findFileContext(SegmentID target_id);
 
    private:
     bool installed_;

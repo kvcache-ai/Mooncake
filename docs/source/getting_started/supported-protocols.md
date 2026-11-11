@@ -20,6 +20,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
 | **hylink** | Hygon DCU + DTK | Hygon DCU HSL fabric communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
+| **xpu** | Intel GPU + oneAPI SYCL | Host staging and same-node XPU P2P/IPC; TCP/RDMA between nodes | ⚠️ Advanced (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
 | **flagcx** | RDMA-capable NIC(s) | Unified P2P transfer through FlagOS FlagCX | ⚠️ Advanced |
 
@@ -72,6 +73,7 @@ export MOONCAKE_PROTOCOL="tcp"
 - Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
 - Cambricon MLU memory via Neuware (`-DUSE_MLU=ON`)
 - Biren GPU memory via SUPA (`-DUSE_SUPA=ON`)
+- Intel XPU memory via dma-buf (`-DUSE_XPU=ON -DUSE_TENT=ON`)
 
 **Use When:**
 - High-performance networking is required
@@ -81,6 +83,10 @@ export MOONCAKE_PROTOCOL="tcp"
 **Note:** If no RDMA HCA (Host Channel Adapter) is detected on the system, the Transfer Engine will automatically fall back to TCP protocol for compatibility.
 
 **MLU Note:** Cambricon MLU support uses the standard `rdma` data path. There is no separate `mlu` protocol string. To enable MLU memory detection, topology discovery, and DMA-BUF based registration, build Transfer Engine with `-DUSE_MLU=ON` and make Neuware available through `NEUWARE_HOME` or `NEUWARE_ROOT`.
+
+**Intel XPU Note:** Intel XPU support lives in TENT (`-DUSE_XPU=ON -DUSE_TENT=ON`, run with `MC_USE_TENT=1`). On registration, VRAM is exported through Level Zero as a dma-buf and registered with `ibv_reg_dmabuf_mr`, so RDMA reads and writes go to VRAM directly. The direct path is per buffer, not guaranteed: when the NIC or rdma-core lacks dma-buf support, when the export fails for an allocation (for example small foreign USM allocations pooled by the Intel compute runtime, see the build guide), or when `transports/rdma/disable_gpu_direct_rdma` is `true`, the engine transparently stages that VRAM through pinned host memory over the same RDMA or TCP transport. A request hinted to another transport (e.g. `tcp`), or one whose selector policy only admits a DRAM-only transport (e.g. `hp_tcp`), is staged as well. Within one process, VRAM-to-VRAM copies between two XPUs on the same node go directly over PCIe (or Xe Link) when the devices have peer access, and are bounced through host memory otherwise. Across processes on the same node (for example a prefill and a decode worker), registered VRAM is also published with a Level Zero IPC handle; the peer maps it into its own context and the copy runs as a local XPU copy instead of going through the network transport. Opening a peer's handle fetches its dma-buf descriptor with `pidfd_getfd(2)`, which needs ptrace permission over the exporting process: the Level Zero runtime marks its processes `PR_SET_PTRACER_ANY`, so the same user in the same PID namespace suffices under Yama `ptrace_scope` 0 or 1, while `ptrace_scope` 2 needs `CAP_SYS_PTRACE`; when that is refused, or when `transports/xpu/disable_ipc` is `true`, the engine falls back to the network path.
+
+**XPU initiator requirement:** Both direct RDMA and host-staged transfers involving XPU memory currently require an XPU-platform initiator. Staging additionally requires its `XpuTransport` to be enabled; without it, XPU memory is not staged and is routed only over a transport that copies device memory itself, such as TCP. A CPU-platform initiator is not supported even when its local buffer is DRAM and only the remote buffer is XPU memory; it cannot transparently fall back to staging. A `cpu:0` buffer in an XPU-platform process does not exercise this CPU-platform case. Foreign/fallback USM whose dma-buf size exceeds its allocation size is conservatively staged, including ambiguous padding; see the [build guide](build.md).
 
 **Configuration:**
 ```python
@@ -202,13 +208,61 @@ The following protocols are available at the C++ Transfer Engine level for speci
 - NVIDIA MNNVL hardware
 - Compiled with `USE_MNNVL=ON`
 
+Mooncake Store providers can use this transport for a default-off,
+EGM-backed DRAM tier. Configure the Python `setup(config)` overload with
+`enable_egm_store_pool=true`, `protocol="nvlink"`,
+and `global_segment_size>0`. `egm_numa_nodes` accepts
+`auto` (the default, using each visible GPU's CUDA
+`CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`) or a comma-separated node list. Consumers
+do not enable the pool; they use the ordinary `nvlink` protocol to access the
+provider's mounted segments. Use `MC_MS_AUTO_DISC=0` for the manual selection
+shown below, for both Providers and Consumers. `MC_FORCE_MNNVL` is not needed
+in this mode. EGM requires a non-TENT Transfer Engine with the `nvlink`
+transport installed.
+
+`local_buffer_size` controls a separate client staging pool and can be zero
+or nonzero. Nonzero buffers use the existing client-buffer allocator, not
+the EGM pool allocator. A storage-only Provider can leave it at zero; a
+Provider that also uses staging APIs such as `put()` or `get_buffer()` needs
+a nonzero buffer.
+
+The requested EGM capacity is rounded down to a multiple of the common
+alignment: the maximum of the Store slab alignment and the selected nodes'
+CUDA allocation granularities. It is distributed across nodes, then split
+into balanced, aligned chunks no larger than `max_mr_size`. This planning
+applies only to EGM pools.
+
 **Configuration:**
 ```bash
-# Set MC_FORCE_MNNVL=true to use MNNVL even when RDMA NICs are present
-export MC_FORCE_MNNVL=true
+# Provider and Consumer: install the requested nvlink transport explicitly.
+export MC_MS_AUTO_DISC=0
 ```
 
-**Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
+```python
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+**Note:** Manual `protocol="nvlink"` selection is supported for both Providers
+and Consumers. If you use `MC_MS_AUTO_DISC=1` instead, set `MC_FORCE_MNNVL=1`
+on hosts with RDMA HCAs so discovery selects MNNVL. EGM setup checks the
+actual engine and fails before allocation unless it is non-TENT and has
+`nvlink` installed.
+
+Drain all application and offload calls before closing a Store. Close is
+terminal, even on error. EGM cleanup is attempted, and resources whose cleanup
+cannot be confirmed are retained until process exit rather than retried by a
+later close. See
+`close()` in the [Python Store API](../api-reference/python/mooncake-store.md)
+for cleanup and failure handling.
 
 **Host memory over NVLink (TENT, EGM):** on Grace-Blackwell systems the GPUs of
 an NVLink domain can also address each other's host DRAM (Extended GPU Memory).
@@ -276,15 +330,21 @@ threshold, `MC_MUSA_COPY_API=transfer_batch` to force the API, or
 
 ### Intra-Node NVLink (nvlink_intra)
 
-**Description:** NVIDIA NVLink for GPU-to-GPU communication within a single node.
+**Description:** GPU-to-GPU copies within a single node through CUDA IPC. Despite the name, the copy
+uses whatever peer-to-peer path the driver provides: NVLink when present, otherwise PCIe P2P.
 
 **Use When:**
 - Local GPU-to-GPU transfers are needed
 - Maximizing intra-node GPU bandwidth
+- PCIe-only nodes without an RDMA NIC, where the automatic selection otherwise falls back to TCP
 
 **Requirements:**
-- NVIDIA NVLink hardware
+- GPU peer-to-peer access between the GPUs involved: NVLink, or PCIe P2P on PCIe-only systems.
+  Check with `nvidia-smi topo -p2p r`; only a pair reported as `OK` can use this transport
+  (`NS`, `CNS`, `GNS`, `TNS`, or `U` all indicate P2P is unavailable).
 - Compiled with `USE_INTRA_NVLINK=ON` (enabled in the prebuilt `x86_64` CUDA wheels; other variants must be built from source)
+- Registered buffers must be legacy device allocations (`cudaMalloc` / `cuMemAlloc`), because the transport shares them with `cudaIpcGetMemHandle`. Virtual-memory allocations (`cuMemCreate`) have no such handle. In particular, PyTorch tensors allocated with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` cannot be registered: allocate the transfer buffers separately, or disable `expandable_segments` for them.
+- Peers in containers must share the IPC **and** PID namespaces, e.g. `docker run --ipc=host --pid=host` (Kubernetes: `hostIPC` plus `hostPID` or `shareProcessNamespace`). A CUDA IPC handle carries the exporting process's PID. Two containers with separate PID namespaces can hand out the same PID, and the importer then rejects the peer's handle as its own: `cudaIpcOpenMemHandle failed: invalid device context`. A typical symptom is that only the peer pairs with the same worker index fail.
 
 **Configuration:**
 ```bash
@@ -293,6 +353,31 @@ export MC_INTRANODE_NVLINK=true
 ```
 
 **Note:** On a build without `USE_MNNVL=ON`, leaving `MC_INTRANODE_NVLINK` unset keeps the usual RDMA (or TCP, when no HCA is detected) selection.
+
+On a node with no HCA, that TCP fallback stages every GPU buffer through host memory and a TCP
+socket, so it is far slower than a direct peer copy. For example, on 8x H200 NVL PCIe
+(the PCIe-baseboard variant: PCIe Gen5, no NVLink, no RDMA NIC), a 1 GiB GPU-to-GPU
+`transfer_sync_write` with the 0.3.14 wheel measured:
+
+| Transport | GPU pair | Bandwidth |
+|---|---|---|
+| TCP (default when no HCA) | same CPU socket | 1.3 GB/s |
+| `nvlink_intra` (`MC_INTRANODE_NVLINK=true`) | same CPU socket | 52 GB/s |
+| `nvlink_intra` (`MC_INTRANODE_NVLINK=true`) | across CPU sockets | 37 GB/s |
+
+Independently reproduced on 8x NVIDIA RTX PRO 5000 72GB Blackwell (PCIe Gen5, no NVLink,
+`nvidia-smi topo -p2p r` all `OK`), built from source at `main` with `-DUSE_CUDA=ON
+-DUSE_INTRA_NVLINK=ON`: 52.6 GB/s (same CPU socket) and 38.8 GB/s (across CPU sockets) for the
+same 1 GiB `transfer_sync_write`, with a full byte comparison of the received buffer. The engine
+log shows `Using Intra-Node NVLink transport (MC_INTRANODE_NVLINK set)` and
+`using cudaMemcpyBatchAsync (CUDA >= 13.0 path)` in both runs.
+
+Two-process setup notes: `P2PHANDSHAKE` discovery relies on the Python `get_rpc_port()` flow.
+The C++ `transfer_engine_bench` needs an etcd metadata server instead
+(`--metadata_server=host:2379`): with `MC_INTRANODE_NVLINK` set the engine installs only this
+transport, and no transport then starts the handshake daemon on the default port. Running both
+peers in the same container (`docker run --ipc=host`) satisfies the IPC/PID namespace
+requirement.
 
 ### HIP Transport (hip)
 
@@ -356,7 +441,7 @@ export MC_INTRANODE_NVLINK=true
 
 ### Ascend Transport (ascend)
 
-**Description:** Huawei Ascend NPU communication using HCCL (Huawei Collective Communication Library) or direct transport.
+**Description:** Huawei Ascend NPU communication using the Ascend Direct transport (ADXL engine). The legacy HCCL transport is deprecated and is no longer built.
 
 **Use When:**
 - Working with Huawei Ascend NPUs
@@ -364,11 +449,11 @@ export MC_INTRANODE_NVLINK=true
 
 **Requirements:**
 - Huawei Ascend NPU hardware
-- HCCL runtime
+- Ascend CANN toolkit with ADXL/HIXL support
 
 **Documentation:**
 - [Heterogeneous Ascend](../design/transfer-engine/transport/heterogeneous_ascend.md)
-- [Ascend Transport](../design/transfer-engine/transport/ascend_transport.md)
+- [Ascend Direct Transport](../design/transfer-engine/transport/ascend_direct_transport.md)
 
 ### Hylink Transport (hylink)
 
@@ -434,6 +519,67 @@ planned as a follow-up.
   transport and the cross-node hop to RDMA/TCP.
 - DMA-mapped (pinned) staging buffers for true async device DMA are a planned
   performance follow-up.
+
+(intel-xpu-transport)=
+### Intel XPU Transport (xpu)
+
+**Description:** Intel GPU support in TENT through oneAPI SYCL. On the same
+node, the XPU transport copies between XPUs. Within a process, the copy runs
+directly over PCIe (or Xe Link) when the two devices have peer access, and is
+bounced through host memory otherwise. Between processes, it maps the peer's
+buffer through a Level Zero IPC handle when the IPC requirements below are met.
+With `rdma`, registered XPU memory is accessed directly through dma-buf when
+available. Otherwise, the XPU transport performs the local device-to-host and
+host-to-device copies, and an existing TCP/RDMA transport carries the staged
+data between peers. See the Intel XPU notes in the RDMA section above.
+
+**Status:** TENT only. `xpu` is a local transport (host staging and same-node
+XPU copies), not a network protocol to pass to Store setup. Select `tcp` or
+`rdma` for the network hop.
+
+**Use When:**
+- Moving Intel GPU device buffers through TENT
+- Copying between Intel GPUs on one node, including between processes such as
+  prefill and decode workers
+- Reading and writing PyTorch XPU tensors with the C++ Mooncake Store backend
+
+**Requirements:**
+- Built with `-DUSE_XPU=ON -DUSE_TENT=ON` using the Intel oneAPI compilers
+  (`icpx` for C++ is required; the build examples also use `icx` for C)
+- Compatible SYCL and Level Zero runtimes and access to the Intel GPU
+- `MC_USE_TENT=1` before constructing the Store client or compatibility API engine
+- A TCP or RDMA transport for transfers between nodes, or when same-node IPC
+  is unavailable
+
+**Configuration:**
+```bash
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export MC_USE_TENT=1
+```
+
+**Design notes:**
+- Device memory uses `xpu:N` locations. Host/shared USM is treated as host memory.
+- PyTorch XPU device pointers are recognized through the platform default SYCL
+  context. Synchronize producing work before passing a buffer to Mooncake, and
+  keep registered allocations alive until transfers complete.
+- Same-node IPC is used only when the selector policy allows `xpu`; a policy
+  with a non-empty `transports` list must name `"xpu"` ahead of `"rdma"` (see
+  [Transport Selector](../design/tent/transport-selector.md)). Set
+  `transports/xpu/disable_ipc` to `true` to turn IPC off.
+
+**Limitations:**
+- No XPU support in the classic Transfer Engine
+- Transfers involving XPU memory require an XPU-platform initiator (see the
+  RDMA section above)
+- Same-node IPC between processes requires both processes in the same PID
+  namespace, peer access from the copying device to the device that holds the
+  buffer, and ptrace permission over the exporting process: Yama
+  `ptrace_scope` 0 or 1, or `CAP_SYS_PTRACE` for scope 2; scope 3 rejects the
+  import even with that capability. Otherwise the transfer takes the network
+  path (RDMA dma-buf or host staging); see the GPU-Direct note in the
+  [build guide](build.md).
+
+**Build instructions:** See {ref}`build-with-intel-xpu`.
 
 ### MPComm Transport (mpcomm)
 
@@ -572,6 +718,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
+| Intel XPU Clusters | tcp or rdma (TENT) | Build with `-DUSE_XPU=ON -DUSE_TENT=ON` and set `MC_USE_TENT=1`; RDMA uses dma-buf when available, otherwise host staging; same-node XPUs copy over P2P/IPC |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
 | Hygon DCU Clusters | rdma + hylink | Build with `-DUSE_HYLINK=ON`; use hylink for HSL fabric communication |
 | Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |
@@ -630,4 +777,5 @@ If a protocol fails to initialize:
 ../design/transfer-engine/transport/sunrise_link_transport
 ../design/transfer-engine/transport/flagcx_transport
 ../design/transfer-engine/transport/mpcomm_transport
+../design/transfer-engine/transport/memfabric_transport
 :::
