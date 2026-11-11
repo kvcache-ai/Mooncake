@@ -597,15 +597,57 @@ void DistributedStorageBackend::ExecuteBucketBatchIo(
         // Bucket I/O completes short transfers.
         SubmitBatchIo(io_requests, io_ops, results, write, true);
 
-        // A failed close fails the bucket's otherwise successful requests.
+        // A failed sync or close fails the bucket's otherwise successful
+        // requests.
+        const bool sync = write && fs_adapter_->RequiresWriteSync();
         for (const auto& [fd, bucket_ops] : opened) {
-            auto close_result = fs_adapter_->CloseFile(fd);
-            if (close_result) continue;
-            for (auto* op : *bucket_ops) {
-                auto& result = results[op->index];
-                if (result) result = tl::make_unexpected(close_result.error());
+            auto fail = [&](ErrorCode error) {
+                for (auto* op : *bucket_ops) {
+                    auto& result = results[op->index];
+                    if (result) result = tl::make_unexpected(error);
+                }
+            };
+            const bool written = std::any_of(
+                bucket_ops->begin(), bucket_ops->end(), [&](const DfsIoOp* op) {
+                    return results[op->index].has_value();
+                });
+            if (sync && written) {
+                auto synced = fs_adapter_->SyncFile(fd);
+                if (!synced) {
+                    LOG(WARNING) << "DFS sync failed for bucket "
+                                 << bucket_ops->front()->descriptor.file_path
+                                 << ", error=" << synced.error();
+                    fail(synced.error());
+                }
             }
+            auto close_result = fs_adapter_->CloseFile(fd);
+            if (!close_result) fail(close_result.error());
         }
+    }
+}
+
+void DistributedStorageBackend::SyncWrittenShards(
+    const std::vector<DfsWriteRequest>& requests,
+    std::vector<tl::expected<void, ErrorCode>>& results) {
+    std::map<int, std::vector<size_t>> written;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (results[i]) written[requests[i].descriptor.shard_idx].push_back(i);
+    }
+    for (const auto& [shard_idx, indices] : written) {
+        tl::expected<void, ErrorCode> synced;
+        auto shard = GetOrOpenShard(requests[indices.front()].descriptor);
+        if (shard) {
+            // The shard mutex keeps a concurrent reopen from closing the fd.
+            std::lock_guard lock((*shard)->mutex);
+            synced = fs_adapter_->SyncFile((*shard)->fd);
+        } else {
+            synced = tl::make_unexpected(shard.error());
+        }
+        if (synced) continue;
+        LOG(WARNING) << "DFS sync failed for shard " << shard_idx
+                     << ", error=" << synced.error();
+        for (size_t i : indices)
+            results[i] = tl::make_unexpected(synced.error());
     }
 }
 
@@ -708,10 +750,14 @@ DistributedStorageBackend::BatchWrite(
     // Execution mode: adapters that opt in (currently 3FS) collect validated
     // writes for submission after the loop. Other adapters (including POSIX)
     // execute each write in the loop, preserving per-request bucket handles
-    // and shard I/O locking.
+    // and shard I/O locking. Adapters that require a sync after writes also
+    // collect bucket writes, so each bucket is opened and synced once, and
+    // sync every written shard once after the batch.
     const bool batch_io = fs_adapter_->SupportsBatchIo();
+    const bool sync_writes = fs_adapter_->RequiresWriteSync();
+    const bool collect_ops = batch_io || (bucket_mode && sync_writes);
     std::vector<DfsIoOp> ops;
-    if (batch_io) ops.reserve(requests.size());
+    if (collect_ops) ops.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         const auto& desc = request.descriptor;
@@ -760,19 +806,19 @@ DistributedStorageBackend::BatchWrite(
         DfsIoOp op{i,          request.key,
                    desc,       std::move(iovs),
                    total_size, static_cast<int64_t>(desc.offset)};
-        if (batch_io) {
+        if (collect_ops) {
             ops.push_back(std::move(op));
         } else {
             results[i] = ExecuteSingleIo(op, true);
         }
     }
 
-    if (!batch_io) return results;
     if (bucket_mode) {
-        ExecuteBucketBatchIo(ops, results, true);
-    } else {
-        ExecuteShardBatchIo(ops, results, true);
+        if (collect_ops) ExecuteBucketBatchIo(ops, results, true);
+        return results;
     }
+    if (batch_io) ExecuteShardBatchIo(ops, results, true);
+    if (sync_writes) SyncWrittenShards(requests, results);
     return results;
 }
 

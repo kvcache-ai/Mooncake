@@ -138,13 +138,18 @@ class DistributedStorageBackend : public StorageBackendInterface {
     // Resolve fds for validated ops and submit them through SubmitBatchIo.
     // Both write failures into results[op.index]. Shard fds come from the
     // shard cache; bucket fds are opened per batch, at most
-    // kMaxOpenBucketsPerBatch at a time, and closed after their submission.
+    // kMaxOpenBucketsPerBatch at a time, synced after their submission when
+    // the adapter requires write sync, and then closed.
     void ExecuteShardBatchIo(
         std::vector<DfsIoOp>& ops,
         std::vector<tl::expected<void, ErrorCode>>& results, bool write);
     void ExecuteBucketBatchIo(
         std::vector<DfsIoOp>& ops,
         std::vector<tl::expected<void, ErrorCode>>& results, bool write);
+    // Syncs each shard written by a successful request once, under the shard
+    // mutex. A failed sync fails every successful request on that shard.
+    void SyncWrittenShards(const std::vector<DfsWriteRequest>& requests,
+                           std::vector<tl::expected<void, ErrorCode>>& results);
     // Submits io_requests (io_requests[i] belongs to *io_ops[i]) to the
     // adapter as one batch. Short transfers are completed when
     // complete_short_io is set and reported as failures otherwise.

@@ -16,6 +16,15 @@ struct DistributedStorageConfig {
     uint64_t bucket_capacity = 1ULL * 1024 * 1024 * 1024;
     int64_t max_bucket_count = 64;
     uint64_t alignment = 4096;
+    // Client-side POSIX adapter only: read and write DFS files with O_DIRECT,
+    // zero-padding each object to `alignment` inside its aligned_size. There
+    // is no page-cache fallback: backend Init fails if the filesystem cannot
+    // serve O_DIRECT at `alignment`.
+    bool posix_direct_io = false;
+    // With posix_direct_io: fsync() each O_DIRECT file once per BatchWrite,
+    // after the batch's writes to it, and fail those writes if fsync fails.
+    // Ignored without posix_direct_io.
+    bool posix_direct_io_fsync = false;
     bool single_tenant = true;
     bool eviction_enabled = true;
     double eviction_high_watermark = 0.9;
