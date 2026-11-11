@@ -637,7 +637,6 @@ jobs:
       variant: cuda13
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cu130
-      include-ep-tests: true
       version-override: 0.0.0.dev0
       # This artifact feeds the T-One e2e pipeline (integration-test.yml picks
       # the py312/cu130 wheel), which exercises the TENT runtime. Default

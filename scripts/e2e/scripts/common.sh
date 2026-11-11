@@ -137,7 +137,7 @@ get_whl(){
     mkdir -p "$whls_path"
 
     echo "get whl file from CI artifacts"
-    rm -f "$whls_path/mooncake.zip" "$whls_path/mooncake-ep-tests.tar.gz"
+    rm -f "$whls_path/mooncake.zip"
     rm -f "$whls_path"/*.whl
 
     if [ -n "${WHEEL_DIR:-}" ]; then

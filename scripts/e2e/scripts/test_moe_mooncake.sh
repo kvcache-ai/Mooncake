@@ -30,16 +30,30 @@ run_ep_tests()
     local source_root
     source_root=$(cd "${E2E_DIR:-${BASE_DIR}/../e2e}/../.." && pwd) || return 1
     if [ ! -f "$source_root/python/tests/ep/test_ep_grid.py" ]; then
-        # TONE stages scripts separately from the checkout. The exact-wheel
-        # artifact also carries the matching test sources.
-        local archive="${BASE_DIR}/run/whls/mooncake-ep-tests.tar.gz"
-        if [ ! -f "$archive" ]; then
-            echo "ERROR: EP test source bundle is missing from the wheel artifact: $archive" >&2
+        # TONE keeps only scripts after installation. Fetch tests from the
+        # commit that produced the selected wheel, using its artifact metadata.
+        if [ -z "${GIT_REPO:-}" ] || [ -z "${ARTIFACT_ID:-}" ]; then
+            echo "ERROR: GIT_REPO and ARTIFACT_ID are required to fetch EP test sources" >&2
             return 1
         fi
-        source_root="${BASE_DIR}/run/ep-test-sources"
+        local source_sha archive
+        source_sha=$(timeout 60s gh api \
+            "repos/${GIT_REPO}/actions/artifacts/${ARTIFACT_ID}" \
+            --jq '.workflow_run.head_sha') || return 1
+        if ! [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: Wheel artifact does not identify a source commit: $source_sha" >&2
+            return 1
+        fi
+        echo "Fetching EP test sources: ${GIT_REPO}@${source_sha}"
+        source_root="${BASE_DIR}/run/ep-test-sources/${source_sha}"
+        archive="${BASE_DIR}/run/ep-test-sources/${source_sha}.tar.gz"
         mkdir -p "$source_root" || return 1
-        tar -xzf "$archive" -C "$source_root" || return 1
+        timeout 300s gh api "repos/${GIT_REPO}/tarball/${source_sha}" \
+            > "$archive" || return 1
+        tar -xzf "$archive" -C "$source_root" --strip-components=1 --wildcards \
+            '*/python/tests/ep/*.py' \
+            '*/mooncake-ep/benchmarks/ep_benchmark/*.py' || return 1
+        rm -f "$archive"
     fi
 
     # Copy tests only: imports of mooncake still resolve to the installed wheel.

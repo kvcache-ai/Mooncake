@@ -35,10 +35,6 @@ on:
         # false until TENT is validated on arm64.
         type: boolean
         default: false
-      include-ep-tests:
-        description: Bundle EP test sources alongside the wheel for TONE
-        type: boolean
-        default: false
       use-store-rs:
         # Test-only combined wheel used by the T-One Store-RS lane. Release
         # callers keep the default false and continue through build_wheel.sh.
@@ -357,16 +353,8 @@ jobs:
 
           bash scripts/ci/check_wheel_typing.sh "$smoke_venv/bin/python"
 
-      - name: Bundle EP test sources for TONE
-        if: ${{ inputs.include-ep-tests }}
-        run: |
-          tar -czf mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/mooncake-ep-tests.tar.gz \
-            python/tests/ep/*.py mooncake-ep/benchmarks/ep_benchmark/*.py
-
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact-prefix }}-py${{ steps.pytag.outputs.tag }}
-          path: |
-            mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl
-            mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/mooncake-ep-tests.tar.gz
+          path: mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl

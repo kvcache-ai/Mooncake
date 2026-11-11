@@ -144,7 +144,6 @@ jobs:
       architecture: x86_64
       python-versions: '["3.12"]'
       artifact-prefix: tone-store-rs-wheel
-      include-ep-tests: true
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
       use-tent: true
       use-store-rs: true
