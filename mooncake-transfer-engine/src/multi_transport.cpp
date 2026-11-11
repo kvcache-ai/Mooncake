@@ -912,6 +912,21 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
         if (allows_reuse) *allows_reuse = false;
+        LOG(WARNING) << "[selectTransport] no descriptor for target_id="
+                     << entry.target_id << " opcode="
+                     << (entry.opcode == TransferRequest::READ ? "READ"
+                                                               : "WRITE")
+                     << " target_offset=" << entry.target_offset
+                     << " length=" << entry.length
+                     << " source=" << entry.source;
+        // RECOVERY: drop the name->id mapping for this id so the next
+        // openSegment() misses and re-handshakes under a fresh id. id->desc is
+        // intentionally kept (see invalidateSegmentCacheByID) so any valid
+        // in-flight transfers still holding this id are not killed. This
+        // request still fails (the caller retries), but the retry reconnects
+        // cleanly instead of being stuck on a stale cache entry until the
+        // process restarts.
+        metadata_->invalidateSegmentCacheByID(entry.target_id);
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
@@ -982,6 +997,38 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             }
         }
         if (chosen.empty()) {
+            // DIAG: dump the target request and every buffer range currently
+            // in the cached descriptor, so we can see whether the offset falls
+            // in a gap (peer registered only part of its segment yet) or is
+            // entirely outside (stale descriptor from a previous incarnation
+            // of the peer).
+            std::string buf_ranges;
+            for (const auto& buffer : target_segment_desc->buffers) {
+                uint64_t start =
+                    (buffer.protocol == "cxl")
+                        ? buffer.offset + target_segment_desc->cxl_base_addr
+                        : buffer.addr;
+                buf_ranges += "{proto=" + buffer.protocol + " [" +
+                              std::to_string(start) + "," +
+                              std::to_string(start + buffer.length) + ")} ";
+            }
+            LOG(WARNING)
+                << "[selectTransport] no matching buffer for target_id="
+                << entry.target_id << " opcode="
+                << (entry.opcode == TransferRequest::READ ? "READ" : "WRITE")
+                << " target_offset=" << entry.target_offset
+                << " length=" << entry.length
+                << " segment_name=" << target_segment_desc->name
+                << " nbuffers=" << target_segment_desc->buffers.size()
+                << " buffers=[" << buf_ranges << "]";
+            // RECOVERY: the cached descriptor does not cover this offset
+            // (stale or incomplete). Drop only the name->id mapping so the
+            // next openSegment() re-fetches and rebuilds a fresh, complete
+            // descriptor under a new id; id->desc is kept so valid in-flight
+            // transfers to already-registered ranges of THIS segment are not
+            // killed (one bad offset must not avalanche the whole segment).
+            // This request fails now; the caller's retry heals.
+            metadata_->invalidateSegmentCacheByID(entry.target_id);
             return Status::InvalidArgument(
                 "No matching buffer for target offset in multi-protocol "
                 "segment " +
@@ -1034,6 +1081,17 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
                                           std::string& preferred_proto) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
+        LOG(WARNING) << "[mp_selectTransport] no descriptor for target_id="
+                     << entry.target_id << " opcode="
+                     << (entry.opcode == TransferRequest::READ ? "READ"
+                                                               : "WRITE")
+                     << " target_offset=" << entry.target_offset
+                     << " length=" << entry.length
+                     << " source=" << entry.source;
+        // RECOVERY: drop only the name->id mapping so the retry re-fetches
+        // under a fresh id; id->desc is kept to avoid killing valid in-flight
+        // transfers still holding this id.
+        metadata_->invalidateSegmentCacheByID(entry.target_id);
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
