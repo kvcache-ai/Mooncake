@@ -679,7 +679,7 @@ target_include_directories(tent_poll_backoff_test
 add_test(NAME tent_poll_backoff_test COMMAND tent_poll_backoff_test)
 
 # Delegate RPC end to end: ControlClient::delegate -> onDelegate ->
-# transferSync, against a real engine on loopback with a FakeTransport.
+# submitAndWaitTransfer, against a real engine on loopback with a FakeTransport.
 add_executable(tent_delegate_rpc_test delegate_rpc_test.cpp)
 target_link_libraries(tent_delegate_rpc_test PRIVATE gtest gtest_main
                                                      tent_link_group)

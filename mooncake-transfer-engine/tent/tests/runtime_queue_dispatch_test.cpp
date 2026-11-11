@@ -592,6 +592,57 @@ TEST(RuntimeQueueDispatch, CancelsQueuedOwnerWithoutDispatchingIt) {
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
+TEST(RuntimeQueueDispatch, TimeoutDoesNotDispatchQueuedRequestsOfBatch) {
+    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // The first poll blocks past the timeout, so waitTransfer() enters its
+    // timeout path. The status poll that follows then completes the dispatched
+    // owner and frees its dispatch window slot; a refill would submit the
+    // queued owner of the same batch unless it has already been canceled.
+    std::atomic<int> polls{0};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&polls](const Request& request, int) {
+            if (++polls == 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kReqLen = 4096;
+    std::vector<uint8_t> buffer(kReqLen * 2, 0x6b);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    BatchID batch = engine.allocateBatch(2);
+    ASSERT_NE(batch, (BatchID)0);
+    ASSERT_TRUE(
+        engine
+            .submitTransfer(batch,
+                            {makeLocalWrite(buffer.data(), kReqLen),
+                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+            .ok());
+    ASSERT_EQ(fake_rdma->submit_calls.load(), 1);
+    ASSERT_EQ(TransferEngineImplTestPeer::windowOwners(engine), 1U);
+    ASSERT_EQ(TransferEngineImplTestPeer::queuedOwners(engine), 2U);
+
+    std::vector<TransferStatus> statuses;
+    ASSERT_TRUE(engine.waitTransfer(batch, &statuses, 1).ok());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(TransferEngineImplTestPeer::windowOwners(engine), 0U);
+    EXPECT_EQ(TransferEngineImplTestPeer::queuedOwners(engine), 0U);
+    ASSERT_EQ(statuses.size(), 2U);
+    EXPECT_EQ(statuses[0].s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(statuses[1].s, TransferStatusEnum::CANCELED);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
 TEST(RuntimeQueueDispatch, CancelsDispatchedRdmaTaskIdempotently) {
     auto cfg = makeRuntimeQueueConfig(1, 1UL << 20);
     TransferEngineImpl engine(cfg);
