@@ -46,6 +46,7 @@ add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+add_store_test(accelerator_registry_test accelerator_registry_test.cpp)
 if(USE_MLU)
   foreach(mlu_test mlu_accelerator_test mlu_store_test)
     # These tests do not use master_service_test_peer, which would pull the
