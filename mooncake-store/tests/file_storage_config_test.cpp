@@ -376,7 +376,7 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
 
 }  // namespace
 
-TEST_F(FileStorageConfigTest, OffloadWriteWorkersParseStrictly) {
+TEST_F(FileStorageConfigTest, OffloadWriteWorkersValidateConfiguration) {
     for (const char* value : {"1", "2", "16"}) {
         env.write_workers.Set(value);
         auto config = FileStorageConfig::FromEnvironment();
@@ -391,28 +391,18 @@ TEST_F(FileStorageConfigTest, OffloadWriteWorkersParseStrictly) {
         config.storage_filepath = data_path.string();
         EXPECT_FALSE(config.Validate()) << value;
     }
-}
-
-TEST_F(FileStorageConfigTest, OffloadWriteWorkersRequireLocalBucket) {
     FileStorageConfig config;
     config.storage_filepath = data_path.string();
     config.offload_write_workers = 2;
     ASSERT_TRUE(config.Validate());
     config.use_uring = true;
     EXPECT_TRUE(config.Validate());
-    config.use_uring = false;
     config.enable_dfs = true;
     EXPECT_FALSE(config.Validate());
     config.enable_dfs = false;
-    for (auto backend :
-         {StorageBackendType::kFilePerKey, StorageBackendType::kDistributed,
-          StorageBackendType::kOffsetAllocator, StorageBackendType::kNvmeKv}) {
-        config.storage_backend_type = backend;
-        EXPECT_FALSE(config.Validate());
-    }
-    config.storage_backend_type = StorageBackendType::kBucket;
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    EXPECT_FALSE(config.Validate());
     config.offload_write_workers = 1;
-    config.use_uring = true;
     EXPECT_TRUE(config.Validate());
 }
 

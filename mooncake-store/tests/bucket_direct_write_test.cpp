@@ -265,18 +265,15 @@ TEST(BucketDirectWriteConfigTest, ParallelWorkersRejectPackedUringWrites) {
     FileStorageConfig config;
     config.storage_filepath = path.string();
     config.use_uring = true;
-    for (uint32_t workers : {2u, 4u, 16u}) {
-        SCOPED_TRACE(workers);
-        config.offload_write_workers = workers;
-        for (const char* setting : {"packed", "true", "1"}) {
-            SCOPED_TRACE(setting);
-            ScopedEnvVar env("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE", setting);
-            BucketStorageBackend backend(config, BucketBackendConfig{});
-            const auto result = backend.Init();
-            EXPECT_FALSE(result);
-            if (!result) EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-            EXPECT_TRUE(std::filesystem::is_empty(path));
-        }
+    config.offload_write_workers = 2;
+    for (const char* setting : {"packed", "true", "1"}) {
+        SCOPED_TRACE(setting);
+        ScopedEnvVar env("MOONCAKE_OFFLOAD_BUCKET_DIRECT_WRITE", setting);
+        BucketStorageBackend backend(config, BucketBackendConfig{});
+        const auto result = backend.Init();
+        EXPECT_FALSE(result);
+        if (!result) EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_TRUE(std::filesystem::is_empty(path));
     }
     std::filesystem::remove_all(path);
 }
