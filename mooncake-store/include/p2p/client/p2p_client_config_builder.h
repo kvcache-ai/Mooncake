@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <json/json.h>
@@ -157,13 +156,8 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
         config.enable_http_server = enable_http_server;
         config.enable_metric_collection = enable_metric_collection;
         config.metric_report_interval_seconds = metric_report_interval_seconds;
-        std::string rc_source = runtime_config;
-        if (runtime_config.empty()) {
-            const char* env = std::getenv("MC_RUNTIME_CONFIG");
-            if (env && *env) {
-                rc_source = env;
-            }
-        }
+        const std::string rc_source =
+            ResolveRuntimeConfigSource(runtime_config);
         if (!rc_source.empty()) {
             config.runtime_config_json = LoadJsonConfig(rc_source);
             if (config.runtime_config_json.isNull() ||
@@ -314,6 +308,9 @@ class P2PClientConfigBuilder : private ClientConfigBuilder {
     }
 
    private:
+    static std::string ResolveRuntimeConfigSource(
+        const std::string& runtime_config);
+
     struct RedisDiscoveryConfig {
         std::string cluster_id = DEFAULT_CLUSTER_ID;
         std::string username;

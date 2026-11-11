@@ -254,6 +254,7 @@ if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
         client_service.cpp
         centralized_real_client.cpp
         client_metric.cpp
+        config/client_metric_config.cpp
         master_client.cpp
         transfer_task.cpp
         file_storage.cpp

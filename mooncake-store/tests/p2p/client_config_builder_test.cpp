@@ -22,18 +22,37 @@ const char* kTieredConfigJson = R"({
   ]
 })";
 
-TEST(ClientConfigBuilderTest, RuntimeEnvironmentBelongsToP2P) {
-    const char* old = std::getenv("MC_RUNTIME_CONFIG");
-    struct RestoreRuntimeEnv {
-        std::optional<std::string> value;
-        ~RestoreRuntimeEnv() {
-            if (value) {
-                setenv("MC_RUNTIME_CONFIG", value->c_str(), 1);
-            } else {
-                unsetenv("MC_RUNTIME_CONFIG");
-            }
+class RuntimeConfigBuilderTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        const char* value = std::getenv("MC_RUNTIME_CONFIG");
+        if (value != nullptr) {
+            original_ = value;
         }
-    } restore{old ? std::optional<std::string>(old) : std::nullopt};
+        ASSERT_EQ(unsetenv("MC_RUNTIME_CONFIG"), 0);
+    }
+
+    void TearDown() override {
+        if (original_.has_value()) {
+            EXPECT_EQ(setenv("MC_RUNTIME_CONFIG", original_->c_str(), 1), 0);
+        } else {
+            EXPECT_EQ(unsetenv("MC_RUNTIME_CONFIG"), 0);
+        }
+    }
+
+    P2PClientConfig Build(const std::string& runtime_config = "") {
+        return P2PClientConfigBuilder::build_p2p_real_client(
+            {{"local_hostname", "127.0.0.1:12345"},
+             {"metadata_server", "P2PHANDSHAKE"},
+             {"tiered_backend_config", kTieredConfigJson},
+             {"runtime_config", runtime_config}});
+    }
+
+   private:
+    std::optional<std::string> original_;
+};
+
+TEST_F(RuntimeConfigBuilderTest, RuntimeEnvironmentBelongsToP2P) {
     ASSERT_EQ(
         setenv("MC_RUNTIME_CONFIG", R"({"write":{"remote_weight":0.8}})", 1),
         0);
@@ -49,6 +68,43 @@ TEST(ClientConfigBuilderTest, RuntimeEnvironmentBelongsToP2P) {
                      "127.0.0.1:12345", "P2PHANDSHAKE", "tcp", std::nullopt,
                      "127.0.0.1:50051", kTieredConfigJson),
                  std::runtime_error);
+}
+
+TEST_F(RuntimeConfigBuilderTest, UnsetAndEmptyEnvironmentKeepDefaults) {
+    EXPECT_TRUE(Build().runtime_config_json.isNull());
+    ASSERT_EQ(setenv("MC_RUNTIME_CONFIG", "", 1), 0);
+    EXPECT_TRUE(Build().runtime_config_json.isNull());
+}
+
+TEST_F(RuntimeConfigBuilderTest, ExplicitRuntimeOverridesMalformedEnvironment) {
+    ASSERT_EQ(setenv("MC_RUNTIME_CONFIG", "{invalid json", 1), 0);
+    auto config = Build(R"({"write":{"remote_weight":0.2}})");
+    EXPECT_DOUBLE_EQ(
+        config.runtime_config_json["write"]["remote_weight"].asDouble(), 0.2);
+
+    auto empty_object = Build("{}");
+    EXPECT_TRUE(empty_object.runtime_config_json.isObject());
+    EXPECT_TRUE(empty_object.runtime_config_json.empty());
+}
+
+TEST_F(RuntimeConfigBuilderTest, ReadsCurrentEnvironmentOnEachBuild) {
+    ASSERT_EQ(
+        setenv("MC_RUNTIME_CONFIG", R"({"write":{"remote_weight":0.4}})", 1),
+        0);
+    auto first = Build();
+    ASSERT_EQ(
+        setenv("MC_RUNTIME_CONFIG", R"({"write":{"remote_weight":0.8}})", 1),
+        0);
+    auto second = Build();
+    EXPECT_DOUBLE_EQ(
+        first.runtime_config_json["write"]["remote_weight"].asDouble(), 0.4);
+    EXPECT_DOUBLE_EQ(
+        second.runtime_config_json["write"]["remote_weight"].asDouble(), 0.8);
+}
+
+TEST_F(RuntimeConfigBuilderTest, InvalidExplicitRuntimeDoesNotFallBackToEnv) {
+    ASSERT_EQ(setenv("MC_RUNTIME_CONFIG", "{}", 1), 0);
+    EXPECT_THROW(Build("{invalid json"), std::runtime_error);
 }
 
 TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
