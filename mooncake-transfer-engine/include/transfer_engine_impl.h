@@ -454,6 +454,8 @@ class TransferEngineImpl {
 
     void eraseMemoryRegionLocked(void* addr);
 
+    void clearSkipRegistrationLocked(void* addr);
+
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;

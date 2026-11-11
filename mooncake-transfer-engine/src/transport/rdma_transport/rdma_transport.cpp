@@ -45,6 +45,10 @@
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+#include "transport/hylink_transport/hylink_transport.h"
+#endif
+
 namespace mooncake {
 
 namespace {
@@ -445,6 +449,22 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                bool remote_accessible,
                                                bool update_metadata,
                                                bool force_sequential) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // When HyLink is installed, device memory registration is delegated
+    // to HyLink, which rejects allocations it cannot export.
+    if (localSegmentHasHylink(metadata_) && isDtkDeviceMemory(addr)) {
+        {
+            std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+            skipped_hylink_fabric_addrs_.insert(
+                reinterpret_cast<uint64_t>(addr));
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "RdmaTransport: skipping device memory " << addr
+                      << " (owned by HyLink)";
+        }
+        return 0;
+    }
+#endif
     int access_rights = IBV_ACCESS_LOCAL_WRITE;
     if (remote_accessible)
         access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
@@ -777,6 +797,13 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     return 0;
 }
 
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+void RdmaTransport::clearSkipRegistration(void *addr) {
+    std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+    skipped_hylink_fabric_addrs_.erase(reinterpret_cast<uint64_t>(addr));
+}
+#endif
+
 int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     return unregisterLocalMemoryInternal(addr, update_metadata, false);
 }
@@ -784,6 +811,18 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                                                  bool update_metadata,
                                                  bool force_sequential) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    {
+        std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+        auto it =
+            skipped_hylink_fabric_addrs_.find(reinterpret_cast<uint64_t>(addr));
+        if (it != skipped_hylink_fabric_addrs_.end()) {
+            // Other transports may still fail. Keep the delegation mark so
+            // retrying the engine-level unregister remains a no-op for RDMA.
+            return 0;
+        }
+    }
+#endif
     // Mooncake#2017: if this base buffer was split into chunks at registration,
     // unregister each chunk's MR + metadata entry (unregisterLocalMemory only
     // receives the base addr).
@@ -1136,6 +1175,18 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     std::mutex cleaned_mutex;
     std::vector<void *> cleaned_addrs;
     int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+        {
+            std::lock_guard<std::mutex> lock(skipped_hylink_fabric_mutex_);
+            if (skipped_hylink_fabric_addrs_.count(
+                    reinterpret_cast<uint64_t>(addr_list[i]))) {
+                // No RDMA cleanup: exclude this address from cleaned_addrs so
+                // a publish failure cannot seed pending_dereg_ for HyLink.
+                any_cleaned.store(true, std::memory_order_relaxed);
+                return 0;
+            }
+        }
+#endif
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         // NOT_REGISTERED means nothing remains for this member: its metadata
         // entry is gone and no pending MR cleanup is recorded. A batch retry
