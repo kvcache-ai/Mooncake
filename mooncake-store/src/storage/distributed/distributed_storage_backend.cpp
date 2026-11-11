@@ -1054,18 +1054,33 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     };
 
     // Each bucket read holds its own fd, so bucket layout keeps the caller plus
-    // workers within kMaxOpenBucketsPerBatch. enqueue() throws once the pool is
-    // stopped; the caller then drains the rest itself.
+    // workers within kMaxOpenBucketsPerBatch.
     size_t pool_workers =
         dfs_read_pool_ ? std::min(static_cast<size_t>(dfs_read_threads_), n - 1)
                        : 0;
     if (bucket_mode) {
         pool_workers = std::min(pool_workers, kMaxOpenBucketsPerBatch - 1);
     }
+    // Helper jobs are bounded across calls: at most dfs_read_threads_ are
+    // queued or running at once, and each releases its slot when it finishes.
+    // A job may still start after this call returns, but busy workers cannot
+    // accumulate jobs from repeated calls. Without a free slot, or once the
+    // pool is stopped and enqueue() throws, the caller reads the rest itself.
+    const auto job_limit = static_cast<size_t>(dfs_read_threads_);
     for (size_t t = 0; t < pool_workers; ++t) {
+        size_t jobs = dfs_read_jobs_.load(std::memory_order_relaxed);
+        while (jobs < job_limit &&
+               !dfs_read_jobs_.compare_exchange_weak(
+                   jobs, jobs + 1, std::memory_order_relaxed)) {
+        }
+        if (jobs >= job_limit) break;
         try {
-            dfs_read_pool_->enqueue(drain);
+            dfs_read_pool_->enqueue([this, drain]() {
+                drain();
+                dfs_read_jobs_.fetch_sub(1, std::memory_order_relaxed);
+            });
         } catch (...) {
+            dfs_read_jobs_.fetch_sub(1, std::memory_order_relaxed);
             break;
         }
     }

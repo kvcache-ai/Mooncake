@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -170,6 +171,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
     // BatchRead workers in addition to the calling thread
     // (MOONCAKE_DFS_READ_THREADS; see Init for defaults).
     int dfs_read_threads_ = 1;
+    // Helper jobs queued or running in dfs_read_pool_, capped at
+    // dfs_read_threads_. Declared before the pool so it outlives the jobs.
+    std::atomic<size_t> dfs_read_jobs_{0};
     std::unique_ptr<ThreadPool> dfs_read_pool_;
 };
 

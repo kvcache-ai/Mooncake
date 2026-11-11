@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,6 +39,27 @@ class TempDir {
 
    private:
     std::filesystem::path path_;
+};
+
+// Sets an environment variable for the lifetime of the object and restores
+// the previous value afterwards.
+class ScopedEnv {
+   public:
+    ScopedEnv(const char* name, const char* value) : name_(name) {
+        if (const char* old = std::getenv(name)) old_ = old;
+        ::setenv(name, value, 1);
+    }
+    ~ScopedEnv() {
+        if (old_) {
+            ::setenv(name_, old_->c_str(), 1);
+        } else {
+            ::unsetenv(name_);
+        }
+    }
+
+   private:
+    const char* name_;
+    std::optional<std::string> old_;
 };
 
 DistributedStorageConfig MakeConfig(const TempDir& dir) {
@@ -176,6 +199,9 @@ INSTANTIATE_TEST_SUITE_P(ScalarAndBatch, ImmutableBucketShortIoTest,
                          ::testing::Bool());
 
 TEST(ImmutableBucketBackendTest, PosixKeepsPerRequestBucketHandles) {
+    // peak_open == 1 and the adapter's plain counters assume one read at a
+    // time, so pin the serial read path.
+    ScopedEnv serial_reads("MOONCAKE_DFS_READ_THREADS", "1");
     TempDir dir;
     const auto config = MakeConfig(dir);
     ImmutableBucketAllocator allocator;
