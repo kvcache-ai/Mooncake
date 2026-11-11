@@ -282,10 +282,11 @@ jobs:
               fi
               # PG must import without a driver even when its VMM paths are
               # compiled in. DT_NEEDED alone misses unresolved Driver API calls.
+              # cuFile symbols belong to libcufile, not the CUDA Driver API.
               if [[ "$file" == */mooncake/libmooncake_pg.so ]]; then
                 cuda_symbols=$(nm -D --undefined-only "$file")
                 cuda_symbols=$(grep -E ' [Uw] cu[A-Z][[:alnum:]_]*(@[^[:space:]]+)?$' \
-                  <<< "$cuda_symbols" || true)
+                  <<< "$cuda_symbols" | grep -Ev ' [Uw] cuFile[[:alnum:]_]*(@[^[:space:]]+)?$' || true)
                 if [ -n "$cuda_symbols" ]; then
                   echo "::error file=$file::Mooncake PG has unresolved CUDA Driver API symbols"
                   echo "$cuda_symbols"
