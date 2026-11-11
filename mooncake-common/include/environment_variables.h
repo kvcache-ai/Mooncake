@@ -71,6 +71,11 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct NvlinkCoalesceEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(bool, MC_NVLINK_COALESCE);
+    MC_DEFINE_ENV_VAR(uint64_t, MC_NVLINK_COALESCE_STAGING_MB);
+};
+
 struct EmbeddedMasterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(bool, MOONCAKE_ENABLE_EMBEDDED_MASTER);
 };
