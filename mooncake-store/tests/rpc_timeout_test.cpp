@@ -12,6 +12,7 @@
 //      retain the default initial-connection retry policy.
 //   6. HA MasterClient bounds control-plane probes without changing the
 //      foreground RPC retry policy.
+//   7. DummyClient preserves timeout errors for single and batch RPCs.
 //
 // The end-to-end test points a MasterClient at a "black hole" TCP listener: a
 // socket that accepts the connection (so connect() succeeds) but never sends a
@@ -34,6 +35,10 @@
 #include <optional>
 #include <string>
 
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
+
+#include "dummy_client.h"
+#include "real_client.h"
 #include "master_client.h"
 #include "pyclient.h"
 #include "test_server_helpers.h"
@@ -419,5 +424,104 @@ TEST_F(RpcTimeoutEnvTest, RpcTimesOutAgainstUnresponsiveOffloadPeer) {
     EXPECT_GE(elapsed, kTimeoutMs - 100);
     EXPECT_LT(elapsed, 5000);
 }
+
+namespace {
+
+struct RpcErrorCase {
+    coro_rpc::errc rpc_error;
+    int single_result;
+    int batch_result;
+};
+
+// Inject RPC protocol errors without waiting for the default request deadline.
+// The custom route keys let DummyClient use its normal RealClient RPC methods.
+class ErrorService {
+   public:
+    explicit ErrorService(coro_rpc::errc error) : error_(error) {}
+
+    tl::expected<void, ErrorCode> Ready() { return {}; }
+
+    tl::expected<void, ErrorCode> Unmap(const UUID&) { return {}; }
+
+    void IsExist(coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+                 const std::string&) {
+        if (error_ == coro_rpc::errc::ok) {
+            ctx.response_msg(true);
+        } else {
+            ctx.response_error(error_);
+        }
+    }
+
+    void BatchRemove(
+        coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+        const std::vector<std::string>& keys, bool) {
+        if (error_ == coro_rpc::errc::ok) {
+            ctx.response_msg(
+                std::vector<tl::expected<void, ErrorCode>>(keys.size()));
+        } else {
+            ctx.response_error(error_);
+        }
+    }
+
+   private:
+    const coro_rpc::errc error_;
+};
+
+}  // namespace
+
+class DummyClientRpcErrorTest : public ::testing::TestWithParam<RpcErrorCase> {
+   protected:
+    DummyClientRpcErrorTest()
+        : service_(GetParam().rpc_error),
+          server_(2, 0, "127.0.0.1", std::chrono::seconds(0), true) {}
+
+    void SetUp() override {
+        server_.register_handler<&ErrorService::Ready>(
+            &service_,
+            coro_rpc::func_id<&RealClient::service_ready_internal>());
+        server_.register_handler<&ErrorService::Unmap>(
+            &service_, coro_rpc::func_id<&RealClient::unmap_shm_internal>());
+        server_.register_handler<&ErrorService::IsExist>(
+            &service_, coro_rpc::func_id<&RealClient::isExist_internal>());
+        server_.register_handler<&ErrorService::BatchRemove>(
+            &service_, coro_rpc::func_id<&RealClient::batchRemove_internal>());
+        auto started = server_.async_start();
+        ASSERT_FALSE(started.hasResult());
+        ASSERT_GT(server_.port(), 0);
+        // Connect without shared-memory allocation or a background ping thread.
+        ASSERT_EQ(
+            client_.connect("127.0.0.1:" + std::to_string(server_.port())),
+            ErrorCode::OK);
+    }
+
+    // Destroy the client before stopping its server and destroying handlers.
+    ErrorService service_;
+    coro_rpc::coro_rpc_server server_;
+    DummyClient client_;
+};
+
+TEST_P(DummyClientRpcErrorTest, SingleRequestPreservesErrorCode) {
+    EXPECT_EQ(client_.isExist("key"), GetParam().single_result);
+}
+
+TEST_P(DummyClientRpcErrorTest, BatchRequestPreservesErrorCodeForEveryKey) {
+    const std::vector<std::string> keys = {"first", "second", "third"};
+    const auto results = client_.batchRemove(keys);
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_EQ(results[i], GetParam().batch_result) << "key: " << keys[i];
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    RpcResults, DummyClientRpcErrorTest,
+    ::testing::Values(
+        RpcErrorCase{coro_rpc::errc::ok, 1, 0},
+        RpcErrorCase{coro_rpc::errc::timed_out, toInt(ErrorCode::RPC_TIMEOUT),
+                     toInt(ErrorCode::RPC_TIMEOUT)},
+        RpcErrorCase{coro_rpc::errc::function_not_registered,
+                     toInt(ErrorCode::RPC_FAIL), toInt(ErrorCode::RPC_FAIL)},
+        RpcErrorCase{coro_rpc::errc::invalid_rpc_arguments,
+                     toInt(ErrorCode::RPC_FAIL), toInt(ErrorCode::RPC_FAIL)}));
 
 }  // namespace mooncake
