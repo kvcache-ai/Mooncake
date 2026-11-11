@@ -67,6 +67,7 @@ pub struct GlobalArgs {
 pub enum Protocol {
     Tcp,
     Rdma,
+    Ascend,
 }
 
 #[derive(Clone, Debug, ValueEnum)]

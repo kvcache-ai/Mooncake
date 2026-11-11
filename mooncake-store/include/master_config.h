@@ -123,6 +123,7 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     int64_t ha_leader_lease_ttl_sec = DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     std::string etcd_endpoints;
+    int32_t etcd_max_send_message_bytes = 2 * 1024 * 1024;
 
     // OpLog store configuration
     bool enable_oplog = false;

@@ -36,6 +36,9 @@ class PosixFsAdapter : public FileSystemAdapter {
 
     bool SupportsFdReopen() const override { return true; }
 
+    // Buffered preadv(): no alignment or registration requirements.
+    bool SupportsArbitraryHostReadBuffers() const override { return true; }
+
     const char* GetName() const override { return "posix"; }
 
    private:

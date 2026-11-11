@@ -870,6 +870,14 @@ class Client {
     }
 
     /**
+     * @brief Whether a DFS replica is served by an fs adapter that accepts
+     * arbitrary host read buffers, so a host destination can be read into
+     * directly without a staging buffer.
+     */
+    bool CanReadDfsReplicaIntoHostMemory(
+        const Replica::Descriptor& replica) const;
+
+    /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
      */
@@ -964,6 +972,14 @@ class Client {
     // SSD read (#3884).
     DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
 
+    // Reads one byte window of each DISK or DFS replica. `windows[i]` receives
+    // `windows[i].size` bytes starting at `value_offsets[i]` in the value.
+    std::vector<tl::expected<void, ErrorCode>> BatchReadFileReplicaRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<Slice>& windows,
+        const std::vector<uint64_t>& value_offsets);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -1008,6 +1024,12 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
+    // Submits one transfer without waiting for it. The caller must get() the
+    // returned future before it releases the slices or the replica.
+    tl::expected<TransferFuture, ErrorCode> SubmitSingleTransfer(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code,
+        TransferIntent intent = TransferIntent::kUnspecified);
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,
@@ -1028,6 +1050,12 @@ class Client {
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,
         TransferIntent intent = TransferIntent::kUnspecified);
+    // Writes the slices to every memory and NoF replica in the list. All
+    // transfers are submitted before any is waited on. Returns the type and
+    // result of each such replica, in order.
+    std::vector<std::pair<ReplicaType, ErrorCode>> WriteMemoryAndNofReplicas(
+        const std::vector<Replica::Descriptor>& replicas,
+        std::vector<Slice>& slices);
     ErrorCode TransferRead(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices,

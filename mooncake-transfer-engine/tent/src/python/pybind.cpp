@@ -108,6 +108,7 @@ static void ThrowStatus(const Status& s, const char* where) {
             throw MetadataError(full_msg);
         case Status::Code::kRpcServiceError:
         case Status::Code::kRpcConnectionError:
+        case Status::Code::kRpcFunctionNotFound:
             throw RpcServiceError(full_msg);
         case Status::Code::kNotImplemented:
             throw NotImplementedError(full_msg);

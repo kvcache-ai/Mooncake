@@ -16,7 +16,9 @@
 #define WORKER_H
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -114,7 +116,9 @@ class WorkerPool {
 
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
                     bool handoff_to_local_worker = false,
-                    bool defer_local_redispatch = false);
+                    bool defer_local_redispatch = false,
+                    bool metadata_ready = false);
+    void performPendingRedispatch(int thread_id);
 
     void transferWorker(int thread_id);
 
@@ -207,6 +211,24 @@ class WorkerPool {
         collective_slice_queue_;
     std::vector<std::unordered_map<std::string, SliceList>> worker_slice_queue_;
     std::vector<std::mutex> worker_slice_queue_lock_;
+
+    // Each posting worker owns its pending handshakes; no task retains slices.
+    struct PendingEndpointSetup {
+        std::shared_ptr<RdmaEndPoint> endpoint;
+        std::future<int> result;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::vector<std::unordered_map<std::string, PendingEndpointSetup>>
+        pending_setups_;
+
+    // Metadata RPCs own only metadata; the posting worker retains the slices.
+    struct PendingRedispatch {
+        SliceList slices;
+        std::future<int> result;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::vector<std::unordered_map<SegmentID, PendingRedispatch>>
+        pending_redispatch_;
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
     std::atomic<uint64_t> recovery_activate_after_ns_{0};

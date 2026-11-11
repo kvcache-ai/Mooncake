@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -30,11 +32,15 @@ enum class WeightResidencyState : uint8_t {
     ABSENT = 4,
 };
 
-enum class WeightOperationState : uint8_t {
-    NONE = 0,
-    EVICTING = 1,
-    REHYDRATING = 2,
-    REPAIRING = 3,
+enum class WeightMigrationMode : uint8_t {
+    PINNED = 0,
+    MANUAL = 1,
+    AUTO = 2,
+};
+
+enum class WeightOperationKind : uint8_t {
+    MIGRATING = 0,
+    REPAIRING = 1,
 };
 
 inline constexpr bool IsValidWeightAvailabilityState(
@@ -54,13 +60,6 @@ inline constexpr bool IsValidWeightResidencyState(WeightResidencyState state) {
            state == WeightResidencyState::ABSENT;
 }
 
-inline constexpr bool IsValidWeightOperationState(WeightOperationState state) {
-    return state == WeightOperationState::NONE ||
-           state == WeightOperationState::EVICTING ||
-           state == WeightOperationState::REHYDRATING ||
-           state == WeightOperationState::REPAIRING;
-}
-
 enum class WeightManagementError : uint8_t {
     INVALID_ARGUMENT = 1,
     NOT_FOUND = 2,
@@ -71,6 +70,7 @@ enum class WeightManagementError : uint8_t {
     LEASE_EXPIRED = 7,
     GENERATION_EXHAUSTED = 8,
     DURABILITY_FAILED = 9,
+    POLICY_UNSATISFIABLE = 10,
 };
 
 struct WeightRevisionIdentity {
@@ -107,23 +107,63 @@ struct WeightManifestReference {
 YLT_REFL(WeightManifestReference, manifest_key, manifest_sha256,
          payload_group_id, payload_keys_sha256, payload_count, logical_bytes);
 
+struct WeightStoragePolicy {
+    WeightResidencyState preferred_residency{WeightResidencyState::MIXED};
+    double mixed_hot_ratio{0.5};
+    WeightMigrationMode migration_mode{WeightMigrationMode::MANUAL};
+
+    friend bool operator==(const WeightStoragePolicy&,
+                           const WeightStoragePolicy&) = default;
+};
+YLT_REFL(WeightStoragePolicy, preferred_residency, mixed_hot_ratio,
+         migration_mode);
+
+struct WeightAffinityMappingEntry {
+    std::string key;
+    uint64_t size{0};
+    std::string affinity_id;
+
+    friend bool operator==(const WeightAffinityMappingEntry&,
+                           const WeightAffinityMappingEntry&) = default;
+};
+YLT_REFL(WeightAffinityMappingEntry, key, size, affinity_id);
+
+std::string ComputeWeightAffinityMappingSha256(
+    const std::vector<WeightAffinityMappingEntry>& entries);
+
+struct WeightAffinitySummary {
+    uint64_t affinity_count{0};
+    std::string affinity_digest;
+
+    friend bool operator==(const WeightAffinitySummary&,
+                           const WeightAffinitySummary&) = default;
+};
+YLT_REFL(WeightAffinitySummary, affinity_count, affinity_digest);
+
 struct WeightRevisionMetadata {
     WeightRevisionIdentity identity;
     WeightManifestReference manifest;
+    WeightStoragePolicy policy;
     WeightAvailabilityState availability{WeightAvailabilityState::IMPORTING};
     WeightResidencyState residency{WeightResidencyState::UNKNOWN};
-    WeightOperationState operation{WeightOperationState::NONE};
-    uint64_t operation_id{0};
+    std::optional<uint64_t> operation_id;
+    uint64_t affinity_count{0};
+    std::string affinity_digest;
+    double observed_hot_ratio{0.0};
     uint64_t metadata_generation{1};
     uint64_t created_at_ms{0};
     uint64_t updated_at_ms{0};
 
+    // The declared physical layout is retained only until import commits.
+    std::vector<WeightAffinityMappingEntry> import_layout;
+
     friend bool operator==(const WeightRevisionMetadata&,
                            const WeightRevisionMetadata&) = default;
 };
-YLT_REFL(WeightRevisionMetadata, identity, manifest, availability, residency,
-         operation, operation_id, metadata_generation, created_at_ms,
-         updated_at_ms);
+YLT_REFL(WeightRevisionMetadata, identity, manifest, policy, availability,
+         residency, operation_id, affinity_count, affinity_digest,
+         observed_hot_ratio, metadata_generation, created_at_ms, updated_at_ms,
+         import_layout);
 
 struct WeightRevisionLease {
     uint64_t lease_id{0};
@@ -151,22 +191,26 @@ inline bool IsWeightOperationTerminal(const std::string& message) {
 struct WeightResidencyOperation {
     uint64_t operation_id{0};
     WeightRevisionIdentity identity;
-    WeightOperationState operation{WeightOperationState::NONE};
+    WeightOperationKind kind{WeightOperationKind::MIGRATING};
     WeightResidencyState target_residency{WeightResidencyState::UNKNOWN};
+    std::optional<double> target_hot_ratio;
     uint64_t fenced_metadata_generation{0};
     uint64_t started_at_ms{0};
     uint64_t updated_at_ms{0};
-    uint64_t processed_members{0};
-    uint64_t total_members{0};
+    uint64_t processed_units{0};
+    uint64_t total_units{0};
+    uint64_t processed_bytes{0};
+    uint64_t total_bytes{0};
     std::string cursor;
     std::string message;
 
     friend bool operator==(const WeightResidencyOperation&,
                            const WeightResidencyOperation&) = default;
 };
-YLT_REFL(WeightResidencyOperation, operation_id, identity, operation,
-         target_residency, fenced_metadata_generation, started_at_ms,
-         updated_at_ms, processed_members, total_members, cursor, message);
+YLT_REFL(WeightResidencyOperation, operation_id, identity, kind,
+         target_residency, target_hot_ratio, fenced_metadata_generation,
+         started_at_ms, updated_at_ms, processed_units, total_units,
+         processed_bytes, total_bytes, cursor, message);
 
 struct WeightRevisionView {
     WeightRevisionMetadata metadata;
@@ -181,9 +225,13 @@ struct BeginWeightImportRequest {
     std::string payload_group_id;
     uint64_t expected_payload_count{0};
     uint64_t expected_logical_bytes{0};
+    std::optional<WeightStoragePolicy> policy;
+    WeightAffinitySummary affinity_summary;
+    std::vector<WeightAffinityMappingEntry> payload_layout;
 };
 YLT_REFL(BeginWeightImportRequest, identity, payload_group_id,
-         expected_payload_count, expected_logical_bytes);
+         expected_payload_count, expected_logical_bytes, policy,
+         affinity_summary, payload_layout);
 
 struct CommitWeightImportRequest {
     WeightRevisionIdentity identity;
@@ -246,9 +294,18 @@ struct StartWeightResidencyOperationRequest {
     WeightRevisionIdentity identity;
     uint64_t expected_metadata_generation{0};
     WeightResidencyState target_residency{WeightResidencyState::UNKNOWN};
+    std::optional<double> mixed_hot_ratio;
 };
 YLT_REFL(StartWeightResidencyOperationRequest, identity,
-         expected_metadata_generation, target_residency);
+         expected_metadata_generation, target_residency, mixed_hot_ratio);
+
+struct UpdateWeightPolicyRequest {
+    WeightRevisionIdentity identity;
+    uint64_t expected_metadata_generation{0};
+    WeightStoragePolicy policy;
+};
+YLT_REFL(UpdateWeightPolicyRequest, identity, expected_metadata_generation,
+         policy);
 
 struct QueryWeightOperationRequest {
     std::string tenant_id{"default"};
@@ -387,6 +444,59 @@ inline WeightValidationResult ValidateWeightManifestReference(
     return WeightValidationResult::Success();
 }
 
+inline bool IsWeightResidencyTarget(WeightResidencyState residency) {
+    return residency == WeightResidencyState::HOT ||
+           residency == WeightResidencyState::COLD ||
+           residency == WeightResidencyState::MIXED;
+}
+
+inline bool IsValidWeightOperationShape(
+    const WeightResidencyOperation& operation) {
+    return (operation.kind == WeightOperationKind::MIGRATING ||
+            operation.kind == WeightOperationKind::REPAIRING) &&
+           IsWeightResidencyTarget(operation.target_residency) &&
+           (operation.target_residency == WeightResidencyState::MIXED
+                ? operation.target_hot_ratio.has_value() &&
+                      std::isfinite(*operation.target_hot_ratio) &&
+                      *operation.target_hot_ratio > 0.0 &&
+                      *operation.target_hot_ratio < 1.0
+                : !operation.target_hot_ratio.has_value()) &&
+           operation.total_units != 0 && operation.total_bytes != 0 &&
+           operation.processed_units <= operation.total_units &&
+           operation.processed_bytes <= operation.total_bytes &&
+           (operation.cursor.empty() ||
+            IsValidWeightComponent(operation.cursor));
+}
+
+inline WeightValidationResult ValidateWeightStoragePolicy(
+    const WeightStoragePolicy& policy) {
+    if (!IsWeightResidencyTarget(policy.preferred_residency)) {
+        return WeightValidationResult::Failure("invalid preferred_residency");
+    }
+    if (!std::isfinite(policy.mixed_hot_ratio) ||
+        policy.mixed_hot_ratio <= 0.0 || policy.mixed_hot_ratio >= 1.0) {
+        return WeightValidationResult::Failure("invalid mixed_hot_ratio");
+    }
+    if (policy.migration_mode == WeightMigrationMode::AUTO) {
+        return WeightValidationResult::Failure(
+            "AUTO migration is not supported yet");
+    }
+    if (policy.migration_mode != WeightMigrationMode::PINNED &&
+        policy.migration_mode != WeightMigrationMode::MANUAL) {
+        return WeightValidationResult::Failure("invalid migration_mode");
+    }
+    return WeightValidationResult::Success();
+}
+
+inline WeightValidationResult ValidateWeightAffinitySummary(
+    const WeightAffinitySummary& summary) {
+    if (summary.affinity_count == 0 ||
+        !IsValidSha256(summary.affinity_digest)) {
+        return WeightValidationResult::Failure("invalid affinity_digest");
+    }
+    return WeightValidationResult::Success();
+}
+
 inline bool IsValidWeightAvailabilityTransition(WeightAvailabilityState from,
                                                 WeightAvailabilityState to) {
     switch (from) {
@@ -409,11 +519,6 @@ inline bool IsValidWeightAvailabilityTransition(WeightAvailabilityState from,
 
 inline WeightValidationResult ValidateWeightRevisionMetadata(
     const WeightRevisionMetadata& metadata) {
-    if (!IsValidWeightAvailabilityState(metadata.availability) ||
-        !IsValidWeightResidencyState(metadata.residency) ||
-        !IsValidWeightOperationState(metadata.operation)) {
-        return WeightValidationResult::Failure("invalid weight state");
-    }
     auto identity_result = ValidateWeightRevisionIdentity(metadata.identity);
     if (!identity_result.ok()) {
         return identity_result;
@@ -435,21 +540,55 @@ inline WeightValidationResult ValidateWeightRevisionMetadata(
     if (metadata.updated_at_ms < metadata.created_at_ms) {
         return WeightValidationResult::Failure("timestamps are not monotonic");
     }
-    if ((metadata.operation == WeightOperationState::NONE) !=
-        (metadata.operation_id == 0)) {
-        return WeightValidationResult::Failure(
-            "operation and operation_id disagree");
+    auto policy_result = ValidateWeightStoragePolicy(metadata.policy);
+    if (!policy_result.ok()) {
+        return policy_result;
     }
-    if (metadata.operation != WeightOperationState::NONE &&
-        metadata.availability != WeightAvailabilityState::READY &&
-        metadata.availability != WeightAvailabilityState::DEGRADED) {
-        return WeightValidationResult::Failure(
-            "active operation requires a published revision");
+    auto affinity_result = ValidateWeightAffinitySummary(WeightAffinitySummary{
+        .affinity_count = metadata.affinity_count,
+        .affinity_digest = metadata.affinity_digest,
+    });
+    if (!affinity_result.ok()) {
+        return affinity_result;
     }
-    if (metadata.availability == WeightAvailabilityState::IMPORTING &&
-        metadata.residency != WeightResidencyState::UNKNOWN) {
+    if (!metadata.import_layout.empty()) {
+        uint64_t bytes = 0;
+        std::set<std::string> affinities;
+        for (const auto& entry : metadata.import_layout) {
+            if (entry.size > std::numeric_limits<uint64_t>::max() - bytes) {
+                return WeightValidationResult::Failure("invalid import layout");
+            }
+            bytes += entry.size;
+            affinities.insert(entry.affinity_id);
+        }
+        if (metadata.import_layout.size() != metadata.manifest.payload_count ||
+            bytes != metadata.manifest.logical_bytes ||
+            affinities.size() != metadata.affinity_count ||
+            ComputeWeightAffinityMappingSha256(metadata.import_layout) !=
+                metadata.affinity_digest) {
+            return WeightValidationResult::Failure("invalid import layout");
+        }
+    }
+    if (!std::isfinite(metadata.observed_hot_ratio) ||
+        metadata.observed_hot_ratio < 0.0 ||
+        metadata.observed_hot_ratio > 1.0) {
+        return WeightValidationResult::Failure("invalid observed_hot_ratio");
+    }
+    if (!IsValidWeightAvailabilityState(metadata.availability) ||
+        !IsValidWeightResidencyState(metadata.residency)) {
+        return WeightValidationResult::Failure("invalid weight state");
+    }
+    if ((metadata.residency == WeightResidencyState::HOT &&
+         metadata.observed_hot_ratio != 1.0) ||
+        ((metadata.residency == WeightResidencyState::UNKNOWN ||
+          metadata.residency == WeightResidencyState::COLD ||
+          metadata.residency == WeightResidencyState::ABSENT) &&
+         metadata.observed_hot_ratio != 0.0) ||
+        (metadata.residency == WeightResidencyState::MIXED &&
+         (metadata.observed_hot_ratio <= 0.0 ||
+          metadata.observed_hot_ratio >= 1.0))) {
         return WeightValidationResult::Failure(
-            "importing revision must have unknown residency");
+            "observed residency and hot ratio disagree");
     }
     if (metadata.availability == WeightAvailabilityState::READY ||
         metadata.availability == WeightAvailabilityState::DEGRADED) {
@@ -459,20 +598,23 @@ inline WeightValidationResult ValidateWeightRevisionMetadata(
             return manifest_result;
         }
     }
-    if ((metadata.availability == WeightAvailabilityState::READY ||
-         metadata.availability == WeightAvailabilityState::DEGRADED) &&
-        metadata.residency == WeightResidencyState::UNKNOWN) {
+    if ((metadata.availability == WeightAvailabilityState::IMPORTING &&
+         (metadata.residency != WeightResidencyState::UNKNOWN ||
+          metadata.operation_id.has_value())) ||
+        (metadata.availability == WeightAvailabilityState::READY &&
+         !IsWeightResidencyTarget(metadata.residency)) ||
+        (metadata.availability == WeightAvailabilityState::DEGRADED &&
+         metadata.residency == WeightResidencyState::UNKNOWN) ||
+        (metadata.operation_id.has_value() &&
+         (*metadata.operation_id == 0 ||
+          (metadata.availability != WeightAvailabilityState::READY &&
+           metadata.availability != WeightAvailabilityState::DEGRADED)))) {
         return WeightValidationResult::Failure(
-            "published revision must have observed residency");
-    }
-    if (metadata.availability == WeightAvailabilityState::READY &&
-        metadata.residency == WeightResidencyState::ABSENT) {
-        return WeightValidationResult::Failure(
-            "ready revision must have readable residency");
+            "availability and residency state disagree");
     }
     if (metadata.availability == WeightAvailabilityState::DELETED &&
         (metadata.residency != WeightResidencyState::ABSENT ||
-         metadata.operation != WeightOperationState::NONE)) {
+         metadata.operation_id.has_value())) {
         return WeightValidationResult::Failure(
             "deleted revision must be absent and idle");
     }

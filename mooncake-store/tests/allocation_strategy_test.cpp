@@ -60,11 +60,33 @@ class AllocationStrategyParameterizedTest
         size_t size = 64 * MiB) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         auto allocator = CreateBufferAllocator(allocator_type_, segment_name,
-                                               base, size, segment_name);
+                                               base, size, segment_name, "tcp");
         if (!allocator) {
             throw std::invalid_argument("Invalid allocator test parameters");
         }
         return std::move(*allocator);
+    }
+
+    // Registrations bound to the returned record are not serving.
+    static std::shared_ptr<ClientLivenessRecord> MakeSuspectedRecord() {
+        const auto initial = ClientLivenessRecord::TimePoint{};
+        auto record = std::make_shared<ClientLivenessRecord>(initial);
+        EXPECT_EQ(
+            record->Evaluate(initial + std::chrono::seconds(1),
+                             std::chrono::seconds(1), std::chrono::seconds(10)),
+            ClientLivenessTransition::BECAME_SUSPECTED);
+        return record;
+    }
+
+    // Adds non-serving segments suspected<first> .. suspected<first+count-1>.
+    void AddSuspectedSegments(AllocatorManager& allocator_manager, size_t first,
+                              size_t count) {
+        const auto suspected = MakeSuspectedRecord();
+        for (size_t i = first; i < first + count; ++i) {
+            const auto name = "suspected" + std::to_string(i);
+            allocator_manager.addAllocator(
+                name, CreateTestAllocator(name, i * 64 * MiB), suspected);
+        }
     }
 
     BufferAllocatorType allocator_type_;
@@ -133,9 +155,9 @@ TEST_F(AllocationStrategyTest, SuspectedRegistrationIsSkipped) {
     auto active = std::make_shared<ClientLivenessRecord>(initial);
 
     auto suspected_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected");
+        "shared", DEFAULT_CXL_BASE, 64 * MiB, "suspected", "tcp");
     auto active_allocator = std::make_shared<OffsetBufferAllocator>(
-        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active");
+        "shared", DEFAULT_CXL_BASE + 64 * MiB, 64 * MiB, "active", "tcp");
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("shared", suspected_allocator, suspected);
     allocator_manager.addAllocator("shared", active_allocator, active);
@@ -380,7 +402,7 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
 // Test invalid replication count
 TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator);
@@ -397,9 +419,10 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
 // count
 TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
     auto allocator2 = std::make_shared<OffsetBufferAllocator>(
-        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2");
+        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MiB, "segment2",
+        "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -504,7 +527,7 @@ TEST_P(AllocationStrategyParameterizedTest, ExcludedSegmentsAllocation) {
 // Test allocation when all available segments are excluded
 TEST_F(AllocationStrategyTest, AllSegmentsExcluded) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MiB, "segment1");
+        "segment1", 0x100000000ULL, 64 * MiB, "segment1", "tcp");
 
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator1);
@@ -595,6 +618,96 @@ TEST_P(AllocationStrategyParameterizedTest,
             "segment1");  // Should not be allocated from excluded segments
         EXPECT_TRUE(segment_ep == "segment2" || segment_ep == "segment3");
         EXPECT_EQ(mem_desc.buffer_descriptor.size_, 1024);
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       NonServingSegmentsDoNotUseUpRetries) {
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("serving",
+                                   CreateTestAllocator("serving-suspected", 0),
+                                   MakeSuspectedRecord());
+    allocator_manager.addAllocator("serving",
+                                   CreateTestAllocator("serving", 64 * MiB));
+    AddSuspectedSegments(allocator_manager, 2, 200);
+    // These fill FreeRatioFirst's candidate sample, so it falls back to the
+    // random walk.
+    std::set<std::string> excluded;
+    for (size_t i = 0; i < 6; ++i) {
+        const auto name = "excluded" + std::to_string(i);
+        allocator_manager.addAllocator(
+            name, CreateTestAllocator(name, (i + 202) * 64 * MiB));
+        excluded.insert(name);
+    }
+
+    for (int i = 0; i < 20; ++i) {
+        auto result =
+            strategy_->Allocate(allocator_manager, 1024, 1, {}, excluded);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "serving");
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       NonServingRunDoesNotFavorTheNextSegment) {
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < 12; ++i) {
+        if (i == 6) {
+            AddSuspectedSegments(allocator_manager, 12, 4);
+        }
+        const auto name = "serving" + std::to_string(i);
+        allocator_manager.addAllocator(name,
+                                       CreateTestAllocator(name, i * 64 * MiB));
+    }
+
+    constexpr int kAllocations = 3000;
+    std::unordered_map<std::string, int> picks;
+    for (int i = 0; i < kAllocations; ++i) {
+        auto result = strategy_->Allocate(allocator_manager, 1024);
+        ASSERT_TRUE(result.has_value());
+        ++picks[(*result)[0]
+                    .get_descriptor()
+                    .get_memory_descriptor()
+                    .buffer_descriptor.transport_endpoint_];
+    }
+    for (const auto& [name, count] : picks) {
+        EXPECT_LT(count, kAllocations * 15 / 100) << name;
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest,
+       FreeRatioFirstRanksOnlyServingSegments) {
+    auto [strategy_type, allocator_type] = GetParam();
+    if (strategy_type != AllocationStrategyType::FREE_RATIO_FIRST) {
+        GTEST_SKIP();
+    }
+
+    auto busy = CreateTestAllocator("busy", 0);
+    std::vector<std::unique_ptr<AllocatedBuffer>> held;
+    for (int i = 0; i < 32; ++i) {
+        held.push_back(busy->allocate(MiB));
+        ASSERT_NE(held.back(), nullptr);
+    }
+
+    AllocatorManager allocator_manager;
+    allocator_manager.addAllocator("busy", busy);
+    AddSuspectedSegments(allocator_manager, 1, 100);
+    allocator_manager.addAllocator("idle",
+                                   CreateTestAllocator("idle", 101 * 64 * MiB));
+    AddSuspectedSegments(allocator_manager, 102, 100);
+
+    for (int i = 0; i < 20; ++i) {
+        auto result = strategy_->Allocate(allocator_manager, 1024);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ((*result)[0]
+                      .get_descriptor()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  "idle");
     }
 }
 
@@ -701,8 +814,8 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, "tcp"));
     }
 
     // Test Random strategy
@@ -764,8 +877,8 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "segment_" + std::to_string(i);
         allocator_manager.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, kSegmentBase,
-                                                          kSegmentSize, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, kSegmentBase, kSegmentSize, name, "tcp"));
     }
 
     std::vector<std::vector<Replica>> replicas;
@@ -801,7 +914,7 @@ class SsdPlacementTestState {
         allocators.addAllocator(
             name, std::make_shared<OffsetBufferAllocator>(
                       name, 0x100000000ULL + index * segment_size, segment_size,
-                      name));
+                      name, "tcp"));
         const UUID client_id{index + 1, index + 100};
         client_by_name.emplace(name, client_id);
         ASSERT_EQ(local_ssd.RegisterClient(client_id, true), ErrorCode::OK);
@@ -812,8 +925,8 @@ class SsdPlacementTestState {
 
     void AddSegmentWithoutSsd(const std::string& name, size_t segment_size) {
         allocators.addAllocator(
-            name, std::make_shared<OffsetBufferAllocator>(name, 0x100000000ULL,
-                                                          segment_size, name));
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x100000000ULL, segment_size, name, "tcp"));
         client_by_name.emplace(name, UUID{1, 100});
     }
 

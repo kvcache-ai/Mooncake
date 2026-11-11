@@ -27,7 +27,7 @@
 
 #include <acl/acl.h>
 #include "transport/transport.h"
-#include "utils.h"
+#include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
 namespace mooncake {
 
@@ -52,8 +52,13 @@ class ISliceDispatcher {
  * One local device keeps one transfer pool and one memcpy pool. Both pin to
  * the shared NPU CPU affinity when that device resolves a cpulist.
  * Several local devices (standalone) keep one transfer pool and one memcpy
- * pool per device. Each pool pins to that device's NUMA cpulist. Non-fabric
- * host allocation for a device runs on that device's transfer pool.
+ * pool per device. Each pool pins to that device's NUMA cpulist. When that
+ * node cannot be read, devices are spread across the machine's CPU nodes.
+ * Non-fabric host allocation for a device runs on that device's transfer pool.
+ * Slices that share a target segment are split by target adxl engine and each
+ * group is queued on its own, so those engines transfer together. The split
+ * happens here, on the caller, so a worker runs its group directly instead of
+ * resolving the segment and splitting it again.
  */
 class DefaultSliceDispatcher : public ISliceDispatcher {
    public:
@@ -84,6 +89,9 @@ class DefaultSliceDispatcher : public ISliceDispatcher {
  * Device copies run on a separate pool of 6 threads. Each engine thread
  * pins to that NPU's affinity CPUs. The memcpy pool pins only when every
  * NPU shares one CPU set.
+ * Selected only for a standalone holder with HCCL_INTRA_ROCE_ENABLE=1.
+ * This path is being retired. roce:device and roce:host use
+ * DefaultSliceDispatcher.
  */
 class RoceDummyRealSliceDispatcher : public ISliceDispatcher {
    public:

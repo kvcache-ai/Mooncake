@@ -1684,6 +1684,44 @@ fn execute_batch_get_values_into_multi(
     all_buffer_ptrs: Vec<Vec<usize>>,
     all_sizes: Vec<Vec<usize>>,
 ) -> Result<Vec<i64>, StoreError> {
+    // Without a hot cache the whole batch can go through one data-plane call:
+    // store-client then issues a single transfer batch for every key instead
+    // of one submit/wait round trip per key. This is what makes multi-buffer
+    // reads bandwidth-bound instead of latency-bound.
+    if hot_cache.is_none() && keys.len() > 1 {
+        let mut buffer_groups: Vec<Vec<&mut [u8]>> = Vec::with_capacity(keys.len());
+        for (buffer_ptrs, sizes) in all_buffer_ptrs.iter().zip(all_sizes.iter()) {
+            let mut buffers = Vec::with_capacity(buffer_ptrs.len());
+            for (buffer_ptr, size) in buffer_ptrs.iter().zip(sizes.iter()) {
+                // Safety: the Python caller owns these buffers for the duration
+                // of the call; the pointer/size pairs are validated by the
+                // native facade entry point.
+                buffers
+                    .push(unsafe { std::slice::from_raw_parts_mut(*buffer_ptr as *mut u8, *size) });
+            }
+            buffer_groups.push(buffers);
+        }
+        let mut requests = keys
+            .iter()
+            .zip(buffer_groups.iter_mut())
+            .map(|(key, buffers)| {
+                apply_scope_to_multi_buffer_get_request(
+                    MultiBufferGetRequest::new(key.as_str(), buffers.as_mut_slice()),
+                    &scope,
+                )
+            })
+            .collect::<Vec<_>>();
+        match client.batch_get_into_multi_buffers(requests.as_mut_slice()) {
+            Ok(sizes) => return Ok(sizes.into_iter().map(|size| size as i64).collect()),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    items = requests.len(),
+                    "batched multi-buffer read failed, falling back to per-key reads"
+                );
+            }
+        }
+    }
     let mut lengths = Vec::with_capacity(keys.len());
     for ((key, buffer_ptrs), sizes) in keys.into_iter().zip(all_buffer_ptrs).zip(all_sizes) {
         let copied =

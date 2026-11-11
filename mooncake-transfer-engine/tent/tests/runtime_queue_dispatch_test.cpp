@@ -1030,6 +1030,8 @@ TEST(RuntimeQueueDispatch, TcpCapsPreservePublicMappingAndOwnerBytes) {
                 SCOPED_TRACE(testing::Message()
                              << type << "/" << hint << "/" << opcode);
                 const auto cap = tcpMaxTransferBytes(opcode);
+                EXPECT_EQ(cap, opcode == Request::READ ? kTcpMaxReadBytes
+                                                       : kTcpMaxWriteV2Bytes);
                 auto cfg = makeRuntimeQueueConfig(3, 1024, true);
                 cfg->set("enable_runtime_queue", false);
                 cfg->set("enable_progress_worker", false);
