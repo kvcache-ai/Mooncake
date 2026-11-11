@@ -34,6 +34,9 @@
 #include "tent/runtime/segment_tracker.h"
 #include "tent/runtime/progress_worker.h"
 #include "tent/runtime/proxy_manager.h"
+#ifdef USE_CUDA
+#include "tent/transport/mnnvl/mnnvl_transport.h"
+#endif
 #include "tent/runtime/transport.h"
 #include "tent/runtime/topology.h"
 #include "tent/runtime/platform.h"
@@ -829,6 +832,44 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
         }
     }
     return Status::OK();
+}
+
+Status TransferEngineImpl::getMnnvlEgmInfo(std::vector<EgmNumaInfo>& info,
+                                           bool nearest) {
+    info.clear();
+#ifdef USE_CUDA
+    auto* transport =
+        dynamic_cast<MnnvlTransport*>(transport_list_[MNNVL].get());
+    if (!available_ || !transport || !transport->strictFabricEgm())
+        return Status::InvalidArgument("Strict MNNVL EGM is not enabled");
+    std::vector<int> nodes;
+    CHECK_STATUS(transport->getEgmNumaNodes(nodes, nearest));
+    std::vector<EgmNumaInfo> result;
+    for (int node : nodes) {
+        size_t granularity = 0;
+        CHECK_STATUS(transport->getEgmGranularity(node, granularity));
+        result.push_back({node, granularity});
+    }
+    info = std::move(result);
+    return Status::OK();
+#else
+    return Status::NotImplemented("MNNVL EGM requires a CUDA build");
+#endif
+}
+
+Status TransferEngineImpl::acquireMnnvlMemory(
+    SegmentID segment, uint64_t address, size_t length, int device,
+    std::shared_ptr<MappedMemory>& mapping) {
+#ifdef USE_CUDA
+    auto* transport =
+        dynamic_cast<MnnvlTransport*>(transport_list_[MNNVL].get());
+    if (!available_ || !transport)
+        return Status::InvalidArgument("MNNVL transport is not available");
+    return transport->acquireEgmMemory(segment, address, length, device,
+                                       mapping);
+#else
+    return Status::NotImplemented("MNNVL EGM requires a CUDA build");
+#endif
 }
 
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,

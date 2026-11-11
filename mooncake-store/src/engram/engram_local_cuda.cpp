@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "engram_local_cuda.h"
+#include "engram_mapped_table.h"
 
 namespace py = pybind11;
 namespace {
@@ -89,30 +90,52 @@ struct View {
 };
 
 class Lookup {
-    std::vector<std::shared_ptr<LocalTable>> owners_;
+    // Keep the Python owners alive: the device tables point into their
+    // memory, and captured graphs may replay after the caller drops its refs.
+    std::vector<py::object> owners_;
     EngramLocalTable* device_tables_ = nullptr;
     int device_;
     size_t width_;
 
    public:
-    Lookup(std::vector<std::shared_ptr<LocalTable>> owners,
-           const std::vector<int64_t>& offsets)
+    Lookup(std::vector<py::object> owners, const std::vector<int64_t>& offsets)
         : owners_(std::move(owners)) {
         if (owners_.empty() || owners_.size() > 65535 ||
             offsets.size() != owners_.size())
             throw std::invalid_argument("Invalid table count");
         check(cudaGetDevice(&device_));
-        width_ = owners_.front()->width;
+        width_ = 0;
         std::vector<EngramLocalTable> tables;
         for (size_t i = 0; i < owners_.size(); ++i) {
-            const auto& owner = *owners_[i];
-            if (owner.width != width_ || offsets[i] < 0)
+            const uint8_t* pointer = nullptr;
+            int64_t count = 0;
+            size_t width = 0;
+            if (PyCapsule_IsValid(owners_[i].ptr(),
+                                  kEngramMappedTableCapsule)) {
+                auto* table =
+                    static_cast<EngramMappedTable*>(PyCapsule_GetPointer(
+                        owners_[i].ptr(), kEngramMappedTableCapsule));
+                if (table->device != device_ ||
+                    (table->count && (!table->rows || !table->owner)))
+                    throw std::invalid_argument(
+                        "mapped table has an invalid device or owner");
+                pointer = table->rows;
+                count = table->count;
+                width = table->width;
+            } else {
+                const auto owner =
+                    owners_[i].cast<std::shared_ptr<LocalTable>>();
+                void* mapped = nullptr;
+                if (owner->count)
+                    check(cudaHostGetDevicePointer(&mapped, owner->host, 0));
+                pointer = static_cast<const uint8_t*>(mapped);
+                count = owner->count;
+                width = owner->width;
+            }
+            if (i == 0) width_ = width;
+            if (!width || width != width_ || offsets[i] < 0)
                 throw std::invalid_argument("Invalid table width or offset");
-            void* pointer = nullptr;
-            if (owner.count)
-                check(cudaHostGetDevicePointer(&pointer, owner.host, 0));
-            tables.push_back({static_cast<const uint8_t*>(pointer), owner.count,
-                              offsets[i]});
+            tables.push_back({pointer, count, offsets[i]});
         }
         check(cudaMalloc(reinterpret_cast<void**>(&device_tables_),
                          tables.size() * sizeof(EngramLocalTable)));
@@ -185,8 +208,7 @@ PYBIND11_MODULE(_engram_cuda, m) {
     py::class_<LocalTable, std::shared_ptr<LocalTable>>(m, "LocalTable")
         .def(py::init<py::array>(), py::arg("array").noconvert());
     py::class_<Lookup>(m, "Lookup")
-        .def(py::init<std::vector<std::shared_ptr<LocalTable>>,
-                      const std::vector<int64_t>&>())
+        .def(py::init<std::vector<py::object>, const std::vector<int64_t>&>())
         .def("run", &Lookup::run)
         .def("synchronize", &Lookup::synchronize);
 }

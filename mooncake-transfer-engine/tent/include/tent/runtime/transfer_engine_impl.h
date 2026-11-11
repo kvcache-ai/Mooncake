@@ -32,6 +32,7 @@
 #include "tent/common/config_lifecycle.h"
 #include "tent/common/status.h"
 #include "tent/common/types.h"
+#include "tent/common/mapped_memory.h"
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
@@ -293,6 +294,10 @@ class TransferEngineImpl {
     Status closeSegment(SegmentID handle);
 
     Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
+    Status getMnnvlEgmInfo(std::vector<EgmNumaInfo>& info, bool nearest);
+    Status acquireMnnvlMemory(SegmentID segment, uint64_t address,
+                              size_t length, int device,
+                              std::shared_ptr<MappedMemory>& mapping);
 
    public:
     Status allocateLocalMemory(void** addr, size_t size,

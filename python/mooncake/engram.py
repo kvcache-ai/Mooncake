@@ -29,8 +29,11 @@ class EngramStore:
     Persistent local files survive close; anonymous tables (persistent=False)
     are released on close or process exit. CPU lookup is synchronous. CUDA
     lookup enqueues the complete operation on the supplied stream, including
-    completion, and returns None. ``store_client`` is reserved for a future
-    remote backend; remote tables are not supported yet.
+    completion, and returns None.
+
+    ``store_client`` is retained for a future KV Store backend. MNNVL EGM uses
+    ``populate_shard_and_sync`` on a newly created anonymous Store and requires
+    explicit coordinated initialization and shutdown.
     """
 
     def __init__(
@@ -43,6 +46,9 @@ class EngramStore:
         persistent=True,
     ):
         self._closed = False
+        self._remote = None
+        self._locally_used = False
+        self._namespace = namespace
         self._lock = threading.RLock()
         self._mappings = {}
         self._cuda_tables = {}
@@ -92,8 +98,78 @@ class EngramStore:
             raise TypeError("Expected a NumPy array or CPU tensor")
         return value.detach().numpy()
 
+    def populate_shard_and_sync(
+        self,
+        local_rows,
+        *,
+        backend,
+        shard_id,
+        num_shards,
+        table_owners,
+        master_addr,
+        session_id,
+        caller_id,
+        num_callers,
+        max_lookup_rows,
+        max_egm_bytes_per_numa,
+        device=None,
+        host_id=None,
+        numa_node=None,
+        rpc_hostname="",
+        init_timeout_s=300,
+        close_timeout_s=60,
+    ):
+        """Publish this node's shard of EGM tables; every caller invokes this in
+        the same order before graph capture.
+
+        Only backend='mnnvl' is supported, and persistent=False is required.
+        Each table is provided as complete CPU uint8 data by one NUMA writer on
+        its owner node; non-writers pass an empty dict. Destroy the graph before
+        closing; every caller must call close explicitly, and the deployment
+        session cannot be reused after a timeout.
+        """
+        with self._lock:
+            if self._closed or self._remote is not None or self._locally_used:
+                raise RuntimeError(
+                    "Only a new, unused Store can initialize the remote backend"
+                )
+            if backend != "mnnvl":
+                raise ValueError(
+                    "Coordinated initialization supports only backend='mnnvl'"
+                )
+            if self._persistent:
+                raise ValueError("MNNVL Engram requires persistent=False")
+            from ._engram_mnnvl_backend import Backend
+
+            rows = {name: self._array(array) for name, array in local_rows.items()}
+            self._remote = Backend(
+                self._specs,
+                self._namespace,
+                shard_id=shard_id,
+                num_shards=num_shards,
+                table_owners=table_owners,
+                master_addr=master_addr,
+                session_id=session_id,
+                caller_id=caller_id,
+                num_callers=num_callers,
+                max_lookup_rows=max_lookup_rows,
+                max_egm_bytes_per_numa=max_egm_bytes_per_numa,
+                device=device,
+                host_id=host_id,
+                numa_node=numa_node,
+                rpc_hostname=rpc_hostname,
+                init_timeout_s=init_timeout_s,
+                close_timeout_s=close_timeout_s,
+            )
+            self._remote.initialize(rows)
+
     def populate(self, table_id, rows):
         with self._lock:
+            if self._remote is not None:
+                raise RuntimeError(
+                    "Cannot override the already selected MNNVL backend"
+                )
+            self._locally_used = True
             spec = self._spec(table_id)
             rows = self._array(rows)
             shape = (spec["num_rows"], spec["row_bytes"])
@@ -185,6 +261,10 @@ class EngramStore:
         graph capture; destroy captured graphs before closing this Store.
         """
         with self._lock:
+            if self._remote is not None:
+                self._remote.validate_lookup(row_ids, stream)
+            else:
+                self._locally_used = True
             table_ids = tuple(table_ids)
             specs = [self._spec(name) for name in table_ids]
             if not specs or any(s["row_bytes"] != specs[0]["row_bytes"] for s in specs):
@@ -259,7 +339,11 @@ class EngramStore:
             tables = []
             for name in names:
                 if name not in self._cuda_tables:
-                    self._cuda_tables[name] = _engram_cuda.LocalTable(self._open(name))
+                    self._cuda_tables[name] = (
+                        self._remote.tables[name]
+                        if self._remote is not None
+                        else _engram_cuda.LocalTable(self._open(name))
+                    )
                 tables.append(self._cuda_tables[name])
             self._cuda_lookups[key] = _engram_cuda.Lookup(tables, offsets)
         self._cuda_lookups[key].run(ids, out, stream)
@@ -267,6 +351,8 @@ class EngramStore:
     def remove(self, table_id):
         with self._lock:
             self._spec(table_id)
+            if self._remote is not None:
+                raise RuntimeError("MNNVL tables are released by close()")
             if not self._persistent:
                 raise RuntimeError("Anonymous tables are released by close()")
             if table_id in self._mappings:
@@ -285,9 +371,10 @@ class EngramStore:
                 return
             for lookup in self._cuda_lookups.values():
                 lookup.synchronize()
-            lookup = None
             self._cuda_lookups.clear()
             self._cuda_tables.clear()
+            if self._remote is not None:
+                self._remote.close()
             for name in list(self._mappings):
                 mapping, array = self._mappings.pop(name)
                 del array
@@ -303,4 +390,11 @@ class EngramStore:
 
     def __del__(self):
         with contextlib.suppress(Exception):
-            self.close()
+            if self._remote is not None and not self._closed:
+                # GC cannot replace cross-process coordinated shutdown, nor
+                # discard resources used by the graph.
+                from .engram_session import abandon
+
+                abandon(self)
+            else:
+                self.close()

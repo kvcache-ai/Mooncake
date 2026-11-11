@@ -2,6 +2,12 @@
 # not add_test targets. tent/benchmark/hip_bandwidth_bench.cpp is a standalone
 # hipcc program.
 
+add_executable(tent_mapped_memory_test mapped_memory_test.cpp)
+target_include_directories(tent_mapped_memory_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(tent_mapped_memory_test PRIVATE tent_common gtest gtest_main)
+add_test(NAME tent_mapped_memory_test COMMAND tent_mapped_memory_test)
+
 add_executable(tent_diagnostic_test diagnostic_test.cpp)
 target_link_libraries(tent_diagnostic_test PRIVATE tent_diagnostics gtest
                                                    gtest_main)
@@ -392,6 +398,15 @@ if(USE_CUDA)
                                                           tent_link_group)
   target_include_directories(tent_mnnvl_transport_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  # acquireEgmMemory only inspects transport configuration, so this case runs
+  # without the real-GPU setup the rest of the executable needs.
+  add_test(
+    NAME tent_mnnvl_transport_AcquireEgmRequiresStrictTransportAndEmptyOutput
+    COMMAND
+      tent_mnnvl_transport_test --gtest_filter=MnnvlTransportTest.AcquireEgmRequiresStrictTransportAndEmptyOutput)
+  set_tests_properties(
+    tent_mnnvl_transport_AcquireEgmRequiresStrictTransportAndEmptyOutput
+    PROPERTIES TIMEOUT 120)
 endif()
 
 add_executable(tent_endpoint_lifecycle_test endpoint_lifecycle_test.cpp)

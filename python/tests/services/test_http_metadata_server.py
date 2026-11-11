@@ -24,6 +24,83 @@ class HttpMetadataServerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.server = KVBootstrapServer(port=0)
 
+    async def test_conditional_put_has_one_winner(self):
+        requests = [
+            FakeRequest(
+                "PUT",
+                key="engram/session/member",
+                body=str(i).encode(),
+                headers={"If-None-Match": "*"},
+            )
+            for i in range(8)
+        ]
+        responses = await asyncio.gather(
+            *(self.server._handle_metadata(request) for request in requests)
+        )
+        self.assertEqual(sum(response.status == 200 for response in responses), 1)
+        self.assertEqual(sum(response.status == 412 for response in responses), 7)
+        self.assertTrue(
+            all(
+                response.headers["X-Mooncake-Conditional-Put"] == "1"
+                for response in responses
+            )
+        )
+        stored = self.server.store["engram/session/member"]
+        again = await self.server._handle_metadata(
+            FakeRequest(
+                "PUT",
+                key="engram/session/member",
+                body=stored,
+                headers={"If-None-Match": "*"},
+            )
+        )
+        self.assertEqual(again.status, 412)
+        self.assertEqual(self.server.store["engram/session/member"], stored)
+
+    async def test_engram_metadata_client_round_trip(self):
+        from mooncake.engram_session import Metadata
+        import time
+
+        async with TestClient(TestServer(self.server.app)) as client:
+            metadata = Metadata(str(client.make_url("/metadata")))
+            deadline = time.monotonic() + 5
+            await asyncio.to_thread(
+                metadata.create, "engram/member", {"nonce": "first"}, deadline
+            )
+            await asyncio.to_thread(
+                metadata.create, "engram/member", {"nonce": "first"}, deadline
+            )
+            with self.assertRaises(RuntimeError):
+                await asyncio.to_thread(
+                    metadata.create, "engram/member", {"nonce": "other"}, deadline
+                )
+            value = await asyncio.to_thread(metadata.get, "engram/member", deadline)
+            self.assertEqual(value, {"nonce": "first"})
+
+    async def test_engram_metadata_client_accepts_409_conflict(self):
+        import json
+        import time
+
+        from mooncake.engram_session import Metadata
+
+        metadata = Metadata("http://127.0.0.1:1/metadata")
+        stored = {"nonce": "first"}
+
+        def request(key, deadline, body=None):
+            if body is not None:
+                return 409, {"X-Mooncake-Conditional-Put": "1"}, b""
+            return 200, {}, json.dumps(stored).encode()
+
+        metadata.request = request
+        deadline = time.monotonic() + 1
+        await asyncio.to_thread(
+            metadata.create, "engram/member", stored, deadline
+        )
+        with self.assertRaises(RuntimeError):
+            await asyncio.to_thread(
+                metadata.create, "engram/member", {"nonce": "other"}, deadline
+            )
+
     async def test_missing_metadata_key_is_rejected_for_all_methods(self):
         for method in ("GET", "PUT", "DELETE"):
             with self.subTest(method=method):

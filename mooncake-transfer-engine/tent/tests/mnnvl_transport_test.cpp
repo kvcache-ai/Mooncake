@@ -651,6 +651,21 @@ TEST(MnnvlTransportTest, RelocateRejectsMalformedPosixFdHandle) {
 
 // transports/mnnvl/egm_strict without transports/mnnvl/egm must refuse host
 // allocations instead of silently handing out memory peers cannot address.
+TEST(MnnvlTransportTest, AcquireEgmRequiresStrictTransportAndEmptyOutput) {
+    MnnvlTransport transport;
+    std::shared_ptr<MappedMemory> mapping;
+    EXPECT_FALSE(
+        transport.acquireEgmMemory(LOCAL_SEGMENT_ID, 4096, 4096, 0, mapping)
+            .ok());
+    EXPECT_FALSE(mapping);
+    mapping =
+        std::make_shared<MappedMemory>(4096, 4096, [] { return Status::OK(); });
+    EXPECT_FALSE(
+        transport.acquireEgmMemory(LOCAL_SEGMENT_ID, 4096, 4096, 0, mapping)
+            .ok());
+    EXPECT_EQ(mapping->address(), 4096);
+}
+
 TEST(MnnvlTransportTest, StrictEgmRejectsHostAllocationWithoutEgm) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
