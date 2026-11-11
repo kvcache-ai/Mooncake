@@ -41,11 +41,14 @@ run_ep_tests()
         echo '===== Existing EP unit checks ====='
         python3 -m pytest /tmp/mooncake-ep-tests/test_fp8_cast.py \
             /tmp/mooncake-ep-tests/test_mooncake_elastic_buffer_transport.py -v
-        echo '===== Existing EP grid: bounded native profile ====='
-        PYTHONPATH=/tmp/mooncake-ep-tests \
+        echo '===== Existing EP grid: single-node native P2P ====='
         timeout --signal=TERM --kill-after=30s 900s \
-            python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
-            --max-restarts=0 /test_run/e2e/python/test_mooncake_ep_smoke.py
+            python3 /tmp/mooncake-ep-tests/test_ep_grid.py \
+            --local-p2p --num-ranks 2 --iterations 3
+        echo '===== Existing legacy EP correctness and bandwidth ====='
+        timeout --signal=TERM --kill-after=30s 900s \
+            python3 /tmp/mooncake-ep-tests/test_mooncake_ep.py \
+            --pg-backend nccl --num-ranks 2 --require-native
         echo '===== Existing EP benchmark: short routing sweep ====='
         for route in uniform k_hot zipf; do
             timeout --signal=TERM --kill-after=30s 300s \
