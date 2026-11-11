@@ -29,6 +29,10 @@ namespace tent {
 
 constexpr int32_t kAscendDefaultTransferTimeoutMs = 10000;
 constexpr int32_t kAscendDefaultBasePort = 20000;
+// Disconnect timeout used when aborting the HIXL sessions of a timed-out route.
+// A caller-judged timeout must Disconnect the peer: HIXL never reports TIMEOUT
+// itself and has no cancel API, and Disconnect is what aborts the in-flight
+// device DMA of that peer.
 constexpr int32_t kAscendTimeoutDisconnectMs = 1000;
 constexpr const char* kDefaultLocalCommRes = R"({"version":"1.3"})";
 constexpr const char* kHixlNameAttr = "hixl_name";
@@ -85,6 +89,35 @@ uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id);
 std::vector<std::string> ParseHixlNames(const MemorySegmentDesc& detail);
 std::string ResolveRemoteHixlName(const MemorySegmentDesc& detail,
                                   uint64_t dest_addr);
+
+// Resolves the destination engine's HIXL name for many requests that target one
+// segment, for example the thousands of page requests of a page-granular
+// batch. Construction parses the segment's hixl_names JSON and the per-buffer
+// engine mapping once; Resolve() then only walks the small range table.
+// Reparsing the JSON per request dominated submission for a peer segment that
+// publishes many engines (for example the 16-engine segment holder of
+// standalone mode).
+class HixlNameResolver {
+   public:
+    HixlNameResolver() = default;
+    explicit HixlNameResolver(const MemorySegmentDesc& detail);
+
+    // HIXL engine name that owns dest_addr, or an empty string when the
+    // segment publishes no engine name.
+    const std::string& Resolve(uint64_t dest_addr) const;
+
+   private:
+    struct BufferRange {
+        uint64_t begin;
+        uint64_t length;
+        size_t name_idx;
+    };
+
+    std::vector<std::string> names_;
+    std::vector<BufferRange> ranges_;
+
+    static const std::string empty_;
+};
 
 }  // namespace tent
 }  // namespace mooncake
