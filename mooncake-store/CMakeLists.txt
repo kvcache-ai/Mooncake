@@ -1,5 +1,7 @@
 project(MooncakeStore VERSION 2.0.0)
 
+set(MOONCAKE_STORE_INCLUDE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
 # Extract version components for C++ usage
 set(MOONCAKE_STORE_VERSION ${PROJECT_VERSION})
 
@@ -9,18 +11,6 @@ if (STORE_USE_ETCD)
 else()
     message(STATUS "STORE_USE_ETCD=OFF, high availability of Store is disabled")
 endif()
-
-# Add include directories
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/fake_include
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/mooncake-store/proto/
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/
-    ${CMAKE_CURRENT_BINARY_DIR}/include/
-    ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/include
-    ${ETCD_WRAPPER_INCLUDE}
-)
 
 set(MOONCAKE_STORE_CLIENT_ARCH "centralized" CACHE STRING
     "Store architecture for master, client, tests and benchmarks: centralized or p2p")
@@ -45,5 +35,8 @@ add_subdirectory(src)
 
 if (BUILD_UNIT_TESTS)
     add_subdirectory(tests)
+endif()
+
+if (BUILD_BENCHMARK)
     add_subdirectory(benchmarks)
 endif()

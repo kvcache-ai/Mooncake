@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "client_service.h"
 
 namespace mooncake {

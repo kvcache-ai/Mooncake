@@ -17,7 +17,8 @@
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "p2p/client/tiered_cache/tiers/cache_tier.h"
 #include "p2p/client/tiered_cache/data_copier.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
+#include "common/client_buffer_allocation.h"
 #include "utils.h"
 
 #include <async_simple/Promise.h>

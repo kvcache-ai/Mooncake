@@ -9,6 +9,7 @@ if(USE_HIP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+set_target_properties(transfer_engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()

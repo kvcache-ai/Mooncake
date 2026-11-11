@@ -9,6 +9,9 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
 
+  add_subdirectory(../extern/pybind11
+                   ${CMAKE_CURRENT_BINARY_DIR}/extern/pybind11)
+
   # Build asio_shared library for standalone build
   # Set compile definitions before add_subdirectory to ensure proper compilation
   add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)

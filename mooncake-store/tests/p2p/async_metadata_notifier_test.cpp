@@ -12,6 +12,8 @@
 #include <string>
 #include <thread>
 
+#include "common/network.h"
+
 #define private public
 #define protected public
 #include "p2p/client/async_metadata_notifier.h"

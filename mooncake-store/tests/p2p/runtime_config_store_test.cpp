@@ -9,6 +9,7 @@
 
 #include <ylt/coro_http/coro_http_client.hpp>
 
+#include "common/network.h"
 #include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/p2p_client_service.h"
 #include "p2p/client/runtime_config_store.h"

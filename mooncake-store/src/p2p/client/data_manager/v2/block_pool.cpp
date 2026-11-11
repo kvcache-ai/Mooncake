@@ -19,7 +19,7 @@
 #include <cstring>
 #include <filesystem>
 
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "transfer_engine.h"
 #include "utils.h"
 

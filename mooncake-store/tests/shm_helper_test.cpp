@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-#include "dummy_client.h"
+#include "shm_helper.h"
 
 namespace mooncake {
 

@@ -27,7 +27,6 @@ add_store_test(serializer_test serializer_test.cpp)
 add_store_test(shm_helper_test shm_helper_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(real_client_deployment_test real_client_deployment_test.cpp)
-target_link_libraries(real_client_deployment_test PRIVATE mooncake_master_core)
 set_tests_properties(real_client_deployment_test
     PROPERTIES LABELS "${MOONCAKE_STORE_CLIENT_ARCH};client;deployment" TIMEOUT 180)
 add_store_test(real_client_shm_ping_test real_client_shm_ping_test.cpp)

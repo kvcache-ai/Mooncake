@@ -23,6 +23,7 @@
 
 #include <ylt/coro_http/coro_http_client.hpp>
 
+#include "common/network.h"
 #include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/p2p_client_service.h"
 #include "test_p2p_server_helpers.h"

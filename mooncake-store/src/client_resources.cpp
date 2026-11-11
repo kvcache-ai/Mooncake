@@ -11,7 +11,8 @@
 #include <thread>
 #include <utility>
 
-#include "client_buffer.hpp"
+#include "client_buffer.h"
+#include "common/network.h"
 #include "config.h"
 #include "transfer_engine.h"
 #include "utils.h"

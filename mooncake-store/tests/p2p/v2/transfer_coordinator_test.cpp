@@ -11,6 +11,7 @@
 
 #include <async_simple/coro/SyncAwait.h>
 
+#include "common/network.h"
 #include "config.h"
 #include "p2p/client/data_manager/v2/transfer_coordinator.h"
 #include "utils.h"

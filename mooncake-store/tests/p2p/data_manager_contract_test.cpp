@@ -25,7 +25,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "p2p/client/data_manager.h"
 #include "p2p/client/data_manager_factory.h"
 #include "p2p/client/data_manager_test_hook.h"

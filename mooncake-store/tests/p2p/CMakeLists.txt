@@ -44,8 +44,7 @@ function(add_p2p_store_test_with_custom_main name)
 endfunction()
 
 function(add_p2p_master_test name)
-    add_executable(${name} ${ARGN})
-    target_link_libraries(${name} PRIVATE mooncake_master_core gtest gtest_main)
+    add_p2p_store_executable(${name} ${ARGN})
     add_test(NAME ${name} COMMAND ${name})
     set_tests_properties(${name} PROPERTIES LABELS "p2p;master;unit")
 endfunction()
@@ -53,13 +52,12 @@ endfunction()
 # master side
 add_p2p_master_test(p2p_route_table_test p2p_route_table_test.cpp)
 add_p2p_master_test(p2p_rpc_types_test p2p_rpc_types_test.cpp)
-add_p2p_master_test(p2p_master_rpc_test
-    p2p_master_rpc_test.cpp
-    ../../src/p2p/master/p2p_master_client.cpp)
+add_p2p_master_test(p2p_master_rpc_test p2p_master_rpc_test.cpp)
 set_tests_properties(p2p_master_rpc_test PROPERTIES TIMEOUT 60)
 add_p2p_master_test(p2p_master_service_test p2p_master_service_test.cpp)
 add_p2p_master_test(p2p_master_http_endpoints_test p2p_master_http_endpoints_test.cpp)
 add_p2p_master_test(p2p_master_metrics_test p2p_master_metrics_test.cpp)
+add_p2p_master_test(client_metrics_aggregator_test client_metrics_aggregator_test.cpp)
 add_p2p_master_test(p2p_segment_manager_test p2p_segment_manager_test.cpp)
 add_p2p_master_test(p2p_client_manager_test p2p_client_manager_test.cpp)
 add_p2p_master_test(p2p_client_meta_test p2p_client_meta_test.cpp)
@@ -137,7 +135,6 @@ add_p2p_store_test(v2_evict_engine_test v2/evict_engine_test.cpp)
 add_p2p_store_test(route_cache_test route_cache_test.cpp)
 add_p2p_store_test(async_metadata_notifier_test async_metadata_notifier_test.cpp)
 add_p2p_store_test(runtime_config_store_test runtime_config_store_test.cpp)
-add_p2p_store_test(client_metrics_aggregator_test client_metrics_aggregator_test.cpp)
 add_p2p_store_test(p2p_client_metrics_test p2p_client_metrics_test.cpp)
 add_p2p_store_test(p2p_client_config_builder_test client_config_builder_test.cpp)
 add_p2p_store_test(client_http_metrics_test client_http_metrics_test.cpp)
@@ -195,6 +192,13 @@ add_p2p_store_test(p2p_oplog_test
     ha/oplog/p2p_hot_standby_service_test.cpp
 )
 
+# These callers compute checksums independently of the Store implementation.
+foreach(target oplog_serializer_test oplog_applier_test
+               oplog_replicator_test p2p_oplog_test)
+    target_include_directories(${target} PRIVATE ${XXHASH_INCLUDE_DIR})
+    target_link_libraries(${target} PRIVATE ${XXHASH_LIBRARY})
+endforeach()
+
 set_tests_properties(p2p_client_ha_test ha_integration_test metadata_recovery_worker_test
     oplog_manager_test oplog_serializer_test localfs_oplog_store_test
     standby_state_machine_test ha_metric_manager_test oplog_applier_test
@@ -206,12 +210,17 @@ add_executable(redis_election_helper_test redis_election_helper_test.cpp)
 target_link_libraries(redis_election_helper_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
     add_test(NAME redis_election_helper_test COMMAND redis_election_helper_test)
     add_p2p_store_test(redis_oplog_store_test ha/oplog/redis_oplog_store_test.cpp)
-add_p2p_store_test(redis_oplog_trim_worker_test
-    ha/oplog/redis_oplog_trim_worker_test.cpp)
-target_link_options(redis_oplog_store_test PRIVATE
-    "LINKER:--wrap=redisCommand"
-    "LINKER:--wrap=redisAppendCommand"
-    "LINKER:--wrap=redisGetReply")
+    add_p2p_store_test(redis_oplog_trim_worker_test
+        ha/oplog/redis_oplog_trim_worker_test.cpp)
+    foreach(target p2p_client_ha_test redis_election_helper_test redis_oplog_store_test)
+        target_link_libraries(${target} PRIVATE ${HIREDIS_LIB})
+    endforeach()
+    target_include_directories(redis_oplog_store_test PRIVATE ${XXHASH_INCLUDE_DIR})
+    target_link_libraries(redis_oplog_store_test PRIVATE ${XXHASH_LIBRARY})
+    target_link_options(redis_oplog_store_test PRIVATE
+        "LINKER:--wrap=redisCommand"
+        "LINKER:--wrap=redisAppendCommand"
+        "LINKER:--wrap=redisGetReply")
     set_tests_properties(redis_election_helper_test redis_oplog_store_test
         redis_oplog_trim_worker_test PROPERTIES LABELS "p2p;ha;redis")
 endif()

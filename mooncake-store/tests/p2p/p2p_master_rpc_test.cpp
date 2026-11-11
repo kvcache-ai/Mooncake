@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/network.h"
 #include "p2p/master/p2p_master_client.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "p2p/master/p2p_rpc_service.h"

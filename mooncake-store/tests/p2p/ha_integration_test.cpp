@@ -73,6 +73,8 @@ extern "C" int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
 }
 #endif
 
+#include "common/network.h"
+
 #define private public
 #define protected public
 #include "p2p/client/p2p_client_config_builder.h"
