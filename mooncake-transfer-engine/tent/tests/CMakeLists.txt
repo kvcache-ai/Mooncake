@@ -969,3 +969,10 @@ if(USE_MLU)
     "-Wl,--wrap=cnQueryNotifier"
     "-Wl,--wrap=cnQueryQueue")
 endif()
+
+# Exercise the C translation unit against the production shared library.
+enable_language(C)
+add_executable(tent_c_status_test c_status_test.cpp status_c_api_smoke.c)
+target_link_libraries(tent_c_status_test PRIVATE tent_shared tent_interface
+                                                 gtest gtest_main)
+add_test(NAME tent_c_status_test COMMAND tent_c_status_test)
