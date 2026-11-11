@@ -305,8 +305,49 @@ TEST_F(HAMetricManagerTest, TestBatchRecordMetrics) {
         EXPECT_NE(std::string::npos, text.find(name)) << name;
     }
 }
+
+TEST_F(HAMetricManagerTest, BatchRecordPhaseLatenciesIncludeZeroSamples) {
+    const struct {
+        const char* name;
+        void (HAMetricManager::*observe)(int64_t);
+    } metrics[] = {
+        {"ha_batch_record_encode_latency_us",
+         &HAMetricManager::observe_batch_record_encode_latency_us},
+        {"ha_batch_record_decode_latency_us",
+         &HAMetricManager::observe_batch_record_decode_latency_us},
+        {"ha_batch_record_backend_txn_latency_us",
+         &HAMetricManager::observe_batch_record_backend_txn_latency_us},
+    };
+    for (const auto& metric : metrics) {
+        SCOPED_TRACE(metric.name);
+        const std::string count_name = std::string(metric.name) + "_count";
+        const std::string sum_name = std::string(metric.name) + "_sum";
+        const auto before = M().serialize_metrics();
+        const auto count_before =
+            FindSerializedMetricValue(before, count_name).value_or(0);
+        const auto sum_before =
+            FindSerializedMetricValue(before, sum_name).value_or(0);
+
+        (M().*metric.observe)(0);
+        const auto after_zero = M().serialize_metrics();
+        EXPECT_EQ(count_before + 1,
+                  FindSerializedMetricValue(after_zero, count_name));
+        EXPECT_EQ(sum_before, FindSerializedMetricValue(after_zero, sum_name));
+
+        (M().*metric.observe)(125);
+
+        const auto after = M().serialize_metrics();
+        EXPECT_EQ(count_before + 2,
+                  FindSerializedMetricValue(after, count_name));
+        EXPECT_EQ(sum_before + 125, FindSerializedMetricValue(after, sum_name));
+    }
+}
 #else
 TEST_F(HAMetricManagerTest, BatchRecordMetricsAreAbsentWhenDisabled) {
+    M().observe_batch_record_batch_bytes(1024);
+    M().observe_batch_record_encode_latency_us(10);
+    M().observe_batch_record_decode_latency_us(20);
+    M().observe_batch_record_backend_txn_latency_us(100);
     EXPECT_EQ(std::string::npos,
               M().serialize_metrics().find("ha_batch_record_"));
 }

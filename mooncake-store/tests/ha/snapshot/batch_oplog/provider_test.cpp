@@ -168,6 +168,111 @@ TEST_F(BatchOpLogSnapshotProviderTest, AllAbsentNamespaceIsAnEmptyBaseline) {
     EXPECT_EQ(EncodeDurablePrefix({.batch_id = 0, .last_seq = 0}), prefix);
 }
 
+TEST_F(BatchOpLogSnapshotProviderTest,
+       RestoresManagedMetadataAndAppliesSuffixRemoval) {
+    LocalFileSnapshotObjectStore object_store(root_);
+    EmptyBackend backend;
+
+    OpLogEntry suffix_entry;
+    suffix_entry.sequence_id = 3;
+    suffix_entry.op_type = OpType::REMOVE;
+    suffix_entry.tenant_id = "tenant";
+    suffix_entry.object_key = "removed-after-snapshot";
+    OpLogBatchRecord suffix_batch{.batch_id = 2,
+                                  .first_seq = 3,
+                                  .last_seq = 3,
+                                  .entries = {suffix_entry}};
+    ASSERT_EQ(ErrorCode::OK, backend.Put(BuildBatchRecordKey("clusterA", 2),
+                                         EncodeOpLogBatchRecord(suffix_batch)));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 3})));
+
+    const std::string snapshot_id = "1-7";
+    StandbyObjectMetadata metadata_value;
+    metadata_value.client_id = {4, 9};
+    metadata_value.size = 8192;
+    metadata_value.group_id = "managed-group";
+    metadata_value.data_type = ObjectDataType::WEIGHT;
+    metadata_value.hard_pinned = true;
+    const auto chunk = EncodeBatchOpLogSnapshotObjectChunk(
+        0, {{.tenant_id = "tenant",
+             .key = "managed-weight",
+             .metadata = metadata_value},
+            {.tenant_id = "tenant",
+             .key = "removed-after-snapshot",
+             .metadata = metadata_value}});
+    const auto chunk_key =
+        ha::BuildBatchOpLogSnapshotObjectChunkKey("snapshots", snapshot_id, 0);
+    ASSERT_TRUE(object_store.UploadBuffer(chunk_key, chunk));
+
+    const auto segments_key =
+        ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", snapshot_id);
+    const auto segments = EncodeBatchOpLogSnapshotSegments({});
+    ASSERT_TRUE(object_store.UploadBuffer(segments_key, segments));
+    ha::BatchOpLogSnapshotManifest manifest;
+    manifest.snapshot_id = snapshot_id;
+    manifest.last_included_seq = 2;
+    manifest.last_included_batch_id = 1;
+    manifest.producer_view_version = 7;
+    manifest.segments = {
+        .key = segments_key,
+        .stored_size = segments.size(),
+        .crc32c = Crc32cValue(segments.data(), segments.size())};
+    manifest.object_chunks = {
+        {.chunk_index = 0,
+         .key = chunk_key,
+         .object_count = 2,
+         .stored_size = chunk.size(),
+         .crc32c = Crc32cValue(chunk.data(), chunk.size())}};
+    const auto manifest_bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
+    const auto manifest_key =
+        ha::BuildBatchOpLogSnapshotManifestKey("snapshots", snapshot_id);
+    ASSERT_TRUE(object_store.UploadString(manifest_key, manifest_bytes));
+
+    ha::BatchOpLogSnapshotDescriptor descriptor;
+    descriptor.snapshot_id = snapshot_id;
+    descriptor.last_included_seq = 2;
+    descriptor.last_included_batch_id = 1;
+    descriptor.producer_view_version = 7;
+    descriptor.manifest_key = manifest_key;
+    descriptor.manifest_size = manifest_bytes.size();
+    descriptor.manifest_crc32c =
+        Crc32cValue(manifest_bytes.data(), manifest_bytes.size());
+    const auto descriptor_bytes =
+        ha::EncodeBatchOpLogSnapshotDescriptor(descriptor);
+    const auto descriptor_key =
+        ha::BuildBatchOpLogSnapshotDescriptorKey("snapshots", snapshot_id);
+    ASSERT_TRUE(object_store.UploadString(descriptor_key, descriptor_bytes));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotLatestKey("clusterA"),
+                          descriptor_bytes));
+
+    BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
+                                        "snapshots");
+    StandbyMetadataStore restored;
+    StandbySegmentRegistry registry;
+    OpLogApplier applier(&restored, "clusterA");
+    auto result = provider.RestoreBaseline(restored, registry, &applier);
+
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    EXPECT_EQ(2u, result->last_included_seq);
+    EXPECT_EQ(1u, result->last_included_batch_id);
+    EXPECT_EQ(3u, result->last_applied_seq);
+    EXPECT_EQ(2u, result->last_applied_batch_id);
+    EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+    EXPECT_EQ(1u, restored.GetKeyCount());
+    EXPECT_FALSE(restored.Exists("tenant", "removed-after-snapshot"));
+    const auto recovered = restored.GetMetadata("tenant", "managed-weight");
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(metadata_value.client_id, recovered->client_id);
+    EXPECT_EQ(8192u, recovered->size);
+    EXPECT_EQ("managed-group", recovered->group_id);
+    EXPECT_EQ(ObjectDataType::WEIGHT, recovered->data_type);
+    EXPECT_TRUE(recovered->hard_pinned.value_or(false));
+    EXPECT_EQ(7, result->producer_view_version);
+}
+
 TEST_F(BatchOpLogSnapshotProviderTest, RestoreHonorsCancellation) {
     EmptyBackend backend;
     LocalFileSnapshotObjectStore object_store(root_);
