@@ -1041,9 +1041,14 @@ void WorkerPool::performPostSend(int thread_id) {
         local_slice_queue.clear();
         for (auto &entry : local_slice_queue_clone) {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-            for (auto *slice : entry.second)
-                adaptive_congestion_control_.observeUnavailable(
-                    slice, entry.first, TaskCongestionFailureScope::kDevice);
+            if (adaptive_congestion_control_.enabled()) {
+                const auto local_nic_path = context_.nicPath();
+                for (auto *slice : entry.second)
+                    adaptive_congestion_control_.observeUnavailable(
+                        slice, local_nic_path,
+                        TaskCongestionFailureScope::kDevice, std::nullopt,
+                        TaskCongestionReason::kNoUsablePath);
+            }
 #endif
             redispatch(entry.second, thread_id, true);
         }
