@@ -7,7 +7,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <system_error>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -44,11 +43,25 @@ class DurableWaitExecutor final : public async_simple::Executor {
     }
 
     bool schedule(Func task) override {
+        auto task_state = std::make_shared<Func>(std::move(task));
+        auto dispatch = [task_state]() mutable {
+            auto task = std::move(*task_state);
+            if (task) task();
+        };
         if (TestFailPoint::Wait("durable_wait_before_dispatch_failure")) {
-            throw std::system_error(std::make_error_code(
-                std::errc::resource_unavailable_try_again));
+            // async_simple runs a failed continuation inline. Keep that
+            // fallback off the notification drainer, which must remain free
+            // to publish later waiters while this continuation is blocked.
+            fallback_pool_.enqueue(std::move(dispatch));
+            return true;
         }
-        pool_.enqueue(std::move(task));
+        try {
+            pool_.enqueue(dispatch);
+        } catch (...) {
+            // Preserve the executor contract when the primary pool rejects
+            // dispatch; otherwise async_simple would run inline in Complete().
+            fallback_pool_.enqueue(std::move(dispatch));
+        }
         return true;
     }
 
@@ -74,7 +87,9 @@ class DurableWaitExecutor final : public async_simple::Executor {
 
    private:
     DurableWaitExecutor()
-        : pool_(4), notification_thread_([this] { NotificationLoop(); }) {}
+        : pool_(4),
+          fallback_pool_(2),
+          notification_thread_([this] { NotificationLoop(); }) {}
 
     void NotificationLoop() {
         while (true) {
@@ -92,6 +107,7 @@ class DurableWaitExecutor final : public async_simple::Executor {
     }
 
     ThreadPool pool_;
+    ThreadPool fallback_pool_;
     std::mutex notification_mutex_;
     std::condition_variable notification_cv_;
     std::shared_ptr<DurableWaitNotification> notification_head_;

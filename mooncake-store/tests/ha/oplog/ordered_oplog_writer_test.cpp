@@ -2319,27 +2319,42 @@ TEST(OrderedOpLogWriterTimeoutTest, ConcurrentContinuationsCanStopWriter) {
 }
 
 TEST(OrderedOpLogWriterTimeoutTest,
-     DispatchFailureFallbackDoesNotBlockDeadlineThread) {
+     DispatchFailureFallbackDoesNotBlockLaterWaiters) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     ASSERT_EXIT(
         ([] {
             TimeoutGate dispatch_gate("durable_wait_before_dispatch_failure");
             OrderedOpLogWriter writer(
                 {}, [](const auto&, const auto&) { return ErrorCode::OK; });
-            auto callback_entered_promise = std::promise<void>();
-            auto callback_entered = callback_entered_promise.get_future();
-            auto release_callback_promise = std::promise<void>();
-            auto release_callback =
-                release_callback_promise.get_future().share();
-            auto waiter = writer.AwaitDurable(1, std::chrono::milliseconds(1))
+            std::promise<void> first_callback_entered_promise;
+            auto first_callback_entered =
+                first_callback_entered_promise.get_future();
+            std::promise<void> release_first_callback_promise;
+            auto release_first_callback =
+                release_first_callback_promise.get_future().share();
+            auto first = writer.AwaitDurable(1, std::chrono::milliseconds(10))
+                             .thenValue([&](ErrorCode error) {
+                                 first_callback_entered_promise.set_value();
+                                 release_first_callback.wait();
+                                 return error;
+                             });
+            std::promise<void> second_callback_entered_promise;
+            auto second_callback_entered =
+                second_callback_entered_promise.get_future();
+            auto second = writer.AwaitDurable(2, std::chrono::milliseconds(40))
                               .thenValue([&](ErrorCode error) {
-                                  callback_entered_promise.set_value();
-                                  release_callback.wait();
+                                  second_callback_entered_promise.set_value();
                                   return error;
                               });
-            if (!dispatch_gate.WaitForHit() || !dispatch_gate.Release())
+            if (!dispatch_gate.WaitForHit()) std::_Exit(1);
+            // Keep the first completion in executor dispatch while the later
+            // deadline expires and queues behind it.
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            if (!dispatch_gate.Release()) std::_Exit(1);
+            if (first_callback_entered.wait_for(std::chrono::seconds(5)) !=
+                std::future_status::ready)
                 std::_Exit(1);
-            if (callback_entered.wait_for(std::chrono::seconds(5)) !=
+            if (second_callback_entered.wait_for(std::chrono::seconds(2)) !=
                 std::future_status::ready)
                 std::_Exit(1);
 
@@ -2348,8 +2363,10 @@ TEST(OrderedOpLogWriterTimeoutTest,
             if (stopped.wait_for(std::chrono::seconds(2)) !=
                 std::future_status::ready)
                 std::_Exit(1);
-            release_callback_promise.set_value();
-            if (std::move(waiter).get() != ErrorCode::PERSISTENT_FAIL)
+            if (std::move(second).get() != ErrorCode::PERSISTENT_FAIL)
+                std::_Exit(1);
+            release_first_callback_promise.set_value();
+            if (std::move(first).get() != ErrorCode::PERSISTENT_FAIL)
                 std::_Exit(1);
             stopped.get();
             dispatch_gate.Close();
