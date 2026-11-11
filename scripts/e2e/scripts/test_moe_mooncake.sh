@@ -7,13 +7,9 @@ TEST_TYPE="single"
 BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
 . ${BASE_DIR}/scripts/common.sh
 
-run_test()
+run_model_test()
 {
     echo "===== Running pytest tests ====="
-    local log_file="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${test_case_name}.log"
-
-    echo "Running tests in container and saving output to: $log_file"
-
     if ! ${docker_exec} "command -v sgl-eval >/dev/null 2>&1"; then
         echo "ERROR: sgl-eval is missing from the SGLang test container" >&2
         echo "The T-One setup must install the pinned sgl-eval dependency before pytest." >&2
@@ -26,9 +22,57 @@ run_test()
     ${docker_exec} "\
         export PYTHONPATH=/sgl-workspace/sglang:\$PYTHONPATH && \
         cd /test_run/e2e/python && \
-        ${offline_prefix}python3 -m pytest test_moe_mooncake.py -v -s --tb=long" \
-        2>&1 | tee "$log_file"
+        ${offline_prefix}python3 -m pytest test_moe_mooncake.py -v -s --tb=long"
+}
 
+run_ep_tests()
+{
+    local source_root
+    source_root=$(cd "${E2E_DIR:-${BASE_DIR}/../e2e}/../.." && pwd) || return 1
+
+    # Copy tests only: imports of mooncake still resolve to the installed wheel.
+    docker cp "${source_root}/python/tests/ep" \
+        "${CONTAINER_NAME}:/tmp/mooncake-ep-tests" || return 1
+    docker cp "${source_root}/mooncake-ep/benchmarks/ep_benchmark" \
+        "${CONTAINER_NAME}:/tmp/mooncake-ep-benchmark" || return 1
+
+    ${docker_exec} "
+        set -e
+        echo '===== Existing EP unit checks ====='
+        python3 -m pytest /tmp/mooncake-ep-tests/test_fp8_cast.py \
+            /tmp/mooncake-ep-tests/test_mooncake_elastic_buffer_transport.py -v
+        echo '===== Existing EP grid: bounded native profile ====='
+        PYTHONPATH=/tmp/mooncake-ep-tests \
+        timeout --signal=TERM --kill-after=30s 900s \
+            python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
+            --max-restarts=0 /test_run/e2e/python/test_mooncake_ep_smoke.py
+        echo '===== Existing EP benchmark: short routing sweep ====='
+        for route in uniform k_hot zipf; do
+            timeout --signal=TERM --kill-after=30s 300s \
+                python3 -m torch.distributed.run --standalone --nproc-per-node=2 \
+                --max-restarts=0 /tmp/mooncake-ep-benchmark/run_ep_benchmark.py \
+                --pg-backend nccl --require-native --num-tokens 128 \
+                --hidden-size 2048 --num-experts 32 --top-k 4 --dtype bf16 \
+                --routing-mode \$route --hot-experts 4 --warmup-iters 3 --iters 10
+        done
+    "
+}
+
+run_checks()
+{
+    local ep_status=0 model_status=0
+    run_ep_tests || ep_status=$?
+    run_model_test || model_status=$?
+    echo "Native EP checks exit code: $ep_status"
+    echo "Elastic EP backend model test exit code: $model_status"
+    [ "$ep_status" -eq 0 ] && [ "$model_status" -eq 0 ]
+}
+
+run_test()
+{
+    local log_file="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${test_case_name}.log"
+    echo "Running model and native EP checks; saving output to: $log_file"
+    run_checks 2>&1 | tee "$log_file"
     return ${PIPESTATUS[0]}
 }
 

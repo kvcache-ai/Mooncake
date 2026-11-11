@@ -52,7 +52,6 @@ All_TEST_SCRIPTS_SGLANG=(
     "test_1p1d_erdma.sh"
     "test_epd_sglang.sh"
     "test_moe_mooncake.sh"
-    "test_mooncake_ep.sh"
 )
 
 All_TEST_SCRIPTS_VLLM=(
