@@ -4496,4 +4496,172 @@ TEST(TcpWriteVisibilityTest, RpcMetadataRefreshInvalidatesCachedHost) {
         << initial_rpc.ip_or_host_name;
 }
 
+// --- Request coalescing (MC_TCP_COALESCE) ------------------------------------
+// Submits `count` requests of `length` bytes whose local buffers are spaced
+// `local_stride` apart and whose remote ranges start at `remote_offsets[i]`
+// from the pool base, waits for all of them and returns how many wire
+// requests the lanes started.
+int runCoalesceBatch(
+    EngineHandle& h, TransferRequest::OpCode opcode, char* local,
+    size_t local_stride, size_t length,
+    const std::vector<uint64_t>& remote_offsets,
+    TransferStatusEnum expected = TransferStatusEnum::COMPLETED) {
+    const size_t count = remote_offsets.size();
+    std::vector<TransferRequest> requests(count);
+    for (size_t i = 0; i < count; ++i) {
+        requests[i].opcode = opcode;
+        requests[i].length = length;
+        requests[i].source = local + i * local_stride;
+        requests[i].target_id = h.segment_id;
+        requests[i].target_offset = h.remote_base + remote_offsets[i];
+    }
+    const int busy_before = lane_busy_count.load(std::memory_order_acquire);
+    const auto batch_id = h.engine->allocateBatchID(count);
+    EXPECT_TRUE(h.engine->submitTransfer(batch_id, requests).ok());
+    EXPECT_TRUE(waitForBatchTerminal(h.engine.get(), batch_id, count,
+                                     std::chrono::seconds(15)));
+    for (size_t i = 0; i < count; ++i) {
+        TransferStatus status;
+        status.s = TransferStatusEnum::WAITING;
+        EXPECT_TRUE(h.engine->getTransferStatus(batch_id, i, status).ok());
+        EXPECT_EQ(status.s, expected) << "task " << i;
+        if (expected == TransferStatusEnum::COMPLETED)
+            EXPECT_EQ(status.transferred_bytes, length) << "task " << i;
+    }
+    (void)h.engine->freeBatchID(batch_id);
+    return lane_busy_count.load(std::memory_order_acquire) - busy_before;
+}
+
+TEST(TcpWriteVisibilityTest, CoalesceIsOffByDefault) {
+    ScopedLaneHooks hooks;
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.1:17961", 4ull << 20);
+    ASSERT_TRUE(h.ok);
+    auto* local = static_cast<char*>(h.pool) + (2ull << 20);
+    std::vector<uint64_t> remote_offsets(8);
+    for (size_t i = 0; i < 8; ++i) remote_offsets[i] = i * 1000;
+    EXPECT_EQ(runCoalesceBatch(h, TransferRequest::WRITE, local, 4096, 1000,
+                               remote_offsets),
+              8);
+}
+
+TEST(TcpWriteVisibilityTest, CoalesceFoldsContiguousRequestsAndKeepsEveryByte) {
+    ScopedEnvVar coalesce("MC_TCP_COALESCE", "1");
+    ScopedLaneHooks hooks;
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.1:17962", 4ull << 20);
+    ASSERT_TRUE(h.ok);
+    auto* remote = static_cast<char*>(h.pool);
+    auto* local = static_cast<char*>(h.pool) + (2ull << 20);
+    // 1000-byte pieces do not line up with the 64 KiB socket chunk, and the
+    // local buffers are 4096 apart, so a piece that lands in the wrong buffer
+    // or spills past its end is visible.
+    constexpr size_t count = 200, length = 1000, stride = 4096;
+    // Remote ranges are contiguous except for a hole after piece 119.
+    std::vector<uint64_t> remote_offsets(count);
+    for (size_t i = 0; i < count; ++i)
+        remote_offsets[i] = i * length + (i >= 120 ? 5000 : 0);
+
+    for (auto opcode : {TransferRequest::WRITE, TransferRequest::READ}) {
+        memset(remote, 0, 1ull << 20);
+        memset(local, 0, 1ull << 20);
+        for (size_t i = 0; i < count; ++i) {
+            auto* source = opcode == TransferRequest::READ
+                               ? remote + remote_offsets[i]
+                               : local + i * stride;
+            memset(source, static_cast<int>(i % 251 + 1), length);
+        }
+        // One wire request per contiguous run instead of one per piece.
+        EXPECT_EQ(
+            runCoalesceBatch(h, opcode, local, stride, length, remote_offsets),
+            2);
+        for (size_t i = 0; i < count; ++i) {
+            EXPECT_EQ(
+                memcmp(local + i * stride, remote + remote_offsets[i], length),
+                0)
+                << "piece " << i;
+            EXPECT_EQ(local[i * stride + length], 0) << "piece " << i;
+        }
+        EXPECT_EQ(remote[120 * length], 0);
+    }
+}
+
+TEST(TcpWriteVisibilityTest, CoalesceStopsAtRegisteredBufferBoundary) {
+    ScopedEnvVar coalesce("MC_TCP_COALESCE", "1");
+    ScopedLaneHooks hooks;
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.1:17963", 1ull << 20);
+    ASSERT_TRUE(h.ok);
+    // Two adjacent, separately registered buffers. The responder validates a
+    // request against one buffer, so a request spanning both would be
+    // rejected even though each piece on its own is valid.
+    constexpr size_t half = 64 * 1024, length = 16 * 1024;
+    auto* block = static_cast<char*>(aligned_alloc(4096, 2 * half));
+    ASSERT_NE(block, nullptr);
+    memset(block, 0, 2 * half);
+    ASSERT_EQ(h.engine->registerLocalMemory(block, half, "cpu:0"), 0);
+    ASSERT_EQ(h.engine->registerLocalMemory(block + half, half, "cpu:0"), 0);
+
+    auto* local = static_cast<char*>(h.pool);
+    for (size_t i = 0; i < 8; ++i)
+        memset(local + i * length, static_cast<int>(i + 1), length);
+    std::vector<uint64_t> remote_offsets(8);
+    const uint64_t block_offset =
+        reinterpret_cast<uint64_t>(block) - h.remote_base;
+    for (size_t i = 0; i < 8; ++i)
+        remote_offsets[i] = block_offset + i * length;
+    EXPECT_EQ(runCoalesceBatch(h, TransferRequest::WRITE, local, length, length,
+                               remote_offsets),
+              2);
+    EXPECT_EQ(memcmp(local, block, 2 * half), 0);
+
+    ASSERT_EQ(h.engine->unregisterLocalMemory(block), 0);
+    ASSERT_EQ(h.engine->unregisterLocalMemory(block + half), 0);
+    h.engine.reset();
+    free(block);
+}
+
+TEST(TcpWriteVisibilityTest, CoalesceCapsOneWireRequestAt16MiB) {
+    ScopedEnvVar coalesce("MC_TCP_COALESCE", "1");
+    ScopedLaneHooks hooks;
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.1:17964", 64ull << 20);
+    ASSERT_TRUE(h.ok);
+    auto* remote = static_cast<char*>(h.pool);
+    auto* local = remote + (32ull << 20);
+    constexpr size_t count = 6, length = 4ull << 20;
+    for (size_t i = 0; i < count; ++i)
+        memset(local + i * length, static_cast<int>(i + 1), length);
+    std::vector<uint64_t> remote_offsets(count);
+    for (size_t i = 0; i < count; ++i) remote_offsets[i] = i * length;
+    // 24 MiB of contiguous work: four pieces fill the first request.
+    EXPECT_EQ(runCoalesceBatch(h, TransferRequest::WRITE, local, length, length,
+                               remote_offsets),
+              2);
+    EXPECT_EQ(memcmp(local, remote, count * length), 0);
+}
+
+TEST(TcpWriteVisibilityTest, CoalescedItemCountsEveryByteAndFailsEveryTask) {
+    ScopedEnvVar coalesce("MC_TCP_COALESCE", "1");
+    ScopedEnvVar byte_capacity("MC_TCP_MAX_QUEUED_BYTES_PER_PEER", "2");
+    ScopedLaneHooks hooks;
+    HoldingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.1:17965", 64 * 1024);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    // Three contiguous 1-byte writes fold into one 3-byte item, which is over
+    // the 2-byte queue limit: one rejection, and all three tasks must fail.
+    EXPECT_EQ(runCoalesceBatch(h, TransferRequest::WRITE,
+                               static_cast<char*>(h.pool) + 1024, 1, 1,
+                               {0, 1, 2}, TransferStatusEnum::FAILED),
+              0);
+    EXPECT_EQ(queue_rejection_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(fake_peer.acceptedCount(), 0);
+    h.engine.reset();
+}
+
 #endif
