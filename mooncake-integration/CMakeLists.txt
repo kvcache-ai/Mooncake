@@ -21,7 +21,6 @@ endif()
 if(WITH_STORE)
   include_directories("../mooncake-store/include")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
-  include_directories("../mooncake-store/include/engram")
 
   include_directories(
     "../mooncake-store/include/cachelib_memory_allocator/include")
@@ -83,6 +82,23 @@ if(WITH_TE)
   if(USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(engine PRIVATE CUDA::cudart)
+
+    if(BUILD_UNIT_TESTS)
+      find_package(
+        Python3
+        COMPONENTS Development.Embed
+        REQUIRED)
+      add_executable(on_cuda_transport_guard_test
+                     tests/on_cuda_transport_guard_test.cpp)
+      target_include_directories(
+        on_cuda_transport_guard_test
+        PRIVATE $<TARGET_PROPERTY:transfer_engine,INTERFACE_INCLUDE_DIRECTORIES>
+      )
+      target_link_libraries(on_cuda_transport_guard_test
+                            PRIVATE pybind11::headers Python3::Python)
+      add_test(NAME on_cuda_transport_guard_test
+               COMMAND on_cuda_transport_guard_test)
+    endif()
   endif()
 
   if(BUILD_UNIT_TESTS AND USE_TENT)
@@ -92,7 +108,7 @@ if(WITH_TE)
         ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
         "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
         PYTHONPATH=$<TARGET_FILE_DIR:engine>
-        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>:$ENV{LD_LIBRARY_PATH}
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_send_probe.py)
     add_test(
@@ -101,7 +117,7 @@ if(WITH_TE)
         ${CMAKE_COMMAND} -E env MC_USE_TENT=1 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
         "MC_TENT_CONF={\"transports\":{\"rdma\":{\"enable\":false},\"tcp\":{\"enable\":true},\"gds\":{\"enable\":false},\"shm\":{\"enable\":false}}}"
         PYTHONPATH=$<TARGET_FILE_DIR:engine>
-        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>
+        LD_LIBRARY_PATH=$<TARGET_FILE_DIR:transfer_engine>:$<TARGET_FILE_DIR:tent_metrics>:$<TARGET_FILE_DIR:asio_shared>:$ENV{LD_LIBRARY_PATH}
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tent_first_buffer.py)
     set_tests_properties(tent_python_first_buffer_test PROPERTIES TIMEOUT 60)
@@ -146,16 +162,15 @@ if(USE_UBSHMEM)
 endif()
 
 if(WITH_STORE)
+  if(USE_CUDA)
+    add_subdirectory(../mooncake-store/src/engram
+                     ${CMAKE_BINARY_DIR}/mooncake-store/src/engram)
+  endif()
   pybind11_add_module(
-    store
-    ${SOURCES}
-    ${CACHE_ALLOCATOR_SOURCES}
-    store/store_py.cpp
-    store/buffer_pool.cpp
-    store/engram_store_py.cpp
-    integration_utils.h)
-  set_target_properties(
-    store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH "$ORIGIN")
+    store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES} store/store_py.cpp
+    store/buffer_pool.cpp integration_utils.h)
+  set_target_properties(store PROPERTIES OUTPUT_NAME "_store" INSTALL_RPATH
+                                                              "$ORIGIN")
   if(USE_TENT)
     target_link_libraries(store PRIVATE tent)
   endif()
@@ -296,8 +311,8 @@ if(WITH_TE)
                                  COMPONENT python)
   # Co-locate libtent_metrics.so with the Python C extensions so engine.so and
   # _store.so resolve it via $ORIGIN RPATH. The shared TentMetrics singleton
-  # must be loadable wherever the extensions are installed; otherwise
-  # `import mooncake.engine` / `mooncake.store` fails with a missing library.
+  # must be loadable wherever the extensions are installed; otherwise `import
+  # mooncake.engine` / `mooncake.store` fails with a missing library.
   if(TARGET tent_metrics)
     install(TARGETS tent_metrics
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
@@ -307,35 +322,30 @@ endif()
 if(WITH_EP)
   install(TARGETS _ep LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
                               COMPONENT python)
-  # XPU builds no Mooncake PG, so EP_PG_STAGING_DIR is unset there.
-  if(NOT USE_XPU)
+  if(USE_CUDA)
     install(
-      DIRECTORY "${EP_PG_STAGING_DIR}/"
+      FILES "${EP_PG_STAGING_DIR}/libmooncake_ep_device.so"
       DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
-      COMPONENT python
-      FILES_MATCHING
-      PATTERN "*.so")
+      COMPONENT python)
 
     # The CUDA EP JIT runs nvcc on the user's machine, so nvcc needs the kernel
     # headers there too. Put them in the wheel, in a mooncake_ep_jit/ directory
     # next to libmooncake_ep_device.so.
-    if(USE_CUDA)
-      install(
-        DIRECTORY "${CMAKE_BINARY_DIR}/mooncake_ep_jit/"
-        DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/mooncake_ep_jit"
-        COMPONENT python)
-    endif()
+    install(
+      DIRECTORY "${CMAKE_BINARY_DIR}/mooncake_ep_jit/"
+      DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}/mooncake_ep_jit"
+      COMPONENT python)
   endif()
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/ep.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ep_buffer.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_ep_tcpstore.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/mooncake_elastic_buffer.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
-  # ep.so / pg.so link against engine.so by that exact bare name. Create a
-  # engine.so -> engine<EXT_SUFFIX> symlink so they can find it.
+  # The EP host extension links against engine.so by that exact bare name.
+  # Create a compatibility symlink next to the ABI-tagged engine extension.
   if(SKBUILD)
     set(_mooncake_engine_compat_path
         "${CMAKE_INSTALL_PREFIX}/${MOONCAKE_PYTHON_INSTALL_DIR}/engine.so")
@@ -349,6 +359,17 @@ if(WITH_EP)
             \"${_mooncake_engine_compat_path}\"
         )
     "
+    COMPONENT python)
+endif()
+
+if(WITH_PG)
+  install(
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/pg.py"
+    DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
+    COMPONENT python)
+  install(
+    FILES "${EP_PG_STAGING_DIR}/libmooncake_pg_device.so"
+    DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
     COMPONENT python)
 endif()
 
@@ -383,16 +404,11 @@ if(SKBUILD)
   endif()
 
   if(USE_ASCEND_DIRECT OR USE_UBSHMEM)
-    install(TARGETS ascend_transport
+    install(TARGETS ascend_transport ascend_allocator
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()
 
-  if(USE_ASCEND)
-    install(TARGETS ascend_transport_mem
-            LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
-  endif()
-
-  if(WITH_EP AND NOT USE_XPU)
+  if(WITH_PG)
     install(TARGETS mooncake_pg
             LIBRARY DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR} COMPONENT python)
   endif()

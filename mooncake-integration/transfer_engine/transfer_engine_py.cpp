@@ -1560,6 +1560,16 @@ void TransferEnginePy::batchTransferOnCuda(
         total_bytes += lengths[i];
     }
 
+    auto target_segment_desc =
+        engine_->getMetadata()->getSegmentDescByID(handle);
+    if (target_segment_desc &&
+        isCudaHostFuncUnsupportedProtocol(target_segment_desc->protocol)) {
+        throw std::runtime_error(
+            "transfer_*_on_cuda does not support nvlink_intra because CUDA "
+            "host functions cannot call CUDA APIs; use transfer_sync_* or "
+            "another transport");
+    }
+
     auto batch_id = engine_->allocateBatchID(batch_size);
     auto* ctx = new TransferOnCudaContext{engine_, batch_id, std::move(entries),
                                           total_bytes};
@@ -1743,6 +1753,18 @@ void bind_coro_rpc_interface(py::module_& m) {
 }
 
 PYBIND11_MODULE(engine, m) {
+#ifdef USE_XPU
+    m.attr("SUPPORT_XPU") = true;
+#else
+    m.attr("SUPPORT_XPU") = false;
+#endif
+
+#ifdef USE_TENT
+    m.attr("SUPPORT_TENT") = true;
+#else
+    m.attr("SUPPORT_TENT") = false;
+#endif
+
 #ifdef USE_EFA
     m.attr("SUPPORT_EFA") = true;
 #else

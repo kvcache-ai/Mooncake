@@ -27,6 +27,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "cuda_alike.h"
@@ -36,6 +37,35 @@ namespace mooncake {
 namespace device {
 
 namespace {
+
+enum class P2pHandleKind : int32_t { Ipc = 1, Fabric = 2 };
+
+std::vector<int32_t> encodeP2pHandle(P2pHandleKind kind,
+                                     std::vector<int32_t> payload) {
+    if (payload.empty()) return {};
+    payload.insert(payload.begin(), static_cast<int32_t>(kind));
+    return payload;
+}
+
+bool decodeP2pHandle(const std::vector<int32_t>& encoded, P2pHandleKind& kind,
+                     std::vector<int32_t>& payload) {
+    if (encoded.size() < 2) return false;
+    kind = static_cast<P2pHandleKind>(encoded[0]);
+    if (kind != P2pHandleKind::Ipc && kind != P2pHandleKind::Fabric)
+        return false;
+    payload.assign(encoded.begin() + 1, encoded.end());
+    return true;
+}
+
+bool parseBoolEnv(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s == "1" || s == "on" || s == "true" || s == "yes";
+}
 
 #if defined(USE_CUDA)
 bool supportFabricMem() {
@@ -104,16 +134,6 @@ bool supportFabricMem() { return false; }
 
 #ifdef USE_MACA
 namespace {
-
-bool parseBoolEnv(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr) return false;
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s == "1" || s == "on" || s == "true" || s == "yes";
-}
 
 std::string getLowerEnv(const char* name) {
     const char* value = std::getenv(name);
@@ -240,6 +260,260 @@ bool macaP2pPairAllowed(int src_physical, int dst_physical) {
 
 }  // namespace
 #endif
+
+namespace {
+
+struct P2pMappingImpl : P2pMapping {
+    ~P2pMappingImpl() override {
+        if (!ptr) return;
+        int previous_device = -1;
+        if (cudaGetDevice(&previous_device) != cudaSuccess ||
+            (previous_device != import_device &&
+             cudaSetDevice(import_device) != cudaSuccess)) {
+            LOG(ERROR) << "[P2P] failed to select device for mapping cleanup";
+            return;
+        }
+#if defined(USE_CUDA)
+        if (kind == P2pHandleKind::Fabric) {
+            cuMemUnmap(reinterpret_cast<CUdeviceptr>(ptr), size);
+            cuMemAddressFree(reinterpret_cast<CUdeviceptr>(ptr), size);
+            cuMemRelease(handle);
+        } else {
+            cudaIpcCloseMemHandle(ptr);
+        }
+#else
+        cudaIpcCloseMemHandle(ptr);
+#endif
+        if (previous_device != import_device &&
+            cudaSetDevice(previous_device) != cudaSuccess)
+            LOG(ERROR)
+                << "[P2P] failed to restore device after mapping cleanup";
+    }
+    void* address() const override { return ptr; }
+
+    int import_device = -1;
+    void* ptr = nullptr;
+#if defined(USE_CUDA)
+    P2pHandleKind kind = P2pHandleKind::Ipc;
+    size_t size = 0;
+    CUmemGenericAllocationHandle handle = 0;
+#endif
+};
+
+std::vector<int32_t> exportIpcMemory(void* ptr) {
+#ifdef USE_MACA
+    if (parseBoolEnv("MOONCAKE_EP_MACA_DISABLE_IPC")) {
+        LOG(INFO) << "[P2P] MACA IPC handle export disabled by "
+                     "MOONCAKE_EP_MACA_DISABLE_IPC";
+        return {};
+    }
+
+    cudaPointerAttributes attr{};
+    cudaError_t attr_err = cudaPointerGetAttributes(&attr, ptr);
+    if (attr_err != cudaSuccess || attr.type != cudaMemoryTypeDevice ||
+        attr.devicePointer == nullptr) {
+        LOG(WARNING) << "[P2P] skip MACA IPC handle export for "
+                     << "non-device pointer=" << ptr
+                     << ", attr_err=" << cudaGetErrorString(attr_err)
+                     << ", type=" << attr.type
+                     << ", devicePointer=" << attr.devicePointer
+                     << ", allocationFlags=" << attr.allocationFlags;
+        return {};
+    }
+
+    std::string ipc_mode = macaIpcMode();
+    if (ipc_mode == "cross-v2" || ipc_mode == "cross_v2") {
+        mcIpcCrossMemHandle_t handle;
+        cudaError_t err = mcIpcGetMemHandleCross_v2(&handle, ptr);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "[P2P] mcIpcGetMemHandleCross_v2 failed: "
+                       << cudaGetErrorString(err);
+            return {};
+        }
+        constexpr size_t kHandleBytes = sizeof(mcIpcCrossMemHandle_t);
+        constexpr size_t kNumInt32s =
+            (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+        std::vector<int32_t> result(kNumInt32s);
+        memcpy(result.data(), &handle, kHandleBytes);
+        return result;
+    }
+#endif
+    cudaIpcMemHandle_t handle;
+#ifdef USE_MACA
+    cudaError_t err = macaIpcMode() == "cross"
+                          ? mcIpcGetMemHandleCross(&handle, ptr)
+                          : cudaIpcGetMemHandle(&handle, ptr);
+#else
+    cudaError_t err = cudaIpcGetMemHandle(&handle, ptr);
+#endif
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "[P2P] IPC handle export failed: "
+                   << cudaGetErrorString(err);
+        return {};
+    }
+    constexpr size_t kHandleBytes = sizeof(cudaIpcMemHandle_t);
+    constexpr size_t kNumInt32s =
+        (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+    std::vector<int32_t> result(kNumInt32s);
+    memcpy(result.data(), &handle, kHandleBytes);
+    return result;
+}
+
+void* importIpcMemory(const std::vector<int32_t>& payload) {
+    void* peer_ptr = nullptr;
+    cudaError_t err;
+#ifdef USE_MACA
+    std::string ipc_mode = macaIpcMode();
+    if (ipc_mode == "cross-v2" || ipc_mode == "cross_v2") {
+        constexpr size_t kHandleBytes = sizeof(mcIpcCrossMemHandle_t);
+        constexpr size_t kNumInt32s =
+            (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+        if (payload.size() < kNumInt32s) return nullptr;
+        mcIpcCrossMemHandle_t handle;
+        memcpy(&handle, payload.data(), kHandleBytes);
+        err = mcIpcOpenMemHandleCross_v2(&peer_ptr, &handle,
+                                         cudaIpcMemLazyEnablePeerAccess);
+    } else
+#endif
+    {
+        constexpr size_t kHandleBytes = sizeof(cudaIpcMemHandle_t);
+        constexpr size_t kNumInt32s =
+            (kHandleBytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+        if (payload.size() < kNumInt32s) return nullptr;
+        cudaIpcMemHandle_t handle;
+        memcpy(&handle, payload.data(), kHandleBytes);
+#ifdef USE_MACA
+        err = ipc_mode == "cross"
+                  ? mcIpcOpenMemHandleCross(&peer_ptr, handle,
+                                            cudaIpcMemLazyEnablePeerAccess)
+                  : cudaIpcOpenMemHandle(&peer_ptr, handle,
+                                         cudaIpcMemLazyEnablePeerAccess);
+#else
+        err = cudaIpcOpenMemHandle(&peer_ptr, handle,
+                                   cudaIpcMemLazyEnablePeerAccess);
+#endif
+    }
+    if (err != cudaSuccess) {
+        LOG(WARNING) << "[P2P] IPC handle import failed: "
+                     << cudaGetErrorString(err);
+        return nullptr;
+    }
+    return peer_ptr;
+}
+
+#if defined(USE_CUDA)
+std::vector<int32_t> exportFabricMemory(CUmemGenericAllocationHandle handle,
+                                        size_t bytes) {
+    CUmemFabricHandle exported;
+    const auto result = cuMemExportToShareableHandle(
+        &exported, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "[P2P] cuMemExportToShareableHandle(FABRIC) failed: "
+                   << result;
+        return {};
+    }
+    return serializeFabricHandle(exported, bytes);
+}
+
+std::unique_ptr<P2pMapping> importFabricMemory(
+    const std::vector<int32_t>& payload, const CUmemAccessDesc* access,
+    size_t device_count) {
+    CUmemFabricHandle exported{};
+    size_t size = 0;
+    if (!deserializeFabricHandle(payload, &exported, &size)) return nullptr;
+    auto mapping = std::make_unique<P2pMappingImpl>();
+    if (cudaGetDevice(&mapping->import_device) != cudaSuccess) return nullptr;
+    CUmemGenericAllocationHandle handle = 0;
+    auto result = cuMemImportFromShareableHandle(&handle, &exported,
+                                                 CU_MEM_HANDLE_TYPE_FABRIC);
+    if (result != CUDA_SUCCESS) return nullptr;
+    CUdeviceptr address = 0;
+    result = cuMemAddressReserve(&address, size, 0, 0, 0);
+    if (result != CUDA_SUCCESS) {
+        cuMemRelease(handle);
+        return nullptr;
+    }
+    result = cuMemMap(address, size, 0, handle, 0);
+    if (result != CUDA_SUCCESS) {
+        cuMemAddressFree(address, size);
+        cuMemRelease(handle);
+        return nullptr;
+    }
+    mapping->ptr = reinterpret_cast<void*>(address);
+    mapping->kind = P2pHandleKind::Fabric;
+    mapping->size = size;
+    mapping->handle = handle;
+    result = cuMemSetAccess(address, size, access, device_count);
+    if (result != CUDA_SUCCESS) return nullptr;
+    return mapping;
+}
+#endif
+
+}  // namespace
+
+std::vector<int32_t> exportP2pMemory(void* ptr, size_t bytes) {
+    if (!ptr || bytes == 0) return {};
+#if defined(USE_CUDA)
+    cudaPointerAttributes attributes{};
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaPointerGetAttributes(&attributes, ptr) != cudaSuccess ||
+        attributes.type != cudaMemoryTypeDevice || attributes.device != device)
+        return {};
+    CUmemGenericAllocationHandle handle = 0;
+    if (cuMemRetainAllocationHandle(&handle, ptr) == CUDA_SUCCESS) {
+        CUmemAllocationProp properties{};
+        size_t granularity = 0;
+        if (cuMemGetAllocationPropertiesFromHandle(&properties, handle) !=
+                CUDA_SUCCESS ||
+            properties.location.type != CU_MEM_LOCATION_TYPE_DEVICE ||
+            properties.location.id != device ||
+            !(properties.requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) ||
+            cuMemGetAllocationGranularity(&granularity, &properties,
+                                          CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
+                CUDA_SUCCESS ||
+            granularity == 0 ||
+            reinterpret_cast<uintptr_t>(ptr) % granularity != 0 ||
+            bytes % granularity != 0) {
+            cuMemRelease(handle);
+            return {};
+        }
+        auto payload = exportFabricMemory(handle, bytes);
+        cuMemRelease(handle);
+        return encodeP2pHandle(P2pHandleKind::Fabric, std::move(payload));
+    }
+    CUdeviceptr base = 0;
+    size_t allocated_size = 0;
+    if (cuMemGetAddressRange(&base, &allocated_size,
+                             reinterpret_cast<CUdeviceptr>(ptr)) !=
+            CUDA_SUCCESS ||
+        base != reinterpret_cast<CUdeviceptr>(ptr) || bytes > allocated_size)
+        return {};
+#endif
+    return encodeP2pHandle(P2pHandleKind::Ipc, exportIpcMemory(ptr));
+}
+
+std::unique_ptr<P2pMapping> importP2pMemory(
+    const std::vector<int32_t>& metadata) {
+    P2pHandleKind kind;
+    std::vector<int32_t> payload;
+    if (!decodeP2pHandle(metadata, kind, payload)) return nullptr;
+#if defined(USE_CUDA)
+    if (kind == P2pHandleKind::Fabric) {
+        CUmemAccessDesc access{};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        if (cudaGetDevice(&access.location.id) != cudaSuccess) return nullptr;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        return importFabricMemory(payload, &access, 1);
+    }
+#endif
+    if (kind != P2pHandleKind::Ipc) return nullptr;
+    auto mapping = std::make_unique<P2pMappingImpl>();
+    if (cudaGetDevice(&mapping->import_device) != cudaSuccess) return nullptr;
+    mapping->ptr = importIpcMemory(payload);
+    if (!mapping->ptr) return nullptr;
+    return mapping;
+}
 
 class P2pDeviceTransportImpl : public P2pTransport {
     struct StagedPeerMapping {
@@ -807,6 +1081,8 @@ class P2pDeviceTransportImpl : public P2pTransport {
         std::vector<int32_t> available(num_ranks_, 0);
         available[rank] = 1;
         peer_ptrs_host_[rank] = local_ptr;
+        const bool allow_cross_node_p2p =
+            parseBoolEnv("MC_DEVICE_API_P2P_ALLOW_CROSS_LOGICAL_NODE");
 
 #if defined(USE_CUDA)
         if (use_fabric_mem_) {
@@ -900,41 +1176,64 @@ class P2pDeviceTransportImpl : public P2pTransport {
         int group_start = node_id * device_count;
         int group_end = std::min(group_start + device_count, num_ranks_);
 
-        for (int dst = group_start; dst < group_end; ++dst) {
+        const int peer_start = allow_cross_node_p2p ? 0 : group_start;
+        const int peer_end = allow_cross_node_p2p ? num_ranks_ : group_end;
+        if (allow_cross_node_p2p) {
+            LOG(INFO) << "[EP P2P] allowing cross-logical-node IPC probing";
+        }
+
+        for (int dst = peer_start; dst < peer_end; ++dst) {
             if (active_ranks_mask[dst] == 0) continue;
             if (dst == rank) continue;
 
+            const bool is_local_group_peer =
+                dst >= group_start && dst < group_end;
             int dst_device = dst % device_count;
-            int can_access = 0;
-            cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
-            LOG(INFO) << "[EP P2P] rank " << rank << " (device " << device_id
-                      << ") -> rank " << dst << " (device " << dst_device
-                      << "): canAccessPeer=" << can_access;
-            if (!can_access) continue;
+            cudaError_t err = cudaSuccess;
+            if (is_local_group_peer) {
+                int can_access = 0;
+                err =
+                    cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
+                if (err != cudaSuccess) {
+                    LOG(WARNING)
+                        << "[EP P2P] cudaDeviceCanAccessPeer failed for rank "
+                        << rank << " -> rank " << dst << ": "
+                        << cudaGetErrorString(err);
+                    cudaGetLastError();
+                    continue;
+                }
+                LOG(INFO) << "[EP P2P] rank " << rank << " (device "
+                          << device_id << ") -> rank " << dst << " (device "
+                          << dst_device << "): canAccessPeer=" << can_access;
+                if (!can_access) continue;
 
 #ifdef USE_MACA
-            int src_physical = physicalDeviceFromVisibleList(device_id);
-            int dst_physical = physicalDeviceFromVisibleList(dst_device);
-            if (!macaP2pPairAllowed(src_physical, dst_physical)) {
-                LOG(INFO) << "[EP P2P] rank " << rank << " physical GPU"
-                          << src_physical << " -> rank " << dst
-                          << " physical GPU" << dst_physical
-                          << " disabled for MACA EP fast path; set "
-                             "MOONCAKE_EP_MACA_ALLOW_NODE_P2P=1 or "
-                             "MOONCAKE_EP_MACA_P2P_PAIRS to override";
-                continue;
-            }
+                int src_physical = physicalDeviceFromVisibleList(device_id);
+                int dst_physical = physicalDeviceFromVisibleList(dst_device);
+                if (!macaP2pPairAllowed(src_physical, dst_physical)) {
+                    LOG(INFO) << "[EP P2P] rank " << rank << " physical GPU"
+                              << src_physical << " -> rank " << dst
+                              << " physical GPU" << dst_physical
+                              << " disabled for MACA EP fast path; set "
+                                 "MOONCAKE_EP_MACA_ALLOW_NODE_P2P=1 or "
+                                 "MOONCAKE_EP_MACA_P2P_PAIRS to override";
+                    continue;
+                }
 #endif
 
-            cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
-            if (err != cudaSuccess &&
-                err != cudaErrorPeerAccessAlreadyEnabled) {
-                LOG(WARNING) << "[EP P2P] rank " << rank
-                             << " failed to enable peer access to device "
-                             << dst_device << ": " << cudaGetErrorString(err);
-                continue;
+                err = cudaDeviceEnablePeerAccess(dst_device, 0);
+                if (err != cudaSuccess &&
+                    err != cudaErrorPeerAccessAlreadyEnabled) {
+                    LOG(WARNING)
+                        << "[EP P2P] rank " << rank
+                        << " failed to enable peer access to device "
+                        << dst_device << ": " << cudaGetErrorString(err);
+                    cudaGetLastError();
+                    continue;
+                }
+                if (err == cudaErrorPeerAccessAlreadyEnabled)
+                    cudaGetLastError();
             }
-            if (err == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
 
             if (dst >= static_cast<int>(remote_handles.size())) continue;
             const auto& h = remote_handles[dst];
@@ -961,6 +1260,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                         << "[EP P2P] rank " << rank
                         << " failed to open cross_v2 IPC handle for rank "
                         << dst << ": " << cudaGetErrorString(err);
+                    cudaGetLastError();
                     continue;
                 }
                 LOG(INFO) << "[EP P2P] rank " << rank
@@ -991,6 +1291,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 LOG(WARNING) << "[EP P2P] rank " << rank
                              << " failed to open IPC handle for rank " << dst
                              << ": " << cudaGetErrorString(err);
+                cudaGetLastError();
                 continue;
             }
             LOG(INFO) << "[EP P2P] rank " << rank
@@ -1010,7 +1311,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
             }
         }
         // Multi-node: P2P only within a node
-        if (all_peers_accessible_ && num_ranks_ > 1) {
+        if (!allow_cross_node_p2p && all_peers_accessible_ && num_ranks_ > 1) {
             int first_node = 0 / device_count;
             int last_node = (num_ranks_ - 1) / device_count;
             if (first_node != last_node) all_peers_accessible_ = false;

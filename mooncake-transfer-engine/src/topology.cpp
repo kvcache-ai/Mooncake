@@ -591,7 +591,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_ENFLAME)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -834,7 +834,7 @@ int Topology::discover(const std::vector<std::string> &filter,
     }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUPA)
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_ENFLAME)
     int cuda_rc = 0;
     for (auto &ent : discoverCudaTopology(all_hca, &cuda_rc)) {
         matrix_[ent.name] = ent;
@@ -856,6 +856,11 @@ int Topology::discover(const std::vector<std::string> &filter,
 }
 
 int Topology::parse(const std::string &topology_json) {
+    return parse(topology_json, {});
+}
+
+int Topology::parse(const std::string &topology_json,
+                    const std::vector<std::string> &device_filter) {
     std::set<std::string> rnic_set;
     Json::Value root;
 
@@ -877,6 +882,11 @@ int Topology::parse(const std::string &topology_json) {
 
     matrix_.clear();
     resolved_hca_peer_affinity_by_local_.clear();
+    auto allowed = [&device_filter](const std::string &device_name) {
+        return device_filter.empty() ||
+               std::find(device_filter.begin(), device_filter.end(),
+                         device_name) != device_filter.end();
+    };
     for (const auto &key : root.getMemberNames()) {
         const Json::Value &value = root[key];
         if (value.isArray() && value.size() == 2) {
@@ -884,11 +894,13 @@ int Topology::parse(const std::string &topology_json) {
             topo_entry.name = key;
             for (const auto &array : value[0]) {
                 auto device_name = array.asString();
-                topo_entry.preferred_hca.push_back(device_name);
+                if (allowed(device_name))
+                    topo_entry.preferred_hca.push_back(device_name);
             }
             for (const auto &array : value[1]) {
                 auto device_name = array.asString();
-                topo_entry.avail_hca.push_back(device_name);
+                if (allowed(device_name))
+                    topo_entry.avail_hca.push_back(device_name);
             }
             matrix_[key] = topo_entry;
         } else {

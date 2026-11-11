@@ -4,6 +4,12 @@ file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
 set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
 list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
+set(TRANSFER_ENGINE_METRICS_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/metrics_exporter.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/transfer_engine_metrics.cpp")
+if(NOT WITH_METRICS)
+  list(REMOVE_ITEM ENGINE_SOURCES ${TRANSFER_ENGINE_METRICS_SOURCES})
+endif()
 # ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
 # newer rdma-core adds active_speed_ex to carry it. TENT probes the same cache
 # variable in tent/src; this definition covers the classic RdmaContext under
@@ -137,6 +143,11 @@ if(USE_MACA)
   target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
 endif()
 
+if(USE_ENFLAME)
+  target_include_directories(transfer_engine PRIVATE ${MC_TOPS_PATH}/include)
+  target_link_libraries(transfer_engine PUBLIC topsrt efrt rt)
+endif()
+
 if(USE_MUSA)
   target_include_directories(transfer_engine PRIVATE /usr/local/musa/include)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)
@@ -187,17 +198,18 @@ if(USE_MLU)
   target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
 endif()
 
-if(USE_ASCEND)
-  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
-                                               MPI::MPI)
-endif()
-
 if(USE_ASCEND_DIRECT)
-  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+  # ascend_allocator.so carries the store host allocator, ContextManager and the
+  # shared bound-runner registry. PUBLIC so the store and TENT resolve
+  # allocator/ContextManager symbols through the transfer engine without extra
+  # link wiring.
+  target_link_libraries(transfer_engine PUBLIC ascend_transport
+                                               ascend_allocator)
 endif()
 
 if(USE_UBSHMEM)
-  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+  target_link_libraries(transfer_engine PUBLIC ascend_transport
+                                               ascend_allocator)
 endif()
 
 if(USE_ASCEND_HETEROGENEOUS)
@@ -211,6 +223,18 @@ endif()
 if(USE_TENT)
   add_compile_definitions(transfer_engine PUBLIC USE_TENT)
   target_link_libraries(transfer_engine PUBLIC tent_link_group)
+  # TENT's HIXL engine includes <hixl/hixl.h>, which pulls in CANN's
+  # external/ge_common/api_error_codes.h. That header defines the inline
+  # ge::StatusFactory error registry, so the TENT Ascend transport archive
+  # carries weak ge::* symbols. If this DSO exports them, CANN libraries loaded
+  # afterwards bind their own GE error registration to this DSO's copy of the
+  # singleton; the interposed instance is torn down out of order and corrupts
+  # the GE heap at process exit ("corrupted size vs. prev_size"). Do not export
+  # the symbols that come from that archive; they are internal to this DSO.
+  if(BUILD_SHARED_LIBS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(transfer_engine PRIVATE
+                        "LINKER:--exclude-libs,libtent_xport_ascend_direct.a")
+  endif()
 endif()
 
 if(USE_MEMFABRIC)

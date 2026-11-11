@@ -400,7 +400,8 @@ std::string MakeHixlEngineName(const std::string& host_ip, uint16_t port) {
     return host_ip + ":" + std::to_string(port);
 }
 
-uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
+uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports) {
     if (device_id < 0 || !ValidBasePort(base_port)) {
         LOG(ERROR) << "Invalid HIXL port range: base_port=" << base_port
                    << ", device_id=" << device_id;
@@ -416,7 +417,7 @@ uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
                              static_cast<int64_t>(physical_dev_id) * kPortRange;
     const int64_t max_port =
         static_cast<int64_t>(base_port) +
-        (static_cast<int64_t>(physical_dev_id) + 1) * kPortRange;
+        (static_cast<int64_t>(physical_dev_id) + 1) * kPortRange - 1;
     if (min_port < kMinListenPort || max_port > kMaxListenPort) {
         LOG(ERROR) << "HIXL port range exceeds TCP port space: [" << min_port
                    << ", " << max_port << "]";
@@ -427,6 +428,10 @@ uint16_t FindHixlListenPort(int32_t base_port, int32_t device_id) {
     std::uniform_int_distribution<int64_t> rand_dist(min_port, max_port);
     for (int attempt = 0; attempt < kMaxPortAttempts; ++attempt) {
         const int port = static_cast<int>(rand_dist(rand_gen));
+        if (std::find(excluded_ports.begin(), excluded_ports.end(), port) !=
+            excluded_ports.end()) {
+            continue;
+        }
         int sockfd = socket(AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
@@ -467,6 +472,57 @@ std::vector<std::string> ParseHixlNames(const MemorySegmentDesc& detail) {
         return {name_it->second};
     }
     return {};
+}
+
+const std::string HixlNameResolver::empty_{};
+
+HixlNameResolver::HixlNameResolver(const MemorySegmentDesc& detail) {
+    names_ = ParseHixlNames(detail);
+    if (names_.size() <= 1) {
+        return;
+    }
+    ranges_.reserve(detail.buffers.size());
+    for (const auto& buf : detail.buffers) {
+        size_t name_idx = 0;
+        bool resolved = false;
+        auto attr = buf.transport_attrs.find(AscendDirect);
+        if (attr != buf.transport_attrs.end() && !attr->second.empty()) {
+            try {
+                const auto idx = static_cast<size_t>(std::stoul(attr->second));
+                if (idx < names_.size()) {
+                    name_idx = idx;
+                    resolved = true;
+                }
+            } catch (const std::exception&) {
+            }
+        }
+        if (!resolved) {
+            LocationParser location(buf.location);
+            if (location.type() == "npu" && location.index() >= 0) {
+                const auto idx = static_cast<size_t>(location.index());
+                if (idx < names_.size()) {
+                    name_idx = idx;
+                }
+            }
+        }
+        ranges_.push_back(BufferRange{buf.addr, buf.length, name_idx});
+    }
+}
+
+const std::string& HixlNameResolver::Resolve(uint64_t dest_addr) const {
+    if (names_.empty()) {
+        return empty_;
+    }
+    if (names_.size() == 1) {
+        return names_.front();
+    }
+    for (const auto& range : ranges_) {
+        if (dest_addr >= range.begin &&
+            dest_addr - range.begin < range.length) {
+            return names_[range.name_idx];
+        }
+    }
+    return names_.front();
 }
 
 std::string ResolveRemoteHixlName(const MemorySegmentDesc& detail,
