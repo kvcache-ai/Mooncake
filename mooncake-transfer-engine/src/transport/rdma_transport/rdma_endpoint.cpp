@@ -532,7 +532,7 @@ int RdmaEndPoint::connectNotification(const ibv_gid &gid, uint32_t lid,
     attr = {};
     attr.qp_state = IBV_QPS_RTS;
     attr.sq_psn = 0;
-    attr.timeout = 14;
+    attr.timeout = static_cast<uint8_t>(cfg.ib_timeout);
     attr.retry_cnt = 3;
     attr.rnr_retry =
         7;  // Like TENT, receiver backpressure is not a link fault.
