@@ -20,6 +20,12 @@ option(WITH_TE "build mooncake transfer engine and sample code" ON)
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_STORE_GO "build Go bindings for mooncake store" OFF)
 option(WITH_CONDUCTOR "build mooncake conductor service" OFF)
+option(WITH_CONDUCTOR_GO "build Go bindings for mooncake conductor" OFF)
+option(WITH_CONDUCTOR_C_SHARED
+       "build the conductor client C ABI shared library" OFF)
+if((WITH_CONDUCTOR_GO OR WITH_CONDUCTOR_C_SHARED) AND NOT WITH_CONDUCTOR)
+  message(FATAL_ERROR "Conductor language bindings require WITH_CONDUCTOR=ON")
+endif()
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE
        "build the Rust interface and sample code for the transfer engine" OFF)
