@@ -1244,6 +1244,9 @@ impl StoreClient {
                     }
                 }
                 Err(error) if self.should_skip_candidate(&error, candidate.soft) => {
+                    if matches!(error, StoreError::Backpressure(_)) {
+                        last_backpressure = Some(error.clone());
+                    }
                     debug!(
                         tenant,
                         key,
