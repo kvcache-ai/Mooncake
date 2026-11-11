@@ -35,6 +35,7 @@
 #include "p2p/ha/ha_metric_manager.h"
 #include "p2p/ha/ha_status.h"
 #include "p2p/ha/p2p_status_http_server.h"
+#include "p2p/master/p2p_master.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "types.h"
 #include "utils.h"
@@ -276,6 +277,47 @@ TEST_F(P2PMasterHttpEndpointsTest, HealthEndpointReturnsOk) {
     ASSERT_EQ(resp.status, 200) << "body=" << resp.resp_body;
     EXPECT_EQ(resp.resp_body, "OK");
 }
+
+#ifdef STORE_USE_REDIS
+TEST_F(P2PMasterHttpEndpointsTest,
+       RunWithHAPublishesLocalIdentityAndDetectsViewMismatch) {
+    HAStatusResetGuard reset_guard;
+    P2PMasterConfig config;
+    config.ha.enabled = true;
+    config.ha.election_backend = ElectionBackend::REDIS;
+    config.oplog.enabled = true;
+    config.cluster_id = "p2p_master_instance_id_startup_test";
+    config.rpc.address = "127.0.0.1";
+    config.rpc.port = 0;
+    config.rpc.thread_num = 1;
+    config.metrics.http_port = 0;
+    config.redis.endpoint = "127.0.0.1:1";
+
+    // Use the supervisor-facing Run path; the closed endpoint makes Redis
+    // connect fail after RunWithHA has initialized status.
+    P2PMaster master(config);
+    EXPECT_EQ(master.Run(), -1);
+
+    auto& status = HAStatusManager::instance();
+    const auto instance_id = status.Snapshot().instance_id;
+    EXPECT_FALSE(instance_id.empty());
+
+    constexpr std::string_view kLocalEndpoint = "127.0.0.1:50051";
+    status.Configure(/*ha_enabled=*/true, config.cluster_id,
+                     std::string(kLocalEndpoint));
+    status.SetRoleState("primary", "RUNNING");
+    status.SetMasterView(std::string(kLocalEndpoint), /*epoch=*/7,
+                         /*timestamp_ms=*/123456789, /*ttl_sec=*/4,
+                         /*instance_id=*/"another-instance");
+    const auto report = status.GetDoctorReport();
+    const auto issue = std::find_if(
+        report.issues.begin(), report.issues.end(),
+        [](const auto& issue) { return issue.code == "MASTER_VIEW_MISMATCH"; });
+    ASSERT_NE(issue, report.issues.end());
+    EXPECT_NE(issue->message.find(instance_id), std::string::npos);
+    EXPECT_NE(issue->message.find("another-instance"), std::string::npos);
+}
+#endif  // STORE_USE_REDIS
 
 TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
     std::atomic<bool> stepdown_called{false};

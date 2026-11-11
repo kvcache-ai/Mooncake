@@ -265,6 +265,7 @@ int P2PMaster::RunWithHA() {
     if (config_.oplog.enabled &&
         config_.ha.election_backend == ElectionBackend::REDIS) {
         master_instance_id = GenerateMasterInstanceId();
+        HAStatusManager::instance().SetInstanceId(master_instance_id);
     }
 #endif  // STORE_USE_REDIS
     const std::string local_endpoint =
