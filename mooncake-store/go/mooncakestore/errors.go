@@ -31,4 +31,5 @@ var (
 	ErrBatchOp          = errors.New("mooncakestore: batch operation failed")
 	ErrHostname         = errors.New("mooncakestore: get hostname failed")
 	ErrInvalidArgument  = errors.New("mooncakestore: invalid argument")
+	ErrBufferNotFound   = errors.New("mooncakestore: buffer not found")
 )
