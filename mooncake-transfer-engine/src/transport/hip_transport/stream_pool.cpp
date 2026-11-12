@@ -16,7 +16,31 @@
 
 #include <glog/logging.h>
 
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
 namespace mooncake {
+
+namespace {
+
+// MC_HIP_STREAM_PRIORITY=default|high. Read once before creating the first
+// pool. Priority is an opt-in scheduling hint; it does not guarantee
+// preemption.
+bool useHighPriorityStreams() {
+    static const bool high = [] {
+        const char *v = std::getenv("MC_HIP_STREAM_PRIORITY");
+        bool h = v != nullptr && std::strcmp(v, "high") == 0;
+        if (v != nullptr && !h && std::strcmp(v, "default") != 0) {
+            LOG(WARNING) << "StreamPool: ignoring MC_HIP_STREAM_PRIORITY=" << v
+                         << " (want default|high)";
+        }
+        return h;
+    }();
+    return high;
+}
+
+}  // namespace
 
 StreamPool::StreamPool(int num_streams_per_device)
     : num_streams_per_device_(num_streams_per_device) {
@@ -69,9 +93,27 @@ bool StreamPool::initializeStreamsForDevice(int device_id) {
     std::vector<hipStream_t> device_streams;
     device_streams.reserve(num_streams_per_device_);
 
+    int least_priority = 0, greatest_priority = 0;
+    const bool high = useHighPriorityStreams();
+    if (high) {
+        err = hipDeviceGetStreamPriorityRange(&least_priority,
+                                              &greatest_priority);
+        if (err != hipSuccess) {
+            LOG(ERROR) << "StreamPool: hipDeviceGetStreamPriorityRange failed: "
+                       << hipGetErrorString(err);
+            return false;
+        }
+    }
+    LOG(INFO) << "StreamPool: device " << device_id << ": "
+              << num_streams_per_device_ << " non-blocking streams, priority "
+              << (high ? "high (" + std::to_string(greatest_priority) + ")"
+                       : std::string("default"));
+
     for (int i = 0; i < num_streams_per_device_; ++i) {
         hipStream_t stream;
-        err = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+        err = high ? hipStreamCreateWithPriority(&stream, hipStreamNonBlocking,
+                                                 greatest_priority)
+                   : hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
         if (err != hipSuccess) {
             LOG(ERROR) << "StreamPool: Failed to create stream for device "
                        << device_id << ": " << hipGetErrorString(err);
