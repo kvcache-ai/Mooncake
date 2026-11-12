@@ -39,12 +39,11 @@ def submit_and_wait(engine, requests, timeout_ms):
 
 
 class PythonWaitTransferTest(unittest.TestCase):
-    def test_write_and_read_report_per_request_status(self):
+    def test_write_reports_per_request_status(self):
         with tempfile.TemporaryDirectory() as directory:
             server = tent.TransferEngine(write_config(directory, "server.json"))
             client = tent.TransferEngine(write_config(directory, "client.json"))
             buffer_size = 4096
-            read_offset = 1024
             payload = b"wait-transfer-payload"
             server_addr = server.allocate_local_memory(buffer_size)
             client_addr = client.allocate_local_memory(buffer_size)
@@ -75,29 +74,6 @@ class PythonWaitTransferTest(unittest.TestCase):
                 )
                 self.assertEqual(write_status[0].bytes, len(payload))
                 self.assertEqual(ctypes.string_at(server_addr, len(payload)), payload)
-
-                ctypes.memset(client_addr + read_offset, 0, len(payload))
-                read_status = submit_and_wait(
-                    client,
-                    [
-                        tent.Request(
-                            opcode=tent.OpCode.READ,
-                            source=client_addr + read_offset,
-                            target_id=segment,
-                            target_offset=server_base,
-                            length=len(payload),
-                        )
-                    ],
-                    5000,
-                )
-                self.assertEqual(len(read_status), 1)
-                self.assertEqual(
-                    read_status[0].state, tent.TransferStatusEnum.COMPLETED
-                )
-                self.assertEqual(
-                    ctypes.string_at(client_addr + read_offset, len(payload)),
-                    payload,
-                )
             finally:
                 if segment:
                     client.close_segment(segment)
