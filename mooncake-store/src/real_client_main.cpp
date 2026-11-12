@@ -49,12 +49,14 @@ bool ValidateByteSizeFlag(const char *flagname, const std::string &value) {
     return true;
 }
 
-size_t ParseByteSizeFlagOrDie(const char *flag_name, const std::string &value) {
+std::optional<size_t> ParseByteSizeFlag(const char *flag_name,
+                                        const std::string &value) {
     auto parsed = try_string_to_byte_size(value);
     if (!parsed.has_value()) {
-        LOG(FATAL) << "Invalid value for --" << flag_name << ": " << value;
+        LOG(ERROR) << "Invalid value for --" << flag_name << ": " << value;
+        return std::nullopt;
     }
-    return static_cast<size_t>(parsed.value());
+    return static_cast<size_t>(*parsed);
 }
 
 }  // namespace
@@ -164,10 +166,15 @@ int main(int argc, char *argv[]) {
     LOG(INFO) << "Mooncake real client version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
 
-    size_t global_segment_size = ParseByteSizeFlagOrDie(
-        "global_segment_size", FLAGS_global_segment_size);
-    size_t local_buffer_size =
-        ParseByteSizeFlagOrDie("local_buffer_size", FLAGS_local_buffer_size);
+    // ValidateByteSizeFlag already rejects these during flag parsing; never
+    // fall back to 0 here, since a global segment size of 0 means pure client.
+    auto global_segment_size =
+        ParseByteSizeFlag("global_segment_size", FLAGS_global_segment_size);
+    auto local_buffer_size =
+        ParseByteSizeFlag("local_buffer_size", FLAGS_local_buffer_size);
+    if (!global_segment_size.has_value() || !local_buffer_size.has_value()) {
+        return -1;
+    }
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.
     globalConfig().ascend_agent_mode = true;
@@ -175,8 +182,8 @@ int main(int argc, char *argv[]) {
 
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(
-        FLAGS_host, FLAGS_metadata_server, global_segment_size,
-        local_buffer_size, FLAGS_protocol, FLAGS_device_names,
+        FLAGS_host, FLAGS_metadata_server, *global_segment_size,
+        *local_buffer_size, FLAGS_protocol, FLAGS_device_names,
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
