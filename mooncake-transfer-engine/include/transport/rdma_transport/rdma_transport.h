@@ -155,6 +155,11 @@ class RdmaTransport : public Transport {
    private:
     int initializeRdmaResources();
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    void recordClassicCongestionControlMode(
+        adaptive_congestion_control::Mode mode);
+#endif
+
     int startHandshakeDaemon(std::string &local_server_name);
 
     void notifyWorkerThread();
@@ -182,6 +187,19 @@ class RdmaTransport : public Transport {
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::atomic<bool> notify_running_{false};
     std::thread notify_worker_;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    enum class ClassicCongestionControlMode {
+        kUninitialized = -1,
+        kOff = static_cast<int>(adaptive_congestion_control::Mode::kOff),
+        kObserve =
+            static_cast<int>(adaptive_congestion_control::Mode::kObserve),
+        kEnforce =
+            static_cast<int>(adaptive_congestion_control::Mode::kEnforce),
+        kConflict = -2,
+    };
+    std::atomic<ClassicCongestionControlMode> classic_congestion_control_mode_{
+        ClassicCongestionControlMode::kUninitialized};
+#endif
     std::shared_ptr<Topology> local_topology_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
     // rdma_server_name_ holds the RDMA-reachable address (e.g.

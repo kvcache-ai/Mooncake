@@ -294,6 +294,24 @@ RdmaTransport::RdmaTransport() {
     }
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+void RdmaTransport::recordClassicCongestionControlMode(
+    adaptive_congestion_control::Mode mode) {
+    const auto next_mode = static_cast<ClassicCongestionControlMode>(mode);
+    auto current =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
+    while (current == ClassicCongestionControlMode::kUninitialized) {
+        if (classic_congestion_control_mode_.compare_exchange_weak(
+                current, next_mode, std::memory_order_acq_rel,
+                std::memory_order_acquire))
+            return;
+    }
+    if (current != next_mode)
+        classic_congestion_control_mode_.store(
+            ClassicCongestionControlMode::kConflict, std::memory_order_release);
+}
+#endif
+
 RdmaTransport::~RdmaTransport() {
     notify_running_.store(false, std::memory_order_release);
     if (notify_worker_.joinable()) notify_worker_.join();
@@ -1275,6 +1293,30 @@ Status RdmaTransport::submitTransferTaskWithSeal(
 
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    const auto congestion_control_mode =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
+    std::optional<TaskCongestionControllerMode> task_mode;
+    switch (congestion_control_mode) {
+        case ClassicCongestionControlMode::kOff:
+            task_mode = TaskCongestionControllerMode::kOff;
+            break;
+        case ClassicCongestionControlMode::kObserve:
+            task_mode = TaskCongestionControllerMode::kObserve;
+            break;
+        case ClassicCongestionControlMode::kEnforce:
+            task_mode = TaskCongestionControllerMode::kEnforce;
+            break;
+        case ClassicCongestionControlMode::kUninitialized:
+        case ClassicCongestionControlMode::kConflict:
+            break;
+    }
+    if (task_mode) {
+        for (auto *task : task_list) {
+            task->rdma_congestion_control_mode = {true, *task_mode};
+        }
+    }
+#endif
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
@@ -1322,6 +1364,10 @@ Status RdmaTransport::submitTransferTask(
             slice->length = 0;
             slice->task = &task;
             slice->status = Slice::PENDING;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
+#endif
             task.slice_list.push_back(slice);
             __sync_fetch_and_add(&task.slice_count, 1);
             slice->markFailed();
@@ -1418,6 +1464,10 @@ Status RdmaTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
             slice->ts = 0;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
+#endif
             task.slice_list.push_back(slice);
 
             int buffer_id = -1, device_id = -1,

@@ -191,6 +191,31 @@ TEST_F(SubmitTransferTaskTest, EmptyNicHintPreservesDefaultSelection) {
               lkeyForDevice(local_device_id_));
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TEST_F(SubmitTransferTaskTest, CongestionModeConflictRemainsUnknown) {
+    using adaptive_congestion_control::Mode;
+    const auto submittedMode = [this] {
+        Transport::TransferRequest request;
+        Transport::TransferTask task;
+        triggerError(request, task);
+        return task.rdma_congestion_control_mode;
+    };
+    EXPECT_FALSE(submittedMode().observed);
+
+    RdmaTransportTestPeer::recordCongestionMode(*transport_, Mode::kEnforce);
+    RdmaTransportTestPeer::recordCongestionMode(*transport_, Mode::kEnforce);
+    const auto consistent = submittedMode();
+    ASSERT_TRUE(consistent.observed);
+    EXPECT_EQ(consistent.value, TaskCongestionControllerMode::kEnforce);
+
+    RdmaTransportTestPeer::recordCongestionMode(*transport_, Mode::kOff);
+    EXPECT_FALSE(submittedMode().observed);
+
+    RdmaTransportTestPeer::recordCongestionMode(*transport_, Mode::kEnforce);
+    EXPECT_FALSE(submittedMode().observed);
+}
+#endif
+
 TEST_F(SubmitTransferTaskTest, NicHintUsesWildcardWhenAbsentFromLocation) {
     Transport::TransferRequest request;
     request.nic_hint = global_device_id_;

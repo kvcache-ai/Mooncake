@@ -27,6 +27,7 @@
 
 #include "memory_location.h"
 #include "multi_transport.h"
+#include "task_congestion_status.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -286,6 +287,12 @@ class TransferEngine {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
+
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const;
+
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const;
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
