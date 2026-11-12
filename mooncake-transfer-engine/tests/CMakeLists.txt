@@ -172,8 +172,9 @@ target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest
 # dev + metadata server
 
 # Registering a sub-view of a HugeTLB mapping through RdmaTransport: the
-# registration is widened to whole huge pages instead of failing with EINVAL.
-# Self-skips without an RDMA device or reserved hugepages.
+# caller's range is tried first and widened to whole huge pages only when
+# ibv_reg_mr rejects it with EINVAL. Self-skips without an RDMA device or
+# reserved hugepages.
 add_executable(rdma_hugetlb_subview_test
                ${WORKSPACE}/rdma_hugetlb_subview_test.cpp)
 target_link_libraries(rdma_hugetlb_subview_test PUBLIC transfer_engine gtest)
@@ -589,6 +590,26 @@ add_executable(rdma_unregister_retry_test
 target_link_libraries(rdma_unregister_retry_test PUBLIC transfer_engine gtest
                                                         gtest_main)
 add_test(NAME rdma_unregister_retry_test COMMAND rdma_unregister_retry_test)
+
+# Pending-cleanup state machine after a failed unregister (pending_dereg_ vs
+# pending_republish_). Interposes libibverbs, so no RDMA device or metadata
+# server is needed.
+add_executable(rdma_unregister_republish_test
+               ${WORKSPACE}/rdma_unregister_republish_test.cpp)
+target_link_libraries(rdma_unregister_republish_test PUBLIC transfer_engine
+                                                            gtest gtest_main)
+add_test(NAME rdma_unregister_republish_test
+         COMMAND rdma_unregister_republish_test)
+
+# HugeTLB narrow-first registration with interposed libibverbs (misaligned
+# ranges fail with EINVAL). Needs no NIC, but self-skips without two reserved
+# 2 MiB hugepages.
+add_executable(rdma_hugetlb_subview_fake_mr_test
+               ${WORKSPACE}/rdma_hugetlb_subview_fake_mr_test.cpp)
+target_link_libraries(rdma_hugetlb_subview_fake_mr_test PUBLIC transfer_engine
+                                                               gtest gtest_main)
+add_test(NAME rdma_hugetlb_subview_fake_mr_test
+         COMMAND rdma_hugetlb_subview_fake_mr_test)
 
 add_executable(rdma_memory_location_test
                ${WORKSPACE}/rdma_memory_location_test.cpp)

@@ -166,6 +166,23 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
+    // Register [addr, addr + length) for local and (when remote_accessible)
+    // remote RDMA access.
+    //
+    // HugeTLB sub-views: RDMA transports that madvise the registered range
+    // (RDMA transports call ibv_fork_init, whose MADV_DONTFORK the kernel
+    // refuses to apply to a hugetlb VMA split inside a huge page) first try
+    // the range as given. Only if that is rejected with EINVAL is the
+    // registration retried over the enclosing huge pages. The resulting MR —
+    // and the rkey/lkey handed to peers — therefore covers whole huge pages,
+    // including padding outside [addr, addr + length). Access rights are
+    // per-MR, not per-range: a peer that holds the key can address that
+    // padding, which may contain application data that was never registered.
+    // The published description advertises only the requested range, but that
+    // is a cooperative boundary, not an enforced one. A caller unwilling to
+    // expose neighbouring bytes must register the whole hugepage-aligned
+    // mapping itself (whose sub-ranges it then owns exclusively) rather than
+    // passing a sub-view.
     int registerLocalMemory(void* addr, size_t length,
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,

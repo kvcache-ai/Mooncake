@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <string_view>
@@ -72,6 +73,11 @@ class RdmaTransport : public Transport {
     int sendNativeNotify(const std::string &peer_server_name,
                          const TransferMetadata::NotifyDesc &notify);
 
+    // HugeTLB host memory is tried over the caller's own range first; only an
+    // EINVAL from ibv_reg_mr (a hugetlb VMA cannot be split for the
+    // MADV_DONTFORK ibv_fork_init installs) retries it over the enclosing huge
+    // pages. The widened MR covers that padding and so do its keys; see the
+    // caller contract on TransferEngine::registerLocalMemory.
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,
                             bool update_metadata) override;
@@ -92,8 +98,21 @@ class RdmaTransport : public Transport {
                                     bool update_metadata,
                                     bool force_sequential);
 
+    // defer_publish_to_caller: used by unregisterLocalMemoryBatch, whose
+    // members must not each publish the local segment desc. A member that has
+    // finished everything but the publish records that in pending_republish_
+    // and returns, leaving the batch to publish once and then clearPending().
     int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
-                                      bool force_sequential);
+                                      bool force_sequential,
+                                      bool defer_publish_to_caller = false);
+
+    // Pending-cleanup bookkeeping (see the members below). Each helper takes
+    // pending_cleanup_mutex_ exactly once.
+    bool hasPendingDereg(uint64_t addr);
+    std::optional<std::vector<uint64_t>> lookupPendingRepublish(uint64_t addr);
+    void markPendingDereg(uint64_t addr);
+    void markPendingRepublish(uint64_t addr, std::vector<uint64_t> keys);
+    void clearPending(uint64_t addr);
 
     // amdgpu before 6.19.14 charges a NIC's dma-buf pin of KFD-allocated VRAM
     // against the KFD free pool a second time; only pins taken through its
@@ -191,38 +210,60 @@ class RdmaTransport : public Transport {
     std::mutex chunk_map_mutex_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
 
-    // A registration of HugeTLB host memory that does not cover whole huge
-    // pages is widened outward to the enclosing huge pages before ibv_reg_mr
-    // is called (see registerLocalMemoryInternal): the kernel refuses to split
-    // a hugetlb VMA when ibv_fork_init() makes the registration madvise() it.
-    // Such an MR is registered under a base the caller never sees, while the
-    // published BufferDesc keeps the caller's range. Two things are tracked:
+    // A registration of HugeTLB host memory is attempted over the caller's own
+    // range first; only when ibv_reg_mr() rejects it with EINVAL — the kernel
+    // refuses to split a hugetlb VMA when ibv_fork_init() makes the
+    // registration madvise() it — is it retried over the enclosing huge pages
+    // (see registerLocalMemoryInternal). Such an MR is registered under a base
+    // the caller never sees, while the published BufferDesc keeps the caller's
+    // range. Two things are tracked:
     //
     // hugetlb_registered_regions_ holds the range of every live hugetlb-backed
-    // MR (widened or not), keyed by MR base. Overlap is what has to be refused,
-    // not just a shared base: RdmaContext's MR map would silently drop an MR
-    // registered at a duplicate base, and unregisterMemoryRegion() madvises
-    // MADV_DOFORK over the whole MR range (issue #3639), which must not be
-    // re-opened while a second MR still covers part of it. Overlapping the
-    // interior of a larger registration has exactly that effect, so every
-    // hugetlb-backed registration is claimed and checked against the live
-    // ranges rather than their bases.
+    // registration, keyed by MR base (the narrow range where that worked, the
+    // widened one otherwise). Overlap is what has to be refused, not just a
+    // shared base: RdmaContext's MR map would silently drop an MR registered at
+    // a duplicate base, and unregisterMemoryRegion() madvises MADV_DOFORK over
+    // the whole MR range (issue #3639), which must not be re-opened while a
+    // second MR still covers part of it. Overlapping the interior of a larger
+    // registration has exactly that effect, so every hugetlb-backed
+    // registration is claimed and checked against the live ranges rather than
+    // their bases. The check, the claim, both attempts and the release are
+    // serialized by hugetlb_registry_mutex_ so two workers of a batch cannot
+    // both pass the check before either records its range.
     //
     // hugepage_widen_aliases_ maps a widened registration's caller-visible
     // address to the base its MR actually lives at, so unregisterLocalMemory
-    // (which only receives the caller's address) can deregister it.
+    // (which only receives the caller's address) can deregister it. A
+    // registration that succeeded over the caller's own range has no alias.
     std::mutex hugetlb_registry_mutex_;
     std::map<uint64_t, size_t> hugetlb_registered_regions_;
     std::unordered_map<uint64_t, uint64_t> hugepage_widen_aliases_;
 
-    // Single-buffer counterpart of chunk_map_'s pending bookkeeping: base
-    // addresses whose metadata was removed but whose MR deregistration has
-    // not completed. Gates the metadata-missing fall-through so only a known
-    // pending cleanup retries the per-context deregistration — an address
-    // that was never a registration base must not reach the containing-range
-    // MR lookup.
-    std::mutex pending_dereg_mutex_;
+    // A failed unregister is resumed in one of two states, never both:
+    //
+    // pending_dereg_: MR deregistration is NOT confirmed (an ibv_dereg_mr
+    // failed, or the metadata removal/publish failed while the MRs were still
+    // live). A retry must re-enter the per-context MR cleanup, whose MR lookup
+    // is safe here because the address still belongs to our registration.
+    //
+    // pending_republish_: the MRs are confirmed gone, the claim and widen
+    // alias are released and chunk_map_ was erased; only the final
+    // updateLocalSegmentDesc() (and possibly a leftover local metadata
+    // removal) is outstanding. The value holds the metadata keys the
+    // registration was added under (the caller's address for a single buffer,
+    // the chunk addresses for a chunked one) so a retry can finish the
+    // removal idempotently. A retry in this state MUST NOT perform any MR
+    // lookup: a disjoint view of the same range may have registered in the
+    // meantime, and RdmaContext::unregisterMemoryRegion() resolves by
+    // containing range, so it would deregister that view's live MR (and
+    // madvise MADV_DOFORK over it).
+    //
+    // The batch path uses pending_republish_ to defer its single collective
+    // publish; it must never seed pending_dereg_ for a member it already
+    // cleaned.
+    std::mutex pending_cleanup_mutex_;
     std::unordered_set<uint64_t> pending_dereg_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> pending_republish_;
 
     struct KfdPinAnchor {
         ibv_mr *mr = nullptr;

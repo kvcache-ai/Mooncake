@@ -20,6 +20,8 @@
 #define MOONCAKE_TESTS_RDMA_TEST_PEERS_H
 
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 
 #include "transfer_metadata.h"
@@ -53,6 +55,34 @@ class RdmaTransportTestPeer {
     // the resulting context_list_ layout without a full install().
     static int initializeResources(RdmaTransport &transport) {
         return transport.initializeRdmaResources();
+    }
+
+    // Pending-cleanup state left behind by a failed unregister. An address is
+    // in at most one of the two.
+    static bool hasPendingDereg(RdmaTransport &transport, uint64_t addr) {
+        std::lock_guard<std::mutex> lock(transport.pending_cleanup_mutex_);
+        return transport.pending_dereg_.contains(addr);
+    }
+
+    static bool hasPendingRepublish(RdmaTransport &transport, uint64_t addr) {
+        std::lock_guard<std::mutex> lock(transport.pending_cleanup_mutex_);
+        return transport.pending_republish_.contains(addr);
+    }
+
+    // A widened hugetlb registration's MR base, if the caller address is
+    // aliased; std::nullopt for a registration that succeeded over the range
+    // the caller passed.
+    static std::optional<uint64_t> widenAliasBase(RdmaTransport &transport,
+                                                  uint64_t addr) {
+        std::lock_guard<std::mutex> lock(transport.hugetlb_registry_mutex_);
+        auto it = transport.hugepage_widen_aliases_.find(addr);
+        if (it == transport.hugepage_widen_aliases_.end()) return std::nullopt;
+        return it->second;
+    }
+
+    static bool isHugepageClaimed(RdmaTransport &transport, uint64_t base) {
+        std::lock_guard<std::mutex> lock(transport.hugetlb_registry_mutex_);
+        return transport.hugetlb_registered_regions_.contains(base);
     }
 };
 
