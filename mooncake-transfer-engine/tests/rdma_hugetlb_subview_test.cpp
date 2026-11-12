@@ -20,8 +20,15 @@
 // falls inside a huge page. A caller that registers a view of a larger
 // hugepage-backed allocation (rather than the whole mapping) therefore failed
 // with EINVAL below libibverbs, which surfaced as a generic registration error
-// and left such callers unable to use RDMA at all. The transport now widens the
-// registration outward to the enclosing huge pages.
+// and left such callers unable to use RDMA at all.
+//
+// The transport now tries the caller's own range first and widens it to the
+// enclosing huge pages only when that fails with EINVAL. Environments where
+// ibv_reg_mr does not madvise hugetlb splits (for example
+// RDMAV_HUGEPAGES_SAFE=1) therefore keep registering narrow sub-views, while a
+// fork-protected stack still gets a working (widened) registration. Which of
+// the two happens is detected from the actual error, never from the
+// environment, so this test accepts either outcome where it cannot control it.
 //
 // Requires both a usable RDMA device and a reserved 2 MiB huge page, so it
 // self-skips on hardware-free CI.
@@ -167,25 +174,43 @@ TEST_F(RdmaHugetlbSubviewTest, AlignedRegistrationUnchanged) {
     EXPECT_EQ(engine_->unregisterLocalMemory(base()), 0);
 }
 
-// Two views of one huge page widen onto the same pages. RdmaContext keys its
-// MR map by base address and overwrites on a duplicate key, which would leak
-// the first MR and its keys, so the second registration is refused instead of
-// being silently collapsed.
-TEST_F(RdmaHugetlbSubviewTest, SecondViewOfSameHugepageRejected) {
+// Two views of one huge page, while fork protection is active, both widen onto
+// the same pages. RdmaContext keys its MR map by base address and overwrites on
+// a duplicate key, which would leak the first MR and its keys, so the second
+// registration is refused instead of being silently collapsed.
+//
+// Without fork protection the first view registers over its own range and the
+// second does too: narrow-first intentionally preserves that. The outcome is
+// therefore decided by what ibv_reg_mr actually reports, not by the
+// environment. Either way the claim must be released with the first
+// registration.
+TEST_F(RdmaHugetlbSubviewTest, SecondViewOfSameHugepageIsOverlapOrNarrow) {
     char *first = base() + 4096;
     char *second = base() + 8192;
 
     ASSERT_EQ(engine_->registerLocalMemory(first, 4096, "cpu:0"), 0);
-    EXPECT_EQ(engine_->registerLocalMemory(second, 4096, "cpu:0"),
-              ERR_ADDRESS_OVERLAPPED);
-    // The rejected registration must not have disturbed the accepted one.
+    const int second_rc = engine_->registerLocalMemory(second, 4096, "cpu:0");
+    if (second_rc == 0) {
+        // No EINVAL: the first view registered narrow, so the two ranges are
+        // disjoint registrations.
+        EXPECT_EQ(engine_->unregisterLocalMemory(second), 0);
+    } else {
+        EXPECT_EQ(second_rc, ERR_ADDRESS_OVERLAPPED);
+    }
+    // The rejected registration must not have disturbed the accepted one, and
+    // releasing it must release the claim so the second view can register.
     EXPECT_EQ(engine_->unregisterLocalMemory(first), 0);
+    ASSERT_EQ(engine_->registerLocalMemory(second, 4096, "cpu:0"), 0);
+    EXPECT_EQ(engine_->unregisterLocalMemory(second), 0);
 }
 
 // The same collision arises the other way round: an aligned registration
-// already owns the hugepage, and a later view widens onto it. Checking only
-// other widened registrations would miss this, so every hugetlb-backed MR
-// range is tracked, not just the widened ones.
+// already owns the hugepage, and a later view is checked against it. The
+// transport overlaps the range actually being attempted — the caller's narrow
+// range, which sits inside the claimed page — so the check refuses the view
+// before ibv_reg_mr is called, regardless of whether widening would be needed.
+// Checking only widened registrations would miss this, so every hugetlb-backed
+// MR range is tracked, not just the widened ones.
 //
 // This one goes through the transport rather than the engine: the two ranges
 // overlap as the caller states them, so TransferEngine rejects the second one

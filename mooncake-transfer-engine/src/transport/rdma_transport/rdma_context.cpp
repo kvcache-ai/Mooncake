@@ -901,11 +901,16 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
 #endif
     if (!mrMeta.mr) {
+        // Capture errno before PLOG touches it: the transport needs to tell
+        // the HugeTLB sub-view EINVAL apart from every other failure so it can
+        // retry with a widened range (see
+        // RdmaTransport::registerLocalMemoryInternal).
+        const int saved_errno = errno;
         PLOG(ERROR) << "Failed to register memory " << addr << " length "
                     << length << " dmabuf_offset " << exp.offset << " on "
                     << device_name_ << " MC_RDMA_DATA_DIRECT="
                     << globalConfig().rdma_data_direct;
-        return ERR_CONTEXT;
+        return saved_errno == EINVAL ? ERR_CONTEXT_EINVAL : ERR_CONTEXT;
     }
     return 0;
 }
@@ -1000,6 +1005,8 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
     // safe and does not affect the subsequent dereg.
     closeDmabufExport(exp);
     if (ret != 0) {
+        // Propagates ERR_CONTEXT_EINVAL unchanged: the fault-in attempt runs
+        // before any MR is recorded, so the transport can retry it widened.
         return ret;
     }
     if (!mrMeta.mr) return 0;  // skipped on a non-paired Data Direct NIC

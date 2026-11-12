@@ -31,6 +31,13 @@
 #define ERR_METADATA (-200)
 #define ERR_ENDPOINT (-201)
 #define ERR_CONTEXT (-202)
+// Internal to the RDMA transport: ERR_CONTEXT whose errno was EINVAL. On
+// HugeTLB memory that is what ibv_reg_mr() reports when the range cuts
+// through a huge page (ibv_fork_init()'s MADV_DONTFORK cannot split the VMA),
+// which RdmaTransport::registerLocalMemoryInternal retries with a widened
+// range. Must never cross a public API boundary; translate it back to
+// ERR_CONTEXT first.
+#define ERR_CONTEXT_EINVAL (-203)
 
 #define ERR_NUMA (-300)
 #define ERR_CLOCK (-301)

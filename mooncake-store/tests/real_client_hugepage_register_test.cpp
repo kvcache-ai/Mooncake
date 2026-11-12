@@ -9,8 +9,9 @@
 // split the hugetlb VMA at a non-hugepage-aligned boundary.
 //
 // Sub-range registrations are not special-cased at this layer: the logical
-// range is passed through exactly as given. The RDMA transport then widens a
-// misaligned HugeTLB sub-range to its enclosing huge pages itself (see
+// range is passed through exactly as given. RdmaTransport tries that range
+// first and widens a misaligned HugeTLB sub-range to its enclosing huge pages
+// only when ibv_reg_mr rejects it with EINVAL (see
 // RdmaTransport::registerLocalMemoryInternal), so such a range also registers
 // on a fork-protected stack, where it used to fail with EINVAL.
 //
@@ -310,9 +311,10 @@ TEST_F(RealClientHugepageRegisterTest, SubHugepageMaxMrSizeIsRejected) {
 }
 
 // Sub-range registrations are not special-cased at the store layer: an
-// interior pointer is passed through exactly as given. Widening to whole huge
-// pages is done by RdmaTransport::registerLocalMemoryInternal, which covers an
-// interior pointer just as well as a segment base, so on RDMA (ibv_fork_init
+// interior pointer is passed through exactly as given. RdmaTransport tries the
+// range as given first and, if ibv_reg_mr rejects it with EINVAL, retries it
+// over the enclosing huge pages (see registerLocalMemoryInternal), which covers
+// an interior pointer just as well as a segment base. So on RDMA (ibv_fork_init
 // active) a misaligned interior sub-range of a hugetlb VMA now registers
 // instead of failing with EINVAL; on TCP there is no ibv_reg_mr and the exact
 // registration succeeds either way.
@@ -333,12 +335,11 @@ TEST_F(RealClientHugepageRegisterTest,
 
     const int rc = client_->register_buffer(sub, kLength);
     // The store passes the interior pointer through untouched; the RDMA
-    // transport widens it to the enclosing huge pages, independently of
-    // fork-protection settings. A failure here means the widening did not
-    // happen.
+    // transport registers it as given or, when that is rejected on a
+    // fork-protected stack, widens it to the enclosing huge pages. A failure
+    // here means neither happened.
     EXPECT_EQ(rc, 0) << "an interior sub-range of a HugeTLB segment must "
-                        "register once the transport widens it to whole huge "
-                        "pages";
+                        "register, as given or widened to whole huge pages";
     if (rc == 0) {
         EXPECT_EQ(client_->unregister_buffer(sub), 0);
     }
