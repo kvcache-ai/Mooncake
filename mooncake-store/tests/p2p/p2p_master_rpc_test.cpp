@@ -752,6 +752,12 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
                                           .ip_address = "127.0.0.1",
                                           .rpc_port = kClientPort})
                         .has_value());
+    }
+    // Establish both business connections before opening the separate
+    // heartbeat connections. The server assigns connections round-robin to
+    // two workers; interleaving heartbeats would put both writers on the same
+    // worker, so the first blocked write would prevent the second from running.
+    for (size_t i = 0; i < clients.size(); ++i) {
         ASSERT_TRUE(
             clients[i]
                 ->Heartbeat({.client_id = client_ids[i],
