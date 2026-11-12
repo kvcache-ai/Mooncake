@@ -2261,9 +2261,15 @@ class MasterService {
     // Gated snapshots for the call sites that capture a pre-mutation medium
     // set. They run on hot metadata paths, so skip the VisitReplicas walk
     // entirely when no publisher is listening.
-    std::vector<std::string> KvMediaSnapshot(const ObjectMetadata& metadata) {
-        return KvEventsEnabled() ? KvMediaForMetadata(metadata)
-                                 : std::vector<std::string>{};
+    // Cleanup paths recover previously announced media only for invalid
+    // COMPLETE replicas selected by their own removal predicate.
+    std::vector<std::string> KvMediaSnapshot(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_include_invalid =
+            {}) {
+        return KvEventsEnabled()
+                   ? KvMediaForMetadata(metadata, should_include_invalid)
+                   : std::vector<std::string>{};
     }
     std::vector<std::string> KvRemovalSnapshot(const ObjectMetadata& metadata) {
         return KvEventsEnabled() ? KvMediaForRemoval(metadata)
@@ -2272,7 +2278,8 @@ class MasterService {
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
     static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata);
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_include_invalid = {});
     // Removal paths may run after replicas have transitioned to PROCESSING or
     // REMOVED. Keep their former medium visible as a conservative hint even
     // though only COMPLETE replicas count as currently available media.
