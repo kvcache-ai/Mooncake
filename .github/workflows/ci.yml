@@ -737,7 +737,7 @@ jobs:
       # The rest need an EFA device; they are only compiled here.
       run: |
         cd build
-        ctest --output-on-failure --timeout 300 \
+        ctest --output-on-failure --timeout 300 --no-tests=error \
           -R '^efa_(endpoint_handshake|select_device|discovery|stale_segment_desc|remote_accessible)_test$'
       shell: bash
 
