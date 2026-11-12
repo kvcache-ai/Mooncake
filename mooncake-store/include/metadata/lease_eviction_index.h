@@ -16,6 +16,9 @@
 // lease anyway, and leaving the bucket out would hold back a lease that ran out
 // a moment ago.
 //
+// Postpone moves a lone key to a later bucket until its next write. Groups
+// are never postponed: their members may be skipped for different reasons.
+//
 // The filed members of a group are filed as one entry of the index's own,
 // which the group's last filed member takes with it. Members share one lease,
 // which only ever grows, so the deadline the latest member write saw is the
@@ -68,6 +71,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
     void OnWrite(const route::WriteGuard& guard) override {
         route::SlotOwnerState& owner = guard.owner_state();
+        const bool postponed = std::exchange(owner.eviction_postponed, false);
         const bool file = guard.has_object() && Qualifies(guard.metadata());
         const Rank rank = file ? RankOf(guard.metadata()) : 0;
         const Lease* const lease =
@@ -75,6 +79,11 @@ class LeaseEvictionIndex final : public EvictionIndex {
         // Read without the index lock: the group outlives this member, which
         // the held key lock keeps in it, and its lease never changes.
         Group* const filed_in = GroupOf(owner);
+        // The release that follows Postpone leaves the key where it was put.
+        if (postponed && file && lease == nullptr &&
+            rank <= owner.eviction_rank) {
+            return;
+        }
         const bool same_group =
             (filed_in != nullptr ? filed_in->lease() : nullptr) == lease;
         if (file == owner.eviction_filed &&
@@ -94,6 +103,23 @@ class LeaseEvictionIndex final : public EvictionIndex {
         }
         owner.eviction_filed = file;
         owner.eviction_rank = rank;
+    }
+
+    void Postpone(const route::WriteGuard& guard,
+                  Clock::time_point not_before) override {
+        route::SlotOwnerState& owner = guard.owner_state();
+        const Rank rank = BucketOf(not_before);
+        if (!owner.eviction_filed || GroupOf(owner) != nullptr ||
+            rank <= owner.eviction_rank) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            buckets_.Remove(owner.eviction_rank, guard.slot());
+            buckets_.Add(rank, guard.slot());
+        }
+        owner.eviction_rank = rank;
+        owner.eviction_postponed = true;
     }
 
     [[nodiscard]] std::unique_ptr<Cursor> Scan(

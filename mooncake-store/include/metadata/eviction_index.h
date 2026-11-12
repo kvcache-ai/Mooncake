@@ -11,8 +11,9 @@
 //
 // An index may rank keys however it likes (by lease deadline, by access
 // frequency, by size) as long as it keeps one rule: the rank a key is filed at
-// is never later than the rank it really has. A read may raise a key's real
-// rank without telling the index, which then catches up when the cursor's
+// is never later than the rank it really has, unless eviction postponed the
+// key (see Postpone) and nothing has written it since. A read may raise a key's
+// real rank without telling the index, which then catches up when the cursor's
 // StillAt is asked about the key under its write lock: that release files the
 // key again at its real rank. So an index only has to watch reads when a read
 // can lower a rank, and says so at construction; the route skips the read hook
@@ -84,6 +85,11 @@ class EvictionIndex {
     // held exclusively: files, refiles or drops the key to match the object
     // it holds now.
     virtual void OnWrite(const route::WriteGuard& guard) = 0;
+    // Under the key's write lock: files the key no earlier than `not_before`
+    // until its next write. The caller must not change the object before
+    // releasing the lock. An index may ignore it.
+    virtual void Postpone(const route::WriteGuard& /*guard*/,
+                          Clock::time_point /*not_before*/) {}
     // A walk over the keys that may be due by `now`.
     [[nodiscard]] virtual std::unique_ptr<Cursor> Scan(
         Clock::time_point now) const = 0;
