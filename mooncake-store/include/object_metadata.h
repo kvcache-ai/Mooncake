@@ -334,6 +334,7 @@ struct ObjectMetadata {
 
     // Lease deadline eviction ranks the object by.
     std::chrono::system_clock::time_point EvictionDeadline() const {
+        SpinLocker locker(&lock);
         return lease_->ExpiresAt();
     }
 

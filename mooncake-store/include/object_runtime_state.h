@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,7 @@ struct ReplicationTask {
     UUID dynamic_replication_lease_id{};
     uint64_t dynamic_replication_version_epoch{0};
     bool durable_cleanup_pending{false};
+    std::optional<ReplicaID> existing_move_target{};
 };
 
 struct OffloadingTask {

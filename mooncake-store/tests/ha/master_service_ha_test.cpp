@@ -5918,7 +5918,7 @@ TEST_F(MasterServiceHATest,
     const std::string cluster_id = "test_batch_record_move_end_visible";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(50)
+                              .set_default_kv_lease_ttl(1000)
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
                               .set_cluster_id(cluster_id)
@@ -5950,6 +5950,21 @@ TEST_F(MasterServiceHATest,
                                "batch_move_visible_src",
                                "batch_move_visible_dst")
                     .has_value());
+
+    const auto before = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(before);
+    ASSERT_EQ(before->replicas.size(), 1u);
+    const auto leased_end =
+        service.MoveEnd(source.client_id, key, kDefaultTenant);
+    ASSERT_FALSE(leased_end);
+    EXPECT_EQ(leased_end.error(), ErrorCode::OBJECT_HAS_LEASE);
+    const auto still_visible =
+        service.GetReplicaListForAdmin(key, kDefaultTenant);
+    ASSERT_TRUE(still_visible);
+    ASSERT_EQ(still_visible->replicas.size(), 1u);
+    EXPECT_EQ(still_visible->replicas.front().id, before->replicas.front().id);
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(before->lease_ttl_ms));
 
     backend->BlockTxn();
     auto move_future = std::async(std::launch::async, [&] {
