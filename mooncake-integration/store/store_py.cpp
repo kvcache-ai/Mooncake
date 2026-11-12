@@ -349,10 +349,8 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
             exported_data, data_offset, tensor_size, take_ownership);
         exported_data_guard.release();
 
-        // Reshape
-        if (ndim > 0) {
-            np_array = np_array.attr("reshape")(tensor_shape_tuple(metadata));
-        }
+        // Reshape. A 0-dim tensor gets shape (), not the flat shape (1,).
+        np_array = np_array.attr("reshape")(tensor_shape_tuple(metadata));
 
         // Convert to torch tensor
         pybind11::object tensor = torch_module().attr("from_numpy")(np_array);

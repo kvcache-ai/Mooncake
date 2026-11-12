@@ -406,6 +406,48 @@ class TestDistributedObjectStore(unittest.TestCase):
         for key in keys:
             self.store.remove(key)
 
+    def test_put_get_scalar_tensor(self):
+        """Test that 0-dim tensors keep their shape through every get path."""
+        import torch
+
+        tensors = [
+            torch.tensor(3.5, dtype=torch.float32),
+            torch.tensor(7, dtype=torch.int64),
+            torch.tensor(1.25, dtype=torch.bfloat16),
+            # Size-1 dimensions must stay, so the fix cannot squeeze them.
+            torch.tensor([3.5], dtype=torch.float32),
+            torch.ones((1, 1), dtype=torch.float16),
+        ]
+        keys = [f"test_scalar_tensor_{os.getpid()}_{i}" for i in range(len(tensors))]
+
+        def assert_same(expected, actual):
+            self.assertIsNotNone(actual)
+            self.assertEqual(tuple(actual.shape), tuple(expected.shape))
+            self.assertEqual(actual.dtype, expected.dtype)
+            self.assertTrue(torch.equal(actual, expected))
+
+        for key, tensor in zip(keys, tensors):
+            self.assertEqual(self.store.put_tensor(key, tensor), 0)
+            assert_same(tensor, self.store.get_tensor(key))
+
+        batch_results = self.store.batch_get_tensor(keys)
+        self.assertEqual(len(batch_results), len(tensors))
+        for tensor, retrieved in zip(tensors, batch_results):
+            assert_same(tensor, retrieved)
+
+        buffer_size = 4096
+        buffer = (ctypes.c_ubyte * buffer_size)()
+        buffer_ptr = ctypes.addressof(buffer)
+        self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_size), 0)
+        try:
+            assert_same(
+                tensors[0], self.store.get_tensor_into(keys[0], buffer_ptr, buffer_size)
+            )
+        finally:
+            self.store.unregister_buffer(buffer_ptr)
+            for key in keys:
+                self.store.remove(key)
+
     def test_zero_tensor_into_and_from(self):
         """Test metadata-only zero tensor get_into and put_tensor_from."""
         import torch
