@@ -3,6 +3,7 @@
 #include <atomic>
 #include <csignal>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -42,6 +43,9 @@ class P2PMasterRpcService final {
 
     void init();
     uint16_t GetHttpPort() const { return http_server_.port(); }
+    // The embedding supervisor supplies this callback so that accepting a
+    // stepdown request can stop the active RPC server.
+    void SetStepdownCallback(std::function<void()> callback);
     P2PMasterService& GetMasterService() { return master_service_; }
     const P2PMasterService& GetMasterService() const { return master_service_; }
 
@@ -107,6 +111,8 @@ class P2PMasterRpcService final {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
+    std::function<void()> stepdown_callback_;
+    std::atomic<bool> stepdown_requested_{false};
     uint32_t heartbeat_rpc_port_ = 0;
 };
 

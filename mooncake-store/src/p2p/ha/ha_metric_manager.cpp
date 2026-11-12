@@ -1,11 +1,34 @@
 #include "p2p/ha/ha_metric_manager.h"
 
+#include "p2p/ha/ha_status.h"
+
 #include <glog/logging.h>
 
+#include <initializer_list>
 #include <iomanip>
 #include <sstream>
 
 namespace mooncake {
+
+namespace {
+
+std::string EscapeLabelValue(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char c : value) {
+        if (c == '\\' || c == '"') {
+            escaped += '\\';
+            escaped += c;
+        } else if (c == '\n') {
+            escaped += "\\n";
+        } else {
+            escaped += c;
+        }
+    }
+    return escaped;
+}
+
+}  // namespace
 
 // --- Singleton Instance ---
 HAMetricManager& HAMetricManager::instance() {
@@ -18,8 +41,9 @@ HAMetricManager::HAMetricManager()
     // OpLog Sequence Gauges
     : oplog_last_sequence_id_("ha_oplog_last_sequence_id",
                               "Latest OpLog sequence ID written by Primary"),
-      oplog_applied_sequence_id_("ha_oplog_applied_sequence_id",
-                                 "Latest OpLog sequence ID applied by Standby"),
+      oplog_applied_sequence_id_(
+          "ha_oplog_applied_sequence_id",
+          "Local OpLog metadata apply watermark (same as /ha/status)"),
       oplog_standby_lag_("ha_oplog_standby_lag",
                          "Number of OpLog entries Standby is behind Primary"),
       oplog_pending_entries_(
@@ -30,6 +54,9 @@ HAMetricManager::HAMetricManager()
           "Number of OpLog writes pending asynchronous persistence"),
       election_is_leader_("ha_election_is_leader",
                           "Whether this node currently owns leadership"),
+      election_last_successful_renew_timestamp_ms_(
+          "ha_election_last_successful_renew_timestamp_ms",
+          "Unix timestamp of the latest successful Redis leadership renewal"),
       oplog_async_workers_running_(
           "ha_oplog_async_workers_running",
           "Whether Primary OpLog asynchronous workers are running"),
@@ -40,12 +67,37 @@ HAMetricManager::HAMetricManager()
       oplog_last_successful_poll_timestamp_ms_(
           "ha_oplog_last_successful_poll_timestamp_ms",
           "Unix timestamp of the latest successful Standby OpLog poll"),
+      oplog_last_successful_write_timestamp_ms_(
+          "ha_oplog_last_successful_write_timestamp_ms",
+          "Unix timestamp of the latest successful Primary OpLog write"),
       p2p_snapshot_bootstrap_baseline_sequence_id_(
           "ha_p2p_snapshot_bootstrap_baseline_sequence_id",
           "Latest baseline sequence ID restored by P2P snapshot bootstrap"),
       p2p_bootstrap_catchup_target_sequence_id_(
           "ha_p2p_bootstrap_catchup_target_sequence_id",
           "Latest OpLog target sequence ID used after P2P snapshot bootstrap"),
+      oplog_trimmed_sequence_id_("ha_oplog_trimmed_sequence_id",
+                                 "Current OpLog logical trim horizon"),
+      oplog_gc_cursor_sequence_id_(
+          "ha_oplog_gc_cursor_sequence_id",
+          "Current OpLog physical garbage collection cursor"),
+      master_role_("ha_master_role",
+                   "Current HA master role (0=unknown, 1=disabled, 2=starting, "
+                   "3=standby, 4=promoting, 5=primary, 6=failed)"),
+      snapshot_ready_("ha_snapshot_ready",
+                      "Whether this master can serve HA snapshot requests"),
+      registry_heartbeat_ok_(
+          "ha_registry_heartbeat_ok",
+          "Whether the latest Redis Master registry heartbeat succeeded"),
+      status_updated_timestamp_ms_(
+          "ha_status_updated_timestamp_ms",
+          "Unix timestamp of the latest HA status update"),
+      oplog_consecutive_write_failures_(
+          "ha_oplog_consecutive_write_failures",
+          "Current number of consecutive Primary OpLog write failures"),
+      oplog_snapshot_ready_standby_count_(
+          "ha_oplog_snapshot_ready_standby_count",
+          "Number of alive standby instances eligible for snapshot trim"),
 
       // Error Counters
       oplog_skipped_entries_total_(
@@ -78,6 +130,9 @@ HAMetricManager::HAMetricManager()
       election_leadership_lost_total_(
           "ha_election_leadership_lost_total",
           "Total number of times this node lost leadership"),
+      election_renew_failures_total_(
+          "ha_election_renew_failures_total",
+          "Total number of failed Redis leadership renewal attempts"),
       election_reconnects_total_("ha_election_reconnects_total",
                                  "Total successful election Redis reconnects"),
       election_watch_failures_total_("ha_election_watch_failures_total",
@@ -144,6 +199,15 @@ HAMetricManager::HAMetricManager()
       p2p_snapshot_resync_failures_total_(
           "ha_p2p_snapshot_resync_failures_total",
           "Total failed P2P snapshot resync attempts"),
+      oplog_trim_advance_success_total_(
+          "ha_oplog_trim_advance_success_total",
+          "Total successful OpLog logical trim advances"),
+      oplog_gc_deleted_entries_total_(
+          "ha_oplog_gc_deleted_entries_total",
+          "Total OpLog entries deleted by physical garbage collection"),
+      oplog_trim_failures_total_(
+          "ha_oplog_trim_failures_total",
+          "Total failed OpLog auto trim worker iterations"),
       oplog_watch_disconnections_total_(
           "ha_oplog_watch_disconnections_total",
           "Total number of OpLog watch disconnections"),
@@ -201,12 +265,22 @@ HAMetricManager::HAMetricManager()
     oplog_pending_entries_.update(0);
     oplog_async_queue_size_.update(0);
     election_is_leader_.update(0);
+    election_last_successful_renew_timestamp_ms_.update(0);
     oplog_async_workers_running_.update(0);
     standby_degraded_.update(0);
     primary_degraded_.update(0);
     oplog_last_successful_poll_timestamp_ms_.update(0);
+    oplog_last_successful_write_timestamp_ms_.update(0);
     p2p_snapshot_bootstrap_baseline_sequence_id_.update(0);
     p2p_bootstrap_catchup_target_sequence_id_.update(0);
+    oplog_trimmed_sequence_id_.update(0);
+    oplog_gc_cursor_sequence_id_.update(0);
+    master_role_.update(0);
+    snapshot_ready_.update(0);
+    registry_heartbeat_ok_.update(0);
+    status_updated_timestamp_ms_.update(0);
+    oplog_consecutive_write_failures_.update(0);
+    oplog_snapshot_ready_standby_count_.update(0);
     standby_state_.update(0);
 }
 
@@ -256,6 +330,16 @@ void HAMetricManager::set_election_is_leader(bool value) {
     election_is_leader_.update(value ? 1 : 0);
 }
 
+void HAMetricManager::set_election_last_successful_renew_timestamp_ms(
+    int64_t timestamp_ms) {
+    election_last_successful_renew_timestamp_ms_.update(timestamp_ms);
+}
+
+int64_t HAMetricManager::get_election_last_successful_renew_timestamp_ms() {
+    return static_cast<int64_t>(
+        election_last_successful_renew_timestamp_ms_.value());
+}
+
 void HAMetricManager::set_oplog_async_workers_running(bool value) {
     oplog_async_workers_running_.update(value ? 1 : 0);
 }
@@ -273,6 +357,16 @@ void HAMetricManager::set_oplog_last_successful_poll_timestamp_ms(
     oplog_last_successful_poll_timestamp_ms_.update(timestamp_ms);
 }
 
+void HAMetricManager::set_oplog_last_successful_write_timestamp_ms(
+    int64_t timestamp_ms) {
+    oplog_last_successful_write_timestamp_ms_.update(timestamp_ms);
+}
+
+int64_t HAMetricManager::get_oplog_last_successful_write_timestamp_ms() {
+    return static_cast<int64_t>(
+        oplog_last_successful_write_timestamp_ms_.value());
+}
+
 void HAMetricManager::set_p2p_snapshot_bootstrap_baseline_sequence_id(
     int64_t seq_id) {
     p2p_snapshot_bootstrap_baseline_sequence_id_.update(seq_id);
@@ -281,6 +375,70 @@ void HAMetricManager::set_p2p_snapshot_bootstrap_baseline_sequence_id(
 void HAMetricManager::set_p2p_bootstrap_catchup_target_sequence_id(
     int64_t seq_id) {
     p2p_bootstrap_catchup_target_sequence_id_.update(seq_id);
+}
+
+void HAMetricManager::set_oplog_trimmed_sequence_id(int64_t seq_id) {
+    oplog_trimmed_sequence_id_.update(seq_id);
+}
+
+int64_t HAMetricManager::get_oplog_trimmed_sequence_id() {
+    return static_cast<int64_t>(oplog_trimmed_sequence_id_.value());
+}
+
+void HAMetricManager::set_oplog_gc_cursor_sequence_id(int64_t seq_id) {
+    oplog_gc_cursor_sequence_id_.update(seq_id);
+}
+
+int64_t HAMetricManager::get_oplog_gc_cursor_sequence_id() {
+    return static_cast<int64_t>(oplog_gc_cursor_sequence_id_.value());
+}
+
+void HAMetricManager::set_master_role(int64_t role) {
+    master_role_.update(role);
+}
+
+int64_t HAMetricManager::get_master_role() {
+    return static_cast<int64_t>(master_role_.value());
+}
+
+void HAMetricManager::set_snapshot_ready(bool value) {
+    snapshot_ready_.update(value ? 1 : 0);
+}
+
+int64_t HAMetricManager::get_snapshot_ready() {
+    return static_cast<int64_t>(snapshot_ready_.value());
+}
+
+void HAMetricManager::set_registry_heartbeat_ok(bool value) {
+    registry_heartbeat_ok_.update(value ? 1 : 0);
+}
+
+int64_t HAMetricManager::get_registry_heartbeat_ok() {
+    return static_cast<int64_t>(registry_heartbeat_ok_.value());
+}
+
+void HAMetricManager::set_status_updated_timestamp_ms(int64_t timestamp_ms) {
+    status_updated_timestamp_ms_.update(timestamp_ms);
+}
+
+int64_t HAMetricManager::get_status_updated_timestamp_ms() {
+    return static_cast<int64_t>(status_updated_timestamp_ms_.value());
+}
+
+void HAMetricManager::set_oplog_consecutive_write_failures(int64_t count) {
+    oplog_consecutive_write_failures_.update(count);
+}
+
+int64_t HAMetricManager::get_oplog_consecutive_write_failures() {
+    return static_cast<int64_t>(oplog_consecutive_write_failures_.value());
+}
+
+void HAMetricManager::set_oplog_snapshot_ready_standby_count(int64_t count) {
+    oplog_snapshot_ready_standby_count_.update(count);
+}
+
+int64_t HAMetricManager::get_oplog_snapshot_ready_standby_count() {
+    return static_cast<int64_t>(oplog_snapshot_ready_standby_count_.value());
 }
 
 // ========== Error Counters ==========
@@ -360,6 +518,12 @@ void HAMetricManager::inc_election_failures(int64_t val) {
 void HAMetricManager::inc_election_leadership_lost(int64_t val) {
     election_leadership_lost_total_.inc(val);
 }
+void HAMetricManager::inc_election_renew_failures(int64_t val) {
+    election_renew_failures_total_.inc(val);
+}
+int64_t HAMetricManager::get_election_renew_failures_total() {
+    return static_cast<int64_t>(election_renew_failures_total_.value());
+}
 void HAMetricManager::inc_election_reconnects(int64_t val) {
     election_reconnects_total_.inc(val);
 }
@@ -432,6 +596,30 @@ void HAMetricManager::inc_p2p_snapshot_resync_success(int64_t val) {
 
 void HAMetricManager::inc_p2p_snapshot_resync_failures(int64_t val) {
     p2p_snapshot_resync_failures_total_.inc(val);
+}
+
+void HAMetricManager::inc_oplog_trim_advance_success(int64_t val) {
+    oplog_trim_advance_success_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_trim_advance_success_total() {
+    return static_cast<int64_t>(oplog_trim_advance_success_total_.value());
+}
+
+void HAMetricManager::inc_oplog_gc_deleted_entries(int64_t val) {
+    oplog_gc_deleted_entries_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_gc_deleted_entries_total() {
+    return static_cast<int64_t>(oplog_gc_deleted_entries_total_.value());
+}
+
+void HAMetricManager::inc_oplog_trim_failures(int64_t val) {
+    oplog_trim_failures_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_trim_failures_total() {
+    return static_cast<int64_t>(oplog_trim_failures_total_.value());
 }
 
 void HAMetricManager::inc_oplog_watch_disconnections(int64_t val) {
@@ -538,12 +726,22 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(oplog_pending_entries_);
     serialize_metric(oplog_async_queue_size_);
     serialize_metric(election_is_leader_);
+    serialize_metric(election_last_successful_renew_timestamp_ms_);
     serialize_metric(oplog_async_workers_running_);
     serialize_metric(standby_degraded_);
     serialize_metric(primary_degraded_);
     serialize_metric(oplog_last_successful_poll_timestamp_ms_);
+    serialize_metric(oplog_last_successful_write_timestamp_ms_);
     serialize_metric(p2p_snapshot_bootstrap_baseline_sequence_id_);
     serialize_metric(p2p_bootstrap_catchup_target_sequence_id_);
+    serialize_metric(oplog_trimmed_sequence_id_);
+    serialize_metric(oplog_gc_cursor_sequence_id_);
+    serialize_metric(master_role_);
+    serialize_metric(snapshot_ready_);
+    serialize_metric(registry_heartbeat_ok_);
+    serialize_metric(status_updated_timestamp_ms_);
+    serialize_metric(oplog_consecutive_write_failures_);
+    serialize_metric(oplog_snapshot_ready_standby_count_);
     serialize_metric(standby_state_);
 
     // Counters
@@ -558,6 +756,7 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(election_attempts_total_);
     serialize_metric(election_failures_total_);
     serialize_metric(election_leadership_lost_total_);
+    serialize_metric(election_renew_failures_total_);
     serialize_metric(election_reconnects_total_);
     serialize_metric(election_watch_failures_total_);
     serialize_metric(election_polling_fallbacks_total_);
@@ -581,6 +780,9 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(p2p_snapshot_bootstrap_failures_total_);
     serialize_metric(p2p_snapshot_resync_success_total_);
     serialize_metric(p2p_snapshot_resync_failures_total_);
+    serialize_metric(oplog_trim_advance_success_total_);
+    serialize_metric(oplog_gc_deleted_entries_total_);
+    serialize_metric(oplog_trim_failures_total_);
     serialize_metric(oplog_watch_disconnections_total_);
     serialize_metric(oplog_applied_entries_total_);
     serialize_metric(oplog_applied_noop_entries_total_);
@@ -595,6 +797,27 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(election_duration_ms_);
     serialize_metric(oplog_apply_latency_us_);
 
+    // Doctor includes time-derived diagnoses, so recompute on every scrape.
+    const auto report = HAStatusManager::instance().GetDoctorReport();
+    ss << "# HELP ha_doctor_health Current local HA doctor health (one-hot).\n"
+          "# TYPE ha_doctor_health gauge\n";
+    for (const char* health : {"ok", "degraded", "unknown"}) {
+        ss << "ha_doctor_health{status=\"" << health << "\"} "
+           << (report.health == health ? 1 : 0) << '\n';
+    }
+    ss << "# HELP ha_doctor_issues Number of active local HA doctor issues.\n"
+          "# TYPE ha_doctor_issues gauge\n"
+          "ha_doctor_issues "
+       << report.issues.size() << '\n';
+    ss << "# HELP ha_doctor_issue_active Active local HA doctor issue.\n"
+          "# TYPE ha_doctor_issue_active gauge\n";
+    for (const auto& issue : report.issues) {
+        ss << "ha_doctor_issue_active{code=\"" << EscapeLabelValue(issue.code)
+           << "\",category=\"" << EscapeLabelValue(issue.category)
+           << "\",component=\"" << EscapeLabelValue(issue.component)
+           << "\",severity=\"" << EscapeLabelValue(issue.severity) << "\"} 1\n";
+    }
+
     return ss.str();
 }
 
@@ -606,13 +829,25 @@ std::string HAMetricManager::get_summary_string() {
     ss << ", lag=" << get_oplog_standby_lag();
     ss << ", pending=" << get_oplog_pending_entries();
     ss << ", async_queue=" << get_oplog_async_queue_size();
+    ss << ", trimmed_seq=" << get_oplog_trimmed_sequence_id();
+    ss << ", gc_cursor=" << get_oplog_gc_cursor_sequence_id();
+    ss << ", consecutive_write_fail=" << get_oplog_consecutive_write_failures();
+    ss << ", snapshot_ready_standby="
+       << get_oplog_snapshot_ready_standby_count();
     ss << ", batch_commits=" << get_oplog_batch_commits_total();
     ss << ", sync_commits=" << get_oplog_sync_batch_commits_total();
+    ss << ", trim_advance_success=" << get_oplog_trim_advance_success_total();
+    ss << ", gc_deleted_entries=" << get_oplog_gc_deleted_entries_total();
+    ss << ", trim_fail=" << get_oplog_trim_failures_total();
     ss << ", skipped=" << get_oplog_skipped_entries_total();
     ss << ", checksum_fail=" << get_oplog_checksum_failures_total();
     ss << ", write_fail=" << get_oplog_write_failures_total();
+    ss << ", renew_fail=" << get_election_renew_failures_total();
     ss << ", watch_disconn=" << get_oplog_watch_disconnections_total();
     ss << ", state=" << get_standby_state();
+    ss << ", role=" << get_master_role();
+    ss << ", snapshot_ready=" << get_snapshot_ready();
+    ss << ", registry_heartbeat_ok=" << get_registry_heartbeat_ok();
     return ss.str();
 }
 

@@ -58,6 +58,12 @@ DEFINE_string(oplog_async_queue_overflow_mode, "reject",
               "Asynchronous OpLog overflow mode: reject or bypass");
 DEFINE_uint64(oplog_best_effort_max_retries, 3,
               "Maximum best-effort Redis OpLog retries");
+DEFINE_uint32(oplog_latest_stall_timeout_sec, 10,
+              "HA doctor: seconds without confirmed latest progress while "
+              "OpLogs are pending; 0 disables stall diagnosis");
+DEFINE_uint32(oplog_catchup_stall_timeout_sec, 10,
+              "HA doctor: seconds without applied progress while a watching "
+              "standby is behind latest; 0 disables catch-up stall diagnosis");
 DEFINE_uint32(oplog_async_write_batch_size, 64,
               "Maximum entries in a Redis OpLog pipeline batch");
 DEFINE_bool(enable_oplog_auto_trim, false,
@@ -155,6 +161,12 @@ void LoadConfigFile(const DefaultConfig& source, P2PMasterConfig& config,
     source.GetUInt64("oplog_best_effort_max_retries",
                      &config.oplog.best_effort_max_retries,
                      config.oplog.best_effort_max_retries);
+    source.GetUInt32("oplog_latest_stall_timeout_sec",
+                     &config.oplog.latest_stall_timeout_sec,
+                     config.oplog.latest_stall_timeout_sec);
+    source.GetUInt32("oplog_catchup_stall_timeout_sec",
+                     &config.oplog.catchup_stall_timeout_sec,
+                     config.oplog.catchup_stall_timeout_sec);
     source.GetUInt32("oplog_async_write_batch_size",
                      &config.oplog.async_write_batch_size,
                      config.oplog.async_write_batch_size);
@@ -234,6 +246,10 @@ void ApplyCommandLineOverrides(P2PMasterConfig& config,
                    config.oplog.async_queue_overflow_mode);
     APPLY_OVERRIDE(oplog_best_effort_max_retries,
                    config.oplog.best_effort_max_retries);
+    APPLY_OVERRIDE(oplog_latest_stall_timeout_sec,
+                   config.oplog.latest_stall_timeout_sec);
+    APPLY_OVERRIDE(oplog_catchup_stall_timeout_sec,
+                   config.oplog.catchup_stall_timeout_sec);
     APPLY_OVERRIDE(oplog_async_write_batch_size,
                    config.oplog.async_write_batch_size);
     APPLY_OVERRIDE(enable_oplog_auto_trim, config.oplog.enable_auto_trim);

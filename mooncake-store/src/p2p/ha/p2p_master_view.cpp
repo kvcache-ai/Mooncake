@@ -107,9 +107,11 @@ P2PRedisMasterView::P2PRedisMasterView(const std::string& cluster_id,
                                        const std::string& password,
                                        int db_index, int ttl_seconds,
                                        int heartbeat_interval_seconds,
-                                       const std::string& username)
+                                       const std::string& username,
+                                       const std::string& instance_id)
     : redis_election_helper_(cluster_id, redis_endpoint, password, db_index,
-                             ttl_seconds, heartbeat_interval_seconds, username),
+                             ttl_seconds, heartbeat_interval_seconds, username,
+                             instance_id),
       ttl_seconds_(ttl_seconds) {}
 
 ErrorCode P2PRedisMasterView::Connect() {

@@ -49,6 +49,7 @@ class RedisOpLogStore : public OpLogStore {
     void RequestStopWriting() override;
     // Once this returns, all workers have exited and no async writes remain.
     void StopWriting() override;
+    OpLogDrainResult DrainWriting(uint32_t timeout_ms) override;
     ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) override;
     ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,
                              std::vector<OpLogEntry>& entries) override;
@@ -78,6 +79,7 @@ class RedisOpLogStore : public OpLogStore {
         OpLogEntry entry;
         bool sync{true};
         bool done{false};
+        bool write_failed{false};  // Protected by async_mutex_.
         ErrorCode result{ErrorCode::OK};
         size_t attempts{0};
     };
@@ -103,11 +105,13 @@ class RedisOpLogStore : public OpLogStore {
     std::vector<WriteResult> PersistEntriesNoLatest(
         redisContext* ctx,
         const std::vector<std::shared_ptr<PendingWrite>>& batch);
+    void SetWriteFailedUnlocked(PendingWrite& pending, bool failed);
     uint64_t MaxKnownSequenceUnlocked() const;
     bool HasCommittableLatestUnlocked() const;
     ErrorCode AdvanceCommittedLatestUnlocked(redisContext* ctx);
     void CompleteWrite(const std::shared_ptr<PendingWrite>& pending,
                        ErrorCode result);
+    void UpdateWriteProgressUnlocked();
 
     std::string EntryKey(uint64_t sequence_id) const;
     std::string SnapshotKey(const std::string& snapshot_id) const;
@@ -150,7 +154,9 @@ class RedisOpLogStore : public OpLogStore {
     std::set<uint64_t> persisted_sequences_ GUARDED_BY(async_mutex_);
     std::set<uint64_t> dropped_sequences_ GUARDED_BY(async_mutex_);
     uint64_t committed_sequence_id_ GUARDED_BY(async_mutex_) = 0;
+    size_t failed_write_count_ GUARDED_BY(async_mutex_) = 0;
     std::atomic<bool> async_running_{false};
+    std::atomic<int64_t> consecutive_write_failures_{0};
     std::vector<std::thread> async_workers_;
     std::mutex async_stop_mutex_;
     size_t async_queue_max_entries_;

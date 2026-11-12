@@ -16,6 +16,7 @@
 #include "p2p/ha/oplog/p2p_hot_standby_service.h"
 #include "p2p/master/p2p_master_service.h"
 #ifdef STORE_USE_REDIS
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/redis_util.h"
 #endif
 
@@ -697,6 +698,11 @@ ErrorCode RedisMasterRegistryHeartbeat::Start() {
     }
     stopping_ = false;
     auto err = registry_->Refresh(entry_);
+    HAStatusManager::instance().RecordRegistryHeartbeat(
+        err,
+        err == ErrorCode::OK
+            ? ""
+            : "Redis registry initial registration failed: " + toString(err));
     thread_ = std::thread(&RedisMasterRegistryHeartbeat::Run, this);
     if (err == ErrorCode::OK) {
         LOG(INFO) << "Redis Master registered"
@@ -818,7 +824,13 @@ void RedisMasterRegistryHeartbeat::Run() {
         entry_ = entry;
 
         lock.unlock();
-        if (registry_->Refresh(entry) != ErrorCode::OK) {
+        const auto refresh_result = registry_->Refresh(entry);
+        HAStatusManager::instance().RecordRegistryHeartbeat(
+            refresh_result, refresh_result == ErrorCode::OK
+                                ? ""
+                                : "Redis registry heartbeat refresh failed: " +
+                                      toString(refresh_result));
+        if (refresh_result != ErrorCode::OK) {
             LOG(WARNING) << "Redis Master registry heartbeat failed"
                          << ", instance_id=" << entry.instance_id
                          << ", role=" << entry.role;

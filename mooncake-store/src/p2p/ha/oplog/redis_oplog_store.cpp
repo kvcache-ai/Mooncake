@@ -14,6 +14,7 @@
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/ha/oplog/polling_oplog_change_notifier.h"
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 
 namespace mooncake {
 
@@ -25,6 +26,12 @@ constexpr int kCommandTimeoutMs = 3000;
 bool IsRedisOkStatus(const redisReply* reply) {
     return reply && reply->type == REDIS_REPLY_STATUS && reply->str &&
            reply->len == 2 && std::memcmp(reply->str, "OK", 2) == 0;
+}
+
+int64_t CurrentTimestampMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
 bool SetTimeoutUntil(redisContext* ctx,
@@ -93,6 +100,9 @@ RedisOpLogStore::RedisOpLogStore(
 
 RedisOpLogStore::~RedisOpLogStore() {
     StopWriting();
+    if (enable_write_) {
+        HAStatusManager::instance().SetDoctorIssue("OPLOG_COMMIT_FAILED");
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (ctx_) {
         redisFree(ctx_);
@@ -232,8 +242,7 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
             pending = std::make_shared<PendingWrite>(entry, sync);
             inflight_writes_[entry.sequence_id] = pending;
             pending_writes_.push_back(pending);
-            HAMetricManager::instance().set_oplog_async_queue_size(
-                static_cast<int64_t>(inflight_writes_.size()));
+            UpdateWriteProgressUnlocked();
         }
     }
     async_cv_.notify_one();
@@ -266,6 +275,7 @@ void RedisOpLogStore::StartAsyncWorkers() {
         return;
     }
     async_stop_source_ = std::stop_source{};
+    HAStatusManager::instance().SetOpLogWriterRunning(true);
     async_workers_.reserve(kAsyncWorkerCount);
     for (size_t i = 0; i < kAsyncWorkerCount; ++i) {
         async_workers_.emplace_back(&RedisOpLogStore::AsyncWriteLoop, this, i);
@@ -276,10 +286,42 @@ void RedisOpLogStore::StartAsyncWorkers() {
 void RedisOpLogStore::RequestStopWriting() {
     if (!enable_write_) return;
     async_running_.store(false);
+    HAStatusManager::instance().SetOpLogWriterRunning(false);
     // Cancellation-aware waits cannot lose a stop between checking their
     // predicate and sleeping. Their notifications do not acquire async_mutex_,
     // which a worker may hold in the future while waiting for Redis I/O.
     async_stop_source_.request_stop();
+}
+
+OpLogDrainResult RedisOpLogStore::DrainWriting(uint32_t timeout_ms) {
+    OpLogDrainResult result;
+    if (!enable_write_ || !async_running_.load()) {
+        return result;
+    }
+
+    std::unique_lock<std::mutex> lock(async_mutex_);
+    auto snapshot = [&] {
+        result.queued_count = pending_writes_.size();
+        result.inflight_count = inflight_writes_.size();
+        result.committed_sequence_id = committed_sequence_id_;
+        result.max_known_sequence_id = MaxKnownSequenceUnlocked();
+        result.drained = pending_writes_.empty() && inflight_writes_.empty();
+    };
+
+    snapshot();
+    if (result.drained || timeout_ms == 0) {
+        return result;
+    }
+    // A leadership-loss cancellation during an active stepdown drain must not
+    // keep the primary waiting for the full timeout after writers are stopped.
+    sync_cv_.wait_for(
+        lock, async_stop_source_.get_token(),
+        std::chrono::milliseconds(timeout_ms), [&] {
+            return (pending_writes_.empty() && inflight_writes_.empty()) ||
+                   !async_running_.load();
+        });
+    snapshot();
+    return result;
 }
 
 void RedisOpLogStore::StopWriting() {
@@ -291,6 +333,7 @@ void RedisOpLogStore::StopWriting() {
         std::lock_guard<std::mutex> lock(async_mutex_);
         size_t unfinished_count = 0;
         for (auto& [seq, pending] : inflight_writes_) {
+            pending->write_failed = false;
             if (!pending->done) {
                 ++unfinished_count;
                 pending->done = true;
@@ -305,6 +348,8 @@ void RedisOpLogStore::StopWriting() {
         inflight_writes_.clear();
         persisted_sequences_.clear();
         dropped_sequences_.clear();
+        failed_write_count_ = 0;
+        HAStatusManager::instance().SetDoctorIssue("OPLOG_WRITE_FAILED");
         HAMetricManager::instance().set_oplog_async_queue_size(0);
         sync_cv_.notify_all();
     }
@@ -430,6 +475,10 @@ bool RedisOpLogStore::FinishOrRetryWrite(
         write_latency_us);
     if (err != ErrorCode::OK) {
         HAMetricManager::instance().inc_oplog_write_failures();
+        const int64_t consecutive_failures =
+            consecutive_write_failures_.fetch_add(1) + 1;
+        HAMetricManager::instance().set_oplog_consecutive_write_failures(
+            consecutive_failures);
         if (err == ErrorCode::INVALID_PARAMS) {
             CompleteWrite(pending, err);
             return false;
@@ -445,16 +494,17 @@ bool RedisOpLogStore::FinishOrRetryWrite(
             if (!async_running_.load() || pending->done) {
                 return false;
             }
+            SetWriteFailedUnlocked(*pending, true);
             attempts = ++pending->attempts;
             if (IsBestEffortP2POpLog(pending->entry.op_type) &&
                 attempts >= best_effort_max_retries_) {
                 dropped_sequences_.insert(pending->entry.sequence_id);
+                SetWriteFailedUnlocked(*pending, false);
                 inflight_writes_.erase(pending->entry.sequence_id);
                 pending->done = true;
                 pending->result = ErrorCode::INTERNAL_ERROR;
                 HAMetricManager::instance().inc_oplog_best_effort_dropped();
-                HAMetricManager::instance().set_oplog_async_queue_size(
-                    static_cast<int64_t>(inflight_writes_.size()));
+                UpdateWriteProgressUnlocked();
                 sync_cv_.notify_all();
                 LOG(ERROR) << "RedisOpLogStore: dropping best-effort oplog"
                            << ", sequence_id=" << pending->entry.sequence_id
@@ -474,6 +524,10 @@ bool RedisOpLogStore::FinishOrRetryWrite(
         return true;
     }
 
+    consecutive_write_failures_.store(0);
+    HAMetricManager::instance().set_oplog_consecutive_write_failures(0);
+    HAMetricManager::instance().set_oplog_last_successful_write_timestamp_ms(
+        CurrentTimestampMs());
     CompleteWrite(pending, ErrorCode::OK);
     return false;
 }
@@ -588,6 +642,39 @@ RedisOpLogStore::PersistEntriesNoLatest(
     return results;
 }
 
+void RedisOpLogStore::SetWriteFailedUnlocked(PendingWrite& pending,
+                                             bool failed) {
+    if (pending.write_failed == failed) return;
+    pending.write_failed = failed;
+    if (failed) {
+        ++failed_write_count_;
+    } else {
+        DCHECK_GT(failed_write_count_, 0);
+        --failed_write_count_;
+    }
+    // Update the issue under the same queue lock as the per-entry state.
+    // Write/retry logs keep concrete sequence IDs and Redis errors.
+    HAStatusManager::instance().SetDoctorIssue(
+        "OPLOG_WRITE_FAILED",
+        failed_write_count_ == 0
+            ? ""
+            : "unrecovered_writes=" + std::to_string(failed_write_count_));
+}
+
+void RedisOpLogStore::UpdateWriteProgressUnlocked() {
+    // In-flight includes queued, retrying and persisted-but-uncommitted work.
+    // Dropped-only tails intentionally do not keep the stall timer alive.
+    // Rewrites at/below committed latest do not require another advance.
+    const bool needs_commit =
+        !inflight_writes_.empty() &&
+        inflight_writes_.rbegin()->first > committed_sequence_id_;
+    HAStatusManager::instance().SetOpLogWriteProgress(
+        committed_sequence_id_, needs_commit ? inflight_writes_.size() : 0,
+        async_queue_max_entries_);
+    HAMetricManager::instance().set_oplog_async_queue_size(
+        static_cast<int64_t>(inflight_writes_.size()));
+}
+
 uint64_t RedisOpLogStore::MaxKnownSequenceUnlocked() const {
     uint64_t max_known_sequence = committed_sequence_id_;
     if (!persisted_sequences_.empty() &&
@@ -644,10 +731,13 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
         (redisReply*)redisCommand(ctx, "SET %b %b", latest_key_.data(),
                                   latest_key_.size(), seq.data(), seq.size()));
     if (!IsRedisOkStatus(reply.get())) {
+        HAStatusManager::instance().SetDoctorIssue(
+            "OPLOG_COMMIT_FAILED", "target=" + std::to_string(target));
         LOG(ERROR) << "RedisOpLogStore::AdvanceCommittedLatest: SET failed"
                    << ", target=" << target;
         return ErrorCode::INTERNAL_ERROR;
     }
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_COMMIT_FAILED");
 
     for (uint64_t seq_id = committed_sequence_id_ + 1; seq_id <= target;
          ++seq_id) {
@@ -655,6 +745,7 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
         dropped_sequences_.erase(seq_id);
         auto it = inflight_writes_.find(seq_id);
         if (it != inflight_writes_.end()) {
+            SetWriteFailedUnlocked(*it->second, false);
             it->second->done = true;
             it->second->result = ErrorCode::OK;
             inflight_writes_.erase(it);
@@ -663,8 +754,7 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
     committed_sequence_id_ = target;
     HAMetricManager::instance().set_oplog_last_sequence_id(
         static_cast<int64_t>(target));
-    HAMetricManager::instance().set_oplog_async_queue_size(
-        static_cast<int64_t>(inflight_writes_.size()));
+    UpdateWriteProgressUnlocked();
     sync_cv_.notify_all();
     return ErrorCode::OK;
 }
@@ -675,13 +765,13 @@ void RedisOpLogStore::CompleteWrite(
     if (!async_running_.load() || pending->done) {
         return;
     }
+    SetWriteFailedUnlocked(*pending, false);
 
     if (result != ErrorCode::OK) {
         pending->done = true;
         pending->result = result;
         inflight_writes_.erase(pending->entry.sequence_id);
-        HAMetricManager::instance().set_oplog_async_queue_size(
-            static_cast<int64_t>(inflight_writes_.size()));
+        UpdateWriteProgressUnlocked();
         sync_cv_.notify_all();
         return;
     }
@@ -690,13 +780,13 @@ void RedisOpLogStore::CompleteWrite(
         pending->done = true;
         pending->result = ErrorCode::OK;
         inflight_writes_.erase(pending->entry.sequence_id);
-        HAMetricManager::instance().set_oplog_async_queue_size(
-            static_cast<int64_t>(inflight_writes_.size()));
+        UpdateWriteProgressUnlocked();
         sync_cv_.notify_all();
         return;
     }
 
     persisted_sequences_.insert(pending->entry.sequence_id);
+    UpdateWriteProgressUnlocked();
 }
 
 ErrorCode RedisOpLogStore::ReadOpLog(uint64_t sequence_id, OpLogEntry& entry) {
@@ -928,6 +1018,13 @@ ErrorCode RedisOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
     }
     HAMetricManager::instance().set_oplog_last_sequence_id(
         static_cast<int64_t>(sequence_id));
+    // Keep the local metadata watermark exposed by Prometheus aligned with
+    // /ha/status. Primary has no OpLogApplier, so the primary supervisor
+    // supplies its latest assigned sequence as the local apply watermark.
+    if (enable_write_) {
+        HAMetricManager::instance().set_oplog_applied_sequence_id(
+            static_cast<int64_t>(sequence_id));
+    }
     return ErrorCode::OK;
 }
 
@@ -1031,6 +1128,7 @@ ErrorCode RedisOpLogStore::UpdateLatestSequenceId(uint64_t sequence_id) {
             persisted_sequences_.upper_bound(sequence_id));
         dropped_sequences_.erase(dropped_sequences_.begin(),
                                  dropped_sequences_.upper_bound(sequence_id));
+        if (enable_write_) UpdateWriteProgressUnlocked();
     }
     sync_cv_.notify_all();
     return ErrorCode::OK;

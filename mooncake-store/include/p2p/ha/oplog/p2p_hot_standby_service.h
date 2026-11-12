@@ -52,6 +52,7 @@ struct P2PHotStandbyConfig {
 struct P2PStandbySyncStatus {
     uint64_t applied_seq_id{0};
     uint64_t primary_seq_id{0};
+    bool primary_seq_id_known{false};
     uint64_t lag_entries{0};
     bool is_connected{false};
     bool apply_healthy{true};

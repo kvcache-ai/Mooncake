@@ -11,6 +11,8 @@
 #include <sstream>
 #include <utility>
 
+#include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/oplog_store.h"
 #include "p2p/ha/redis_util.h"
 
@@ -45,6 +47,15 @@ std::unique_ptr<redisContext, decltype(&redisFree)> CreateRedisConnection(
         &redisFree};
 }
 
+bool IsSnapshotTrimEligibleStandby(const RedisMasterRegistryEntry& entry,
+                                   const std::string& self_instance_id) {
+    if (!self_instance_id.empty() && entry.instance_id == self_instance_id) {
+        return false;
+    }
+    return entry.role == "standby" && entry.snapshot_ready &&
+           !entry.snapshot_endpoint.empty();
+}
+
 }  // namespace
 
 uint64_t ComputeRedisOpLogTrimTarget(
@@ -64,12 +75,7 @@ uint64_t ComputeRedisOpLogTrimTarget(
 
     std::vector<uint64_t> snapshot_sequences;
     for (const auto& entry : registry_entries) {
-        if (!self_instance_id.empty() &&
-            entry.instance_id == self_instance_id) {
-            continue;
-        }
-        if (entry.role == "standby" && entry.snapshot_ready &&
-            !entry.snapshot_endpoint.empty()) {
+        if (IsSnapshotTrimEligibleStandby(entry, self_instance_id)) {
             snapshot_sequences.push_back(entry.applied_sequence_id);
         }
     }
@@ -217,8 +223,13 @@ ErrorCode RedisOpLogTrimWorker::CollectGarbage(redisContext* ctx,
 
     uint64_t gc_cursor = 0;
     auto err = ReadSequenceKey(ctx, gc_cursor_key, gc_cursor);
-    if (err != ErrorCode::OK || gc_cursor >= trimmed) {
+    if (err != ErrorCode::OK) {
         return err;
+    }
+    HAMetricManager::instance().set_oplog_gc_cursor_sequence_id(
+        static_cast<int64_t>(gc_cursor));
+    if (gc_cursor >= trimmed) {
+        return ErrorCode::OK;
     }
 
     const uint64_t batch_count =
@@ -265,10 +276,16 @@ ErrorCode RedisOpLogTrimWorker::CollectGarbage(redisContext* ctx,
         return ErrorCode::INTERNAL_ERROR;
     }
     deleted_to = batch_end;
+    HAMetricManager::instance().set_oplog_gc_cursor_sequence_id(
+        static_cast<int64_t>(deleted_to));
+    HAMetricManager::instance().inc_oplog_gc_deleted_entries(
+        static_cast<int64_t>(batch_count));
     return ErrorCode::OK;
 }
 
 ErrorCode RedisOpLogTrimWorker::TrimOnce() {
+    HAStatusManager::instance().SetStandbySnapshotAvailability(0, 0);
+
     auto ctx = CreateRedisConnection(config_);
     if (!ctx) {
         return ErrorCode::INTERNAL_ERROR;
@@ -288,6 +305,8 @@ ErrorCode RedisOpLogTrimWorker::TrimOnce() {
     if (err != ErrorCode::OK) {
         return err;
     }
+    HAMetricManager::instance().set_oplog_trimmed_sequence_id(
+        static_cast<int64_t>(trimmed_sequence_id));
 
     uint64_t logical_trimmed = trimmed_sequence_id;
     if (latest_sequence_id > config_.retention_entries &&
@@ -301,6 +320,17 @@ ErrorCode RedisOpLogTrimWorker::TrimOnce() {
             return err;
         }
 
+        size_t snapshot_ready_count = std::count_if(
+            entries.begin(), entries.end(), [&](const auto& entry) {
+                return IsSnapshotTrimEligibleStandby(entry,
+                                                     config_.self_instance_id);
+            });
+        HAMetricManager::instance().set_oplog_snapshot_ready_standby_count(
+            static_cast<int64_t>(snapshot_ready_count));
+        HAStatusManager::instance().SetStandbySnapshotAvailability(
+            static_cast<uint32_t>(snapshot_ready_count),
+            config_.min_snapshot_ready_standby_count);
+
         const uint64_t trim_target = ComputeRedisOpLogTrimTarget(
             latest_sequence_id, trimmed_sequence_id, config_.retention_entries,
             config_.min_snapshot_ready_standby_count, entries,
@@ -310,6 +340,11 @@ ErrorCode RedisOpLogTrimWorker::TrimOnce() {
             if (err != ErrorCode::OK) {
                 return err;
             }
+            if (logical_trimmed > trimmed_sequence_id) {
+                HAMetricManager::instance().inc_oplog_trim_advance_success();
+            }
+            HAMetricManager::instance().set_oplog_trimmed_sequence_id(
+                static_cast<int64_t>(logical_trimmed));
             LOG(INFO) << "RedisOpLogTrimWorker: advanced trim horizon"
                       << ", cluster_id=" << config_.cluster_id
                       << ", latest_sequence_id=" << latest_sequence_id
@@ -335,7 +370,15 @@ ErrorCode RedisOpLogTrimWorker::TrimOnce() {
 
 void RedisOpLogTrimWorker::Run() {
     while (running_.load()) {
-        (void)TrimOnce();
+        const auto err = TrimOnce();
+        if (err != ErrorCode::OK) {
+            HAMetricManager::instance().inc_oplog_trim_failures();
+            LOG_EVERY_N(WARNING, 10)
+                << "RedisOpLogTrimWorker: trim cycle failed"
+                << ", cluster_id=" << config_.cluster_id
+                << ", error=" << toString(err)
+                << ", interval_sec=" << config_.interval.count();
+        }
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait_for(lock, config_.interval, [this] { return stopping_; });
         if (stopping_) {

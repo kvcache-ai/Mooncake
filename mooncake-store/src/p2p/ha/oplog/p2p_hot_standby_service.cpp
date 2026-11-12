@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 
 namespace mooncake {
 
@@ -154,8 +155,14 @@ ErrorCode P2PHotStandbyService::Start(
                 bootstrap_err = ErrorCode::OPLOG_TRIMMED;
             }
             if (bootstrap_err == ErrorCode::OK || !bootstrap_required) {
+                HAStatusManager::instance().SetDoctorIssue(
+                    "SNAPSHOT_RECOVERY_FAILED");
                 break;
             }
+            HAStatusManager::instance().SetDoctorIssue(
+                "SNAPSHOT_RECOVERY_FAILED",
+                "Required snapshot bootstrap failed: " +
+                    std::string(toString(bootstrap_err)));
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         } while (std::chrono::steady_clock::now() < deadline);
         if (bootstrap_err != ErrorCode::OK) {
@@ -338,6 +345,7 @@ void P2PHotStandbyService::Stop() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     ResetOplogFollowingLocked();
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_READ_FAILED");
 
     StandbyState state = state_machine_.GetState();
     if (state != StandbyState::STOPPED) {
@@ -436,6 +444,9 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
     }
 
     ResetOplogFollowingLocked();
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_READ_FAILED");
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_RECONNECT_FAILED");
+    HAStatusManager::instance().SetDoctorIssue("SNAPSHOT_RECOVERY_FAILED");
     LOG(INFO) << "P2PHotStandbyService promoted"
               << ", latest_applied_sequence_id="
               << GetLocalLastAppliedSequenceIdLocked();
@@ -522,7 +533,6 @@ P2PStandbySyncStatus P2PHotStandbyService::GetSyncStatus() const {
     status.state = state_machine_.GetState();
     status.time_in_state = state_machine_.GetTimeInCurrentState();
     status.is_connected = state_machine_.IsConnected();
-    status.applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
     if (oplog_applier_) {
         status.apply_healthy = oplog_applier_->IsHealthy();
         status.failed_sequence_id = oplog_applier_->GetFailedSequenceId();
@@ -535,9 +545,13 @@ P2PStandbySyncStatus P2PHotStandbyService::GetSyncStatus() const {
         if (watcher_oplog_store_->GetLatestSequenceId(latest_seq) ==
             ErrorCode::OK) {
             status.primary_seq_id = latest_seq;
+            status.primary_seq_id_known = true;
         }
     }
-    if (status.primary_seq_id > status.applied_seq_id) {
+    // Replay can advance during store I/O; sample applied after that read.
+    status.applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    if (status.primary_seq_id_known &&
+        status.primary_seq_id > status.applied_seq_id) {
         status.lag_entries = status.primary_seq_id - status.applied_seq_id;
     }
     HAMetricManager::instance().set_oplog_standby_lag(
@@ -686,6 +700,10 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
         return ErrorCode::OPLOG_TRIMMED;
     }
 
+    // The trusted snapshot replaces metadata affected by earlier local
+    // rejections. A rejection during the new replay will set this again.
+    HAStatusManager::instance().SetDoctorIssue("OPLOG_PENDING_REJECTED", "");
+    HAStatusManager::instance().ResetOpLogLagGrowth();
     oplog_applier_ = std::make_unique<P2POpLogApplier>(
         metadata_store_.get(), config_.cluster_id, nullptr,
         config_.oplog_pending_max_entries);
@@ -979,6 +997,15 @@ void P2PHotStandbyService::RecoveryLoop() {
                 }
             }
 
+            if (err == ErrorCode::OK) {
+                // Commit successful recovery diagnostics before Promote can
+                // acquire mutex_ and stop this worker.
+                HAStatusManager::instance().SetDoctorIssue(
+                    "SNAPSHOT_RECOVERY_FAILED");
+                HAStatusManager::instance().SetDoctorIssue(
+                    "OPLOG_RECONNECT_FAILED");
+            }
+
             recovery_lock.lock();
             if (recovery_stopping_.load()) {
                 return;
@@ -993,6 +1020,10 @@ void P2PHotStandbyService::RecoveryLoop() {
                 break;
             }
 
+            HAStatusManager::instance().SetDoctorIssue(
+                attempted_snapshot_resync ? "SNAPSHOT_RECOVERY_FAILED"
+                                          : "OPLOG_RECONNECT_FAILED",
+                "Recovery failed, retrying: " + std::string(toString(err)));
             if (!attempted_snapshot_resync) {
                 HAMetricManager::instance()
                     .inc_oplog_reader_reconnect_failures();

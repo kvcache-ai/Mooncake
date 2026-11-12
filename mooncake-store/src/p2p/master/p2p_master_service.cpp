@@ -12,6 +12,7 @@
 #include <glog/logging.h>
 
 #include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/oplog_store_factory.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/master/p2p_client_meta.h"
@@ -438,6 +439,15 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
 uint64_t P2PMasterService::GetLatestOpLogSequenceId() const {
     auto* manager = GetOpLogManager();
     return manager ? manager->GetLastSequenceId() : 0;
+}
+
+tl::expected<uint64_t, ErrorCode> P2PMasterService::ReadLatestOpLogSequenceId()
+    const {
+    auto* manager = GetOpLogManager();
+    if (manager == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return manager->ReadLatestOpLogSequenceId();
 }
 
 tl::expected<uint64_t, ErrorCode>
@@ -1281,6 +1291,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
 
     // Even an empty standby may be behind an existing Redis latest watermark.
     // Seed the allocator before restoring metadata or admitting new writes.
+    uint64_t promotion_latest_sequence_id = last_applied_sequence_id;
     if (auto* manager = GetOpLogManager()) {
         auto err = manager->SetInitialSequenceId(last_applied_sequence_id);
         if (err != ErrorCode::OK) {
@@ -1292,13 +1303,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
                        << ", error=" << toString(err);
             return err;
         }
-        if (manager->GetLastSequenceId() > last_applied_sequence_id) {
-            LOG(WARNING)
-                << "RestoreFromStandbyMetadata: promoted with incomplete "
-                   "OpLog catch-up"
-                << ", applied=" << last_applied_sequence_id
-                << ", latest=" << manager->GetLastSequenceId();
-        }
+        promotion_latest_sequence_id = manager->GetLastSequenceId();
     } else if (last_applied_sequence_id > 0) {
         LOG(WARNING) << "RestoreFromStandbyMetadata: cannot set initial OpLog "
                         "sequence without OpLogManager"
@@ -1379,6 +1384,20 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
         HAMetricManager::instance().inc_promotion_skipped_objects(
             static_cast<int64_t>(skipped_objects));
     }
+    if (promotion_latest_sequence_id > last_applied_sequence_id) {
+        // New writes cannot repair skipped metadata. Keep the promotion
+        // watermarks until this primary role ends or the supervisor resets.
+        const auto detail = "oplog_applied_sequence_id=" +
+                            std::to_string(last_applied_sequence_id) +
+                            ", oplog_latest_sequence_id=" +
+                            std::to_string(promotion_latest_sequence_id);
+        HAStatusManager::instance().SetDoctorIssue(
+            "PROMOTION_CATCHUP_INCOMPLETE", detail);
+        LOG(WARNING) << "RestoreFromStandbyMetadata: promoted with incomplete "
+                        "OpLog catch-up, "
+                     << detail;
+    }
+
     LOG(INFO) << "RestoreFromStandbyMetadata: restored"
               << ", clients=" << restored_clients
               << ", objects=" << restored_objects

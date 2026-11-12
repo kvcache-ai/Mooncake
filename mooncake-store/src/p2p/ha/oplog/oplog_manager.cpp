@@ -35,6 +35,16 @@ void OpLogManager::StopWriting() {
     }
 }
 
+OpLogDrainResult OpLogManager::DrainWriting(uint32_t timeout_ms) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto store = oplog_store_;
+    lock.unlock();
+    if (!store) {
+        return {};
+    }
+    return store->DrainWriting(timeout_ms);
+}
+
 uint64_t OpLogManager::Append(OpType type, const std::string& key,
                               const std::string& payload) {
     OpLogEntry entry;
@@ -126,6 +136,23 @@ tl::expected<uint64_t, ErrorCode> OpLogManager::AppendAndPersist(
 uint64_t OpLogManager::GetLastSequenceId() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return last_seq_id_;
+}
+
+tl::expected<uint64_t, ErrorCode> OpLogManager::ReadLatestOpLogSequenceId()
+    const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto store = oplog_store_;
+    lock.unlock();
+    if (!store) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    uint64_t sequence_id = 0;
+    ErrorCode err = store->GetLatestSequenceId(sequence_id);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return sequence_id;
 }
 
 tl::expected<uint64_t, ErrorCode> OpLogManager::GetLocalCommittedSequenceId()

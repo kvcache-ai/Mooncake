@@ -2,7 +2,8 @@
  * @file p2p_master_http_endpoints_test.cpp
  * @brief Integration tests for the P2P master HTTP endpoints
  *        (GET /health, GET /get_key_count, GET /get_all_keys,
- *         GET /batch_query_routes, GET /metrics).
+ *         GET /batch_query_routes, GET /metrics, GET /ha/status, GET
+ * /ha/doctor).
  *
  * Brings up an in-process P2PMasterRpcService with the embedded HTTP
  * server bound to a kernel-assigned port (no RPC server)
@@ -13,6 +14,7 @@
 #include <json/json.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -30,6 +32,10 @@
 
 #include <ylt/coro_http/coro_http_client.hpp>
 
+#include "p2p/ha/ha_metric_manager.h"
+#include "p2p/ha/ha_status.h"
+#include "p2p/ha/p2p_status_http_server.h"
+#include "p2p/master/p2p_master.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "types.h"
 #include "utils.h"
@@ -98,6 +104,14 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
+    void SetUp() override {
+        // Timed doctor tests must not let the shared fixture client expire.
+        P2PHeartbeatRequest request;
+        request.client_id = client_id_;
+        request.service_state = P2PClientServiceState::ONLINE;
+        ASSERT_TRUE(wrapped_->Heartbeat(request).has_value());
+    }
+
     // Owns the response body: resp_data::resp_body is a string_view into
     // the client's internal buffer and would dangle once the client used
     // below is destroyed.
@@ -109,6 +123,13 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
     static HttpResponse HttpGet(const std::string& url) {
         coro_http::coro_http_client client;
         auto resp = client.get(url);
+        return {resp.status, std::string(resp.resp_body)};
+    }
+
+    static HttpResponse HttpPost(const std::string& url) {
+        coro_http::coro_http_client client;
+        auto resp =
+            client.post(url, "", coro_http::req_content_type::octet_stream);
         return {resp.status, std::string(resp.resp_body)};
     }
 
@@ -239,6 +260,12 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
     static UUID segment_id_b_;
 };
 
+namespace {
+struct HAStatusResetGuard {
+    ~HAStatusResetGuard() { HAStatusManager::instance().Reset(); }
+};
+}  // namespace
+
 std::unique_ptr<P2PMasterRpcService> P2PMasterHttpEndpointsTest::wrapped_;
 std::string P2PMasterHttpEndpointsTest::http_base_url_;
 UUID P2PMasterHttpEndpointsTest::client_id_;
@@ -249,6 +276,463 @@ TEST_F(P2PMasterHttpEndpointsTest, HealthEndpointReturnsOk) {
     auto resp = HttpGet(http_base_url_ + "/health");
     ASSERT_EQ(resp.status, 200) << "body=" << resp.resp_body;
     EXPECT_EQ(resp.resp_body, "OK");
+}
+
+#ifdef STORE_USE_REDIS
+TEST_F(P2PMasterHttpEndpointsTest,
+       RunWithHAPublishesLocalIdentityAndDetectsViewMismatch) {
+    HAStatusResetGuard reset_guard;
+    P2PMasterConfig config;
+    config.ha.enabled = true;
+    config.ha.election_backend = ElectionBackend::REDIS;
+    config.oplog.enabled = true;
+    config.cluster_id = "p2p_master_instance_id_startup_test";
+    config.rpc.address = "127.0.0.1";
+    config.rpc.port = 0;
+    config.rpc.thread_num = 1;
+    config.metrics.http_port = 0;
+    config.redis.endpoint = "127.0.0.1:1";
+
+    // Use the supervisor-facing Run path; the closed endpoint makes Redis
+    // connect fail after RunWithHA has initialized status.
+    P2PMaster master(config);
+    EXPECT_EQ(master.Run(), -1);
+
+    auto& status = HAStatusManager::instance();
+    const auto instance_id = status.Snapshot().instance_id;
+    EXPECT_FALSE(instance_id.empty());
+
+    constexpr std::string_view kLocalEndpoint = "127.0.0.1:50051";
+    status.Configure(/*ha_enabled=*/true, config.cluster_id,
+                     std::string(kLocalEndpoint));
+    status.SetRoleState("primary", "RUNNING");
+    status.SetMasterView(std::string(kLocalEndpoint), /*epoch=*/7,
+                         /*timestamp_ms=*/123456789, /*ttl_sec=*/4,
+                         /*instance_id=*/"another-instance");
+    const auto report = status.GetDoctorReport();
+    const auto issue = std::find_if(
+        report.issues.begin(), report.issues.end(),
+        [](const auto& issue) { return issue.code == "MASTER_VIEW_MISMATCH"; });
+    ASSERT_NE(issue, report.issues.end());
+    EXPECT_NE(issue->message.find(instance_id), std::string::npos);
+    EXPECT_NE(issue->message.find("another-instance"), std::string::npos);
+}
+#endif  // STORE_USE_REDIS
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
+    std::atomic<bool> stepdown_called{false};
+    wrapped_->SetStepdownCallback(
+        [&stepdown_called] { stepdown_called.store(true); });
+
+    const auto response = HttpPost(http_base_url_ + "/ha/stepdown");
+    ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
+    const auto body = ParseJson(response.resp_body, "stepdown");
+    EXPECT_TRUE(body["success"].asBool());
+    EXPECT_TRUE(stepdown_called.load());
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Configure(/*ha_enabled=*/true, "test_cluster", "127.0.0.1:50051");
+    status.SetInstanceId("test-instance");
+    status.SetRoleState("primary", "RUNNING");
+    status.SetMasterView("127.0.0.1:50051", 7,
+                         /*timestamp_ms=*/123456789,
+                         /*ttl_sec=*/4,
+                         /*instance_id=*/"candidate-1");
+    status.SetOpLogProgress(/*applied_sequence_id=*/12,
+                            /*latest_sequence_id=*/15,
+                            /*trimmed_sequence_id=*/3,
+                            /*gc_cursor_sequence_id=*/2);
+    status.SetOpLogWriterRunning(true);
+    status.SetOpLogWriteProgress(/*committed_sequence_id=*/15, /*pending=*/4,
+                                 /*capacity=*/100);
+    status.SetOpLogPollSuccess();
+    status.SetSnapshotReady(true);
+    status.RecordRegistryHeartbeat(ErrorCode::OK, "");
+
+    auto response = HttpGet(http_base_url_ + "/ha/status");
+    ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
+    const auto body = ParseJson(response.resp_body, "/ha/status");
+    EXPECT_EQ(body["ha_enabled"].asBool(), true);
+    EXPECT_EQ(body["cluster_id"].asString(), "test_cluster");
+    EXPECT_EQ(body["local_endpoint"].asString(), "127.0.0.1:50051");
+    EXPECT_EQ(body["instance_id"].asString(), "test-instance");
+    EXPECT_EQ(body["role"].asString(), "primary");
+    EXPECT_EQ(body["state"].asString(), "RUNNING");
+    EXPECT_EQ(body["leader_endpoint"].asString(), "127.0.0.1:50051");
+    EXPECT_EQ(body["epoch"].asUInt64(), 7u);
+    EXPECT_EQ(body["master_view_address"].asString(), "127.0.0.1:50051");
+    EXPECT_EQ(body["master_view_epoch"].asUInt64(), 7u);
+    EXPECT_EQ(body["master_view_timestamp_ms"].asInt64(), 123456789);
+    EXPECT_EQ(body["master_view_ttl_sec"].asInt64(), 4);
+    // A freshly set/refreshed master_view has positive remaining lease; the
+    // old fixed-timestamp computation drifted negative under renewals.
+    EXPECT_GT(body["master_view_expires_in_ms"].asInt64(), 0);
+    EXPECT_EQ(body["master_view_instance_id"].asString(), "candidate-1");
+    EXPECT_EQ(body["applied_sequence_id"].asUInt64(), 12u);
+    EXPECT_EQ(body["oplog_applied_sequence_id"].asUInt64(), 12u);
+    EXPECT_EQ(body["latest_sequence_id"].asUInt64(), 15u);
+    EXPECT_EQ(body["oplog_latest_sequence_id"].asUInt64(), 15u);
+    EXPECT_TRUE(body["oplog_latest_read_ok"].asBool());
+    EXPECT_EQ(body["trimmed_sequence_id"].asUInt64(), 3u);
+    EXPECT_EQ(body["oplog_trimmed_sequence_id"].asUInt64(), 3u);
+    EXPECT_EQ(body["gc_cursor_sequence_id"].asUInt64(), 2u);
+    EXPECT_EQ(body["oplog_gc_cursor_sequence_id"].asUInt64(), 2u);
+    EXPECT_EQ(body["oplog_lag"].asUInt64(), 3u);
+    EXPECT_EQ(body["oplog_apply_lag"].asUInt64(), 3u);
+    EXPECT_EQ(body["oplog_pending_writes"].asUInt64(), 4u);
+    EXPECT_EQ(body["oplog_writer_pending_writes"].asUInt64(), 4u);
+    EXPECT_EQ(body["oplog_writer_queue_capacity"].asUInt64(), 100u);
+    EXPECT_TRUE(body["oplog_writer_running"].asBool());
+    EXPECT_EQ(body["oplog_writer_last_committed_sequence_id"].asUInt64(), 15u);
+    EXPECT_GT(body["oplog_last_successful_poll_timestamp_ms"].asInt64(), 0);
+    EXPECT_GE(body["oplog_poll_success_age_ms"].asInt64(), 0);
+    EXPECT_EQ(body["snapshot_ready"].asBool(), true);
+    EXPECT_EQ(body["registry_heartbeat_ok"].asBool(), true);
+    EXPECT_EQ(body["registry_heartbeat_last_success_timestamp_ms"].asInt64(),
+              body["registry_heartbeat_last_success_ms"].asInt64());
+    EXPECT_EQ(body["registry_heartbeat_last_failure_timestamp_ms"].asInt64(),
+              body["registry_heartbeat_last_failure_ms"].asInt64());
+    EXPECT_EQ(body["status_updated_at_ms"].asInt64(),
+              body["updated_at_ms"].asInt64());
+    EXPECT_GT(body["updated_at_ms"].asInt64(), 0);
+
+    auto metrics_response = HttpGet(http_base_url_ + "/metrics");
+    ASSERT_EQ(metrics_response.status, 200)
+        << "body=" << metrics_response.resp_body;
+    EXPECT_EQ(ParseMetricValue(metrics_response.resp_body, "ha_master_role")
+                  .value_or(0),
+              5);
+    EXPECT_EQ(ParseMetricValue(metrics_response.resp_body, "ha_snapshot_ready")
+                  .value_or(0),
+              1);
+    EXPECT_EQ(
+        ParseMetricValue(metrics_response.resp_body, "ha_registry_heartbeat_ok")
+            .value_or(0),
+        1);
+    EXPECT_GT(ParseMetricValue(metrics_response.resp_body,
+                               "ha_status_updated_timestamp_ms")
+                  .value_or(0),
+              0);
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorReportsCurrentIssuesAndIndependentRecovery) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "127.0.0.1:50051");
+    status.SetRoleState("standby", "WATCHING");
+
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << "body=" << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetDoctorIssue("OPLOG_APPLY_FAILED", "seq=123: invalid payload");
+    status.RecordRegistryHeartbeat(ErrorCode::INTERNAL_ERROR, "Redis timeout");
+    auto report = doctor();
+    EXPECT_EQ(report["health"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 2u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_APPLY_FAILED");
+    EXPECT_EQ(report["issues"][0]["message"].asString(),
+              "seq=123: invalid payload");
+    EXPECT_EQ(report["issues"][0]["category"].asString(), "oplog");
+    EXPECT_EQ(report["issues"][0]["component"].asString(), "oplog_applier");
+    EXPECT_EQ(report["issues"][0]["severity"].asString(), "error");
+    EXPECT_EQ(report["issues"][1]["code"].asString(),
+              "REGISTRY_HEARTBEAT_FAILED");
+    EXPECT_EQ(report["issues"][1]["category"].asString(), "registry");
+    EXPECT_EQ(report["issues"][1]["component"].asString(),
+              "registry_heartbeat");
+    EXPECT_EQ(report["issues"][1]["severity"].asString(), "error");
+
+    // Repeated failures replace the current message without accumulating.
+    status.SetDoctorIssue("OPLOG_APPLY_FAILED", "seq=124: invalid payload");
+    status.RecordRegistryHeartbeat(ErrorCode::OK, "");
+    report = doctor();
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["message"].asString(),
+              "seq=124: invalid payload");
+    status.SetDoctorIssue("OPLOG_APPLY_FAILED");
+    report = doctor();
+    EXPECT_EQ(report["health"].asString(), "ok");
+    EXPECT_TRUE(report["issues"].empty());
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorDoesNotTreatGapsOrHistoryAsFailures) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "127.0.0.1:50051");
+    status.SetLastError("An earlier snapshot attempt failed");
+    status.SetOpLogProgress(200, 1000, 50);
+    for (const auto* state : {"SYNCING", "WATCHING", "PROMOTING"}) {
+        status.SetRoleState("standby", state);
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
+        auto report = ParseJson(response.resp_body, "/ha/doctor");
+        EXPECT_TRUE(report["issues"].empty());
+        EXPECT_EQ(report["health"].asString(),
+                  std::string(state) == "WATCHING" ? "ok" : "unknown");
+    }
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorReturnsElectionInstability) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "local");
+    status.SetRoleState("standby", "WATCHING");
+    for (uint64_t epoch = 1; epoch <= 4; ++epoch) {
+        status.SetMasterView("leader", epoch);
+    }
+    auto response = HttpGet(http_base_url_ + "/ha/doctor");
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    const auto report = ParseJson(response.resp_body, "/ha/doctor");
+    EXPECT_EQ(report["health"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "ELECTION_UNSTABLE");
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorHandlesLifecycleAndFatalFailure) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << "body=" << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.Reset();
+    EXPECT_EQ(doctor()["health"].asString(), "unknown");
+    status.Configure(false, "test_cluster", "127.0.0.1:50051");
+    EXPECT_EQ(doctor()["health"].asString(), "unknown");
+    status.Configure(true, "test_cluster", "127.0.0.1:50051");
+    status.SetRoleState("promoting", "FAILED");
+    status.SetLastError("Failed to promote: INTERNAL_ERROR");
+    auto report = doctor();
+    EXPECT_EQ(report["health"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "HA_FAILED");
+    EXPECT_EQ(report["issues"][0]["message"].asString(),
+              "Failed to promote: INTERNAL_ERROR");
+    status.SetDoctorIssue("ELECTION_FAILED", "Redis unavailable");
+    status.ClearDoctorIssues();
+    status.ClearLastError();
+    status.SetRoleState("starting", "INITIALIZING");
+    report = doctor();
+    EXPECT_EQ(report["health"].asString(), "unknown");
+    EXPECT_TRUE(report["issues"].empty());
+    status.SetLeader("127.0.0.1:50051", 1);
+    status.SetRoleState("primary", "RUNNING");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorKeepsIncompleteCatchupUntilRoleEnds) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "test-primary");
+    status.SetRoleState("primary", "STARTING");
+    status.SetLeader("test-primary", 1);
+    status.SetMasterView("test-primary", 1);
+    status.SetDoctorIssue("PROMOTION_CATCHUP_INCOMPLETE",
+                          "oplog_applied_sequence_id=100, "
+                          "oplog_latest_sequence_id=200");
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << "body=" << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetRoleState("primary", "RUNNING");
+    status.SetOpLogProgress(201, 201);
+    status.RecordRegistryHeartbeat(ErrorCode::OK, "");
+    auto report = doctor();
+    EXPECT_EQ(report["health"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(),
+              "PROMOTION_CATCHUP_INCOMPLETE");
+    EXPECT_EQ(report["issues"][0]["message"].asString(),
+              "oplog_applied_sequence_id=100, oplog_latest_sequence_id=200");
+
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "standby read failed");
+    status.SetRoleState("standby", "WATCHING");
+    report = doctor();
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_READ_FAILED");
+    status.ClearDoctorIssues();
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "test-primary", 1);
+    status.SetLeader("test-primary", 1);
+    status.SetRoleState("primary", "RUNNING");
+    // This is the assigned primary watermark, not the writer's committed
+    // latest. The stall diagnosis must use the latter.
+    status.SetOpLogProgress(999, 999);
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetOpLogWriterRunning(true);
+    status.SetOpLogWriteProgress(10, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    // New pending work begins a fresh timer. Idle time is excluded.
+    status.SetOpLogWriteProgress(10, 1);
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // Additional work cannot reset the timer while confirmed latest stalls.
+    status.SetOpLogWriteProgress(10, 2);
+    auto report = doctor();
+    EXPECT_EQ(report["health"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_LATEST_STALLED");
+    EXPECT_NE(report["issues"][0]["message"].asString().find(
+                  "latest=10, pending=2, stalled_ms="),
+              std::string::npos);
+
+    status.Configure(true, "test_cluster", "test-primary", 0);
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    status.Configure(true, "test_cluster", "test-primary", 1);
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
+
+    // Confirmed progress restarts the timer while work remains busy.
+    status.SetOpLogWriteProgress(11, 1);
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
+
+    // Draining work disarms the timer.
+    status.SetOpLogWriteProgress(12, 0);
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+
+    // A stopped writer clears cache and rejects late callbacks from the
+    // previous worker.
+    status.SetOpLogWriteProgress(12, 1);
+    status.SetOpLogWriterRunning(false);
+    status.SetOpLogWriteProgress(12, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, HADoctorDetectsCatchupStallAndRecovery) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "test-standby", 10, 1);
+    status.SetRoleState("standby", "WATCHING");
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetOpLogProgress(100, 100);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    status.SetOpLogProgress(100, 200);
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // More backlog cannot restart the timer.
+    status.SetOpLogProgress(100, 300);
+    auto report = doctor();
+    EXPECT_EQ(report["health"].asString(), "degraded");
+    ASSERT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(), "OPLOG_CATCHUP_STALLED");
+    EXPECT_NE(report["issues"][0]["message"].asString().find(
+                  "oplog_applied_sequence_id=100, "
+                  "oplog_latest_sequence_id=300, stalled_ms="),
+              std::string::npos);
+    EXPECT_NE(report["health"].asString(), "ok");
+
+    // A failed latest read retains the last known latest.
+    status.SetOpLogProgress(100, std::nullopt);
+    EXPECT_EQ(status.Snapshot().latest_sequence_id, 300u);
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "Redis read failed");
+    report = doctor();
+    EXPECT_EQ(report["issues"].size(), 2u);
+
+    status.Configure(true, "test_cluster", "test-standby", 10, 0);
+    report = doctor();
+    EXPECT_EQ(report["issues"].size(), 1u);
+    EXPECT_EQ(report["issues"][0]["code"].asString(),
+              std::string("OPLOG_READ_FAILED"));
+    status.Configure(true, "test_cluster", "test-standby", 10, 1);
+    status.SetDoctorIssue("OPLOG_READ_FAILED");
+
+    // Applied progress restarts the timer without requiring a new latest.
+    status.SetOpLogProgress(101, std::nullopt);
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    status.SetOpLogProgress(101, std::nullopt);
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
+    status.SetOpLogProgress(300, 300);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       HADoctorCatchupStallFollowsStandbyLifecycle) {
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "test_cluster", "test-standby", 10, 1);
+    const auto doctor = [&] {
+        auto response = HttpGet(http_base_url_ + "/ha/doctor");
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        return ParseJson(response.resp_body, "/ha/doctor");
+    };
+
+    status.SetRoleState("standby", "SYNCING");
+    status.SetOpLogProgress(10, 20);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_TRUE(doctor()["issues"].empty());
+    status.SetRoleState("standby", "WATCHING");
+
+    // Unknown latest cannot initialize the timer.
+    status.SetOpLogProgress(10, std::nullopt);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    status.SetOpLogProgress(10, 20);
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // No newer sample means the stall is not confirmed yet.
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    status.SetOpLogProgress(10, 20);
+    EXPECT_EQ(doctor()["health"].asString(), "degraded");
+
+    status.SetLeader("test-standby", 1);
+    status.SetRoleState("primary", "RUNNING");
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    status.SetRoleState("standby", "WATCHING");
+    status.SetOpLogProgress(10, 20);
+
+    // A new HA round discards the old timer and last-known latest.
+    status.ClearDoctorIssues();
+    status.SetOpLogProgress(10, std::nullopt);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    status.SetOpLogProgress(10, std::nullopt);
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+    status.SetOpLogProgress(10, 20);
+
+    status.Configure(false, "test_cluster", "test-standby", 10, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_TRUE(doctor()["issues"].empty());
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,
@@ -410,6 +894,44 @@ TEST_F(P2PMasterHttpEndpointsTest, BatchQueryRoutesRejectsEmptyKeyList) {
     ASSERT_EQ(resp_empty.status, 400) << "body=" << resp_empty.resp_body;
 }
 
+TEST_F(P2PMasterHttpEndpointsTest, MetricsEndpointsExposeRedisHAHealthMetrics) {
+    auto& ha_metrics = HAMetricManager::instance();
+    ha_metrics.set_election_last_successful_renew_timestamp_ms(70);
+    ha_metrics.set_oplog_last_successful_write_timestamp_ms(60);
+    ha_metrics.set_oplog_consecutive_write_failures(1);
+    ha_metrics.set_oplog_snapshot_ready_standby_count(2);
+    ha_metrics.inc_election_renew_failures();
+
+    auto metrics_response = HttpGet(http_base_url_ + "/metrics");
+    ASSERT_EQ(metrics_response.status, 200)
+        << "body=" << metrics_response.resp_body;
+    for (const char* name : {
+             "ha_election_last_successful_renew_timestamp_ms",
+             "ha_oplog_last_successful_write_timestamp_ms",
+             "ha_oplog_consecutive_write_failures",
+             "ha_oplog_snapshot_ready_standby_count",
+             "ha_election_renew_failures_total",
+         }) {
+        EXPECT_NE(metrics_response.resp_body.find(name), std::string::npos)
+            << name;
+    }
+
+    auto summary_response = HttpGet(http_base_url_ + "/metrics/summary");
+    ASSERT_EQ(summary_response.status, 200)
+        << "body=" << summary_response.resp_body;
+    EXPECT_NE(summary_response.resp_body.find("HA Metrics Summary:"),
+              std::string::npos);
+    EXPECT_NE(summary_response.resp_body.find("consecutive_write_fail=1"),
+              std::string::npos);
+    EXPECT_NE(summary_response.resp_body.find("snapshot_ready_standby=2"),
+              std::string::npos);
+
+    ha_metrics.set_election_last_successful_renew_timestamp_ms(0);
+    ha_metrics.set_oplog_last_successful_write_timestamp_ms(0);
+    ha_metrics.set_oplog_consecutive_write_failures(0);
+    ha_metrics.set_oplog_snapshot_ready_standby_count(0);
+}
+
 TEST_F(P2PMasterHttpEndpointsTest,
        MetricsEndpointReflectsPopulatedDataAndOperations) {
     const std::string kKeyCountMetric = "master_key_count";
@@ -449,6 +971,44 @@ TEST_F(P2PMasterHttpEndpointsTest,
     ASSERT_EQ(resp.status, 200) << "body=" << resp.resp_body;
     EXPECT_NE(resp.resp_body.find("master_cluster_total_get_requests"),
               std::string::npos);
+}
+
+// Reproduces the real standby lifecycle: the supervisor-level status server
+// runs while the active (primary-only) HTTP surface is absent.
+TEST_F(P2PMasterHttpEndpointsTest, StatusServerServesStandbyDiagnostics) {
+    P2PStatusHttpServer status_server(/*port=*/0);
+    status_server.Start();
+    const uint16_t status_port = status_server.port();
+    ASSERT_NE(status_port, 0);
+    const std::string status_base_url =
+        "http://127.0.0.1:" + std::to_string(status_port);
+
+    HAStatusResetGuard reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Configure(/*ha_enabled=*/true, "test_cluster", "");
+    status.SetRoleState("standby", "WATCHING");
+
+    auto health = HttpGet(status_base_url + "/health");
+    ASSERT_EQ(health.status, 200) << "body=" << health.resp_body;
+    EXPECT_EQ(health.resp_body, "OK");
+
+    auto ha_status = HttpGet(status_base_url + "/ha/status");
+    ASSERT_EQ(ha_status.status, 200) << "body=" << ha_status.resp_body;
+    const auto status_body = ParseJson(ha_status.resp_body, "/ha/status");
+    EXPECT_EQ(status_body["role"].asString(), "standby");
+    EXPECT_EQ(status_body["state"].asString(), "WATCHING");
+
+    auto doctor = HttpGet(status_base_url + "/ha/doctor");
+    ASSERT_EQ(doctor.status, 200) << "body=" << doctor.resp_body;
+    const auto doctor_body = ParseJson(doctor.resp_body, "/ha/doctor");
+    EXPECT_EQ(doctor_body["status"]["role"].asString(), "standby");
+
+    auto metrics = HttpGet(status_base_url + "/metrics");
+    ASSERT_EQ(metrics.status, 200);
+    auto summary = HttpGet(status_base_url + "/metrics/summary");
+    ASSERT_EQ(summary.status, 200);
+
+    status_server.Stop();
 }
 
 }  // namespace testing
