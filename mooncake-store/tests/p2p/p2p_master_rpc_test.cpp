@@ -20,6 +20,7 @@
 #include "p2p/master/p2p_master_client.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "ha/oplog/mock_oplog_store.h"
+#include "p2p/ha/ha_status.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "utils.h"
@@ -691,8 +692,12 @@ INSTANTIATE_TEST_SUITE_P(HeartbeatModes, P2PMasterRpcShutdownTest,
 
 TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     constexpr auto kTimeout = std::chrono::seconds(5);
+    struct StatusResetGuard {
+        ~StatusResetGuard() { HAStatusManager::instance().Reset(); }
+    } reset_guard;
 
     P2PMasterConfig config;
+    config.ha.enabled = true;
     config.rpc.address = "127.0.0.1";
     config.rpc.port = 0;
     config.rpc.thread_num = 2;
@@ -727,7 +732,10 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
 
     std::packaged_task<int()> run([&master, &server, &service, &oplog_store] {
         return master.RunActiveRpcServers(
-            *server, *service, /*before_start=*/{},
+            *server, *service,
+            [] {
+                HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+            },
             [&oplog_store] { (void)oplog_store->DrainWriting(3000); });
     });
     auto run_result = run.get_future();

@@ -146,6 +146,20 @@ void P2PMasterRpcService::init_http_server() {
                 "installed\"}");
             return;
         }
+        const auto status = HAStatusManager::instance().Snapshot();
+        if (!status.ha_enabled || status.role != "primary" ||
+            status.state != "RUNNING") {
+            LOG_EVERY_N(WARNING, 30)
+                << "Rejected P2P master stepdown: requires HA-enabled "
+                   "primary/RUNNING"
+                << ", ha_enabled=" << status.ha_enabled
+                << ", role=" << status.role << ", state=" << status.state;
+            resp.set_status_and_content(
+                status_type::service_unavailable,
+                "{\"success\":false,\"error\":\"stepdown requires HA-enabled "
+                "primary/RUNNING\"}");
+            return;
+        }
         if (stepdown_requested_.exchange(true)) {
             resp.set_status_and_content(
                 status_type::service_unavailable,

@@ -327,11 +327,14 @@ TEST_F(P2PMasterHttpEndpointsTest,
 #endif  // STORE_USE_REDIS
 
 TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
+    HAStatusResetGuard reset_guard;
     std::atomic<uint32_t> cooldown_sec{0};
     P2PMasterConfig config;
+    config.ha.enabled = true;
     config.metrics.enable_reporting = false;
     config.metrics.http_port = 0;
     P2PMasterRpcService service(config);
+    HAStatusManager::instance().SetRoleState("primary", "RUNNING");
     service.SetStepdownCallback(
         [&cooldown_sec](uint32_t seconds) { cooldown_sec.store(seconds); });
     service.init();
@@ -347,12 +350,15 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesCooldown) {
+    HAStatusResetGuard reset_guard;
     std::atomic<uint32_t> callback_count{0};
     std::atomic<uint32_t> cooldown_sec{0};
     P2PMasterConfig config;
+    config.ha.enabled = true;
     config.metrics.enable_reporting = false;
     config.metrics.http_port = 0;
     P2PMasterRpcService service(config);
+    HAStatusManager::instance().SetRoleState("primary", "RUNNING");
     service.SetStepdownCallback([&](uint32_t seconds) {
         cooldown_sec.store(seconds);
         callback_count.fetch_add(1);
@@ -380,12 +386,15 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesCooldown) {
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointAcceptsCooldownBounds) {
+    HAStatusResetGuard reset_guard;
     for (const uint32_t seconds : {0u, 3600u}) {
         std::atomic<uint32_t> cooldown_sec{1};
         P2PMasterConfig config;
+        config.ha.enabled = true;
         config.metrics.enable_reporting = false;
         config.metrics.http_port = 0;
         P2PMasterRpcService service(config);
+        HAStatusManager::instance().SetRoleState("primary", "RUNNING");
         service.SetStepdownCallback(
             [&cooldown_sec](uint32_t value) { cooldown_sec.store(value); });
         service.init();
@@ -398,6 +407,59 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointAcceptsCooldownBounds) {
             ParseJson(response.resp_body, "stepdown")["cooldown_sec"].asUInt(),
             seconds);
     }
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointRequiresRunningPrimary) {
+    HAStatusResetGuard reset_guard;
+    std::atomic<uint32_t> callback_count{0};
+    P2PMasterConfig config;
+    config.ha.enabled = true;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    P2PMasterRpcService service(config);
+    service.SetStepdownCallback([&](uint32_t) { callback_count.fetch_add(1); });
+    service.init();
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+        "/ha/stepdown";
+    auto& status = HAStatusManager::instance();
+    struct RejectedState {
+        bool ha_enabled;
+        const char* role;
+        const char* state;
+    };
+    const RejectedState rejected_states[] = {
+        {false, "primary", "RUNNING"},
+        {true, "standby", "RUNNING"},
+        {true, "standby", "WATCHING"},
+        {true, "promoting", "PROMOTING"},
+        // The active HTTP server is already listening while metadata recovery
+        // runs with primary/STARTING, before business RPCs start.
+        {true, "primary", "STARTING"},
+        {true, "primary", "STOPPED"},
+        {true, "standby", "STEPPED_DOWN"},
+    };
+    for (const auto& rejected : rejected_states) {
+        SCOPED_TRACE(::testing::Message() << "ha=" << rejected.ha_enabled
+                                          << ", role=" << rejected.role
+                                          << ", state=" << rejected.state);
+        status.Configure(rejected.ha_enabled, config.cluster_id, "127.0.0.1:0");
+        status.SetRoleState(rejected.role, rejected.state);
+        const auto response = HttpPost(url);
+        EXPECT_EQ(response.status, 503) << response.resp_body;
+        const auto body = ParseJson(response.resp_body, "stepdown");
+        EXPECT_FALSE(body["success"].asBool());
+        EXPECT_NE(body["error"].asString().find("primary/RUNNING"),
+                  std::string::npos);
+        EXPECT_EQ(callback_count.load(), 0u);
+    }
+    // Rejected requests must not latch stepdown_requested_: becoming ready
+    // should allow a subsequent request to reach the callback exactly once.
+    status.SetRoleState("primary", "RUNNING");
+    const auto response = HttpPost(url);
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    EXPECT_TRUE(ParseJson(response.resp_body, "stepdown")["success"].asBool());
+    EXPECT_EQ(callback_count.load(), 1u);
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
