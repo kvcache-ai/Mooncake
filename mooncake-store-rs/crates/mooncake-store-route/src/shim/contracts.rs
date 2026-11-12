@@ -276,6 +276,12 @@ pub trait RouteAuthorityService: Send + Sync {
         requests
             .iter()
             .map(|request| {
+                if request.next.is_none() && request.expected.is_some() {
+                    return Err(StoreError::Unsupported(
+                        "route authority must implement versioned delete marker replacement"
+                            .to_string(),
+                    ));
+                }
                 self.replace_route(namespace, authority, &request.key, request.next.as_ref())
             })
             .collect()

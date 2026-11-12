@@ -1050,7 +1050,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                     .transpose()
                     .map(|next| RouteCasRequest {
                         key: ObjectKey::new(entry.key),
-                        expected: None,
+                        expected: entry.delete_version.map(RouteVersion),
                         next,
                     })
             })

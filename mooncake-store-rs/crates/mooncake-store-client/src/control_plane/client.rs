@@ -495,6 +495,12 @@ impl ControlPlaneClient {
                 .map(|request| pb::RouteReplaceEntry {
                     key: request.key.0.clone(),
                     next: request.next.as_ref().map(pb_object_route),
+                    delete_version: request
+                        .next
+                        .is_none()
+                        .then_some(request.expected)
+                        .flatten()
+                        .map(|version| version.0),
                 })
                 .collect(),
         };

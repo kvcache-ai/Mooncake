@@ -7,9 +7,9 @@ use parking_lot::Mutex;
 
 use mooncake_store_core::{
     AllocationRouteIdentity, AllocationRouteReference, AllocationRouteReferenceState, CasResult,
-    ClientLease, ClientRuntimeId, ClientStableId, CompatibilityDescriptor, MetadataBackend,
-    NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest,
-    RouteDirectory, RouteReplicaReference, RouteState, RouteVersion, StoreError,
+    ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope, ObjectKey,
+    ObjectRoute, ReplicaRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
+    RouteReplicaReference, RouteState, RouteVersion, StoreError,
     ROUTE_OWNER_LIST_PAGINATION_CAPABILITY, ROUTE_OWNER_LIST_SNAPSHOT_CAPABILITY,
 };
 use tracing::{debug, trace, warn};
@@ -19,8 +19,8 @@ use crate::mesh::async_mirror::{
     maybe_mark_authority_suspect, mirror_secondary_batch, AsyncRouteMirrorWorker,
 };
 use crate::mesh::read_repair::{
-    compute_backfill_requests, merge_fresher_route, merge_route_listing, set_repair_observation,
-    RouteAuthorityObservation, RouteReadRepairState,
+    compute_backfill_requests, merge_authority_value, merge_route_listing, set_repair_observation,
+    RouteAuthorityObservation, RouteAuthorityValue, RouteReadRepairState,
 };
 use crate::mesh::registry::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_contains_many,
@@ -106,41 +106,17 @@ fn merge_allocation_route_reference(
 
 /// Resolves one authority record with the cluster-wide version rule: a live
 /// route wins only when its version is strictly newer than the delete marker.
-fn route_from_authority_record(
-    key: &ObjectKey,
-    record: RouteAuthorityRecord,
-) -> Option<ObjectRoute> {
+fn value_from_authority_record(record: RouteAuthorityRecord) -> Option<RouteAuthorityValue> {
     if let Some(route) = record.route {
         if record
             .delete_version
-            .is_none_or(|delete_version| route.version > delete_version)
+            .is_none_or(|version| route.version > version)
         {
-            return Some(route);
+            return Some(RouteAuthorityValue::Route(Box::new(route)));
         }
         record_delete_marker_event("route_marker_conflict", 1);
     }
-    record
-        .delete_version
-        .map(|version| delete_marker_route(key, version))
-}
-
-/// Builds the minimal Tombstone route used to carry a Delete Marker through
-/// the existing route-control wire contract.
-fn delete_marker_route(key: &ObjectKey, version: RouteVersion) -> ObjectRoute {
-    ObjectRoute {
-        key: key.clone(),
-        namespace: None,
-        logical_key: None,
-        canonical_key: None,
-        sharing_scope: None,
-        qos_tier: None,
-        version,
-        state: RouteState::Tombstone,
-        compatibility: CompatibilityDescriptor::default(),
-        replicas: Vec::new(),
-        cold_backing: None,
-        nof_backing: None,
-    }
+    record.delete_version.map(RouteAuthorityValue::DeleteMarker)
 }
 
 struct BaselineState {
@@ -916,7 +892,7 @@ impl EmbeddedWrhRouteDirectory {
         keys: &[ObjectKey],
         ranked_authorities: &[Vec<ClientLease>],
         rank: usize,
-        resolved: &mut [Option<ObjectRoute>],
+        resolved: &mut [Option<RouteAuthorityValue>],
         repairs: Option<&mut [RouteReadRepairState]>,
         failure_message: &'static str,
     ) -> Result<bool> {
@@ -949,7 +925,7 @@ impl EmbeddedWrhRouteDirectory {
             match self.read_authority_batch(&authority, &batch_keys) {
                 Ok(results) => {
                     for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
-                        match result.map(|record| route_from_authority_record(&key, record)) {
+                        match result.map(value_from_authority_record) {
                             Ok(Some(route)) => {
                                 trace!(
                                     namespace = %self.namespace,
@@ -957,8 +933,8 @@ impl EmbeddedWrhRouteDirectory {
                                     authority = %authority.runtime,
                                     rank,
                                     source = route_read_source(rank, self.route_topk),
-                                    route_version = route.version.0,
-                                    replica_count = route.replicas.len(),
+                                    route_version = route.version().0,
+                                    replica_count = match &route { RouteAuthorityValue::Route(route) => route.replicas.len(), RouteAuthorityValue::DeleteMarker(_) => 0 },
                                     "route authority returned object route"
                                 );
                                 if sampled_per_key_debug_log(&[
@@ -971,8 +947,8 @@ impl EmbeddedWrhRouteDirectory {
                                         key = %key.0,
                                         authority = %authority.runtime,
                                         source = route_read_source(rank, self.route_topk),
-                                        route_version = route.version.0,
-                                        replica_count = route.replicas.len(),
+                                        route_version = route.version().0,
+                                        replica_count = match &route { RouteAuthorityValue::Route(route) => route.replicas.len(), RouteAuthorityValue::DeleteMarker(_) => 0 },
                                         "sampled route authority object route"
                                     );
                                 }
@@ -980,10 +956,10 @@ impl EmbeddedWrhRouteDirectory {
                                     set_repair_observation(
                                         &mut states[index],
                                         rank,
-                                        RouteAuthorityObservation::Present(Box::new(route.clone())),
+                                        RouteAuthorityObservation::Present(route.clone()),
                                     );
                                 }
-                                merge_fresher_route(
+                                merge_authority_value(
                                     &mut resolved[index],
                                     route,
                                     &authority.runtime.to_string(),
@@ -1082,11 +1058,26 @@ impl EmbeddedWrhRouteDirectory {
         &self,
         keys: &[ObjectKey],
         selections: &[RouteAuthoritySelection],
-        resolved: &[Option<ObjectRoute>],
+        resolved: &[Option<RouteAuthorityValue>],
         repairs: &[RouteReadRepairState],
     ) {
         let backfills = compute_backfill_requests(keys, selections, resolved, repairs);
         for (_, (authority, requests)) in backfills {
+            let (markers, requests): (Vec<_>, Vec<_>) = requests
+                .into_iter()
+                .partition(|request| request.next.is_none());
+            if !markers.is_empty() {
+                mirror_secondary_batch(
+                    &self.namespace,
+                    self.authority_client.as_ref(),
+                    self.membership.as_ref(),
+                    &authority,
+                    &markers,
+                );
+            }
+            if requests.is_empty() {
+                continue;
+            }
             match self.cas_authority_batch(&authority, &requests) {
                 Ok(results) => {
                     for (request, result) in requests.iter().zip(results) {
@@ -1373,7 +1364,8 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     continue;
                 }
             };
-            let response = route_from_authority_record(key, response);
+            let response =
+                value_from_authority_record(response).and_then(RouteAuthorityValue::into_route);
             let references_replica = response.as_ref().is_some_and(|route| {
                 route.replicas.iter().any(|candidate| {
                     candidate.owner == replica.owner
@@ -1614,7 +1606,10 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         }
 
         self.backfill_missing_authorities(keys, &selections, &resolved, &repairs);
-        Ok(resolved)
+        Ok(resolved
+            .into_iter()
+            .map(|value| value.and_then(RouteAuthorityValue::into_route))
+            .collect())
     }
 
     fn get_object_routes_bounded(
@@ -1645,7 +1640,10 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 },
             )?;
         }
-        Ok(resolved)
+        Ok(resolved
+            .into_iter()
+            .map(|value| value.and_then(RouteAuthorityValue::into_route))
+            .collect())
     }
 
     fn contains_object_route(&self, observer: &ClientLease, key: &ObjectKey) -> Result<bool> {
@@ -1867,7 +1865,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                             continue;
                         }
                         let next = if is_delete_marker {
-                            delete_version.map(|version| delete_marker_route(&request.key, version))
+                            None
                         } else {
                             request.next.clone()
                         };
@@ -1877,7 +1875,11 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                             .1
                             .push(RouteCasRequest {
                                 key: request.key.clone(),
-                                expected: request.expected,
+                                expected: if is_delete_marker {
+                                    delete_version
+                                } else {
+                                    request.expected
+                                },
                                 next,
                             });
                     }
@@ -3005,6 +3007,83 @@ mod owner_page_contract_tests {
             (single, batch),
             (Some(RouteVersion(9)), vec![Some(RouteVersion(9))]),
         );
+    }
+
+    #[test]
+    fn public_reads_repair_delete_markers_without_exposing_tombstone_routes() {
+        let observer = test_lease("typed-marker-observer");
+        let peer = test_lease("typed-marker-peer");
+        let candidates = vec![observer.clone(), peer.clone()];
+        let key = ObjectKey::new("typed-marker-key".to_string());
+        let directory = EmbeddedWrhRouteDirectory::new(
+            2,
+            Arc::new(InMemoryMetadataBackend::new()),
+            &observer,
+            Arc::new(ConfirmationClient {
+                routes: BTreeMap::new(),
+                allocation_references: BTreeMap::new(),
+            }),
+            Arc::new(TestMembership {
+                leases: candidates.clone(),
+            }),
+        );
+        register_local_authority(
+            &directory.namespace,
+            &peer.runtime.stable_id,
+            DEFAULT_DELETE_MARKER_BUDGET_BYTES,
+        );
+        let ranked = ranked_top_authorities(&directory.namespace, &candidates, &key, 2);
+        let mut stale = test_route(&key.0, &observer.runtime);
+        stale.version = RouteVersion(2);
+        stale.replicas[0].allocation_id = Some(7);
+        crate::mesh::registry::authority_replace_many(
+            &directory.namespace,
+            &ranked[0].runtime.stable_id,
+            &[RouteCasRequest {
+                key: key.clone(),
+                expected: None,
+                next: Some(stale.clone()),
+            }],
+        )
+        .unwrap();
+        crate::mesh::registry::authority_replace_many(
+            &directory.namespace,
+            &ranked[1].runtime.stable_id,
+            &[RouteCasRequest {
+                key: key.clone(),
+                expected: Some(RouteVersion(5)),
+                next: None,
+            }],
+        )
+        .unwrap();
+        assert!(directory
+            .get_object_route(&observer, &key)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            authority_get_delete_marker(&directory.namespace, &ranked[0].runtime.stable_id, &key),
+            Some(RouteVersion(5))
+        );
+        let rejected = directory
+            .compare_and_swap_object_route(&observer, &key, None, Some(&stale))
+            .unwrap();
+        assert!(!rejected.applied);
+        assert_eq!(rejected.delete_version, Some(RouteVersion(5)));
+        stale.version = RouteVersion(6);
+        stale.replicas[0].allocation_id = Some(8);
+        assert!(
+            directory
+                .compare_and_swap_object_route(&observer, &key, Some(RouteVersion(5)), Some(&stale))
+                .unwrap()
+                .applied
+        );
+        let live = directory
+            .get_object_route(&observer, &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.version, RouteVersion(6));
+        assert_eq!(live.replicas[0].allocation_id, Some(8));
+        unregister_local_authority(&directory.namespace, &peer.runtime.stable_id);
     }
 
     #[test]

@@ -269,6 +269,8 @@ message ReplaceRouteReply {
 message RouteReplaceEntry {
   string key = 1;
   ObjectRoute next = 2;
+  // Delete-marker version for replacement without a live route, not a CAS precondition.
+  optional uint64 delete_version = 3;
 }
 
 message BatchReplaceRoutesRequest {

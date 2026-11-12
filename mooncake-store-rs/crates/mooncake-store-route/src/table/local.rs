@@ -472,7 +472,13 @@ impl LocalRouteTable {
             }
             None => {
                 self.routes.remove(&key.0);
-                if let Some(version) = old.as_ref().map(|route| route.version).or(delete_version) {
+                if let Some(version) = old
+                    .as_ref()
+                    .map(|route| route.version)
+                    .into_iter()
+                    .chain(delete_version)
+                    .max()
+                {
                     self.record_delete_marker(key, version);
                     record_authoritative_route_update(None, key);
                     return Some(version);
@@ -793,6 +799,25 @@ mod tests {
             Some(RouteVersion(4)),
             "a delayed mirror must not roll a live route back to an older version"
         );
+    }
+
+    #[test]
+    fn versioned_delete_mirror_retains_actual_marker_over_stale_live_route() {
+        let key = ObjectKey::new("versioned-delete".to_string());
+        let old = test_route(&key, 1);
+        let mut table = LocalRouteTable::default();
+        table.replace(&key, Some(&old));
+        table.replace_many(&[RouteCasRequest {
+            key: key.clone(),
+            expected: Some(RouteVersion(5)),
+            next: None,
+        }]);
+        assert!(table.get(&key).is_none());
+        assert_eq!(table.delete_marker(&key), Some(RouteVersion(5)));
+        table.replace(&key, Some(&test_route(&key, 4)));
+        assert!(table.get(&key).is_none());
+        table.replace(&key, Some(&test_route(&key, 6)));
+        assert_eq!(table.get(&key).unwrap().version, RouteVersion(6));
     }
 
     #[test]

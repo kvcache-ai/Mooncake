@@ -2404,6 +2404,118 @@ fn route_get_preserves_delete_marker_over_control_plane_transport() {
 }
 
 #[test]
+fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
+    use mooncake_store_core::MetadataBackend;
+    use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
+    use mooncake_store_test_utils::transport::TestTransport;
+
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store = crate::StoreClientBuilder::new(metadata.clone(), "marker-wire-authority")
+        .state(ClientLifecycleState::Active)
+        .transport(Arc::new(TestTransport::new("marker-wire-segment")))
+        .build(u64::MAX)
+        .expect("route authority should build");
+    let lease = store.lease();
+    let namespace = metadata.route_namespace();
+    let authority = lease.runtime.stable_id.clone();
+    let client = ControlPlaneClient::new().expect("control plane client should build");
+    let keys = [
+        ObjectKey::new("missing-marker"),
+        ObjectKey::new("stale-marker"),
+    ];
+    let replace = |requests| {
+        let response = client
+            .send_route_control(
+                &lease,
+                RouteControlRequest::BatchReplace {
+                    namespace: namespace.clone(),
+                    authority: authority.clone(),
+                    requests,
+                },
+            )
+            .expect("replacement should cross the control plane");
+        let RouteControlResponse::BatchReplace(results) = response else {
+            panic!("expected replacement results");
+        };
+        for result in results {
+            result.expect("authority should accept replacement");
+        }
+    };
+    let read = || {
+        let response = client
+            .send_route_control(
+                &lease,
+                RouteControlRequest::BatchGet {
+                    namespace: namespace.clone(),
+                    authority: authority.clone(),
+                    keys: keys.to_vec(),
+                },
+            )
+            .expect("records should cross the control plane");
+        let RouteControlResponse::BatchGet(records) = response else {
+            panic!("expected authority records");
+        };
+        records
+            .into_iter()
+            .map(|record| record.expect("record should decode"))
+            .collect::<Vec<_>>()
+    };
+    replace(vec![RouteCasRequest {
+        key: keys[1].clone(),
+        expected: None,
+        next: Some(sample_route(&keys[1].0, 1, &lease.runtime)),
+    }]);
+    replace(
+        keys.iter()
+            .map(|key| RouteCasRequest {
+                key: key.clone(),
+                expected: Some(RouteVersion(43)),
+                next: None,
+            })
+            .collect(),
+    );
+    for record in read() {
+        assert!(record.route.is_none());
+        assert_eq!(record.delete_version, Some(RouteVersion(43)));
+    }
+    for version in [42, 43] {
+        replace(
+            keys.iter()
+                .map(|key| RouteCasRequest {
+                    key: key.clone(),
+                    expected: None,
+                    next: Some(sample_route(&key.0, version, &lease.runtime)),
+                })
+                .collect(),
+        );
+        for record in read() {
+            assert!(record.route.is_none());
+            assert_eq!(record.delete_version, Some(RouteVersion(43)));
+        }
+    }
+    replace(
+        keys.iter()
+            .map(|key| {
+                let mut route = sample_route(&key.0, 44, &lease.runtime);
+                route.replicas[0].allocation_id = Some(71);
+                RouteCasRequest {
+                    key: key.clone(),
+                    expected: None,
+                    next: Some(route),
+                }
+            })
+            .collect(),
+    );
+    for record in read() {
+        let route = record.route.expect("newer live route must be retained");
+        assert_eq!(route.version, RouteVersion(44));
+        assert_eq!(route.replicas[0].allocation_id, Some(71));
+        assert_eq!(record.delete_version, None);
+    }
+}
+
+#[test]
 fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();
@@ -2556,6 +2668,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 entries: vec![pb::RouteReplaceEntry {
                     key: "broken".to_string(),
                     next: Some(invalid_route),
+                    delete_version: None,
                 }],
             }))
             .await
