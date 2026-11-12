@@ -745,7 +745,7 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
         });
 
     std::packaged_task<int()> run([&master, &server, &service, oplog_manager,
-                                   &drain_timeout_ms] {
+                                   &drain_timeout_ms, &stepdown_requested] {
         return master.RunActiveRpcServers(
             *server, *service,
             [] {
@@ -754,7 +754,9 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
             [oplog_manager, &drain_timeout_ms] {
                 P2PMaster::DrainOpLogAfterStepdown(*oplog_manager,
                                                    drain_timeout_ms.load());
-            });
+            },
+            /*stopping=*/{},
+            [&stepdown_requested] { return stepdown_requested.load(); });
     });
     auto run_result = run.get_future();
     std::thread run_thread(std::move(run));

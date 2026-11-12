@@ -223,7 +223,8 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                                    P2PMasterRpcService& p2p_service,
                                    std::function<void()> before_start,
                                    std::function<void()> after_stop,
-                                   std::function<bool()> stopping) {
+                                   std::function<bool()> stopping,
+                                   std::function<bool()> stepping_down) {
     auto is_stopping = [&stopping] { return stopping && stopping(); };
     if (is_stopping()) {
         return 0;
@@ -282,7 +283,15 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
         return 0;
     }
     auto error = std::move(server_result).get();
-    LOG(ERROR) << "P2P master RPC server stopped: " << error;
+    // Closing the listener for voluntary stepdown cancels its accept loop.
+    // An unexpected exit, including lease loss, must remain an error.
+    if (stepping_down && stepping_down() &&
+        error == coro_rpc::errc::operation_canceled) {
+        LOG(INFO) << "P2P master RPC server stopped for active stepdown: "
+                  << error.message();
+    } else {
+        LOG(ERROR) << "P2P master RPC server stopped: " << error.message();
+    }
     // The start futures only wait for accept loops. Stop and destroy each
     // server so every in-flight RPC returns before callers drain OpLog state.
     server.stop();
@@ -839,7 +848,12 @@ int P2PMaster::RunWithHA() {
 #endif
         const int run_result = RunActiveRpcServers(
             *server, *active_service, std::move(mark_primary),
-            std::move(drain_after_stepdown), stopping);
+            std::move(drain_after_stepdown), stopping,
+            [&active_stepdown_requested, &leadership_lost] {
+                return active_stepdown_requested.load(
+                           std::memory_order_acquire) &&
+                       !leadership_lost.load(std::memory_order_acquire);
+            });
 #ifdef STORE_USE_REDIS
         redis_oplog_trim_worker.reset();
 #endif

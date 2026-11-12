@@ -34,7 +34,8 @@ class P2PMaster {
                             P2PMasterRpcService& service,
                             std::function<void()> before_start = {},
                             std::function<void()> after_stop = {},
-                            std::function<bool()> stopping = {});
+                            std::function<bool()> stopping = {},
+                            std::function<bool()> stepping_down = {});
 
     P2PMasterConfig config_;
     static std::atomic<bool> shutdown_requested_;
