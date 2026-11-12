@@ -1,12 +1,78 @@
 // Copyright 2026 KVCache.AI
 // SPDX-License-Identifier: Apache-2.0
 #include "gather_read.h"
+#include "gather_read_directory.h"
 #include "real_client.h"
 #include "http_metadata_server.h"
 #include "test_server_helpers.h"
 #include <gtest/gtest.h>
 #include <cstring>
 #include <numeric>
+#include <atomic>
+#include <thread>
+#include <poll.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#ifdef MOONCAKE_GATHER_TEST_WRAPPED_SUBMIT
+namespace {
+std::atomic<size_t> test_writes{0}, fail_submission{0}, fail_completion{0};
+std::atomic<mooncake::BatchID> failed_batch{mooncake::INVALID_BATCH_ID};
+struct ScopedWriteFailure {
+    ScopedWriteFailure(size_t submission, size_t completion = 0) {
+        test_writes = 0;
+        failed_batch = mooncake::INVALID_BATCH_ID;
+        fail_submission = submission;
+        fail_completion = completion;
+    }
+    ~ScopedWriteFailure() {
+        fail_submission = 0;
+        fail_completion = 0;
+        failed_batch = mooncake::INVALID_BATCH_ID;
+    }
+};
+}  // namespace
+extern "C" mooncake::Status
+real_gather_submit(mooncake::TransferEngine*, mooncake::BatchID, const std::vector<mooncake::TransferRequest>&) asm(
+    "__real__ZN8mooncake14TransferEngine14submitTransferEmRKSt6vectorINS_"
+    "9Transport15TransferRequestESaIS3_EE");
+extern "C" mooncake::Status
+wrapped_gather_submit(mooncake::TransferEngine*, mooncake::BatchID, const std::vector<mooncake::TransferRequest>&) asm(
+    "__wrap__ZN8mooncake14TransferEngine14submitTransferEmRKSt6vectorINS_"
+    "9Transport15TransferRequestESaIS3_EE");
+extern "C" mooncake::Status wrapped_gather_submit(
+    mooncake::TransferEngine* engine, mooncake::BatchID batch,
+    const std::vector<mooncake::TransferRequest>& entries) {
+    if ((fail_submission || fail_completion) && entries.size() == 1 &&
+        entries[0].opcode == mooncake::TransferRequest::WRITE) {
+        const auto write = ++test_writes;
+        if (write == fail_submission)
+            return mooncake::Status::Memory(
+                "injected gather submission failure");
+        if (write == fail_completion) failed_batch = batch;
+    }
+    return real_gather_submit(engine, batch, entries);
+}
+extern "C" mooncake::Status
+real_gather_status(mooncake::TransferEngine*, mooncake::BatchID, size_t, mooncake::TransferStatus&) asm(
+    "__real__ZN8mooncake14TransferEngine17getTransferStatusEmmRNS_"
+    "9Transport14TransferStatusE");
+extern "C" mooncake::Status
+wrapped_gather_status(mooncake::TransferEngine*, mooncake::BatchID, size_t, mooncake::TransferStatus&) asm(
+    "__wrap__ZN8mooncake14TransferEngine17getTransferStatusEmmRNS_"
+    "9Transport14TransferStatusE");
+extern "C" mooncake::Status wrapped_gather_status(
+    mooncake::TransferEngine* engine, mooncake::BatchID batch, size_t index,
+    mooncake::TransferStatus& progress) {
+    auto status = real_gather_status(engine, batch, index, progress);
+    // Report a drained data failure only after real DMA has completed.
+    if (status.ok() && batch == failed_batch &&
+        progress.s == mooncake::TransferStatusEnum::COMPLETED)
+        progress.s = mooncake::TransferStatusEnum::FAILED;
+    return status;
+}
+#endif
 
 namespace mooncake::store {
 class GatherReadTest : public ::testing::Test {
@@ -125,6 +191,37 @@ TEST_F(GatherReadRdmaTest, ReusesConnectionWithChangingRanges) {
         verify(ranges);
     }
 }
+#ifdef MOONCAKE_GATHER_TEST_WRAPPED_SUBMIT
+TEST_F(GatherReadRdmaTest, LaterSubmissionFailurePreservesCompletedPrefix) {
+    ScopedWriteFailure fault(2);
+    auto result = submit({{0, 3 * 4096}}).wait();
+    ASSERT_EQ(result.completion, GatherReadCompletion::FailedDrained);
+    ASSERT_EQ(test_writes, 2);
+    EXPECT_EQ(result.bytes, 4096);
+    EXPECT_TRUE(result.completedRange(0, 4096));
+    EXPECT_FALSE(result.completedRange(4095, 2));
+    EXPECT_FALSE(result.completedRange(4096, 1));
+    EXPECT_EQ(
+        memcmp(static_cast<char*>(destination.get()) + 32, source.get(), 4096),
+        0);
+    EXPECT_EQ(static_cast<uint8_t*>(destination.get())[32 + 4096], 0xa5);
+}
+TEST_F(GatherReadRdmaTest, FailedEarlierSlotKeepsLaterSuccessfulChunk) {
+    ScopedWriteFailure fault(0, 1);
+    auto result = submit({{0, 3 * 4096}}).wait();
+    ASSERT_EQ(result.completion, GatherReadCompletion::FailedDrained);
+    ASSERT_EQ(test_writes, 2);
+    EXPECT_EQ(result.bytes, 4096);
+    EXPECT_FALSE(result.completedRange(0, 1));
+    EXPECT_TRUE(result.completedRange(4096, 4096));
+    EXPECT_FALSE(result.completedRange(4095, 2));
+    EXPECT_FALSE(result.completedRange(8192, 1));
+    EXPECT_EQ(memcmp(static_cast<char*>(destination.get()) + 32 + 4096,
+                     static_cast<char*>(source.get()) + 4096, 4096),
+              0);
+}
+#endif
+
 TEST_F(GatherReadTest, RejectsWholeRequestBeforeWritingAnyValidPrefix) {
     auto result = submit({{0, 64}, {size - 1, 2}}).wait();
     EXPECT_EQ(result.completion, GatherReadCompletion::Rejected);
@@ -301,6 +398,38 @@ TEST_F(GatherReadTest, RetiredSessionsDoNotExhaustCapacity) {
                      .wait();
     EXPECT_EQ(fresh.completion, GatherReadCompletion::Rejected);
     EXPECT_FALSE(clients.back()->retired());
+}
+
+struct LegacyGatherReadResult {
+    GatherReadCompletion completion;
+    std::string error;
+    uint64_t bytes;
+};
+TEST(GatherReadResultTest,
+     PartialCompletionIsWireCompatibleAndRequiresWholeSpan) {
+    LegacyGatherReadResult legacy{GatherReadCompletion::FailedDrained, "failed",
+                                  0};
+    auto upgraded = struct_pack::deserialize<GatherReadResult>(
+        struct_pack::serialize(legacy));
+    ASSERT_TRUE(upgraded.has_value());
+    EXPECT_FALSE(upgraded->completed_ranges.has_value());
+    EXPECT_FALSE(upgraded->completedRange(0, 1));
+    GatherReadResult partial{GatherReadCompletion::FailedDrained, "failed",
+                             8192};
+    partial.completed_ranges =
+        std::vector<GatherReadRange>{{0, 4096}, {8192, 4096}};
+    auto encoded = struct_pack::serialize(partial);
+    auto restored = struct_pack::deserialize<GatherReadResult>(encoded);
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_TRUE(restored->completedRange(0, 4096));
+    EXPECT_TRUE(restored->completedRange(8192, 4096));
+    EXPECT_FALSE(restored->completedRange(4095, 2));
+    EXPECT_FALSE(restored->completedRange(4096, 1));
+    EXPECT_FALSE(restored->completedRange(12287, 2));
+    auto downgraded = struct_pack::deserialize<LegacyGatherReadResult>(encoded);
+    ASSERT_TRUE(downgraded.has_value());
+    EXPECT_EQ(downgraded->completion, GatherReadCompletion::FailedDrained);
+    EXPECT_EQ(downgraded->bytes, 8192);
 }
 
 struct OwnedRanges {
@@ -486,6 +615,185 @@ TEST_P(StoreGatherReadTest, InterleavedKeysSnapshotAndScatterFallback) {
     owner->tearDownAll();
     master.Stop();
 }
+
+// Accept the open request, hold the connection beyond the Store lease TTL,
+// then abandon the reply. No data write is ever accepted on this endpoint.
+class DelayedGatherEndpoint {
+   public:
+    DelayedGatherEndpoint() {
+        listener_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listener_ < 0) throw std::runtime_error("test socket");
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listener_, reinterpret_cast<sockaddr*>(&address),
+                 sizeof(address)) ||
+            listen(listener_, 1))
+            throw std::runtime_error("test listen");
+        socklen_t length = sizeof(address);
+        if (getsockname(listener_, reinterpret_cast<sockaddr*>(&address),
+                        &length))
+            throw std::runtime_error("test port");
+        endpoint = "127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+        worker_ = std::jthread([this](std::stop_token stop) {
+            pollfd pending{listener_, POLLIN, 0};
+            while (!stop.stop_requested()) {
+                if (poll(&pending, 1, 20) <= 0) continue;
+                const int peer = accept(listener_, nullptr, nullptr);
+                if (peer < 0) return;
+                pollfd request{peer, POLLIN, 0};
+                while (!stop.stop_requested()) {
+                    if (poll(&request, 1, 20) <= 0) continue;
+                    char buffer[4096];
+                    received = recv(peer, buffer, sizeof(buffer), 0) > 0;
+                    if (received)
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(500));
+                    break;
+                }
+                close(peer);
+                return;
+            }
+        });
+    }
+    ~DelayedGatherEndpoint() {
+        worker_.request_stop();
+        worker_.join();
+        close(listener_);
+    }
+    std::string endpoint;
+    std::atomic<bool> received{false};
+
+   private:
+    int listener_;
+    std::jthread worker_;
+};
+
+TEST(StoreGatherLeaseTest, RenewsAllOwnersDuringDelayedSessionOpen) {
+    const char* device = std::getenv("MC_GATHER_TEST_DEVICE");
+    if (!device) GTEST_SKIP() << "Set MC_GATHER_TEST_DEVICE for RDMA";
+    setenv("MC_STORE_MEMCPY", "0", 1);
+    setenv("MC_STORE_GATHER_READ", "1", 1);
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(100).build()));
+    auto a = RealClient::create(), b = RealClient::create(),
+         reader = RealClient::create();
+    std::vector<char> value(1 << 20);
+    for (size_t i = 0; i < value.size(); ++i) value[i] = i % 251;
+    ASSERT_EQ(a->setup_real("127.0.0.1:0", P2PHANDSHAKE, 16 << 20, 8 << 20,
+                            "rdma", device, master.master_address()),
+              0);
+    ASSERT_EQ(a->put("lease-a", value), 0);
+    auto first = a->get_replica_desc("lease-a");
+    ASSERT_EQ(first.size(), 1);
+    const auto first_owner =
+        first[0].get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    ASSERT_EQ(b->setup_real("127.0.0.2:0", P2PHANDSHAKE, 16 << 20, 8 << 20,
+                            "rdma", device, master.master_address()),
+              0);
+    ReplicateConfig config;
+    config.preferred_segment = b->get_hostname();
+    ASSERT_EQ(b->put("lease-b", value, config), 0);
+    auto second = b->get_replica_desc("lease-b");
+    ASSERT_EQ(second.size(), 1);
+    const auto second_owner =
+        second[0].get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    ASSERT_NE(first_owner, second_owner);
+    ASSERT_EQ(reader->setup_real("127.0.0.3:0", P2PHANDSHAKE, 0, 8 << 20,
+                                 "rdma", device, master.master_address()),
+              0);
+    MasterClient discovery(generate_uuid());
+    ASSERT_EQ(discovery.Connect(master.master_address()), ErrorCode::OK);
+    DelayedGatherEndpoint delayed;
+    // Plans are ordered by owner: stall the second after the first is
+    // submitted.
+    ASSERT_TRUE(discovery.PublishGatherEndpoint(
+        std::max(first_owner, second_owner), delayed.endpoint, false));
+    std::vector<char> out_a(256 * 264), out_b(out_a.size());
+    ASSERT_EQ(reader->register_buffer(out_a.data(), out_a.size()), 0);
+    ASSERT_EQ(reader->register_buffer(out_b.data(), out_b.size()), 0);
+    std::vector<std::vector<std::vector<size_t>>> dst(2, {{}}), src(2, {{}}),
+        sizes(2, {{}});
+    for (size_t owner = 0; owner < 2; ++owner)
+        for (size_t i = 0; i < 256; ++i) {
+            dst[owner][0].push_back(i * 264);
+            src[owner][0].push_back(i * 997);
+            sizes[owner][0].push_back(264);
+        }
+    auto results =
+        reader->get_into_ranges({out_a.data(), out_b.data()},
+                                {{"lease-a"}, {"lease-b"}}, dst, src, sizes);
+    ASSERT_TRUE(delayed.received);
+    for (size_t owner = 0; owner < 2; ++owner)
+        for (size_t i = 0; i < 256; ++i) {
+            EXPECT_EQ(results[owner][0][i], 264) << owner << ":" << i;
+            EXPECT_EQ(memcmp((owner ? out_b : out_a).data() + i * 264,
+                             value.data() + i * 997, 264),
+                      0);
+        }
+    EXPECT_EQ(reader->unregister_buffer(out_a.data()), 0);
+    EXPECT_EQ(reader->unregister_buffer(out_b.data()), 0);
+    reader->tearDownAll();
+    b->tearDownAll();
+    a->tearDownAll();
+}
+
+#ifdef MOONCAKE_GATHER_TEST_WRAPPED_SUBMIT
+TEST(StoreGatherFailureTest, CompletedChunksKeepPerFragmentResults) {
+    const char* device = std::getenv("MC_GATHER_TEST_DEVICE");
+    if (!device) GTEST_SKIP() << "Set MC_GATHER_TEST_DEVICE for RDMA";
+    setenv("MC_STORE_MEMCPY", "0", 1);
+    setenv("MC_STORE_GATHER_READ", "1", 1);
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    auto owner = RealClient::create(), reader = RealClient::create();
+    ASSERT_EQ(owner->setup_real("127.0.0.1:0", P2PHANDSHAKE, 16 << 20, 8 << 20,
+                                "rdma", device, master.master_address()),
+              0);
+    ASSERT_EQ(reader->setup_real("127.0.0.2:0", P2PHANDSHAKE, 0, 8 << 20,
+                                 "rdma", device, master.master_address()),
+              0);
+    std::vector<char> value(4 << 20);
+    for (size_t i = 0; i < value.size(); ++i) value[i] = i % 251;
+    ASSERT_EQ(owner->put("partial-a", value), 0);
+    ASSERT_EQ(owner->put("partial-b", value), 0);
+    // Interleave two keys and reverse API fragment order. Fragment 512
+    // straddles the failed chunk boundary and must not report success.
+    std::vector<char> output(1024 * 1024 + 1, 'z');
+    ASSERT_EQ(reader->register_buffer(output.data(), output.size()), 0);
+    std::vector<std::vector<std::vector<size_t>>> dst{{{}, {}}}, src{{{}, {}}},
+        sizes{{{}, {}}};
+    for (size_t n = 1024; n > 0; --n) {
+        const size_t i = n - 1, key = i % 2;
+        dst[0][key].push_back(1 + i * 1024 - (i > 511 ? 1 : 0));
+        src[0][key].push_back(i * 2048);
+        sizes[0][key].push_back(i == 511 ? 1023 : 1024);
+    }
+    ScopedWriteFailure fault(2);
+    auto results = reader->get_into_ranges(
+        {output.data()}, {{"partial-a", "partial-b"}}, dst, src, sizes);
+    ASSERT_EQ(test_writes, 2);
+    for (size_t key = 0; key < 2; ++key)
+        for (size_t k = 0; k < sizes[0][key].size(); ++k) {
+            const bool completed =
+                dst[0][key][k] - 1 + sizes[0][key][k] <= 512 * 1024;
+            EXPECT_EQ(results[0][key][k],
+                      completed ? static_cast<int64_t>(sizes[0][key][k])
+                                : toInt(ErrorCode::TRANSFER_FAIL));
+            if (completed)
+                EXPECT_EQ(
+                    memcmp(output.data() + dst[0][key][k],
+                           value.data() + src[0][key][k], sizes[0][key][k]),
+                    0);
+        }
+    EXPECT_EQ(output.front(), 'z');
+    EXPECT_EQ(output.back(), 'z');
+    EXPECT_EQ(reader->unregister_buffer(output.data()), 0);
+    reader->tearDownAll();
+    owner->tearDownAll();
+}
+#endif
 
 INSTANTIATE_TEST_SUITE_P(Transports, StoreGatherReadTest,
                          ::testing::Values("tcp", "rdma"));

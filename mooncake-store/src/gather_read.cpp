@@ -136,6 +136,8 @@ class GatherReadService::Impl {
    public:
     struct Slot {
         BatchID batch = INVALID_BATCH_ID;
+        size_t chunk = 0;
+        bool submitted = false;
         std::vector<TransferRequest> request{1};
     };
     struct Worker {
@@ -303,12 +305,21 @@ class GatherReadService::Impl {
                 for (auto& slot : worker->slots) self->drain(slot);
             }
         } drain_on_exit{this, worker};
+        // Allocate completion bookkeeping before publishing any writes. A
+        // failed chunk can drain after a later chunk succeeds in another slot.
+        std::vector<bool> completed((bytes - 1) / options_.chunk_bytes + 1);
+        auto finish = [&](Slot& slot) {
+            auto status = drain(slot);
+            if (slot.submitted && status.ok()) completed[slot.chunk] = true;
+            slot.submitted = false;
+            return status;
+        };
         size_t range_index = 0, within_range = 0, written = 0, chunk_index = 0;
         Status result = Status::OK();
         while (written < bytes) {
             const size_t slot_index = chunk_index++ % worker->slots.size();
             auto& slot = worker->slots[slot_index];
-            result = drain(slot);
+            result = finish(slot);
             if (!result.ok()) break;
             char* output = static_cast<char*>(worker->staging.get()) +
                            slot_index * options_.chunk_bytes;
@@ -342,18 +353,32 @@ class GatherReadService::Impl {
                                 .length = packed};
             result = engine_->submitTransfer(slot.batch, slot.request);
             if (!result.ok()) break;
+            slot.chunk = written / options_.chunk_bytes;
+            slot.submitted = true;
             written += packed;
         }
         for (auto& slot : worker->slots) {
-            auto status = drain(slot);
+            auto status = finish(slot);
             if (!status.ok() && result.ok()) result = status;
         }
-        return result.ok()
-                   ? GatherReadResult{GatherReadCompletion::Completed,
-                                      {},
-                                      bytes}
-                   : GatherReadResult{GatherReadCompletion::FailedDrained,
-                                      result.ToString(), 0};
+        if (result.ok()) return {GatherReadCompletion::Completed, {}, bytes};
+        GatherReadResult failure{GatherReadCompletion::FailedDrained,
+                                 result.ToString(), 0};
+        // Expand status only after all writes drain, and only on failure.
+        auto& spans = failure.completed_ranges.emplace();
+        for (size_t i = 0; i < completed.size(); ++i) {
+            if (!completed[i]) continue;
+            const uint64_t offset = i * options_.chunk_bytes;
+            const uint64_t length =
+                std::min<uint64_t>(options_.chunk_bytes, bytes - offset);
+            failure.bytes += length;
+            if (!spans.empty() &&
+                spans.back().offset + spans.back().length == offset)
+                spans.back().length += length;
+            else
+                spans.push_back({offset, length});
+        }
+        return failure;
     }
 
     struct Session {

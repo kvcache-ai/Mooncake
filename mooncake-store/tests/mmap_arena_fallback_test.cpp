@@ -222,14 +222,37 @@ TEST_F(MmapArenaFallbackTest, AllocateFreeCycle) {
     }
 }
 
+TEST_F(MmapArenaFallbackTest, ThpAlignedUnderTaskPolicy) {
+    EXPECT_EQ(allocate_buffer_thp(SZ_2MB + 4096, ThpNumaPolicy::kInheritTask),
+              nullptr);
+
+    const size_t alloc_size = 2 * SZ_2MB;
+    void* ptr = allocate_buffer_thp(alloc_size, ThpNumaPolicy::kInheritTask);
+    ASSERT_NE(ptr, nullptr);
+    // A cachelib master accepts only slab-aligned segments.
+    EXPECT_EQ(
+        reinterpret_cast<uintptr_t>(ptr) % facebook::cachelib::Slab::kSize, 0u);
+    if (numa_available() >= 0) {
+        int mode = -1;
+        ASSERT_EQ(get_mempolicy(&mode, nullptr, 0, ptr, MPOL_F_ADDR), 0);
+        EXPECT_EQ(mode, MPOL_DEFAULT);
+    }
+    memset(ptr, 0x5A, alloc_size);
+    free_buffer_mmap_memory(ptr, alloc_size);
+}
+
 TEST_F(MmapArenaFallbackTest, ThpInterleavedRejectsUnalignedSize) {
-    EXPECT_EQ(allocate_buffer_thp_interleaved(0), nullptr);
-    EXPECT_EQ(allocate_buffer_thp_interleaved(SZ_2MB + 4096), nullptr);
+    EXPECT_EQ(allocate_buffer_thp(0, ThpNumaPolicy::kInterleaveIfDefault),
+              nullptr);
+    EXPECT_EQ(
+        allocate_buffer_thp(SZ_2MB + 4096, ThpNumaPolicy::kInterleaveIfDefault),
+        nullptr);
 }
 
 TEST_F(MmapArenaFallbackTest, ThpInterleavedAlignedAndInterleaved) {
     const size_t alloc_size = 4 * SZ_2MB;
-    void* ptr = allocate_buffer_thp_interleaved(alloc_size);
+    void* ptr =
+        allocate_buffer_thp(alloc_size, ThpNumaPolicy::kInterleaveIfDefault);
     ASSERT_NE(ptr, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % SZ_2MB, 0u);
 
@@ -254,7 +277,8 @@ TEST_F(MmapArenaFallbackTest, ThpInterleavedKeepsExplicitTaskPolicy) {
     ASSERT_EQ(set_mempolicy(MPOL_BIND, node0->maskp, node0->size + 1), 0);
 
     const size_t alloc_size = 2 * SZ_2MB;
-    void* ptr = allocate_buffer_thp_interleaved(alloc_size);
+    void* ptr =
+        allocate_buffer_thp(alloc_size, ThpNumaPolicy::kInterleaveIfDefault);
     int mode = -1;
     const int rc =
         ptr ? get_mempolicy(&mode, nullptr, 0, ptr, MPOL_F_ADDR) : -1;

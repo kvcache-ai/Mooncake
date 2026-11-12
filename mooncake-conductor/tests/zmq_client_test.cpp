@@ -3,8 +3,6 @@
 
 #include <gtest/gtest.h>
 #include <msgpack.hpp>
-#include <zmq.hpp>
-#include <zmq_addon.hpp>
 
 #include <algorithm>
 #include <array>
@@ -21,7 +19,10 @@
 #include <variant>
 #include <vector>
 
+#include "conductor/zmq/transport.h"
 #include "conductor/zmq/zmq_client.h"
+
+namespace transport = mooncake::conductor::zmq::detail;
 
 namespace mooncake::conductor::zmq {
 
@@ -346,16 +347,16 @@ class MockPublisher {
                            bool bad_sequence = false,
                            PublisherKind publisher_kind = PublisherKind::kVllm)
         : ctx_(1),
-          pub_(ctx_, ::zmq::socket_type::pub),
-          router_(ctx_, ::zmq::socket_type::router),
+          pub_(ctx_, ZMQ_PUB),
+          router_(ctx_, ZMQ_ROUTER),
           replay_with_topic_(replay_with_topic),
           replay_topic_(std::move(replay_topic)),
           bad_delimiter_(bad_delimiter),
           bad_sequence_(bad_sequence),
           publisher_kind_(publisher_kind) {
-        pub_.set(::zmq::sockopt::ipv6, 1);
+        pub_.set(ZMQ_IPV6, 1);
         pub_.bind("tcp://127.0.0.1:*");
-        router_.set(::zmq::sockopt::ipv6, 1);
+        router_.set(ZMQ_IPV6, 1);
         router_.bind("tcp://127.0.0.1:*");
         replay_thread_ = std::thread([this] { HandleReplay(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -371,13 +372,9 @@ class MockPublisher {
         }
     }
 
-    std::string PubEndpoint() {
-        return pub_.get(::zmq::sockopt::last_endpoint);
-    }
+    std::string PubEndpoint() { return pub_.Endpoint(); }
 
-    std::string RouterEndpoint() {
-        return router_.get(::zmq::sockopt::last_endpoint);
-    }
+    std::string RouterEndpoint() { return router_.Endpoint(); }
 
     void Publish(const std::string& topic, const std::string& payload,
                  uint64_t sequence) {
@@ -386,21 +383,21 @@ class MockPublisher {
             sequence_bytes[index] = static_cast<unsigned char>(sequence & 0xFF);
             sequence >>= 8;
         }
-        std::array<::zmq::const_buffer, 3> frames = {
-            ::zmq::buffer(topic),
-            ::zmq::buffer(sequence_bytes, sizeof(sequence_bytes)),
-            ::zmq::buffer(payload),
+        std::array<std::string_view, 3> frames = {
+            transport::Buffer(topic),
+            transport::Buffer(sequence_bytes, sizeof(sequence_bytes)),
+            transport::Buffer(payload),
         };
-        ::zmq::send_multipart(pub_, frames);
+        transport::SendMultipart(pub_, frames);
     }
 
     void PublishFrames(const std::vector<std::string>& frames) {
-        std::vector<::zmq::const_buffer> buffers;
+        std::vector<std::string_view> buffers;
         buffers.reserve(frames.size());
         for (const auto& frame : frames) {
-            buffers.push_back(::zmq::buffer(frame));
+            buffers.push_back(transport::Buffer(frame));
         }
-        ::zmq::send_multipart(pub_, buffers);
+        transport::SendMultipart(pub_, buffers);
     }
 
     size_t ReplayRequestCount() const { return replay_requests_.load(); }
@@ -431,11 +428,10 @@ class MockPublisher {
 
    private:
     void HandleReplay() {
-        router_.set(::zmq::sockopt::rcvtimeo, 100);
+        router_.set(ZMQ_RCVTIMEO, 100);
         while (!closed_.load()) {
-            std::vector<::zmq::message_t> frames;
-            const auto count = ::zmq::recv_multipart(
-                router_, std::back_inserter(frames), ::zmq::recv_flags::none);
+            std::vector<transport::Message> frames;
+            const auto count = transport::ReceiveMultipart(router_, frames);
             if (!count) continue;
             // REQ adds the empty delimiter automatically; Conductor's DEALER
             // adds it explicitly. ROUTER therefore sees the vLLM shape below.
@@ -469,16 +465,16 @@ class MockPublisher {
                                          : PackVllmStoredBatch(sequence);
                 // SGLang/older vLLM omit topic; newer vLLM includes it.
                 const std::string delimiter = bad_delimiter_ ? "bad" : "";
-                std::vector<::zmq::const_buffer> reply = {
-                    ::zmq::buffer(frames[0].data(), frames[0].size()),
-                    ::zmq::buffer(delimiter),
+                std::vector<std::string_view> reply = {
+                    transport::Buffer(frames[0].data(), frames[0].size()),
+                    transport::Buffer(delimiter),
                 };
                 if (replay_with_topic_)
-                    reply.push_back(::zmq::buffer(replay_topic_));
-                reply.push_back(::zmq::buffer(sequence_bytes.data(),
-                                              bad_sequence_ ? 7 : 8));
-                reply.push_back(::zmq::buffer(payload));
-                ::zmq::send_multipart(router_, reply);
+                    reply.push_back(transport::Buffer(replay_topic_));
+                reply.push_back(transport::Buffer(sequence_bytes.data(),
+                                                  bad_sequence_ ? 7 : 8));
+                reply.push_back(transport::Buffer(payload));
+                transport::SendMultipart(router_, reply);
                 replay_events_.fetch_add(1);
             }
 
@@ -488,20 +484,21 @@ class MockPublisher {
             }
             std::array<unsigned char, 8> end_sequence{};
             end_sequence.fill(0xFF);
-            std::vector<::zmq::const_buffer> end = {
-                ::zmq::buffer(frames[0].data(), frames[0].size()),
-                ::zmq::buffer(empty),
+            std::vector<std::string_view> end = {
+                transport::Buffer(frames[0].data(), frames[0].size()),
+                transport::Buffer(empty),
             };
-            if (replay_with_topic_) end.push_back(::zmq::buffer(empty));
-            end.push_back(::zmq::buffer(end_sequence));
-            end.push_back(::zmq::buffer(empty));
-            ::zmq::send_multipart(router_, end);
+            if (replay_with_topic_) end.push_back(transport::Buffer(empty));
+            end.push_back(
+                transport::Buffer(end_sequence.data(), end_sequence.size()));
+            end.push_back(transport::Buffer(empty));
+            transport::SendMultipart(router_, end);
         }
     }
 
-    ::zmq::context_t ctx_;
-    ::zmq::socket_t pub_;
-    ::zmq::socket_t router_;
+    transport::Context ctx_;
+    transport::Socket pub_;
+    transport::Socket router_;
     const bool replay_with_topic_;
     const std::string replay_topic_;
     const bool bad_delimiter_;
@@ -988,7 +985,10 @@ TEST(ZMQClient, ReplayTopicCountsTowardsRecoveryByteLimit) {
     publisher.Publish("", PackVllmStoredBatch(2), 15);
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!client.IsStale() && std::chrono::steady_clock::now() < deadline) {
+    // MarkStale publishes the state before invoking the handler outside its
+    // lock. Wait for the notification too before asserting callback metadata.
+    while ((!client.IsStale() || handler->StaleNotificationCount() == 0) &&
+           std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_TRUE(client.IsStale());
@@ -1087,7 +1087,10 @@ TEST(ZMQClient, UnrecoverableGapMarksSourceStaleWithoutApplyingBoundary) {
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!client.IsStale() && std::chrono::steady_clock::now() < deadline) {
+    // MarkStale publishes the state before invoking the handler outside its
+    // lock. Wait for the notification too before asserting callback metadata.
+    while ((!client.IsStale() || handler->StaleNotificationCount() == 0) &&
+           std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_TRUE(client.IsStale());
@@ -1117,7 +1120,10 @@ TEST(ZMQClient, RecoveryDeadlineMarksSourceStale) {
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!client.IsStale() && std::chrono::steady_clock::now() < deadline) {
+    // MarkStale publishes the state before invoking the handler outside its
+    // lock. Wait for the notification too before asserting callback metadata.
+    while ((!client.IsStale() || handler->StaleNotificationCount() == 0) &&
+           std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_TRUE(client.IsStale());
@@ -1143,7 +1149,10 @@ TEST(ZMQClient, RecoveryBufferLimitMarksSourceStale) {
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!client.IsStale() && std::chrono::steady_clock::now() < deadline) {
+    // MarkStale publishes the state before invoking the handler outside its
+    // lock. Wait for the notification too before asserting callback metadata.
+    while ((!client.IsStale() || handler->StaleNotificationCount() == 0) &&
+           std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_TRUE(client.IsStale());
@@ -1169,7 +1178,10 @@ TEST(ZMQClient, EventGapMarksSourceStaleWhenReplayUnavailable) {
     publisher.Publish("", PackVllmStoredBatch(2), 13);
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!client.IsStale() && std::chrono::steady_clock::now() < deadline) {
+    // MarkStale publishes the state before invoking the handler outside its
+    // lock. Wait for the notification too before asserting callback metadata.
+    while ((!client.IsStale() || handler->StaleNotificationCount() == 0) &&
+           std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     EXPECT_TRUE(client.IsStale());

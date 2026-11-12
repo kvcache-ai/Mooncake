@@ -6,9 +6,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <unordered_map>
+#include <tuple>
+#include <vector>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
+#include <mooncake_ep_dispatch_slots.h>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
 #include <glog/logging.h>
@@ -75,13 +77,11 @@ struct MooncakeEpBuffer {
 
     // GDR buffer — allocated by p2p_transport_; peer mappings are optional.
     int buffer_idx{};
-    int phase_epochs[2]{};
     // TBO owns multiple logical dispatchers but shares one native Buffer.
     // Keep a private top-k snapshot slot per dispatch metadata tensor so
     // interleaved subbatches cannot overwrite one another.
     std::mutex buffer_mutex;
-    std::unordered_map<uint64_t, int> dispatch_shadow_slots;
-    int next_shadow_slot = 0;
+    DispatchSlots dispatch_slots;
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
@@ -90,19 +90,36 @@ struct MooncakeEpBuffer {
     // rdma_transport_: IBGDA inter-node RDMA.  nullptr when IBGDA unavailable.
     device::P2pTransport* p2p_transport_ = nullptr;
     device::RdmaTransport* rdma_transport_ = nullptr;
+    device::RdmaMemoryRegion rdma_memory_region_;
     // When EP creates transports itself (no engine provided), ownership lives
     // in these unique_ptrs.  When an engine is provided, the engine owns them
     // and these remain null.
     std::unique_ptr<device::P2pTransport> owned_p2p_transport_;
     std::unique_ptr<device::RdmaTransport> owned_rdma_transport_;
 
+    bool elastic_enabled_ = false;
+    bool explicitly_destroy_ = false;
+    bool destroyed_ = false;
+    int num_experts_per_rank_ = 0;
+    int active_rank_bound_ = 0;
+    int32_t* elastic_active_ranks_ = nullptr;
+    int* barrier_send_count_ = nullptr;
+    int* barrier_arrivals_ = nullptr;
+    std::vector<uint8_t> elastic_connected_ranks_;
+    std::vector<uint8_t> elastic_committed_ranks_;
+    std::vector<uint8_t> elastic_staged_ranks_;
+    std::vector<int32_t> elastic_active_ranks_host_;
+    std::mutex elastic_mutex_;
+
+    void commit_staged_peers();
+    void refresh_active_rank_bound();
+
     bool ibgda_disabled_ = false;
     bool p2p_enabled_ = true;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
-    // Active RoCE QPs per peer. The platform-specific default is selected in
-    // active_qps_per_rank_for_ep(); a positive
-    // MOONCAKE_EP_ACTIVE_QPS_PER_RANK value forces an explicit count.
+    // Active RoCE QPs per peer. MUSA uses one until its independent per-QP
+    // staging protocol is implemented; CUDA/MACA retain their runtime cap.
     int active_qps_cap_ = 0;
 
     // Stream for communication
@@ -121,6 +138,26 @@ struct MooncakeEpBuffer {
 
     ~MooncakeEpBuffer() noexcept(false);
 
+    void configure_elastic(int num_experts_per_rank, uint64_t active_ranks_ptr);
+    void set_explicit_destroy(bool explicitly_destroy);
+    void validate_connect_ranks(const std::vector<int>& peer_ranks);
+    void stage_peer(int peer_rank, int64_t raddr, int32_t rkey,
+                    int64_t subnet_prefix, int64_t interface_id,
+                    const std::vector<int32_t>& qpns,
+                    const std::vector<int32_t>& lids,
+                    const std::vector<int32_t>& ipc_handle);
+    void disconnect_ranks(const std::vector<int>& peer_ranks);
+    void update_mask_buffer(int peer_rank, bool masked, uint64_t stream_ptr);
+    void query_mask_buffer(uint64_t output_ptr, uint64_t stream_ptr) const;
+    void clean_mask_buffer(uint64_t stream_ptr);
+    void barrier(int timeout_us, uint64_t stream_ptr);
+    int get_active_rank_bound() const { return active_rank_bound_; }
+    uint64_t get_comm_stream() const {
+        return reinterpret_cast<uint64_t>(comm_stream);
+    }
+    std::tuple<uint64_t, size_t> get_local_buffer_descriptor() const;
+    void destroy();
+
     std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
     dispatch(uint64_t x_ptr, uint64_t topk_idx_ptr, uint64_t active_ranks_ptr,
              int num_tokens, int hidden, int num_topk,
@@ -129,7 +166,8 @@ struct MooncakeEpBuffer {
              uint64_t packed_recv_x_scales_ptr, uint64_t packed_recv_count_ptr,
              uint64_t packed_recv_src_info_ptr,
              uint64_t packed_recv_layout_range_ptr, bool async,
-             bool return_recv_hook, uint64_t compute_stream_ptr);
+             bool return_recv_hook, uint64_t compute_stream_ptr,
+             uint64_t cumulative_local_expert_recv_stats_ptr = 0);
 
     std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
     combine(uint64_t x_ptr, uint64_t topk_idx_ptr, uint64_t topk_weights_ptr,
@@ -174,24 +212,24 @@ struct MooncakeEpBuffer {
     // Metadata accessors for Python-level bootstrap exchange.
     std::tuple<int64_t, int32_t> get_mr_info() {
         if (!rdma_transport_) return {0, 0};
-        auto m = rdma_transport_->localMetadata();
+        auto m = rdma_transport_->localMetadata(rdma_memory_region_);
         return {m.raddr, m.rkey};
     }
 
     std::tuple<int64_t, int64_t> get_gid() {
         if (!rdma_transport_) return {0, 0};
-        auto m = rdma_transport_->localMetadata();
+        auto m = rdma_transport_->localMetadata(rdma_memory_region_);
         return {m.subnet_prefix, m.interface_id};
     }
 
     std::vector<int32_t> get_local_qpns() {
         if (!rdma_transport_) return {};
-        return rdma_transport_->localMetadata().qpns;
+        return rdma_transport_->localMetadata(rdma_memory_region_).qpns;
     }
 
     std::vector<int32_t> get_local_lids() {
         if (!rdma_transport_) return {};
-        return rdma_transport_->localMetadata().lids;
+        return rdma_transport_->localMetadata(rdma_memory_region_).lids;
     }
 
     // IPC handle for P2P (NVLink).
@@ -208,6 +246,16 @@ inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,
     return BufferPair(nullptr, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts)
         .total_bytes;
+}
+
+inline size_t get_ep_elastic_buffer_size_hint(
+    int num_max_dispatch_tokens_per_rank, int hidden, int capacity_ranks,
+    int num_experts_per_rank) {
+    const int capacity_experts = capacity_ranks * num_experts_per_rank;
+    return BufferPair(nullptr, num_max_dispatch_tokens_per_rank, hidden,
+                      capacity_ranks, capacity_experts)
+               .total_bytes +
+           2 * static_cast<size_t>(capacity_ranks) * sizeof(int32_t);
 }
 
 }  // namespace mooncake

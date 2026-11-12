@@ -31,8 +31,11 @@ bool shouldLogOccurrence(uint64_t occurrence) {
 void cancelTimerNoThrow(
     const std::shared_ptr<asio::steady_timer>& timer) noexcept {
     if (!timer) return;
-    asio::error_code ec;
-    timer->cancel(ec);
+    // Asio 1.36 cancel() throws on failure; this helper stays non-throwing.
+    try {
+        timer->cancel();
+    } catch (const std::exception&) {
+    }
 }
 
 // Tracks only whether executor-posted cancellation actions ran. It is not an
@@ -803,9 +806,21 @@ void TcpTransport::runGroupPump(
         for (const auto& lane : group->lanes) {
             if (group->queue.empty()) break;
             if (lane->state != LaneState::IDLE) continue;
-            if (!lane->socket || !lane->socket->is_open()) {
+            // is_open() only describes the local descriptor. A peer may have
+            // closed an otherwise idle pooled connection since its last ACK.
+            char pending_byte;
+            asio::error_code peek_ec = asio::error::not_connected;
+            size_t received = 0;
+            if (lane->socket && lane->socket->is_open()) {
+                received = lane->socket->receive(
+                    asio::buffer(&pending_byte, 1),
+                    asio::socket_base::message_peek, peek_ec);
+            }
+            if (received != 0 || (peek_ec != asio::error::would_block &&
+                                  peek_ec != asio::error::try_again)) {
                 lane->socket.reset();
                 lane->state = LaneState::DISCONNECTED;
+                lane->last_connect_round = 0;
                 continue;
             }
 
@@ -1086,6 +1101,7 @@ void TcpTransport::handleLaneConnected(
         } else {
             asio::error_code option_ec;
             lane->socket->set_option(asio::ip::tcp::no_delay(true), option_ec);
+            if (!option_ec) lane->socket->non_blocking(true, option_ec);
             if (option_ec) {
                 option_error = option_ec.message();
             } else {
@@ -1549,10 +1565,7 @@ void TcpTransport::shutdownConnectionLanes() {
                     asio::dispatch(
                         group->executor,
                         [retry_timer, admission_timer, cancellation_posts] {
-                            if (retry_timer) {
-                                asio::error_code timer_ec;
-                                retry_timer->cancel(timer_ec);
-                            }
+                            if (retry_timer) cancelTimerNoThrow(retry_timer);
                             cancelTimerNoThrow(admission_timer);
                             cancellation_posts->done();
                         });

@@ -13,6 +13,14 @@
 
 namespace mooncake {
 
+inline constexpr uint32_t kWeightMetadataSchemaVersion = 3;
+
+struct WeightResidencyObservation {
+    WeightResidencyState residency{WeightResidencyState::UNKNOWN};
+    double hot_ratio{0.0};
+    bool preferred_placement_satisfied{false};
+};
+
 enum class WeightMetadataMutationKind : uint8_t {
     UPSERT = 0,
     ERASE = 1,
@@ -23,6 +31,7 @@ struct WeightMetadataMutation {
     WeightRevisionIdentity identity;
     std::optional<WeightRevisionMetadata> previous;
     std::optional<WeightRevisionMetadata> next;
+    std::optional<WeightResidencyOperation> operation;
     bool no_op{false};
 };
 
@@ -42,7 +51,7 @@ struct WeightOperationMutation {
 };
 
 struct WeightMetadataSnapshot {
-    uint32_t schema_version{1};
+    uint32_t schema_version{kWeightMetadataSchemaVersion};
     std::vector<WeightRevisionMetadata> metadata;
     std::vector<WeightRevisionLease> leases;
     std::vector<WeightResidencyOperation> operations;
@@ -66,11 +75,14 @@ class WeightMetadataStore {
     Result<WeightMetadataMutation> PrepareBeginImport(
         const BeginWeightImportRequest& request, uint64_t now_ms) const;
     Result<WeightMetadataMutation> PrepareCommitImport(
-        const CommitWeightImportRequest& request, uint64_t now_ms) const;
+        const CommitWeightImportRequest& request, uint64_t now_ms,
+        std::optional<WeightResidencyObservation> observation = std::nullopt);
     Result<WeightMetadataMutation> PrepareAbortImport(
         const AbortWeightImportRequest& request, uint64_t now_ms) const;
     Result<WeightRevisionMetadata> Publish(
         const WeightMetadataMutation& mutation);
+    Result<WeightMetadataMutation> PrepareUpdatePolicy(
+        const UpdateWeightPolicyRequest& request, uint64_t now_ms);
 
     Result<WeightRevisionView> Get(const WeightRevisionIdentity& identity,
                                    uint64_t now_ms) const;
@@ -83,7 +95,9 @@ class WeightMetadataStore {
         const RenewWeightRevisionLeaseRequest& request, uint64_t now_ms) const;
     Result<WeightLeaseMutation> PrepareReleaseLease(
         const ReleaseWeightRevisionLeaseRequest& request) const;
-    std::vector<WeightLeaseMutation> PrepareExpireLeases(uint64_t now_ms) const;
+    std::vector<WeightLeaseMutation> PrepareExpireLeases(
+        uint64_t now_ms, const std::optional<WeightRevisionIdentity>& identity =
+                             std::nullopt) const;
     Result<WeightRevisionLease> Publish(const WeightLeaseMutation& mutation);
     bool HasActiveLease(const WeightRevisionIdentity& identity,
                         uint64_t metadata_generation, uint64_t now_ms) const;
@@ -92,16 +106,23 @@ class WeightMetadataStore {
         const StartWeightResidencyOperationRequest& request, uint64_t now_ms);
     Result<WeightOperationMutation> PrepareFinishOperation(
         uint64_t operation_id, WeightResidencyState observed_residency,
-        uint64_t now_ms) const;
+        double observed_hot_ratio, uint64_t now_ms) const;
     Result<WeightOperationMutation> PrepareUpdateOperationProgress(
-        uint64_t operation_id, uint64_t processed_members,
-        uint64_t total_members, std::string cursor, uint64_t now_ms) const;
+        uint64_t operation_id, uint64_t processed_units, uint64_t total_units,
+        uint64_t processed_bytes, uint64_t total_bytes, std::string cursor,
+        std::string message, WeightAvailabilityState observed_availability,
+        WeightResidencyState observed_residency, double observed_hot_ratio,
+        uint64_t now_ms) const;
+    Result<WeightOperationMutation> PrepareRecordOperationError(
+        uint64_t operation_id, std::string message, uint64_t now_ms) const;
     Result<WeightResidencyOperation> Publish(
         const WeightOperationMutation& mutation);
     Result<WeightResidencyOperation> QueryOperation(
         uint64_t operation_id) const;
 
     Result<WeightMetadataMutation> PrepareDelete(
+        const DeleteWeightRevisionRequest& request, uint64_t now_ms) const;
+    Result<WeightOperationMutation> PrepareCancelOperationForDelete(
         const DeleteWeightRevisionRequest& request, uint64_t now_ms) const;
     Result<WeightMetadataMutation> PrepareFinishDelete(
         const WeightRevisionIdentity& identity,
@@ -110,7 +131,7 @@ class WeightMetadataStore {
         const WeightRevisionIdentity& identity,
         uint64_t expected_metadata_generation,
         WeightAvailabilityState availability, WeightResidencyState residency,
-        uint64_t now_ms) const;
+        double observed_hot_ratio, uint64_t now_ms) const;
 
     bool IsManagedGroup(const std::string& payload_group_id) const;
     bool AllowsGroupMemberMutation(const std::string& payload_group_id) const;
@@ -119,12 +140,13 @@ class WeightMetadataStore {
     void Clear();
 
    private:
+    Result<WeightMetadataMutation> PrepareDeleteLocked(
+        const DeleteWeightRevisionRequest& request, uint64_t now_ms,
+        bool cancel_operation) const;
     static std::string MakePageToken(const WeightRevisionIdentity& identity);
     static Result<std::pair<std::string, uint64_t>> ParsePageToken(
         const std::string& page_token);
     static uint64_t AddTtl(uint64_t now_ms, uint64_t ttl_ms);
-    static WeightOperationState OperationForTarget(WeightResidencyState target);
-
     uint64_t CountActiveLeasesLocked(const WeightRevisionMetadata& metadata,
                                      uint64_t now_ms,
                                      std::optional<uint64_t>* nearest) const;

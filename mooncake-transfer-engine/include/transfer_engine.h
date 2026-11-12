@@ -27,6 +27,7 @@
 
 #include "memory_location.h"
 #include "multi_transport.h"
+#include "task_congestion_status.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -79,6 +80,10 @@ enum class PeerLiveness : uint8_t {
 
 struct AutoDiscoverConfig {
     bool enabled = false;
+    // Transport hint, read whether or not auto-discovery is enabled: "efa"
+    // selects EFA, and on an Ascend Direct build the hint decides between
+    // Ascend Direct and the host transports. Written by setAutoDiscover(), or
+    // by the protocol argument of init() when that is not empty.
     std::string protocol;
 };
 
@@ -282,6 +287,12 @@ class TransferEngine {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
+
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const;
+
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const;
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 

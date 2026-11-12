@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <unordered_set>
 #include <utility>
 
@@ -28,6 +30,19 @@ bool retryableStatus(const Status& status) {
            status.IsRpcServiceError() || status.IsInternalError() ||
            status.IsRdmaError();
 }
+
+// Rail health and quota are keyed by the physical rail, which deliberately
+// excludes the endpoint generation (see UbRailKey). These read-only probes
+// therefore only need a generation that satisfies UbPostPath::valid(); real
+// endpoint generations are monotonic and never below this value.
+constexpr uint64_t kRailProbeEndpointGeneration = 1;
+
+// Number of candidates always taken in pre-score order, regardless of which
+// local device they belong to. Two is the floor that keeps tryAcquireFirst from
+// deferring a slice when its top pick is preempted by another worker, including
+// on a single-local-device topology where per-device coverage alone would leave
+// only one candidate.
+constexpr size_t kMinResolvedCandidates = 2;
 
 }  // namespace
 
@@ -60,7 +75,8 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
                      SegmentManager* segment_manager, UbBufferManager* buffers,
                      RailMonitor* rail_monitor, QuotaManager* quota,
                      UbParams params, EndpointResolver endpoint_resolver,
-                     EndpointRetirer endpoint_retirer)
+                     EndpointRetirer endpoint_retirer,
+                     LocalDeviceFailureHandler local_device_failure_handler)
     : adapter_(std::move(adapter)),
       contexts_(std::move(contexts)),
       local_topology_(std::move(local_topology)),
@@ -70,7 +86,8 @@ UbWorkers::UbWorkers(std::shared_ptr<UrmaAdapter> adapter,
       quota_(quota),
       params_(std::move(params)),
       endpoint_resolver_(std::move(endpoint_resolver)),
-      endpoint_retirer_(std::move(endpoint_retirer)) {
+      endpoint_retirer_(std::move(endpoint_retirer)),
+      local_device_failure_handler_(std::move(local_device_failure_handler)) {
     for (const auto& context : contexts_) {
         if (!context) continue;
         context_by_topology_id_[context->topologyId()] = context;
@@ -260,42 +277,106 @@ Status UbWorkers::submit(const UbTask::Ptr& task, uint64_t device_mask) {
     if (!task) {
         return Status::InvalidArgument("Cannot submit a null UB task" LOC_MARK);
     }
+    return submitBatch({task}, device_mask);
+}
+
+thread_local bool UbWorkers::fail_second_enqueue_for_test_ = false;
+
+Status UbWorkers::submitBatch(const std::vector<UbTask::Ptr>& tasks,
+                              uint64_t device_mask) {
+    const bool fail_second_enqueue =
+        std::exchange(fail_second_enqueue_for_test_, false);
     if (!accepting_.load(std::memory_order_acquire)) {
         return Status::InvalidArgument(
             "UB workers are not accepting work" LOC_MARK);
     }
-    const auto snapshot = task->snapshot();
-    if (!snapshot.sealed) {
-        return Status::InvalidArgument(
-            "UB task must be sealed before submission" LOC_MARK);
-    }
-    const int priority =
-        std::clamp(task->request().priority, static_cast<int>(PRIO_HIGH),
-                   static_cast<int>(PRIO_LOW));
 
     std::vector<PendingSlice> pending;
-    for (const auto& slice : task->slices()) {
-        if (slice && slice->markQueued()) {
+    std::unordered_set<const UbTask*> unique_tasks;
+    for (const auto& task : tasks) {
+        if (!task) {
+            return Status::InvalidArgument(
+                "Cannot submit a null UB task" LOC_MARK);
+        }
+        if (!unique_tasks.insert(task.get()).second) {
+            return Status::InvalidArgument(
+                "Cannot submit the same UB task twice in one batch" LOC_MARK);
+        }
+        const auto snapshot = task->snapshot();
+        if (!snapshot.sealed) {
+            return Status::InvalidArgument(
+                "UB task must be sealed before submission" LOC_MARK);
+        }
+        const int priority =
+            std::clamp(task->request().priority, static_cast<int>(PRIO_HIGH),
+                       static_cast<int>(PRIO_LOW));
+        for (const auto& slice : task->slices()) {
+            if (!slice || slice->snapshot().state != UbSliceState::kInitial) {
+                return Status::InvalidArgument(
+                    "UB task contains a slice that cannot be "
+                    "submitted" LOC_MARK);
+            }
             pending.push_back(PendingSlice{task, slice, device_mask, priority,
                                            task->request().target_id,
                                            task->request().opcode});
         }
     }
-    bool stopped_during_submit = false;
+
+    bool enqueue_failed = false;
+    size_t marked_count = 0;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (!accepting_.load(std::memory_order_relaxed)) {
-            stopped_during_submit = true;
-        } else {
-            for (auto& item : pending) {
-                queues_[item.priority].push_back(std::move(item));
+            return Status::InvalidArgument(
+                "UB workers stopped during submission" LOC_MARK);
+        }
+
+        for (const auto& item : pending) {
+            if (!item.slice->markQueued()) break;
+            ++marked_count;
+        }
+
+        if (marked_count == pending.size()) {
+            std::array<size_t, PRIO_LOW + 1> inserted_counts{};
+            try {
+                for (size_t index = 0; index < pending.size(); ++index) {
+                    if (fail_second_enqueue && index == 1) {
+                        throw std::length_error("Injected UB enqueue failure");
+                    }
+                    const auto& item = pending[index];
+                    queues_[item.priority].push_back(item);
+                    ++inserted_counts[item.priority];
+                }
+            } catch (const std::bad_alloc&) {
+                enqueue_failed = true;
+            } catch (const std::length_error&) {
+                enqueue_failed = true;
+            }
+            if (enqueue_failed) {
+                for (size_t priority = 0; priority < queues_.size();
+                     ++priority) {
+                    while (inserted_counts[priority] != 0) {
+                        queues_[priority].pop_back();
+                        --inserted_counts[priority];
+                    }
+                }
             }
         }
     }
-    if (stopped_during_submit) {
-        for (auto& item : pending) item.slice->requestCancellation();
+
+    if (enqueue_failed || marked_count != pending.size()) {
+        // A markQueued() failure or enqueue exception may occur after earlier
+        // slices changed state. None of them are visible to posting workers;
+        // cancel the private tasks so no slice remains orphaned in kQueued.
+        for (size_t index = 0; index < marked_count; ++index) {
+            (void)pending[index].task->requestCancellation();
+        }
+        if (enqueue_failed) {
+            return Status::InternalError(
+                "Unable to enqueue UB task batch" LOC_MARK);
+        }
         return Status::InvalidArgument(
-            "UB workers stopped during submission" LOC_MARK);
+            "UB task changed while it was being submitted" LOC_MARK);
     }
     if (!pending.empty()) queue_cv_.notify_all();
     return Status::OK();
@@ -360,14 +441,26 @@ void UbWorkers::pollingLoop(size_t poller_index) {
              index += poller_count) {
             std::vector<Completion> completions;
             auto status = all_jfcs_[index]->poll(64, completions);
+            auto context = context_by_jfc_.find(all_jfcs_[index].get());
             if (!status.ok()) {
-                auto context = context_by_jfc_.find(all_jfcs_[index].get());
                 if (context != context_by_jfc_.end() && context->second) {
-                    (void)context->second->markUnavailable();
+                    handleLocalDeviceFailure(context->second);
                 }
                 LOG_EVERY_N(WARNING, 1000)
                     << "UB JFC poll failed: " << status.ToString();
                 continue;
+            }
+            if (context != context_by_jfc_.end() && context->second) {
+                progressLocalDeviceFailure(context->second);
+                if (context->second->recordPollSuccess(
+                        all_jfcs_[index]->index(),
+                        static_cast<uint64_t>(params_.endpoint_cooldown_ms) *
+                            1'000'000ULL)) {
+                    LOG(INFO) << "Recovered UB device "
+                              << context->second->deviceInfo().topology_name
+                              << " after endpoint retirement and an "
+                                 "error-free JFC cooldown";
+                }
             }
             progressed = progressed || !completions.empty();
             for (const auto& completion : completions) {
@@ -471,9 +564,9 @@ Status UbWorkers::buildRoute(const PendingSlice& pending, Route& route) {
         });
 }
 
-std::vector<Topology::NicID> UbWorkers::orderedLocalDevices(
+std::vector<UbWorkers::LocalDeviceCandidate> UbWorkers::orderedLocalDevices(
     const PendingSlice& pending) const {
-    std::vector<Topology::NicID> ordered;
+    std::vector<LocalDeviceCandidate> ordered;
     std::unordered_set<Topology::NicID> seen;
     std::unordered_map<Topology::NicID, size_t> device_rank;
     std::string location = kWildcardLocation;
@@ -490,7 +583,12 @@ std::vector<Topology::NicID> UbWorkers::orderedLocalDevices(
         const bool allowed = pending.device_mask == ~0ULL ||
                              (id >= 0 && id < 64 &&
                               (pending.device_mask & (uint64_t{1} << id)) != 0);
-        if (allowed && seen.insert(id).second) ordered.push_back(id);
+        if (allowed && seen.insert(id).second) {
+            const auto rank = device_rank.find(id);
+            ordered.push_back({id, rank == device_rank.end()
+                                       ? Topology::DevicePriorityRanks
+                                       : rank->second});
+        }
     };
     if (local_topology_) {
         if (const auto* memory = local_topology_->getMemEntry(location)) {
@@ -511,13 +609,13 @@ std::vector<Topology::NicID> UbWorkers::orderedLocalDevices(
             append(context->topologyId());
         }
     }
-    std::stable_sort(ordered.begin(), ordered.end(), [&](auto lhs, auto rhs) {
-        const auto lhs_rank = device_rank.at(lhs);
-        const auto rhs_rank = device_rank.at(rhs);
-        if (lhs_rank != rhs_rank) return lhs_rank < rhs_rank;
-        return context_by_topology_id_.at(lhs)->inflightBytes() <
-               context_by_topology_id_.at(rhs)->inflightBytes();
-    });
+    std::stable_sort(
+        ordered.begin(), ordered.end(), [&](const auto& lhs, const auto& rhs) {
+            if (lhs.topology_rank != rhs.topology_rank)
+                return lhs.topology_rank < rhs.topology_rank;
+            return context_by_topology_id_.at(lhs.id)->inflightBytes() <
+                   context_by_topology_id_.at(rhs.id)->inflightBytes();
+        });
     return ordered;
 }
 
@@ -552,26 +650,135 @@ std::vector<Topology::NicID> UbWorkers::orderedRemoteDevices(
 
 Status UbWorkers::chooseAndResolveEndpoint(
     const PendingSlice& pending, Route& route,
-    std::shared_ptr<UbEndpoint>& endpoint, UbPostPath& path) {
+    std::shared_ptr<UbEndpoint>& endpoint, UbPostPath& path,
+    QuotaReservation& reservation) {
+    struct Candidate {
+        std::shared_ptr<UbEndpoint> endpoint;
+        UbPostPath path;
+        UbPathSelectionScore score;
+    };
+
+    // One local x remote combination, scored from rail-level state before any
+    // endpoint is resolved. Endpoint-level load is deliberately absent: it is
+    // only available after resolution and is applied to the finalists below.
+    struct RailCandidate {
+        Topology::NicID local_id;
+        int remote_id;
+        size_t topology_rank;
+        size_t retry_order;
+        UbPostPath probe_path;
+        RailStats rail_stats;
+        QuotaAvailability capacity;
+    };
+
     const auto local_devices = orderedLocalDevices(pending);
-    if (local_devices.empty() || route.remote_devices.empty()) {
+    if (route.remote_devices.empty()) {
         return Status::DeviceNotFound("No usable UB posting path" LOC_MARK);
     }
     const auto snapshot = pending.slice->snapshot();
+    if (local_devices.empty()) {
+        const uint64_t now_ns = steadyNowNs();
+        const uint64_t cooldown_ns =
+            static_cast<uint64_t>(params_.endpoint_cooldown_ms) * 1'000'000ULL;
+        const uint64_t recovery_grace_ns =
+            static_cast<uint64_t>(params_.slice_timeout_ms) * 1'000'000ULL;
+        uint64_t recovery_deadline_ns = 0;
+        for (const auto& context : contexts_) {
+            if (!context || context->state() != UbContext::State::kFailed) {
+                continue;
+            }
+            const uint64_t failed_ns = context->failureStartedNs();
+            if (failed_ns == 0) continue;
+            recovery_deadline_ns =
+                std::max(recovery_deadline_ns,
+                         deadlineAfter(deadlineAfter(failed_ns, cooldown_ns),
+                                       recovery_grace_ns));
+        }
+        if (pending.task && pending.task->request().deadline_ns != 0 &&
+            recovery_deadline_ns != 0) {
+            recovery_deadline_ns = std::min(
+                recovery_deadline_ns, pending.task->request().deadline_ns);
+        }
+        if (recovery_deadline_ns != 0 && now_ns < recovery_deadline_ns) {
+            return Status::TooManyRequests(
+                "All local UB devices are in recovery cooldown" LOC_MARK);
+        }
+        return Status::DeviceNotFound(
+            "All local UB devices remained unavailable" LOC_MARK);
+    }
     const size_t combinations =
         local_devices.size() * route.remote_devices.size();
     const size_t start =
         combinations == 0 ? 0 : snapshot.retry_count % combinations;
     Status first_error = Status::DeviceNotFound(
         "No ready UB endpoint for any posting path" LOC_MARK);
-    for (size_t candidate = 0; candidate < combinations; ++candidate) {
-        const size_t flat = (start + candidate) % combinations;
-        const auto local_id = local_devices[flat / route.remote_devices.size()];
+
+    auto railScore = [](const RailCandidate& candidate) {
+        return UbPathSelectionScore{
+            candidate.capacity.can_acquire,
+            candidate.topology_rank,
+            candidate.capacity.normalized_inflight,
+            candidate.capacity.normalized_outstanding_wrs,
+            0,
+            0,
+            candidate.rail_stats.ewma_bandwidth_bytes_per_second >= 0.0,
+            candidate.rail_stats.ewma_bandwidth_bytes_per_second,
+            candidate.retry_order,
+            candidate.local_id,
+            candidate.remote_id};
+    };
+
+    // Phase 1: rank every combination from rail-level state only. Resolving an
+    // uncached endpoint costs a bootstrap RPC to the peer, so this pass must
+    // not resolve anything.
+    std::vector<RailCandidate> rails;
+    rails.reserve(combinations);
+    for (size_t flat = 0; flat < combinations; ++flat) {
+        const auto& local = local_devices[flat / route.remote_devices.size()];
         const auto remote_id =
             route.remote_devices[flat % route.remote_devices.size()];
-        auto context = context_by_topology_id_.at(local_id);
+        const UbPostPath probe_path{local.id, pending.target_id, remote_id,
+                                    kRailProbeEndpointGeneration};
+        // A non-inserting lookup: an unknown rail scores as "no health history
+        // yet" without being added to the map, so probing every local x remote
+        // combination cannot grow the rail map or seed a generation for a rail
+        // that is never posted to.
+        auto rail_stats = rail_monitor_->statsIfPresent(probe_path);
+        if (rail_stats.paused) continue;
+        rails.push_back(RailCandidate{
+            local.id, remote_id, local.topology_rank,
+            (flat + combinations - start) % combinations, probe_path,
+            std::move(rail_stats),
+            quota_->availability(probe_path, pending.slice->spec().length)});
+    }
+    std::stable_sort(rails.begin(), rails.end(),
+                     [&](const RailCandidate& lhs, const RailCandidate& rhs) {
+                         return betterUbPathScore(railScore(lhs),
+                                                  railScore(rhs));
+                     });
+
+    // Phase 2: resolve lazily in the order produced by
+    // ubResolutionAttemptOrder(), which takes the best rail of each local
+    // device first and the remaining rails only after that. So the candidates
+    // span devices instead of piling onto whichever device ranks best, and a
+    // rail that cannot be resolved simply yields to the next attempt -
+    // including the remaining rails on its own device from pass two. The
+    // bootstrap fan-out is therefore bounded by the number of local devices -
+    // one endpoint per device on a cold peer - rather than by the local x
+    // remote combination count.
+    const size_t resolve_limit =
+        std::max(kMinResolvedCandidates, local_devices.size());
+    std::vector<Topology::NicID> rail_local_ids;
+    rail_local_ids.reserve(rails.size());
+    for (const auto& rail : rails) rail_local_ids.push_back(rail.local_id);
+    std::vector<Candidate> candidates;
+    candidates.reserve(std::min(rails.size(), resolve_limit));
+    for (size_t attempt : ubResolutionAttemptOrder(rail_local_ids)) {
+        if (candidates.size() >= resolve_limit) break;
+        const auto& rail = rails[attempt];
+        auto context = context_by_topology_id_.at(rail.local_id);
         EndpointResolveRequest request{context, pending.target_id,
-                                       route.pin.get(), remote_id,
+                                       route.pin.get(), rail.remote_id,
                                        route.metadata.generation};
         std::shared_ptr<UbEndpoint> candidate_endpoint;
         auto status = endpoint_resolver_(request, candidate_endpoint);
@@ -581,14 +788,71 @@ Status UbWorkers::chooseAndResolveEndpoint(
                 first_error = status;
             continue;
         }
-        UbPostPath candidate_path{local_id, pending.target_id, remote_id,
+        UbPostPath candidate_path{rail.local_id, pending.target_id,
+                                  rail.remote_id,
                                   candidate_endpoint->generation()};
-        if (!rail_monitor_->available(candidate_path)) continue;
-        endpoint = std::move(candidate_endpoint);
-        path = candidate_path;
-        return Status::OK();
+        // Re-read rail state under the real generation: the rail may only have
+        // been created by the resolution above.
+        const auto rail_stats = rail_monitor_->stats(candidate_path);
+        if (rail_stats.paused) continue;
+        const auto capacity =
+            quota_->availability(candidate_path, pending.slice->spec().length);
+        const uint64_t endpoint_wrs = candidate_endpoint->outstandingWrs();
+        const uint64_t endpoint_bytes = candidate_endpoint->outstandingBytes();
+        candidates.push_back(
+            Candidate{std::move(candidate_endpoint), candidate_path,
+                      UbPathSelectionScore{
+                          capacity.can_acquire, rail.topology_rank,
+                          capacity.normalized_inflight,
+                          capacity.normalized_outstanding_wrs, endpoint_wrs,
+                          endpoint_bytes,
+                          rail_stats.ewma_bandwidth_bytes_per_second >= 0.0,
+                          rail_stats.ewma_bandwidth_bytes_per_second,
+                          rail.retry_order, rail.local_id, rail.remote_id}});
     }
-    return first_error;
+    if (candidates.empty()) {
+        if (first_error.IsTooManyRequests()) {
+            // Endpoint-cache/handshake pressure is different from live path
+            // quota pressure below. Consume the slice's bounded retry budget
+            // so a persistently quarantined native endpoint can eventually
+            // fail this transport and let TENT select a fallback instead of
+            // remaining in deferPending forever.
+            return Status::InternalError(
+                "UB endpoint resolution remained unavailable: " +
+                first_error.ToString());
+        }
+        return first_error;
+    }
+
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const Candidate& lhs, const Candidate& rhs) {
+                         return betterUbPathScore(lhs.score, rhs.score);
+                     });
+    std::vector<UbPostPath> ordered_paths;
+    ordered_paths.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        ordered_paths.push_back(candidate.path);
+    }
+
+    auto acquired =
+        quota_->tryAcquireFirst(ordered_paths, pending.slice->spec().length);
+    if (!acquired) {
+        return Status::TooManyRequests(
+            "Every ready UB posting path is at quota" LOC_MARK);
+    }
+    const auto selected = std::find_if(
+        candidates.begin(), candidates.end(), [&](const Candidate& candidate) {
+            return candidate.path == acquired->path;
+        });
+    if (selected == candidates.end()) {
+        (void)quota_->release(*acquired);
+        return Status::InternalError(
+            "UB quota selected an unknown posting path" LOC_MARK);
+    }
+    endpoint = selected->endpoint;
+    path = selected->path;
+    reservation = *acquired;
+    return Status::OK();
 }
 
 void UbWorkers::processPending(const PendingSlice& pending,
@@ -610,8 +874,14 @@ void UbWorkers::processPending(const PendingSlice& pending,
 
     std::shared_ptr<UbEndpoint> endpoint;
     UbPostPath path;
-    status = chooseAndResolveEndpoint(pending, route, endpoint, path);
+    QuotaReservation reservation;
+    status =
+        chooseAndResolveEndpoint(pending, route, endpoint, path, reservation);
     if (!status.ok()) {
+        if (status.IsTooManyRequests()) {
+            deferPending(pending);
+            return;
+        }
         const auto resolution = pending.slice->resolveBeforePost(
             FAILED, 0, retryableStatus(status));
         if (resolution == UbAttemptResolution::kRetryScheduled) {
@@ -625,6 +895,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
         reinterpret_cast<uint64_t>(pending.slice->spec().local_address),
         pending.slice->spec().length, path.local_topology_id, local);
     if (!status.ok()) {
+        (void)quota_->release(reservation);
         (void)pending.slice->resolveBeforePost(FAILED, 0, false);
         return;
     }
@@ -635,6 +906,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
                                     pending.slice->spec().remote_address,
                                     pending.slice->spec().length, remote);
     if (!status.ok()) {
+        (void)quota_->release(reservation);
         const bool retryable = status.IsNeedsRefreshCache();
         if (retryable && pending.target_id != LOCAL_SEGMENT_ID) {
             (void)segment_manager_->invalidateRemote(pending.target_id);
@@ -647,13 +919,8 @@ void UbWorkers::processPending(const PendingSlice& pending,
         return;
     }
 
-    auto reservation = quota_->tryAcquire(path, pending.slice->spec().length);
-    if (!reservation) {
-        deferPending(pending);
-        return;
-    }
     if (!endpoint->tryAcquireOutstanding(pending.slice->spec().length)) {
-        (void)quota_->release(*reservation);
+        (void)quota_->release(reservation);
         deferPending(pending);
         return;
     }
@@ -661,7 +928,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     auto attempt = pending.slice->beginAttempt(path);
     if (!attempt) {
         endpoint->releaseOutstanding(pending.slice->spec().length);
-        (void)quota_->release(*reservation);
+        (void)quota_->release(reservation);
         return;
     }
 
@@ -674,7 +941,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
     inflight->endpoint = endpoint;
     inflight->local_segment = local.segment;
     inflight->remote_segment = remote.segment;
-    inflight->quota = *reservation;
+    inflight->quota = reservation;
     inflight->posted_ns = steadyNowNs();
     inflight->deadline_ns = deadlineAfter(
         inflight->posted_ns,
@@ -682,7 +949,7 @@ void UbWorkers::processPending(const PendingSlice& pending,
 
     if (!pending.slice->tryCommitPost(*attempt, inflight->posted_ns)) {
         endpoint->releaseOutstanding(pending.slice->spec().length);
-        (void)quota_->release(*reservation);
+        (void)quota_->release(reservation);
         return;
     }
     {
@@ -736,6 +1003,41 @@ void UbWorkers::processPending(const PendingSlice& pending,
     }
 }
 
+void UbWorkers::handleLocalDeviceFailure(const UbContextPtr& context) {
+    if (!context) return;
+    const bool newly_failed = context->markUnavailable();
+    if (!newly_failed) return;
+
+    if (!local_device_failure_handler_) {
+        LOG(WARNING) << "UB device " << context->deviceInfo().topology_name
+                     << " has no endpoint cleanup handler; automatic "
+                        "reactivation is disabled";
+        return;
+    }
+    progressLocalDeviceFailure(context);
+}
+
+void UbWorkers::progressLocalDeviceFailure(const UbContextPtr& context) {
+    if (!context || context->state() != UbContext::State::kFailed ||
+        !local_device_failure_handler_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(local_device_failure_mutex_);
+    if (context->state() != UbContext::State::kFailed) return;
+
+    auto status = local_device_failure_handler_(context->topologyId());
+    if (status.ok()) {
+        // EndpointStore reports success only after every old endpoint has
+        // reached Destroyed. This is the native-resource barrier required
+        // before JFC health can reactivate the context.
+        context->completeFailureCleanup();
+        return;
+    }
+    LOG_EVERY_N(WARNING, 100)
+        << "UB endpoint retirement after local device failure is pending: "
+        << status.ToString();
+}
+
 void UbWorkers::handleCompletion(const Completion& completion) {
     std::shared_ptr<Inflight> inflight;
     {
@@ -776,7 +1078,7 @@ void UbWorkers::handleCompletion(const Completion& completion) {
             break;
         case CompletionCategory::LOCAL_DEVICE_ERROR:
             if (inflight->endpoint && inflight->endpoint->context()) {
-                (void)inflight->endpoint->context()->markUnavailable();
+                handleLocalDeviceFailure(inflight->endpoint->context());
             }
             rail_monitor_->recordError(inflight->path, now);
             if (endpoint_retirer_) endpoint_retirer_(inflight->endpoint);

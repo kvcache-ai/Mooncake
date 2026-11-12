@@ -639,8 +639,8 @@ void PackCacheHitResult(MsgpackPacker& packer,
     for (const auto& [rank, match] : result.rank_matches) {
         packer.pack(std::to_string(rank));
         packer.pack_map(4);
-        packer.pack("npu");
-        packer.pack(match.npu);
+        packer.pack("device");
+        packer.pack(match.device);
         packer.pack("cpu_local");
         packer.pack(match.cpu_local);
         packer.pack("cpu_share");
@@ -648,8 +648,8 @@ void PackCacheHitResult(MsgpackPacker& packer,
         packer.pack("disk");
         packer.pack(match.disk);
     }
-    packer.pack("npu");
-    packer.pack(result.npu);
+    packer.pack("device");
+    packer.pack(result.device);
     packer.pack("cpu_local");
     packer.pack(result.cpu_local);
     packer.pack("cpu_share");
@@ -718,8 +718,10 @@ std::string MakeServiceKey(const std::string& instance_id,
 }
 
 EventManager::EventManager(std::vector<common::ServiceConfig> services,
-                           int http_server_port, int rpc_server_port)
-    : services_(std::move(services)),
+                           int http_server_port, int rpc_server_port,
+                           size_t max_blocks_per_context)
+    : indexer_(max_blocks_per_context),
+      services_(std::move(services)),
       http_server_port_(http_server_port),
       rpc_server_port_(rpc_server_port),
       service_(std::make_unique<ConductorService>(*this)) {}

@@ -26,10 +26,15 @@ TEST(WireTypesTest, QueryRequestRoundtrip) {
 TEST(WireTypesTest, QueryResultRoundtrip) {
     QueryResult result;
     prefixindex::CacheHitResult hit;
-    hit.longest_match_tokens = 42;
-    hit.dp = {{0, 10}, {1, 20}};
-    hit.npu = 5;
-    hit.cpu_share = 7;
+    hit.longest_match_tokens = 80;
+    hit.dp = {{0, 16}, {12, 32}};
+    hit.rank_matches = {
+        {0, {.device = 16, .cpu_local = 32, .cpu_share = 48, .disk = 64}},
+        {12, {.device = 32, .cpu_local = 48, .cpu_share = 64, .disk = 80}}};
+    hit.device = 32;
+    hit.cpu_local = 48;
+    hit.cpu_share = 64;
+    hit.disk = 80;
     result.instances.emplace("inst-1", hit);
     ExpectRoundtrip(result);
 }

@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -191,6 +193,17 @@ class FakeCudaDriver {
         api.mem_export_to_shareable_handle =
             [](void*, CUmemGenericAllocationHandle, CUmemAllocationHandleType,
                unsigned long long) { return CUDA_SUCCESS; };
+        api.device_primary_ctx_retain = [this](CUcontext* context,
+                                               CUdevice device) {
+            retained_devices.push_back(device);
+            *context =
+                reinterpret_cast<CUcontext>(static_cast<uintptr_t>(device) + 1);
+            return CUDA_SUCCESS;
+        };
+        api.device_primary_ctx_release = [this](CUdevice device) {
+            ++released_devices[device];
+            return CUDA_SUCCESS;
+        };
         return api;
     }
 
@@ -212,6 +225,8 @@ class FakeCudaDriver {
     int address_free_calls = 0;
     int release_calls = 0;
     size_t created_size = 0;
+    std::vector<CUdevice> retained_devices;
+    std::map<CUdevice, int> released_devices;
     size_t reserved_alignment = 0;
     CUmemAllocationProp last_prop = {};
     std::vector<CUmemAccessDesc> accesses;
@@ -228,6 +243,22 @@ TEST(NvlinkHostNumaAllocationTest, DiscoversSortedGpuLocalNodes) {
     driver.fabric_supported = 0;
     EXPECT_TRUE(NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes)
                     .IsNotSupportedTransport());
+    EXPECT_TRUE(nodes.empty());
+}
+
+TEST(NvlinkHostNumaAllocationTest, NvlinkIpcZeroKeepsFabricAllocations) {
+    FakeCudaDriver driver;
+    std::vector<int> nodes;
+    setenv("MC_USE_NVLINK_IPC", "0", 1);
+    auto zero = NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes);
+    unsetenv("MC_USE_NVLINK_IPC");
+    ASSERT_TRUE(zero.ok());
+    EXPECT_EQ(nodes, (std::vector<int>{0, 2}));
+
+    setenv("MC_USE_NVLINK_IPC", "1", 1);
+    auto one = NvlinkHostNumaAllocationTestPeer::Discover(driver.api(), nodes);
+    unsetenv("MC_USE_NVLINK_IPC");
+    EXPECT_TRUE(one.IsNotSupportedTransport());
     EXPECT_TRUE(nodes.empty());
 }
 
@@ -263,6 +294,34 @@ TEST(NvlinkHostNumaAllocationTest, AlignsAndGrantsCpuAndGpuAccess) {
     EXPECT_EQ(driver.handles, 0);
     EXPECT_EQ(driver.reservations, 0);
     EXPECT_EQ(driver.mappings, 0);
+}
+
+TEST(NvlinkHostNumaAllocationTest, KeepsAContextOnTheNodesOwnSocket) {
+    FakeCudaDriver driver;
+    std::unique_ptr<NvlinkHostNumaAllocation> allocation;
+    ASSERT_TRUE(NvlinkHostNumaAllocationTestPeer::Create(
+                    0, 64 * 1024, 0, driver.api(), allocation)
+                    .ok());
+    EXPECT_EQ(driver.retained_devices, (std::vector<CUdevice>{1}));
+    EXPECT_TRUE(driver.released_devices.empty());
+    EXPECT_TRUE(allocation->Release().ok());
+    EXPECT_EQ(driver.released_devices[1], 1);
+
+    allocation.reset();
+    ASSERT_TRUE(NvlinkHostNumaAllocationTestPeer::Create(
+                    2, 64 * 1024, 0, driver.api(), allocation)
+                    .ok());
+    EXPECT_EQ(driver.retained_devices, (std::vector<CUdevice>{1, 0}));
+    EXPECT_TRUE(allocation->Release().ok());
+    EXPECT_EQ(driver.released_devices[0], 1);
+
+    allocation.reset();
+    ASSERT_TRUE(NvlinkHostNumaAllocationTestPeer::Create(
+                    5, 64 * 1024, 0, driver.api(), allocation)
+                    .ok());
+    EXPECT_EQ(driver.retained_devices, (std::vector<CUdevice>{1, 0}));
+    EXPECT_TRUE(allocation->Release().ok());
+    EXPECT_EQ(driver.released_devices.size(), 2U);
 }
 
 TEST(NvlinkHostNumaAllocationTest,

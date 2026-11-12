@@ -20,6 +20,10 @@
 
 #define LOCATION_LEN 32
 
+// The plugin handled the operation and failed. Stop dispatch without falling
+// back to host memory handling.
+#define TENT_DEVICE_PLUGIN_ERROR (-3)
+
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus

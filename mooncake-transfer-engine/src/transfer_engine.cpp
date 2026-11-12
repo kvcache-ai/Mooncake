@@ -139,7 +139,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
-    (void)protocol;
+    impl_->applyProtocolHint(protocol);
     return init(metadata_conn_string, local_server_name, ip_or_host_name,
                 rpc_port);
 }
@@ -298,6 +298,16 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     return impl_->getTransferStatus(batch_id, task_id, status);
 }
 
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
+}
+
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     return impl_->getBatchTransferStatus(batch_id, status);
@@ -392,7 +402,7 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
 #include "topology.h"
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_MEMFABRIC)
 #include "config.h"
 #endif
 
@@ -672,6 +682,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
     if (!use_tent_) {
+        impl_->applyProtocolHint(protocol);
         const int result = impl_->init(metadata_conn_string, local_server_name,
                                        ip_or_host_name, rpc_port);
         if (result == 0) metadata_conn_string_ = metadata_conn_string;
@@ -698,6 +709,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                 config->set("transports/ascend_direct/fabric_mem", true);
             }
         }
+#endif
+#ifdef USE_MEMFABRIC
+        config->set("transports/memfabric/store_te_init",
+                    globalConfig().ascend_store_te_init);
 #endif
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         if (!impl_tent_->available()) return ERR_CONTEXT;
@@ -1017,7 +1032,8 @@ int TransferEngine::sendNotifyByName(std::string remote_agent,
         auto status = impl_tent_->openSegment(handle, remote_agent);
         if (!status.ok()) return tentToClassicError(status.code());
         status = impl_tent_->sendNotification(handle, notifi);
-        impl_tent_->closeSegment(handle);
+        // openSegment may return a handle already held by a transfer caller.
+        // Keep the cached mapping until that caller closes it explicitly.
         return tentToClassicError(status.code());
     } else
         return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
@@ -1047,6 +1063,32 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         return impl_->getTransferStatus(batch_id, task_id, status);
     }
+}
+
+template <typename Output>
+static Status unsupportedTaskCongestionQuery(BatchID batch_id, Output& output,
+                                             const Output& reset) {
+    output = reset;
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("Invalid Batch ID");
+    return Status::NotImplemented(
+        "Task congestion queries are not supported by the TENT backend");
+}
+
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    if (use_tent_)
+        return unsupportedTaskCongestionQuery(batch_id, state,
+                                              TaskCongestionState::kUnknown);
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    if (use_tent_)
+        return unsupportedTaskCongestionQuery(batch_id, detail,
+                                              TaskCongestionDetail{});
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
 }
 
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,

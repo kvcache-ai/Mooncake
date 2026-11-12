@@ -21,7 +21,10 @@
 #include <string>
 #include <glog/logging.h>
 
-using mooncake::tent::getCudaDeviceForPtr;
+using mooncake::tent::cudaDriverInitResult;
+using mooncake::tent::CudaMemoryKind;
+using mooncake::tent::CudaPointerInfo;
+using mooncake::tent::getCudaPointerInfo;
 
 struct cuda_plugin_ctx_t {
     // reserved
@@ -32,7 +35,7 @@ struct cuda_plugin_ctx_t {
         auto err = call;                                                       \
         if (err != cudaSuccess) {                                              \
             LOG(ERROR) << std::string(#call) + ": " + cudaGetErrorString(err); \
-            return -1;                                                         \
+            return TENT_DEVICE_PLUGIN_ERROR;                                   \
         }                                                                      \
     } while (0)
 
@@ -89,31 +92,90 @@ static int cuda_alloc(void* ctx_, void** pptr, size_t size, const char* loc) {
 static int cuda_free(void* ctx_, void* ptr, size_t size) {
     (void)ctx_;
     (void)size;
-    if (getCudaDeviceForPtr(ptr) < 0) return -2;
+    CudaPointerInfo info;
+    const CUresult result = getCudaPointerInfo(ptr, info);
+    if (result == CUDA_ERROR_NO_DEVICE &&
+        cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE)
+        return -2;
+    if (result != CUDA_SUCCESS) return TENT_DEVICE_PLUGIN_ERROR;
+    if (!info.isCuda()) return -2;
     CHECK_CUDA(cudaFree(ptr));
     return 0;
 }
 
 static int cuda_memcpy_sync(void* ctx_, void* dst, void* src, size_t length) {
     (void)ctx_;
-    // Pin the owning device so the runtime does not default to GPU 0.
-    int dev = getCudaDeviceForPtr(src);
-    if (dev < 0) dev = getCudaDeviceForPtr(dst);
-    if (dev < 0) return -1;  // host-to-host; let the caller fall back
-    CHECK_CUDA(cudaSetDevice(dev));
-    CHECK_CUDA(cudaMemcpy(dst, src, length, cudaMemcpyDefault));
-    return 0;
+    CudaPointerInfo src_info, dst_info;
+    const CUresult src_result = getCudaPointerInfo(src, src_info);
+    const CUresult dst_result = getCudaPointerInfo(dst, dst_info);
+    if (src_result == CUDA_ERROR_NO_DEVICE &&
+        dst_result == CUDA_ERROR_NO_DEVICE &&
+        cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE)
+        return -1;
+    if (src_result != CUDA_SUCCESS || dst_result != CUDA_SUCCESS)
+        return TENT_DEVICE_PLUGIN_ERROR;
+    if (!src_info.isCuda() && !dst_info.isCuda()) return -1;
+    // Use the buffer's owning device so the runtime does not default to GPU 0.
+    int dev = src_info.isCuda() ? src_info.device : dst_info.device;
+
+    // Restore the exact caller state, as CudaPlatform::copy() does. An ordinal
+    // cannot distinguish a custom context from its device's primary context,
+    // and a caller that started without a context must remain without one.
+    CUcontext caller_ctx = nullptr;
+    CUresult ctx_result = cuCtxGetCurrent(&caller_ctx);
+    if (ctx_result != CUDA_SUCCESS) {
+        LOG(ERROR) << "CUDA plugin cuCtxGetCurrent: " << ctx_result;
+        return TENT_DEVICE_PLUGIN_ERROR;
+    }
+    int caller_device = -1;
+    // Bare cudaGetDevice() may initialize GPU 0; only query an existing
+    // binding.
+    if (caller_ctx != nullptr && cudaGetDevice(&caller_device) != cudaSuccess) {
+        LOG(ERROR) << "CUDA plugin cudaGetDevice failed before copying";
+        return TENT_DEVICE_PLUGIN_ERROR;
+    }
+
+    cudaError_t err = cudaSetDevice(dev);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(dst, src, length, cudaMemcpyDefault);
+    int result = err == cudaSuccess ? 0 : TENT_DEVICE_PLUGIN_ERROR;
+    if (err != cudaSuccess)
+        LOG(ERROR) << "CUDA plugin copy: " << cudaGetErrorString(err);
+
+    // Do not return early after switching: both restore steps must be attempted
+    // even if the copy or restoring the runtime binding failed.
+    if (caller_device != -1 && caller_device != dev) {
+        err = cudaSetDevice(caller_device);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "CUDA plugin cudaSetDevice(restore): "
+                       << cudaGetErrorString(err);
+            result = TENT_DEVICE_PLUGIN_ERROR;
+        }
+    }
+    ctx_result = cuCtxSetCurrent(caller_ctx);
+    if (ctx_result != CUDA_SUCCESS) {
+        LOG(ERROR) << "CUDA plugin cuCtxSetCurrent(restore): " << ctx_result;
+        result = TENT_DEVICE_PLUGIN_ERROR;
+    }
+    return result;
 }
 
 static int cuda_query_location(void* ctx_, void* addr, size_t size,
                                location_t* buf, size_t buf_count) {
     (void)ctx_;
     if (buf_count == 0) return -1;
-    int dev = getCudaDeviceForPtr(addr);
-    if (dev < 0) return 0;
+    CudaPointerInfo info;
+    const CUresult result = getCudaPointerInfo(addr, info);
+    if (result == CUDA_ERROR_NO_DEVICE &&
+        cudaDriverInitResult() == CUDA_ERROR_NO_DEVICE)
+        return 0;
+    if (result != CUDA_SUCCESS) return TENT_DEVICE_PLUGIN_ERROR;
+    // Keep managed memory out of GPUDirect RDMA routing.
+    if (info.kind == CudaMemoryKind::Managed) return TENT_DEVICE_PLUGIN_ERROR;
+    if (!info.isCuda()) return 0;
     buf[0].start = addr;
     buf[0].length = size;
-    snprintf(buf[0].location, LOCATION_LEN, "cuda:%d", dev);
+    snprintf(buf[0].location, LOCATION_LEN, "cuda:%d", info.device);
     return 1;
 }
 

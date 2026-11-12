@@ -1261,6 +1261,10 @@ class ReusingWriteServer {
     bool ok() const { return ok_; }
     uint16_t port() const { return port_; }
     int acceptedCount() const { return accepted_count_.load(); }
+    void closeClientConnections() {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        for (int fd : accepted_fds_) (void)shutdown(fd, SHUT_RDWR);
+    }
     int activeAcceptedCount() const {
         std::lock_guard<std::mutex> lock(connection_mutex_);
         return static_cast<int>(accepted_fds_.size());
@@ -1387,9 +1391,9 @@ class ReusingWriteServer {
             std::lock_guard<std::mutex> lock(connection_mutex_);
             auto it = std::find(accepted_fds_.begin(), accepted_fds_.end(), fd);
             if (it != accepted_fds_.end()) accepted_fds_.erase(it);
+            close(fd);
         }
         connection_cv_.notify_all();
-        close(fd);
     }
 
     void stop() {
@@ -3986,7 +3990,10 @@ TEST(TcpWriteVisibilityTest,
     EXPECT_EQ(final_status, TransferStatusEnum::FAILED);
     expectEverySliceCompletedExactlyOnce(batch_id);
     EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
-    ASSERT_TRUE(h.engine->freeBatchID(batch_id).ok());
+    // The terminal io callback may still hold its BatchDesc pin; a deferred
+    // cleanup is a legal outcome here.
+    Status free_status = h.engine->freeBatchID(batch_id);
+    ASSERT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     fake_peer.release();
 }
 
@@ -4025,7 +4032,10 @@ TEST(TcpWriteVisibilityTest, WritePayloadNoProgressFailsWithinBoundedDeadline) {
     if (waitForTaskTerminal(h.engine.get(), batch_id,
                             std::chrono::seconds(5))) {
         expectEverySliceCompletedExactlyOnce(batch_id);
-        EXPECT_TRUE(h.engine->freeBatchID(batch_id).ok());
+        // The terminal io callback may still hold its BatchDesc pin; a
+        // deferred cleanup is a legal outcome here.
+        Status free_status = h.engine->freeBatchID(batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     } else {
         h.engine.reset();
         reclaimBatchDescAfterEngineShutdownForTest(batch_id);
@@ -4071,7 +4081,10 @@ TEST(TcpWriteVisibilityTest,
     if (waitForTaskTerminal(h.engine.get(), batch_id,
                             std::chrono::seconds(5))) {
         expectEverySliceCompletedExactlyOnce(batch_id);
-        EXPECT_TRUE(h.engine->freeBatchID(batch_id).ok());
+        // The terminal io callback may still hold its BatchDesc pin; a
+        // deferred cleanup is a legal outcome here.
+        Status free_status = h.engine->freeBatchID(batch_id);
+        EXPECT_TRUE(free_status.ok() || free_status.IsBatchCleanupDeferred());
     } else {
         h.engine.reset();
         reclaimBatchDescAfterEngineShutdownForTest(batch_id);
@@ -4147,6 +4160,33 @@ TEST(TcpWriteVisibilityTest, EndpointRefreshRoutesNewWorkToNewTcpEndpoint) {
     EXPECT_EQ(endpoint_a.acceptedCount(), 1)
         << "endpoint visibility is a separate observation from old-group "
            "retirement";
+}
+
+TEST(TcpWriteVisibilityTest, ReconnectsWhenPeerClosesIdlePooledSocket) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    LocalHttpMetadataServer metadata_server;
+    ReusingWriteServer endpoint;
+    ASSERT_TRUE(metadata_server.ok());
+    ASSERT_TRUE(endpoint.ok());
+
+    const std::string logical_peer = "127.0.0.2:18061";
+    EngineHandle target;
+    target.init(metadata_server.uri(), logical_peer, 64 * 1024);
+    ASSERT_TRUE(target.ok);
+    EngineHandle h;
+    h.init(metadata_server.uri(), "127.0.0.2:18161", 64 * 1024, logical_peer);
+    ASSERT_TRUE(h.ok);
+    ASSERT_EQ(publishAndRefreshTcpEndpoint(h, endpoint.port()), logical_peer);
+    ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(endpoint.waitForRequests(1, std::chrono::seconds(5)));
+    endpoint.closeClientConnections();
+    ASSERT_TRUE(endpoint.waitForNoActiveConnections(std::chrono::seconds(5)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    EXPECT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
+              TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(endpoint.acceptedCount(), 2);
 }
 
 TEST(TcpWriteVisibilityTest,

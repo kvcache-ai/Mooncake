@@ -204,7 +204,7 @@
     "remove_first_block_hex": "93cb40690000000000009183a474797065ac426c6f636b52656d6f766564ac626c6f636b5f68617368657391d3f67c5ff154ee4961a66d656469756da347505500",
     "clear_all_hex": "93cb40692000000000009181a474797065b0416c6c426c6f636b73436c656172656400",
     "expected_cumulative_tokens": {
-      "npu": 4,
+      "device": 4,
       "cpu_local": 8,
       "disk": 12,
       "cpu_share": 8
