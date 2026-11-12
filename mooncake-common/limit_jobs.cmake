@@ -1,7 +1,10 @@
 # Limit compile/link parallelism by memory and CPU; cap hosted runners at 3.
 # Overrides: PARALLEL_COMPILE_JOBS, PARALLEL_LINK_JOBS,
 # MAX_COMPILER_MEMORY_MB (1500), MAX_LINKER_MEMORY_MB (4000).
-# TODO(MAIN-001.1): Deduplicate the upstream build-parallelism implementation.
+# TODO(F02-T006, replace-in=UPG2-F01-public-build): Reconcile this implementation
+# with fixed U during UPG2 public-build merge review, before UPG2 reception.
+# receiver=UPG2-F01-public-build; retain required limits and verify consumers.
+# Source: F02-B05 audit, Codex, 2026-11-12; replaces legacy MAIN-001.1.
 
 set(MAX_COMPILER_MEMORY_MB "1500" CACHE STRING
     "Estimated peak memory per compile job in MB")

@@ -27,6 +27,8 @@ set(EXTRA_LIBS "")
 
 if(USE_3FS)
   # TODO(F10-S38-T001, replace-in=UPG1-F10-S38): Reconcile this client-side
+  # Source: UPG1-F01-2.1; tracking clarified by F02-B05/Codex, 2026-11-12.
+  # Due: UPG1-F10-S38 implementation/merge review, before task acceptance.
   # ThreeFSFile wiring with U's shared HF3FS resource manager and DFS adapter
   # when the approved descriptor-based DFS consumers are implemented.
   # Owner: F10-S38. Keep USE_3FS source/header/library conditions aligned;
@@ -220,6 +222,8 @@ target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 
 # TODO(F01-T070, replace-in=UPG2-F01-public-build): Export common headers through
+# Source: UPG1-F01-2.2; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG2-F01-public-build implementation/merge review, before task acceptance.
 # mooncake_common's PUBLIC include interface as in U. Owner: UPG2 public build.
 # Remove this temporary include block and marker after that interface is adopted.
 target_include_directories(mooncake_store_client_objects
@@ -230,6 +234,8 @@ target_include_directories(mooncake_master
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-common/include)
 
 # TODO(F01-T071, replace-in=UPG2-F01-public-build): Export TE headers through
+# Source: UPG1-F01-2.2; tracking clarified by F02-B05/Codex, 2026-11-12.
+# Due: UPG2-F01-public-build implementation/merge review, before task acceptance.
 # transfer_engine's PUBLIC include interface as in U. Owner: UPG2 public build.
 # Remove this temporary include block and marker after that interface is adopted.
 target_include_directories(mooncake_store_client_objects

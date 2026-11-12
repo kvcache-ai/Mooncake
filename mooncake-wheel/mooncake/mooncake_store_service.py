@@ -126,6 +126,13 @@ class MooncakeStoreService:
                 if self.is_p2p:
                     ret = self.store.setup_p2p_real_client(self.config)
                 else:
+                    # TODO-REF(F02-T001, receiver=UPG1-F10-S31): Wire SSD fields
+                    # with native setup before S31 implementation review.
+                    # TODO-REF(F02-T002, receiver=UPG1-F05-S44): Wire tenant_id
+                    # with tenant isolation before S44 implementation review.
+                    # TODO-REF(F02-T003, receiver=UPG1-F14-S49): Wire client HTTP
+                    # fields with the listener before S49 implementation review.
+                    # Source: F02-B05 block 3, Codex, 2026-11-12; not U code.
                     ret = self.store.setup(
                         self.config.local_hostname,
                         self.config.metadata_server,

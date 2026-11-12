@@ -502,7 +502,11 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(
 
 std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
     const std::string& key, const std::optional<ReadConfig>& config) {
-    // TODO: Make the returned SHM data lifetime safe for Dummy consumption.
+    // TODO(F02-T010, replace-in=UPG1-F07-S11): receiver=UPG1-F07-S11 must
+    // resolve this SHM borrowing lifetime during S11 analysis/implementation,
+    // before S11 review and acceptance; verify release/reuse/close or an
+    // explicitly approved unsupported path. Source: F02-B05 audit, Codex,
+    // 2026-11-12. No lifetime fix is implied by this tracking comment.
     // Real returns only an address and size and releases the allocation before
     // the RPC reply is consumed. It cannot tell when Dummy finishes reading,
     // so another allocation can overwrite the data.

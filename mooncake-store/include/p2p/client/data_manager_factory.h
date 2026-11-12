@@ -83,7 +83,9 @@ struct DataManagerConfig {
     // registering against one dereferences an absent transport.
     bool register_tiers_with_transfer_engine = true;
 
-    // TODO(phase-2): std::optional<DataManagerV2Config> v2;
+    // V2 configuration is parsed from tier_config by CreateV2 through
+    // ParseDataManagerV2Config; a separate optional V2 field is not required.
+    // Legacy phase-2 note reconciled in F02-B05 audit (Codex, 2026-11-12).
 };
 
 /**

@@ -1,6 +1,10 @@
 name: 'Integration test (Linux)'
 
-# TODO: Adapt SGLang's embedded API and integration tests to P2P.
+# TODO(F02-T008, replace-in=UPG1-F22-B04): receiver=UPG1-F21-B08 must freeze
+# the SGLang API/version and decide P2P scope during B08 analysis, then deliver
+# the approved integration. receiver=UPG1-F22-B04 wires this workflow after
+# provider reception and verifies coverage before B04 CI acceptance.
+# Source: F02-B05 audit, Codex, 2026-11-12; no automatic P2P enablement.
 on:
   push:
     branches: [ "main" ]
