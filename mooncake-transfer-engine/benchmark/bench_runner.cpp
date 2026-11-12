@@ -125,6 +125,8 @@ uint64_t BenchRunner::getTargetSegmentId(int thread_id) const {
 std::optional<uint64_t> BenchRunner::slotAddress(uint64_t base, uint64_t length,
                                                  uint64_t bytes,
                                                  uint64_t slot) {
+    // An empty region is always valid and always starts at base.
+    if (bytes == 0) return base;
     const uint64_t offset = checkedMul(bytes, slot, "buffer slot offset");
     if (!rangeContains(offset, bytes, length)) return std::nullopt;
     return checkedAdd(base, offset, "buffer slot address");
