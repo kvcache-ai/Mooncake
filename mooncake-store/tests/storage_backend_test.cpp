@@ -583,6 +583,7 @@ TEST_P(BucketScanBatchingTest, RecoveryUsesBoundedBatches) {
             return ErrorCode::OK;
         });
     ASSERT_TRUE(result.has_value()) << result.error();
+    // Batching must preserve every key and its original storage coordinates.
     ASSERT_EQ(scanned.size(), expected.size());
     for (const auto& [key, metadata] : expected) {
         ASSERT_TRUE(scanned.contains(key));
@@ -595,6 +596,7 @@ TEST_P(BucketScanBatchingTest, RecoveryUsesBoundedBatches) {
     EXPECT_EQ(CountDataFiles(data_path), file_count);
 }
 
+// Exercise smaller, exact-bucket, and cross-bucket batch limits.
 INSTANTIATE_TEST_SUITE_P(ScanLimits, BucketScanBatchingTest,
                          ::testing::Values(1, 4, 10, 25));
 
@@ -611,6 +613,7 @@ TEST_F(StorageBackendTest, BucketScanRetriesFailedBatchWithoutSkippingKeys) {
     std::unordered_map<std::string, std::string> data;
     ASSERT_TRUE(BatchOffloadUtil(backend, keys, sizes, data, buckets));
 
+    // Accept one batch, then reject the next batch within the same bucket.
     std::vector<std::string> accepted;
     std::vector<std::string> rejected;
     auto result =
@@ -628,6 +631,7 @@ TEST_F(StorageBackendTest, BucketScanRetriesFailedBatchWithoutSkippingKeys) {
     ASSERT_EQ(result.error(), ErrorCode::RPC_FAIL);
     ASSERT_FALSE(rejected.empty());
 
+    // A caller retry must start with the rejected batch, not skip past it.
     bool first_retry = true;
     result = backend.ScanMeta([&](const std::vector<std::string>& batch_keys,
                                   std::vector<StorageObjectMetadata>&) {
@@ -639,6 +643,7 @@ TEST_F(StorageBackendTest, BucketScanRetriesFailedBatchWithoutSkippingKeys) {
         return ErrorCode::OK;
     });
     ASSERT_TRUE(result.has_value()) << result.error();
+    // Successful batches across both scans must cover every key exactly once.
     std::sort(accepted.begin(), accepted.end());
     std::sort(keys.begin(), keys.end());
     EXPECT_EQ(accepted, keys);
@@ -4149,8 +4154,8 @@ void RunPinnedScanEvictionScenario(BucketEvictionPolicy policy,
     std::vector<StorageObjectMetadata> scan_metadatas;
     std::vector<int64_t> scan_buckets;
     std::vector<BucketScanPin> pins;
-    auto scan_res = storage_backend.BucketScan({0, 0}, scan_keys, scan_metadatas,
-                                               scan_buckets, 1, &pins);
+    auto scan_res = storage_backend.BucketScan(
+        {0, 0}, scan_keys, scan_metadatas, scan_buckets, 1, &pins);
     ASSERT_TRUE(scan_res.has_value());
     ASSERT_EQ(scan_buckets.size(), 1u);
     ASSERT_EQ(scan_buckets.at(0), bucket_ids.at(0));

@@ -2668,11 +2668,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
 }
 
 tl::expected<BucketStorageBackend::ScanCursor, ErrorCode>
-BucketStorageBackend::BucketScan(
-    ScanCursor cursor, std::vector<std::string>& keys,
-    std::vector<StorageObjectMetadata>& metadatas,
-    std::vector<int64_t>& buckets, int64_t limit,
-    std::vector<BucketScanPin>* pins) {
+BucketStorageBackend::BucketScan(ScanCursor cursor,
+                                 std::vector<std::string>& keys,
+                                 std::vector<StorageObjectMetadata>& metadatas,
+                                 std::vector<int64_t>& buckets, int64_t limit,
+                                 std::vector<BucketScanPin>* pins) {
     if (limit <= 0) {
         LOG(ERROR) << "Bucket scan limit must be positive: " << limit;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
