@@ -566,7 +566,8 @@ double TENTBenchRunner::runSingleTransfer(
             logSplitXfer({block_size, batch_size, splitWarmup(), submit_ns,
                           total_ns - submit_ns, polls});
         }
-        return finish(static_cast<double>(total_ns) / 1000.0);
+        return finish(static_cast<double>(total_ns) /
+                      kNanosecondsPerMicrosecond);
     }
     if (overall_status.s == TransferStatusEnum::PENDING) {
         return finish(-1.0);  // stopped and abandoned

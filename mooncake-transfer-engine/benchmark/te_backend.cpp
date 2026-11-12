@@ -803,7 +803,7 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr, uint64_t target_id,
         }
         auto released = releaseFinishedBatch(*engine_, batch_id);
         if (!released.ok()) return fail("Failed to free batch", released);
-        return static_cast<double>(total_ns) / 1000.0;
+        return static_cast<double>(total_ns) / kNanosecondsPerMicrosecond;
     }
     if (overall_status.s == TransferStatusEnum::PENDING) {
         // Abandoned after a stop; waitForBatch() already counted it.

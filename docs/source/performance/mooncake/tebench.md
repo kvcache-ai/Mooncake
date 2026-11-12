@@ -290,7 +290,7 @@ When set, each completed transfer appends one JSON line:
 | `block_size`, `batch_size` | Shape of the transfer, identifying the sweep point |
 | `warmup` | `true` for transfers in the 1 s warmup before measurement |
 | `submit_us` | Time in `submitTransfer`, in microseconds with ns precision |
-| `wait_us` | Time from submit return until the batch reports COMPLETED |
+| `wait_us` | Time from submit return until the batch reports COMPLETED, in microseconds with ns precision |
 | `polls` | Number of status polls in that wait |
 
 The file is opened once as `std::ofstream` and written with stream buffering.

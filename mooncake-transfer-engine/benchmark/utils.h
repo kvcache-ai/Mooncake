@@ -15,6 +15,8 @@
 #ifndef XFER_UTILS_H
 #define XFER_UTILS_H
 
+#include "split_output.h"
+
 #include <string>
 #include <unordered_map>
 #include <cmath>
@@ -179,7 +181,9 @@ class XferBenchTimer {
         return duration;
     }
 
-    uint64_t lap_us(bool reset = true) { return lap_ns(reset) / 1000; }
+    uint64_t lap_us(bool reset = true) {
+        return lap_ns(reset) / kNanosecondsPerMicrosecond;
+    }
 
    private:
     inline uint64_t getCurrentTimeNs() {

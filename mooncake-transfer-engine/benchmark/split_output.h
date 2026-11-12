@@ -22,6 +22,10 @@
 namespace mooncake {
 namespace tent {
 
+// Nanoseconds per microsecond. Shared by the split log and the timing code so
+// the ns -> us conversion has one definition.
+constexpr uint64_t kNanosecondsPerMicrosecond = 1000;
+
 // Durations are kept in nanoseconds and written as microseconds with three
 // decimals, so the log matches the table's unit without losing precision.
 struct SplitXferSample {

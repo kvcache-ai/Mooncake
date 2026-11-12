@@ -47,8 +47,10 @@ bool formatSplitXferLine(char* buf, size_t cap, const SplitXferSample& sample,
         ",\"warmup\":%s,\"submit_us\":%" PRIu64 ".%03" PRIu64
         ",\"wait_us\":%" PRIu64 ".%03" PRIu64 ",\"polls\":%" PRIu64 "}\n",
         sample.block_size, sample.batch_size, sample.warmup ? "true" : "false",
-        sample.submit_ns / 1000, sample.submit_ns % 1000, sample.wait_ns / 1000,
-        sample.wait_ns % 1000, sample.polls);
+        sample.submit_ns / kNanosecondsPerMicrosecond,
+        sample.submit_ns % kNanosecondsPerMicrosecond,
+        sample.wait_ns / kNanosecondsPerMicrosecond,
+        sample.wait_ns % kNanosecondsPerMicrosecond, sample.polls);
     if (n < 0 || static_cast<size_t>(n) >= cap) return false;
     *written = static_cast<size_t>(n);
     return true;

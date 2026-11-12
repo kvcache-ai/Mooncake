@@ -206,7 +206,7 @@ int processBatchSizes(
 
         XferBenchTimer timer;
         setSplitWarmup(true);
-        while (timer.lap_us(false) < 1000000ull) {
+        while (timer.lap_ns(false) < 1000ull * 1000 * 1000) {  // 1 s
             if (runner.runSingleTransfer(
                     local_addr, target_id, nextTargetAddr(), thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type) < 0) {
