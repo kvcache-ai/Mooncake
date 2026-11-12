@@ -300,6 +300,20 @@ class TransferEngine {
 
     Status freeLocalMemory(void* addr);
 
+    // Map the published GVA region containing [gva, gva + size) on the
+    // caller's current device, at the same numeric address as its owner.
+    // Success is idempotent and makes the region ready for direct kernel
+    // access. NVLINK and MNNVL support CUDA VMM regions; POSIX FD import
+    // uses pidfd_getfd and requires permission to access the exporting process.
+    Status mapRemoteMemory(SegmentID peer, void* gva, size_t size,
+                           TransportType type = UNSPEC);
+
+    // gva must be the published region base. The application synchronizes
+    // kernels and transfers using the region before unmapping it. The owner
+    // unregisters/frees only after all peers have finished using it.
+    Status unmapRemoteMemory(SegmentID peer, void* gva,
+                             TransportType type = UNSPEC);
+
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 

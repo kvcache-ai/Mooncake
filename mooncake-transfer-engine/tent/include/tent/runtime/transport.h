@@ -144,6 +144,18 @@ class Transport {
         return Platform::getLoader().free(addr, size);
     }
 
+    virtual bool supportsGlobalAddressing() const { return false; }
+
+    virtual Status mapRemoteMemory(SegmentID, void*, size_t) {
+        return Status::NotImplemented(
+            "Global address mapping is unavailable" LOC_MARK);
+    }
+
+    virtual Status unmapRemoteMemory(SegmentID, void*) {
+        return Status::NotImplemented(
+            "Global address mapping is unavailable" LOC_MARK);
+    }
+
     // Pre-registration warm-up that pins pages before NUMA probing.
     // Returns true if pages were successfully pinned (caller may skip
     // prefault). Default: no-op, returns false.
