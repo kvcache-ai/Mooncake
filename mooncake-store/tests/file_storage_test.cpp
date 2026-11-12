@@ -896,6 +896,90 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.storage_backend_->Init();
     }
 
+    // Reads values of several sizes back from the offset allocator backend
+    // through FileStorage, whole and in windows, into the staging buffers
+    // FileStorage allocates for them.
+    void RunOffsetBackendLocalReadScenario(bool use_uring) {
+        auto config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+        config.storage_filepath = data_path;
+        config.total_size_limit = 64 * 1024 * 1024;
+        config.local_buffer_size = 128 * 1024 * 1024;
+        config.use_uring = use_uring;
+        FileStorage fileStorage(config, nullptr, "localhost:9003");
+        ASSERT_TRUE(InitStorageBackend(fileStorage));
+
+        // 200 bytes is about what BatchOffloadUtil writes per key, 56960 is
+        // the KV page size reported in issue #5272 and 131072 the default of
+        // storage_backend_bench. The extents of the small values are not
+        // multiples of 4 KiB, so the records after them do not start on a
+        // page boundary.
+        constexpr size_t kSizes[] = {200,  131072, 1000, 56960,
+                                     1500, 11000,  777};
+        constexpr size_t kKeyCount = 28;
+        std::vector<std::string> keys;
+        std::vector<std::string> values;
+        std::vector<int64_t> sizes;
+        for (size_t i = 0; i < kKeyCount; ++i) {
+            std::string value(kSizes[i % std::size(kSizes)], '\0');
+            for (size_t j = 0; j < value.size(); ++j) {
+                value[j] =
+                    static_cast<char>((j * 31 + (j >> 12) + i * 131) & 0xff);
+            }
+            keys.push_back("fs_offset_key_" + std::to_string(i));
+            sizes.push_back(static_cast<int64_t>(value.size()));
+            values.push_back(std::move(value));
+
+            std::unordered_map<std::string, std::vector<Slice>> batch;
+            batch.emplace(keys.back(),
+                          std::vector<Slice>{Slice{values.back().data(),
+                                                   values.back().size()}});
+            auto stored = fileStorage.storage_backend_->BatchOffload(
+                batch, [](const std::vector<std::string>&,
+                          std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                });
+            ASSERT_TRUE(stored.has_value()) << stored.error();
+            ASSERT_EQ(stored.value(), 1);
+        }
+
+        // Both results stay alive, so the second batch gets other staging
+        // buffers than the first.
+        std::vector<FileStorage::LocalBatchResult> alive;
+        for (int pass = 0; pass < 2; ++pass) {
+            auto result = fileStorage.BatchGetLocal(keys, sizes);
+            ASSERT_TRUE(result) << result.error();
+            ASSERT_EQ(result->pointers.size(), keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                EXPECT_EQ(std::memcmp(reinterpret_cast<const char*>(
+                                          result->pointers[i]),
+                                      values[i].data(), values[i].size()),
+                          0)
+                    << "pass " << pass << " key " << keys[i];
+            }
+            alive.push_back(std::move(result.value()));
+        }
+
+        std::vector<int64_t> offsets;
+        std::vector<int64_t> lengths;
+        for (const auto size : sizes) {
+            offsets.push_back(size / 3);
+            lengths.push_back(std::min<int64_t>(size - size / 3, 5000));
+        }
+        auto ranges =
+            fileStorage.BatchGetLocalRanges(keys, offsets, lengths, sizes);
+        ASSERT_TRUE(ranges) << ranges.error();
+        ASSERT_EQ(ranges->pointers.size(), keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            EXPECT_EQ(
+                std::memcmp(reinterpret_cast<const char*>(ranges->pointers[i]),
+                            values[i].data() + offsets[i],
+                            static_cast<size_t>(lengths[i])),
+                0)
+                << "range of key " << keys[i];
+        }
+    }
+
     struct DiskFenceOutcome {
         bool fenced = false;
         int filesystem_checks = 0;
@@ -1490,7 +1574,15 @@ TEST_F(FileStorageTest, UringStagingBufferUnpinnedOnDestruction) {
     }
     EXPECT_LE(PinnedKib(), pinned_before);
 }
+
+TEST_F(FileStorageTest, OffsetBackendLocalReadsWithUring) {
+    RunOffsetBackendLocalReadScenario(/*use_uring=*/true);
+}
 #endif
+
+TEST_F(FileStorageTest, OffsetBackendLocalReads) {
+    RunOffsetBackendLocalReadScenario(/*use_uring=*/false);
+}
 
 TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",

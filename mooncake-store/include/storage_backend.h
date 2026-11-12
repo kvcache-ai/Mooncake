@@ -1414,10 +1414,16 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
      * @param batched_slices A map from object key to a pre-allocated writable
      * buffer (Slice).
      * @return tl::expected<void, ErrorCode> indicating operation status.
+     *
+     * With io_uring (O_DIRECT), a buffer that starts on a 4 KiB boundary
+     * must have room for the value rounded up to 4 KiB and one page more,
+     * as the buffers of FileStorage::AllocateBatch have: whole pages are
+     * read into it and Slice::ptr is moved to the first byte of the value.
      */
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
+    // Same buffer requirement as BatchLoad.
     tl::expected<void, ErrorCode> BatchLoadSpans(
         std::unordered_map<std::string, StorageValueSpan>& spans) override;
 
@@ -1586,7 +1592,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         // Validate key matches expected key
         tl::expected<void, ErrorCode> ValidateKey(
             const std::string& expected_key,
-            const std::string& stored_key) const {
+            std::string_view stored_key) const {
             if (stored_key.size() != key_len) {
                 LOG(ERROR) << "Key length mismatch: expected " << key_len
                            << ", got " << stored_key.size();
@@ -1605,6 +1611,31 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> ReadOffsetValues(
         std::unordered_map<std::string, StorageValueSpan>& spans,
         bool require_exact_size);
+
+    // One value to read: where its record is and where the bytes go.
+    struct ReadPlan;
+
+    // Reads one record with a single read when the value is wanted from its
+    // first byte, and with two otherwise, then checks its header and key.
+    // `head` is scratch space for the header and key.
+    static tl::expected<void, ErrorCode> ReadRecord(const ReadPlan& plan,
+                                                    std::string& head);
+
+    // Checks the header and key at `head`, the first bytes of the record
+    // read from disk, against what the index has for the record.
+    static tl::expected<void, ErrorCode> CheckRecordHead(const ReadPlan& plan,
+                                                         const char* head);
+
+#ifdef USE_URING
+    // Reads the records of `plans`, all in `file`, with page-aligned reads
+    // submitted together, and moves each plan's destination pointer to the
+    // first value byte.
+    static tl::expected<void, ErrorCode> ReadRecordsDirect(
+        UringFile& file, const std::vector<ReadPlan*>& plans);
+#endif
+
+    // Alignment O_DIRECT wants for buffer, length and file offset.
+    static constexpr uint64_t kDirectIoAlignment = 4096;
 
     // Maximum key length accepted by BatchOffload and trusted on recovery.
     // Write-side enforcement (BatchOffload) and recovery-side validation

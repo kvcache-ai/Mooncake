@@ -4501,7 +4501,6 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // O_DIRECT vector I/O rounds writes up to 4 KiB. An unaligned capacity
         // can let an end-of-file write grow the data file past capacity_, after
         // which recovery's exact size check rejects the file.
-        constexpr uint64_t kDirectIoAlignment = 4096;
         if (file_storage_config_.use_uring &&
             (capacity_ % kDirectIoAlignment) != 0) {
             LOG(ERROR)
@@ -6107,13 +6106,254 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     for (const auto& [key, slice] : batched_slices) {
         spans.emplace(key, StorageValueSpan{0, slice.size, slice});
     }
-    return ReadOffsetValues(spans, true);
+    auto loaded = ReadOffsetValues(spans, true);
+    if (!loaded) return loaded;
+    // An O_DIRECT read may have moved the start of a value in its buffer.
+    for (const auto& [key, span] : spans) {
+        batched_slices.at(key).ptr = span.slice.ptr;
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadSpans(
     std::unordered_map<std::string, StorageValueSpan>& spans) {
     return ReadOffsetValues(spans, false);
 }
+
+struct OffsetAllocatorStorageBackend::ReadPlan {
+    std::string key;
+    uint64_t offset;           // where the record starts in the data file
+    uint32_t value_size;       // size of the whole value
+    uint64_t value_offset;     // first value byte wanted
+    AllocationPtr allocation;  // Refcounted handle keeps allocation alive
+    // Where the wanted bytes go. An O_DIRECT read moves ptr to the first of
+    // them.
+    Slice dest_slice;
+    // Pin the data file so a concurrent RemoveAll() rebuild (which rebinds
+    // the data_file_ member) cannot destroy this file while we still have
+    // pending I/O on it in phase 2 (no shard lock held there).
+    std::shared_ptr<StorageFile> data_file;
+};
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::CheckRecordHead(
+    const ReadPlan& plan, const char* head) {
+    const RecordHeader header = RecordHeader::ReadFrom(head);
+    if (!header.ValidateAgainstMetadata(plan.value_size)) {
+        LOG(ERROR) << "Stored value_len mismatch for key: " << plan.key
+                   << ", metadata: " << plan.value_size
+                   << ", header: " << header.value_len;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    // As many key bytes were read as the wanted key has. A record whose key
+    // has another length fails the length check.
+    return header.ValidateKey(
+        plan.key, std::string_view(head + RecordHeader::SIZE, plan.key.size()));
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadRecord(
+    const ReadPlan& plan, std::string& head) {
+    const Slice& dest = plan.dest_slice;
+    const uint64_t value_start = RecordHeader::ValueOffsetInRecord(
+        static_cast<uint32_t>(plan.key.size()));
+
+    if (plan.value_offset == 0) {
+        // Header, key, padding and the wanted value bytes are one range of
+        // the file.
+        head.resize(value_start);
+        const iovec iov[2] = {{head.data(), head.size()},
+                              {dest.ptr, dest.size}};
+        auto read = plan.data_file->vector_read(iov, dest.size > 0 ? 2 : 1,
+                                                plan.offset);
+        if (!read) {
+            LOG(ERROR) << "Failed to read record for key: " << plan.key
+                       << ", error: " << read.error();
+            return tl::make_unexpected(read.error());
+        }
+        if (read.value() != head.size() + dest.size) {
+            LOG(ERROR) << "Record read size mismatch for key: " << plan.key
+                       << ", expected: " << head.size() + dest.size
+                       << ", got: " << read.value();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        return CheckRecordHead(plan, head.data());
+    }
+
+    // A window inside the value: it is not next to the header and key.
+    head.resize(RecordHeader::SIZE + plan.key.size());
+    const iovec head_iov = {head.data(), head.size()};
+    auto head_read = plan.data_file->vector_read(&head_iov, 1, plan.offset);
+    if (!head_read) {
+        LOG(ERROR) << "Failed to read header for key: " << plan.key
+                   << ", error: " << head_read.error();
+        return tl::make_unexpected(head_read.error());
+    }
+    if (head_read.value() != head.size()) {
+        LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    auto checked = CheckRecordHead(plan, head.data());
+    if (!checked) return checked;
+
+    const iovec value_iov = {dest.ptr, dest.size};
+    auto value_read = plan.data_file->vector_read(
+        &value_iov, 1, plan.offset + value_start + plan.value_offset);
+    if (!value_read) {
+        LOG(ERROR) << "Failed to read value for key: " << plan.key
+                   << ", error: " << value_read.error();
+        return tl::make_unexpected(value_read.error());
+    }
+    if (value_read.value() != dest.size) {
+        LOG(ERROR) << "Value read size mismatch for key: " << plan.key
+                   << ", expected: " << dest.size
+                   << ", got: " << value_read.value();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return {};
+}
+
+#ifdef USE_URING
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadRecordsDirect(
+    UringFile& file, const std::vector<ReadPlan*>& plans) {
+    // O_DIRECT wants the buffer, the length and the file offset of a read on
+    // page boundaries, so whole pages are read, straight into the
+    // destination, whose pointer then moves to the first wanted byte. The
+    // destination has room for the value rounded up to pages and one page
+    // more.
+    //
+    // That room takes the whole record, header and key included, when the
+    // record starts on a page boundary and its key is short, the usual
+    // case: one read per record. Otherwise the record is read as two
+    // ranges of pages: the pages its header and key are in, into scratch
+    // memory, and the pages the wanted bytes are in, into the destination.
+    // A record does not always start on a page boundary: the allocator
+    // rounds an extent to its own size classes, which are multiples of
+    // 4 KiB only from 32 KiB up. When the key then ends in the page the
+    // value starts in, that page is read twice, once into each buffer.
+    constexpr uint64_t kPage = kDirectIoAlignment;
+    const auto round_up = [](uint64_t n) {
+        return (n + kPage - 1) / kPage * kPage;
+    };
+
+    struct RecordReads {
+        // One read brings the whole record into the destination.
+        bool whole_record;
+        // The read the header and key are in, and where the record starts
+        // in its buffer.
+        size_t head_read;
+        size_t head_shift;
+        // The read the wanted value bytes are in, and where the first of
+        // them is in its buffer. An empty value has no such read.
+        std::optional<size_t> value_read;
+        size_t value_shift;
+    };
+
+    std::vector<UringFile::ReadDesc> reads;
+    std::vector<RecordReads> records;
+    reads.reserve(plans.size() * 2);
+    records.reserve(plans.size());
+
+    // First the reads into the destinations. A record that also needs a
+    // read into scratch memory gets it below, once its size is known.
+    size_t scratch_size = 0;
+    for (const ReadPlan* plan : plans) {
+        const size_t size = plan->dest_slice.size;
+        const uint64_t page_shift = plan->offset % kPage;
+        const uint64_t head_end =
+            page_shift + RecordHeader::SIZE + plan->key.size();
+        const uint64_t value_start = RecordHeader::ValueOffsetInRecord(
+            static_cast<uint32_t>(plan->key.size()));
+
+        RecordReads record{};
+        record.head_shift = page_shift;
+        if (size > 0 && plan->value_offset == 0 &&
+            round_up(page_shift + value_start + size) <=
+                round_up(size) + kPage) {
+            record.whole_record = true;
+            record.head_read = reads.size();
+            record.value_read = reads.size();
+            record.value_shift = page_shift + value_start;
+            reads.push_back(UringFile::ReadDesc{
+                plan->dest_slice.ptr, round_up(record.value_shift + size),
+                static_cast<off_t>(plan->offset - page_shift)});
+        } else {
+            scratch_size += round_up(head_end);
+            if (size > 0) {
+                const uint64_t value_pos =
+                    plan->offset + value_start + plan->value_offset;
+                record.value_shift = value_pos % kPage;
+                record.value_read = reads.size();
+                reads.push_back(UringFile::ReadDesc{
+                    plan->dest_slice.ptr, round_up(record.value_shift + size),
+                    static_cast<off_t>(value_pos - record.value_shift)});
+            }
+        }
+        records.push_back(record);
+    }
+
+    std::unique_ptr<void, decltype(&std::free)> scratch(nullptr, &std::free);
+    if (scratch_size > 0) {
+        void* raw = nullptr;
+        if (int ret = posix_memalign(&raw, kPage, scratch_size); ret != 0) {
+            LOG(ERROR) << "Failed to allocate " << scratch_size
+                       << " bytes to read record headers: " << strerror(ret);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        scratch.reset(raw);
+
+        char* head_buffer = static_cast<char*>(raw);
+        for (size_t i = 0; i < plans.size(); ++i) {
+            RecordReads& record = records[i];
+            if (record.whole_record) continue;
+            const size_t head_pages = round_up(
+                record.head_shift + RecordHeader::SIZE + plans[i]->key.size());
+            record.head_read = reads.size();
+            reads.push_back(UringFile::ReadDesc{
+                head_buffer, head_pages,
+                static_cast<off_t>(plans[i]->offset - record.head_shift)});
+            head_buffer += head_pages;
+        }
+    }
+
+    auto read = file.batch_read(reads.data(), static_cast<int>(reads.size()));
+    if (!read) {
+        LOG(ERROR) << "Failed to read " << plans.size()
+                   << " records, error: " << read.error();
+        return tl::make_unexpected(read.error());
+    }
+
+    for (size_t i = 0; i < plans.size(); ++i) {
+        ReadPlan& plan = *plans[i];
+        const RecordReads& record = records[i];
+
+        // A read that reaches the end of the file returns fewer bytes than
+        // the pages asked for; the record's own bytes must all be there.
+        const auto& head = reads[record.head_read];
+        if (!head.completed || head.bytes_read < record.head_shift +
+                                                     RecordHeader::SIZE +
+                                                     plan.key.size()) {
+            LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        auto checked = CheckRecordHead(
+            plan, static_cast<const char*>(head.buf) + record.head_shift);
+        if (!checked) return checked;
+
+        if (!record.value_read.has_value()) continue;
+        const auto& value = reads[*record.value_read];
+        if (!value.completed ||
+            value.bytes_read < record.value_shift + plan.dest_slice.size) {
+            LOG(ERROR) << "Value read size mismatch for key: " << plan.key
+                       << ", expected at least: "
+                       << record.value_shift + plan.dest_slice.size
+                       << ", got: " << value.bytes_read;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        plan.dest_slice.ptr =
+            static_cast<char*>(plan.dest_slice.ptr) + record.value_shift;
+    }
+    return {};
+}
+#endif
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
     std::unordered_map<std::string, StorageValueSpan>& spans,
@@ -6126,19 +6366,6 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
 
     // Step 1: Build read plan by copying metadata under shard locks
     // No locks held during actual disk I/O
-    struct ReadPlan {
-        std::string key;
-        uint64_t offset;
-        uint32_t value_size;
-        uint64_t value_offset;
-        AllocationPtr allocation;  // Refcounted handle keeps allocation alive
-        Slice dest_slice;
-        // Pin the data file so a concurrent RemoveAll() rebuild (which rebinds
-        // the data_file_ member) cannot destroy this file while we still have
-        // pending I/O on it in phase 2 (no shard lock held there).
-        std::shared_ptr<StorageFile> data_file;
-    };
-
     std::vector<ReadPlan> read_plans;
     read_plans.reserve(spans.size());
 
@@ -6187,77 +6414,52 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
 
     // Step 2: Perform disk I/O without holding any locks
     // Allocations and data file are kept alive by shared_ptr refs in read_plans
+    //
+    // Where the bytes of a record are is known before any of them is read.
+    // The index gives the record offset and the value size, and a record
+    // that passes the checks has the wanted key, so the key length, and
+    // with it the position of the value, follow from the request. The
+    // header and key are therefore read along with the value and checked
+    // afterwards, so a span read still cannot return bytes of another
+    // record.
+    //
+    // The CRC is NOT verified here: records are CRC-validated once during
+    // recovery, and during normal operation a key only becomes visible
+    // after its write completed, so the hot read path stays checksum-free.
+    std::vector<ReadPlan*> one_by_one;
+#ifdef USE_URING
+    // Records in an io_uring file go out together, per file: a concurrent
+    // RemoveAll() can leave the plans of one call on two files.
+    std::unordered_map<UringFile*, std::vector<ReadPlan*>> direct;
+    for (auto& plan : read_plans) {
+        auto* uring_file = dynamic_cast<UringFile*>(plan.data_file.get());
+        const bool page_aligned =
+            reinterpret_cast<uintptr_t>(plan.dest_slice.ptr) %
+                kDirectIoAlignment ==
+            0;
+        if (uring_file != nullptr && page_aligned) {
+            direct[uring_file].push_back(&plan);
+        } else {
+            one_by_one.push_back(&plan);
+        }
+    }
+    for (const auto& [uring_file, plans] : direct) {
+        auto read = ReadRecordsDirect(*uring_file, plans);
+        if (!read) return read;
+    }
+#else
+    one_by_one.reserve(read_plans.size());
+    for (auto& plan : read_plans) one_by_one.push_back(&plan);
+#endif
+
+    std::string head;
+    for (const ReadPlan* plan : one_by_one) {
+        auto read = ReadRecord(*plan, head);
+        if (!read) return read;
+    }
+
     for (const auto& plan : read_plans) {
-        // Read header first.  The CRC is NOT verified here: records are
-        // CRC-validated once during recovery, and during normal operation
-        // a key only becomes visible after its write completed, so the
-        // hot read path stays checksum-free.
-        char hdr_buf[RecordHeader::SIZE];
-        iovec header_iov = {hdr_buf, sizeof(hdr_buf)};
-        auto read_header_result =
-            plan.data_file->vector_read(&header_iov, 1, plan.offset);
-        if (!read_header_result) {
-            LOG(ERROR) << "Failed to read header for key: " << plan.key
-                       << ", error: " << read_header_result.error();
-            return tl::make_unexpected(read_header_result.error());
-        }
-
-        if (read_header_result.value() != RecordHeader::SIZE) {
-            LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
-
-        // Validate header matches metadata
-        if (!header.ValidateAgainstMetadata(plan.value_size)) {
-            LOG(ERROR) << "Stored value_len mismatch for key: " << plan.key
-                       << ", metadata: " << plan.value_size
-                       << ", header: " << header.value_len;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-
-        // Read key from disk
-        std::string stored_key(header.key_len, '\0');
-        iovec key_iov = {stored_key.data(), header.key_len};
-        auto read_key_result = plan.data_file->vector_read(
-            &key_iov, 1, plan.offset + RecordHeader::SIZE);
-        if (!read_key_result) {
-            LOG(ERROR) << "Failed to read key for: " << plan.key
-                       << ", error: " << read_key_result.error();
-            return tl::make_unexpected(read_key_result.error());
-        }
-
-        if (read_key_result.value() != header.key_len) {
-            LOG(ERROR) << "Key read size mismatch for: " << plan.key;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-
-        // Validate key matches expected
-        auto validate_result = header.ValidateKey(plan.key, stored_key);
-        if (!validate_result) {
-            return tl::make_unexpected(validate_result.error());
-        }
-
-        // Read only the requested value window. The header and key are still
-        // checked so a span read cannot return bytes from the wrong record.
-        iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
-        const uint64_t value_pos =
-            plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len) +
-            plan.value_offset;
-        auto read_value_result =
-            plan.data_file->vector_read(&value_iov, 1, value_pos);
-        if (!read_value_result) {
-            LOG(ERROR) << "Failed to read value for key: " << plan.key
-                       << ", error: " << read_value_result.error();
-            return tl::make_unexpected(read_value_result.error());
-        }
-
-        if (read_value_result.value() != plan.dest_slice.size) {
-            LOG(ERROR) << "Value read size mismatch for key: " << plan.key
-                       << ", expected: " << plan.dest_slice.size
-                       << ", got: " << read_value_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
+        spans.at(plan.key).slice.ptr = plan.dest_slice.ptr;
     }
 
     // read_plans destructor releases all AllocationPtr references
