@@ -56,6 +56,19 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
+namespace {
+ObjectMeta WriteObjectMeta(const std::string& key,
+                           std::optional<uint64_t> checksum,
+                           const std::vector<Replica::Descriptor>& replicas,
+                           ReplicaType type) {
+    ObjectMeta meta{key, checksum};
+    if (type == ReplicaType::ALL || type == ReplicaType::MEMORY) {
+        if (auto proof = MakeStrictWriteProof(replicas))
+            meta.strict_write_proof = std::move(*proof);
+    }
+    return meta;
+}
+}  // namespace
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol) {
@@ -538,6 +551,18 @@ Client::~Client() {
                                                     std::move(entry.second));
         }
         graceful_unmount_cleanup_callbacks_.clear();
+    }
+
+    if (piece_put_target_) {
+        auto retired = RetirePiecePutEndpoint();
+        if (!retired && retired.error() == ErrorCode::TRANSFER_FAIL) {
+            // Destruction cannot hand the backing to its owner while TCP may
+            // still access it. Supported normal-thread retirement is blocking.
+            LOG(FATAL) << "Cannot destroy PiecePut target before TCP drains";
+        }
+        if (!retired)
+            LOG(ERROR) << "PiecePut retirement report failed: "
+                       << toString(retired.error());
     }
 
     // Unmount mounted segments: notify master + local cleanup
@@ -2196,7 +2221,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            WriteObjectMeta(key, object_checksum, *start_result,
+                            *finalize_decision.end_type),
+            *finalize_decision.end_type);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -2397,7 +2424,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         DetermineFinalizeDecision(client_cfg, transfer_summary);
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.UpsertEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            WriteObjectMeta(key, object_checksum, *start_result,
+                            *finalize_decision.end_type),
+            *finalize_decision.end_type);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -3362,8 +3391,9 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         std::vector<ObjectMeta> object_metas;
         object_metas.reserve(group.indices.size());
         for (size_t i = 0; i < group.indices.size(); ++i) {
-            object_metas.emplace_back(ObjectMeta{
-                group.keys[i], ops[group.indices[i]].object_checksum});
+            const auto& op = ops[group.indices[i]];
+            object_metas.emplace_back(WriteObjectMeta(
+                group.keys[i], op.object_checksum, op.replicas, replica_type));
         }
         auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
         if (responses.size() != group.keys.size()) {
@@ -3487,8 +3517,8 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
             HasExpectedReplicaAllocation(op.ToReplicateConfig(),
                                          op.transfer_summary) &&
             AllAllocatedTransfersSucceeded(op.transfer_summary)) {
-            successful_object_metas.emplace_back(
-                ObjectMeta{op.key, op.object_checksum});
+            successful_object_metas.emplace_back(WriteObjectMeta(
+                op.key, op.object_checksum, op.replicas, ReplicaType::MEMORY));
             successful_indices.emplace_back(i);
             continue;
         }
@@ -3948,6 +3978,421 @@ std::vector<int> Client::GetNicNumaNodes() const {
     return {nodes.begin(), nodes.end()};
 }
 
+tl::expected<void, ErrorCode> Client::EnablePiecePutTarget() {
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    if (protocol_ != "tcp" || !mounted_segments_.empty() ||
+        !gracefully_unmounting_segments_.empty() || piece_put_target_ ||
+        !transfer_engine_ || transfer_engine_->isTcpRetired() ||
+        transfer_engine_->getTcpInstanceId().empty())
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const auto master = master_client_.GetPiecePutMasterInstance();
+    if (!master) return tl::make_unexpected(master.error());
+    if (!transfer_engine_->bindTcpMasterInstance(UuidToString(*master)))
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    piece_put_master_instance_ = *master;
+    piece_put_target_ = true;
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::RetirePiecePutEndpoint() {
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    if (!piece_put_target_ || !transfer_engine_)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    const auto instance = transfer_engine_->getTcpInstanceId();
+    if (!transfer_engine_->retireStrictWrites())
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    return master_client_.RetirePiecePutEndpoint(instance);
+}
+
+// Shared by failure handles; accepted data futures never escape the call.
+struct PiecePutRecoveryBatch {
+    UUID owner;
+    std::vector<PiecePutStartRequest> requests;
+    std::vector<PiecePutFinishRequest> finishes;
+    std::vector<size_t> finish_index;
+    std::vector<ErrorCode> errors;
+};
+
+std::vector<PiecePutResult> Client::BatchPiecePut(
+    const std::vector<PiecePutInput>& inputs,
+    std::vector<std::vector<Slice>>& slices) {
+    std::vector<PiecePutResult> results(inputs.size());
+    if (inputs.size() > kMaxPiecePutBatchSize || protocol_ != "tcp" ||
+        inputs.size() != slices.size() || !transfer_submitter_)
+        return results;
+
+    auto context = std::make_shared<PiecePutRecoveryBatch>();
+    context->owner = client_id_;
+    auto& requests = context->requests;
+    std::vector<size_t> input_indices;
+    requests.reserve(inputs.size());
+    input_indices.reserve(inputs.size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        uint64_t length = 0;
+        bool valid = true;
+        for (const auto& slice : slices[i]) {
+            if (!slice.ptr || !slice.size || slice.size > UINT64_MAX - length) {
+                valid = false;
+                break;
+            }
+            length += slice.size;
+        }
+        const auto& input = inputs[i];
+        if (!valid || !length || input.key.empty() || input.write_id.empty() ||
+            input.write_id.size() > 256 || input.offset > input.total_size ||
+            length > input.total_size - input.offset)
+            continue;
+        requests.push_back({input.key, input.total_size, input.offset, length,
+                            input.write_id, 0, false, std::nullopt});
+        input_indices.push_back(i);
+    }
+    if (requests.empty()) return results;
+    const size_t count = requests.size();
+    constexpr size_t kNoFinish = std::numeric_limits<size_t>::max();
+    // All bookkeeping and recovery ownership exist before granting addresses.
+    context->finishes.reserve(count);
+    for (const auto& request : requests)
+        context->finishes.push_back(
+            {request.key, {}, 0, PiecePutFinishOutcome::NO_POST});
+    context->finish_index.assign(count, kNoFinish);
+    context->errors.assign(count, ErrorCode::INTERNAL_ERROR);
+    std::vector<bool> pending(count, false);
+    std::vector<std::optional<TransferFuture>> futures(count);
+    struct DrainAcceptedTransfers {
+        std::vector<std::optional<TransferFuture>>& futures;
+        ~DrainAcceptedTransfers() {
+            for (auto& future : futures)
+                if (future) future->wait();
+        }
+    } drain{futures};
+    auto set_error = [&](size_t j, ErrorCode error) {
+        context->errors[j] = error;
+        results[input_indices[j]].result = tl::make_unexpected(error);
+    };
+    auto complete_transfers = [&] {
+        for (size_t j = 0; j < count; ++j) {
+            if (!futures[j]) continue;
+            const auto error = futures[j]->get();
+            context->finishes[j].outcome =
+                error == ErrorCode::OK ? PiecePutFinishOutcome::APPLIED
+                                       : PiecePutFinishOutcome::UNCERTAIN;
+            set_error(j, error == ErrorCode::OK ? ErrorCode::RPC_FAIL : error);
+            futures[j].reset();
+        }
+    };
+    auto compact_finishes = [&] {
+        size_t next = 0;
+        for (size_t j = 0; j < count; ++j) {
+            if (pending[j] && context->finish_index[j] != kNoFinish) {
+                if (next != j)
+                    context->finishes[next] = std::move(context->finishes[j]);
+                context->finish_index[j] = next++;
+            } else {
+                context->finish_index[j] = kNoFinish;
+            }
+        }
+        context->finishes.resize(next);
+    };
+    bool compacted = false;
+    bool start_attempted = false;
+    try {
+        std::vector<tl::expected<PiecePutStartResponse, ErrorCode>> grants;
+        for (;;) {
+            std::shared_lock admission_lock(piece_put_admission_mutex_);
+            const auto session = piece_put_admission_;
+            uint64_t first =
+                piece_put_sequence_.load(std::memory_order_relaxed);
+            bool admitted = session.session_id != 0 &&
+                            std::chrono::steady_clock::now() -
+                                    piece_put_admission_refreshed_ <
+                                std::chrono::seconds(45);
+            if (admitted) {
+                for (;;) {
+                    if (first > session.capacity ||
+                        count > session.capacity - first + 1) {
+                        admitted = false;
+                        break;
+                    }
+                    if (piece_put_sequence_.compare_exchange_weak(
+                            first, first + count, std::memory_order_relaxed))
+                        break;
+                }
+            }
+            if (admitted) {
+                for (size_t j = 0; j < count; ++j) {
+                    requests[j].operation_seq = first + j;
+                    requests[j].admission = session;
+                    context->finishes[j].operation_seq = first + j;
+                    pending[j] = true;
+                }
+                // Renewal cannot overtake any already-issued Start RPC.
+                start_attempted = true;
+                grants = master_client_.BatchPiecePutStart(requests);
+                break;
+            }
+            admission_lock.unlock();
+            std::unique_lock renew_lock(piece_put_admission_mutex_);
+            if (piece_put_admission_.session_id != session.session_id) continue;
+            auto renewed = master_client_.GetPiecePutAdmission(
+                session.session_id, host_id_);
+            if (!renewed || renewed->session_id == 0 ||
+                renewed->master_instance == UUID{} ||
+                renewed->capacity < count || renewed->capacity > 4096) {
+                const auto error =
+                    renewed ? ErrorCode::INTERNAL_ERROR : renewed.error();
+                for (size_t j = 0; j < count; ++j) set_error(j, error);
+                return results;
+            }
+            piece_put_admission_ = *renewed;
+            piece_put_admission_refreshed_ = std::chrono::steady_clock::now();
+            piece_put_sequence_.store(1, std::memory_order_relaxed);
+        }
+        if (grants.size() == count) {
+            // Capture every returned identity before descriptor copies or
+            // posts. Moving the token's string cannot allocate.
+            for (size_t j = 0; j < count; ++j) {
+                if (grants[j] && grants[j]->token) {
+                    context->finishes[j].token = std::move(*grants[j]->token);
+                    context->finish_index[j] = j;
+                }
+            }
+            for (size_t j = 0; j < count; ++j) {
+                if (!grants[j]) {
+                    const auto error = grants[j].error();
+                    set_error(j, error);
+                    if (error == ErrorCode::INVALID_WRITE) {
+                        // A new Master rejects the old epoch before it can
+                        // return an admission_closed response.
+                        std::unique_lock lock(piece_put_admission_mutex_);
+                        if (piece_put_admission_.session_id ==
+                                requests[j].admission.session_id &&
+                            piece_put_admission_.master_instance ==
+                                requests[j].admission.master_instance) {
+                            piece_put_sequence_.store(
+                                piece_put_admission_.capacity + 1,
+                                std::memory_order_relaxed);
+                            piece_put_admission_refreshed_ = {};
+                        }
+                    }
+                    pending[j] = error == ErrorCode::RPC_FAIL ||
+                                 error == ErrorCode::RPC_TIMEOUT ||
+                                 error == ErrorCode::INTERNAL_ERROR;
+                    continue;
+                }
+                const auto& grant = *grants[j];
+                if (grant.round_state == PiecePutRoundState::ROUND_PUBLISHED ||
+                    (grant.piece_state == PiecePutPieceState::APPLIED &&
+                     grant.round_state == PiecePutRoundState::OPEN)) {
+                    results[input_indices[j]].result = PiecePutFinishResponse{
+                        grant.piece_state, grant.round_state};
+                    pending[j] = false;
+                    continue;
+                }
+                set_error(j, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                if (grant.admission_closed &&
+                    context->finish_index[j] == kNoFinish) {
+                    // A restarted Master or expired session must force renewal
+                    // on the next attempt, rather than fail until our cache
+                    // ages.
+                    std::unique_lock lock(piece_put_admission_mutex_);
+                    if (piece_put_admission_.session_id ==
+                            requests[j].admission.session_id &&
+                        piece_put_admission_.master_instance ==
+                            requests[j].admission.master_instance) {
+                        piece_put_sequence_.store(
+                            piece_put_admission_.capacity + 1,
+                            std::memory_order_relaxed);
+                        piece_put_admission_refreshed_ = {};
+                    }
+                    pending[j] = false;
+                    continue;
+                }
+                if (context->finish_index[j] == kNoFinish || !grant.replica ||
+                    !grant.replica->is_memory_replica() ||
+                    grant.tcp_instance.empty() ||
+                    grant.round_state != PiecePutRoundState::OPEN)
+                    continue;
+                auto descriptor = *grant.replica;
+                auto& buffer =
+                    descriptor.get_memory_descriptor().buffer_descriptor;
+                const auto& request = requests[j];
+                if (request.offset > buffer.size_ ||
+                    request.length > buffer.size_ - request.offset ||
+                    request.offset > UINTPTR_MAX - buffer.buffer_address_)
+                    continue;
+                buffer.buffer_address_ += request.offset;
+                buffer.size_ = request.length;
+                // The strict submit API throws only before ownership/posts;
+                // after acceptance it always returns a draining future.
+                futures[j] = transfer_submitter_->submitStrictWrite(
+                    descriptor, slices[input_indices[j]], grant.tcp_instance);
+                if (futures[j]) {
+                    context->finishes[j].outcome =
+                        PiecePutFinishOutcome::UNCERTAIN;
+                } else {
+                    set_error(j, ErrorCode::TRANSFER_FAIL);
+                }
+            }
+        } else {
+            for (size_t j = 0; j < count; ++j)
+                set_error(j, ErrorCode::RPC_FAIL);
+        }
+        complete_transfers();
+        compact_finishes();
+        compacted = true;
+        if (!context->finishes.empty()) {
+            const auto settled =
+                master_client_.BatchPiecePutFinish(context->finishes);
+            for (size_t j = 0; j < count; ++j) {
+                const auto f = context->finish_index[j];
+                if (!pending[j] || f == kNoFinish) continue;
+                if (settled.size() != context->finishes.size()) {
+                    set_error(j, ErrorCode::RPC_FAIL);
+                } else if (!settled[f]) {
+                    set_error(j, settled[f].error());
+                } else {
+                    pending[j] = false;
+                    const auto& response = *settled[f];
+                    if (context->finishes[f].outcome ==
+                            PiecePutFinishOutcome::APPLIED &&
+                        (response.round_state ==
+                             PiecePutRoundState::ROUND_PUBLISHED ||
+                         (response.piece_state == PiecePutPieceState::APPLIED &&
+                          response.round_state == PiecePutRoundState::OPEN))) {
+                        results[input_indices[j]].result = response;
+                    } else {
+                        set_error(
+                            j, context->errors[j] == ErrorCode::TRANSFER_FAIL
+                                   ? ErrorCode::TRANSFER_FAIL
+                                   : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                    }
+                }
+            }
+        }
+        std::vector<PiecePutStartRequest> closes;
+        std::vector<size_t> close_indices;
+        for (size_t j = 0; j < count; ++j) {
+            if (!pending[j] || context->finish_index[j] != kNoFinish) continue;
+            auto request = requests[j];
+            request.lookup_only = true;
+            request.close_no_post = true;
+            closes.push_back(std::move(request));
+            close_indices.push_back(j);
+        }
+        if (!closes.empty()) {
+            const auto closed = master_client_.BatchPiecePutStart(closes);
+            for (size_t k = 0; k < close_indices.size(); ++k) {
+                const auto j = close_indices[k];
+                if (closed.size() == closes.size() && closed[k] &&
+                    closed[k]->admission_closed)
+                    pending[j] = false;
+            }
+        }
+    } catch (...) {
+        // Identities survive allocation/RPC exceptions; payload ownership does
+        // not escape. Re-evaluate every accepted future before returning.
+        complete_transfers();
+        if (!compacted) compact_finishes();
+        for (size_t j = 0; j < count; ++j)
+            if (pending[j] || !start_attempted)
+                set_error(j, ErrorCode::INTERNAL_ERROR);
+    }
+    for (size_t j = 0; j < count; ++j) {
+        if (pending[j])
+            results[input_indices[j]].recovery = PiecePutRecovery(context, j);
+    }
+    return results;
+}
+
+std::vector<PiecePutResult> Client::RetryPiecePut(
+    const std::vector<PiecePutRecovery>& operations) {
+    std::vector<PiecePutResult> results(operations.size());
+    const bool oversized = operations.size() > kMaxPiecePutBatchSize;
+    // Publish every retry handle before any fallible request construction.
+    for (size_t i = 0; i < operations.size(); ++i) {
+        const auto& recovery = operations[i];
+        const auto& batch = recovery.batch_;
+        if (batch && batch->owner == client_id_ &&
+            recovery.index_ < batch->requests.size()) {
+            results[i].recovery = recovery;
+            results[i].result =
+                tl::make_unexpected(oversized ? ErrorCode::INVALID_PARAMS
+                                              : batch->errors[recovery.index_]);
+        }
+    }
+    if (oversized) return results;
+    std::vector<PiecePutStartRequest> closes;
+    std::vector<size_t> close_indices;
+    std::vector<PiecePutFinishRequest> finishes;
+    std::vector<size_t> finish_indices;
+    try {
+        for (size_t i = 0; i < operations.size(); ++i) {
+            if (!results[i].recovery) continue;
+            const auto& recovery = operations[i];
+            const auto& batch = recovery.batch_;
+            const auto j = recovery.index_;
+            const auto f = batch->finish_index[j];
+            if (f == std::numeric_limits<size_t>::max()) {
+                auto request = batch->requests[j];
+                request.lookup_only = true;
+                request.close_no_post = true;
+                closes.push_back(std::move(request));
+                close_indices.push_back(i);
+            } else {
+                finishes.push_back(batch->finishes[f]);
+                finish_indices.push_back(i);
+            }
+        }
+        if (!closes.empty()) {
+            const auto closed = master_client_.BatchPiecePutStart(closes);
+            for (size_t k = 0; k < close_indices.size(); ++k) {
+                const auto i = close_indices[k];
+                if (closed.size() != closes.size()) {
+                    results[i].result =
+                        tl::make_unexpected(ErrorCode::RPC_FAIL);
+                } else if (!closed[k]) {
+                    results[i].result = tl::make_unexpected(closed[k].error());
+                } else if (closed[k]->admission_closed) {
+                    results[i].recovery.reset();
+                }
+            }
+        }
+        if (!finishes.empty()) {
+            const auto settled = master_client_.BatchPiecePutFinish(finishes);
+            for (size_t k = 0; k < finish_indices.size(); ++k) {
+                const auto i = finish_indices[k];
+                if (settled.size() != finishes.size()) {
+                    results[i].result =
+                        tl::make_unexpected(ErrorCode::RPC_FAIL);
+                } else if (!settled[k]) {
+                    results[i].result = tl::make_unexpected(settled[k].error());
+                } else {
+                    results[i].recovery.reset();
+                    const auto& response = *settled[k];
+                    if (finishes[k].outcome == PiecePutFinishOutcome::APPLIED &&
+                        (response.round_state ==
+                             PiecePutRoundState::ROUND_PUBLISHED ||
+                         (response.piece_state == PiecePutPieceState::APPLIED &&
+                          response.round_state == PiecePutRoundState::OPEN)))
+                        results[i].result = response;
+                    else
+                        results[i].result = tl::make_unexpected(
+                            finishes[k].outcome ==
+                                    PiecePutFinishOutcome::UNCERTAIN
+                                ? ErrorCode::TRANSFER_FAIL
+                                : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                }
+            }
+        }
+    } catch (...) {
+        // The immutable handles remain retryable, including after a lost reply.
+        for (auto& result : results)
+            if (result.recovery)
+                result.result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return results;
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
@@ -4018,6 +4463,11 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
+        if (piece_put_target_ && transfer_engine_->isTcpRetired()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+
         // Check if the segment overlaps with any existing segment
         for (auto& it : mounted_segments_) {
             auto& mtseg = it.second;
@@ -4031,6 +4481,15 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
                            << " size2=" << size;
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
+        }
+
+        // A shared TE cannot publish a legacy Store address after another
+        // Client binds it as a strict target. Reserve before local publication
+        // or the Mount RPC; registration history survives a later unmount.
+        if (protocol == "tcp" && !piece_put_target_ &&
+            !transfer_engine_->reserveLegacyTcpMount()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
 
         int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
@@ -4048,6 +4507,10 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        if (piece_put_target_) {
+            segment.tcp_instance = transfer_engine_->getTcpInstanceId();
+            segment.piece_put_master_instance = piece_put_master_instance_;
+        }
         if (protocol == "rdma" && StoreHcaAffinityEnabled()) {
             if (auto topology = transfer_engine_->getLocalTopology()) {
                 segment.locality = DiscoverSegmentLocality(*topology, location);
@@ -4059,11 +4522,42 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.te_endpoint = local_hostname_;
         }
 
-        auto mount_result = master_client_.MountSegment(segment);
+        bool definitely_not_accepted = false;
+        tl::expected<void, ErrorCode> mount_result;
+        if (piece_put_target_) {
+            auto outcome = master_client_.MountSegmentWithOutcome(segment);
+            if (!outcome) {
+                mount_result = tl::make_unexpected(outcome.error());
+            } else if (outcome->error != ErrorCode::OK) {
+                definitely_not_accepted = outcome->definitely_not_accepted;
+                mount_result = tl::make_unexpected(outcome->error);
+            }
+        } else {
+            mount_result = master_client_.MountSegment(segment);
+        }
         if (!mount_result) {
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
+            if (piece_put_target_) {
+                if (!definitely_not_accepted) {
+                    if (!transfer_engine_->retireStrictWrites()) {
+                        LOG(FATAL) << "Cannot release pending PiecePut "
+                                      "registration before TCP drains";
+                    }
+                    const auto retired = master_client_.RetirePiecePutEndpoint(
+                        transfer_engine_->getTcpInstanceId());
+                    if (!retired) {
+                        LOG(ERROR) << "Failed to report terminal TCP endpoint: "
+                                   << retired.error();
+                        // Retry the endpoint fence even when the uncertain
+                        // first Mount never entered our local segment table.
+                        EnsureStorageControlPlaneStarted();
+                    }
+                }
+                transfer_engine_->unregisterLocalMemory(
+                    const_cast<void*>(buffer));
+            }
             return tl::unexpected(err);
         }
 
@@ -4490,6 +4984,13 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
     return master_client_.NotifyPromotionSuccess(client_id_, key, tenant_id);
 }
 
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
+    const std::string& key, const std::string& tenant_id,
+    const StrictWriteProof& proof) {
+    return master_client_.CompleteProtectedReplicaWrite(
+        key, tenant_id, proof, StrictWriteOperation::PROMOTION);
+}
+
 tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     const std::string& key) {
     return master_client_.NotifyPromotionFailure(client_id_, key);
@@ -4648,7 +5149,13 @@ tl::expected<void, ErrorCode> Client::Copy(
         return {};
     }
 
+    const auto strict_proof = MakeStrictWriteProof(response.targets);
     auto copy_end = [&]() {
+        if (strict_proof)
+            return master_client_.CompleteProtectedReplicaWrite(
+                key, tenant_id, *strict_proof, StrictWriteOperation::COPY,
+                dynamic_replication_lease_id,
+                dynamic_replication_version_epoch);
         return dynamic_replication_lease_id == UUID{}
                    ? master_client_.CopyEnd(key, tenant_id)
                    : master_client_.DynamicReplicaCopyEnd(
@@ -4716,7 +5223,13 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     std::vector<Replica::Descriptor> targets = {response.target.value()};
 
     auto result = ExecuteReplicaTransfer(
-        key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
+        key, "move",
+        [&]() {
+            if (auto proof = MakeStrictWriteProof(targets))
+                return master_client_.CompleteProtectedReplicaWrite(
+                    key, tenant_id, *proof, StrictWriteOperation::MOVE);
+            return master_client_.MoveEnd(key, tenant_id);
+        },
         [&]() { return master_client_.MoveRevoke(key, tenant_id); },
         response.source, targets);
 
@@ -5099,10 +5612,13 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
     }
 
     size_t fragment_count = 0;
+    size_t strict_fragment_count = 0;
     for (size_t i = 0; i < replicas_per_entry.size(); ++i) {
         for (const auto& replica : replicas_per_entry[i]) {
             if (replica.is_memory_replica()) {
                 fragment_count += slices[i].size();
+                if (replica.get_memory_descriptor().strict_tcp_instance)
+                    strict_fragment_count += slices[i].size();
             }
         }
     }
@@ -5110,6 +5626,14 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
     // One scatter submit covers every replica of every entry, so replication
     // fans out inside a single transfer instead of one submit per fragment.
     ScatterRangeBuilder builder(fragment_count);
+    std::vector<Replica::Descriptor> strict_replicas;
+    std::vector<std::vector<Slice>> strict_slices;
+    std::vector<bool> strict_entries;
+    if (strict_fragment_count != 0) {
+        strict_entries.resize(replicas_per_entry.size(), false);
+        strict_replicas.reserve(strict_fragment_count);
+        strict_slices.reserve(strict_fragment_count);
+    }
     std::vector<std::optional<ErrorCode>> entry_errors(
         replicas_per_entry.size());
     for (size_t i = 0; i < replicas_per_entry.size(); ++i) {
@@ -5130,11 +5654,32 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
             if (!replica.is_memory_replica()) {
                 continue;
             }
-            const auto& handle =
-                replica.get_memory_descriptor().buffer_descriptor;
+            const auto& memory = replica.get_memory_descriptor();
+            const auto& handle = memory.buffer_descriptor;
             for (size_t j = 0; j < slices[i].size(); ++j) {
-                builder.Add(TransferRequest::WRITE, handle, slices[i][j],
-                            dst_offsets[i][j], &entry_errors[i]);
+                if (memory.strict_tcp_instance) {
+                    const auto offset = dst_offsets[i][j];
+                    const auto& slice = slices[i][j];
+                    if (!slice.ptr || !slice.size || offset > handle.size_ ||
+                        slice.size > handle.size_ - offset ||
+                        offset > UINT64_MAX - handle.buffer_address_) {
+                        entry_errors[i] = ErrorCode::INVALID_PARAMS;
+                        continue;
+                    }
+                    // Preserve the capability when converting a subrange.
+                    // Native scatter takes only a bare address descriptor.
+                    auto ranged = replica;
+                    auto& range =
+                        ranged.get_memory_descriptor().buffer_descriptor;
+                    range.buffer_address_ += offset;
+                    range.size_ = slice.size;
+                    strict_replicas.push_back(std::move(ranged));
+                    strict_slices.push_back({slice});
+                    strict_entries[i] = true;
+                } else {
+                    builder.Add(TransferRequest::WRITE, handle, slices[i][j],
+                                dst_offsets[i][j], &entry_errors[i]);
+                }
                 submitted = true;
             }
         }
@@ -5145,7 +5690,18 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
         results[i] = transferred;  // optimistic; corrected on await
     }
 
+    if (!strict_replicas.empty()) {
+        auto future = transfer_submitter_->submit_batch(
+            strict_replicas, strict_slices, TransferRequest::WRITE, intent);
+        const auto error = future ? future->get() : ErrorCode::TRANSFER_FAIL;
+        if (error != ErrorCode::OK) {
+            for (size_t i = 0; i < results.size(); ++i)
+                if (strict_entries[i]) entry_errors[i] = error;
+        }
+    }
     if (builder.empty()) {
+        for (size_t i = 0; i < results.size(); ++i)
+            if (entry_errors[i]) results[i] = tl::unexpected(*entry_errors[i]);
         return results;
     }
 
@@ -5637,6 +6193,26 @@ void Client::StorageHeartbeatThreadMain() {
         // unmounted successfully first, and then remounted again in
         // this thread.
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        if (piece_put_target_ && transfer_engine_->isTcpRetired()) return;
+        if (piece_put_target_ && (!mounted_segments_.empty() ||
+                                  !gracefully_unmounting_segments_.empty())) {
+            const auto current = master_client_.GetPiecePutMasterInstance();
+            if (!current && (current.error() == ErrorCode::RPC_FAIL ||
+                             current.error() == ErrorCode::RPC_TIMEOUT))
+                return;  // Unknown epoch cannot authorize rebuilding
+                         // allocations.
+            if (!current || *current != piece_put_master_instance_) {
+                // The endpoint is bound to its first Master for life. A new
+                // Master must not rebuild allocations over old network writes.
+                if (transfer_engine_->retireStrictWrites()) {
+                    (void)master_client_.RetirePiecePutEndpoint(
+                        transfer_engine_->getTcpInstanceId());
+                }
+                LOG(ERROR)
+                    << "PiecePut target retired after Master instance changed";
+                return;
+            }
+        }
         std::vector<Segment> segments;
         for (auto it : mounted_segments_) {
             auto& segment = it.second;
@@ -5695,6 +6271,19 @@ void Client::StorageHeartbeatThreadMain() {
             remount_segment_future.wait_for(std::chrono::seconds(0)) ==
                 std::future_status::ready) {
             remount_segment_future = std::future<void>();
+        }
+
+        if (piece_put_target_ && transfer_engine_->isTcpRetired()) {
+            // A retired target cannot become healthy or remount its old
+            // addresses. Keep reporting a lost endpoint-fence acknowledgement.
+            const auto retired = RetirePiecePutEndpoint();
+            last_ping_success_.store(false);
+            if (!retired)
+                LOG(ERROR) << "Endpoint retirement retry failed: "
+                           << retired.error();
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(fail_ping_interval_ms));
+            continue;
         }
 
         auto ping_result = metrics_

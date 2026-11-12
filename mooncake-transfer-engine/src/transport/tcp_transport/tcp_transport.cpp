@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cstring>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -32,10 +33,15 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <iomanip>
+#include <random>
+#include <sstream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "common.h"
@@ -59,6 +65,7 @@ using tcpsocket = asio::ip::tcp::socket;
 namespace {
 using LaneConnectHandlerHook = void (*)() noexcept;
 using LaneConnectFailureInjectionHook = bool (*)(size_t) noexcept;
+using LaneConnectPauseHook = bool (*)() noexcept;
 using LaneRetryHandlerHook = void (*)() noexcept;
 using LaneAdmissionHandlerHook = void (*)() noexcept;
 using LaneObserverHook = void (*)(int, size_t, uint64_t, size_t, bool) noexcept;
@@ -69,12 +76,24 @@ using StartTransferMetadataHook = void (*)() noexcept;
 std::mutex lane_test_hook_mutex;
 LaneConnectHandlerHook lane_connect_handler_hook = nullptr;
 LaneConnectFailureInjectionHook lane_connect_failure_injection_hook = nullptr;
+LaneConnectPauseHook lane_connect_pause_hook = nullptr;
 LaneRetryHandlerHook lane_retry_handler_hook = nullptr;
 LaneAdmissionHandlerHook lane_admission_handler_hook = nullptr;
 LaneObserverHook lane_observer_hook = nullptr;
 LaneFailureReasonHook lane_failure_reason_hook = nullptr;
 SessionProgressHook session_progress_hook = nullptr;
 StartTransferMetadataHook start_transfer_metadata_hook = nullptr;
+std::atomic<TcpAllocationFailurePoint> allocation_failure_point{
+    TcpAllocationFailurePoint::NONE};
+
+void injectAllocationFailureForTest(TcpAllocationFailurePoint point) {
+    auto expected = point;
+    if (allocation_failure_point.compare_exchange_strong(
+            expected, TcpAllocationFailurePoint::NONE,
+            std::memory_order_relaxed))
+        throw std::bad_alloc();
+}
+
 std::atomic<size_t> staging_buffer_allocation_count{0};
 std::atomic<size_t> staging_device_query_count{0};
 
@@ -116,12 +135,20 @@ enum SessionProgressTestEvent {
     kSessionTimeoutCommitted = 3,
     kSessionTimeoutStale = 4,
     kSessionTerminal = 5,
+    kSessionHeaderCompletion = 6,
+    kSessionWriteBodyStarted = 7,
+    kSessionStatusDeadlineArmed = 8,
+    kSessionStatusTimeoutCommitted = 9,
+    kSessionStatusTimeoutStale = 10,
+    kSessionServerWriteAckReady = 11,
+    kSessionStatusReplayComplete = 12,
 };
 
 enum SessionProgressTestAction {
     kSessionProgressNoAction = 0,
     kSessionCommitTimeoutBeforeProgress = 1,
     kSessionReplayPreviousTimeoutAfterProgress = 2,
+    kSessionReplayPreviousStatusAfterArm = 3,
 };
 
 void invokeLaneConnectHandlerHook() noexcept {
@@ -140,6 +167,15 @@ bool invokeLaneConnectFailureInjectionHook(size_t lane_id) noexcept {
         hook = lane_connect_failure_injection_hook;
     }
     return hook && hook(lane_id);
+}
+
+bool invokeLaneConnectPauseHook() noexcept {
+    LaneConnectPauseHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_connect_pause_hook;
+    }
+    return hook && hook();
 }
 
 void invokeLaneRetryHandlerHook() noexcept {
@@ -201,6 +237,16 @@ void invokeStartTransferMetadataHook() noexcept {
 }
 }  // namespace
 
+void tcpTransportFailNextAllocationForTest(
+    TcpAllocationFailurePoint point) noexcept {
+    allocation_failure_point.store(point, std::memory_order_relaxed);
+}
+
+bool tcpTransportAllocationFailureConsumedForTest() noexcept {
+    return allocation_failure_point.load(std::memory_order_relaxed) ==
+           TcpAllocationFailurePoint::NONE;
+}
+
 void tcpTransportSetLaneConnectHandlerHookForTest(
     LaneConnectHandlerHook hook) noexcept {
     std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
@@ -228,6 +274,12 @@ void tcpTransportSetLaneAdmissionHandlerHookForTest(
     LaneAdmissionHandlerHook hook) noexcept {
     std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
     lane_admission_handler_hook = hook;
+}
+
+void tcpTransportSetLaneConnectPauseHookForTest(
+    LaneConnectPauseHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_connect_pause_hook = hook;
 }
 
 void tcpTransportSetLaneFailureReasonHookForTest(
@@ -318,8 +370,17 @@ bool validateTcpAddress(const std::shared_ptr<TransferMetadata>& metadata,
 }
 }  // namespace
 
+static std::string newTcpInstanceId() {
+    std::random_device random;
+    std::ostringstream id;
+    id << std::hex << std::setfill('0');
+    for (int i = 0; i < 4; ++i) id << std::setw(8) << random();
+    return id.str();
+}
+
 TcpTransport::TcpTransport()
     : context_(nullptr),
+      instance_id_(newTcpInstanceId()),
       running_(false),
       lane_state_(std::make_shared<ConnectionLaneState>()) {
     if (getenv("MC_TCP_ENABLE_CONNECTION_POOL") != nullptr) {
@@ -385,6 +446,55 @@ TcpTransport::TcpTransport()
         kDefaultNumIoThreads, 1, kMaxNumIoThreads);
 }
 
+bool TcpTransport::bindTcpMasterInstance(const std::string& master_instance) {
+    if (master_instance.empty()) return false;
+    std::unique_lock<std::mutex> lock(retirement_mutex_);
+    if (retired_.load(std::memory_order_acquire) || legacy_memory_exposed_ ||
+        !context_)
+        return false;
+    if (master_instance_.empty()) master_instance_ = master_instance;
+    if (master_instance_ != master_instance) return false;
+    context_->requireStrictWrites();
+    return true;
+}
+
+bool TcpTransport::reserveLegacyTcpMount() {
+    std::lock_guard<std::mutex> lock(retirement_mutex_);
+    if (retired_.load(std::memory_order_acquire) || !master_instance_.empty())
+        return false;
+    legacy_memory_exposed_ = true;
+    return true;
+}
+
+bool TcpTransport::retireStrictWrites() {
+    // One-shot requests historically do not live in the lane registry. Do not
+    // advertise a retirement proof for that configuration.
+    if (!enable_connection_pool_) return false;
+    // Contexts remain alive through retirement. Check before waiting so an
+    // IO callback cannot block a retirement joining its own thread.
+    if (io_pool_) {
+        for (size_t i = 0; i < io_pool_->size(); ++i)
+            if (io_pool_->executor(i).running_in_this_thread()) return false;
+    }
+    std::unique_lock<std::mutex> lock(retirement_mutex_);
+    if (retirement_complete_) return true;
+    retired_.store(true, std::memory_order_release);
+
+    // Keep IO running until every accepted server session, including a body
+    // read/write in flight, has actually been destroyed.
+    if (context_) context_->retireAndDrain();
+    // Existing teardown closes/cancels lanes, joins every IO thread, then
+    // publishes terminal failure for any remaining local sends.
+    shutdownConnectionLanes();
+    delete context_;
+    context_ = nullptr;
+    // Retain stopped contexts until Transport destruction: a submitting thread
+    // may still be posting a pump after releasing the admission mutex. Such a
+    // post must have a live executor but can never execute after this barrier.
+    retirement_complete_ = true;
+    return true;
+}
+
 TcpTransport::~TcpTransport() {
     shutdownConnectionLanes();
 
@@ -405,6 +515,7 @@ int TcpTransport::startHandshakeDaemon() {
 int TcpTransport::install(std::string& local_server_name,
                           std::shared_ptr<TransferMetadata> meta,
                           std::shared_ptr<Topology> topo) {
+    if (retired_.load(std::memory_order_acquire)) return ERR_INVALID_ARGUMENT;
     metadata_ = meta;
     local_server_name_ = local_server_name;
     int sockfd = -1;
@@ -442,7 +553,8 @@ int TcpTransport::install(std::string& local_server_name,
         *io_pool_, tcp_port,
         [metadata = std::move(metadata)](uint64_t addr, uint64_t size) {
             return validateTcpAddress(metadata, addr, size);
-        });
+        },
+        instance_id_);
     lane_runtime_ = std::make_shared<ConnectionLaneRuntime>(*io_pool_);
     lane_state_->runtime = lane_runtime_;
     running_ = true;
@@ -481,6 +593,14 @@ int TcpTransport::registerLocalMemory(void* addr, size_t length,
                                       bool remote_accessible,
                                       bool update_metadata) {
     (void)remote_accessible;
+    {
+        std::lock_guard<std::mutex> lock(retirement_mutex_);
+        // Classic TCP publishes every registered region, including source
+        // buffers. Record exposure before publication, even if metadata update
+        // later fails. A bound target may register its protected backing; this
+        // latch only prevents upgrading a previously unbound listener.
+        if (master_instance_.empty()) legacy_memory_exposed_ = true;
+    }
     BufferDesc buffer_desc;
     buffer_desc.name = local_server_name_;
     buffer_desc.addr = (uint64_t)addr;
@@ -584,6 +704,62 @@ Status TcpTransport::submitTransfer(
     return Status::OK();
 }
 
+Status TcpTransport::submitStrictWrite(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    const std::string& expected_tcp_instance) {
+    if (retired_.load(std::memory_order_acquire) ||
+        expected_tcp_instance.size() != 32 || entries.empty() ||
+        forceLegacyTcpProto())
+        return Status::InvalidArgument(
+            "strict TCP write capability unavailable");
+    auto& batch = toBatchDesc(batch_id);
+    if (!batch.task_list.empty() || entries.size() > batch.batch_size)
+        return Status::InvalidArgument("strict write needs an empty batch");
+    for (const auto& entry : entries) {
+        auto peer = metadata_->getSegmentDescByID(entry.target_id);
+        if (entry.opcode != TransferRequest::WRITE || !entry.source ||
+            entry.length == 0 || !peer || peer->tcp_data_host.empty() ||
+            peer->tcp_proto_version < 2)
+            return Status::InvalidArgument("invalid strict TCP write");
+    }
+
+    auto requirement = std::make_shared<StrictWriteRequirement>();
+    requirement->tcp_instance = expected_tcp_instance;
+    // Prepare every task before any network work is admitted. A preparation
+    // failure can therefore return an error without exposing caller buffers.
+    std::vector<Slice*> slices;
+    slices.reserve(entries.size());
+    batch.task_list.resize(entries.size());
+    for (auto& task : batch.task_list) task.slice_list.reserve(1);
+    try {
+        for (size_t i = 0; i < entries.size(); ++i) {
+            auto& task = batch.task_list[i];
+            task.batch_id = batch_id;
+            task.transport_ = this;
+            auto* slice = prepareTransfer(&task, entries[i]);
+            slice->strict_write = requirement;
+            slices.push_back(slice);
+        }
+    } catch (...) {
+        // None of these slices has been admitted. Publish terminal failure so
+        // batch destruction does not defer a never-submitted operation.
+        for (auto* slice : slices) slice->markFailed();
+        throw;
+    }
+    for (auto* slice : slices) {
+        // The TCP scheduler never requeues a failed data session. Reconnects
+        // are used only by work that has not started on a socket.
+        try {
+            startTransfer(slice, nullptr, true);
+        } catch (...) {
+            // startTransfer does not throw after transferring work ownership
+            // to a lane; admission and pump failures are settled by the lane.
+            slice->markFailed();
+        }
+    }
+    return Status::OK();
+}
+
 Status TcpTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
     for (size_t i = 0; i < task_list.size();) {
@@ -629,6 +805,7 @@ Transport::Slice* TcpTransport::prepareTransfer(
     TransferTask* task, const TransferRequest& request) {
     task->total_bytes += request.length;
     Slice* slice = getSliceCache().allocate();
+    slice->strict_write.reset();
     slice->source_addr = static_cast<char*>(request.source);
     slice->length = request.length;
     slice->opcode = request.opcode;
@@ -746,6 +923,10 @@ void TcpTransport::startTransfer(Slice* slice,
         }
     };
 
+    if (retired_.load(std::memory_order_acquire)) {
+        finish(TransferStatusEnum::FAILED);
+        return;
+    }
     auto desc = metadata_->getSegmentDescByID(slice->target_id);
     if (!desc) {
         LOG(ERROR) << "TcpTransport::startTransfer failed to get segment "
@@ -778,6 +959,10 @@ void TcpTransport::startTransfer(Slice* slice,
     const ConnectionKey key{desc->tcp_data_host,
                             static_cast<uint16_t>(desc->tcp_data_port)};
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
+    if (slice->strict_write && !use_v2) {
+        finish(TransferStatusEnum::FAILED);
+        return;
+    }
     TcpWorkItem work(slice, use_v2, std::move(continuation));
 
     // Scatter task groups request reuse even when the general pool setting is

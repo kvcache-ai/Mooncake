@@ -513,11 +513,22 @@ struct Segment {
     std::string protocol;
     std::string host_id{};
     struct_pack::compatible<SegmentLocality, 1> locality;
+    struct_pack::compatible<std::string, 2> tcp_instance;
+    struct_pack::compatible<UUID, 3> piece_put_master_instance;
     Segment() = default;
     bool operator==(const Segment&) const = default;
 };
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
-         locality);
+         locality, tcp_instance, piece_put_master_instance);
+
+// A transport error cannot prove whether Master accepted the mount. Only a
+// successful RPC carrying this explicit pre-publication rejection permits the
+// target to unregister the new region without retiring its healthy endpoint.
+struct MountSegmentOutcome {
+    ErrorCode error{ErrorCode::INTERNAL_ERROR};
+    bool definitely_not_accepted{false};
+};
+YLT_REFL(MountSegmentOutcome, error, definitely_not_accepted);
 
 /**
  * @brief Allocation strategy type for segment allocation

@@ -83,6 +83,35 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetPiecePutAdmission> {
+    static constexpr const char* value = "GetPiecePutAdmission";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetPiecePutMasterInstance> {
+    static constexpr const char* value = "GetPiecePutMasterInstance";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CompleteProtectedReplicaWrite> {
+    static constexpr const char* value = "CompleteProtectedReplicaWrite";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RetirePiecePutEndpoint> {
+    static constexpr const char* value = "RetirePiecePutEndpoint";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPiecePutStart> {
+    static constexpr const char* value = "BatchPiecePutStart";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPiecePutFinish> {
+    static constexpr const char* value = "BatchPiecePutFinish";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -165,6 +194,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchRemove> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::MountSegment> {
     static constexpr const char* value = "MountSegment";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MountSegmentWithOutcome> {
+    static constexpr const char* value = "MountSegmentWithOutcome";
 };
 
 template <>
@@ -777,6 +811,48 @@ MasterClient::BatchGetReplicaListReadOnly(
     return result;
 }
 
+tl::expected<PiecePutAdmission, ErrorCode> MasterClient::GetPiecePutAdmission(
+    uint64_t previous_session_id, const std::string& host_id) {
+    return invoke_rpc<&WrappedMasterService::GetPiecePutAdmission,
+                      PiecePutAdmission>(client_id_, previous_session_id,
+                                         host_id);
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::GetPiecePutMasterInstance() {
+    return invoke_rpc<&WrappedMasterService::GetPiecePutMasterInstance, UUID>();
+}
+
+tl::expected<void, ErrorCode> MasterClient::CompleteProtectedReplicaWrite(
+    const std::string& key, const std::string& tenant_id,
+    const StrictWriteProof& proof, StrictWriteOperation operation,
+    const UUID& dynamic_lease_id, uint64_t dynamic_version) {
+    return invoke_rpc<&WrappedMasterService::CompleteProtectedReplicaWrite,
+                      void>(client_id_, key, tenant_id, proof, operation,
+                            dynamic_lease_id, dynamic_version);
+}
+
+tl::expected<void, ErrorCode> MasterClient::RetirePiecePutEndpoint(
+    const std::string& tcp_instance) {
+    return invoke_rpc<&WrappedMasterService::RetirePiecePutEndpoint, void>(
+        client_id_, tcp_instance);
+}
+
+std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+MasterClient::BatchPiecePutStart(
+    const std::vector<PiecePutStartRequest>& requests) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchPiecePutStart,
+                            PiecePutStartResponse>(
+        requests.size(), client_id_, requests, tenant_id_.value());
+}
+
+std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+MasterClient::BatchPiecePutFinish(
+    const std::vector<PiecePutFinishRequest>& requests) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchPiecePutFinish,
+                            PiecePutFinishResponse>(
+        requests.size(), client_id_, requests, tenant_id_.value());
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 MasterClient::PutStart(const std::string& key,
                        const std::vector<size_t>& slice_lengths,
@@ -1009,6 +1085,20 @@ tl::expected<void, ErrorCode> MasterClient::MountSegment(
 
     auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
         segment, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<MountSegmentOutcome, ErrorCode>
+MasterClient::MountSegmentWithOutcome(const Segment& segment) {
+    ScopedVLogTimer timer(1, "MasterClient::MountSegmentWithOutcome");
+    timer.LogRequest("base=", segment.base, ", size=", segment.size,
+                     ", name=", segment.name, ", id=", segment.id,
+                     ", client_id=", client_id_);
+    // invoke_rpc dispatches one request. Its transport failures deliberately
+    // do not distinguish an unsent request from an accepted, lost reply.
+    auto result = invoke_rpc<&WrappedMasterService::MountSegmentWithOutcome,
+                             MountSegmentOutcome>(segment, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }

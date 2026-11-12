@@ -62,6 +62,10 @@ class Transport {
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
     using NotifyDesc = TransferMetadata::NotifyDesc;
 
+    struct StrictWriteRequirement {
+        std::string tcp_instance;
+    };
+
     struct TransferRequest {
         enum OpCode { READ, WRITE };
         enum Priority { PRIO_HIGH = 0, PRIO_MEDIUM = 1, PRIO_LOW = 2 };
@@ -180,6 +184,7 @@ class Transport {
             bool observe_success;
         };
 
+        std::shared_ptr<const StrictWriteRequirement> strict_write;
         void *source_addr;
         size_t length;
         TransferRequest::OpCode opcode;
@@ -475,6 +480,7 @@ class Transport {
             auto cleanup = slice->cleanup_callback;
             slice->cleanup_callback = nullptr;
             if (cleanup) cleanup(slice);
+            slice->strict_write.reset();
             slice->interned_peer_nic_path = nullptr;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
             Transport::releaseCongestionPermit(slice);

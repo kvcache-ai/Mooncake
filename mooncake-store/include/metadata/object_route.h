@@ -92,8 +92,11 @@ struct ObjectRef {
 // slot, so the owner returns it to its initial value once the key holds none,
 // before the slot can be dropped.
 struct SlotOwnerState {
-    // Whether the owner's in-flight list holds the slot.
-    bool in_flight_listed{false};
+    // Which of the owner's in-flight lists holds this slot's one hook.
+    enum class InFlightKind : uint8_t { NONE, ORDINARY, PIECE_PUT };
+    static_assert(sizeof(InFlightKind) == sizeof(bool));
+    static_assert(alignof(InFlightKind) == alignof(bool));
+    InFlightKind in_flight_kind{InFlightKind::NONE};
     // Whether the owner's eviction index files the slot, at what rank, and
     // under which of the index's own entries for a group, if any.
     bool eviction_filed{false};
@@ -694,8 +697,10 @@ class ObjectRoute::Cursor {
     // the cursor then advances or the loop is left early.
     void AssertInFlightUnchanged() const {
         assert((!kWrite || current_ == nullptr ||
-                current_->record_->state.HasWorkInFlight() ==
-                    visited_in_flight_) &&
+                (current_->record_->state.HasWorkInFlight() ==
+                     visited_in_flight_ &&
+                 static_cast<bool>(current_->record_->state.piece_put) ==
+                     visited_piece_put_)) &&
                "a write cursor's loop body changed in-flight work");
     }
 
@@ -703,6 +708,7 @@ class ObjectRoute::Cursor {
         slot_lock_ = std::move(lock);
         current_ = &slot;
         visited_in_flight_ = slot.record_->state.HasWorkInFlight();
+        visited_piece_put_ = static_cast<bool>(slot.record_->state.piece_put);
     }
 
     void UnlockSlot() {
@@ -731,6 +737,7 @@ class ObjectRoute::Cursor {
     KeySlot* current_ = nullptr;
     // Whether the object stood on carried in-flight work when reached.
     bool visited_in_flight_ = false;
+    bool visited_piece_put_ = false;
 };
 
 // --- ObjectRoute ------------------------------------------------------------

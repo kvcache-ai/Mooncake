@@ -807,6 +807,8 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     ASSERT_EQ(segment_access.GetSegmentStatusByName(segment.name, status),
               ErrorCode::OK);
     EXPECT_EQ(status, SegmentStatus::DRAINING);
+    EXPECT_EQ(segment_access.ValidateRemountSegment(segment, client_id),
+              ErrorCode::OK);
     EXPECT_FALSE(segment_access.IsSegmentAllocatable(segment.name));
     EXPECT_FALSE(HasAllocatorForSegment(segment_manager, segment.id));
 
@@ -861,6 +863,8 @@ TEST_F(SegmentTest,
     {
         auto segment_access = segment_manager.getSegmentAccess();
         ASSERT_EQ(segment_access.PrepareGracefulUnmountSegment(segment.id),
+                  ErrorCode::OK);
+        EXPECT_EQ(segment_access.ValidateRemountSegment(segment, client_id),
                   ErrorCode::OK);
     }
 

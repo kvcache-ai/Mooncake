@@ -18,8 +18,45 @@ using WeightRpcResult =
 struct ObjectMeta {
     std::string key;
     std::optional<uint64_t> object_checksum;
+    struct_pack::compatible<StrictWriteProof, 1> strict_write_proof{};
 };
-YLT_REFL(ObjectMeta, key, object_checksum);
+YLT_REFL(ObjectMeta, key, object_checksum, strict_write_proof);
+
+// Start descriptors carry everything a producer needs to settle strict writes.
+// Malformed capabilities remain an invalid proof, never a legacy downgrade.
+inline std::optional<StrictWriteProof> MakeStrictWriteProof(
+    const std::vector<Replica::Descriptor>& replicas) {
+    std::optional<StrictWriteProof> proof;
+    for (const auto& replica : replicas) {
+        if (!replica.is_memory_replica()) continue;
+        const auto& memory = replica.get_memory_descriptor();
+        if (!memory.strict_tcp_instance) {
+            if (memory.strict_write_id || memory.strict_write_master_instance)
+                return StrictWriteProof{};
+            continue;
+        }
+        if (memory.strict_tcp_instance->empty() || !memory.strict_write_id ||
+            *memory.strict_write_id == 0 ||
+            !memory.strict_write_master_instance ||
+            *memory.strict_write_master_instance == UUID{}) {
+            return StrictWriteProof{};
+        }
+        if (!proof) {
+            proof = StrictWriteProof{*memory.strict_write_master_instance, {}};
+            proof->targets.reserve(replicas.size());
+        }
+        if (proof->master_instance != *memory.strict_write_master_instance)
+            return StrictWriteProof{};
+        proof->targets.push_back({replica.id, *memory.strict_write_id});
+    }
+    return proof;
+}
+
+enum class StrictWriteOperation : uint8_t {
+    COPY,
+    MOVE,
+    PROMOTION,
+};
 
 enum class ReplicaActionType {
     ADD = 0,

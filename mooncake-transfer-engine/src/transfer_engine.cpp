@@ -21,6 +21,9 @@
 #include <thread>
 #include <unordered_map>
 #include "error.h"
+#ifdef USE_TCP
+#include "transport/tcp_transport/tcp_transport.h"
+#endif
 
 namespace mooncake {
 namespace {
@@ -1342,6 +1345,74 @@ std::optional<tent::IntentType> toTentIntent(int intent_type) {
 #endif
 
 }  // namespace
+
+std::string TransferEngine::getTcpInstanceId() const {
+#ifdef USE_TCP
+    if (use_tent_ || !impl_) return {};
+    auto* tcp = dynamic_cast<TcpTransport*>(impl_->getTransport("tcp"));
+    return tcp ? tcp->instanceId() : std::string{};
+#else
+    return {};
+#endif
+}
+
+bool TransferEngine::isTcpRetired() const {
+#ifdef USE_TCP
+    if (use_tent_ || !impl_) return true;
+    auto* tcp = dynamic_cast<TcpTransport*>(impl_->getTransport("tcp"));
+    return !tcp || tcp->isRetired();
+#else
+    return true;
+#endif
+}
+
+bool TransferEngine::bindTcpMasterInstance(const std::string& master_instance) {
+#ifdef USE_TCP
+    if (use_tent_ || !impl_) return false;
+    auto* tcp = dynamic_cast<TcpTransport*>(impl_->getTransport("tcp"));
+    return tcp && tcp->bindTcpMasterInstance(master_instance);
+#else
+    (void)master_instance;
+    return false;
+#endif
+}
+
+bool TransferEngine::reserveLegacyTcpMount() {
+#ifdef USE_TCP
+    if (use_tent_ || !impl_) return true;
+    auto* tcp = dynamic_cast<TcpTransport*>(impl_->getTransport("tcp"));
+    return !tcp || tcp->reserveLegacyTcpMount();
+#else
+    return true;
+#endif
+}
+
+bool TransferEngine::retireStrictWrites() {
+#ifdef USE_TCP
+    if (use_tent_ || !impl_) return false;
+    auto* tcp = dynamic_cast<TcpTransport*>(impl_->getTransport("tcp"));
+    return tcp && tcp->retireStrictWrites();
+#else
+    return false;
+#endif
+}
+
+Status TransferEngine::submitStrictWriteTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    const std::string& expected_tcp_instance) {
+#ifdef USE_TCP
+    if (use_tent_ || !impl_)
+        return Status::NotImplemented("strict writes require classic TCP");
+    auto* tcp = dynamic_cast<TcpTransport*>(impl_->getTransport("tcp"));
+    if (!tcp) return Status::NotImplemented("classic TCP is not installed");
+    return tcp->submitStrictWrite(batch_id, entries, expected_tcp_instance);
+#else
+    (void)batch_id;
+    (void)entries;
+    (void)expected_tcp_instance;
+    return Status::NotImplemented("classic TCP is not built");
+#endif
+}
 
 int TransferEngine::getSegmentBuffers(SegmentHandle handle,
                                       std::vector<SegmentBufferInfo>& buffers) {

@@ -146,6 +146,23 @@ TEST_F(MetricsBootstrapConfigTest, RejectsOutOfRangeCommandLinePort) {
                  std::invalid_argument);
 }
 
+TEST(MasterServiceConfigTest, PiecePutDefaultsAndOverridesReachServingConfig) {
+    MasterConfig source{};
+    source.allocation_strategy = "random";
+    const MasterServiceConfig defaults(WrappedMasterServiceConfig(source, 0));
+    EXPECT_FALSE(defaults.enable_piece_put);
+    EXPECT_EQ(defaults.max_piece_put_rounds, 1024);
+    EXPECT_EQ(defaults.piece_put_timeout_sec, 30);
+
+    source.enable_piece_put = true;
+    source.max_piece_put_rounds = 17;
+    source.piece_put_timeout_sec = 45;
+    const MasterServiceConfig enabled(WrappedMasterServiceConfig(source, 0));
+    EXPECT_TRUE(enabled.enable_piece_put);
+    EXPECT_EQ(enabled.max_piece_put_rounds, 17);
+    EXPECT_EQ(enabled.piece_put_timeout_sec, 45);
+}
+
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
     MasterConfig master_config;
     EXPECT_EQ(1024u, master_config.oplog_batch_max_entries);

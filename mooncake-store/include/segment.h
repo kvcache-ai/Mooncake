@@ -80,6 +80,9 @@ class ScopedSegmentAccess {
 
     /**
      * @brief Mount a segment under its non-null owner's client ID.
+     * Errors other than OK/SEGMENT_ALREADY_EXISTS precede publication of
+     * allocator, Segment, or TCP endpoint state. Post-publication exceptions
+     * remain uncertain to the RPC caller.
      */
     ErrorCode MountSegment(const Segment& segment,
                            ClientSessionSharedPtr owner_session);
@@ -93,8 +96,10 @@ class ScopedSegmentAccess {
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
                              ClientSessionSharedPtr owner_session);
 
-    ErrorCode ValidateRemountSegment(const Segment& segment,
-                                     const UUID& client_id) const;
+    ErrorCode ValidateRemountSegment(
+        const Segment& segment, const UUID& client_id,
+        const ClientSessionSharedPtr& owner_session = {},
+        bool require_existing = false) const;
 
     bool GetSegment(const UUID& segment_id, Segment& segment) const;
 
@@ -119,7 +124,26 @@ class ScopedSegmentAccess {
      * @brief Prepare a segment for graceful unmount: remove allocator but keep
      *        segment metadata. Status becomes GRACEFULLY_UNMOUNTING.
      */
-    ErrorCode PrepareGracefulUnmountSegment(const UUID& segment_id);
+    ErrorCode PrepareGracefulUnmountSegment(
+        const UUID& segment_id,
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max());
+
+    [[nodiscard]] std::shared_ptr<SegmentAllocatorRegistration> GetRegistration(
+        const UUID& segment_id) const;
+    ErrorCode BindTcpInstance(const UUID& segment_id,
+                              const std::string& tcp_instance);
+    // Target attests the entire old endpoint has synchronously drained.
+    // Also fences instances whose delayed Mount has not arrived yet.
+    ErrorCode RetireTcpEndpoint(const UUID& client_id,
+                                const std::string& tcp_instance);
+    ErrorCode CloseForWrites(
+        const UUID& segment_id,
+        const std::shared_ptr<SegmentAllocatorRegistration>& expected);
+    // Only call after validating target-side drain and old-endpoint fencing.
+    ErrorCode MarkPhysicallyRetired(
+        const UUID& segment_id,
+        const std::shared_ptr<SegmentAllocatorRegistration>& expected);
 
     /**
      * @brief Deleting the segment to complete the unmounting operation
@@ -141,8 +165,11 @@ class ScopedSegmentAccess {
     /**
      * @brief Bind all segments of the owner's client ID to `owner_session`.
      */
-    void BindClientSession(const ClientSessionSharedPtr& owner_session);
-    void BindBufferToSegment(const UUID& segment_id, AllocatedBuffer& buffer);
+    ErrorCode ValidateClientSessionBinding(
+        const ClientSessionSharedPtr& owner_session) const;
+    ErrorCode BindClientSession(const ClientSessionSharedPtr& owner_session);
+    ErrorCode BindBufferToSegment(const UUID& segment_id,
+                                  AllocatedBuffer& buffer);
 
     /**
      * @brief Get the names of all the segments
@@ -210,6 +237,8 @@ class ScopedSegmentAccess {
                                      SegmentStatus status);
 
    private:
+    ErrorCode ValidateTcpMount(const Segment& segment,
+                               const UUID& client_id) const;
     void ReindexSegmentNameAfterRemoval(const UUID& removed_segment_id,
                                         const std::string& segment_name);
 
@@ -312,8 +341,19 @@ class ScopedAllocatorAccess {
         return allocator_manager_;
     }
 
+    // The shared segment lock keeps registration closure ordered with
+    // admission.
+    [[nodiscard]] tl::expected<SegmentWriteHold, ErrorCode> AcquireWriteHold(
+        const AllocatedBuffer& buffer, bool require_strict_tcp = true) const;
+
     AllocatorManager SnapshotAllocatorManager() const {
         return allocator_manager_.Snapshot(client_by_name_);
+    }
+
+    template <typename Predicate>
+    AllocatorManager SnapshotAllocatorManager(Predicate&& accepts) const {
+        return allocator_manager_.SnapshotMatching(
+            std::forward<Predicate>(accepts), client_by_name_);
     }
 
     std::vector<std::string> GetHostOrderedSegments(
@@ -402,6 +442,21 @@ class SegmentManager {
     std::shared_ptr<StorageUsageTracker> usage_tracker_ =
         std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
+    // Monotonic under segment_mutex_: no WriteHold can exist before a target
+    // successfully binds its first nonempty TCP instance.
+    bool has_piece_put_targets_{false};
+    struct TcpEndpointRecord {
+        UUID owner;
+        bool retired{false};
+        std::string endpoint;
+    };
+    // Master-lifetime tombstones: rejecting new instances at the bound is
+    // safer than forgetting a retired endpoint and admitting a delayed mount.
+    static constexpr size_t kMaxTcpEndpointRecords = 65536;
+    std::unordered_map<std::string, TcpEndpointRecord> tcp_endpoints_;
+    // One entry per historically protected endpoint; never silently downgrade
+    // the same remote address to a legacy TCP registration.
+    std::unordered_map<std::string, std::string> tcp_instance_by_endpoint_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
         memory_allocator_;  // Type of buffer allocator to use

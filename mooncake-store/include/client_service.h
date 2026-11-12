@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -30,6 +31,47 @@
 #include "pinned_buffer_pool.h"
 
 namespace mooncake {
+
+// One producer knows its own span and the complete object's size. All
+// producers of a round must supply the same upstream calculation write_id.
+struct PiecePutInput {
+    std::string key;
+    uint64_t total_size{0};
+    uint64_t offset{0};
+    std::string write_id;
+};
+
+// Recovery retains only operation metadata, never caller-owned payload buffers.
+struct PiecePutRecoveryBatch;
+class PiecePutRecovery {
+   public:
+    PiecePutRecovery(const PiecePutRecovery&) = default;
+    PiecePutRecovery(PiecePutRecovery&&) noexcept = default;
+    PiecePutRecovery& operator=(const PiecePutRecovery&) = default;
+    PiecePutRecovery& operator=(PiecePutRecovery&&) noexcept = default;
+
+   private:
+    friend class Client;
+    PiecePutRecovery(std::shared_ptr<const PiecePutRecoveryBatch> batch,
+                     size_t index) noexcept
+        : batch_(std::move(batch)), index_(index) {}
+    std::shared_ptr<const PiecePutRecoveryBatch> batch_;
+    size_t index_;
+};
+
+struct PiecePutResult {
+    tl::expected<PiecePutFinishResponse, ErrorCode> result =
+        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    // Retry this metadata operation; never resubmit its payload.
+    std::optional<PiecePutRecovery> recovery;
+
+    explicit operator bool() const { return result.has_value(); }
+    bool has_value() const { return result.has_value(); }
+    ErrorCode error() const { return result.error(); }
+    const PiecePutFinishResponse& value() const { return result.value(); }
+    const PiecePutFinishResponse& operator*() const { return *result; }
+    const PiecePutFinishResponse* operator->() const { return &*result; }
+};
 
 class PutOperation;
 class DistributedStorageBackend;
@@ -77,6 +119,29 @@ class QueryResult {
  */
 class Client {
    public:
+    static constexpr size_t kMaxPiecePutBatchSize = 64;
+
+    // Opt in before mounting. Retirement permanently shuts this TE's TCP
+    // endpoint down; it must happen before freeing a target's backing memory.
+    tl::expected<void, ErrorCode> EnablePiecePutTarget();
+    tl::expected<void, ErrorCode> RetirePiecePutEndpoint();
+
+    // Synchronous: all locally accepted transfers are drained before return.
+    // A successful item confirms this producer's bytes; round_state says
+    // whether the entire object has become readable. At most
+    // kMaxPiecePutBatchSize items. The result always has one entry per input;
+    // oversized batches are rejected with INVALID_PARAMS before any RPC.
+    std::vector<PiecePutResult> BatchPiecePut(
+        const std::vector<PiecePutInput>& inputs,
+        std::vector<std::vector<Slice>>& slices);
+    // Resolves uncertain control RPCs using the original identity. A failed
+    // result without a recovery means settlement is definitive; a new data
+    // attempt must use BatchPiecePut, not this metadata-only operation.
+    // The same batch limit applies. Rejected oversized retries retain valid
+    // recovery handles so callers can settle them in smaller batches.
+    std::vector<PiecePutResult> RetryPiecePut(
+        const std::vector<PiecePutRecovery>& operations);
+
     virtual ~Client();
 
     // One topology/registration snapshot serves every key or fragment in a
@@ -708,6 +773,9 @@ class Client {
         const std::string& key);
     virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const std::string& key, const std::string& tenant_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key, const std::string& tenant_id,
+        const StrictWriteProof& proof);
 
     /**
      * @brief Release master-side promotion task after a client-side failure
@@ -1163,6 +1231,16 @@ class Client {
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
+    // The Client UUID plus a monotonic nonce identifies an SDK operation.
+    // A new call never re-submits a previous operation's payload.
+    // Shared only through Start RPC admission, never through data transfer.
+    // Renewal waits for already-issued Starts before closing their session.
+    mutable std::shared_mutex piece_put_admission_mutex_;
+    PiecePutAdmission piece_put_admission_;
+    std::atomic<uint64_t> piece_put_sequence_{1};
+    std::chrono::steady_clock::time_point piece_put_admission_refreshed_{};
+    std::atomic<bool> piece_put_target_{false};
+    UUID piece_put_master_instance_{};
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
     // NoF initiator injected by RealClient; nullptr when NoF is unavailable.
     std::shared_ptr<NVMeoFInitiator> nof_initiator_;

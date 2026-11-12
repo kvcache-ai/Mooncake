@@ -100,6 +100,7 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
                                   ? config.root_fs_dir.value()
                                   : DEFAULT_ROOT_FS_DIR;
         wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
+        wms_cfg.enable_piece_put = config.enable_piece_put.value_or(false);
         if (config.enable_disk_eviction.has_value()) {
             wms_cfg.enable_disk_eviction = config.enable_disk_eviction.value();
         }

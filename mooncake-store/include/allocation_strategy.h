@@ -131,6 +131,11 @@ class AllocatorManager {
             if (target == it->second.end()) {
                 return false;
             }
+            if (replacement.expected->GetAllocator() !=
+                    replacement.replacement->GetAllocator() &&
+                ((*target)->HasWriteHolds() || (*target)->IsWriteClosed())) {
+                return false;
+            }
             auto* slot = std::addressof(*target);
             if (std::find(targets.begin(), targets.end(), slot) !=
                 targets.end()) {
@@ -151,6 +156,33 @@ class AllocatorManager {
         snapshot.allocators_ = allocators_;
         if (owners) {
             snapshot.owner_by_name_ = *owners;
+        }
+        return snapshot;
+    }
+
+    // Build request-local candidates while the caller owns segment access.
+    // Registrations stay shared; selection and allocation may run after unlock.
+    template <typename Predicate>
+    AllocatorManager SnapshotMatching(
+        Predicate&& accepts,
+        const std::unordered_map<std::string, UUID>* owners = nullptr) const {
+        AllocatorManager snapshot;
+        snapshot.names_.reserve(names_.size());
+        for (const auto& name : names_) {
+            const auto& registrations = allocators_.at(name);
+            std::vector<std::shared_ptr<SegmentAllocatorRegistration>> eligible;
+            for (const auto& registration : registrations) {
+                if (!accepts(*registration)) continue;
+                if (eligible.empty()) eligible.reserve(registrations.size());
+                eligible.push_back(registration);
+            }
+            if (eligible.empty()) continue;
+            snapshot.names_.push_back(name);
+            snapshot.allocators_.emplace(name, std::move(eligible));
+            if (owners) {
+                if (auto owner = owners->find(name); owner != owners->end())
+                    snapshot.owner_by_name_.emplace(*owner);
+            }
         }
         return snapshot;
     }

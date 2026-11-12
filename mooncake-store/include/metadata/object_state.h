@@ -4,6 +4,7 @@
 
 #include "common/heap_optional.h"
 #include "object_runtime_state.h"
+#include "piece_put_runtime.h"
 
 namespace mooncake {
 namespace route {
@@ -18,6 +19,8 @@ namespace route {
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
+    // Present only for a live or retiring PiecePut primary write.
+    std::unique_ptr<PiecePutRuntime> piece_put;
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;
@@ -31,8 +34,8 @@ struct ObjectState {
     HeapOptional<PromotionCandidate> promotion_candidate;
 
     bool HasWorkInFlight() const {
-        return is_processing || replication_task || offloading_task ||
-               promotion_task;
+        return is_processing || piece_put || replication_task ||
+               offloading_task || promotion_task;
     }
 };
 

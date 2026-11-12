@@ -135,6 +135,29 @@ class TransferEngine {
 
     int uninstallTransport(const std::string& proto);
 
+    // Empty for TENT or an engine without an installed classic TCP listener.
+    std::string getTcpInstanceId() const;
+    bool isTcpRetired() const;
+    // One listener incarnation can contribute strict-write backing to exactly
+    // one Master incarnation. Binding cannot be changed by Mount RPC retries.
+    bool bindTcpMasterInstance(const std::string& master_instance);
+    // Reserve a legacy Store mount before any registration or RPC. A listener
+    // with legacy address exposure cannot later become a strict Store target.
+    // Non-classic-TCP engines retain their existing mount behavior.
+    bool reserveLegacyTcpMount();
+
+    // Irreversible retirement of the entire classic TCP endpoint. Returns
+    // only after its listener, IO threads and pending handlers are gone.
+    // Never call from a TCP IO callback. Unsupported configurations fail
+    // closed.
+    bool retireStrictWrites();
+
+    // No fallback: preflight failure means no request was submitted. Accepted
+    // requests complete only through the peer-validated TCP v2 path.
+    Status submitStrictWriteTransfer(
+        BatchID batch_id, const std::vector<TransferRequest>& entries,
+        const std::string& expected_tcp_instance);
+
     std::string getLocalIpAndPort();
 
     int getRpcPort();

@@ -439,6 +439,13 @@ DEFINE_uint64(put_start_release_timeout_sec,
               mooncake::DEFAULT_PUT_START_RELEASE_TIMEOUT,
               "Timeout for releasing space allocated in uncompleted PutStart "
               "operations");
+DEFINE_bool(enable_piece_put, false,
+            "Enable single-Master TCP/OFFSET PiecePut (one memory replica)");
+DEFINE_uint64(max_piece_put_rounds, 1024,
+              "Maximum number of incomplete PiecePut objects");
+DEFINE_uint64(
+    piece_put_timeout_sec, 30,
+    "PiecePut collection deadline in seconds; does not free unknown writes");
 DEFINE_bool(enable_disk_eviction, true,
             "Enable disk eviction feature for storage backend (default: true)");
 DEFINE_uint64(
@@ -752,6 +759,14 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("put_start_release_timeout_sec",
                              &master_config.put_start_release_timeout_sec,
                              FLAGS_put_start_release_timeout_sec);
+    default_config.GetBool("enable_piece_put", &master_config.enable_piece_put,
+                           FLAGS_enable_piece_put);
+    default_config.GetUInt64("max_piece_put_rounds",
+                             &master_config.max_piece_put_rounds,
+                             FLAGS_max_piece_put_rounds);
+    default_config.GetUInt64("piece_put_timeout_sec",
+                             &master_config.piece_put_timeout_sec,
+                             FLAGS_piece_put_timeout_sec);
     default_config.GetBool("enable_disk_eviction",
                            &master_config.enable_disk_eviction,
                            FLAGS_enable_disk_eviction);
@@ -1299,6 +1314,21 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.put_start_release_timeout_sec =
             FLAGS_put_start_release_timeout_sec;
     }
+    if ((google::GetCommandLineFlagInfo("enable_piece_put", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_piece_put = FLAGS_enable_piece_put;
+    }
+    if ((google::GetCommandLineFlagInfo("max_piece_put_rounds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_piece_put_rounds = FLAGS_max_piece_put_rounds;
+    }
+    if ((google::GetCommandLineFlagInfo("piece_put_timeout_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.piece_put_timeout_sec = FLAGS_piece_put_timeout_sec;
+    }
     if ((google::GetCommandLineFlagInfo("enable_disk_eviction", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1497,6 +1527,20 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "Invalid Client liveness configuration: " << error.what();
         return 1;
     }
+    if (master_config.enable_piece_put &&
+        (master_config.enable_ha || master_config.enable_oplog ||
+         master_config.enable_oplog_snapshot || master_config.enable_cxl ||
+         master_config.allocation_strategy == "cxl" ||
+         master_config.memory_allocator != "offset" ||
+         master_config.max_piece_put_rounds == 0 ||
+         master_config.piece_put_timeout_sec == 0 ||
+         master_config.piece_put_timeout_sec > 24 * 60 * 60)) {
+        LOG(ERROR)
+            << "PiecePut requires a single Master, the offset allocator, "
+               "positive round and timeout limits, and a timeout <= 86400 "
+               "seconds";
+        return 1;
+    }
     ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     // Fall back to environment variables for pod identity (K8s Downward API)
@@ -1613,6 +1657,9 @@ int main(int argc, char* argv[]) {
         << ", enable_metric_reporting=" << master_config.metrics.enabled
         << ", metrics_port=" << master_config.metrics.port
         << ", metrics_host=" << master_config.metrics.host
+        << ", enable_piece_put=" << master_config.enable_piece_put
+        << ", max_piece_put_rounds=" << master_config.max_piece_put_rounds
+        << ", piece_put_timeout_sec=" << master_config.piece_put_timeout_sec
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
         << ", max_kv_soft_pin_ttl=" << master_config.max_kv_soft_pin_ttl

@@ -8305,6 +8305,8 @@ std::vector<int> RealClient::batch_put_session_end(
     std::vector<std::string> end_keys;
     std::vector<size_t> end_indices;
     std::vector<char> has_nof;
+    std::vector<ObjectMeta> end_metas;
+    end_metas.reserve(keys.size());
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -8330,6 +8332,10 @@ std::vector<int> RealClient::batch_put_session_end(
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
+            ObjectMeta meta{keys[i], std::nullopt};
+            if (auto proof = MakeStrictWriteProof(it->second.replicas))
+                meta.strict_write_proof = std::move(*proof);
+            end_metas.push_back(std::move(meta));
             end_keys.push_back(keys[i]);
             end_indices.push_back(i);
             has_nof.push_back(static_cast<char>(nof));
@@ -8342,11 +8348,6 @@ std::vector<int> RealClient::batch_put_session_end(
         return ToPyResults(results);
     }
 
-    std::vector<ObjectMeta> end_metas;
-    end_metas.reserve(end_keys.size());
-    for (const auto &key : end_keys) {
-        end_metas.emplace_back(ObjectMeta{key, std::nullopt});
-    }
     auto end_responses = client_->BatchPutEnd(end_metas, ReplicaType::MEMORY);
     if (end_responses.size() != end_keys.size()) {
         for (size_t j = 0; j < end_keys.size(); ++j) {

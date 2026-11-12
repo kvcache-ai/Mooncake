@@ -50,6 +50,8 @@
 #include "metadata/object_route.h"
 #include "metadata/object_state.h"
 #include "promotion_candidate_tracker.h"
+#include "piece_put_types.h"
+#include "piece_put_admission.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
@@ -172,6 +174,10 @@ class MasterService {
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
+
+    // Explicit acceptance information for PiecePut target memory cleanup.
+    auto MountSegmentWithOutcome(const Segment& segment, const UUID& client_id)
+        -> MountSegmentOutcome;
 
     /**
      * @brief Mount a NoF SSD segment for buffer allocation. This function is
@@ -425,6 +431,32 @@ class MasterService {
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
+    // Experimental v1: one CPU/TCP MEMORY replica, with bounded producer
+    // admission.
+    auto GetPiecePutMasterInstance() const -> tl::expected<UUID, ErrorCode>;
+    auto GetPiecePutAdmission(const UUID& client_id,
+                              uint64_t previous_session_id,
+                              const std::string& host_id = {})
+        -> tl::expected<PiecePutAdmission, ErrorCode>;
+    // Called without master/key locks by periodic maintenance.
+    void SweepPiecePutAdmissions();
+    auto PiecePutStart(const UUID& client_id,
+                       const PiecePutStartRequest& request,
+                       const TenantId& tenant_id)
+        -> tl::expected<PiecePutStartResponse, ErrorCode>;
+    std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+    BatchPiecePutStart(const UUID& client_id,
+                       const std::vector<PiecePutStartRequest>& requests,
+                       const TenantId& tenant_id);
+    auto PiecePutFinish(const UUID& client_id,
+                        const PiecePutFinishRequest& request,
+                        const TenantId& tenant_id)
+        -> tl::expected<PiecePutFinishResponse, ErrorCode>;
+    // Target attests that its entire old TCP endpoint is closed and drained.
+    auto RetirePiecePutEndpoint(const UUID& client_id,
+                                const std::string& tcp_instance)
+        -> tl::expected<void, ErrorCode>;
+
     auto PutStart(const UUID& client_id, const std::string& key,
                   const TenantId& tenant_id, const uint64_t slice_length,
                   const ReplicateConfig& config)
@@ -604,7 +636,9 @@ class MasterService {
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id,
         const UUID& dynamic_replication_lease_id = UUID{},
-        uint64_t dynamic_replication_version_epoch = 0);
+        uint64_t dynamic_replication_version_epoch = 0,
+        const std::optional<StrictWriteProof>& strict_write_proof =
+            std::nullopt);
 
     tl::expected<void, ErrorCode> CopyRevoke(
         const UUID& client_id, const std::string& key,
@@ -630,9 +664,11 @@ class MasterService {
         const TenantId& tenant_id, const std::string& src_segment,
         const std::string& tgt_segment);
 
-    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
-                                          const std::string& key,
-                                          const TenantId& tenant_id);
+    tl::expected<void, ErrorCode> MoveEnd(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id,
+        const std::optional<StrictWriteProof>& strict_write_proof =
+            std::nullopt);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
@@ -840,7 +876,9 @@ class MasterService {
      * NotifyOffloadSuccess.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
-                                const TenantId& tenant_id)
+                                const TenantId& tenant_id,
+                                const std::optional<StrictWriteProof>&
+                                    strict_write_proof = std::nullopt)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1067,6 +1105,10 @@ class MasterService {
     void StopHttpMetadataCleanup();
 
    private:
+    auto MountSegmentImpl(const Segment& segment, const UUID& client_id,
+                          bool& definitely_not_accepted)
+        -> tl::expected<void, ErrorCode>;
+
     // Lifecycle wrapper around the restore implementation: performs the
     // {Constructed, Ready, Failed} -> Recovering -> {Ready, Failed}
     // transitions so a promotion restore has an explicit lifecycle
@@ -1225,6 +1267,18 @@ class MasterService {
     // the namespaces so that it outlives them.
     NamespacePolicy* policy_ = nullptr;
 
+    const bool enable_piece_put_;
+    const size_t max_piece_put_rounds_;
+    const std::chrono::seconds piece_put_timeout_;
+    const UUID piece_put_master_instance_;
+    std::atomic<uint64_t> next_strict_write_id_{1};
+    // Outlives namespaces_ and the runtime charges stored in their records.
+    std::atomic<size_t> piece_put_rounds_{0};
+    PiecePutAdmissionRegistry piece_put_admissions_;
+    // TestPeer pins the namespace-miss race before a non-granting request
+    // consumes its nonce. Set only while no request is running.
+    std::function<void()> piece_put_missing_namespace_hook_;
+
     // One namespace per tenant id written to, each owning that tenant's object
     // route; a namespace stays put once created (see NamespaceTable).
     metadata::NamespaceTable namespaces_{[this](const TenantId& tenant_id) {
@@ -1287,10 +1341,18 @@ class MasterService {
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
-    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+    tl::expected<void, ErrorCode> PrepareMemoryWrites(
+        std::span<Replica> replicas);
+    uint64_t AllocateStrictWriteId();
+    bool ValidateStrictWriteProof(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& is_target,
+        const StrictWriteProof* proof) const;
+    class ScopedReplicaRemoval;
+    ScopedReplicaRemoval PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
-    std::vector<Replica> PopReplicasWithCacheTotalAccounting(
+    ScopedReplicaRemoval PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
@@ -1447,6 +1509,25 @@ class MasterService {
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     class MetadataAccessorRW;
+    // Caller holds master_state_mutex_; traverses only namespace in-flight
+    // keys.
+    void SweepPiecePutRoundsLocked();
+    struct PiecePutPlacement {
+        std::string writer_host_id;
+        std::optional<AllocatorManager> allocators;
+    };
+    PiecePutPlacement MakePiecePutPlacement(const UUID& client_id) const;
+    auto PiecePutStartImpl(const UUID& client_id,
+                           const PiecePutStartRequest& request,
+                           const TenantId& tenant_id,
+                           PiecePutPlacement& placement)
+        -> tl::expected<PiecePutStartResponse, ErrorCode>;
+    void ScheduleEagerOffload(MetadataAccessorRW& accessor);
+    void RefreshPiecePutRound(PiecePutRuntime& runtime);
+    auto ValidatePiecePutMount(const Segment& segment) const
+        -> tl::expected<void, ErrorCode>;
+    bool IsPublishedPiecePutRound(MetadataAccessorRW& accessor,
+                                  const PiecePutToken& token);
     // Publishes a new object under the key `accessor` holds, which must hold
     // none.
     auto InsertMetadata(MetadataAccessorRW& accessor, const UUID& client_id,
@@ -1562,7 +1643,12 @@ class MasterService {
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
         UUID client_id;
+        std::weak_ptr<SegmentAllocatorRegistration> registration;
+        std::chrono::steady_clock::time_point original_deadline;
     };
+    auto UnmountSegmentImpl(const UUID& segment_id, const UUID& client_id,
+                            const GracefulUnmountDeadlineRecord* deadline)
+        -> tl::expected<void, ErrorCode>;
 
     DeadlineScheduler<GracefulUnmountDeadlineRecord>
         graceful_unmount_scheduler_;
@@ -1700,6 +1786,17 @@ class MasterService {
             }
         }
 
+        struct ExistingKey {};
+        // Holds the key, including an absent object, only if its namespace
+        // already exists. A miss does not create a permanent namespace.
+        MetadataAccessorRW(MasterService* service,
+                           const ObjectIdentity& object_id, ExistingKey)
+            : service_(service),
+              ns_(service_->namespaces_.Lookup(object_id.tenant_id)),
+              guard_(ns_ == nullptr
+                         ? std::optional<route::WriteGuard>()
+                         : ns_->objects.WriteKey(object_id.user_key)) {}
+
         // Holds the key only while `ref` is still its current publication: a
         // key republished since `ref` was taken, or emptied, is not held.
         // The held object is left as it is, without the invalid-replica
@@ -1725,6 +1822,9 @@ class MasterService {
         bool IsPublished() const {
             return guard_.has_value() && guard_->has_object();
         }
+
+        // Also true for an absent object held by CreateKey or ExistingKey.
+        bool HasKeyGuard() const { return guard_.has_value(); }
 
         bool InProcessing() const {
             return IsPublished() && guard_->state().is_processing;
@@ -1767,8 +1867,8 @@ class MasterService {
         // Publishes an object under the held key, which must hold none:
         // builds its metadata in place from `metadata_args`, ObjectMetadata's
         // constructor arguments, with an empty state, and wires a grouped
-        // object to its group's shared lease. Only a CreateKey accessor holds
-        // a key with no object. Returns the new publication's generation.
+        // object to its group's shared lease. CreateKey and ExistingKey can
+        // hold a key with no object. Returns the publication's generation.
         template <typename... Args>
         route::Generation Publish(Args&&... metadata_args) {
             assert(guard_.has_value() && !guard_->has_object());
@@ -2117,22 +2217,75 @@ class MasterService {
                 1, mem_size_);
         }
 
+        // Prepare queue storage before detaching an exposed target. An unused
+        // reservation does not affect discarded-replica metrics.
+        explicit DiscardedReplicas(size_t capacity)
+            : ttl_(std::chrono::system_clock::now()),
+              mem_size_(0),
+              accounted_(false) {
+            replicas_.reserve(capacity);
+        }
+
         ~DiscardedReplicas() {
-            MasterMetricManager::instance().inc_put_start_release_cnt(
+            if (accounted_) {
+                MasterMetricManager::instance().inc_put_start_release_cnt(
+                    1, mem_size_);
+            }
+        }
+
+        void AppendReserved(Replica&& replica) noexcept {
+            assert(replicas_.size() < replicas_.capacity());
+            mem_size_ += replica.get_memory_buffer_size();
+            replicas_.push_back(std::move(replica));
+        }
+
+        void Account() noexcept {
+            assert(!accounted_);
+            accounted_ = true;
+            MasterMetricManager::instance().inc_put_start_discard_cnt(
                 1, mem_size_);
         }
 
         uint64_t memSize() const { return mem_size_; }
 
         bool isExpired(const std::chrono::system_clock::time_point& now) const {
-            return ttl_ <= now;
+            return ttl_ <= now &&
+                   std::none_of(replicas_.begin(), replicas_.end(),
+                                [](const Replica& replica) {
+                                    return replica.has_unsettled_write();
+                                });
         }
 
        private:
         std::vector<Replica> replicas_;
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
+        bool accounted_{true};
     };
+
+    // Owns detached replicas across allocating bookkeeping. Its reserved queue
+    // node and vector capacity are prepared while metadata still owns every
+    // allocation. On any exit, unsettled targets move to the existing discard
+    // queue without allocating; completed/retired replicas release normally.
+    class ScopedReplicaRemoval {
+       public:
+        ScopedReplicaRemoval(
+            MasterService& service, ObjectMetadata& metadata,
+            const std::function<bool(const Replica&)>& predicate,
+            bool pop_all = false);
+        ~ScopedReplicaRemoval();
+        ScopedReplicaRemoval(ScopedReplicaRemoval&&) noexcept = default;
+        ScopedReplicaRemoval(const ScopedReplicaRemoval&) = delete;
+        ScopedReplicaRemoval& operator=(const ScopedReplicaRemoval&) = delete;
+
+        std::vector<Replica>& replicas() { return replicas_; }
+
+       private:
+        MasterService& service_;
+        std::list<DiscardedReplicas> quarantine_;
+        std::vector<Replica> replicas_;
+    };
+
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "piece_put_types.h"
+
 #include <atomic>
 #include <csignal>
 #include <memory>
@@ -95,6 +97,21 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
  */
 class MasterClient {
    public:
+    tl::expected<UUID, ErrorCode> GetPiecePutMasterInstance();
+    tl::expected<PiecePutAdmission, ErrorCode> GetPiecePutAdmission(
+        uint64_t previous_session_id, const std::string& host_id = {});
+    tl::expected<void, ErrorCode> CompleteProtectedReplicaWrite(
+        const std::string& key, const std::string& tenant_id,
+        const StrictWriteProof& proof, StrictWriteOperation operation,
+        const UUID& dynamic_lease_id = UUID{}, uint64_t dynamic_version = 0);
+    tl::expected<void, ErrorCode> RetirePiecePutEndpoint(
+        const std::string& tcp_instance);
+
+    std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+    BatchPiecePutStart(const std::vector<PiecePutStartRequest>& requests);
+    std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+    BatchPiecePutFinish(const std::vector<PiecePutFinishRequest>& requests);
+
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(),
@@ -389,6 +406,11 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
         const Segment& segment);
+
+    // Outer errors leave acceptance uncertain; inspect the explicit outcome
+    // only after receiving a successful response from Master.
+    [[nodiscard]] tl::expected<MountSegmentOutcome, ErrorCode>
+    MountSegmentWithOutcome(const Segment& segment);
 
     [[nodiscard]] tl::expected<void, ErrorCode> MountSSDSegment(
         const Segment& segment);

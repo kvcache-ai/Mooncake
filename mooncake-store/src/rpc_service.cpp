@@ -466,6 +466,160 @@ WrappedMasterService::GetReplicaListForAdmin(const std::string& key,
         [&](auto& timer) { timer.LogRequest("key=", key); }, [] {}, [] {});
 }
 
+tl::expected<PiecePutAdmission, ErrorCode>
+WrappedMasterService::GetPiecePutAdmission(const UUID& client_id,
+                                           uint64_t previous_session_id,
+                                           const std::string& host_id) {
+    return execute_rpc(
+        "GetPiecePutAdmission",
+        [&] {
+            return master_service_.GetPiecePutAdmission(
+                client_id, previous_session_id, host_id);
+        },
+        [](auto&) {}, [] {}, [] {});
+}
+
+tl::expected<UUID, ErrorCode>
+WrappedMasterService::GetPiecePutMasterInstance() {
+    return execute_rpc(
+        "GetPiecePutMasterInstance",
+        [&] { return master_service_.GetPiecePutMasterInstance(); },
+        [](auto&) {}, [] {}, [] {});
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::CompleteProtectedReplicaWrite(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const StrictWriteProof& proof, StrictWriteOperation operation,
+    const UUID& dynamic_lease_id, uint64_t dynamic_version) {
+    return execute_rpc(
+        "CompleteProtectedReplicaWrite",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& tenant) -> tl::expected<void, ErrorCode> {
+                    switch (operation) {
+                        case StrictWriteOperation::COPY:
+                            return master_service_.CopyEnd(
+                                client_id, key, tenant, dynamic_lease_id,
+                                dynamic_version, proof);
+                        case StrictWriteOperation::MOVE:
+                            if (dynamic_lease_id != UUID{} ||
+                                dynamic_version != 0)
+                                return tl::make_unexpected(
+                                    ErrorCode::INVALID_PARAMS);
+                            return master_service_.MoveEnd(client_id, key,
+                                                           tenant, proof);
+                        case StrictWriteOperation::PROMOTION:
+                            if (dynamic_lease_id != UUID{} ||
+                                dynamic_version != 0)
+                                return tl::make_unexpected(
+                                    ErrorCode::INVALID_PARAMS);
+                            return master_service_.NotifyPromotionSuccess(
+                                client_id, key, tenant, proof);
+                    }
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                });
+        },
+        [](auto&) {}, [] {}, [] {});
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::RetirePiecePutEndpoint(
+    const UUID& client_id, const std::string& tcp_instance) {
+    return execute_rpc(
+        "RetirePiecePutEndpoint",
+        [&] {
+            return master_service_.RetirePiecePutEndpoint(client_id,
+                                                          tcp_instance);
+        },
+        [](auto&) {}, [] {}, [] {});
+}
+
+std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+WrappedMasterService::BatchPiecePutStart(
+    const UUID& client_id, const std::vector<PiecePutStartRequest>& requests,
+    const std::string& tenant_id) {
+    std::vector<tl::expected<PiecePutStartResponse, ErrorCode>> results;
+    if (requests.size() > 64) return results;
+    ScopedVLogTimer timer(1, "BatchPiecePutStart");
+    const size_t total = requests.size();
+    timer.LogRequest("client_id=", client_id, ", pieces_count=", total);
+    auto& metrics = MasterMetricManager::instance();
+    // Include PiecePut control batches in the existing write request family.
+    metrics.inc_batch_put_start_requests(total);
+    results.reserve(total);
+    auto tenant = ResolveTenantIdForWrite(
+        tenant_id, master_service_.IsTenantQuotaEnabled());
+    if (!tenant) {
+        results.assign(total, tl::make_unexpected(tenant.error()));
+    } else {
+        results =
+            master_service_.BatchPiecePutStart(client_id, requests, *tenant);
+    }
+    size_t failures = 0;
+    int64_t already_exists = 0;
+    for (const auto& result : results) {
+        if (!result) {
+            ++failures;
+            if (result.error() == ErrorCode::OBJECT_ALREADY_EXISTS)
+                ++already_exists;
+        }
+    }
+    if (already_exists != 0)
+        metrics.inc_batch_put_start_object_already_exists(already_exists);
+    if (failures != 0) {
+        if (failures == total)
+            metrics.inc_batch_put_start_failures(failures);
+        else
+            metrics.inc_batch_put_start_partial_success(failures);
+    }
+    timer.LogResponse("total=", total, ", success=", total - failures,
+                      ", failures=", failures);
+    return results;
+}
+
+std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+WrappedMasterService::BatchPiecePutFinish(
+    const UUID& client_id, const std::vector<PiecePutFinishRequest>& requests,
+    const std::string& tenant_id) {
+    std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>> results;
+    if (requests.size() > 64) return results;
+    ScopedVLogTimer timer(1, "BatchPiecePutFinish");
+    const size_t total = requests.size();
+    timer.LogRequest("client_id=", client_id, ", pieces_count=", total);
+    auto& metrics = MasterMetricManager::instance();
+    // These count accepted/failed Finish reports, including NO_POST and
+    // UNCERTAIN. A successful report does not imply object publication.
+    metrics.inc_batch_put_end_requests(total);
+    results.reserve(total);
+    auto tenant = ResolveRequestTenantId(master_service_.IsTenantQuotaEnabled()
+                                             ? std::string_view(tenant_id)
+                                             : TenantId::kDefaultValue);
+    if (!tenant) {
+        results.assign(total, tl::make_unexpected(tenant.error()));
+    } else {
+        for (const auto& request : requests) {
+            results.emplace_back(
+                master_service_.PiecePutFinish(client_id, request, *tenant));
+        }
+    }
+    size_t failures = 0;
+    for (const auto& result : results) {
+        if (!result) ++failures;
+    }
+    if (failures != 0) {
+        if (failures == total)
+            metrics.inc_batch_put_end_failures(failures);
+        else
+            metrics.inc_batch_put_end_partial_success(failures);
+    }
+    timer.LogResponse("total=", total, ", success=", total - failures,
+                      ", failures=", failures);
+    return results;
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const uint64_t slice_length,
@@ -1062,6 +1216,23 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
         },
         [] { MasterMetricManager::instance().inc_mount_segment_requests(); },
         [] { MasterMetricManager::instance().inc_mount_segment_failures(); });
+}
+
+tl::expected<MountSegmentOutcome, ErrorCode>
+WrappedMasterService::MountSegmentWithOutcome(const Segment& segment,
+                                              const UUID& client_id) {
+    TestFailPoint::Wait("rpc_mount_segment_before_service");
+    ScopedVLogTimer timer(1, "MountSegmentWithOutcome");
+    timer.LogRequest("base=", segment.base, ", size=", segment.size,
+                     ", segment_name=", segment.name, ", id=", segment.id);
+    MasterMetricManager::instance().inc_mount_segment_requests();
+    auto outcome = master_service_.MountSegmentWithOutcome(segment, client_id);
+    if (outcome.error != ErrorCode::OK) {
+        MasterMetricManager::instance().inc_mount_segment_failures();
+    }
+    timer.LogResponse("error=", outcome.error, ", definitely_not_accepted=",
+                      outcome.definitely_not_accepted);
+    return outcome;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
@@ -2080,6 +2251,12 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::GetReplicaListByRegex,
         &WrappedMasterService::GetReplicaList,
         &WrappedMasterService::BatchGetReplicaList,
+        &WrappedMasterService::GetPiecePutMasterInstance,
+        &WrappedMasterService::GetPiecePutAdmission,
+        &WrappedMasterService::CompleteProtectedReplicaWrite,
+        &WrappedMasterService::RetirePiecePutEndpoint,
+        &WrappedMasterService::BatchPiecePutStart,
+        &WrappedMasterService::BatchPiecePutFinish,
         &WrappedMasterService::PutStart, &WrappedMasterService::PutEnd,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
@@ -2091,6 +2268,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::BatchUpsertRevoke, &WrappedMasterService::Remove,
         &WrappedMasterService::RemoveByRegex, &WrappedMasterService::RemoveAll,
         &WrappedMasterService::BatchRemove, &WrappedMasterService::MountSegment,
+        &WrappedMasterService::MountSegmentWithOutcome,
         &WrappedMasterService::MountNoFSegment,
         &WrappedMasterService::ReMountSegment,
         &WrappedMasterService::ReMountNoFSegment,

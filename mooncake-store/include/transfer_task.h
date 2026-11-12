@@ -638,6 +638,13 @@ class TransferSubmitter {
      * @brief Submit a range read: read [src_offset, src_offset+size) from
      * object into slice.ptr. Slices must total exactly `size` bytes.
      */
+    // Opt-in CPU/classic TCP write. nullopt means no work was submitted.
+    // Accepted failures are uncertain remote outcomes. Destruction/get drains
+    // every local fragment before the caller may release its source buffers.
+    std::optional<TransferFuture> submitStrictWrite(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        const std::string& expected_tcp_instance);
+
     std::optional<TransferFuture> submitRangeRead(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         uint64_t src_offset,
@@ -764,6 +771,10 @@ class TransferSubmitter {
      */
     void updateTransferMetrics(const std::vector<Slice>& slices,
                                TransferRequest::OpCode op);
+
+    std::optional<TransferFuture> submitStrictTransfer(
+        std::vector<TransferRequest>& requests,
+        const std::string& expected_tcp_instance);
 
     std::optional<TransferFuture> submitTransfer(
         std::vector<TransferRequest>& requests,

@@ -22,6 +22,7 @@
 
 #include "types.h"
 #include "allocator.h"
+#include "segment_allocator_registration.h"
 #include "master_metric_manager.h"
 
 namespace mooncake {
@@ -30,6 +31,20 @@ namespace mooncake {
  * @brief Globally unique replica identification.
  */
 using ReplicaID = uint64_t;
+
+struct StrictWriteTarget {
+    ReplicaID replica_id{0};
+    uint64_t write_id{0};
+    bool operator==(const StrictWriteTarget&) const = default;
+};
+YLT_REFL(StrictWriteTarget, replica_id, write_id);
+
+// Settlement names the exact ordinary write grants, including their Master.
+struct StrictWriteProof {
+    UUID master_instance{};
+    std::vector<StrictWriteTarget> targets;
+};
+YLT_REFL(StrictWriteProof, master_instance, targets);
 
 /**
  * @brief Stream operator for ReplicaType
@@ -325,6 +340,13 @@ inline ReplicaWriteMode DetermineReplicaWriteMode(
 
 struct MemoryReplicaData {
     std::unique_ptr<AllocatedBuffer> buffer;
+    // Empty for completed and legacy replicas. An exposed strict TCP target
+    // keeps one registration hold until success or physical retirement.
+    std::unique_ptr<SegmentWriteHold> write_hold{};
+    // Keep the last identity after completion for idempotent End validation.
+    // A protected PiecePut replica has a Master identity but no ordinary id.
+    uint64_t strict_write_id{0};
+    UUID strict_write_master_instance{};
 };
 
 struct NoFReplicaData {
@@ -364,7 +386,11 @@ struct DfsReplicaData {
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     struct_pack::compatible<SegmentLocality, 1> locality;
-    YLT_REFL(MemoryDescriptor, buffer_descriptor, locality);
+    struct_pack::compatible<std::string, 2> strict_tcp_instance;
+    struct_pack::compatible<uint64_t, 3> strict_write_id;
+    struct_pack::compatible<UUID, 4> strict_write_master_instance;
+    YLT_REFL(MemoryDescriptor, buffer_descriptor, locality, strict_tcp_instance,
+             strict_write_id, strict_write_master_instance);
 };
 
 struct NoFDescriptor {
@@ -590,6 +616,11 @@ class Replica {
         return false;  // DiskReplicaData does not have handles
     }
 
+    [[nodiscard]] const AllocatedBuffer* memory_buffer() const {
+        const auto* memory = std::get_if<MemoryReplicaData>(&data_);
+        return memory == nullptr ? nullptr : memory->buffer.get();
+    }
+
     bool replace_memory_buffer(std::unique_ptr<AllocatedBuffer> buffer) {
         if (!buffer || !is_memory_replica()) {
             return false;
@@ -677,9 +708,64 @@ class Replica {
     [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
         const;
 
+    // Called before publishing an ordinary write descriptor. The caller may
+    // drop this hold on an unexposed allocation rollback; after publication,
+    // only successful strict completion or physical retirement permits reuse.
+    void bind_write_hold(SegmentWriteHold hold, uint64_t write_id,
+                         const UUID& master_instance) {
+        auto owned = hold ? std::make_unique<SegmentWriteHold>(std::move(hold))
+                          : nullptr;
+        bind_write_hold(std::move(owned), write_id, master_instance);
+    }
+
+    // In-place updates prepare every owning wrapper before committing any
+    // target, so allocation failure cannot leave a partially bound object.
+    void bind_write_hold(std::unique_ptr<SegmentWriteHold> hold,
+                         uint64_t write_id,
+                         const UUID& master_instance) noexcept {
+        assert(is_memory_replica());
+        auto& memory = std::get<MemoryReplicaData>(data_);
+        assert(!memory.write_hold);
+        if (hold) {
+            assert(write_id != 0 && master_instance != UUID{});
+            memory.write_hold = std::move(hold);
+            memory.strict_write_id = write_id;
+            memory.strict_write_master_instance = master_instance;
+        }
+    }
+
+    void bind_piece_put_identity(const UUID& master_instance) {
+        auto& memory = std::get<MemoryReplicaData>(data_);
+        memory.strict_write_id = 0;
+        memory.strict_write_master_instance = master_instance;
+    }
+
+    [[nodiscard]] uint64_t strict_write_id() const {
+        const auto* memory = std::get_if<MemoryReplicaData>(&data_);
+        return memory ? memory->strict_write_id : 0;
+    }
+
+    [[nodiscard]] UUID strict_write_master_instance() const {
+        const auto* memory = std::get_if<MemoryReplicaData>(&data_);
+        return memory ? memory->strict_write_master_instance : UUID{};
+    }
+
+    [[nodiscard]] bool has_unsettled_write() const {
+        const auto* memory = std::get_if<MemoryReplicaData>(&data_);
+        return memory && memory->write_hold &&
+               !memory->write_hold->IsPhysicallyRetired();
+    }
+
+    void release_unexposed_write_hold() {
+        if (auto* memory = std::get_if<MemoryReplicaData>(&data_)) {
+            memory->write_hold.reset();
+        }
+    }
+
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::COMPLETE;
+            release_unexposed_write_hold();
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
         } else {
@@ -982,6 +1068,13 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         if (mem_data.buffer) {
             mem_desc.buffer_descriptor =
                 mem_data.buffer->get_descriptor(&mem_desc.locality);
+            if (mem_data.write_hold) {
+                mem_desc.strict_tcp_instance =
+                    mem_data.write_hold->registration()->TcpInstance();
+                mem_desc.strict_write_id = mem_data.strict_write_id;
+                mem_desc.strict_write_master_instance =
+                    mem_data.strict_write_master_instance;
+            }
         } else {
             mem_desc.buffer_descriptor.size_ = 0;
             mem_desc.buffer_descriptor.buffer_address_ = 0;

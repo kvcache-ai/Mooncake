@@ -164,6 +164,94 @@ std::optional<UUID> ScopedAllocatorAccess::GetOwnerClientId(
     return it->second;
 }
 
+tl::expected<SegmentWriteHold, ErrorCode>
+ScopedAllocatorAccess::AcquireWriteHold(const AllocatedBuffer& buffer,
+                                        bool require_strict_tcp) const {
+    if (!buffer.isAvailable()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    const auto descriptor = buffer.get_descriptor();
+    if (descriptor.protocol_ != "tcp") {
+        if (!require_strict_tcp) return SegmentWriteHold{};
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto* registrations =
+        allocator_manager_.getAllocators(buffer.getSegmentName());
+    if (registrations == nullptr) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    for (const auto& registration : *registrations) {
+        if (!registration->OwnsBuffer(buffer) ||
+            registration->GetAllocator() != buffer.getAllocator()) {
+            continue;
+        }
+        if (registration->TcpInstance().empty()) {
+            if (!require_strict_tcp) return SegmentWriteHold{};
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!registration->IsAllocatable() || registration->IsWriteClosed()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        registration->write_holds_.fetch_add(1, std::memory_order_acq_rel);
+        return SegmentWriteHold(registration, registration->GetAllocator());
+    }
+    return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+ErrorCode ScopedSegmentAccess::ValidateTcpMount(const Segment& segment,
+                                                const UUID& client_id) const {
+    const bool strict = segment.tcp_instance && !segment.tcp_instance->empty();
+    const auto bound =
+        segment_manager_->tcp_instance_by_endpoint_.find(segment.te_endpoint);
+    if (bound != segment_manager_->tcp_instance_by_endpoint_.end()) {
+        if (!strict) {
+            return segment_manager_->tcp_endpoints_.at(bound->second).retired
+                       ? ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS
+                       : ErrorCode::OBJECT_REPLICA_BUSY;
+        }
+        if (bound->second != *segment.tcp_instance &&
+            !segment_manager_->tcp_endpoints_.at(bound->second).retired) {
+            return ErrorCode::OBJECT_REPLICA_BUSY;
+        }
+    }
+    if (!strict) return ErrorCode::OK;
+    const auto endpoint =
+        segment_manager_->tcp_endpoints_.find(*segment.tcp_instance);
+    if (endpoint != segment_manager_->tcp_endpoints_.end()) {
+        if (endpoint->second.owner != client_id)
+            return ErrorCode::ILLEGAL_CLIENT;
+        if (endpoint->second.retired) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+        if (!endpoint->second.endpoint.empty() &&
+            endpoint->second.endpoint != segment.te_endpoint) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+    } else if (segment_manager_->tcp_endpoints_.size() >=
+               SegmentManager::kMaxTcpEndpointRecords) {
+        LOG_EVERY_N(WARNING, 100)
+            << "tcp_endpoint_lifetime_capacity_reached records="
+            << segment_manager_->tcp_endpoints_.size()
+            << " capacity=" << SegmentManager::kMaxTcpEndpointRecords
+            << " records_retained_for_master_lifetime";
+        return ErrorCode::NO_AVAILABLE_HANDLE;
+    }
+    // A legacy ordinary transfer may already hold an address from one of
+    // these registrations. Capability upgrade cannot retroactively fence it.
+    for (const auto& [id, mounted] : segment_manager_->mounted_segments_) {
+        if ((mounted.segment.name == segment.name ||
+             mounted.segment.te_endpoint == segment.te_endpoint) &&
+            mounted.allocator_registration &&
+            mounted.allocator_registration->TcpInstance().empty() &&
+            (!mounted.segment.tcp_instance ||
+             mounted.segment.tcp_instance->empty())) {
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        }
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode ScopedSegmentAccess::MountSegment(
     const Segment& segment, ClientSessionSharedPtr owner_session) {
     if (!owner_session) {
@@ -172,6 +260,10 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     const UUID client_id = owner_session->ClientId();
     if (segment.locality && segment.locality->numa_node < 0) {
         return ErrorCode::INVALID_PARAMS;
+    }
+    if (const auto allowed = ValidateTcpMount(segment, client_id);
+        allowed != ErrorCode::OK) {
+        return allowed;
     }
     const auto indexed_name =
         segment_manager_->segment_id_by_name_.find(segment.name);
@@ -215,6 +307,33 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             }
         }
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    }
+    // Skip the alias scan until a target opts in. After that, a different
+    // segment id must not make an exposed region allocatable again.
+    if (segment_manager_->has_piece_put_targets_) {
+        const auto owned = segment_manager_->client_segments_.find(client_id);
+        for (const auto& [mounted_id, mounted] :
+             segment_manager_->mounted_segments_) {
+            if (!mounted.allocator_registration ||
+                !mounted.allocator_registration->HasWriteHolds()) {
+                continue;
+            }
+            const bool same_owner =
+                owned != segment_manager_->client_segments_.end() &&
+                std::find(owned->second.begin(), owned->second.end(),
+                          mounted_id) != owned->second.end();
+            const bool same_endpoint =
+                !segment.te_endpoint.empty() &&
+                segment.te_endpoint == mounted.segment.te_endpoint;
+            const bool overlaps =
+                segment.base <= mounted.segment.base
+                    ? mounted.segment.base - segment.base < segment.size
+                    : segment.base - mounted.segment.base <
+                          mounted.segment.size;
+            if ((same_owner || same_endpoint) && overlaps) {
+                return ErrorCode::OBJECT_REPLICA_BUSY;
+            }
+        }
     }
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
@@ -282,46 +401,79 @@ ErrorCode ScopedSegmentAccess::MountSegment(
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
     AddHostSegment(segment_manager_->segments_by_host_, segment);
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
+    if (segment.tcp_instance && !segment.tcp_instance->empty()) {
+        segment_manager_->tcp_endpoints_.try_emplace(
+            *segment.tcp_instance, SegmentManager::TcpEndpointRecord{
+                                       client_id, false, segment.te_endpoint});
+        segment_manager_->tcp_instance_by_endpoint_[segment.te_endpoint] =
+            *segment.tcp_instance;
+    }
 
     return ErrorCode::OK;
 }
 
-void ScopedSegmentAccess::BindClientSession(
-    const ClientSessionSharedPtr& owner_session) {
-    CHECK(owner_session);
-    const auto client_segments_it =
+ErrorCode ScopedSegmentAccess::ValidateClientSessionBinding(
+    const ClientSessionSharedPtr& owner_session) const {
+    if (!owner_session) return ErrorCode::INVALID_PARAMS;
+    const auto owned =
         segment_manager_->client_segments_.find(owner_session->ClientId());
-    if (client_segments_it == segment_manager_->client_segments_.end()) {
-        return;
+    if (owned == segment_manager_->client_segments_.end()) return ErrorCode::OK;
+    for (const auto& segment_id : owned->second) {
+        const auto mounted =
+            segment_manager_->mounted_segments_.find(segment_id);
+        if (mounted == segment_manager_->mounted_segments_.end()) continue;
+        const auto& registration = mounted->second.allocator_registration;
+        if (registration && registration->GetClientSession() != owner_session &&
+            !registration->TcpInstance().empty() &&
+            (registration->HasWriteHolds() || registration->IsWriteClosed())) {
+            return ErrorCode::OBJECT_REPLICA_BUSY;
+        }
     }
-    for (const auto& segment_id : client_segments_it->second) {
-        auto mounted_it = segment_manager_->mounted_segments_.find(segment_id);
-        if (mounted_it == segment_manager_->mounted_segments_.end() ||
-            !mounted_it->second.allocator_registration) {
-            continue;
-        }
-        auto& mounted = mounted_it->second;
-        auto old_registration = mounted.allocator_registration;
-        if (old_registration->GetClientSession() == owner_session) {
-            continue;
-        }
-        const bool in_allocator_manager =
-            HasAllocatorRegistration(segment_manager_->allocator_manager_,
-                                     mounted.segment.name, old_registration);
-        auto next_registration = old_registration->ReplaceClientSession(
-            owner_session, mounted.buf_allocator, in_allocator_manager);
-        if (in_allocator_manager) {
-            CHECK(segment_manager_->allocator_manager_.replaceRegistrations(
-                {{mounted.segment.name, old_registration, next_registration}}));
-        }
-        mounted.allocator_registration = std::move(next_registration);
-    }
+    return ErrorCode::OK;
 }
 
-void ScopedSegmentAccess::BindBufferToSegment(const UUID& segment_id,
-                                              AllocatedBuffer& buffer) {
-    segment_manager_->mounted_segments_.at(segment_id)
-        .allocator_registration->BindBuffer(buffer);
+ErrorCode ScopedSegmentAccess::BindClientSession(
+    const ClientSessionSharedPtr& owner_session) {
+    if (const auto valid = ValidateClientSessionBinding(owner_session);
+        valid != ErrorCode::OK) {
+        return valid;
+    }
+    const auto owned =
+        segment_manager_->client_segments_.find(owner_session->ClientId());
+    if (owned == segment_manager_->client_segments_.end()) return ErrorCode::OK;
+    for (const auto& segment_id : owned->second) {
+        const auto mounted_it =
+            segment_manager_->mounted_segments_.find(segment_id);
+        if (mounted_it == segment_manager_->mounted_segments_.end() ||
+            !mounted_it->second.allocator_registration)
+            continue;
+        auto& mounted = mounted_it->second;
+        auto old_registration = mounted.allocator_registration;
+        if (old_registration->GetClientSession() == owner_session) continue;
+        const bool in_manager =
+            HasAllocatorRegistration(segment_manager_->allocator_manager_,
+                                     mounted.segment.name, old_registration);
+        auto next = old_registration->ReplaceClientSession(
+            owner_session, mounted.buf_allocator, in_manager);
+        CHECK(next);
+        if (in_manager) {
+            CHECK(segment_manager_->allocator_manager_.replaceRegistrations(
+                {{mounted.segment.name, old_registration, next}}));
+        }
+        mounted.allocator_registration = std::move(next);
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::BindBufferToSegment(const UUID& segment_id,
+                                                   AllocatedBuffer& buffer) {
+    auto registration = GetRegistration(segment_id);
+    if (!registration) return ErrorCode::SEGMENT_NOT_FOUND;
+    if (registration->HasWriteHolds() || registration->IsWriteClosed()) {
+        return ErrorCode::OBJECT_REPLICA_BUSY;
+    }
+    registration->BindBuffer(buffer);
+    return ErrorCode::OK;
 }
 
 ErrorCode ScopedSegmentAccess::ReMountSegment(
@@ -331,13 +483,14 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
         return ErrorCode::INVALID_PARAMS;
     }
     for (const auto& segment : segments) {
-        auto validation =
-            ValidateRemountSegment(segment, owner_session->ClientId());
+        auto validation = ValidateRemountSegment(
+            segment, owner_session->ClientId(), owner_session);
         if (validation != ErrorCode::OK) {
             return validation;
         }
         ErrorCode err = MountSegment(segment, owner_session);
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+            err == ErrorCode::OBJECT_REPLICA_BUSY ||
             err == ErrorCode::INTERNAL_ERROR) {
             LOG(ERROR) << "segment_name=" << segment.name
                        << ", error=fail_to_remount_segment";
@@ -363,10 +516,15 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
 }
 
 ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
-    const Segment& segment, const UUID& client_id) const {
+    const Segment& segment, const UUID& client_id,
+    const ClientSessionSharedPtr& owner_session, bool require_existing) const {
+    if (const auto allowed = ValidateTcpMount(segment, client_id);
+        allowed != ErrorCode::OK) {
+        return allowed;
+    }
     auto mounted = segment_manager_->mounted_segments_.find(segment.id);
     if (mounted == segment_manager_->mounted_segments_.end()) {
-        return ErrorCode::OK;
+        return require_existing ? ErrorCode::SEGMENT_NOT_FOUND : ErrorCode::OK;
     }
     const auto owner = segment_manager_->client_segments_.find(client_id);
     const bool owned = owner != segment_manager_->client_segments_.end() &&
@@ -382,6 +540,53 @@ ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
         authoritative.host_id != segment.host_id ||
         (authoritative.locality && segment.locality &&
          *authoritative.locality != *segment.locality)) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto& registration = mounted->second.allocator_registration;
+    const bool protected_target =
+        (registration && !registration->TcpInstance().empty()) ||
+        (authoritative.tcp_instance && !authoritative.tcp_instance->empty()) ||
+        (segment.tcp_instance && !segment.tcp_instance->empty());
+    // Legacy remount validation retains the ordinary identity-only contract.
+    // Lifecycle and exact-registration replay guards belong to protected
+    // writes, whose old addresses may still be in flight.
+    if (!protected_target) return ErrorCode::OK;
+    if (mounted->second.status != SegmentStatus::OK) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (registration && registration->IsWriteClosed()) {
+        return ErrorCode::OBJECT_REPLICA_BUSY;
+    }
+    const bool same_locality =
+        bool(authoritative.locality) == bool(segment.locality) &&
+        (!segment.locality || *authoritative.locality == *segment.locality);
+    const bool same_tcp_instance =
+        bool(authoritative.tcp_instance) == bool(segment.tcp_instance) &&
+        (!segment.tcp_instance ||
+         *authoritative.tcp_instance == *segment.tcp_instance);
+    const bool same_master_instance =
+        bool(authoritative.piece_put_master_instance) ==
+            bool(segment.piece_put_master_instance) &&
+        (!segment.piece_put_master_instance ||
+         *authoritative.piece_put_master_instance ==
+             *segment.piece_put_master_instance);
+    // Holds protect replacement, not an identity-preserving replay. Verify
+    // every binding under the same Segment lock before allowing that replay;
+    // a SUSPECTED liveness record remains the same record and is not revived.
+    const bool same_binding =
+        registration && mounted->second.buf_allocator && owner_session &&
+        registration->GetAllocator() == mounted->second.buf_allocator &&
+        registration->GetClientSession() == owner_session &&
+        (segment.tcp_instance
+             ? registration->TcpInstance() == *segment.tcp_instance
+             : registration->TcpInstance().empty()) &&
+        HasAllocatorRegistration(segment_manager_->allocator_manager_,
+                                 authoritative.name, registration) &&
+        same_locality && same_tcp_instance && same_master_instance;
+    if (registration && registration->HasWriteHolds() && !same_binding) {
+        return ErrorCode::OBJECT_REPLICA_BUSY;
+    }
+    if (require_existing && !same_binding) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;
@@ -411,11 +616,17 @@ bool ScopedSegmentAccess::ReplaceAllocators(
             !replacement.replacement) {
             return false;
         }
+        if (replacement.expected != replacement.replacement &&
+            (mounted->second.allocator_registration->HasWriteHolds() ||
+             mounted->second.allocator_registration->IsWriteClosed())) {
+            return false;
+        }
         auto next_registration =
             replacement.expected == replacement.replacement
                 ? mounted->second.allocator_registration
                 : mounted->second.allocator_registration->WithAllocator(
                       replacement.replacement);
+        if (!next_registration) return false;
         manager_replacements.push_back({mounted->second.segment.name,
                                         mounted->second.allocator_registration,
                                         std::move(next_registration)});
@@ -449,6 +660,155 @@ std::shared_ptr<BufferAllocatorBase> ScopedSegmentAccess::GetAllocator(
                : mounted->second.buf_allocator;
 }
 
+std::shared_ptr<SegmentAllocatorRegistration>
+ScopedSegmentAccess::GetRegistration(const UUID& segment_id) const {
+    const auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    return mounted == segment_manager_->mounted_segments_.end()
+               ? nullptr
+               : mounted->second.allocator_registration;
+}
+
+ErrorCode ScopedSegmentAccess::BindTcpInstance(
+    const UUID& segment_id, const std::string& tcp_instance) {
+    auto registration = GetRegistration(segment_id);
+    if (!registration) return ErrorCode::SEGMENT_NOT_FOUND;
+    if (!registration->tcp_instance_.empty() &&
+        registration->tcp_instance_ != tcp_instance) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto& mounted = segment_manager_->mounted_segments_.at(segment_id);
+    const auto owner =
+        segment_manager_->client_by_name_.find(mounted.segment.name);
+    if (owner == segment_manager_->client_by_name_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    if (!tcp_instance.empty()) {
+        const auto bound = segment_manager_->tcp_instance_by_endpoint_.find(
+            mounted.segment.te_endpoint);
+        if (bound != segment_manager_->tcp_instance_by_endpoint_.end() &&
+            bound->second != tcp_instance &&
+            !segment_manager_->tcp_endpoints_.at(bound->second).retired) {
+            return ErrorCode::OBJECT_REPLICA_BUSY;
+        }
+        const auto endpoint =
+            segment_manager_->tcp_endpoints_.find(tcp_instance);
+        if (endpoint != segment_manager_->tcp_endpoints_.end()) {
+            if (endpoint->second.owner != owner->second) {
+                return ErrorCode::ILLEGAL_CLIENT;
+            }
+            if (endpoint->second.retired) {
+                return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            }
+            if (!endpoint->second.endpoint.empty() &&
+                endpoint->second.endpoint != mounted.segment.te_endpoint) {
+                return ErrorCode::INVALID_PARAMS;
+            }
+        } else if (segment_manager_->tcp_endpoints_.size() >=
+                   SegmentManager::kMaxTcpEndpointRecords) {
+            LOG_EVERY_N(WARNING, 100)
+                << "tcp_endpoint_lifetime_capacity_reached records="
+                << segment_manager_->tcp_endpoints_.size()
+                << " capacity=" << SegmentManager::kMaxTcpEndpointRecords
+                << " records_retained_for_master_lifetime";
+            return ErrorCode::NO_AVAILABLE_HANDLE;
+        }
+    }
+    if (registration->tcp_instance_ == tcp_instance) {
+        if (!tcp_instance.empty()) {
+            segment_manager_->has_piece_put_targets_ = true;
+        }
+        return ErrorCode::OK;
+    }
+    if (!registration->tcp_instance_.empty() || tcp_instance.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (registration->HasWriteHolds() || registration->IsWriteClosed()) {
+        return ErrorCode::OBJECT_REPLICA_BUSY;
+    }
+    registration->tcp_instance_ = tcp_instance;
+    segment_manager_->tcp_endpoints_.try_emplace(
+        tcp_instance, SegmentManager::TcpEndpointRecord{
+                          owner->second, false, mounted.segment.te_endpoint});
+    segment_manager_->tcp_instance_by_endpoint_[mounted.segment.te_endpoint] =
+        tcp_instance;
+    segment_manager_->has_piece_put_targets_ = true;
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::RetireTcpEndpoint(
+    const UUID& client_id, const std::string& tcp_instance) {
+    if (tcp_instance.empty() || tcp_instance.size() > 256) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto endpoint = segment_manager_->tcp_endpoints_.find(tcp_instance);
+    if (endpoint == segment_manager_->tcp_endpoints_.end()) {
+        if (segment_manager_->tcp_endpoints_.size() >=
+            SegmentManager::kMaxTcpEndpointRecords) {
+            LOG_EVERY_N(WARNING, 100)
+                << "tcp_endpoint_lifetime_capacity_reached records="
+                << segment_manager_->tcp_endpoints_.size()
+                << " capacity=" << SegmentManager::kMaxTcpEndpointRecords
+                << " records_retained_for_master_lifetime";
+            return ErrorCode::NO_AVAILABLE_HANDLE;
+        }
+        endpoint =
+            segment_manager_->tcp_endpoints_
+                .emplace(tcp_instance,
+                         SegmentManager::TcpEndpointRecord{client_id, true, {}})
+                .first;
+    } else {
+        if (endpoint->second.owner != client_id) {
+            return ErrorCode::ILLEGAL_CLIENT;
+        }
+        endpoint->second.retired = true;
+    }
+    segment_manager_->has_piece_put_targets_ = true;
+    // Closing registrations does not erase mounted_segments_, so the walk and
+    // every future Mount/ReMount observe the terminal state under this lock.
+    for (auto& [segment_id, mounted] : segment_manager_->mounted_segments_) {
+        const auto& registration = mounted.allocator_registration;
+        if (registration && (registration->TcpInstance() == tcp_instance ||
+                             (mounted.segment.tcp_instance &&
+                              *mounted.segment.tcp_instance == tcp_instance))) {
+            const auto retired =
+                MarkPhysicallyRetired(segment_id, registration);
+            if (retired != ErrorCode::OK) return retired;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::CloseForWrites(
+    const UUID& segment_id,
+    const std::shared_ptr<SegmentAllocatorRegistration>& expected) {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end() || !expected ||
+        mounted->second.allocator_registration != expected) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    expected->CloseForWrites();
+    const auto& segment = mounted->second.segment;
+    if (HasAllocatorRegistration(segment_manager_->allocator_manager_,
+                                 segment.name, expected)) {
+        segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                             expected);
+    }
+    RemoveHostSegment(segment_manager_->segments_by_host_, segment);
+    if (mounted->second.status == SegmentStatus::OK) {
+        mounted->second.status = SegmentStatus::DRAINING;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::MarkPhysicallyRetired(
+    const UUID& segment_id,
+    const std::shared_ptr<SegmentAllocatorRegistration>& expected) {
+    const auto closed = CloseForWrites(segment_id, expected);
+    if (closed != ErrorCode::OK) return closed;
+    expected->MarkPhysicallyRetired();
+    return ErrorCode::OK;
+}
+
 ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     const UUID& segment_id, size_t& metrics_dec_capacity) {
     auto it = segment_manager_->mounted_segments_.find(segment_id);
@@ -468,6 +828,11 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
 
     auto& mounted_segment = it->second;
     auto& segment = mounted_segment.segment;
+    if (mounted_segment.allocator_registration &&
+        mounted_segment.allocator_registration->HasWriteHolds()) {
+        CloseForWrites(segment_id, mounted_segment.allocator_registration);
+        return ErrorCode::OBJECT_REPLICA_BUSY;
+    }
     metrics_dec_capacity = segment.size;
 
     // Remove the allocator from the segment manager
@@ -496,7 +861,7 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
 }
 
 ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
-    const UUID& segment_id) {
+    const UUID& segment_id, std::chrono::steady_clock::time_point deadline) {
     auto it = segment_manager_->mounted_segments_.find(segment_id);
     if (it == segment_manager_->mounted_segments_.end()) {
         LOG(WARNING) << "segment_id=" << segment_id
@@ -504,13 +869,17 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     auto status = it->second.status;
+    if (it->second.allocator_registration &&
+        it->second.allocator_registration->IsWriteClosed()) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     if (status == SegmentStatus::UNMOUNTING) {
         LOG(ERROR) << "segment_id=" << segment_id
                    << ", error=segment_is_unmounting";
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     if (status == SegmentStatus::GRACEFULLY_UNMOUNTING) {
-        // Idempotent: already in graceful unmount state
+        it->second.allocator_registration->BeginGracefulUnmount(deadline);
         return ErrorCode::OK;
     }
     if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING) {
@@ -530,7 +899,7 @@ ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
         segment_manager_->allocator_manager_.removeAllocator(segment.name,
                                                              registration);
     }
-    registration->SetAllocatable(false);
+    registration->BeginGracefulUnmount(deadline);
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
     // Set the segment status to GRACEFULLY_UNMOUNTING
     mounted_segment.status = SegmentStatus::GRACEFULLY_UNMOUNTING;
@@ -582,6 +951,11 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     auto mounted = segment_manager_->mounted_segments_.find(segment_id);
     if (mounted == segment_manager_->mounted_segments_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+
+    if (mounted->second.allocator_registration &&
+        mounted->second.allocator_registration->HasWriteHolds()) {
+        return ErrorCode::OBJECT_REPLICA_BUSY;
     }
 
     // Remove from client_segments_
@@ -835,6 +1209,12 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const bool should_be_allocatable = status == SegmentStatus::OK;
     const bool is_allocatable =
         HasAllocatorRegistration(allocator_manager, name, registration);
+    if (should_be_allocatable && registration &&
+        (registration->IsWriteClosed() ||
+         (mounted_segment.status == SegmentStatus::GRACEFULLY_UNMOUNTING &&
+          registration->HasWriteHolds()))) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     if (should_be_allocatable && !is_allocatable && registration) {
         registration->SetAllocatable(true);
         allocator_manager.addRegistration(name, registration);

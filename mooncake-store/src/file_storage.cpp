@@ -1410,7 +1410,11 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
 
     // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
     // becomes visible to readers.
-    auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
+    const auto proof =
+        MakeStrictWriteProof({alloc_result.value().memory_descriptor});
+    auto notify_res =
+        proof ? client_->NotifyPromotionSuccess(key, tenant_id, *proof)
+              : client_->NotifyPromotionSuccess(key, tenant_id);
     if (!notify_res) {
         // The write landed but the commit failed. We can't retry the
         // commit (the success path is one-shot via alloc_id), and we

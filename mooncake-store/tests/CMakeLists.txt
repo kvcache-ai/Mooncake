@@ -291,6 +291,7 @@ add_store_test(dynamic_replication_lease_table_test
                dynamic_replication_lease_table_test.cpp)
 add_store_test(group_index_test group_index_test.cpp)
 add_store_test(metadata_namespace_test metadata_namespace_test.cpp)
+add_store_test(metadata_piece_put_index_test metadata_piece_put_index_test.cpp)
 add_store_test(metadata_namespace_table_test metadata_namespace_table_test.cpp)
 add_store_test(eviction_index_test eviction_index_test.cpp)
 add_store_test(evictor_test evictor_test.cpp)
@@ -639,3 +640,23 @@ target_include_directories(hf3fs_resource_manager_test BEFORE
 target_link_libraries(hf3fs_resource_manager_test PRIVATE gtest gtest_main
                                                           pthread)
 add_test(NAME hf3fs_resource_manager_test COMMAND hf3fs_resource_manager_test)
+
+add_store_test(piece_put_state_test piece_put_state_test.cpp)
+add_store_test(piece_put_admission_test piece_put_admission_test.cpp)
+add_store_test(piece_put_registration_test piece_put_registration_test.cpp)
+add_store_test(master_piece_put_test master_piece_put_test.cpp)
+add_store_test(master_piece_put_adversarial_test
+               master_piece_put_adversarial_test.cpp)
+add_store_test(master_piece_put_policy_test master_piece_put_policy_test.cpp)
+add_store_test(master_piece_put_maintenance_test
+               master_piece_put_maintenance_test.cpp)
+if(USE_TCP)
+  add_store_test(strict_write_test strict_write_test.cpp)
+  add_store_test(piece_put_integration_test piece_put_integration_test.cpp)
+  target_compile_definitions(strict_write_test
+                             PRIVATE MOONCAKE_TCP_TRANSPORT_TEST_HOOKS)
+  target_compile_definitions(piece_put_integration_test
+                             PRIVATE MOONCAKE_TCP_TRANSPORT_TEST_HOOKS)
+endif()
+
+add_store_test(ordinary_write_lifetime_test ordinary_write_lifetime_test.cpp)

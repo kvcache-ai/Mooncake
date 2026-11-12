@@ -1108,6 +1108,176 @@ TransferSubmitter::TransferSubmitter(
             << memcpy_enabled_;
 }
 
+namespace {
+
+// The ordinary future has a 60 s caller timeout. Strict borrowed-buffer writes
+// must instead retain their batch until every physical TCP operation
+// terminates.
+class StrictWriteOperationState final : public OperationState {
+   public:
+    StrictWriteOperationState(TransferEngine& engine, Transport& transport,
+                              BatchID batch, size_t count)
+        : engine_(engine),
+          transport_(transport),
+          batch_(batch),
+          count_(count) {}
+
+    ~StrictWriteOperationState() override {
+        if (submitted_) wait_for_completion();
+        engine_.freeBatchID(batch_);
+    }
+
+    void submitted() noexcept { submitted_ = true; }
+
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (result_) return true;
+        bool complete = true;
+        bool failed = false;
+        for (size_t i = 0; i < count_; ++i) {
+            TransferStatus status{};
+            auto query = transport_.getTransferStatus(batch_, i, status);
+            // A query failure is not a buffer-lifetime proof.
+            if (!query.ok()) return false;
+            if (status.s == TransferStatusEnum::COMPLETED) continue;
+            if (status.s == TransferStatusEnum::FAILED) {
+                failed = true;
+            } else {
+                complete = false;
+            }
+        }
+        if (complete)
+            result_ = failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK;
+        return result_.has_value();
+    }
+
+    void wait_for_completion() override {
+        while (!is_completed())
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::TRANSFER_ENGINE;
+    }
+
+   private:
+    TransferEngine& engine_;
+    Transport& transport_;
+    BatchID batch_;
+    size_t count_;
+    bool submitted_ = false;
+};
+
+// A strict batch can span target endpoint instances. Keep one physical batch
+// per instance and settle all of them before returning any aggregate failure.
+class GroupedWriteOperationState final : public OperationState {
+   public:
+    explicit GroupedWriteOperationState(std::vector<TransferFuture> futures)
+        : futures_(std::move(futures)) {}
+
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (result_) return true;
+        for (const auto& future : futures_) {
+            if (!future.isReady()) return false;
+        }
+        SetResult();
+        return true;
+    }
+
+    void wait_for_completion() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!result_) SetResult();
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::TRANSFER_ENGINE;
+    }
+
+   private:
+    void SetResult() {
+        ErrorCode result = ErrorCode::OK;
+        for (auto& future : futures_) {
+            const auto current = future.get();
+            if (current != ErrorCode::OK) result = current;
+        }
+        result_ = result;
+    }
+    std::vector<TransferFuture> futures_;
+};
+
+}  // namespace
+
+std::optional<TransferFuture> TransferSubmitter::submitStrictWrite(
+    const Replica::Descriptor& replica, std::vector<Slice>& slices,
+    const std::string& expected_tcp_instance) {
+    if (engine_.isUsingTent() || expected_tcp_instance.size() != 32 ||
+        !replica.is_memory_replica() || slices.empty())
+        return std::nullopt;
+    const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+    if (handle.transport_endpoint_.empty() ||
+        !validateTransferParams(handle, slices))
+        return std::nullopt;
+    auto* tcp = engine_.getTransport("tcp");
+    if (!tcp) return std::nullopt;
+    for (const auto& slice : slices)
+        if (!slice.ptr || slice.size == 0) return std::nullopt;
+
+    const SegmentHandle remote =
+        engine_.openSegment(handle.transport_endpoint_);
+    if (remote == static_cast<uint64_t>(ERR_INVALID_ARGUMENT))
+        return std::nullopt;
+
+    std::vector<TransferRequest> requests;
+    requests.reserve(slices.size());
+    uint64_t offset = 0;
+    for (const auto& slice : slices) {
+        if (slice.size > handle.size_ - offset ||
+            offset >
+                std::numeric_limits<uint64_t>::max() - handle.buffer_address_ ||
+            slice.size > std::numeric_limits<uint64_t>::max() -
+                             (handle.buffer_address_ + offset))
+            return std::nullopt;
+        TransferRequest request{};
+        request.opcode = TransferRequest::WRITE;
+        request.source = slice.ptr;
+        request.target_id = remote;
+        request.target_offset = handle.buffer_address_ + offset;
+        request.length = slice.size;
+        requests.push_back(request);
+        offset += slice.size;
+    }
+    if (offset != handle.size_) return std::nullopt;
+
+    return submitStrictTransfer(requests, expected_tcp_instance);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitStrictTransfer(
+    std::vector<TransferRequest>& requests,
+    const std::string& expected_tcp_instance) {
+    if (engine_.isUsingTent() || expected_tcp_instance.size() != 32 ||
+        requests.empty())
+        return std::nullopt;
+    auto* tcp = engine_.getTransport("tcp");
+    if (!tcp) return std::nullopt;
+    const BatchID batch = engine_.allocateBatchID(requests.size());
+    if (batch == INVALID_BATCH_ID) return std::nullopt;
+    std::shared_ptr<StrictWriteOperationState> state;
+    try {
+        state = std::make_shared<StrictWriteOperationState>(
+            engine_, *tcp, batch, requests.size());
+    } catch (...) {
+        engine_.freeBatchID(batch);
+        throw;
+    }
+    // Dispatch preflights the complete batch before publishing its first frame.
+    auto status = engine_.submitStrictWriteTransfer(batch, requests,
+                                                    expected_tcp_instance);
+    if (!status.ok()) return std::nullopt;
+    state->submitted();
+    return TransferFuture(std::move(state));
+}
+
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     TransferRequest::OpCode op_code, void* ptr, size_t size,
@@ -1124,6 +1294,9 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 
         if (op_code == TransferRequest::READ) {
             future = submitMemoryReadOperation(handle, slices, 0, intent);
+        } else if (mem_desc.strict_tcp_instance) {
+            future = submitStrictWrite(replica, slices,
+                                       *mem_desc.strict_tcp_instance);
         } else {
             TransferStrategy strategy = selectStrategy(handle, slices);
 
@@ -1171,6 +1344,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     }
 
     bool use_local_memcpy = !replicas.empty();
+    bool has_strict_write = false;
     size_t operation_count = 0;
     for (size_t i = 0; i < replicas.size(); ++i) {
         if (!replicas[i].is_memory_replica()) {
@@ -1182,11 +1356,27 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         if (!validateTransferParams(handle, all_slices[i])) {
             return std::nullopt;
         }
+        const auto& strict_instance =
+            replicas[i].get_memory_descriptor().strict_tcp_instance;
+        if (op_code == TransferRequest::WRITE && strict_instance) {
+            if (strict_instance->size() != 32 || engine_.isUsingTent() ||
+                handle.buffer_address_ >
+                    std::numeric_limits<uint64_t>::max() - handle.size_ ||
+                std::any_of(all_slices[i].begin(), all_slices[i].end(),
+                            [](const Slice& slice) {
+                                return !slice.ptr || slice.size == 0;
+                            })) {
+                return std::nullopt;
+            }
+            has_strict_write = true;
+        }
         use_local_memcpy =
             use_local_memcpy && canUseLocalMemcpy(handle.transport_endpoint_);
         operation_count += all_slices[i].size();
     }
 
+    use_local_memcpy = use_local_memcpy && !has_strict_write;
+    std::unordered_map<std::string, std::vector<TransferRequest>> strict_groups;
     std::vector<TransferRequest> requests;
     std::vector<MemcpyOperation> memcpy_operations;
     if (use_local_memcpy)
@@ -1232,13 +1422,37 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             request.target_id = seg;
             request.target_offset = handle.buffer_address_ + offset;
             request.length = slice.size;
-            requests.emplace_back(request);
+            const auto& strict_instance =
+                replicas[i].get_memory_descriptor().strict_tcp_instance;
+            if (op_code == TransferRequest::WRITE && strict_instance) {
+                strict_groups[*strict_instance].emplace_back(request);
+            } else {
+                requests.emplace_back(request);
+            }
             offset += slice.size;
         }
     }
-    auto future = use_local_memcpy
-                      ? submitMemcpyOperations(std::move(memcpy_operations))
-                      : submitTransfer(requests, intent);
+    std::optional<TransferFuture> future;
+    if (has_strict_write) {
+        std::vector<TransferFuture> grouped;
+        grouped.reserve(strict_groups.size() + !requests.empty());
+        for (auto& [instance, strict_requests] : strict_groups) {
+            auto submitted = submitStrictTransfer(strict_requests, instance);
+            if (!submitted) return std::nullopt;
+            grouped.push_back(std::move(*submitted));
+        }
+        if (!requests.empty()) {
+            auto submitted = submitTransfer(requests, intent);
+            if (!submitted) return std::nullopt;
+            grouped.push_back(std::move(*submitted));
+        }
+        future.emplace(
+            std::make_shared<GroupedWriteOperationState>(std::move(grouped)));
+    } else {
+        future = use_local_memcpy
+                     ? submitMemcpyOperations(std::move(memcpy_operations))
+                     : submitTransfer(requests, intent);
+    }
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1967,7 +2181,21 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
             return std::nullopt;
         }
 
-        future = submitMemoryWriteOperation(handle, slices, dst_offset, intent);
+        if (mem_desc.strict_tcp_instance) {
+            if (handle.buffer_address_ >
+                std::numeric_limits<uint64_t>::max() - dst_offset) {
+                return std::nullopt;
+            }
+            auto ranged = replica;
+            auto& range = ranged.get_memory_descriptor().buffer_descriptor;
+            range.buffer_address_ += dst_offset;
+            range.size_ = slices_size;
+            future = submitStrictWrite(ranged, slices,
+                                       *mem_desc.strict_tcp_instance);
+        } else {
+            future =
+                submitMemoryWriteOperation(handle, slices, dst_offset, intent);
+        }
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range write not supported for NoF replicas";
         return std::nullopt;
@@ -2083,6 +2311,9 @@ bool TransferSubmitter::validateTransferParams(
     const std::vector<Slice>& slices) const {
     uint64_t all_slice_len = 0;
     for (auto slice : slices) {
+        if (slice.size > std::numeric_limits<uint64_t>::max() - all_slice_len) {
+            return false;
+        }
         all_slice_len += slice.size;
     }
     if (handle.size_ != all_slice_len) {

@@ -564,7 +564,10 @@ class ScopedEnvVar {
             had_old_value_ = true;
             old_value_ = old;
         }
-        setenv(name_.c_str(), value, 1);
+        if (value)
+            setenv(name_.c_str(), value, 1);
+        else
+            unsetenv(name_.c_str());
     }
 
     ~ScopedEnvVar() {
@@ -821,7 +824,14 @@ class LegacyReadServer {
     // header. For flagged requests shorter than a status frame this is the
     // configuration that used to hang a v2 initiator forever (fewer than 8
     // payload bytes ever arrive, no EOF, no deadline).
-    explicit LegacyReadServer(bool keep_open = false) : keep_open_(keep_open) {
+    explicit LegacyReadServer(bool keep_open = false,
+                              size_t chunk_bytes = 64 * 1024,
+                              unsigned delay_ms = 0, size_t payload_limit = 0)
+        : keep_open_(keep_open),
+          chunk_bytes_(chunk_bytes),
+          delay_ms_(delay_ms),
+          payload_limit_(payload_limit) {
+        if (chunk_bytes_ == 0) return;
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0) return;
         int one = 1;
@@ -900,13 +910,26 @@ class LegacyReadServer {
         saw_flagged_write_.store(header.opcode == 0x81);
 
         const uint64_t total = le64toh(header.size);
-        std::vector<char> payload(64 * 1024, static_cast<char>(0xA5));
+        const uint64_t send_limit =
+            payload_limit_ == 0 ? total
+                                : std::min<uint64_t>(total, payload_limit_);
+        std::vector<char> payload(chunk_bytes_, static_cast<char>(0xA5));
         uint64_t sent = 0;
-        while (sent < total) {
-            size_t chunk = std::min<uint64_t>(payload.size(), total - sent);
-            ssize_t n = send(fd, payload.data(), chunk, MSG_NOSIGNAL);
-            if (n <= 0) break;
-            sent += static_cast<uint64_t>(n);
+        while (sent < send_limit) {
+            const size_t chunk =
+                std::min<uint64_t>(payload.size(), send_limit - sent);
+            size_t chunk_sent = 0;
+            while (chunk_sent < chunk) {
+                const ssize_t n = send(fd, payload.data() + chunk_sent,
+                                       chunk - chunk_sent, MSG_NOSIGNAL);
+                if (n <= 0) break;
+                chunk_sent += static_cast<size_t>(n);
+                sent += static_cast<uint64_t>(n);
+            }
+            if (chunk_sent != chunk) break;
+            if (delay_ms_ != 0 && sent < send_limit)
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(delay_ms_));
         }
         if (keep_open_) {
             // v1 loop: wait for the next header; leaves only when the
@@ -922,6 +945,9 @@ class LegacyReadServer {
     uint16_t port_ = 0;
     bool ok_ = false;
     bool keep_open_ = false;
+    size_t chunk_bytes_ = 64 * 1024;
+    unsigned delay_ms_ = 0;
+    size_t payload_limit_ = 0;
     std::thread thread_;
     std::atomic<bool> saw_flagged_write_{false};
 };
@@ -2030,6 +2056,70 @@ TEST(TcpWriteVisibilityTest,
     hooks.reset();
 #endif
 }
+
+// Exercise a real timer expiry after progress moved its deadline: the read
+// lasts about 2.8s, while every body-progress interval remains below 1s.
+TEST(TcpWriteVisibilityTest, ProgressDeadlineExtendsAcrossRealReadProgress) {
+    ScopedEnvVar default_cpu_stream("MC_TCP_SLICE_SIZE", nullptr);
+    ScopedEnvVar legacy_protocol("MC_TCP_PROTO", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "1");
+    LegacyReadServer fake_peer(/*keep_open=*/false, /*chunk_bytes=*/32 * 1024,
+                               /*delay_ms=*/400);
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18180", 8ull << 20);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+    constexpr size_t kLength = 256 * 1024;
+    auto* destination = static_cast<char*>(h.pool) + kRegionAlign;
+    std::memset(destination, 0x3C, kLength);
+    const std::vector<char> expected(kLength, static_cast<char>(0xA5));
+
+    const auto begin = std::chrono::steady_clock::now();
+    ASSERT_EQ(runOne(h.engine.get(), makeReadRequest(h, destination, kLength)),
+              TransferStatusEnum::COMPLETED);
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    EXPECT_GE(elapsed, std::chrono::seconds(2));
+    EXPECT_LT(elapsed, std::chrono::seconds(8));
+    EXPECT_EQ(std::memcmp(destination, expected.data(), kLength), 0);
+    fake_peer.join();
+}
+
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+// After progress has extended the first deadline, a silent peer must still
+// fail at the new deadline rather than losing its timer until peer EOF.
+TEST(TcpWriteVisibilityTest, ExtendedReadProgressDeadlineStillTimesOutOnStall) {
+    ScopedEnvVar default_cpu_stream("MC_TCP_SLICE_SIZE", nullptr);
+    ScopedEnvVar legacy_protocol("MC_TCP_PROTO", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "1");
+    ScopedSessionProgressHooks hooks;
+    LegacyReadServer fake_peer(/*keep_open=*/true, /*chunk_bytes=*/32 * 1024,
+                               /*delay_ms=*/400, /*payload_limit=*/160 * 1024);
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18181", 8ull << 20);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+    constexpr size_t kLength = 256 * 1024;
+    auto* destination = static_cast<char*>(h.pool) + kRegionAlign;
+    std::memset(destination, 0x3C, kLength);
+
+    const auto begin = std::chrono::steady_clock::now();
+    ASSERT_EQ(runOne(h.engine.get(), makeReadRequest(h, destination, kLength)),
+              TransferStatusEnum::FAILED);
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    EXPECT_GT(elapsed, std::chrono::seconds(2));
+    EXPECT_LT(elapsed, std::chrono::seconds(6))
+        << "a lost timer would wait for the peer's 8-second socket timeout";
+    EXPECT_EQ(session_timeout_committed_count.load(std::memory_order_acquire),
+              1);
+    EXPECT_EQ(session_terminal_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
+    fake_peer.join();
+}
+#endif
 
 // A cached v2 descriptor can briefly outlive a server downgrade/restart. A
 // legacy server interprets the flagged WRITE opcode as READ and sends payload

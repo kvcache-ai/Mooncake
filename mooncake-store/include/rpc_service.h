@@ -1,5 +1,7 @@
 #pragma once
 
+#include "piece_put_types.h"
+
 #include <csignal>
 
 #include <string>
@@ -21,6 +23,18 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    tl::expected<UUID, ErrorCode> GetPiecePutMasterInstance();
+    tl::expected<PiecePutAdmission, ErrorCode> GetPiecePutAdmission(
+        const UUID& client_id, uint64_t previous_session_id,
+        const std::string& host_id = {});
+    tl::expected<void, ErrorCode> CompleteProtectedReplicaWrite(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const StrictWriteProof& proof,
+        StrictWriteOperation operation, const UUID& dynamic_lease_id,
+        uint64_t dynamic_version);
+    tl::expected<void, ErrorCode> RetirePiecePutEndpoint(
+        const UUID& client_id, const std::string& tcp_instance);
+
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
@@ -47,6 +61,15 @@ class WrappedMasterService {
                          const std::string& http_metadata_remote_url = "");
 
     ~WrappedMasterService();
+
+    std::vector<tl::expected<PiecePutStartResponse, ErrorCode>>
+    BatchPiecePutStart(const UUID& client_id,
+                       const std::vector<PiecePutStartRequest>& requests,
+                       const std::string& tenant_id = "default");
+    std::vector<tl::expected<PiecePutFinishResponse, ErrorCode>>
+    BatchPiecePutFinish(const UUID& client_id,
+                        const std::vector<PiecePutFinishRequest>& requests,
+                        const std::string& tenant_id = "default");
 
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
@@ -182,6 +205,9 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
+
+    tl::expected<MountSegmentOutcome, ErrorCode> MountSegmentWithOutcome(
+        const Segment& segment, const UUID& client_id);
 
     tl::expected<void, ErrorCode> MountNoFSegment(const NoFSegment& segment,
                                                   const UUID& client_id);

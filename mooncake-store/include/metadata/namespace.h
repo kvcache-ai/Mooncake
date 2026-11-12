@@ -107,7 +107,25 @@ class Namespace final : private route::RouteObserver {
         std::vector<std::string> keys;
         for (const InFlightStripe& stripe : in_flight_) {
             std::lock_guard<std::mutex> lock(stripe.lock);
-            for (const route::KeySlot& slot : stripe.slots) {
+            for (const route::KeySlot& slot : stripe.ordinary_slots) {
+                keys.push_back(slot.key());
+            }
+            for (const route::KeySlot& slot : stripe.piece_put_slots) {
+                keys.push_back(slot.key());
+            }
+        }
+        return keys;
+    }
+
+    // PiecePut maintenance visits only these keys, without inspecting ordinary
+    // Put/Copy/Promotion backlog. The two lists share each slot's existing
+    // hook: this is a partition of the in-flight index, not a second key index.
+    // Resolve the owned key copies again after the stripe lock is released.
+    [[nodiscard]] std::vector<std::string> PiecePutInFlightKeys() const {
+        std::vector<std::string> keys;
+        for (const InFlightStripe& stripe : in_flight_) {
+            std::lock_guard<std::mutex> lock(stripe.lock);
+            for (const route::KeySlot& slot : stripe.piece_put_slots) {
                 keys.push_back(slot.key());
             }
         }
@@ -115,6 +133,8 @@ class Namespace final : private route::RouteObserver {
     }
 
    private:
+    using InFlightKind = route::SlotOwnerState::InFlightKind;
+
     PolicyContext Context(const route::WriteGuard& guard) const {
         return PolicyContext{id_, attachment_.get(), guard};
     }
@@ -132,7 +152,8 @@ class Namespace final : private route::RouteObserver {
     }
 
     static bool IsInitial(const route::SlotOwnerState& owner) {
-        return !owner.in_flight_listed && !owner.eviction_filed &&
+        return owner.in_flight_kind == InFlightKind::NONE &&
+               !owner.eviction_filed &&
                owner.policy_words == decltype(owner.policy_words){};
     }
 
@@ -140,35 +161,51 @@ class Namespace final : private route::RouteObserver {
         eviction_index_->OnRead(guard);
     }
 
-    // Puts the held key on the in-flight list or takes it off, to match
-    // whether it holds an object that carries work. The stripe lock is taken
-    // only when that changed.
+    // Classify under the key lock, then move the one hook under its stripe
+    // lock. A publication can change kind while remaining in flight (for
+    // example, PiecePut publication followed by ordinary offload work).
     void SyncInFlight(const route::WriteGuard& guard) {
         route::SlotOwnerState& owner = guard.owner_state();
-        const bool listed =
-            guard.has_object() && guard.state().HasWorkInFlight();
-        if (listed == owner.in_flight_listed) {
+        InFlightKind kind = InFlightKind::NONE;
+        if (guard.has_object()) {
+            if (guard.state().piece_put) {
+                kind = InFlightKind::PIECE_PUT;
+            } else if (guard.state().HasWorkInFlight()) {
+                kind = InFlightKind::ORDINARY;
+            }
+        }
+        if (kind == owner.in_flight_kind) {
             return;
         }
         InFlightStripe& stripe = InFlightStripeOf(guard.key());
         std::lock_guard<std::mutex> lock(stripe.lock);
-        if (listed) {
-            stripe.slots.push_back(guard.slot());
-        } else {
-            stripe.slots.erase(stripe.slots.iterator_to(guard.slot()));
+        if (owner.in_flight_kind != InFlightKind::NONE) {
+            auto& previous = stripe.ListFor(owner.in_flight_kind);
+            previous.erase(previous.iterator_to(guard.slot()));
         }
-        owner.in_flight_listed = listed;
+        if (kind != InFlightKind::NONE) {
+            stripe.ListFor(kind).push_back(guard.slot());
+        }
+        owner.in_flight_kind = kind;
     }
 
     using InFlightList = route::KeySlot::InFlightList;
 
     // One stripe of the in-flight list. Starting and finishing a write each
     // touch the list, so it is striped by key rather than put under one lock
-    // for the whole namespace. Only writers take these locks, and only to
-    // link or unlink, so it needs far fewer stripes than the route.
+    // for the whole namespace. The two kinds share this lock and each slot's
+    // single hook, so classifying a key adds no per-object allocation or node.
     struct InFlightStripe {
         mutable std::mutex lock;
-        InFlightList slots;
+        InFlightList ordinary_slots;
+        InFlightList piece_put_slots;
+
+        InFlightList& ListFor(InFlightKind kind) {
+            assert(kind == InFlightKind::ORDINARY ||
+                   kind == InFlightKind::PIECE_PUT);
+            return kind == InFlightKind::PIECE_PUT ? piece_put_slots
+                                                   : ordinary_slots;
+        }
     };
 
     static constexpr size_t kInFlightStripeCount = 64;

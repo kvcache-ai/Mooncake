@@ -228,6 +228,10 @@ class MasterServiceTestPeer {
         return service.namespaces_;
     }
 
+    void SetPiecePutMissingNamespaceHookForTesting(std::function<void()> hook) {
+        service_.piece_put_missing_namespace_hook_ = std::move(hook);
+    }
+
     // The object under `object_id`, held shared or exclusively for the
     // caller's scope the way a request path holds it; nullopt when that
     // tenant is absent or the key holds no object. A test parks a path that
@@ -563,6 +567,38 @@ class MasterServiceTestPeer {
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true) {
         return service_.TryPushPromotionQueue(object_id, record_candidate);
+    }
+
+    // These synchronous maintenance tests stop every worker that can change
+    // their fixture metadata before driving a sweep.
+    void StopPiecePutMaintenanceWorkersForTesting() {
+        service_.eviction_running_.store(false);
+        service_.client_monitor_running_.store(false);
+        if (service_.eviction_thread_.joinable()) {
+            service_.eviction_thread_.join();
+        }
+        if (service_.client_monitor_thread_.joinable()) {
+            service_.client_monitor_thread_.join();
+        }
+        service_.replica_cleanup_worker_.Stop();
+    }
+
+    void SweepPiecePutRoundsForTesting() {
+        std::shared_lock lock(service_.master_state_mutex_);
+        service_.SweepPiecePutRoundsLocked();
+    }
+
+    size_t PiecePutRoundCountForTesting() const {
+        return service_.piece_put_rounds_.load(std::memory_order_relaxed);
+    }
+
+    PiecePutAdmissionRegistry& PiecePutAdmissionsForTesting() {
+        return service_.piece_put_admissions_;
+    }
+
+    size_t ClientHostIdCountForTesting() const {
+        std::shared_lock lock(service_.client_mutex_);
+        return service_.client_host_id_.size();
     }
 
    private:

@@ -58,6 +58,23 @@ class TcpTransport;
 // TCP lanes and accepted server sockets are round-robin distributed across the
 // shards so a single hot peer can use more than one CPU core. With size 1 the
 // behavior is identical to the historical single-io_context transport.
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+// Each setting injects one bad_alloc at the selected ownership boundary.
+enum class TcpAllocationFailurePoint {
+    NONE = 0,
+    POST_GROUP_PUMP = 1,
+    PUMP_HANDLER = 2,
+    DISPATCH_CONNECT = 3,
+    DISPATCH_SESSION = 4,
+    HEADER_PROGRESS_TIMER = 5,
+    HELLO_STATUS_TIMER = 6,
+    WRITE_ACK_READ = 7,
+};
+void tcpTransportFailNextAllocationForTest(
+    TcpAllocationFailurePoint point) noexcept;
+bool tcpTransportAllocationFailureConsumedForTest() noexcept;
+#endif
+
 class TcpIoPool {
    public:
     explicit TcpIoPool(size_t num_threads) {
@@ -171,6 +188,21 @@ class TcpTransport : public Transport {
 
     bool supportsGroupedScatter() const override { return true; }
 
+    std::string instanceId() const {
+        return (running_.load(std::memory_order_acquire) ||
+                retired_.load(std::memory_order_acquire)) &&
+                       enable_connection_pool_
+                   ? instance_id_
+                   : "";
+    }
+    bool isRetired() const { return retired_.load(std::memory_order_acquire); }
+    bool retireStrictWrites();
+    bool bindTcpMasterInstance(const std::string &master_instance);
+    bool reserveLegacyTcpMount();
+    Status submitStrictWrite(BatchID batch_id,
+                             const std::vector<TransferRequest> &entries,
+                             const std::string &expected_tcp_instance);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
@@ -210,6 +242,14 @@ class TcpTransport : public Transport {
 
    private:
     TcpContext *context_;
+    std::string instance_id_;
+    std::atomic<bool> retired_{false};
+    std::mutex retirement_mutex_;
+    bool retirement_complete_ = false;
+    // Monotonic under retirement_mutex_. Unregistering memory cannot revoke
+    // addresses already handed to another process by a legacy Store writer.
+    bool legacy_memory_exposed_ = false;
+    std::string master_instance_;
     std::atomic_bool running_;
     std::unique_ptr<TcpIoPool> io_pool_;
     size_t num_io_threads_ = 1;
@@ -299,6 +339,35 @@ class TcpTransport : public Transport {
     static_assert(!std::is_copy_assignable<TerminalAction>::value,
                   "TerminalAction must remain move-only");
 
+    // A failure list stays allocation-free on the successful hot path. If
+    // detaching more work throws, its destructor still settles every item it
+    // already owns; the scheduler guard handles work left in the group.
+    struct FailureQueue {
+        explicit FailureQueue(
+            std::shared_ptr<FailureCounters> counters_arg) noexcept
+            : counters(std::move(counters_arg)) {}
+        ~FailureQueue() {
+            if (items)
+                TcpTransport::failWorkItems(
+                    *items, WorkFailureReason::RUNTIME_UNAVAILABLE, counters);
+        }
+        bool empty() const { return !items || items->empty(); }
+        void emplace_back(TcpWorkItem &&work) {
+            if (!items) items.emplace();
+            items->emplace_back(std::move(work));
+        }
+        void swap(std::deque<TcpWorkItem> &source) {
+            if (!items && source.empty()) return;
+            if (!items) items.emplace();
+            items->swap(source);
+        }
+        void fail(WorkFailureReason reason) noexcept {
+            if (items) TcpTransport::failWorkItems(*items, reason, counters);
+        }
+        std::optional<std::deque<TcpWorkItem>> items;
+        std::shared_ptr<FailureCounters> counters;
+    };
+
     enum class GroupState { OPEN, CLOSING, CLOSED };
     enum class LaneState {
         DISCONNECTED,
@@ -343,8 +412,12 @@ class TcpTransport : public Transport {
         uint64_t operation_epoch = 0;
         uint64_t last_connect_round = 0;
         std::shared_ptr<asio::ip::tcp::resolver> resolver;
+        std::shared_ptr<asio::steady_timer> connect_timer;
         std::shared_ptr<asio::ip::tcp::socket> socket;
         std::shared_ptr<ClientSession> session;
+        // Verification belongs to a socket, never merely to its host/port.
+        std::weak_ptr<asio::ip::tcp::socket> verified_socket;
+        std::string verified_instance;
         std::optional<TcpWorkItem> current;
     };
 
@@ -383,11 +456,18 @@ class TcpTransport : public Transport {
         uint64_t queued_bytes = 0;
         bool queued_bytes_saturated = false;
         std::vector<std::shared_ptr<ConnectionLane>> lanes;
+        // A scheduler fault temporarily closes admission while queued and
+        // not-yet-started work is failed without allocating. Active sessions
+        // keep their current work until their physical terminal callback.
+        bool recovering_scheduling = false;
         bool pump_scheduled = false;
         uint64_t pump_epoch = 0;
         uint64_t connect_round = 1;
         size_t probes_in_flight = 0;
         bool connect_round_had_success = false;
+        // Only peers that admit strict work acquire an application-level
+        // connect bound. Mixed ordinary/strict requests share these lanes.
+        bool bound_connect_deadline = false;
         std::chrono::steady_clock::time_point next_probe_not_before{};
         std::shared_ptr<asio::steady_timer> retry_timer;
         uint64_t retry_epoch = 0;
@@ -428,7 +508,9 @@ class TcpTransport : public Transport {
                                const ConnectionKey &key, TcpWorkItem work);
     static uint64_t requestGroupPumpLocked(PeerConnectionGroup &group);
     static void postGroupPump(const std::shared_ptr<PeerConnectionGroup> &group,
-                              uint64_t pump_epoch);
+                              uint64_t pump_epoch) noexcept;
+    static void recoverGroupScheduling(
+        const std::shared_ptr<PeerConnectionGroup> &group) noexcept;
     static bool requestGroupRetirementLocked(PeerConnectionGroup &group);
     static void postGroupRetirement(
         const std::shared_ptr<PeerConnectionGroup> &group);
@@ -437,7 +519,11 @@ class TcpTransport : public Transport {
     static void runGroupRetirement(
         const std::shared_ptr<PeerConnectionGroup> &group);
     static void runGroupPump(const std::shared_ptr<PeerConnectionGroup> &group,
-                             uint64_t pump_epoch);
+                             uint64_t pump_epoch) noexcept;
+    // Called with group->mutex held; each connect epoch is armed once.
+    static void armConnectDeadlineLocked(
+        const std::shared_ptr<PeerConnectionGroup> &group,
+        const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch);
     static void startLaneConnect(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch);
@@ -452,7 +538,7 @@ class TcpTransport : public Transport {
     static void handleLaneConnectFailure(
         const std::shared_ptr<PeerConnectionGroup> &group,
         const std::shared_ptr<ConnectionLane> &lane, uint64_t epoch,
-        const std::string &error);
+        const char *error) noexcept;
     static bool armRetryTimerLocked(
         const std::shared_ptr<PeerConnectionGroup> &group);
     static void handleRetryTimer(
@@ -461,7 +547,7 @@ class TcpTransport : public Transport {
         asio::error_code ec);
     static size_t expirePendingAdmissionsLocked(
         PeerConnectionGroup &group, std::chrono::steady_clock::time_point now,
-        std::deque<TcpWorkItem> &expired);
+        FailureQueue &expired);
     static size_t promotePendingAdmissionsLocked(PeerConnectionGroup &group);
     static bool hasQueuedByteCapacityLocked(const PeerConnectionGroup &group,
                                             uint64_t length);
@@ -472,7 +558,7 @@ class TcpTransport : public Transport {
     static void recomputeAdmittedBytesLocked(PeerConnectionGroup &group);
     static void refreshAdmissionTimerLocked(
         const std::shared_ptr<PeerConnectionGroup> &group,
-        std::deque<TcpWorkItem> &runtime_failed,
+        FailureQueue &runtime_failed,
         std::shared_ptr<asio::steady_timer> &timer_to_cancel,
         bool &timer_armed);
     static void handleAdmissionTimer(
@@ -491,7 +577,7 @@ class TcpTransport : public Transport {
         TcpWorkItem work, WorkFailureReason reason,
         const std::shared_ptr<FailureCounters> &counters) noexcept;
     static void failWorkItems(
-        std::deque<TcpWorkItem> work, WorkFailureReason reason,
+        std::deque<TcpWorkItem> &work, WorkFailureReason reason,
         const std::shared_ptr<FailureCounters> &counters) noexcept;
     static uint64_t recordWorkFailure(
         WorkFailureReason reason,

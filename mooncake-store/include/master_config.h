@@ -141,6 +141,10 @@ struct MasterConfig {
     std::string memory_allocator;
     std::string allocation_strategy;
 
+    bool enable_piece_put = false;
+    uint64_t max_piece_put_rounds = 1024;
+    uint64_t piece_put_timeout_sec = 30;
+
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
     uint32_t http_metadata_server_port;
@@ -557,6 +561,10 @@ class WrappedMasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    // Opt-in, single-Master TCP/OFFSET PiecePut.
+    bool enable_piece_put = false;
+    size_t max_piece_put_rounds = 1024;
+    uint64_t piece_put_timeout_sec = 30;
     bool enable_ha = false;
     bool enable_offload = false;
     bool offload_on_evict = false;
@@ -650,6 +658,9 @@ class WrappedMasterServiceConfig {
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
+        enable_piece_put = config.enable_piece_put;
+        max_piece_put_rounds = config.max_piece_put_rounds;
+        piece_put_timeout_sec = config.piece_put_timeout_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
@@ -1226,6 +1237,10 @@ class MasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    // TCP/OFFSET, one MEMORY replica; no HA, groups or sessions in v1.
+    bool enable_piece_put = false;
+    size_t max_piece_put_rounds = 1024;
+    uint64_t piece_put_timeout_sec = 30;
     bool enable_ha = false;
     bool enable_offload = false;
     bool offload_on_evict = false;
@@ -1317,6 +1332,9 @@ class MasterServiceConfig {
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
             config.nof_heartbeat_failures_threshold;
+        enable_piece_put = config.enable_piece_put;
+        max_piece_put_rounds = config.max_piece_put_rounds;
+        piece_put_timeout_sec = config.piece_put_timeout_sec;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
@@ -1472,6 +1490,7 @@ inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
 
 // Configuration for InProcMaster (in-process master server for testing)
 struct InProcMasterConfig {
+    std::optional<bool> enable_piece_put;
     std::optional<int> rpc_port;
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
