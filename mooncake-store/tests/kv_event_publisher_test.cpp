@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -25,13 +26,13 @@ TEST(KvEventPublisherTest, DisabledPublisherIsNoop) {
     config.enabled = false;
     KvEventPublisher publisher(config);
     EXPECT_FALSE(publisher.enabled());
-    publisher.PublishStored("42", "cpu");
-    publisher.PublishStored("42", "cpu", TenantId::Default(), "", "session");
-    publisher.PublishCommitted("42", {"cpu"}, "default", "", "session");
-    publisher.SyncObjectState("42", {"disk"}, "default", "", {"cpu"},
-                              "session");
-    publisher.PublishRemoved("42", "cpu");
+    publisher.PublishTransition("42", "default", "", "session",
+                                KvEventPublisher::kMediumCpu,
+                                KvEventPublisher::kMediumDisk);
     publisher.PublishCleared("tenant-a");
+    std::atomic<uint64_t> epoch{7};
+    EXPECT_TRUE(publisher.PublishClearedIfUnchanged("tenant-a", epoch, 7));
+    EXPECT_FALSE(publisher.PublishClearedIfUnchanged("tenant-a", epoch, 6));
     const auto stats = publisher.GetStats();
     EXPECT_EQ(stats.published_events, 0u);
     EXPECT_EQ(stats.dropped_events, 0u);
@@ -198,13 +199,17 @@ TEST(KvEventPublisherTest, SessionTagIsStoredAttributionOnly) {
         ScopedSubscriber subscriber;
         ASSERT_TRUE(subscriber.Connect(endpoint));
         std::string session = "session-a";
-        publisher.PublishStored("a", "cpu", "default", "group", session);
+        publisher.PublishTransition("a", "default", "group", session, 0,
+                                    KvEventPublisher::kMediumCpu);
         session = "changed-after-enqueue";
-        publisher.PublishCommitted("b", {"cpu", "disk"}, "default", "",
-                                   "session-b");
-        publisher.SyncObjectState("c", {"disk"}, "default", "", {"cpu"},
-                                  "session-c");
-        publisher.PublishStored("untagged", "cpu");
+        publisher.PublishTransition(
+            "b", "default", "", "session-b", 0,
+            KvEventPublisher::kMediumCpu | KvEventPublisher::kMediumDisk);
+        publisher.PublishTransition("c", "default", "", "session-c",
+                                    KvEventPublisher::kMediumCpu,
+                                    KvEventPublisher::kMediumDisk);
+        publisher.PublishTransition("untagged", "", "", "", 0,
+                                    KvEventPublisher::kMediumCpu);
         publisher.PublishCleared();
         size_t received = 0;
         while (received < 7) {
@@ -267,7 +272,8 @@ TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     ASSERT_EQ(zmq_setsockopt(sub, ZMQ_SUBSCRIBE, "", 0), 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    publisher.PublishStored(object_key, "cpu", "tenant-a", group_id);
+    publisher.PublishTransition(object_key, "tenant-a", group_id, "", 0,
+                                KvEventPublisher::kMediumCpu);
     msgpack::object_handle payload;
     ASSERT_TRUE(ReceivePayload(sub, &payload));
     ASSERT_EQ(payload.get().type, msgpack::type::ARRAY);
@@ -283,7 +289,8 @@ TEST(KvEventPublisherTest, PublishesSglangObjectKeyOverZmq) {
     EXPECT_EQ(FindMapValue(event, "block_size")->as<uint32_t>(), 128u);
     EXPECT_EQ(FindMapValue(event, "dp_rank")->as<uint32_t>(), 5u);
 
-    publisher.PublishRemoved(object_key, "cpu", "tenant-a", group_id);
+    publisher.PublishTransition(object_key, "tenant-a", group_id, "",
+                                KvEventPublisher::kMediumCpu, 0);
     ASSERT_TRUE(ReceivePayload(sub, &payload));
     ExpectObjectEvent(FirstEvent(payload), "removed", object_key);
 
@@ -341,24 +348,24 @@ TEST(KvEventPublisherTest, PublishesStoreMetadataAndMediumDelta) {
         "deployment-a@model-a@tp_rank:2@pcp1@dcp0@pp_rank:3@group:7@"
         "0123456789abcdef000000000000002a";
     msgpack::object_handle payload;
-    publisher.PublishCommitted(object_key, {"cpu"}, "tenant-a", "group-a");
+    publisher.PublishTransition(object_key, "tenant-a", "group-a", "", 0,
+                                KvEventPublisher::kMediumCpu);
     ASSERT_TRUE(ReceivePayload(sub, &payload));
     ExpectObjectEvent(FirstEvent(payload), "stored", object_key);
 
-    publisher.PublishCommitted(object_key, {"cpu"}, "tenant-a", "group-a");
-    ASSERT_TRUE(ReceivePayload(sub, &payload));
-    ExpectObjectEvent(FirstEvent(payload), "stored", object_key);
-
-    publisher.SyncObjectState(object_key, {}, "tenant-a", "group-a", {"cpu"});
+    publisher.PublishTransition(object_key, "tenant-a", "group-a", "",
+                                KvEventPublisher::kMediumCpu, 0);
     ASSERT_TRUE(ReceivePayload(sub, &payload));
     ExpectObjectEvent(FirstEvent(payload), "removed", object_key);
 
-    publisher.PublishCommitted(object_key, {"cpu"}, "tenant-a", "group-a");
+    publisher.PublishTransition(object_key, "tenant-a", "group-a", "", 0,
+                                KvEventPublisher::kMediumCpu);
     ASSERT_TRUE(ReceivePayload(sub, &payload));
     ExpectObjectEvent(FirstEvent(payload), "stored", object_key);
 
-    publisher.SyncObjectState(object_key, {"disk"}, "tenant-a", "group-a",
-                              {"cpu"});
+    publisher.PublishTransition(object_key, "tenant-a", "group-a", "",
+                                KvEventPublisher::kMediumCpu,
+                                KvEventPublisher::kMediumDisk);
     ASSERT_TRUE(ReceivePayload(sub, &payload));
     ASSERT_EQ(payload.get().via.array.ptr[1].via.array.size, 2u);
     ExpectObjectEvent(payload.get().via.array.ptr[1].via.array.ptr[0],
@@ -366,7 +373,8 @@ TEST(KvEventPublisherTest, PublishesStoreMetadataAndMediumDelta) {
     ExpectObjectEvent(payload.get().via.array.ptr[1].via.array.ptr[1], "stored",
                       object_key);
 
-    publisher.PublishObjectRemoved(object_key, "tenant-a", "group-a", {"disk"});
+    publisher.PublishTransition(object_key, "tenant-a", "group-a", "",
+                                KvEventPublisher::kMediumDisk, 0);
     ASSERT_TRUE(ReceivePayload(sub, &payload));
     ExpectObjectEvent(FirstEvent(payload), "removed", object_key);
 
@@ -397,9 +405,11 @@ TEST(KvEventPublisherTest, ClearIsTenantScoped) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     msgpack::object_handle payload;
-    publisher.PublishStored("tenant-a-key", "cpu", "tenant-a");
+    publisher.PublishTransition("tenant-a-key", "tenant-a", "", "", 0,
+                                KvEventPublisher::kMediumCpu);
     ASSERT_TRUE(ReceivePayload(sub, &payload));
-    publisher.PublishStored("tenant-b-key", "cpu", "tenant-b");
+    publisher.PublishTransition("tenant-b-key", "tenant-b", "", "", 0,
+                                KvEventPublisher::kMediumCpu);
     ASSERT_TRUE(ReceivePayload(sub, &payload));
     publisher.PublishCleared("tenant-a");
     ASSERT_TRUE(ReceivePayload(sub, &payload));
@@ -420,8 +430,9 @@ TEST(KvEventPublisherTest, DisabledObjectKeySkipsObjectEventsButKeepsClear) {
     KvEventPublisher publisher(config);
     ASSERT_TRUE(publisher.enabled());
 
-    publisher.PublishStored("object-a", "cpu", "tenant-a");
-    publisher.PublishRemoved("object-a", "cpu", "tenant-a");
+    publisher.PublishTransition("object-a", "tenant-a", "", "",
+                                KvEventPublisher::kMediumCpu,
+                                KvEventPublisher::kMediumDisk);
     publisher.PublishCleared("tenant-a");
 
     for (int i = 0; i < 50; ++i) {
@@ -452,7 +463,8 @@ TEST(KvEventPublisherTest, DropsOldestWhenQueueFull) {
     ASSERT_TRUE(publisher.enabled());
 
     for (int i = 0; i < 100; ++i) {
-        publisher.PublishStored(std::to_string(i), "cpu");
+        publisher.PublishTransition(std::to_string(i), "", "", "", 0,
+                                    KvEventPublisher::kMediumCpu);
     }
 
     for (int i = 0; i < 50; ++i) {
@@ -466,9 +478,9 @@ TEST(KvEventPublisherTest, DropsOldestWhenQueueFull) {
     FAIL() << "expected dropped_events after queue overflow";
 }
 
-// Removal is driven entirely by the caller's previous-media set, in sorted
-// order so a multi-medium object produces a deterministic event sequence.
-TEST(KvEventPublisherTest, RemovalEmitsEveryMediumFromCaller) {
+// Multi-medium transitions emit "cpu" before "disk" so subscribers observe a
+// deterministic event sequence regardless of replica insertion order.
+TEST(KvEventPublisherTest, RemovalEmitsEveryMediumInDeterministicOrder) {
     const std::string endpoint = MakeIpcEndpoint();
     KvEventPublisher publisher(MakeEnabledConfig(endpoint));
     ASSERT_TRUE(publisher.enabled());
@@ -476,8 +488,9 @@ TEST(KvEventPublisherTest, RemovalEmitsEveryMediumFromCaller) {
     ASSERT_TRUE(subscriber.Connect(endpoint));
 
     msgpack::object_handle payload;
-    publisher.PublishObjectRemoved("object-a", "tenant-a", "group-a",
-                                   {"disk", "cpu"});
+    publisher.PublishTransition(
+        "object-a", "tenant-a", "group-a", "",
+        KvEventPublisher::kMediumCpu | KvEventPublisher::kMediumDisk, 0);
     ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
     ASSERT_EQ(EventCount(payload), 2u);
     ExpectObjectEvent(EventAt(payload, 0), "removed", "object-a");
@@ -638,17 +651,17 @@ TEST(KvEventPublisherTest, MemoryCleanupDefersInvalidNoFRemoval) {
             std::vector<Replica> replicas;
             replicas.emplace_back(std::make_unique<AllocatedBuffer>(
                                       expired_allocator, nullptr, 1024),
-                                  ReplicaStatus::COMPLETE,
+                                  ReplicaStatus::PROCESSING,
                                   ReplicaType::NOF_SSD);
             if (surviving_nof) {
                 replicas.emplace_back(std::make_unique<AllocatedBuffer>(
                                           live_allocator, nullptr, 1024),
-                                      ReplicaStatus::COMPLETE,
+                                      ReplicaStatus::PROCESSING,
                                       ReplicaType::NOF_SSD);
             }
             accessor.Get().AddReplicas(std::move(replicas));
         }
-        ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::MEMORY));
+        ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::ALL));
         msgpack::object_handle payload;
         ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
         ASSERT_EQ(EventCount(payload), 2u);
@@ -693,87 +706,129 @@ TEST(KvEventPublisherTest, MemoryCleanupDefersInvalidNoFRemoval) {
     }
 }
 
-// A medium that survives the mutation must not be announced as removed, even
-// though the caller lists it as previously present. This is what keeps a
-// partial eviction from retracting the tier that still holds a replica.
-TEST(KvEventPublisherTest, SurvivingMediumIsNotRemoved) {
+TEST(KvEventPublisherTest,
+     UncommittedPutRevokeEmitsNothingAndUpsertRetractsOnce) {
     const std::string endpoint = MakeIpcEndpoint();
-    KvEventPublisher publisher(MakeEnabledConfig(endpoint));
-    ASSERT_TRUE(publisher.enabled());
+    MasterServiceConfig config;
+    config.enable_kv_events = true;
+    config.kv_events_bind_endpoint = endpoint;
+    config.kv_events_backend_id = "route-observer-test";
+    config.default_kv_lease_ttl = 0;
+    MasterService service(config);
     ScopedSubscriber subscriber;
     ASSERT_TRUE(subscriber.Connect(endpoint));
 
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "kv_event_route_segment";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    const UUID client = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client));
+
+    // Uncommitted PutStart -> PutRevoke must never emit a bogus `removed`.
+    ASSERT_TRUE(service.PutStart(client, "aborted_key", TenantId::Default(),
+                                 1024, ReplicateConfig{}));
+    ASSERT_TRUE(service.PutRevoke(client, "aborted_key", TenantId::Default(),
+                                  ReplicaType::MEMORY));
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+
+    // In-place Upsert (same size) and reallocating Upsert (different size) both
+    // retract the prior tier on UpsertStart and re-announce on UpsertEnd.
+    ASSERT_TRUE(service.PutStart(client, "upsert_key", TenantId::Default(),
+                                 1024, ReplicateConfig{}));
+    ASSERT_TRUE(service.PutEnd(client, "upsert_key", TenantId::Default(),
+                               ReplicaType::MEMORY));
     msgpack::object_handle payload;
-    publisher.SyncObjectState("object-a", {"cpu"}, "tenant-a", "group-a",
-                              {"cpu", "disk"});
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ExpectObjectEvent(FirstEvent(payload), "stored", "upsert_key");
+
+    for (uint64_t next_size : {1024ULL, 2048ULL}) {
+        ASSERT_TRUE(service.UpsertStart(client, "upsert_key",
+                                        TenantId::Default(), next_size,
+                                        ReplicateConfig{}));
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "removed", "upsert_key");
+
+        ASSERT_TRUE(service.UpsertEnd(client, "upsert_key", TenantId::Default(),
+                                      ReplicaType::MEMORY));
+        ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+        ASSERT_EQ(EventCount(payload), 1u);
+        ExpectObjectEvent(FirstEvent(payload), "stored", "upsert_key");
+    }
+}
+
+// A tier that survives a partial eviction must stay announced; only the evicted
+// tier is retracted, and tearing down the object later retracts the survivor.
+TEST(KvEventPublisherTest, SurvivingTierIsNotRetractedOnPartialEviction) {
+    const std::string endpoint = MakeIpcEndpoint();
+    MasterServiceConfig config;
+    config.enable_kv_events = true;
+    config.kv_events_bind_endpoint = endpoint;
+    config.kv_events_backend_id = "partial-evict-test";
+    config.default_kv_lease_ttl = 0;
+    MasterService service(config);
+    test::MasterServiceTestPeer peer(service);
+    ScopedSubscriber subscriber;
+    ASSERT_TRUE(subscriber.Connect(endpoint));
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "kv_event_partial_evict_segment";
+    segment.te_endpoint = segment.name;
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    const UUID client = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client));
+
+    const std::string key = "kv_event_partial_evict_key";
+    const auto tenant = TenantId::Default();
+    ASSERT_TRUE(service.PutStart(client, key, tenant, 1024, ReplicateConfig{}));
+    auto live_allocator =
+        std::make_shared<DummyBufferAllocator>("live-nof", "live-nof");
+    using Accessor = test::MasterServiceTestPeer::MetadataAccessorRW;
+    {
+        Accessor accessor(&service, {tenant, key}, Accessor::AsIs{});
+        ASSERT_TRUE(accessor.IsPublished());
+        std::vector<Replica> replicas;
+        replicas.emplace_back(
+            std::make_unique<AllocatedBuffer>(live_allocator, nullptr, 1024),
+            ReplicaStatus::PROCESSING, ReplicaType::NOF_SSD);
+        accessor.Get().AddReplicas(std::move(replicas));
+    }
+    ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::ALL));
+
+    msgpack::object_handle payload;
+    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+    ASSERT_EQ(EventCount(payload), 2u);
+    EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 0), "medium")),
+              "cpu");
+    EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 1), "medium")),
+              "disk");
+
+    // Lease renewal / metadata writes that leave media unchanged emit nothing.
+    ASSERT_TRUE(service.GetReplicaList(key, tenant).has_value());
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+
+    // Memory eviction demotes the object to disk: only "cpu" is retracted.
+    peer.RunBatchEvictForTesting(1.0, 1.0);
     ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
     ASSERT_EQ(EventCount(payload), 1u);
-    ExpectObjectEvent(EventAt(payload, 0), "removed", "object-a");
-    EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 0), "medium")),
-              "disk");
-}
-
-TEST(KvEventPublisherTest, RemovesBothMediaAfterStoredOnCpuAndDisk) {
-    const std::string endpoint = MakeIpcEndpoint();
-    KvEventPublisher publisher(MakeEnabledConfig(endpoint));
-    ASSERT_TRUE(publisher.enabled());
-    ScopedSubscriber subscriber;
-    ASSERT_TRUE(subscriber.Connect(endpoint));
-
-    msgpack::object_handle payload;
-    publisher.PublishCommitted("object-a", {"cpu", "disk"}, "tenant-a",
-                               "group-a");
-    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
-    ASSERT_EQ(EventCount(payload), 2u);
-    ExpectObjectEvent(EventAt(payload, 0), "stored", "object-a");
-    ExpectObjectEvent(EventAt(payload, 1), "stored", "object-a");
-
-    publisher.PublishObjectRemoved("object-a", "tenant-a", "group-a",
-                                   {"cpu", "disk"});
-    ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
-    ASSERT_EQ(EventCount(payload), 2u);
-    EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 0), "medium")),
+    ExpectObjectEvent(FirstEvent(payload), "removed", key);
+    EXPECT_EQ(MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
               "cpu");
-    EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 1), "medium")),
-              "disk");
-}
-
-// Covers restart and snapshot-restore: metadata can name media the publisher
-// A mutation that left the medium set alone carries no availability news, so it
-// must stay off the wire. This is what separates SyncObjectState from a commit,
-// which always re-announces.
-TEST(KvEventPublisherTest, SyncWithUnchangedMediaEmitsNothing) {
-    const std::string endpoint = MakeIpcEndpoint();
-    KvEventPublisher publisher(MakeEnabledConfig(endpoint));
-    ASSERT_TRUE(publisher.enabled());
-    ScopedSubscriber subscriber;
-    ASSERT_TRUE(subscriber.Connect(endpoint));
-
-    publisher.SyncObjectState("object-a", {"cpu", "disk"}, "tenant-a",
-                              "group-a", {"disk", "cpu"});
     EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
-}
 
-// A medium that appears during an internal mutation, such as an offload landing
-// on disk, has to be announced as stored even though no commit ran.
-TEST(KvEventPublisherTest, SyncAnnouncesNewlyAppearedMedium) {
-    const std::string endpoint = MakeIpcEndpoint();
-    KvEventPublisher publisher(MakeEnabledConfig(endpoint));
-    ASSERT_TRUE(publisher.enabled());
-    ScopedSubscriber subscriber;
-    ASSERT_TRUE(subscriber.Connect(endpoint));
-
-    msgpack::object_handle payload;
-    publisher.SyncObjectState("object-a", {"disk"}, "tenant-a", "group-a",
-                              {"cpu"});
+    // Removing the surviving object retracts the remaining "disk" tier.
+    ASSERT_TRUE(service.Remove(key, tenant, true).has_value());
     ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
-    ASSERT_EQ(EventCount(payload), 2u);
-    ExpectObjectEvent(EventAt(payload, 0), "removed", "object-a");
-    EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 0), "medium")),
-              "cpu");
-    ExpectObjectEvent(EventAt(payload, 1), "stored", "object-a");
-    EXPECT_EQ(MsgpackString(*FindMapValue(EventAt(payload, 1), "medium")),
+    ASSERT_EQ(EventCount(payload), 1u);
+    ExpectObjectEvent(FirstEvent(payload), "removed", key);
+    EXPECT_EQ(MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
               "disk");
+    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
 }
 
 TEST(KvEventPublisherTest, DisabledObjectKeyCountsSkippedObjectEvents) {
@@ -785,8 +840,10 @@ TEST(KvEventPublisherTest, DisabledObjectKeyCountsSkippedObjectEvents) {
     ScopedSubscriber subscriber;
     ASSERT_TRUE(subscriber.Connect(endpoint));
 
-    publisher.PublishCommitted("object-a", {"cpu"}, "tenant-a", "group-a");
-    publisher.PublishObjectRemoved("object-a", "tenant-a", "group-a", {"cpu"});
+    publisher.PublishTransition("object-a", "tenant-a", "group-a", "", 0,
+                                KvEventPublisher::kMediumCpu);
+    publisher.PublishTransition("object-a", "tenant-a", "group-a", "",
+                                KvEventPublisher::kMediumCpu, 0);
     EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
 
     // Clear carries no object key, so it survives the filter.
@@ -843,28 +900,13 @@ TEST(KvEventPublisherTest, ClearedEventIsEnvelopeOnlyWithNilMedium) {
     EXPECT_EQ(FindMapValue(cleared, "dp_rank")->as<uint32_t>(), 3u);
 }
 
-// medium is the availability field, so an empty one would describe a replica
-// the subscriber cannot place on any tier. Every entry point has to drop it
-// rather than publish a nil medium.
-TEST(KvEventPublisherTest, EmptyMediumProducesNoEvent) {
+TEST(KvEventPublisherTest, EmptyTransitionProducesNoEvent) {
     const std::string endpoint = MakeIpcEndpoint();
     KvEventPublisher publisher(MakeEnabledConfig(endpoint));
     ScopedSubscriber subscriber;
     ASSERT_TRUE(subscriber.Connect(endpoint));
 
-    publisher.PublishStored("object-a", "", "tenant-a", "group-a");
-    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
-
-    publisher.PublishRemoved("object-a", "", "tenant-a", "group-a");
-    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
-
-    publisher.PublishCommitted("object-a", {""}, "tenant-a", "group-a");
-    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
-
-    publisher.PublishObjectRemoved("object-a", "tenant-a", "group-a", {""});
-    EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
-
-    publisher.SyncObjectState("object-a", {""}, "tenant-a", "group-a", {""});
+    publisher.PublishTransition("object-a", "tenant-a", "group-a", "", 0, 0);
     EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
 }
 

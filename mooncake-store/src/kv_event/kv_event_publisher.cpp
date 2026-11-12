@@ -6,11 +6,9 @@
 #include <msgpack.hpp>
 #include <zmq.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <endian.h>
-#include <unordered_set>
 #include <vector>
 
 namespace mooncake {
@@ -64,28 +62,10 @@ size_t ComputeEventMapSize(bool is_stored, bool is_cleared, bool emit_legacy,
     return map_size;
 }
 
-std::unordered_set<std::string> NormalizeMedia(
-    const std::vector<std::string>& media) {
-    std::unordered_set<std::string> result;
-    for (const auto& value : media) {
-        if (!value.empty()) {
-            result.insert(value);
-        }
-    }
-    return result;
-}
-
-std::vector<std::string> SortedMedia(
-    const std::unordered_set<std::string>& media) {
-    std::vector<std::string> result(media.begin(), media.end());
-    std::sort(result.begin(), result.end());
-    return result;
-}
-
 // Events always carry a concrete tenant so subscribers can key on it without
 // having to model an unset value.
-std::string NormalizeTenant(const std::string& tenant_id) {
-    return tenant_id.empty() ? "default" : tenant_id;
+std::string NormalizeTenant(std::string_view tenant_id) {
+    return tenant_id.empty() ? "default" : std::string(tenant_id);
 }
 
 }  // namespace
@@ -171,117 +151,84 @@ KvEventPublisher::~KvEventPublisher() {
     }
 }
 
-void KvEventPublisher::PublishStored(const std::string& object_key,
-                                     const std::string& medium,
-                                     const std::string& tenant_id,
-                                     const std::string& group_id,
-                                     const std::string& session_id) {
-    if (!config_.enabled) {
-        return;
-    }
-    // medium is the only availability field on a stored event, so an empty one
-    // would announce a replica the subscriber cannot place on any tier.
-    if (medium.empty()) {
-        return;
-    }
-    std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                  NormalizeTenant(tenant_id), group_id,
-                                  session_id});
-    EnqueueBatch(std::move(events));
-}
-
-void KvEventPublisher::PublishRemoved(const std::string& object_key,
-                                      const std::string& medium,
-                                      const std::string& tenant_id,
-                                      const std::string& group_id) {
-    if (!config_.enabled) {
-        return;
-    }
-    // A retraction has to name the tier it retracts; medium=nil would ask the
-    // subscriber to drop availability it cannot identify.
-    if (medium.empty()) {
-        return;
-    }
-    std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
-                                  NormalizeTenant(tenant_id), group_id});
-    EnqueueBatch(std::move(events));
-}
-
-void KvEventPublisher::PublishCleared(const std::string& tenant_id) {
-    if (!config_.enabled) {
-        return;
-    }
-    std::vector<PendingEvent> events;
-    events.push_back(PendingEvent{EventKind::kCleared, "", "",
-                                  NormalizeTenant(tenant_id), ""});
-    EnqueueBatch(std::move(events));
-}
-
-void KvEventPublisher::PublishCommitted(
-    const std::string& object_key,
-    const std::vector<std::string>& current_media, const std::string& tenant_id,
-    const std::string& group_id, const std::string& session_id) {
-    if (!config_.enabled) {
+void KvEventPublisher::PublishTransition(std::string_view object_key,
+                                         std::string_view tenant_id,
+                                         std::string_view group_id,
+                                         std::string_view session_id,
+                                         uint8_t removed_mask,
+                                         uint8_t stored_mask) {
+    if (!config_.enabled || (removed_mask | stored_mask) == 0) {
         return;
     }
     const std::string normalized_tenant = NormalizeTenant(tenant_id);
-    std::vector<PendingEvent> events;
-    // A commit announces every medium unconditionally. Unlike SyncObjectState
-    // this is not a delta: the medium set can be unchanged while the object
-    // contents are new, and a subscriber that saw no event would keep serving
-    // the previous contents.
-    for (const auto& medium : SortedMedia(NormalizeMedia(current_media))) {
-        events.push_back(PendingEvent{EventKind::kStored, object_key, medium,
-                                      normalized_tenant, group_id, session_id});
-    }
-    EnqueueBatch(std::move(events));
-}
-
-void KvEventPublisher::PublishObjectRemoved(
-    const std::string& object_key, const std::string& tenant_id,
-    const std::string& group_id,
-    const std::vector<std::string>& previous_media) {
-    if (!config_.enabled) {
-        return;
-    }
-    const std::string normalized_tenant = NormalizeTenant(tenant_id);
-    std::vector<PendingEvent> events;
-    for (const auto& medium : SortedMedia(NormalizeMedia(previous_media))) {
-        events.push_back(PendingEvent{EventKind::kRemoved, object_key, medium,
-                                      normalized_tenant, group_id});
-    }
-    EnqueueBatch(std::move(events));
-}
-
-void KvEventPublisher::SyncObjectState(
-    const std::string& object_key,
-    const std::vector<std::string>& current_media, const std::string& tenant_id,
-    const std::string& group_id, const std::vector<std::string>& previous_media,
-    const std::string& session_id) {
-    if (!config_.enabled) {
-        return;
-    }
-    const std::string normalized_tenant = NormalizeTenant(tenant_id);
-    const auto new_set = NormalizeMedia(current_media);
-    const auto previous_set = NormalizeMedia(previous_media);
-
-    std::vector<PendingEvent> events;
-    for (const auto& medium : SortedMedia(previous_set)) {
-        if (!new_set.contains(medium)) {
-            events.push_back(PendingEvent{EventKind::kRemoved, object_key,
-                                          medium, normalized_tenant, group_id});
+    bool was_empty = false;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        was_empty = queue_.empty();
+        if ((removed_mask & kMediumCpu) != 0) {
+            PushEventLocked(
+                PendingEvent{EventKind::kRemoved, std::string(object_key),
+                             "cpu", normalized_tenant, std::string(group_id)});
+        }
+        if ((removed_mask & kMediumDisk) != 0) {
+            PushEventLocked(
+                PendingEvent{EventKind::kRemoved, std::string(object_key),
+                             "disk", normalized_tenant, std::string(group_id)});
+        }
+        if ((stored_mask & kMediumCpu) != 0) {
+            PushEventLocked(
+                PendingEvent{EventKind::kStored, std::string(object_key), "cpu",
+                             normalized_tenant, std::string(group_id),
+                             std::string(session_id)});
+        }
+        if ((stored_mask & kMediumDisk) != 0) {
+            PushEventLocked(
+                PendingEvent{EventKind::kStored, std::string(object_key),
+                             "disk", normalized_tenant, std::string(group_id),
+                             std::string(session_id)});
         }
     }
-    for (const auto& medium : SortedMedia(new_set)) {
-        if (!previous_set.contains(medium)) {
-            events.push_back(PendingEvent{EventKind::kStored, object_key,
-                                          medium, normalized_tenant, group_id,
-                                          session_id});
-        }
+    if (was_empty) {
+        queue_cv_.notify_one();
     }
-    EnqueueBatch(std::move(events));
+}
+
+void KvEventPublisher::PublishCleared(std::string_view tenant_id) {
+    if (!config_.enabled) {
+        return;
+    }
+    bool was_empty = false;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        was_empty = queue_.empty();
+        PushEventLocked(PendingEvent{EventKind::kCleared, "", "",
+                                     NormalizeTenant(tenant_id), ""});
+    }
+    if (was_empty) {
+        queue_cv_.notify_one();
+    }
+}
+
+bool KvEventPublisher::PublishClearedIfUnchanged(
+    std::string_view tenant_id, const std::atomic<uint64_t>& epoch,
+    uint64_t expected_epoch) {
+    if (!config_.enabled) {
+        return epoch.load(std::memory_order_acquire) == expected_epoch;
+    }
+    bool was_empty = false;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (epoch.load(std::memory_order_acquire) != expected_epoch) {
+            return false;
+        }
+        was_empty = queue_.empty();
+        PushEventLocked(PendingEvent{EventKind::kCleared, "", "",
+                                     NormalizeTenant(tenant_id), ""});
+    }
+    if (was_empty) {
+        queue_cv_.notify_one();
+    }
+    return true;
 }
 
 KvEventPublisher::Stats KvEventPublisher::GetStats() const {
@@ -293,24 +240,14 @@ KvEventPublisher::Stats KvEventPublisher::GetStats() const {
     return stats;
 }
 
-void KvEventPublisher::EnqueueBatch(std::vector<PendingEvent> events) {
-    if (events.empty()) {
-        return;
+void KvEventPublisher::PushEventLocked(PendingEvent&& event) {
+    if (config_.queue_capacity > 0 && queue_.size() >= config_.queue_capacity) {
+        queue_.pop_front();
+        dropped_events_.fetch_add(1, std::memory_order_relaxed);
+        // Reserve a ZMQ sequence gap so consumers can detect loss.
+        next_zmq_sequence_.fetch_add(1, std::memory_order_relaxed);
     }
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        for (auto& event : events) {
-            if (config_.queue_capacity > 0 &&
-                queue_.size() >= config_.queue_capacity) {
-                queue_.pop_front();
-                dropped_events_.fetch_add(1, std::memory_order_relaxed);
-                // Reserve a ZMQ sequence gap so consumers can detect loss.
-                next_zmq_sequence_.fetch_add(1, std::memory_order_relaxed);
-            }
-            queue_.push_back(std::move(event));
-        }
-    }
-    queue_cv_.notify_one();
+    queue_.push_back(std::move(event));
 }
 
 void KvEventPublisher::DrainRemainingQueue(std::vector<PendingEvent>& batch) {
