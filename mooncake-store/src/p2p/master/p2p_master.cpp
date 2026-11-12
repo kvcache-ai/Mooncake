@@ -415,20 +415,35 @@ int P2PMaster::RunWithHA() {
         master_view->ElectLeader(local_endpoint, view_version, lease_id);
 
         std::atomic<bool> leadership_lost{false};
-        std::atomic<bool> stepdown_requested{false};
+        std::atomic<bool> active_stepdown_requested{false};
         std::atomic<OpLogManager*> primary_oplog_manager{nullptr};
-        auto stop_primary_server = [&server, &leadership_lost,
-                                    &stepdown_requested] {
-            // Close the write request entry first. RunActiveRpcServers joins
-            // accepted main and heartbeat handlers before OpLog draining.
-            stepdown_requested.store(true, std::memory_order_release);
+        const auto stop_for_leadership_loss = [&server, &leadership_lost,
+                                               &primary_oplog_manager] {
             leadership_lost.store(true, std::memory_order_release);
+            // A lost lease can overlap with the next primary. Stop accepting
+            // and enqueueing new OpLog write immediately; DrainWriting below is
+            // deliberately skipped for this path. TODO(P2P HA): add an
+            // epoch/fencing check in the shared store so an already in-flight
+            // command cannot modify the new primary's OpLog.
+            if (auto* manager =
+                    primary_oplog_manager.load(std::memory_order_acquire)) {
+                manager->RequestStopWriting();
+            }
+            server->stop();
+        };
+        const auto stop_for_active_stepdown = [&server,
+                                               &active_stepdown_requested] {
+            // Active stepdown is voluntary: close the write request entry
+            // first, then let RunActiveRpcServers wait for accepted handlers
+            // and drain confirmed writes while this primary still renews its
+            // lease.
+            active_stepdown_requested.store(true, std::memory_order_release);
             server->stop();
         };
         auto keep_leader_thread = std::thread(
-            [view = master_view.get(), lease_id, stop_primary_server] {
+            [view = master_view.get(), lease_id, stop_for_leadership_loss] {
                 view->KeepLeader(lease_id);
-                stop_primary_server();
+                stop_for_leadership_loss();
             });
         std::this_thread::sleep_for(
             std::chrono::seconds(master_view->GetLeaderLeaseTTLSeconds()));
@@ -462,9 +477,10 @@ int P2PMaster::RunWithHA() {
         }
 
         HAStatusManager::instance().SetRoleState("primary", "STARTING");
-        auto drain_after_stepdown = [&stepdown_requested,
-                                     &primary_oplog_manager] {
-            if (!stepdown_requested.load(std::memory_order_acquire)) {
+        auto drain_after_stepdown = [&active_stepdown_requested,
+                                     &leadership_lost, &primary_oplog_manager] {
+            if (!active_stepdown_requested.load(std::memory_order_acquire) ||
+                leadership_lost.load(std::memory_order_acquire)) {
                 return;
             }
             if (auto* manager =
@@ -488,7 +504,7 @@ int P2PMaster::RunWithHA() {
                 }
             }
         };
-        auto stepdown_callback = stop_primary_server;
+        auto stepdown_callback = stop_for_active_stepdown;
         // The active service serves the full HTTP surface (including
         // business endpoints) on the same metrics port, so hand it over now.
         status_http_server.Stop();
@@ -498,11 +514,12 @@ int P2PMaster::RunWithHA() {
             auto* manager =
                 active_service->GetMasterService().GetOpLogManager();
             primary_oplog_manager.store(manager, std::memory_order_release);
-            // Handle a leader loss that races with service publication. The
-            // keep-leader callback either stops the listener itself or
-            // leadership_lost is observed here and the stop is replayed.
+            // Handle a leader loss that races with service publication.
+            // The keep-leader callback can fire before the manager is
+            // published. Replay the cancellation and server stop here to close
+            // that publication race.
             if (leadership_lost.load(std::memory_order_acquire)) {
-                stop_primary_server();
+                stop_for_leadership_loss();
             }
         }
         if (promoted_metadata.has_value()) {
@@ -631,11 +648,16 @@ int P2PMaster::RunWithHA() {
 #ifdef STORE_USE_REDIS
         redis_oplog_trim_worker.reset();
 #endif
+        const bool demoted_primary =
+            active_stepdown_requested.load(std::memory_order_acquire) ||
+            leadership_lost.load(std::memory_order_acquire);
         HAStatusManager::instance().SetRoleState(
-            leadership_lost.load(std::memory_order_acquire) ? "standby"
-                                                            : "primary",
-            leadership_lost.load(std::memory_order_acquire) ? "LEADERSHIP_LOST"
-                                                            : "STOPPED");
+            demoted_primary ? "standby" : "primary",
+            leadership_lost.load(std::memory_order_acquire)
+                ? "LEADERSHIP_LOST"
+                : (active_stepdown_requested.load(std::memory_order_acquire)
+                       ? "STEPPED_DOWN"
+                       : "STOPPED"));
         if (auto* manager =
                 primary_oplog_manager.load(std::memory_order_acquire)) {
             manager->StopWriting();
@@ -652,8 +674,7 @@ int P2PMaster::RunWithHA() {
         }
 #endif
         auto* active_p2p_service = &active_service->GetMasterService();
-        if (config_.oplog.enabled &&
-            leadership_lost.load(std::memory_order_acquire)) {
+        if (config_.oplog.enabled && demoted_primary) {
             const uint64_t local_assigned_sequence_id =
                 active_p2p_service->GetLatestOpLogSequenceId();
             auto local_committed_sequence_id =
@@ -702,8 +723,9 @@ int P2PMaster::RunWithHA() {
             }
         } else {
             demoted_primary_handoff.reset();
-            LOG(WARNING) << "Skip P2P primary demotion handoff because master "
-                            "service stopped without losing leadership";
+            LOG(WARNING)
+                << "Skip P2P primary demotion handoff because master "
+                   "service stopped without a primary demotion request";
         }
         master_view->CancelKeepAlive(lease_id);
         keep_leader_thread.join();

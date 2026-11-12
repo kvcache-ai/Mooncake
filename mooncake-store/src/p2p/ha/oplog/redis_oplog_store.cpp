@@ -312,9 +312,14 @@ OpLogDrainResult RedisOpLogStore::DrainWriting(uint32_t timeout_ms) {
     if (result.drained || timeout_ms == 0) {
         return result;
     }
-    sync_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-        return pending_writes_.empty() && inflight_writes_.empty();
-    });
+    // A leadership-loss cancellation during an active stepdown drain must not
+    // keep the primary waiting for the full timeout after writers are stopped.
+    sync_cv_.wait_for(
+        lock, async_stop_source_.get_token(),
+        std::chrono::milliseconds(timeout_ms), [&] {
+            return (pending_writes_.empty() && inflight_writes_.empty()) ||
+                   !async_running_.load();
+        });
     snapshot();
     return result;
 }

@@ -490,6 +490,42 @@ TEST_F(RedisOpLogStoreTest, StopWritingAbortsSyncWaitAndRejectsNewWrites) {
     EXPECT_EQ(0, HAMetricManager::instance().get_oplog_async_queue_size());
 }
 
+TEST_F(RedisOpLogStoreTest, DrainWritingReturnsAfterLeaseLossStopRequest) {
+    auto writer = CreateWriter();
+    // seq=2 cannot commit while seq=1 is missing, so the writer keeps it
+    // inflight and a drain cannot complete normally.
+    auto pending = std::async(std::launch::async, [&] {
+        return writer->WriteOpLog(MakeEntry(2), true);
+    });
+    OpLogEntry stored;
+    for (int i = 0; i < 200; ++i) {
+        if (writer->ReadOpLog(2, stored) == ErrorCode::OK) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(2u, stored.sequence_id);
+    ASSERT_EQ(1, HAMetricManager::instance().get_oplog_async_queue_size());
+    EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+
+    auto draining = std::async(std::launch::async,
+                               [&] { return writer->DrainWriting(5000); });
+    EXPECT_EQ(draining.wait_for(std::chrono::milliseconds(200)),
+              std::future_status::timeout);
+
+    // A lost lease cancels the writer while the active stepdown drain is in
+    // progress. The drain must return promptly instead of waiting for a
+    // timeout.
+    writer->RequestStopWriting();
+    ASSERT_EQ(draining.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_FALSE(draining.get().drained);
+
+    EXPECT_EQ(pending.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_EQ(pending.get(), ErrorCode::INTERNAL_ERROR);
+    writer->StopWriting();
+}
+
 TEST_F(RedisOpLogStoreTest, StopRacesWithSyncWaitAndIdleWorkers) {
     for (int i = 0; i < 50; ++i) {
         SCOPED_TRACE(i);
