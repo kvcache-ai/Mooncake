@@ -57,6 +57,7 @@ class TestBufferAllocator final
     uintptr_t base() const override { return base_; }
     std::string getSegmentName() const override { return name_; }
     std::string getTransportEndpoint() const override { return endpoint_; }
+    std::string getTransportProtocol() const override { return "tcp"; }
     size_t getLargestFreeRegion() const override {
         return capacity_ - std::min(size(), capacity_);
     }

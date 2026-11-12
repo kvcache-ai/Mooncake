@@ -471,6 +471,15 @@ fn is_redis_metadata_uri(value: &str) -> bool {
     value.starts_with("redis://")
 }
 
+const ASCEND_DEVICE_ENV: &str = "MC_STORE_RS_ASCEND_DEVICE";
+
+fn ascend_device_id() -> i32 {
+    std::env::var(ASCEND_DEVICE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(0)
+}
+
 fn build_tent_config(
     local_hostname: &str,
     transport_metadata_uri: &str,
@@ -493,15 +502,22 @@ fn build_tent_config(
         .unwrap_or("0");
     let auth = resolve_redis_auth(transport_metadata_uri)?;
 
-    let (tcp_enable, rdma_enable) = match protocol.to_ascii_lowercase().as_str() {
-        "tcp" | "" => ("true", "false"),
-        "rdma" => ("false", "true"),
-        "auto" => ("true", "false"),
+    let ascend = match protocol.to_ascii_lowercase().as_str() {
+        "tcp" | "" => false,
+        "rdma" => false,
+        "auto" => false,
+        "ascend" | "ascend_direct" => true,
         other => {
             return Err(StoreError::Unsupported(format!(
                 "unsupported transport protocol: {other}"
             )))
         }
+    };
+    let (tcp_enable, rdma_enable) = match protocol.to_ascii_lowercase().as_str() {
+        "tcp" | "" | "auto" => ("true", "false"),
+        "rdma" => ("false", "true"),
+        "ascend" | "ascend_direct" => ("false", "false"),
+        _ => unreachable!("protocol validated above"),
     };
 
     let mut config = TentEngineConfig::new()
@@ -523,6 +539,23 @@ fn build_tent_config(
         )
         .set("transports/io_uring/enable", "false")
         .redis_db_index(db_index);
+    if ascend {
+        // TENT selects transports via transports/*/enable, not via a protocol
+        // enum. Keep only ascend_direct for the data path and tell it this TE
+        // has the Store role (mirrors Client::InitTransferEngine).
+        config = config
+            .set("transports/ascend_direct/enable", "true")
+            .set("transports/ascend_direct/store_te_init", "true")
+            .set("transports/ascend_direct/agent_mode", "false")
+            .set(
+                "transports/ascend_direct/transfer_timeout_ms",
+                timeouts.transfer_stall_timeout.as_millis().to_string(),
+            )
+            .ascend_device(ascend_device_id());
+        if std::env::var_os("ASCEND_ENABLE_USE_FABRIC_MEM").is_some() {
+            config = config.set("transports/ascend_direct/fabric_mem", "true");
+        }
+    }
     if let Some(username) = auth.username {
         config = config.redis_username(username);
     }

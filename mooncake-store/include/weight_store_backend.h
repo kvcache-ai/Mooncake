@@ -11,6 +11,7 @@ namespace mooncake {
 
 struct WeightGroupMemberSnapshot {
     std::string key;
+    std::string residency_affinity_id;
     uint64_t size{0};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
     bool readable{false};

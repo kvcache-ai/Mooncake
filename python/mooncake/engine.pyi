@@ -19,6 +19,8 @@ SUPPORT_INTRA_NVLINK: bool
 SUPPORT_MNNVL: bool
 SUPPORT_MULTI_PROTOCOL: bool
 SUPPORT_MUSA: bool
+SUPPORT_TENT: bool
+SUPPORT_XPU: bool
 
 class TransferOpcode:
     Read: ClassVar[TransferOpcode]

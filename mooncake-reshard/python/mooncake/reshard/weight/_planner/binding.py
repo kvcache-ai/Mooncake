@@ -38,6 +38,16 @@ from .attestation import RuntimeBindingAttestation
 from .validation import _validate_logical_target_coverage
 
 
+_BindingAttestations = dict[
+    tuple[PlacementId, ParticipantId],
+    tuple[
+        WeightPlacementManifest,
+        WeightRuntimeBindingManifest,
+        RuntimeBindingAttestation,
+    ],
+]
+
+
 def _validated_bindings_by_placement_id(
     placements: Sequence[WeightPlacementManifest],
     bindings: Sequence[WeightRuntimeBindingManifest],
@@ -128,6 +138,8 @@ def _bound_fragments_by_placement_fragment_id(
         tuple[PlacementId, ParticipantId], WeightRuntimeBindingManifest
     ],
     label: str,
+    *,
+    attestations: _BindingAttestations | None = None,
 ) -> dict[PlacementFragmentId, BoundWeightFragment]:
     result: dict[PlacementFragmentId, BoundWeightFragment] = {}
     for placement in placements:
@@ -138,6 +150,12 @@ def _bound_fragments_by_placement_fragment_id(
             if binding is None:
                 continue
             attestation = RuntimeBindingAttestation(placement, binding)
+            if attestations is not None:
+                attestations[(placement.placement_id, part.participant_id)] = (
+                    placement,
+                    binding,
+                    attestation,
+                )
             runtime_by_id = {
                 fragment.placement_fragment_id: fragment
                 for fragment in binding.fragments
@@ -317,6 +335,7 @@ def _build_executor_plans(
     side: str,
     *,
     selected_fragment_ids: frozenset[RuntimeFragmentId] | None = None,
+    attestations: _BindingAttestations | None = None,
 ) -> tuple[ExecutorTransferPlan, ...]:
     if side not in ("source", "target"):
         raise ValueError(f"invalid executor side: {side}")
@@ -336,8 +355,23 @@ def _build_executor_plans(
             )
             if binding is None:
                 continue
-            validate_runtime_binding(placement, binding)
-            attestation = RuntimeBindingAttestation(placement, binding)
+            attested = (
+                attestations.get((placement.placement_id, part.participant_id))
+                if attestations is not None
+                else None
+            )
+            if attested is None:
+                validate_runtime_binding(placement, binding)
+                attestation = RuntimeBindingAttestation(placement, binding)
+            else:
+                # Reuse only evidence built from these exact inputs in this bind.
+                attested_placement, attested_binding, attestation = attested
+                if (
+                    attested_placement is not placement
+                    or attested_binding is not binding
+                    or attestation.placement is not placement
+                ):
+                    raise ValueError("runtime attestation inputs differ")
             if not part.fragments:
                 continue
             runtime_by_placement_fragment_id = {
@@ -462,10 +496,13 @@ def bind_logical_transfer_plan(
         "source",
         source_required,
     )
+    target_attestations: _BindingAttestations = {}
+    source_attestations: _BindingAttestations = {}
     runtime_targets = _bound_fragments_by_placement_fragment_id(
         (logical_plan.target_placement,),
         target_binding_by_id,
         "target",
+        attestations=target_attestations,
     )
     runtime_sources = (
         _bound_fragments_by_placement_fragment_id(
@@ -476,6 +513,7 @@ def bind_logical_transfer_plan(
             ),
             source_binding_by_id,
             "source",
+            attestations=source_attestations,
         )
         if source_binding_by_id
         else {}
@@ -541,6 +579,7 @@ def bind_logical_transfer_plan(
                     bound_operations,
                     "source",
                 ),
+                attestations=source_attestations,
             )
             if source_binding_values
             else ()
@@ -553,6 +592,7 @@ def bind_logical_transfer_plan(
                 bound_operations,
                 "target",
             ),
+            attestations=target_attestations,
         ),
     )
 

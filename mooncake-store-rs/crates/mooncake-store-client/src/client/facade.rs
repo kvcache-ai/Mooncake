@@ -180,6 +180,38 @@ fn common_value<'a>(mut values: impl Iterator<Item = &'a str>) -> String {
 }
 
 impl StoreClient {
+    /// Write one object with its complete namespace, QoS, and replication policy.
+    ///
+    /// This is the single-object entry point shared by the compatibility facade
+    /// and the Python `put` path, so a `None` policy selects the C++-compatible
+    /// default (see `compat_put_policy`) instead of Store-RS' library default.
+    pub fn put_request(&self, request: &PutRequest<'_>) -> Result<ObjectRoute> {
+        let tenant = request.tenant.unwrap_or(self.default_tenant());
+        let _span = info_span!(
+            "store.put",
+            runtime = %self.lease.runtime,
+            tenant,
+            key = request.key,
+            bytes = request.value.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("put")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.item_count", 1)
+            .input_bytes(request.value.len() as u64);
+        let object = ObjectRef {
+            tenant: request.tenant,
+            domain: request.domain,
+            object_set: request.object_set,
+            qos_tier: request.qos_tier,
+            key: request.key,
+        };
+        let policy = compat_put_policy(request.policy.as_ref());
+        let result = self.put_object(&object, request.value, policy.as_ref());
+        tracker.finish(&result, request.value.len() as u64);
+        result
+    }
+
     fn expect_exactly_one<T>(mut items: Vec<T>, operation: &str) -> Result<T> {
         match items.len() {
             1 => Ok(items.pop().expect("single-item vector should contain one element")),
@@ -1332,21 +1364,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn put_in_tenant(&self, tenant: &str, key: &str, value: &[u8]) -> Result<ObjectRoute> {
-        let _span = info_span!(
-            "store.put",
-            runtime = %self.lease.runtime,
-            tenant,
-            key,
-            bytes = value.len()
-        )
-        .entered();
-        let tracker = OperationTracker::new("put")
-            .attribute_str("mooncake.tenant", tenant)
-            .attribute_u64("mooncake.item_count", 1)
-            .input_bytes(value.len() as u64);
-        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, None);
-        tracker.finish(&result, value.len() as u64);
-        result
+        self.put_request(&PutRequest::new(key, value).tenant(tenant))
     }
 
     fn put_with_policy(
@@ -1365,21 +1383,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
         value: &[u8],
         policy: &ReplicationPolicy,
     ) -> Result<ObjectRoute> {
-        let _span = info_span!(
-            "store.put",
-            runtime = %self.lease.runtime,
-            tenant,
-            key,
-            bytes = value.len()
+        self.put_request(
+            &PutRequest::new(key, value)
+                .tenant(tenant)
+                .replication(policy.clone()),
         )
-        .entered();
-        let tracker = OperationTracker::new("put")
-            .attribute_str("mooncake.tenant", tenant)
-            .attribute_u64("mooncake.item_count", 1)
-            .input_bytes(value.len() as u64);
-        let result = self.put_object(&ObjectRef::new(key).tenant(tenant), value, Some(policy));
-        tracker.finish(&result, value.len() as u64);
-        result
     }
 
     fn put_from(&self, key: &str, buffer: *const c_void, size: usize) -> Result<ObjectRoute> {
@@ -1528,7 +1536,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             if let Some(qos_tier) = request.qos_tier {
                 object = object.qos_tier(qos_tier);
             }
-            routes.push(self.put_object(&object, request.value, request.policy.as_ref())?);
+            let policy = compat_put_policy(request.policy.as_ref());
+            routes.push(self.put_object(&object, request.value, policy.as_ref())?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -1564,7 +1573,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             self.ensure_control_plane_tenant(
                 request.tenant.unwrap_or(self.default_tenant()),
             )?;
-            let payload = flatten_slices(request.buffers);
+            // NPU device buffers cannot be flattened with a CPU copy; stage
+            // them into host memory with an ACL D2H copy first.
+            let payload = flatten_buffers_with_device_staging(request.buffers)?;
             let mut object = ObjectRef::new(request.key);
             if let Some(tenant) = request.tenant {
                 object = object.tenant(tenant);
@@ -1578,7 +1589,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             if let Some(qos_tier) = request.qos_tier {
                 object = object.qos_tier(qos_tier);
             }
-            routes.push(self.put_object(&object, &payload, request.policy.as_ref())?);
+            let policy = compat_put_policy(request.policy.as_ref());
+            routes.push(self.put_object(&object, &payload, policy.as_ref())?);
         }
         let result = Ok(routes);
         tracker.finish(&result, bytes_in);
@@ -1736,56 +1748,24 @@ impl MooncakeCompatibilityFacade for StoreClient {
         &self,
         requests: &mut [MultiBufferGetRequest<'_>],
     ) -> Result<Vec<usize>> {
-        let _span = info_span!(
-            "store.batch_get_into_multi_buffers",
-            runtime = %self.lease.runtime,
-            items = requests.len()
-        )
-        .entered();
-        let tracker = OperationTracker::new("batch_get_into_multi_buffers")
-            .attribute_u64("mooncake.item_count", requests.len() as u64);
-        let objects = requests
-            .iter()
-            .map(|request| {
-                let mut object = ObjectRef::new(request.key);
-                if let Some(tenant) = request.tenant {
-                    object = object.tenant(tenant);
+        match self.batch_get_into_multi_buffers_direct(requests) {
+            Ok(sizes) => Ok(sizes),
+            Err(error) => {
+                // The payload fallback copies through the CPU into the caller's
+                // buffers; that is invalid for NPU device memory. Surface the
+                // original error instead of corrupting the device buffer.
+                if multi_buffer_requests_have_device_targets(requests) {
+                    return Err(error);
                 }
-                if let Some(domain) = request.domain {
-                    object = object.domain(domain);
-                }
-                if let Some(object_set) = request.object_set {
-                    object = object.object_set(object_set);
-                }
-                if let Some(qos_tier) = request.qos_tier {
-                    object = object.qos_tier(qos_tier);
-                }
-                object
-            })
-            .collect::<Vec<_>>();
-        let payloads = self.batch_get(&objects)?;
-        let mut sizes = Vec::with_capacity(requests.len());
-        for (request, payload) in requests.iter_mut().zip(payloads.iter()) {
-            let total = request
-                .buffers
-                .iter()
-                .map(|buffer| buffer.len())
-                .sum::<usize>();
-            if total < payload.len() {
-                return Err(StoreError::Allocator(format!(
-                    "multi-buffer capacity too small for key {}: have={} need={}",
-                    request.key,
-                    total,
-                    payload.len()
-                )));
+                debug!(
+                    runtime = %self.lease.runtime,
+                    items = requests.len(),
+                    error = %error,
+                    "direct multi-buffer read unavailable, falling back to payload path"
+                );
+                self.batch_get_into_multi_buffers_payload(requests)
             }
-            scatter_into_buffers(payload, request.buffers);
-            sizes.push(payload.len());
         }
-        let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
-        let result = Ok(sizes);
-        tracker.finish(&result, bytes_out);
-        result
     }
 
     unsafe fn get_into_range(
@@ -2169,4 +2149,112 @@ impl Drop for StoreClient {
             let _ = memory.release_scratch(transport);
         }
     }
+}
+
+impl StoreClient {
+    fn batch_get_into_multi_buffers_payload(
+        &self,
+        requests: &mut [MultiBufferGetRequest<'_>],
+    ) -> Result<Vec<usize>> {
+        let _span = info_span!(
+            "store.batch_get_into_multi_buffers",
+            runtime = %self.lease.runtime,
+            items = requests.len()
+        )
+        .entered();
+        let tracker = OperationTracker::new("batch_get_into_multi_buffers")
+            .attribute_u64("mooncake.item_count", requests.len() as u64);
+        let objects = requests
+            .iter()
+            .map(|request| {
+                let mut object = ObjectRef::new(request.key);
+                if let Some(tenant) = request.tenant {
+                    object = object.tenant(tenant);
+                }
+                if let Some(domain) = request.domain {
+                    object = object.domain(domain);
+                }
+                if let Some(object_set) = request.object_set {
+                    object = object.object_set(object_set);
+                }
+                if let Some(qos_tier) = request.qos_tier {
+                    object = object.qos_tier(qos_tier);
+                }
+                object
+            })
+            .collect::<Vec<_>>();
+        let payloads = self.batch_get(&objects)?;
+        let mut sizes = Vec::with_capacity(requests.len());
+        for (request, payload) in requests.iter_mut().zip(payloads.iter()) {
+            let total = request
+                .buffers
+                .iter()
+                .map(|buffer| buffer.len())
+                .sum::<usize>();
+            if total < payload.len() {
+                return Err(StoreError::Allocator(format!(
+                    "multi-buffer capacity too small for key {}: have={} need={}",
+                    request.key,
+                    total,
+                    payload.len()
+                )));
+            }
+            scatter_into_buffers(payload, request.buffers);
+            sizes.push(payload.len());
+        }
+        let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
+        let result = Ok(sizes);
+        tracker.finish(&result, bytes_out);
+        result
+    }
+}
+
+fn multi_buffer_requests_have_device_targets(requests: &[MultiBufferGetRequest<'_>]) -> bool {
+    use std::ffi::c_void;
+    requests.iter().any(|request| {
+        request.buffers.iter().any(|buffer| {
+            !buffer.is_empty()
+                && mooncake_store_rs_transport::ascend_pointer_is_device(
+                    buffer.as_ptr() as *mut c_void,
+                ) == Some(true)
+        })
+    })
+}
+
+/// C++ Store's `ReplicateConfig` defaults `prefer_alloc_in_same_node` to
+/// false and lets the master spread replicas over all segments. Store-RS'
+/// library default prefers the writer's own segment, which concentrates every
+/// object of a single writer on one owner and turns multi-reader reads into a
+/// single-owner bottleneck. The compatibility facade follows the C++ default:
+/// `None` selects it, and an explicit policy is passed through unchanged.
+fn compat_put_policy(policy: Option<&ReplicationPolicy>) -> Option<ReplicationPolicy> {
+    match policy {
+        Some(policy) => Some(policy.clone()),
+        None => Some(ReplicationPolicy::default().prefer_local(false)),
+    }
+}
+
+fn flatten_buffers_with_device_staging(buffers: &[&[u8]]) -> Result<Vec<u8>> {
+    use std::ffi::c_void;
+    let total = buffers.iter().map(|buffer| buffer.len()).sum::<usize>();
+    let mut flattened = Vec::with_capacity(total);
+    for buffer in buffers {
+        if !buffer.is_empty()
+            && mooncake_store_rs_transport::ascend_pointer_is_device(
+                buffer.as_ptr() as *mut c_void,
+            ) == Some(true)
+        {
+            let mut host = vec![0u8; buffer.len()];
+            mooncake_store_rs_transport::ascend_copy_d2h(
+                host.as_mut_ptr().cast::<c_void>(),
+                buffer.as_ptr().cast::<c_void>(),
+                buffer.len(),
+            )
+            .map_err(StoreError::Transport)?;
+            flattened.extend_from_slice(&host);
+        } else {
+            flattened.extend_from_slice(buffer);
+        }
+    }
+    Ok(flattened)
 }

@@ -148,7 +148,14 @@ def _require_integer_tuple(
     *,
     minimum: int,
 ) -> tuple[int, ...]:
-    if type(values) not in (tuple, list):
+    values_type = type(values)
+    if values_type is tuple and type(minimum) is int:
+        for item in cast(tuple[object, ...], values):
+            if type(item) is not int or item < minimum:
+                break
+        else:
+            return cast(tuple[int, ...], values)
+    if values_type not in (tuple, list):
         raise ValueError(f"{name} must be a tuple or list")
     items = cast(Sequence[object], values)
     return tuple(
