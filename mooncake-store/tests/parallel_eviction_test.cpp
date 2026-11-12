@@ -102,8 +102,8 @@ TEST_F(ShardedLeaseIndexTest, CursorExcludesPublicationsAddedAfterScanBegan) {
     Publish("first");
     auto cursor = ns_.eviction_index().ScanRanges(now_, 1);
     ASSERT_TRUE(cursor);
-    Publish("later");
-    cursor->SetTarget(1);
+    Publish("later_same_bucket");
+    PublishAt("later_older_bucket", now_ - std::chrono::seconds(20));
     const auto entry = cursor->Next();
     ASSERT_TRUE(entry);
     EXPECT_EQ(entry->keys.front(), "first");
@@ -505,7 +505,6 @@ TEST_F(ParallelEvictorNativeTest, AutomaticWorkersGrowAndShrinkWithFiledKeys) {
             uint64_t Limit() const override { return 0; }
             void VisitRange(uint64_t, uint64_t, const Visitor&) const override {
             }
-            void SetTarget(size_t) override {}
             bool Widen() override { return false; }
             uint64_t Examined() const override { return 0; }
 
@@ -519,10 +518,10 @@ TEST_F(ParallelEvictorNativeTest, AutomaticWorkersGrowAndShrinkWithFiledKeys) {
         void OnRead(const route::ReadGuard&) override {}
         void OnWrite(const route::WriteGuard&) override {}
         std::unique_ptr<Cursor> Scan(Clock::time_point now) const override {
-            return ScanRanges(now, 0);
+            return EvictionIndex::ScanRanges(now, 0);
         }
-        std::unique_ptr<RangeCursor> ScanRanges(Clock::time_point,
-                                                size_t) const override {
+        std::unique_ptr<RangeCursor> ScanRanges(
+            Clock::time_point, const TargetForTotal&) const override {
             return std::make_unique<EmptyCursor>(population_);
         }
 

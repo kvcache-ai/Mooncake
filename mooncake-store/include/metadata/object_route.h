@@ -87,6 +87,44 @@ struct ObjectRef {
     Generation generation{0};
 };
 
+// Per-slot filing record owned by the namespace's EvictionIndex. Stored inline
+// on KeySlot so filing a key allocates no node of its own.
+struct SlotEvictionState {
+    bool filed{false};
+    uint16_t shard{0};
+    int64_t rank{0};
+    uint64_t identity{0};
+    uint64_t born_seq{0};
+    uint64_t refile_seq{0};
+    void* group{nullptr};
+
+    bool operator==(const SlotEvictionState&) const noexcept = default;
+
+    void FileStandalone(uint16_t chosen_shard, int64_t at_rank,
+                        uint64_t entry_identity, uint64_t born) noexcept {
+        *this = SlotEvictionState{
+            .filed = true,
+            .shard = chosen_shard,
+            .rank = at_rank,
+            .identity = entry_identity,
+            .born_seq = born,
+        };
+    }
+
+    void FileGroup(uint16_t group_shard, int64_t at_rank,
+                   uint64_t entry_identity, void* group_ptr) noexcept {
+        *this = SlotEvictionState{
+            .filed = true,
+            .shard = group_shard,
+            .rank = at_rank,
+            .identity = entry_identity,
+            .group = group_ptr,
+        };
+    }
+
+    void Clear() noexcept { *this = SlotEvictionState{}; }
+};
+
 // What the route's owner keeps on every slot, guarded by the slot lock. The
 // route stores it and never reads it; it survives the objects published in the
 // slot, so the owner returns it to its initial value once the key holds none,
@@ -94,54 +132,10 @@ struct ObjectRef {
 struct SlotOwnerState {
     // Whether the owner's in-flight list holds the slot.
     bool in_flight_listed{false};
-    // Whether the eviction index holds the slot, and where it is filed.
-    bool eviction_filed{false};
-    uint16_t eviction_shard{0};
-    int64_t eviction_rank{0};
-    uint64_t eviction_identity{0};
-    uint64_t eviction_born_seq{0};
-    uint64_t eviction_refile_seq{0};
-    void* eviction_group{nullptr};
+    // Where the owner's eviction index has filed the slot, if at all.
+    SlotEvictionState eviction{};
     // Two words for the owner's namespace policy.
     std::array<uint64_t, 2> policy_words{};
-
-    void FileStandalone(uint16_t shard, int64_t rank, uint64_t identity,
-                        uint64_t born_seq) noexcept {
-        eviction_filed = true;
-        eviction_shard = shard;
-        eviction_rank = rank;
-        eviction_identity = identity;
-        eviction_born_seq = born_seq;
-        eviction_refile_seq = 0;
-        eviction_group = nullptr;
-    }
-
-    void FileGroup(uint16_t shard, int64_t rank, uint64_t identity,
-                   void* group) noexcept {
-        eviction_filed = true;
-        eviction_shard = shard;
-        eviction_rank = rank;
-        eviction_identity = identity;
-        eviction_born_seq = 0;
-        eviction_refile_seq = 0;
-        eviction_group = group;
-    }
-
-    void ClearEviction() noexcept {
-        eviction_filed = false;
-        eviction_shard = 0;
-        eviction_rank = 0;
-        eviction_identity = 0;
-        eviction_born_seq = 0;
-        eviction_refile_seq = 0;
-        eviction_group = nullptr;
-    }
-
-    [[nodiscard]] bool HasInitialEviction() const noexcept {
-        return !eviction_filed && eviction_shard == 0 && eviction_rank == 0 &&
-               eviction_identity == 0 && eviction_born_seq == 0 &&
-               eviction_refile_seq == 0 && eviction_group == nullptr;
-    }
 };
 
 // A slot's lock as a guard or cursor holds it in `kMode`.

@@ -392,17 +392,17 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
     scans.reserve(namespaces.size());
     for (metadata::Namespace* ns : namespaces) {
         NamespaceScan scan;
-        scan.ranges = ns->eviction_index().ScanRanges(now, /*target=*/0);
+        // Byte goals have no key-count estimate: 0 visits all due ranks.
+        scan.ranges =
+            ns->eviction_index().ScanRanges(now, [&](size_t filed) -> size_t {
+                return aim.in_bytes ? 0 : aim.NamespaceGoal(filed);
+            });
         if (!scan.ranges) {
             scan.serial = ns->eviction_index().Scan(now);
         }
         const uint64_t filed = scan.Cursor().Total();
         report.filed += filed;
         scan.goal = aim.NamespaceGoal(filed);
-        if (scan.ranges) {
-            // Byte goals have no key-count estimate: visit all due ranks.
-            scan.ranges->SetTarget(aim.in_bytes ? 0 : scan.goal);
-        }
         scans.push_back(std::move(scan));
     }
 

@@ -79,10 +79,13 @@ class EvictionIndex {
         virtual uint64_t GrainSize() const { return 1; }
         virtual void VisitRange(uint64_t begin, uint64_t end,
                                 const Visitor& visitor) const = 0;
-        virtual void SetTarget(size_t target) = 0;
         virtual bool Widen() = 0;
         virtual uint64_t Examined() const = 0;
     };
+
+    // Maps the snapshot's filed key count (`Cursor::Total()`) to a key-count
+    // cutoff hint for the initial wave (0 means all due ranks).
+    using TargetForTotal = std::function<size_t(size_t total)>;
 
     explicit EvictionIndex(bool observes_reads)
         : observes_reads_(observes_reads) {}
@@ -103,11 +106,18 @@ class EvictionIndex {
     [[nodiscard]] virtual std::unique_ptr<Cursor> Scan(
         Clock::time_point now) const = 0;
 
-    // Null for indexes that only support an ordered cursor. target counts
-    // keys (groups remain one entry); it is a cutoff hint, not a scan budget.
-    virtual std::unique_ptr<RangeCursor> ScanRanges(Clock::time_point,
-                                                    size_t /*target*/) const {
+    // Null for indexes that only support an ordered cursor. `target_for_total`
+    // counts keys (groups remain one entry); it is a cutoff hint, not a scan
+    // budget.
+    [[nodiscard]] virtual std::unique_ptr<RangeCursor> ScanRanges(
+        Clock::time_point /*now*/,
+        const TargetForTotal& /*target_for_total*/) const {
         return nullptr;
+    }
+
+    [[nodiscard]] std::unique_ptr<RangeCursor> ScanRanges(Clock::time_point now,
+                                                          size_t target) const {
+        return ScanRanges(now, [target](size_t) { return target; });
     }
 
     // Whether OnRead must be called.
