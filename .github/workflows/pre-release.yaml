@@ -74,6 +74,7 @@ jobs:
       architecture: ${{ matrix.architecture }}
       artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.package_version }}
+      use-tent: true
 
 
   build-npu:

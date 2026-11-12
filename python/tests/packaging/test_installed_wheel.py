@@ -76,6 +76,21 @@ def test_wheel_imports_outside_the_repository(
         assert new_rs_binaries <= wheel_files
     else:
         assert new_rs_binaries.isdisjoint(wheel_files)
+    tent_extensions = [
+        name
+        for name in wheel_files
+        if name.startswith("mooncake/tent.") and name.endswith(".so")
+    ]
+    assert len(tent_extensions) <= 1
+    if tent_extensions:
+        assert "tent/__init__.py" in wheel_files
+    tent_import_check = (
+        "import tent\n"
+        "import mooncake.tent\n"
+        "assert tent.TransferEngine is mooncake.tent.TransferEngine\n"
+        if tent_extensions
+        else ""
+    )
 
     environment = tmp_path / "environment"
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
@@ -173,6 +188,7 @@ if {project_file == "pyproject.toml"!r}:
     assert old_store_rs_commands.isdisjoint(entry_points)
 assert {{name: entry_points[name] for name in expected_entry_points}} == expected_entry_points
 
+{tent_import_check}
 for module in (
     "mooncake.mooncake_ssd_register",
     "mooncake.mooncake_ssd_unregister",

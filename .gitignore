@@ -199,6 +199,7 @@ mooncake-wheel/mooncake/allocator.py
 mooncake-wheel/mooncake/allocator_ascend_npu.py
 mooncake-wheel/mooncake/mooncake_master
 mooncake-wheel/mooncake/transfer_engine_bench
+mooncake-wheel/tent/
 
 # CodeQL
 _codeql_detected_source_root

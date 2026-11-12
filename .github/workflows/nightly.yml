@@ -109,6 +109,7 @@ jobs:
       # Same dual-engine wheel as PR CI cu13: T-One classic stays the default
       # facade; the TENT job below activates via MC_USE_TENT=1.
       use-tent: ${{ matrix.variant == 'cuda13' && matrix.architecture == 'x86_64' }}
+      tent-metrics: ${{ matrix.variant == 'cuda13' && matrix.architecture == 'x86_64' }}
 
   tone-sglang-integration:
     needs: build-wheel-store-rs-tone
