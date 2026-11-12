@@ -127,13 +127,91 @@ static int open_fd(const hipxFabricHandle& export_handle) {
     return open_fd;
 }
 
+// hipIpcGetMemHandle stamps the handle with the exporter's device as an
+// ordinal among the devices the exporter sees (HIP_VISIBLE_DEVICES), and
+// hipIpcOpenMemHandle reads that ordinal against the importer's own device
+// list: one at or past the importer's device count fails with
+// hipErrorInvalidValue, before the mapping is attempted. So peers that see
+// different numbers of devices, such as the ranks of a TP4 decode and a TP2
+// prefill on one node, cannot open each other's handles from the higher
+// ordinals. The field is not part of the mapping: the runtime only uses it
+// to enable peer access to "the owner" (which, across different visible
+// sets, is an unrelated local device anyway, and the constructor already
+// enabled every local pair) and the mapping comes from the ROCr handle. An
+// out-of-range ordinal is therefore replaced with the importer's current
+// device; an in-range one is left alone, so every open that already worked
+// is unchanged.
+//
+// This private ROCclr LP64 layout is not a HIP API contract. Enable the
+// workaround only after qualifying the deployed runtime and both peers with
+// the cross-process test. A runtime version does not establish ABI
+// compatibility. MC_HIP_IPC_OWNER_DEVICE_WORKAROUND=1 opts in; all other values
+// leave handles unchanged. Prefer a runtime with the upstream fix when
+// available.
+struct HipIpcMemHandleLayout {
+    char ipc_handle[32];
+    size_t psize;
+    size_t poffset;
+    int owners_process_id;
+    int owners_device_id;
+    char reserved[8];
+};
+static_assert(sizeof(void*) == 8, "the mirrored layout is the LP64 one");
+static_assert(sizeof(HipIpcMemHandleLayout) == sizeof(hipIpcMemHandle_t),
+              "hipIpcMemHandle_t no longer matches ROCclr's IpcMemHandle");
+static_assert(offsetof(HipIpcMemHandleLayout, owners_device_id) == 52,
+              "owners_device_id moved in the mirrored IpcMemHandle");
+
+static bool ipcOwnerDeviceWorkaroundEnabled() {
+    const char* value = getenv("MC_HIP_IPC_OWNER_DEVICE_WORKAROUND");
+    return value != nullptr && strcmp(value, "1") == 0;
+}
+
+// Returns true if it changed the handle.
+static bool clampIpcHandleOwnerDevice(hipIpcMemHandle_t* handle,
+                                      int device_count, int current_device) {
+    HipIpcMemHandleLayout layout;
+    memcpy(&layout, handle, sizeof(layout));
+    if (!ipcOwnerDeviceWorkaroundEnabled() ||
+        (layout.owners_device_id >= 0 &&
+         layout.owners_device_id < device_count)) {
+        return false;
+    }
+    layout.owners_device_id = current_device;
+    memcpy(handle, &layout, sizeof(layout));
+    return true;
+}
+
 static int openIPCHandle(const std::vector<unsigned char>& buffer,
                          void** shm_addr) {
     hipIpcMemHandle_t handle;
     memcpy(&handle, buffer.data(), sizeof(handle));
+    int device_count = 0, current_device = 0;
+    if (!checkHip(hipGetDeviceCount(&device_count),
+                  "HipTransport: hipGetDeviceCount failed") ||
+        !checkHip(hipGetDevice(&current_device),
+                  "HipTransport: hipGetDevice failed")) {
+        return -1;
+    }
+    if (clampIpcHandleOwnerDevice(&handle, device_count, current_device) &&
+        globalConfig().trace) {
+        LOG(INFO) << "HipTransport: IPC handle's owner device is outside "
+                     "this process's "
+                  << device_count << " devices; opening it on device "
+                  << current_device;
+    }
     if (!checkHip(hipIpcOpenMemHandle(shm_addr, handle,
                                       hipIpcMemLazyEnablePeerAccess),
                   "HipTransport: hipIpcOpenMemHandle failed")) {
+        if (!ipcOwnerDeviceWorkaroundEnabled()) {
+            LOG_FIRST_N(WARNING, 1)
+                << "HipTransport: HIP IPC can fail when peers use different "
+                   "visible device sets. Prefer a ROCm runtime with the IPC "
+                   "owner-device fix. MC_HIP_IPC_OWNER_DEVICE_WORKAROUND=1 "
+                   "enables a private-layout workaround that requires "
+                   "qualification on the deployed runtime.";
+        }
+        (void)hipGetLastError();
         return -1;
     }
     return 0;
@@ -733,6 +811,8 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                                       bool remote_accessible,
                                       bool update_metadata) {
     std::lock_guard<std::mutex> lock(register_mutex_);
+    if (pending_cleanup_addrs_.count((uint64_t)addr))
+        return ERR_ADDRESS_OVERLAPPED;
 
     if (globalConfig().trace) {
         LOG(INFO) << "register memory: addr " << addr << ", length " << length;
@@ -757,7 +837,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                           << ", leaving it to other transports";
             }
             skipped_addrs_.insert((uint64_t)addr);
-            return 0;
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Resolve the true hipMalloc base address. Framework caching
@@ -773,6 +853,14 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                       "HipTransport: hipMemGetAddressRange failed")) {
             return -1;
         }
+        const auto offset = (uint64_t)addr - (uint64_t)base_ptr;
+        if (offset > alloc_size || length > alloc_size - offset) {
+            LOG(WARNING) << "HipTransport: skipping buffer " << addr << " + "
+                         << length << " outside allocation " << base_ptr
+                         << " + " << alloc_size;
+            skipped_addrs_.insert((uint64_t)addr);
+            return REGISTER_MEMORY_SKIPPED;
+        }
 
         // Re-registering the same address is idempotent; a new sub-range of
         // an already exported allocation just takes another reference.
@@ -786,10 +874,34 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             return 0;
         }
 
-        // Get IPC handle
+        // Export with device 0 current when it can access the allocation.
+        // The runtime stamps the handle with the current device ordinal, so
+        // this lets peers with smaller visible device sets open new handles.
+        // Use the allocation's device when device 0 cannot access it.
+        int export_device = 0;
+        if (attr.device != 0) {
+            int can_access = 0;
+            if (hipDeviceCanAccessPeer(&can_access, 0, attr.device) !=
+                    hipSuccess ||
+                !can_access) {
+                (void)hipGetLastError();
+                export_device = attr.device;
+            }
+        }
         hipIpcMemHandle_t handle;
-        if (!checkHip(hipIpcGetMemHandle(&handle, base_ptr),
-                      "HipTransport: hipIpcGetMemHandle failed")) {
+        hipError_t ipc_err;
+        {
+            HipDeviceGuard export_guard(export_device);
+            if (!export_guard.set_ok()) {
+                LOG(ERROR) << "HipTransport: failed to set IPC export device "
+                           << export_device;
+                (void)hipGetLastError();
+                registered_addr_to_base_.erase((uint64_t)addr);
+                return -1;
+            }
+            ipc_err = hipIpcGetMemHandle(&handle, base_ptr);
+        }
+        if (!checkHip(ipc_err, "HipTransport: hipIpcGetMemHandle failed")) {
             registered_addr_to_base_.erase((uint64_t)addr);
             return -1;
         }
@@ -827,7 +939,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                          << " is not allocated by hipMemCreate, "
                          << "but it can be used as local buffer";
             skipped_addrs_.insert((uint64_t)addr);
-            return 0;
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Find whole physical page for memory registration
@@ -905,7 +1017,14 @@ int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     // register path, so a concurrent register of another sub-range cannot
     // republish the buffer in between.
     std::lock_guard<std::mutex> lock(register_mutex_);
-    auto alias_it = registered_addr_to_base_.find((uint64_t)addr);
+    const auto key = (uint64_t)addr;
+    if (pending_cleanup_addrs_.count(key)) {
+        if (!update_metadata) return 0;
+        const int rc = metadata_->updateLocalSegmentDesc();
+        if (rc == 0) pending_cleanup_addrs_.erase(key);
+        return rc;
+    }
+    auto alias_it = registered_addr_to_base_.find(key);
     if (alias_it == registered_addr_to_base_.end()) {
         // The address is not one we registered. If it equals a live base or
         // page, slab-level cleanup must not drop the shared registration
@@ -929,8 +1048,20 @@ int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     // physical page.
     if (--registered_base_refs_[base] > 0) return 0;
     registered_base_refs_.erase(base);
-    return metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc,
-                                              update_metadata);
+    const int rc = metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc,
+                                                      update_metadata);
+    if (rc == ERR_ADDRESS_NOT_REGISTERED) {
+        registered_addr_to_base_[key] = base;
+        registered_base_refs_[base] = 1;
+        return rc;
+    }
+    if (rc != 0 || !update_metadata) pending_cleanup_addrs_.insert(key);
+    return rc;
+}
+
+bool HipTransport::hasPendingUnregistration(void* addr) {
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    return pending_cleanup_addrs_.count((uint64_t)addr) != 0;
 }
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
@@ -1000,12 +1131,15 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
 int HipTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry>& buffer_list,
     const std::string& location) {
+    bool skipped = false;
     for (auto& buffer : buffer_list) {
         int rc = registerLocalMemory(buffer.addr, buffer.length, location, true,
                                      false);
-        if (rc) return rc;
+        if (rc < 0) return rc;
+        skipped |= rc == REGISTER_MEMORY_SKIPPED;
     }
-    return metadata_->updateLocalSegmentDesc();
+    int rc = metadata_->updateLocalSegmentDesc();
+    return rc == 0 && skipped ? REGISTER_MEMORY_SKIPPED : rc;
 }
 
 int HipTransport::unregisterLocalMemoryBatch(
@@ -1016,7 +1150,15 @@ int HipTransport::unregisterLocalMemoryBatch(
         if (rc && !first_error) first_error = rc;
     }
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    return first_error ? first_error : metadata_ret;
+    if (metadata_ret == 0) {
+        std::lock_guard<std::mutex> lock(register_mutex_);
+        for (void* addr : addr_list)
+            pending_cleanup_addrs_.erase((uint64_t)addr);
+    }
+    // A missing alias on retry must not hide a failed publication for another
+    // alias in the same batch.
+    if (metadata_ret != 0) return metadata_ret;
+    return first_error;
 }
 
 void* HipTransport::allocatePinnedLocalMemory(size_t size) {
