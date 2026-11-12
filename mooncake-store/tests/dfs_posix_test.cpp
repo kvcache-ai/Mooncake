@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -1216,6 +1218,9 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     void SetSupportsFdReopen(bool v) { supports_reopen_ = v; }
     bool SupportsFdReopen() const override { return supports_reopen_; }
 
+    void SetSupportsConcurrentReadAt(bool v) { concurrent_reads_ = v; }
+    bool SupportsConcurrentReadAt() const override { return concurrent_reads_; }
+
     // Models an adapter that keeps the "posix" name but constrains read
     // buffers (e.g. an O_DIRECT mode).
     void SetSupportsArbitraryHostReadBuffers(bool v) {
@@ -1290,7 +1295,77 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int64_t short_read_offset_ = -1;
     std::atomic<int64_t> fail_write_offset_once_{-1};
     bool supports_reopen_ = true;
+    bool concurrent_reads_ = true;
     bool arbitrary_host_read_buffers_ = true;
+};
+
+class BlockingReadFsAdapter : public ControlledPosixFsAdapter {
+   public:
+    explicit BlockingReadFsAdapter(bool block_all = true)
+        : block_all_(block_all) {}
+
+    bool WaitForReads(size_t count, std::chrono::milliseconds timeout =
+                                        std::chrono::seconds(5)) {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, timeout,
+                            [&] { return reads_started_ >= count; });
+    }
+
+    bool WaitForReadFailure() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return read_failed_; });
+    }
+
+    void ReleaseReads() {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+    bool ClosedWhileReading() const { return closed_while_reading_.load(); }
+    int CloseCallCount() const { return close_calls_.load(); }
+
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
+                                           int64_t offset) override {
+        {
+            std::unique_lock lock(mutex_);
+            ++reads_started_;
+            ++active_reads_;
+            cv_.notify_all();
+            if (block_all_ || offset == 0) {
+                cv_.wait(lock, [&] { return released_; });
+            }
+        }
+        auto result = ControlledPosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
+        {
+            std::lock_guard lock(mutex_);
+            --active_reads_;
+            read_failed_ |= !result;
+            cv_.notify_all();
+        }
+        return result;
+    }
+
+    tl::expected<void, ErrorCode> CloseFile(int fd) override {
+        {
+            std::lock_guard lock(mutex_);
+            if (active_reads_ != 0) closed_while_reading_ = true;
+        }
+        ++close_calls_;
+        return PosixFsAdapter::CloseFile(fd);
+    }
+
+   private:
+    const bool block_all_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    size_t reads_started_ = 0;
+    size_t active_reads_ = 0;
+    bool released_ = false;
+    bool read_failed_ = false;
+    std::atomic<bool> closed_while_reading_{false};
+    std::atomic<int> close_calls_{0};
 };
 
 // Builds a backend backed by a ControlledPosixFsAdapter pointed at an existing
@@ -1299,7 +1374,8 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
 // adapter pointer so the caller can program fault injection. The caller owns
 // Init() so it can ASSERT.
 std::unique_ptr<DistributedStorageBackend> MakeControlledBackend(
-    const std::string& dir, ControlledPosixFsAdapter** out_adapter) {
+    const std::string& dir, ControlledPosixFsAdapter** out_adapter,
+    std::unique_ptr<ControlledPosixFsAdapter> adapter = nullptr) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = dir;
@@ -1311,8 +1387,8 @@ std::unique_ptr<DistributedStorageBackend> MakeControlledBackend(
     distributed_config.shard_capacity = 64 * 1024 * 1024;
     distributed_config.alignment = 4096;
 
-    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
-    *out_adapter = adapter.get();
+    if (!adapter) adapter = std::make_unique<ControlledPosixFsAdapter>();
+    if (out_adapter) *out_adapter = adapter.get();
     return std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter));
 }
@@ -1952,6 +2028,133 @@ TEST_F(DfsBackendTest, RangeReadRejectsTruncatedObjectWithoutReadingTail) {
     EXPECT_EQ(window.data()[0], 'Z');
 }
 
+TEST_F(DfsBackendTest, ConcurrentReadsShareOneCachedShard) {
+    for (bool concurrent : {false, true}) {
+        SCOPED_TRACE(concurrent);
+        auto adapter = std::make_unique<BlockingReadFsAdapter>();
+        auto* controlled = adapter.get();
+        controlled->SetSupportsConcurrentReadAt(concurrent);
+        auto backend =
+            MakeControlledBackend(tmp_->path(), nullptr, std::move(adapter));
+        ASSERT_TRUE(backend->Init());
+
+        AlignedBuffer source(4096), first(4096), second(4096);
+        source.Fill('R');
+        const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+        ASSERT_TRUE(backend->BatchWrite(
+            {{"key", desc, {{source.data(), source.size()}}}})[0]);
+
+        auto read = [&](AlignedBuffer& out) {
+            return backend->BatchRead(
+                {{"key", desc, {{out.data(), out.size()}}}});
+        };
+        auto first_read =
+            std::async(std::launch::async, [&] { return read(first); });
+        const bool first_entered = controlled->WaitForReads(1);
+        std::promise<void> second_started;
+        auto second_read = std::async(std::launch::async, [&] {
+            second_started.set_value();
+            return read(second);
+        });
+        second_started.get_future().wait();
+        const bool both_entered = controlled->WaitForReads(
+            2, concurrent ? std::chrono::seconds(5)
+                          : std::chrono::milliseconds(100));
+        controlled->ReleaseReads();
+
+        EXPECT_TRUE(first_entered);
+        EXPECT_EQ(both_entered, concurrent);
+        EXPECT_TRUE(first_read.get()[0]);
+        EXPECT_TRUE(second_read.get()[0]);
+        EXPECT_EQ(controlled->OpenCallCount(), 1);
+        EXPECT_EQ(std::memcmp(source.data(), first.data(), source.size()), 0);
+        EXPECT_EQ(std::memcmp(source.data(), second.data(), source.size()), 0);
+    }
+}
+
+TEST_F(DfsBackendTest, ShardWriteWaitsForActiveRead) {
+    auto adapter = std::make_unique<BlockingReadFsAdapter>();
+    auto* controlled = adapter.get();
+    auto backend =
+        MakeControlledBackend(tmp_->path(), nullptr, std::move(adapter));
+    ASSERT_TRUE(backend->Init());
+
+    AlignedBuffer source(4096), out(4096);
+    source.Fill('W');
+    const DistributedFSDescriptor desc{ShardPath(0), 0, 4096, 4096, 0};
+    const std::vector<DfsWriteRequest> writes{
+        {"key", desc, {{source.data(), source.size()}}}};
+    ASSERT_TRUE(backend->BatchWrite(writes)[0]);
+
+    auto reader = std::async(std::launch::async, [&] {
+        return backend->BatchRead({{"key", desc, {{out.data(), out.size()}}}});
+    });
+    const bool read_entered = controlled->WaitForReads(1);
+    std::promise<void> writer_started;
+    auto writer = std::async(std::launch::async, [&] {
+        writer_started.set_value();
+        return backend->BatchWrite(writes);
+    });
+    writer_started.get_future().wait();
+    const auto write_status = writer.wait_for(std::chrono::milliseconds(50));
+    const int write_calls = controlled->WriteCallCount();
+    controlled->ReleaseReads();
+
+    EXPECT_TRUE(read_entered);
+    EXPECT_EQ(write_status, std::future_status::timeout);
+    EXPECT_EQ(write_calls, 1);
+    EXPECT_TRUE(reader.get()[0]);
+    EXPECT_TRUE(writer.get()[0]);
+    EXPECT_EQ(std::memcmp(source.data(), out.data(), source.size()), 0);
+}
+
+TEST_F(DfsBackendTest, ShardReopenWaitsForOtherReaders) {
+    auto adapter = std::make_unique<BlockingReadFsAdapter>(false);
+    auto* controlled = adapter.get();
+    auto backend =
+        MakeControlledBackend(tmp_->path(), nullptr, std::move(adapter));
+    ASSERT_TRUE(backend->Init());
+
+    AlignedBuffer source(4096), first(4096), second(4096);
+    source.Fill('F');
+    const DistributedFSDescriptor first_desc{ShardPath(0), 0, 4096, 4096, 0};
+    const DistributedFSDescriptor second_desc{ShardPath(0), 4096, 4096, 4096,
+                                              0};
+    const auto writes = backend->BatchWrite(
+        {{"first", first_desc, {{source.data(), source.size()}}},
+         {"second", second_desc, {{source.data(), source.size()}}}});
+    ASSERT_TRUE(writes[0]);
+    ASSERT_TRUE(writes[1]);
+    // The offset-zero reader blocks before calling the real read; the other
+    // reader fails first and must wait for that reader before reopening.
+    controlled->FailReadCall(1);
+    auto first_read = std::async(std::launch::async, [&] {
+        return backend->BatchRead(
+            {{"first", first_desc, {{first.data(), first.size()}}}});
+    });
+    const bool first_entered = controlled->WaitForReads(1);
+    auto second_read = std::async(std::launch::async, [&] {
+        return backend->BatchRead(
+            {{"second", second_desc, {{second.data(), second.size()}}}});
+    });
+    const bool failure_observed = controlled->WaitForReadFailure();
+    const auto repair_status =
+        second_read.wait_for(std::chrono::milliseconds(50));
+    const int closes_before_release = controlled->CloseCallCount();
+    controlled->ReleaseReads();
+
+    EXPECT_TRUE(first_entered);
+    EXPECT_TRUE(failure_observed);
+    EXPECT_EQ(repair_status, std::future_status::timeout);
+    EXPECT_EQ(closes_before_release, 0);
+    EXPECT_TRUE(first_read.get()[0]);
+    EXPECT_TRUE(second_read.get()[0]);
+    EXPECT_FALSE(controlled->ClosedWhileReading());
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
+    EXPECT_EQ(std::memcmp(source.data(), first.data(), source.size()), 0);
+    EXPECT_EQ(std::memcmp(source.data(), second.data(), source.size()), 0);
+}
+
 TEST_F(DfsBackendTest, WriteReopensStaleDescriptorAndSucceeds) {
     ControlledPosixFsAdapter* controlled = nullptr;
     auto backend = MakeControlledBackend(tmp_->path(), &controlled);
@@ -2169,8 +2372,8 @@ TEST_F(DfsBackendTest, ConcurrentWritesWithReopenPreserveData) {
     constexpr int kThreads = 8;
     constexpr int64_t kBlock = 4096;
     // One thread's write fails exactly once and must recover via a single
-    // reopen. Because all shard I/O is serialized by the per-shard mutex, the
-    // close+reopen cannot race the other threads' concurrent writes.
+    // reopen. Shard writes and reopen are exclusive, so close+reopen cannot
+    // race the other threads' writes.
     controlled->FailWriteAtOffsetOnce(3 * kBlock);
 
     std::vector<std::unique_ptr<AlignedBuffer>> buffers(kThreads);

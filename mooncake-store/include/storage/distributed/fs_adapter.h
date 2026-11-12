@@ -131,9 +131,14 @@ class FileSystemAdapter {
     // not perform a pointless close/reopen/retry under the shard lock.
     virtual bool SupportsFdReopen() const { return false; }
 
+    // Whether ReadAt calls may run concurrently on one cached fd. Writes and
+    // close/reopen remain exclusive. Adapters with shared per-read state keep
+    // the default serialized path.
+    virtual bool SupportsConcurrentReadAt() const { return false; }
+
     // Opt in to backend batching and concurrent positional I/O on cached
-    // shard fds. Other adapters retain per-request bucket handles and
-    // serialized shard I/O.
+    // shard fds. Other adapters retain per-request bucket handles; cached
+    // reads stay serialized unless SupportsConcurrentReadAt() is enabled.
     virtual bool SupportsBatchIo() const { return false; }
 
     // Whether ReadAt/BatchReadAt accept iovecs pointing at arbitrary writable
