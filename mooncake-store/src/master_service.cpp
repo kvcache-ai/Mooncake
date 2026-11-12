@@ -11271,27 +11271,33 @@ MasterService::KvMediaMasks MasterService::KvMediaMasksForMetadata(
     const ObjectMetadata& metadata) {
     KvMediaMasks masks;
     for (const Replica& replica : metadata.GetAllReplicas()) {
-        if (!replica.is_completed()) {
+        const bool complete = replica.is_completed();
+        // HA removal marks replicas before the OpLog is durable. Retain their
+        // announced tiers until the finalizer erases them, but still exclude
+        // PROCESSING so UpsertStart retracts the old tier.
+        if (!complete && replica.status() != ReplicaStatus::REMOVED) {
             continue;
         }
         if (replica.is_memory_replica()) {
-            masks.resident_complete |= KvEventPublisher::kMediumCpu;
-            if (!replica.has_invalid_mem_handle()) {
+            masks.retained |= KvEventPublisher::kMediumCpu;
+            if (complete && !replica.has_invalid_mem_handle()) {
                 masks.live |= KvEventPublisher::kMediumCpu;
             }
         } else if (replica.is_nof_replica()) {
-            masks.resident_complete |= KvEventPublisher::kMediumDisk;
-            if (!replica.has_invalid_nof_handle()) {
+            masks.retained |= KvEventPublisher::kMediumDisk;
+            if (complete && !replica.has_invalid_nof_handle()) {
                 masks.live |= KvEventPublisher::kMediumDisk;
             }
         } else if (replica.is_local_disk_replica()) {
-            masks.resident_complete |= KvEventPublisher::kMediumDisk;
-            if (!replica.has_stale_local_disk_client()) {
+            masks.retained |= KvEventPublisher::kMediumDisk;
+            if (complete && !replica.has_stale_local_disk_client()) {
                 masks.live |= KvEventPublisher::kMediumDisk;
             }
         } else if (replica.is_disk_replica() || replica.is_dfs_replica()) {
-            masks.resident_complete |= KvEventPublisher::kMediumDisk;
-            masks.live |= KvEventPublisher::kMediumDisk;
+            masks.retained |= KvEventPublisher::kMediumDisk;
+            if (complete) {
+                masks.live |= KvEventPublisher::kMediumDisk;
+            }
         }
     }
     return masks;
@@ -11323,7 +11329,7 @@ void MasterService::OnKvWriteRelease(const TenantId& tenant_id,
     const uint8_t old_mask = state.announced_kv_media;
 
     const KvMediaMasks masks = KvMediaMasksForMetadata(metadata);
-    const uint8_t removed = old_mask & ~masks.resident_complete;
+    const uint8_t removed = old_mask & ~masks.retained;
     const uint8_t stored = static_cast<uint8_t>(masks.live & ~old_mask);
     state.announced_kv_media =
         static_cast<uint8_t>((old_mask & ~removed) | stored);

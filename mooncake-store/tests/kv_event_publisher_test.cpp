@@ -831,6 +831,94 @@ TEST(KvEventPublisherTest, SurvivingTierIsNotRetractedOnPartialEviction) {
     EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
 }
 
+TEST(KvEventPublisherTest, PendingRemovalOnlyRetainsAlreadyAnnouncedTiers) {
+    for (bool committed : {false, true}) {
+        SCOPED_TRACE(committed);
+        const std::string endpoint = MakeIpcEndpoint();
+        MasterServiceConfig config;
+        config.enable_kv_events = true;
+        config.kv_events_bind_endpoint = endpoint;
+        config.kv_events_backend_id = "pending-removal-test";
+        MasterService service(config);
+        test::MasterServiceTestPeer peer(service);
+        ScopedSubscriber subscriber;
+        ASSERT_TRUE(subscriber.Connect(endpoint));
+
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = "kv_event_pending_removal_segment";
+        segment.te_endpoint = segment.name;
+        segment.base = 0x300000000;
+        segment.size = 16 * 1024 * 1024;
+        const UUID client = generate_uuid();
+        ASSERT_TRUE(service.MountSegment(segment, client));
+
+        const std::string key = "kv_event_pending_removal_key";
+        const auto tenant = TenantId::Default();
+        ASSERT_TRUE(
+            service.PutStart(client, key, tenant, 1024, ReplicateConfig{}));
+        auto allocator = std::make_shared<DummyBufferAllocator>("pending-nof",
+                                                                "pending-nof");
+        using Accessor = test::MasterServiceTestPeer::MetadataAccessorRW;
+        {
+            Accessor accessor(&service, {tenant, key}, Accessor::AsIs{});
+            ASSERT_TRUE(accessor.IsPublished());
+            std::vector<Replica> replicas;
+            replicas.emplace_back(
+                std::make_unique<AllocatedBuffer>(allocator, nullptr, 1024),
+                ReplicaStatus::PROCESSING, ReplicaType::NOF_SSD);
+            accessor.Get().AddReplicas(std::move(replicas));
+        }
+        msgpack::object_handle payload;
+        if (committed) {
+            ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::ALL));
+            ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+            ASSERT_EQ(EventCount(payload), 2u);
+            ExpectObjectEvent(EventAt(payload, 0), "stored", key);
+            ExpectObjectEvent(EventAt(payload, 1), "stored", key);
+        }
+
+        // Model pending durable removals, including a revoked write whose
+        // tiers were never announced. REMOVED can retain, but not add, a tier.
+        std::vector<ReplicaID> pending_ids;
+        {
+            Accessor accessor(&service, {tenant, key}, Accessor::AsIs{});
+            ASSERT_TRUE(accessor.IsPublished());
+            accessor.Get().VisitReplicas(
+                [](const Replica&) { return true; },
+                [&](Replica& replica) {
+                    pending_ids.push_back(replica.id());
+                    replica.mark_removed();
+                });
+        }
+        EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+        ASSERT_EQ(pending_ids.size(), 2u);
+
+        OpLogEntry durable_entry;
+        durable_entry.tenant_id = tenant.value();
+        durable_entry.object_key = key;
+        // Finalizing CPU exercises the write-release delta with disk still
+        // pending; finalizing disk exercises the full teardown hook.
+        for (size_t i = 0; i < pending_ids.size(); ++i) {
+            peer.FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                     {pending_ids[i]});
+            if (committed) {
+                ASSERT_TRUE(ReceivePayload(subscriber.sub, &payload));
+                ASSERT_EQ(EventCount(payload), 1u);
+                ExpectObjectEvent(FirstEvent(payload), "removed", key);
+                EXPECT_EQ(
+                    MsgpackString(*FindMapValue(FirstEvent(payload), "medium")),
+                    i == 0 ? "cpu" : "disk");
+            }
+            EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+            // A repeated callback must not publish the removal again.
+            peer.FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                     {pending_ids[i]});
+            EXPECT_TRUE(ExpectNoMessage(subscriber.sub));
+        }
+    }
+}
+
 TEST(KvEventPublisherTest, DisabledObjectKeyCountsSkippedObjectEvents) {
     const std::string endpoint = MakeIpcEndpoint();
     KvEventConfig config = MakeEnabledConfig(endpoint);

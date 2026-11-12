@@ -5022,7 +5022,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
-       RemoveBeforeDurableHidesReplicasFromPrimaryReads) {
+       RemoveBeforeDurableHidesReplicasButKeepsKvMediaAnnounced) {
     const std::string cluster_id = "test_batch_record_e2e_remove_visibility";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -5033,37 +5033,67 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(
-        ErrorCode::OK,
-        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
+    // Exercise the route observer even when built without ZMQ support.
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
+    struct ReleaseOnExit {
+        BlockingBatchHaKvBackend& backend;
+        GatedOrderedOpLogWriter& writer;
+        ~ReleaseOnExit() {
+            backend.AllowTxn();
+            writer.ResumeCallbacks();
+        }
+    } release{*backend, *writer};
 
     auto mounted = PrepareSimpleSegment(service, "batch_e2e_remove_segment");
-    OpLogBatchStorage storage(cluster_id, *backend);
-    OpLogBatchRecord batch;
-    ReadBatchEventually(storage, 1, batch);
-
     const std::string key = "batch_e2e_remove_key";
     PutObjectOnSegment(service, mounted.client_id, key,
                        "batch_e2e_remove_segment");
-    ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(2));
+
+    const MasterServiceTestPeer::ObjectIdentity object_id{kDefaultTenant, key};
+    const auto expect_announced = [&] {
+        auto guard = MasterServiceTestPeer::ReadObject(service, object_id);
+        ASSERT_TRUE(guard.has_value());
+        EXPECT_EQ(KvEventPublisher::kMediumCpu,
+                  guard->state().announced_kv_media);
+    };
+    expect_announced();
 
     backend->BlockTxn();
-    auto removed = service.Remove(key, kDefaultTenant, /*force=*/true);
-    EXPECT_TRUE(removed.has_value());
+    ASSERT_TRUE(service.Remove(key, kDefaultTenant, /*force=*/true));
+    ASSERT_TRUE(backend->WaitForBlockedTxn());
     EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+    // The replica is hidden locally, but retracting its announcement now
+    // would lose the index entry if the primary failed before durability.
+    expect_announced();
+    OpLogBatchStorage storage(cluster_id, *backend);
     DurablePrefix prefix;
-    auto prefix_read = storage.ReadDurablePrefix(prefix);
-    EXPECT_EQ(ErrorCode::OK, prefix_read);
-    if (prefix_read == ErrorCode::OK) {
-        EXPECT_EQ(2u, prefix.batch_id);
-        EXPECT_EQ(2u, prefix.last_seq);
-    }
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(2u, prefix.batch_id);
+    EXPECT_EQ(2u, prefix.last_seq);
 
+    auto durable = writer->AwaitDurable(3);
+    EXPECT_FALSE(durable.hasResult());
     backend->AllowTxn();
-    ReadBatchEventually(storage, 3, batch);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!durable.hasResult() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(durable.hasResult());
+    EXPECT_EQ(ErrorCode::OK, std::move(durable).get());
+    OpLogBatchRecord batch;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadBatch(3, batch));
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
     EXPECT_EQ(key, batch.entries[0].object_key);
+    // Even after persistence, the announcement belongs to the resident
+    // replica until its durable finalizer actually erases it.
+    expect_announced();
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_FALSE(MasterServiceTestPeer::ReadObject(service, object_id));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest, RemoveByRegexWritesBatchRecordOpLog) {

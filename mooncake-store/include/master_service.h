@@ -2268,10 +2268,10 @@ class MasterService {
         // COMPLETE replicas whose handles are still valid (eligible to be
         // announced as `stored`).
         uint8_t live{0};
-        // COMPLETE replicas still resident in `metadata` (eligible to keep a
-        // previously announced tier from being retracted prematurely until its
-        // cleanup pass actually erases the stale record).
-        uint8_t resident_complete{0};
+        // COMPLETE and pending REMOVED replicas still resident in `metadata`.
+        // Keep already-announced tiers until cleanup or durable finalization
+        // erases their records; REMOVED replicas cannot announce new tiers.
+        uint8_t retained{0};
     };
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
