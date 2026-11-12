@@ -17,7 +17,7 @@ target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
 # Add BatchGetReplicaList latency benchmark executable
 add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
-                                                      mooncake_store)
+                                                       mooncake_store)
 
 # Add file interface benchmark executable
 add_executable(file_interface_bench file_interface_bench.cpp)
@@ -43,7 +43,7 @@ target_link_libraries(
 if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
-                                                      gflags::gflags)
+                                                       gflags::gflags)
 endif()
 
 # Add BatchEvict benchmark executable
@@ -51,15 +51,6 @@ add_executable(batch_evict_bench batch_evict_bench.cpp)
 target_link_libraries(
   batch_evict_bench PRIVATE master_service_test_peer cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
-
-if(ENABLE_KV_EVENTS)
-  add_executable(kv_event_eviction_bench kv_event_eviction_bench.cpp)
-  target_compile_definitions(kv_event_eviction_bench
-                             PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
-  target_link_libraries(
-    kv_event_eviction_bench PRIVATE master_service_test_peer Mooncake::libzmq
-                                    gflags::gflags glog::glog pthread)
-endif()
 
 add_executable(batch_oplog_promotion_bench batch_oplog_promotion_bench.cpp)
 target_link_libraries(batch_oplog_promotion_bench PRIVATE mooncake_store
