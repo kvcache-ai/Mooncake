@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <condition_variable>
+#include <future>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -36,6 +38,7 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
         std::lock_guard lock(mutex_);
+        ++range_calls_;
         kvs.clear();
         for (const auto& [key, value] : values_) {
             if (key < begin_key || key >= end_key) continue;
@@ -65,6 +68,15 @@ class FakeHaKvBackend : public HaKvBackend {
         std::lock_guard lock(mutex_);
         return delete_calls_;
     }
+    size_t range_calls() const {
+        std::lock_guard lock(mutex_);
+        return range_calls_;
+    }
+    size_t get_calls(std::string_view key) const {
+        std::lock_guard lock(mutex_);
+        const auto it = get_calls_.find(std::string(key));
+        return it == get_calls_.end() ? 0 : it->second;
+    }
     void FailDelete(ErrorCode error) {
         std::lock_guard lock(mutex_);
         delete_error_ = error;
@@ -85,6 +97,131 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode fail_get_error_{ErrorCode::OK};
     ErrorCode delete_error_{ErrorCode::OK};
     size_t delete_calls_{0};
+    size_t range_calls_{0};
+};
+
+class BlockingFloorReadHaKvBackend : public FakeHaKvBackend {
+   public:
+    void BlockFloorRead(std::string key) {
+        std::lock_guard lock(mutex_);
+        blocked_key_ = std::move(key);
+        blocked_ = true;
+        read_entered_ = false;
+    }
+
+    bool WaitForFloorRead(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, timeout,
+                                   [&] { return read_entered_; });
+    }
+
+    void AllowFloorRead() {
+        {
+            std::lock_guard lock(mutex_);
+            blocked_ = false;
+        }
+        condition_.notify_all();
+    }
+
+    ErrorCode Get(std::string_view key, std::string& value) override {
+        if (key == blocked_key_) {
+            std::unique_lock lock(mutex_);
+            read_entered_ = true;
+            condition_.notify_all();
+            condition_.wait(lock, [&] { return !blocked_; });
+        }
+        return FakeHaKvBackend::Get(key, value);
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::string blocked_key_;
+    bool blocked_{false};
+    bool read_entered_{false};
+};
+
+class BlockingRangeHaKvBackend : public FakeHaKvBackend {
+   public:
+    void BlockRange() {
+        std::lock_guard lock(mutex_);
+        blocked_ = true;
+        range_entered_ = false;
+    }
+
+    bool WaitForRange(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, timeout,
+                                   [&] { return range_entered_; });
+    }
+
+    void AllowRange() {
+        {
+            std::lock_guard lock(mutex_);
+            blocked_ = false;
+        }
+        condition_.notify_all();
+    }
+
+    ErrorCode Range(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs) override {
+        {
+            std::unique_lock lock(mutex_);
+            range_entered_ = true;
+            condition_.notify_all();
+            condition_.wait(lock, [&] { return !blocked_; });
+        }
+        return FakeHaKvBackend::Range(begin_key, end_key, limit, kvs);
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool blocked_{false};
+    bool range_entered_{false};
+};
+
+class BlockingDeleteRangeHaKvBackend : public FakeHaKvBackend {
+   public:
+    void BlockDelete() {
+        std::lock_guard lock(mutex_);
+        blocked_ = true;
+        delete_entered_ = false;
+    }
+
+    bool WaitForDelete(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, timeout,
+                                   [&] { return delete_entered_; });
+    }
+
+    void AllowDelete() {
+        {
+            std::lock_guard lock(mutex_);
+            blocked_ = false;
+        }
+        condition_.notify_all();
+    }
+
+    ErrorCode DeleteRange(std::string_view begin_key,
+                          std::string_view end_key) override {
+        {
+            std::unique_lock lock(mutex_);
+            delete_entered_ = true;
+            condition_.notify_all();
+            condition_.wait(lock, [&] { return !blocked_; });
+        }
+        return FakeHaKvBackend::DeleteRange(begin_key, end_key);
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool blocked_{false};
+    bool delete_entered_{false};
 };
 
 TEST(BatchOpLogPruningWorkerTest,
@@ -116,6 +253,103 @@ TEST(BatchOpLogPruningWorkerTest,
     EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 11)));
     EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 15)));
     EXPECT_EQ(2u, backend.delete_calls());
+}
+
+TEST(BatchOpLogPruningWorkerTest,
+     StopDuringFloorReadDoesNotStartCursorRecovery) {
+    BlockingFloorReadHaKvBackend backend;
+    const std::string cluster = "cluster-stop-during-floor-read";
+    const std::string floor_key =
+        "/oplog/cluster-stop-during-floor-read/snapshot/compaction_floor";
+    ASSERT_EQ(ErrorCode::OK, backend.Put(floor_key, "15"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), "record"));
+
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, /*chunk_batch_count=*/10,
+                                   /*max_batches_per_second=*/50);
+    backend.BlockFloorRead(floor_key);
+    ASSERT_EQ(ErrorCode::OK, worker.Start());
+
+    const bool read_started = backend.WaitForFloorRead();
+    if (read_started) worker.RequestStop();
+    backend.AllowFloorRead();
+    ASSERT_TRUE(read_started);
+    worker.Stop();
+
+    EXPECT_EQ(0u, backend.range_calls());
+    EXPECT_EQ(0u, backend.delete_calls());
+}
+
+TEST(BatchOpLogPruningWorkerTest, StopDuringCursorRecoveryDoesNotStartDelete) {
+    BlockingRangeHaKvBackend backend;
+    const std::string cluster = "cluster-stop-during-recovery";
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/cluster-stop-during-recovery/snapshot/"
+                          "compaction_floor",
+                          "15"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), "record"));
+
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, /*chunk_batch_count=*/10,
+                                   /*max_batches_per_second=*/50);
+    backend.BlockRange();
+    bool deleted_chunk = false;
+    auto run = std::async(std::launch::async,
+                          [&] { return worker.RunOneChunk(deleted_chunk); });
+
+    const bool range_started = backend.WaitForRange();
+    if (range_started) worker.RequestStop();
+    backend.AllowRange();
+    ASSERT_TRUE(range_started);
+
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, run.get());
+    EXPECT_FALSE(deleted_chunk);
+    EXPECT_EQ(0u, backend.delete_calls());
+}
+
+TEST(BatchOpLogPruningWorkerTest,
+     StopDuringDeleteSkipsFollowUpFloorReadAfterSuccessfulDelete) {
+    BlockingDeleteRangeHaKvBackend backend;
+    const std::string cluster = "cluster-stop-during-delete";
+    const std::string floor_key =
+        "/oplog/cluster-stop-during-delete/snapshot/compaction_floor";
+    ASSERT_EQ(ErrorCode::OK, backend.Put(floor_key, "1"));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildBatchRecordKey(cluster, 1), "record"));
+
+    OpLogBatchStorage storage(cluster, backend);
+    BatchOpLogPruningWorker worker(storage, /*chunk_batch_count=*/10,
+                                   /*max_batches_per_second=*/50);
+    auto& metrics = HAMetricManager::instance();
+    metrics.reset_batch_oplog_pruner_runtime();
+    backend.BlockDelete();
+    bool deleted_chunk = false;
+    auto run = std::async(std::launch::async,
+                          [&] { return worker.RunOneChunk(deleted_chunk); });
+
+    const bool delete_started = backend.WaitForDelete();
+    if (delete_started) worker.RequestStop();
+    backend.AllowDelete();
+    ASSERT_TRUE(delete_started);
+
+    EXPECT_EQ(ErrorCode::OK, run.get());
+    EXPECT_TRUE(deleted_chunk);
+    EXPECT_EQ(1u, backend.delete_calls());
+    EXPECT_FALSE(backend.Has(BuildBatchRecordKey(cluster, 1)));
+    EXPECT_EQ(1u, backend.get_calls(floor_key));
+    const auto serialized = metrics.serialize_metrics();
+    EXPECT_NE(
+        std::string::npos,
+        serialized.find("mooncake_ha_batch_oplog_pruner_cursor_batch_id 1\n"));
+    EXPECT_NE(std::string::npos,
+              serialized.find(
+                  "mooncake_ha_batch_oplog_pruner_chunks_deleted_total 1\n"));
+    EXPECT_NE(
+        std::string::npos,
+        serialized.find(
+            "mooncake_ha_batch_oplog_pruner_batch_ids_advanced_total 1\n"));
 }
 
 TEST(BatchOpLogPruningWorkerTest, CountsDeleteRangeFailure) {

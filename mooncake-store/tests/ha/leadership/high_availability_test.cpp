@@ -565,6 +565,48 @@ TEST_F(HighAvailabilityTest, ServingStateSerializesActivationAndLoss) {
     EXPECT_FALSE(serving_state.IsActive());
 }
 
+TEST_F(HighAvailabilityTest, ServingStateRejectsLateTerminalCallback) {
+    ha::detail::ServingStateGate serving_state;
+    bool callback_ran = false;
+
+    ASSERT_TRUE(serving_state.RequestShutdown([] {}));
+    EXPECT_FALSE(serving_state.RequestShutdown([&]() { callback_ran = true; }));
+    EXPECT_FALSE(serving_state.RunIfActive([&]() { callback_ran = true; }));
+    EXPECT_FALSE(callback_ran);
+}
+
+TEST_F(HighAvailabilityTest, ServingStateDrainsInFlightTerminalCallback) {
+    ha::detail::ServingStateGate serving_state;
+    std::atomic<int> callback_target{0};
+    std::promise<void> callback_started;
+    std::promise<void> finish_callback;
+    auto finish_callback_future = finish_callback.get_future().share();
+
+    auto terminal_callback = std::async(std::launch::async, [&] {
+        return serving_state.RequestShutdown([&] {
+            callback_started.set_value();
+            finish_callback_future.wait();
+            callback_target.fetch_add(1);
+        });
+    });
+    callback_started.get_future().wait();
+
+    std::promise<void> release_started;
+    auto release = std::async(std::launch::async, [&] {
+        release_started.set_value();
+        return serving_state.RequestShutdown(
+            [&] { callback_target.fetch_add(10); });
+    });
+    release_started.get_future().wait();
+    EXPECT_EQ(release.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+
+    finish_callback.set_value();
+    EXPECT_TRUE(terminal_callback.get());
+    EXPECT_FALSE(release.get());
+    EXPECT_EQ(1, callback_target.load());
+}
+
 #ifdef STORE_USE_ETCD
 
 TEST_F(HighAvailabilityTest, HaWithoutOplogRestoresEmptyContextAndServes) {

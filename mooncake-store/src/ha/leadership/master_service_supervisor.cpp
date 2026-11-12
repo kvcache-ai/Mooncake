@@ -757,6 +757,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // already stopped.
         auto stop_term_resources =
             [&](std::unique_ptr<LeadershipMonitorHandle>& monitor) {
+                // Close the callback gate before draining anything that can
+                // release the last service owner. A terminal writer callback
+                // captures wrapped_master_service by reference.
+                serving_state.RequestShutdown([] {});
                 worker_pool.reset();
                 StopLeadershipMonitor(monitor);
                 wrapped_master_service->RequestStopBatchOpLogPruningWorker();
@@ -777,7 +781,11 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                 shutdown_exit("service_release",
                               term_lease);  // Does not return.
             }
+            serving_state.RequestShutdown([] {});
             worker_pool.reset();
+            wrapped_master_service->RequestStopBatchOpLogPruningWorker();
+            wrapped_master_service->StopBatchOpLogPruningWorker();
+            wrapped_master_service->StopBatchOpLogWriter();
             wrapped_master_service.reset();
         };
         wrapped_master_service->SetBatchOpLogTerminalCallback(

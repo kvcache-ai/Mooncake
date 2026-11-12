@@ -2319,6 +2319,11 @@ class MasterService {
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
     std::unique_ptr<BatchOpLogPruningWorker> batch_oplog_pruning_worker_;
+    // Serializes the pruning worker's pointer publication with asynchronous
+    // stop requests. The stop latch belongs to this service instance and is
+    // intentionally not cleared by a later worker Start().
+    std::mutex batch_oplog_pruning_mutex_;
+    bool batch_oplog_pruning_stop_requested_{false};
     BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
     // OpLog publishing helpers

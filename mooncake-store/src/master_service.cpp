@@ -1033,6 +1033,10 @@ void MasterService::SetBatchOpLogTerminalCallback(
 
 ErrorCode MasterService::StartBatchOpLogPruningWorker(
     uint64_t chunk_batch_count, uint64_t max_batches_per_second) {
+    std::lock_guard lock(batch_oplog_pruning_mutex_);
+    if (batch_oplog_pruning_stop_requested_) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     if (chunk_batch_count == 0 || max_batches_per_second == 0 ||
         !batch_oplog_storage_) {
         return ErrorCode::INVALID_PARAMS;
@@ -1045,15 +1049,24 @@ ErrorCode MasterService::StartBatchOpLogPruningWorker(
 }
 
 void MasterService::RequestStopBatchOpLogPruningWorker() {
+    std::lock_guard lock(batch_oplog_pruning_mutex_);
+    batch_oplog_pruning_stop_requested_ = true;
     if (batch_oplog_pruning_worker_) {
         batch_oplog_pruning_worker_->RequestStop();
     }
 }
 
 void MasterService::StopBatchOpLogPruningWorker() {
-    if (batch_oplog_pruning_worker_) {
-        batch_oplog_pruning_worker_->Stop();
+    std::unique_ptr<BatchOpLogPruningWorker> worker;
+    {
+        std::lock_guard lock(batch_oplog_pruning_mutex_);
+        batch_oplog_pruning_stop_requested_ = true;
+        if (batch_oplog_pruning_worker_) {
+            batch_oplog_pruning_worker_->RequestStop();
+            worker = std::move(batch_oplog_pruning_worker_);
+        }
     }
+    if (worker) worker->Stop();
 }
 
 void MasterService::StopBatchOpLogWriter() {

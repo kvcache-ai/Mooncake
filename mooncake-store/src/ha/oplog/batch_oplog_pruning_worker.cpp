@@ -57,7 +57,7 @@ ErrorCode BatchOpLogPruningWorker::RunOneChunk(bool& deleted_chunk) {
 void BatchOpLogPruningWorker::RequestStop() {
     {
         std::lock_guard wait_lock(wait_mutex_);
-        stop_requested_.store(true);
+        stop_requested_.store(true, std::memory_order_release);
     }
     wait_condition_.notify_all();
 }
@@ -93,9 +93,15 @@ ErrorCode BatchOpLogPruningWorker::RunOneChunkLocked(
     if (chunk_batch_count_ == 0 || max_batches_per_second_ == 0) {
         return ErrorCode::INVALID_PARAMS;
     }
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     const ErrorCode refresh_error = RefreshFloor();
     if (refresh_error != ErrorCode::OK || !target_floor_.has_value()) {
         return refresh_error;
+    }
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     if (cursor_ >= *target_floor_) return ErrorCode::OK;
 
@@ -103,6 +109,9 @@ ErrorCode BatchOpLogPruningWorker::RunOneChunkLocked(
         std::min(chunk_batch_count_, *target_floor_ - cursor_);
     const uint64_t first_id = cursor_ + 1;
     const uint64_t last_id = cursor_ + count;
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     const auto started = Clock::now();
     const ErrorCode error = storage_.DeleteBatchesInRange(first_id, last_id);
     delete_duration = Clock::now() - started;
@@ -125,8 +134,14 @@ ErrorCode BatchOpLogPruningWorker::RunOneChunkLocked(
 }
 
 ErrorCode BatchOpLogPruningWorker::RefreshFloor() {
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     uint64_t floor = 0;
     const ErrorCode error = storage_.ReadCompactionFloor(floor);
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
         HAMetricManager::instance().update_batch_oplog_pruner_state(
             true, cursor_, target_floor_.value_or(0));
@@ -146,8 +161,14 @@ ErrorCode BatchOpLogPruningWorker::RefreshFloor() {
 }
 
 ErrorCode BatchOpLogPruningWorker::RecoverCursor(uint64_t floor) {
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     std::optional<uint64_t> oldest_batch_id;
     const ErrorCode error = storage_.FindOldestBatchId(oldest_batch_id);
+    if (stop_requested_.load(std::memory_order_acquire)) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     if (error != ErrorCode::OK) {
         HAMetricManager::instance().inc_batch_oplog_pruner_errors();
         return error;
