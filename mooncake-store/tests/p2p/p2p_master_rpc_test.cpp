@@ -1,6 +1,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <ylt/struct_json/json_reader.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -21,6 +23,7 @@
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "ha/oplog/mock_oplog_store.h"
 #include "p2p/ha/ha_status.h"
+#include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "utils.h"
@@ -749,7 +752,8 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
                 HAStatusManager::instance().SetRoleState("primary", "RUNNING");
             },
             [oplog_manager, &drain_timeout_ms] {
-                (void)oplog_manager->DrainWriting(drain_timeout_ms.load());
+                P2PMaster::DrainOpLogAfterStepdown(*oplog_manager,
+                                                   drain_timeout_ms.load());
             });
     });
     auto run_result = run.get_future();
@@ -850,6 +854,119 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     EXPECT_EQ(oplog_store->WritesAfterDrain(), 0u);
 
     run_thread.join();
+}
+
+TEST_F(P2PMasterRpcTest, StepdownDrainDiagnosticsSurviveDemotionAndRecover) {
+    struct StatusResetGuard {
+        ~StatusResetGuard() { HAStatusManager::instance().Reset(); }
+    } reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "stepdown_diagnostics", "local");
+    status.SetMasterView("local", 1);
+    status.SetRoleState("primary", "RUNNING");
+
+    struct ControlledDrainStore final : mooncake::test::MockOpLogStore {
+        OpLogDrainResult result{false, 2, 1, 10, 13};
+        uint32_t last_timeout_ms{0};
+        OpLogDrainResult DrainWriting(uint32_t timeout_ms) override {
+            last_timeout_ms = timeout_ms;
+            return result;
+        }
+    };
+    auto store = std::make_shared<ControlledDrainStore>();
+    OpLogManager manager;
+    manager.SetOpLogStore(store);
+    P2PStatusHttpServer diagnostics(/*port=*/0);
+    diagnostics.Start();
+    ASSERT_NE(diagnostics.port(), 0);
+    auto read_json = [&](const char* path) {
+        coro_http::coro_http_client client;
+        auto response = client.get(
+            "http://127.0.0.1:" + std::to_string(diagnostics.port()) + path);
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        return std::string(response.resp_body);
+    };
+    auto read_doctor = [&] {
+        HADoctorReport report;
+        struct_json::from_json(report, read_json("/ha/doctor"));
+        return report;
+    };
+    auto read_last_error = [&] {
+        HAStatusSnapshot snapshot;
+        struct_json::from_json(snapshot, read_json("/ha/status"));
+        return snapshot.last_error;
+    };
+    auto find_drain = [](const HADoctorReport& report) {
+        return std::find_if(report.issues.begin(), report.issues.end(),
+                            [](const auto& issue) {
+                                return issue.code == "OPLOG_DRAIN_INCOMPLETE";
+                            });
+    };
+
+    // Exercise the same drain/diagnostic path as the real HA supervisor.
+    P2PMaster::DrainOpLogAfterStepdown(manager, 1234);
+    EXPECT_EQ(store->last_timeout_ms, 1234u);
+    auto report = read_doctor();
+    auto issue = find_drain(report);
+    ASSERT_NE(issue, report.issues.end());
+    EXPECT_EQ(report.health, "degraded");
+    EXPECT_EQ(issue->category, "oplog");
+    EXPECT_EQ(issue->component, "oplog_writer");
+    EXPECT_EQ(issue->severity, "warning");
+    for (const auto* detail :
+         {"drain_timeout_ms=1234", "queued=2", "inflight=1",
+          "committed_sequence_id=10", "max_known_sequence_id=13"}) {
+        EXPECT_NE(issue->message.find(detail), std::string::npos);
+    }
+    const auto drain_error = issue->message;
+    EXPECT_EQ(read_last_error(), drain_error);
+
+    // Reproduce demotion and the next supervisor round, including replacing
+    // the HTTP server. Per-round issues clear; the failed drain stays visible.
+    status.SetRoleState("standby", "STEPPED_DOWN");
+    status.SetDoctorIssue("ELECTION_FAILED", "old round failure");
+    diagnostics.Stop();
+    status.ClearDoctorIssues(/*preserve_stepdown_drain=*/true);
+    status.Configure(true, "stepdown_diagnostics", "local");
+    status.SetRoleState("standby", "WATCHING");
+    diagnostics.Start();
+    ASSERT_NE(diagnostics.port(), 0);
+    report = read_doctor();
+    issue = find_drain(report);
+    ASSERT_NE(issue, report.issues.end());
+    EXPECT_EQ(report.issues.size(), 1u);
+    EXPECT_EQ(report.health, "degraded");
+    EXPECT_EQ(issue->message, drain_error);
+    EXPECT_EQ(read_last_error(), drain_error);
+
+    // A later successful drain clears this failure and its last_error.
+    status.SetRoleState("primary", "RUNNING");
+    store->result = {true, 0, 0, 13, 13};
+    P2PMaster::DrainOpLogAfterStepdown(manager, 3000);
+    report = read_doctor();
+    EXPECT_EQ(find_drain(report), report.issues.end());
+    EXPECT_EQ(report.health, "ok");
+    EXPECT_TRUE(read_last_error().empty());
+
+    // Recovery must not erase an unrelated, more recent error.
+    store->result = {false, 2, 1, 10, 13};
+    P2PMaster::DrainOpLogAfterStepdown(manager, 0);
+    status.SetLastError("unrelated registry failure");
+    store->result = {true, 0, 0, 13, 13};
+    P2PMaster::DrainOpLogAfterStepdown(manager, 3000);
+    report = read_doctor();
+    EXPECT_EQ(find_drain(report), report.issues.end());
+    EXPECT_EQ(read_last_error(), "unrelated registry failure");
+
+    store->result = {false, 2, 1, 10, 13};
+    P2PMaster::DrainOpLogAfterStepdown(manager, 0);
+    status
+        .ClearDoctorIssues();  // Explicit clearing keeps its original meaning.
+    report = read_doctor();
+    EXPECT_EQ(find_drain(report), report.issues.end());
+    status.Reset();
+    EXPECT_TRUE(read_last_error().empty());
 }
 
 }  // namespace

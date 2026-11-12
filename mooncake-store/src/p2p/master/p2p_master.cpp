@@ -299,6 +299,33 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
     return 0;
 }
 
+void P2PMaster::DrainOpLogAfterStepdown(OpLogManager& manager,
+                                        uint32_t timeout_ms) {
+    const auto drain = manager.DrainWriting(timeout_ms);
+    auto& status = HAStatusManager::instance();
+    constexpr auto kErrorPrefix = "P2P primary stepdown OpLog drain incomplete";
+    if (drain.drained) {
+        status.SetDoctorIssue("OPLOG_DRAIN_INCOMPLETE");
+        status.ClearLastErrorIfPrefix(kErrorPrefix);
+        LOG(INFO) << "P2P primary stepdown OpLog drain completed"
+                  << ", drain_timeout_ms=" << timeout_ms
+                  << ", committed_sequence_id=" << drain.committed_sequence_id
+                  << ", max_known_sequence_id=" << drain.max_known_sequence_id;
+        return;
+    }
+    std::string error = std::string(kErrorPrefix) +
+                        ", drain_timeout_ms=" + std::to_string(timeout_ms) +
+                        ", queued=" + std::to_string(drain.queued_count) +
+                        ", inflight=" + std::to_string(drain.inflight_count) +
+                        ", committed_sequence_id=" +
+                        std::to_string(drain.committed_sequence_id) +
+                        ", max_known_sequence_id=" +
+                        std::to_string(drain.max_known_sequence_id);
+    LOG(WARNING) << error;
+    status.SetDoctorIssue("OPLOG_DRAIN_INCOMPLETE", error);
+    status.SetLastError(std::move(error));
+}
+
 int P2PMaster::RunStandalone() {
     HAStatusManager::instance().Configure(
         /*ha_enabled=*/false, config_.cluster_id,
@@ -335,7 +362,10 @@ int P2PMaster::RunWithHA() {
     // next round reads it after the active service has been destroyed.
     std::chrono::steady_clock::time_point election_paused_until{};
     while (!stopping()) {
-        HAStatusManager::instance().ClearDoctorIssues();
+        // The previous primary's drain result must remain visible after
+        // demotion; clear it on a successful drain instead of hiding it here.
+        HAStatusManager::instance().ClearDoctorIssues(
+            /*preserve_stepdown_drain=*/true);
         // Read-only diagnostics must be reachable in every role. A standby
         // blocks inside ElectLeader below, so start the diagnostic server
         // before the active (primary-only) HTTP server exists.
@@ -668,26 +698,7 @@ int P2PMaster::RunWithHA() {
             }
             if (auto* manager =
                     primary_oplog_manager.load(std::memory_order_acquire)) {
-                auto drain = manager->DrainWriting(stepdown_drain_timeout_ms);
-                if (!drain.drained) {
-                    LOG(WARNING)
-                        << "P2P primary stepdown OpLog drain incomplete"
-                        << ", drain_timeout_ms=" << stepdown_drain_timeout_ms
-                        << ", queued=" << drain.queued_count
-                        << ", inflight=" << drain.inflight_count
-                        << ", committed_sequence_id="
-                        << drain.committed_sequence_id
-                        << ", max_known_sequence_id="
-                        << drain.max_known_sequence_id;
-                } else {
-                    LOG(INFO)
-                        << "P2P primary stepdown OpLog drain completed"
-                        << ", drain_timeout_ms=" << stepdown_drain_timeout_ms
-                        << ", committed_sequence_id="
-                        << drain.committed_sequence_id
-                        << ", max_known_sequence_id="
-                        << drain.max_known_sequence_id;
-                }
+                DrainOpLogAfterStepdown(*manager, stepdown_drain_timeout_ms);
             }
         };
         auto stepdown_callback = stop_for_active_stepdown;

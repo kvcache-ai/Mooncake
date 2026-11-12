@@ -79,7 +79,8 @@ std::string IssueCategory(const std::string& code) {
 
 std::string IssueComponent(const std::string& code) {
     if (StartsWith(code, "OPLOG_WRITE_") || StartsWith(code, "OPLOG_COMMIT_") ||
-        StartsWith(code, "OPLOG_LATEST_") || code == "OPLOG_QUEUE_PRESSURE") {
+        StartsWith(code, "OPLOG_LATEST_") || code == "OPLOG_QUEUE_PRESSURE" ||
+        code == "OPLOG_DRAIN_INCOMPLETE") {
         return "oplog_writer";
     }
     if (StartsWith(code, "OPLOG_READ_") || code == "OPLOG_POLL_STALE" ||
@@ -115,6 +116,7 @@ std::string IssueSeverity(const std::string& code) {
         code == "OPLOG_QUEUE_PRESSURE" || code == "OPLOG_LATEST_STALLED" ||
         code == "OPLOG_CATCHUP_STALLED" || code == "OPLOG_POLL_STALE" ||
         code == "OPLOG_LAG_GROWING" || code == "PROMOTION_CATCHUP_INCOMPLETE" ||
+        code == "OPLOG_DRAIN_INCOMPLETE" ||
         code == "ELECTION_READINESS_BLOCKED") {
         return "warning";
     }
@@ -638,9 +640,13 @@ void HAStatusManager::SetDoctorIssue(std::string code, std::string message) {
     }
 }
 
-void HAStatusManager::ClearDoctorIssues() {
+void HAStatusManager::ClearDoctorIssues(bool preserve_stepdown_drain) {
     std::lock_guard<std::mutex> lock(mutex_);
+    auto stepdown_drain = doctor_issues_.extract("OPLOG_DRAIN_INCOMPLETE");
     doctor_issues_.clear();
+    if (preserve_stepdown_drain && !stepdown_drain.empty()) {
+        doctor_issues_.insert(std::move(stepdown_drain));
+    }
     oplog_writer_ = {};
     oplog_catchup_ = {};
     oplog_lag_growth_ = {};

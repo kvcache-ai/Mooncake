@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstdint>
 #include <functional>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
@@ -10,6 +11,7 @@
 namespace mooncake {
 
 class P2PMasterRpcService;
+class OpLogManager;
 
 class P2PMaster {
    public:
@@ -26,6 +28,8 @@ class P2PMaster {
     static void HandleSignal(int signal);
     int RunStandalone();
     int RunWithHA();
+    static void DrainOpLogAfterStepdown(OpLogManager& manager,
+                                        uint32_t timeout_ms);
     int RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
                             P2PMasterRpcService& service,
                             std::function<void()> before_start = {},

@@ -167,7 +167,9 @@ class HAStatusManager {
     // An empty message clears the current issue. Callers own recovery and
     // lifecycle cleanup; existing failure-path logs remain the diagnostics.
     void SetDoctorIssue(std::string code, std::string message = {});
-    void ClearDoctorIssues();
+    // A new supervisor round may preserve the last failed stepdown drain until
+    // a successful drain or explicit reset acknowledges it.
+    void ClearDoctorIssues(bool preserve_stepdown_drain = false);
     HADoctorReport GetDoctorReport() const;
     std::string SerializeDoctorJson() const;
     // Writer events publish under its queue lock; diagnostics never take it.
