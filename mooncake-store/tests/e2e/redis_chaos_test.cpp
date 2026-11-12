@@ -1,6 +1,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <ylt/coro_http/coro_http_client.hpp>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -753,6 +754,56 @@ TEST_F(RedisGracefulShutdownTest, PrimarySigtermReleasesLeaseAndRegistry) {
         WaitForMasterLog(leader, "released=1", std::chrono::seconds(1)));
     EXPECT_TRUE(WaitForMasterLog(leader, "HA shutdown completed",
                                  std::chrono::seconds(1)));
+}
+
+TEST_F(RedisGracefulShutdownTest, PrimaryStepDownReleasesLeaseBeforeTTL) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    ASSERT_TRUE(TcpPortAccepting("127.0.0.1:" +
+                                 std::to_string(kMasterPortBase + leader)));
+
+    const auto log_offset = MasterLogEndOffset(leader);
+    auto [host, port] = ParseRedisEndpoint();
+    auto ctx = std::unique_ptr<redisContext, decltype(&redisFree)>(
+        redisConnect(host.c_str(), port), redisFree);
+    ASSERT_TRUE(AuthenticateRedisContext(ctx.get(), FLAGS_redis_username,
+                                         FLAGS_redis_password));
+    const auto key = MasterViewKey();
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::seconds(5);
+    RedisReplyPtr ttl((redisReply*)redisCommand(ctx.get(), "PTTL %b",
+                                                key.data(), key.size()));
+    ASSERT_TRUE(ttl && ttl->type == REDIS_REPLY_INTEGER);
+    ASSERT_GT(ttl->integer, 5000) << "Lease expiry must not satisfy this test";
+
+    coro_http::coro_http_client client;
+    auto response = client.post(
+        "http://127.0.0.1:" + std::to_string(54051 + leader) + "/ha/stepdown",
+        "", coro_http::req_content_type::octet_stream);
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    ASSERT_NE(response.resp_body.find("\"success\":true"),
+              std::string_view::npos);
+
+    bool newer_view = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::string next_address;
+        ViewVersionId next_version = 0;
+        // The same node may win again: this verifies release, not cooldown.
+        if (master_view_->GetMasterView(next_address, next_version) ==
+                ErrorCode::OK &&
+            next_version > version &&
+            std::chrono::steady_clock::now() < deadline) {
+            newer_view = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(newer_view) << "No new leader term within 5s after stepdown";
+    EXPECT_TRUE(WaitForMasterLogOrderSince(
+        leader, "P2P primary stepdown OpLog drain completed", "released=1",
+        log_offset, std::chrono::seconds(1)));
 }
 
 TEST_F(RedisGracefulShutdownTest, StandbySigtermPreservesLeader) {

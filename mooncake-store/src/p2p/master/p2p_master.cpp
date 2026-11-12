@@ -878,6 +878,13 @@ int P2PMaster::RunWithHA() {
                       << ", release_result=" << toString(release_result);
             return 0;
         }
+        if (active_stepdown_requested.load(std::memory_order_acquire)) {
+            // Release only after RPC handlers, OpLog writes, and keepalive have
+            // stopped.
+            const auto release_result = master_view->ReleaseLeader();
+            LOG(INFO) << "HA primary stepdown completed"
+                      << ", release_result=" << toString(release_result);
+        }
         active_service.reset();
         if (run_result != 0) {
             return run_result;
