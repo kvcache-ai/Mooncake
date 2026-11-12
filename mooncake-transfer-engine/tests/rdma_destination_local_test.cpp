@@ -130,6 +130,17 @@ TEST_F(DestinationRail, KeepsReadHostAndUnknownRangesOnNormalPolicy) {
     EXPECT_EQ(hint(), "");
 }
 
+TEST_F(DestinationRail, FollowsOneGpuAcrossAdjacentMemoryRegions) {
+    // A receiver that splits one allocation by MC_MAX_MR_SIZE registers
+    // adjacent MRs; a WRITE crossing their boundary still targets one GPU.
+    TransferMetadata::BufferDesc next = peer.buffers[0];
+    next.addr = 5120;
+    peer.buffers.push_back(next);
+    EXPECT_EQ(hint(Transport::TransferRequest::WRITE, 5000, 512), "rail1");
+    peer.buffers[1].name = gpus("gpu:0");
+    EXPECT_EQ(hint(Transport::TransferRequest::WRITE, 5000, 512), "");
+}
+
 TEST_F(DestinationRail, RequiresBothOptInAndDestinationAffinity) {
     globalConfig().enable_dest_local_rail = false;
     EXPECT_EQ(hint(), "");

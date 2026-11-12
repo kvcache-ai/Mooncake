@@ -88,13 +88,20 @@ std::string RdmaTransport::destinationLocalHca(SegmentDesc *peer,
         !globalConfig().enable_dest_device_affinity ||
         opcode != TransferRequest::WRITE || !peer || length == 0)
         return {};
-    int buffer_id = -1, device_id = -1;
-    if (selectDevice(peer, offset, length, buffer_id, device_id)) return {};
-    const auto &buffer = peer->buffers[buffer_id];
-    const auto location = resolveBufferLocation(buffer, offset);
-    // Ambiguous multi-GPU spans keep ordinary selection.
-    if (location != resolveBufferLocation(buffer, offset + length - 1))
+    // The first and last bytes may sit in different MRs of one GPU (a receiver
+    // splits large allocations by MC_MAX_MR_SIZE), so resolve each on its own.
+    auto locate = [peer](uint64_t addr, std::string &location) {
+        int buffer_id = -1, device_id = -1;
+        if (selectDevice(peer, addr, 1, buffer_id, device_id)) return false;
+        location = resolveBufferLocation(peer->buffers[buffer_id], addr);
+        return true;
+    };
+    std::string location, last_location;
+    if (!locate(offset, location) ||
+        !locate(offset + length - 1, last_location))
         return {};
+    // Ambiguous multi-GPU spans keep ordinary selection.
+    if (location != last_location) return {};
     const int pinned = peer->topology.pinnedDevice(location);
     const auto &hcas = peer->topology.getHcaList();
     if (pinned < 0 || static_cast<size_t>(pinned) >= hcas.size()) return {};
@@ -1425,8 +1432,12 @@ Status RdmaTransport::submitTransferTask(
             request_device_id = -1;
         } else {
             last_local_buffer_id = request_buffer_id;
-            last_local_device_id = request_device_id;
-            last_local_device_buffer_id = request_buffer_id;
+            // A destination-hinted NIC follows the target GPU, not the source
+            // buffer, so unhinted requests must not reuse it.
+            if (destination_hint.empty()) {
+                last_local_device_id = request_device_id;
+                last_local_device_buffer_id = request_buffer_id;
+            }
         }
 
         SliceLengthCalculator slice_calc{request,
@@ -1503,8 +1514,10 @@ Status RdmaTransport::submitTransferTask(
                        context_list_.size());
                 found_device = true;
                 last_local_buffer_id = buffer_id;
-                last_local_device_id = device_id;
-                last_local_device_buffer_id = buffer_id;
+                if (slice_destination_hint.empty()) {
+                    last_local_device_id = device_id;
+                    last_local_device_buffer_id = buffer_id;
+                }
                 break;
             }
             if (!found_device) {
