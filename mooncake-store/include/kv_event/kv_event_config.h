@@ -25,7 +25,7 @@ struct KvEventConfig {
     // Coalesce removals for at most this long, or until 64 events are queued.
     // Stored/cleared events and shutdown flush without waiting. Zero disables
     // the coalescing delay.
-    uint32_t removal_batch_timeout_us{1000};
+    uint32_t removal_batch_timeout_us{100};
 
     // Fixed publisher context supplied by the Master configuration.
     std::string model_name;

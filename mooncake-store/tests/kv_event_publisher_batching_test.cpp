@@ -7,13 +7,10 @@
 #include <msgpack.hpp>
 #include <zmq.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <endian.h>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -35,7 +32,6 @@ struct Event {
 
 struct Batch {
     uint64_t sequence;
-    size_t bytes = 0;
     std::vector<Event> events;
 };
 
@@ -84,7 +80,6 @@ class Subscriber {
         Batch batch;
         std::memcpy(&batch.sequence, frames[1].data(), 8);
         batch.sequence = be64toh(batch.sequence);
-        for (const auto& frame : frames) batch.bytes += frame.size();
         auto payload = msgpack::unpack(frames[2].data(), frames[2].size());
         using Fields = std::map<std::string, msgpack::object>;
         auto envelope =
@@ -110,7 +105,7 @@ class Subscriber {
     void* socket_ = nullptr;
 };
 
-KvEventConfig Config(uint32_t timeout_us = 1000) {
+KvEventConfig Config(std::optional<uint32_t> timeout_us = std::nullopt) {
     static std::atomic<unsigned> next{0};
     KvEventConfig config;
     config.enabled = true;
@@ -118,7 +113,7 @@ KvEventConfig Config(uint32_t timeout_us = 1000) {
     config.bind_endpoint = "ipc:///tmp/mooncake-kv-batch-" +
                            std::to_string(getpid()) + "-" +
                            std::to_string(next.fetch_add(1));
-    config.removal_batch_timeout_us = timeout_us;
+    if (timeout_us) config.removal_batch_timeout_us = *timeout_us;
     return config;
 }
 
@@ -243,77 +238,6 @@ TEST(KvEventPublisherBatchingTest, ShutdownInterruptsRemovalDeadline) {
     const auto before = Clock::now();
     publisher.reset();
     EXPECT_LT(Clock::now() - before, std::chrono::seconds(1));
-}
-
-// CPU-only reproduction. Run explicitly with --gtest_also_run_disabled_tests
-// --gtest_filter=KvEventPublisherBatchingTest.DISABLED_PacedRemovalBurstBenchmark
-// Zero is the previous immediate-drain policy. Every case checks the complete
-// object stream; the reported reduction is in wire batches, not object events.
-TEST(KvEventPublisherBatchingTest, DISABLED_PacedRemovalBurstBenchmark) {
-    constexpr size_t count = 15000;
-    const char* interval = std::getenv("MOONCAKE_KV_EVENT_BENCH_INTERVAL_US");
-    const auto interval_us = interval ? std::stoul(interval) : 5u;
-    std::vector<std::string> keys;
-    for (size_t i = 0; i < count; ++i) {
-        std::string hash(64, '0');
-        const auto suffix = std::to_string(i);
-        hash.replace(hash.size() - suffix.size(), suffix.size(), suffix);
-        keys.push_back("sglang-rkv-v4:dsa:pp0:" + hash);
-    }
-    for (uint32_t timeout_us : {0u, 100u, 250u, 500u, 1000u}) {
-        const auto config = Config(timeout_us);
-        KvEventPublisher publisher(config);
-        Subscriber subscriber;
-        ASSERT_TRUE(subscriber.Connect(config.bind_endpoint));
-        std::vector<std::atomic<int64_t>> enqueued(count);
-        std::jthread producer([&] {
-            for (size_t i = 0; i < count; ++i) {
-                const auto now = Clock::now();
-                enqueued[i].store(now.time_since_epoch().count(),
-                                  std::memory_order_release);
-                publisher.PublishRemoved(keys[i], "cpu", "default", "evict");
-                // Model work between consecutive evictions without making
-                // publication depend on a subscriber acknowledgment.
-                while (Clock::now() - now <
-                       std::chrono::microseconds(interval_us)) {
-                }
-            }
-        });
-        size_t seen = 0, batches = 0, bytes = 0;
-        std::vector<double> latency_us;
-        while (seen < count) {
-            const auto batch = subscriber.Receive();
-            ASSERT_TRUE(batch);
-            EXPECT_EQ(batch->sequence, ++batches);
-            ASSERT_LE(batch->events.size(), 64u);
-            bytes += batch->bytes;
-            const auto received = Clock::now();
-            for (const auto& event : batch->events) {
-                ASSERT_LT(seen, count);
-                EXPECT_EQ(event.id, seen + 1);
-                EXPECT_EQ(event.key, keys[seen]);
-                EXPECT_EQ(event.type, "removed");
-                EXPECT_EQ(event.medium, "cpu");
-                EXPECT_EQ(event.tenant, "default");
-                EXPECT_EQ(event.group, "evict");
-                const auto sent = Clock::time_point(Clock::duration(
-                    enqueued[seen].load(std::memory_order_acquire)));
-                latency_us.push_back(
-                    std::chrono::duration<double, std::micro>(received - sent)
-                        .count());
-                ++seen;
-            }
-        }
-        producer.join();
-        EXPECT_EQ(publisher.GetStats().dropped_events, 0u);
-        std::sort(latency_us.begin(), latency_us.end());
-        std::cout << "{\"interval_us\":" << interval_us
-                  << ",\"window_us\":" << timeout_us << ",\"events\":" << seen
-                  << ",\"batches\":" << batches
-                  << ",\"payload_bytes\":" << bytes
-                  << ",\"p50_us\":" << latency_us[count / 2]
-                  << ",\"p99_us\":" << latency_us[count * 99 / 100] << "}\n";
-    }
 }
 
 }  // namespace

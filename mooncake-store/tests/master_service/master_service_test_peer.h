@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <utility>
 
 #include "master_service.h"
@@ -92,6 +93,14 @@ class MasterServiceTestPeer {
 
     // Enable epoch bookkeeping without starting a live KV event publisher.
     void SetKvTenantEpochTrackingForTesting(bool enabled);
+
+    // Replace the publisher while no mutating clients are active, so a
+    // capacity-pressure benchmark can isolate eviction traffic after warmup.
+    void SetKvEventPublisherForTesting(
+        std::unique_ptr<KvEventPublisher> publisher) {
+        std::unique_lock lock(service_.master_state_mutex_);
+        service_.kv_event_publisher_ = std::move(publisher);
+    }
 
     // Called once per tenant RemoveAll has finished removing. Tests can commit
     // into a tenant the walk already passed to pin the interleaving.
