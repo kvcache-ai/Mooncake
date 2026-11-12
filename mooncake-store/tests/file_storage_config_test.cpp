@@ -53,8 +53,6 @@ struct FileStorageEnvironment {
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT"};
     ScopedEnvVar legacy_scanmeta_iterator_keys_limit{
         "MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT"};
-    ScopedEnvVar recovery_retry_initial{
-        "MOONCAKE_OFFLOAD_METADATA_RECOVERY_RETRY_INITIAL_MS"};
     ScopedEnvVar recovery_retry_max{
         "MOONCAKE_OFFLOAD_METADATA_RECOVERY_RETRY_MAX_MS"};
     ScopedEnvVar total_keys_limit{"MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT"};
@@ -125,17 +123,14 @@ TEST_F(FileStorageConfigTest, DefaultValuesWhenNoEnvSet) {
 
 TEST_F(FileStorageConfigTest, RecoveryBackoffFromEnvironmentAndValidRange) {
     env.storage_path.Set(data_path.c_str());
-    env.recovery_retry_initial.Set("250");
     env.recovery_retry_max.Set("2000");
     auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.metadata_recovery_retry_initial_ms, 250u);
     EXPECT_EQ(config.metadata_recovery_retry_max_ms, 2000u);
     ASSERT_TRUE(config.Validate());
 
-    env.recovery_retry_initial.Set("0");
-    EXPECT_FALSE(FileStorageConfig::FromEnvironment().Validate());
-    env.recovery_retry_initial.Set("200");
-    env.recovery_retry_max.Set("100");
+    config.metadata_recovery_retry_initial_ms = 0;
+    EXPECT_FALSE(config.Validate());
+    env.recovery_retry_max.Set("50");
     EXPECT_FALSE(FileStorageConfig::FromEnvironment().Validate());
 }
 
