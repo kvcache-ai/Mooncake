@@ -253,6 +253,10 @@ struct FileStorageConfig {
     int64_t scanmeta_iterator_keys_limit =
         20000;  // Max number of keys returned per Scan call, required by bucket
                 // backend only
+    // Retry transient recovery registration failures with jittered exponential
+    // backoff until the batch succeeds or the disk tier stops.
+    uint32_t metadata_recovery_retry_initial_ms = 100;
+    uint32_t metadata_recovery_retry_max_ms = 30000;
     // Global limits across all buckets
     int64_t total_keys_limit = 10'000'000;  // Maximum total number of keys
     int64_t total_size_limit =
