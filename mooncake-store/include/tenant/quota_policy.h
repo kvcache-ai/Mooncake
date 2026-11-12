@@ -8,8 +8,8 @@
 // What an object costs is derived from the object itself, never booked by the
 // code that changes it. The key keeps, in its policy words, the bytes the
 // account currently holds for it and what a replaced object still owes, and
-// every write lock released on the key settles the first towards what the
-// object owes now:
+// every write lock released on the key, and every teardown of its object,
+// settles the first towards what the object owes now:
 //
 //   - nothing, once the key holds no object;
 //   - otherwise its size for every memory replica that holds memory: being
@@ -108,6 +108,8 @@ class TenantQuotaPolicy final : public NamespacePolicy {
     friend class test::MasterServiceTestPeer;
 
     static TenantQuotaAccount& AccountOf(const PolicyContext& ctx);
+    // Brings what the account holds for the key to `owed`.
+    static void Settle(const PolicyContext& ctx, uint64_t owed);
 
     StoreControl& store_;
     const Options options_;
