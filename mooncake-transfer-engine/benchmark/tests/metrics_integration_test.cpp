@@ -127,13 +127,13 @@ class BenchMetricsIntegrationTest : public ::testing::Test {
 TEST_F(BenchMetricsIntegrationTest, ExportedMetricsMatchCompletedTransfers) {
     constexpr size_t block_size = 4093, batch_size = 3;
     constexpr size_t bytes = block_size * batch_size;
-    const auto local =
-        initiator_->getLocalBufferBase(0, block_size, batch_size);
-    const auto remote =
-        initiator_->getTargetBufferBase(0, block_size, batch_size);
+    const auto local = initiator_->getLocalBufferBase(0, bytes);
+    const auto remote = initiator_->getTargetBufferBase(0, bytes);
+    ASSERT_TRUE(local.has_value());
+    ASSERT_TRUE(remote.has_value());
     const auto segment = initiator_->getTargetSegmentId(0);
-    auto* source = reinterpret_cast<void*>(local);
-    auto* destination = reinterpret_cast<void*>(remote);
+    auto* source = reinterpret_cast<void*>(*local);
+    auto* destination = reinterpret_cast<void*>(*remote);
     std::string payload(bytes, 'x');
     std::memcpy(source, payload.data(), bytes);
     std::memset(destination, 0, bytes);
@@ -143,7 +143,7 @@ TEST_F(BenchMetricsIntegrationTest, ExportedMetricsMatchCompletedTransfers) {
     for (auto opcode :
          {mooncake::tent::WRITE, mooncake::tent::READ, mooncake::tent::READ}) {
         if (opcode == mooncake::tent::READ) std::memset(source, 0, bytes);
-        ASSERT_GE(initiator_->runSingleTransfer(local, segment, remote,
+        ASSERT_GE(initiator_->runSingleTransfer(*local, segment, *remote,
                                                 block_size, batch_size, opcode,
                                                 0, IntentType::INTENT_UNSPEC),
                   0);

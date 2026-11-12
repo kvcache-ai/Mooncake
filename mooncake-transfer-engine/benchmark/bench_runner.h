@@ -18,6 +18,7 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -30,6 +31,13 @@
 namespace mooncake {
 namespace tent {
 enum class IntentType : int;
+
+// Exit status of a block/batch sweep: success only if at least one point ran
+// and none of them failed. A sweep that skipped every point measured nothing
+// and must not look like a pass.
+inline int sweepExitStatus(bool interrupted, bool ran_any) {
+    return interrupted || !ran_any ? EXIT_FAILURE : EXIT_SUCCESS;
+}
 
 // Backend-independent parts of a benchmark runner: the initiator worker pool,
 // stop/abort state, and the thread-to-target layout. Backends open targets,

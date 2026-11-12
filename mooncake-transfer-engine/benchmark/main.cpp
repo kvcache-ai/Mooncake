@@ -177,10 +177,15 @@ int processBatchSizes(
     }
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
-        const uint64_t local_addr =
-            *runner.getLocalBufferBase(thread_id, address_stride_bytes);
-        const uint64_t target_addr =
-            *runner.getTargetBufferBase(thread_id, target_window_bytes);
+        const auto local_base =
+            runner.getLocalBufferBase(thread_id, address_stride_bytes);
+        const auto target_base =
+            runner.getTargetBufferBase(thread_id, target_window_bytes);
+        LOG_ASSERT(local_base.has_value() && target_base.has_value())
+            << "Buffer layout of thread " << thread_id
+            << " passed the pre-flight check but no longer fits";
+        const uint64_t local_addr = *local_base;
+        const uint64_t target_addr = *target_base;
         uint64_t target_id = runner.getTargetSegmentId(thread_id);
         const size_t target_index = runner.getTargetIndex(thread_id);
         const bool qos_enabled = !qos_classes.empty();
@@ -581,7 +586,6 @@ int main(int argc, char* argv[]) {
     if (!interrupted && !ran_any) {
         // A run that measured nothing must not look like a pass.
         LOG(ERROR) << "No benchmark case ran: every sweep point was skipped";
-        return EXIT_FAILURE;
     }
-    return interrupted ? EXIT_FAILURE : EXIT_SUCCESS;
+    return sweepExitStatus(interrupted, ran_any);
 }
