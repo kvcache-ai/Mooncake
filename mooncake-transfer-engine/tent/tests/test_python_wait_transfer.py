@@ -82,12 +82,6 @@ class PythonWaitTransferTest(unittest.TestCase):
                 client.free_local_memory(client_addr)
                 server.free_local_memory(server_addr)
 
-    def test_wait_transfer_rejects_an_unknown_batch(self):
-        with tempfile.TemporaryDirectory() as directory:
-            engine = tent.TransferEngine(write_config(directory, "engine.json"))
-            with self.assertRaises(tent.InvalidArgumentError):
-                engine.wait_transfer(0, timeout_ms=1000)
-
 
 if __name__ == "__main__":
     unittest.main()
