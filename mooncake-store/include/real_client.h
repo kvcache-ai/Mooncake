@@ -985,6 +985,19 @@ class RealClient : public PyClient {
         std::unordered_map<std::string, std::vector<Slice>> &objects,
         const OffloadReadRange *read_range = nullptr);
 
+    // Indexed counterpart: repeated keys retain independent windows and
+    // destination slices. The map-based entry point is only an adapter.
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_offload_object_internal(
+        const std::string &target_rpc_service_addr,
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<Slice>> &destinations,
+        const std::vector<int64_t> *value_offsets = nullptr,
+        const std::vector<int64_t> *object_sizes = nullptr,
+        bool allow_pinned = true,
+        const std::vector<std::vector<uint64_t>> *relative_source_offsets =
+            nullptr);
+
     // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
     // BatchGetLocal. Callers copy out of the restored arena (sequential
     // BatchGetOffloadObject or session BatchTransferReadOffloadRanges) while
