@@ -1,6 +1,7 @@
 #include "p2p/master/p2p_rpc_service.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <sstream>
@@ -20,6 +21,9 @@
 namespace mooncake {
 
 namespace {
+
+constexpr uint32_t kDefaultStepDownCooldownSec = 30;
+constexpr uint32_t kMaxStepDownCooldownSec = 3600;
 
 std::string GetMasterMetricsSummary() {
     std::string summary =
@@ -58,7 +62,8 @@ P2PMasterRpcService::~P2PMasterRpcService() {
     }
 }
 
-void P2PMasterRpcService::SetStepdownCallback(std::function<void()> callback) {
+void P2PMasterRpcService::SetStepdownCallback(
+    std::function<void(uint32_t)> callback) {
     stepdown_callback_ = std::move(callback);
 }
 
@@ -115,6 +120,25 @@ void P2PMasterRpcService::init_http_server() {
         POST>("/ha/stepdown", [this](coro_http_request& req,
                                      coro_http_response& resp) {
         resp.add_header("Content-Type", "application/json; charset=utf-8");
+        uint32_t cooldown_sec = kDefaultStepDownCooldownSec;
+        const auto cooldown = req.get_query_value("cooldown_sec");
+        if (!cooldown.empty()) {
+            const auto [end, error] = std::from_chars(
+                cooldown.data(), cooldown.data() + cooldown.size(),
+                cooldown_sec);
+            if (error != std::errc{} ||
+                end != cooldown.data() + cooldown.size() ||
+                cooldown_sec > kMaxStepDownCooldownSec) {
+                LOG_EVERY_N(WARNING, 30)
+                    << "Rejected P2P master stepdown: cooldown_sec must be an "
+                       "integer in [0, 3600]";
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "{\"success\":false,\"error\":\"cooldown_sec must be an "
+                    "integer in [0, 3600]\"}");
+                return;
+            }
+        }
         if (!stepdown_callback_) {
             resp.set_status_and_content(
                 status_type::service_unavailable,
@@ -128,11 +152,13 @@ void P2PMasterRpcService::init_http_server() {
                 "{\"success\":false,\"error\":\"stepdown already requested\"}");
             return;
         }
-        LOG(INFO) << "P2P master stepdown requested";
-        stepdown_callback_();
-        resp.set_status_and_content(
-            status_type::ok,
-            "{\"success\":true,\"message\":\"stepdown accepted\"}");
+        LOG(INFO) << "P2P master stepdown requested"
+                  << ", cooldown_sec=" << cooldown_sec;
+        stepdown_callback_(cooldown_sec);
+        resp.set_status_and_content(status_type::ok,
+                                    "{\"success\":true,\"message\":\"stepdown "
+                                    "accepted\",\"cooldown_sec\":" +
+                                        std::to_string(cooldown_sec) + "}");
     });
 
     http_server_.set_http_handler<GET>(

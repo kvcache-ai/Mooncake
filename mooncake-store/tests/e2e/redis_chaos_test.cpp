@@ -779,9 +779,10 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownReleasesLeaseBeforeTTL) {
     ASSERT_GT(ttl->integer, 5000) << "Lease expiry must not satisfy this test";
 
     coro_http::coro_http_client client;
-    auto response = client.post(
-        "http://127.0.0.1:" + std::to_string(54051 + leader) + "/ha/stepdown",
-        "", coro_http::req_content_type::octet_stream);
+    auto response =
+        client.post("http://127.0.0.1:" + std::to_string(54051 + leader) +
+                        "/ha/stepdown?cooldown_sec=0",
+                    "", coro_http::req_content_type::octet_stream);
     ASSERT_EQ(response.status, 200) << response.resp_body;
     ASSERT_NE(response.resp_body.find("\"success\":true"),
               std::string_view::npos);
@@ -804,6 +805,61 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownReleasesLeaseBeforeTTL) {
     EXPECT_TRUE(WaitForMasterLogOrderSince(
         leader, "P2P primary stepdown OpLog drain completed", "released=1",
         log_offset, std::chrono::seconds(1)));
+}
+
+TEST_F(RedisGracefulShutdownTest, PrimaryStepDownPausesReelection) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    const auto log_offset = MasterLogEndOffset(leader);
+    const auto start = std::chrono::steady_clock::now();
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(54051 + leader);
+    coro_http::coro_http_client client;
+    auto response = client.post(url + "/ha/stepdown?cooldown_sec=5", "",
+                                coro_http::req_content_type::octet_stream);
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    ASSERT_NE(response.resp_body.find("\"cooldown_sec\":5"),
+              std::string_view::npos);
+    ASSERT_TRUE(WaitForMasterLogSince(leader,
+                                      "HA election paused after stepdown",
+                                      log_offset, std::chrono::seconds(3)));
+    ExpectPromptSuccessor(leader, version, start);
+
+    // Standby diagnostics remain reachable while election is paused.
+    coro_http::coro_http_client status_client;
+    auto status = status_client.get(url + "/ha/status");
+    EXPECT_EQ(status.status, 200) << status.resp_body;
+    EXPECT_FALSE(TcpPortAccepting("127.0.0.1:" +
+                                  std::to_string(kMasterPortBase + leader)));
+    EXPECT_TRUE(WaitForMasterLogOrderSince(
+        leader, "HA election pause completed", "Trying to elect self as leader",
+        log_offset, std::chrono::seconds(7)));
+    EXPECT_GE(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(5));
+}
+
+TEST_F(RedisGracefulShutdownTest, StepdownCooldownDoesNotBlockShutdown) {
+    int leader = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+    const auto log_offset = MasterLogEndOffset(leader);
+    coro_http::coro_http_client client;
+    auto response = client.post(
+        "http://127.0.0.1:" + std::to_string(54051 + leader) + "/ha/stepdown",
+        "", coro_http::req_content_type::octet_stream);
+    ASSERT_EQ(response.status, 200) << response.resp_body;
+    ASSERT_NE(response.resp_body.find("\"cooldown_sec\":30"),
+              std::string_view::npos);
+    ASSERT_TRUE(WaitForMasterLogSince(leader,
+                                      "HA election paused after stepdown",
+                                      log_offset, std::chrono::seconds(3)));
+    ASSERT_TRUE(masters_[leader]->terminate(std::chrono::seconds(3)));
+    EXPECT_TRUE(WaitForMasterLogSince(
+        leader, "HA shutdown requested during election pause", log_offset,
+        std::chrono::seconds(1)));
 }
 
 TEST_F(RedisGracefulShutdownTest, StandbySigtermPreservesLeader) {

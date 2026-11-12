@@ -720,7 +720,7 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     auto server = std::make_unique<coro_rpc::coro_rpc_server>(
         2, port, "127.0.0.1", std::chrono::seconds(0), false);
     std::atomic<bool> stepdown_requested{false};
-    service->SetStepdownCallback([&server, &stepdown_requested] {
+    service->SetStepdownCallback([&server, &stepdown_requested](uint32_t) {
         stepdown_requested.store(true, std::memory_order_seq_cst);
         server->stop();
     });

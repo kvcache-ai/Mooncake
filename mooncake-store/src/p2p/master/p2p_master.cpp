@@ -178,7 +178,7 @@ class ScopedStandbyRegistryProviders final {
 
 std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     const P2PMasterConfig& config, ViewVersionId view_version,
-    std::function<void()> stepdown_callback = {}) {
+    std::function<void(uint32_t)> stepdown_callback = {}) {
     auto service = std::make_unique<P2PMasterRpcService>(config, view_version);
     if (stepdown_callback) {
         service->SetStepdownCallback(std::move(stepdown_callback));
@@ -191,6 +191,31 @@ struct P2PPrimaryDemotionHandoff {
     P2PStandbyMetadataStore::ExportedMetadata metadata;
     uint64_t sequence_id{0};
 };
+
+bool WaitForElectionPause(std::chrono::steady_clock::time_point deadline,
+                          const std::function<bool()>& stopping) {
+    bool waited = false;
+    while (!stopping()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            if (waited) {
+                LOG(INFO) << "HA election pause completed";
+            }
+            return true;
+        }
+        if (!waited) {
+            LOG(INFO) << "HA election paused after stepdown"
+                      << ", remaining_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - now)
+                             .count();
+            waited = true;
+        }
+        std::this_thread::sleep_until(
+            std::min(deadline, now + std::chrono::milliseconds(100)));
+    }
+    return false;
+}
 
 }  // namespace
 
@@ -305,6 +330,10 @@ int P2PMaster::RunWithHA() {
     const std::string local_endpoint =
         config_.rpc.address + ":" + std::to_string(config_.rpc.port);
     std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
+    // Preserve the accepted request's deadline across active/standby rounds.
+    // The HTTP callback writes it before publishing the stepdown flag; the
+    // next round reads it after the active service has been destroyed.
+    std::chrono::steady_clock::time_point election_paused_until{};
     while (!stopping()) {
         HAStatusManager::instance().ClearDoctorIssues();
         // Read-only diagnostics must be reachable in every role. A standby
@@ -499,6 +528,11 @@ int P2PMaster::RunWithHA() {
             }
         }
 #endif
+        // Keep standby replication and diagnostics running during cooldown.
+        if (!WaitForElectionPause(election_paused_until, stopping)) {
+            LOG(INFO) << "HA shutdown requested during election pause";
+            return 0;
+        }
         if (standby) {
             if (!WaitForP2PElectionReadiness(config_, master_instance_id,
                                              *standby, stopping)) {
@@ -549,7 +583,11 @@ int P2PMaster::RunWithHA() {
             server->stop();
         };
         const auto stop_for_active_stepdown = [&server,
-                                               &active_stepdown_requested] {
+                                               &active_stepdown_requested,
+                                               &election_paused_until](
+                                                  uint32_t cooldown_sec) {
+            election_paused_until = std::chrono::steady_clock::now() +
+                                    std::chrono::seconds(cooldown_sec);
             // Active stepdown is voluntary: close the write request entry
             // first, then let RunActiveRpcServers wait for accepted handlers
             // and drain confirmed writes while this primary still renews its

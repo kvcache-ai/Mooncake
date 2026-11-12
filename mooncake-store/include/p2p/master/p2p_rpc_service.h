@@ -46,8 +46,9 @@ class P2PMasterRpcService final {
     void init();
     uint16_t GetHttpPort() const { return http_server_.port(); }
     // The embedding supervisor supplies this callback so that accepting a
-    // stepdown request can stop the active RPC server.
-    void SetStepdownCallback(std::function<void()> callback);
+    // stepdown request can stop the active RPC server and pause reelection for
+    // the requested cooldown (in seconds).
+    void SetStepdownCallback(std::function<void(uint32_t)> callback);
     P2PMasterService& GetMasterService() { return master_service_; }
     const P2PMasterService& GetMasterService() const { return master_service_; }
 
@@ -115,7 +116,7 @@ class P2PMasterRpcService final {
     std::atomic<bool> metric_report_running_;
     std::mutex metric_report_mutex_;
     std::condition_variable metric_report_cv_;
-    std::function<void()> stepdown_callback_;
+    std::function<void(uint32_t)> stepdown_callback_;
     std::atomic<bool> stepdown_requested_{false};
     uint32_t heartbeat_rpc_port_ = 0;
 };

@@ -327,15 +327,77 @@ TEST_F(P2PMasterHttpEndpointsTest,
 #endif  // STORE_USE_REDIS
 
 TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
-    std::atomic<bool> stepdown_called{false};
-    wrapped_->SetStepdownCallback(
-        [&stepdown_called] { stepdown_called.store(true); });
+    std::atomic<uint32_t> cooldown_sec{0};
+    P2PMasterConfig config;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    P2PMasterRpcService service(config);
+    service.SetStepdownCallback(
+        [&cooldown_sec](uint32_t seconds) { cooldown_sec.store(seconds); });
+    service.init();
 
-    const auto response = HttpPost(http_base_url_ + "/ha/stepdown");
+    const auto response =
+        HttpPost("http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+                 "/ha/stepdown");
     ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
     const auto body = ParseJson(response.resp_body, "stepdown");
     EXPECT_TRUE(body["success"].asBool());
-    EXPECT_TRUE(stepdown_called.load());
+    EXPECT_EQ(body["cooldown_sec"].asUInt(), 30u);
+    EXPECT_EQ(cooldown_sec.load(), 30u);
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesCooldown) {
+    std::atomic<uint32_t> callback_count{0};
+    std::atomic<uint32_t> cooldown_sec{0};
+    P2PMasterConfig config;
+    config.metrics.enable_reporting = false;
+    config.metrics.http_port = 0;
+    P2PMasterRpcService service(config);
+    service.SetStepdownCallback([&](uint32_t seconds) {
+        cooldown_sec.store(seconds);
+        callback_count.fetch_add(1);
+    });
+    service.init();
+    const std::string url =
+        "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+        "/ha/stepdown?cooldown_sec=";
+    for (const auto* value : {"-1", "abc", "1x", "1.5", "3601", "4294967296"}) {
+        const auto response = HttpPost(url + value);
+        EXPECT_EQ(response.status, 400) << value << ": " << response.resp_body;
+        EXPECT_EQ(callback_count.load(), 0u);
+    }
+    // Rejected parameters must not latch the one-shot stepdown flag.
+    const auto accepted = HttpPost(url + "7");
+    ASSERT_EQ(accepted.status, 200) << accepted.resp_body;
+    EXPECT_EQ(
+        ParseJson(accepted.resp_body, "stepdown")["cooldown_sec"].asUInt(), 7u);
+    EXPECT_EQ(cooldown_sec.load(), 7u);
+    EXPECT_EQ(callback_count.load(), 1u);
+    // A duplicate request must not overwrite the accepted cooldown.
+    EXPECT_EQ(HttpPost(url + "0").status, 503);
+    EXPECT_EQ(cooldown_sec.load(), 7u);
+    EXPECT_EQ(callback_count.load(), 1u);
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointAcceptsCooldownBounds) {
+    for (const uint32_t seconds : {0u, 3600u}) {
+        std::atomic<uint32_t> cooldown_sec{1};
+        P2PMasterConfig config;
+        config.metrics.enable_reporting = false;
+        config.metrics.http_port = 0;
+        P2PMasterRpcService service(config);
+        service.SetStepdownCallback(
+            [&cooldown_sec](uint32_t value) { cooldown_sec.store(value); });
+        service.init();
+        const auto response = HttpPost(
+            "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
+            "/ha/stepdown?cooldown_sec=" + std::to_string(seconds));
+        ASSERT_EQ(response.status, 200) << response.resp_body;
+        EXPECT_EQ(cooldown_sec.load(), seconds);
+        EXPECT_EQ(
+            ParseJson(response.resp_body, "stepdown")["cooldown_sec"].asUInt(),
+            seconds);
+    }
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
