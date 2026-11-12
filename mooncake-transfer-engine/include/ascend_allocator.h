@@ -22,9 +22,19 @@ using AscendConfigBoolFn = bool (*)();
 void ascend_allocator_set_config_provider(AscendConfigBoolFn agent_mode,
                                           AscendConfigBoolFn use_fabric_mem);
 
+// Independent of the two switches above. Priority matches them: this provider,
+// then the runtime flag, then ASCEND_STANDALONE_SINGLE_SEGMENT.
+void ascend_allocator_set_single_segment_provider(AscendConfigBoolFn fn);
+
 // Set the fallback switches used when no config provider is registered.
-// Calling this again replaces both values.
-void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem);
+// Calling this again replaces all three values.
+void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem,
+                                        bool single_segment = false);
+
+// 0 keeps one store allocation. Single-segment mode returns 0. Otherwise the
+// standalone split is total/device_count, or 0 when fewer than two devices
+// are visible to ContextManager.
+size_t ascend_agent_mode_store_chunk_cap(size_t total_size);
 
 void* ascend_allocate_memory(size_t total_size, const std::string& protocol);
 

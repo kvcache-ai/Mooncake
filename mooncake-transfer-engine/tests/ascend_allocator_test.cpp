@@ -136,11 +136,29 @@ class AscendAllocatorTest : public ::testing::Test {
 
     void TearDown() override {
         ascend_allocator_set_config_provider(nullptr, nullptr);
+        ascend_allocator_set_single_segment_provider(nullptr);
         ContextManager::getInstance().finalize();
         unsetenv("ASCEND_USE_SHMEM");
         unsetenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+        unsetenv("ASCEND_STANDALONE_SINGLE_SEGMENT");
     }
 };
+
+bool SingleSegmentOn() { return true; }
+
+TEST_F(AscendAllocatorTest, SingleSegmentChunkCapIsOnePool) {
+    g_device_count = 4;
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    ascend_allocator_set_runtime_flags(true, false, false);
+    EXPECT_EQ(ascend_agent_mode_store_chunk_cap(4096), 1024u);
+
+    ascend_allocator_set_runtime_flags(true, false, true);
+    EXPECT_EQ(ascend_agent_mode_store_chunk_cap(4096), 0u);
+
+    ascend_allocator_set_runtime_flags(true, false, false);
+    ascend_allocator_set_single_segment_provider(&SingleSegmentOn);
+    EXPECT_EQ(ascend_agent_mode_store_chunk_cap(8192), 0u);
+}
 
 TEST_F(AscendAllocatorTest, RuntimeFlagsSelectHostAllocation) {
     ascend_allocator_set_runtime_flags(false, false);

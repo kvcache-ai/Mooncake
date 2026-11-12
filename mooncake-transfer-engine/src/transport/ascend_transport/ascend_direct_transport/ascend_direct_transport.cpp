@@ -200,6 +200,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     desc->protocol = "ascend";
 
     agent_mode_ = globalConfig().ascend_agent_mode;
+    single_segment_ =
+        agent_mode_ && globalConfig().ascend_standalone_single_segment;
     roce_mode_ = IsRoceModeEnabled();
     // Only a Store-init TE may use fabric mem; gate on ascend_store_te_init so
     // a P2P/HCCS TE does not inherit a Store TE's fabric flag left in the
@@ -437,6 +439,37 @@ int AscendDirectTransport::registerLocalMemory(void* addr, size_t length,
         return ERR_INVALID_ARGUMENT;
     }
 
+    const bool all_engines = single_segment_ && remote_accessible;
+    if (all_engines) {
+        if (transfer_executor_->getUseBufferPool()) {
+            LOG(ERROR) << "ASCEND_STANDALONE_SINGLE_SEGMENT requires "
+                          "ASCEND_BUFFER_POOL=0:0";
+            return ERR_INVALID_ARGUMENT;
+        }
+        // Register once per engine, keeping every handle under this address.
+        // Publish the existing BufferDesc format once all engines are ready.
+        int ret = transfer_executor_->registerMem(addr, length, mem_type, false,
+                                                  remote_accessible, true);
+        if (ret != 0) return ret;
+        for (size_t i = 0; i < local_engine_contexts_.size(); ++i) {
+            buffer_desc.device_id = static_cast<int32_t>(i);
+            metadata_->addLocalMemoryBuffer(buffer_desc, false);
+        }
+        ret = update_metadata ? metadata_->updateLocalSegmentDesc() : 0;
+        if (ret != 0) {
+            for (size_t i = 0; i < local_engine_contexts_.size(); ++i) {
+                metadata_->removeLocalMemoryBuffer(
+                    addr,
+                    [length](const BufferDesc& buffer) {
+                        return buffer.length == length;
+                    },
+                    false);
+            }
+            (void)transfer_executor_->deregisterMem(addr);
+        }
+        return ret;
+    }
+
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
         LOG(ERROR) << "addLocalMemoryBuffer failed, ret: " << ret;
@@ -482,6 +515,23 @@ int AscendDirectTransport::unregisterLocalMemory(void* addr,
     int ret = transfer_executor_->deregisterMem(addr);
     if (ret != 0) {
         return ret;
+    }
+    if (single_segment_) {
+        // Multi-engine registrations share an address. Remove every record
+        // before publishing, after all handles have been deregistered.
+        const auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        bool removed = false;
+        if (desc) {
+            for (const auto& buffer : desc->buffers) {
+                if (buffer.addr == reinterpret_cast<uint64_t>(addr)) {
+                    metadata_->removeLocalMemoryBuffer(addr, false);
+                    removed = true;
+                }
+            }
+        }
+        if (removed) {
+            return update_metadata ? metadata_->updateLocalSegmentDesc() : 0;
+        }
     }
     (void)metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     return 0;

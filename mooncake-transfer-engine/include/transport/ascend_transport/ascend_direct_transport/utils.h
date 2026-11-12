@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
@@ -28,6 +29,7 @@
 
 #include <acl/acl.h>
 #include "ascend_affinity.h"
+#include "ascend_device_index.h"
 
 namespace mooncake {
 

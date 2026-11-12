@@ -864,7 +864,7 @@ if(USE_ASCEND OR USE_ASCEND_DIRECT)
   add_executable(tent_ascend_direct_transport_test
                  ascend_direct_transport_test.cpp)
   target_link_libraries(tent_ascend_direct_transport_test
-                        PRIVATE gtest gtest_main tent_link_group)
+                        PRIVATE gtest gtest_main tent_link_group glog::glog)
   if(TARGET asio_shared)
     target_link_libraries(tent_ascend_direct_transport_test PRIVATE asio_shared)
   endif()
@@ -882,8 +882,8 @@ endif()
 
 if(USE_ASCEND_DIRECT)
   add_executable(tent_shared_host_mapper_test shared_host_mapper_test.cpp)
-  target_link_libraries(tent_shared_host_mapper_test
-                        PRIVATE gtest gtest_main tent_link_group)
+  target_link_libraries(tent_shared_host_mapper_test PRIVATE gtest gtest_main
+                                                             tent_link_group)
   target_include_directories(tent_shared_host_mapper_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_shared_host_mapper_test

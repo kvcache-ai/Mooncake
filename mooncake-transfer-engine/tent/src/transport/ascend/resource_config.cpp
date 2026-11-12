@@ -18,8 +18,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <utility>
 #include <exception>
 #include <limits>
@@ -507,6 +509,42 @@ HixlNameResolver::HixlNameResolver(const MemorySegmentDesc& detail) {
         }
         ranges_.push_back(BufferRange{buf.addr, buf.length, name_idx});
     }
+}
+
+namespace {
+bool RangeCovers(uint64_t begin, uint64_t length, uint64_t offset,
+                 size_t request_length) {
+    if (request_length == 0) {
+        return offset >= begin && offset - begin < length;
+    }
+    return offset >= begin && request_length <= length &&
+           offset - begin <= length - request_length;
+}
+}  // namespace
+
+std::vector<size_t> HixlNameResolver::CoveringNameIndices(uint64_t dest_addr,
+                                                          size_t length) const {
+    if (names_.empty()) {
+        return {};
+    }
+    if (names_.size() == 1) {
+        return {0};
+    }
+    std::set<size_t> found;
+    for (const auto& range : ranges_) {
+        if (RangeCovers(range.begin, range.length, dest_addr, length) &&
+            range.name_idx < names_.size()) {
+            found.insert(range.name_idx);
+        }
+    }
+    return {found.begin(), found.end()};
+}
+
+const std::string& HixlNameResolver::NameAt(size_t index) const {
+    if (index >= names_.size()) {
+        return empty_;
+    }
+    return names_[index];
 }
 
 const std::string& HixlNameResolver::Resolve(uint64_t dest_addr) const {

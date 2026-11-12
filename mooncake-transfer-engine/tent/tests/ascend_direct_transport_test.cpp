@@ -50,6 +50,7 @@ namespace {
 thread_local int g_device_id = 0;
 thread_local aclrtContext g_context = reinterpret_cast<aclrtContext>(0x10000);
 int g_device_count = 1;
+std::map<int32_t, int32_t> g_physical_by_logic;
 // False stands for a thread that never bound a context, which is what the
 // signal handling thread looks like when it tears the client down.
 bool g_context_bound = true;
@@ -87,6 +88,7 @@ int DeviceForContext(aclrtContext context) {
 void ResetAcl() {
     g_device_id = 0;
     g_device_count = 1;
+    g_physical_by_logic.clear();
     g_context_bound = true;
     g_context = ContextForDevice(0);
     g_pointer_location_type = ACL_MEM_LOCATION_TYPE_HOST;
@@ -231,7 +233,9 @@ const char* aclGetRecentErrMsg() { return "mock acl error message"; }
 
 aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
                                       int32_t* physical_dev_id) {
-    *physical_dev_id = logic_dev_id;
+    const auto it = g_physical_by_logic.find(logic_dev_id);
+    *physical_dev_id =
+        it == g_physical_by_logic.end() ? logic_dev_id : it->second;
     return ACL_ERROR_NONE;
 }
 
@@ -262,6 +266,9 @@ const char* kEnvKeys[] = {
     "HCCL_RDMA_SL",
     "HCCL_INTRA_ROCE_ENABLE",
     "ASCEND_BASE_PORT",
+    "ASCEND_STANDALONE_SINGLE_SEGMENT",
+    "ASCEND_BUFFER_POOL",
+    "ASCEND_USE_SHMEM",
 };
 
 void ClearAscendEnv() {
@@ -285,6 +292,7 @@ struct MockHixlState {
     int max_concurrent_transfer = 0;
     bool fail_next_transfer = false;
     int fail_register_on = -1;
+    int fail_deregister_on = -1;
     // How long TransferAsync stays inside HIXL before returning a handle. The
     // queued-timeout and concurrency tests change it; 5 ms is the historical
     // value the other tests were written against.
@@ -345,6 +353,9 @@ class MockHixlVendor final : public HixlEngine::Vendor {
         (void)handle;
         std::lock_guard<std::mutex> lock(state_->mu);
         state_->deregister_calls++;
+        if (state_->fail_deregister_on == state_->deregister_calls) {
+            return 1;
+        }
         return kHixlOk;
     }
 
@@ -1673,6 +1684,240 @@ TEST_F(AscendDirectTransportTest, AddMemoryBufferPublishesSharedHandle) {
     unsetenv("ASCEND_USE_SHMEM");
 }
 #endif  // TENT_HAS_ASCEND_ALLOCATOR
+
+TEST_F(AscendDirectTransportTest, SingleSegmentRegistersEveryVisibleEngine) {
+    g_device_count = 4;
+    g_device_id = 0;
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/agent_mode", true);
+    ASSERT_TRUE(Install(conf).ok());
+    std::vector<BufferDesc> buffers(1);
+    buffers[0].addr = 0x51000;
+    buffers[0].length = 4096;
+    buffers[0].location = "*";
+    buffers[0].ref_count = 1;
+    MemoryOptions options{};
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, options).ok());
+    EXPECT_EQ(state_->register_calls, 4);
+    ASSERT_EQ(buffers.size(), 4u);
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        EXPECT_EQ(buffers[i].addr, 0x51000u);
+        EXPECT_EQ(buffers[i].length, 4096u);
+        EXPECT_EQ(buffers[i].location, "*");
+        EXPECT_EQ(buffers[i].transport_attrs[AscendDirect], std::to_string(i));
+    }
+    ASSERT_TRUE(transport_->removeMemoryBuffer(buffers[0]).ok());
+    EXPECT_EQ(state_->deregister_calls, 4);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentLocalBuffersStayOnOneEngine) {
+    g_device_count = 4;
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/agent_mode", true);
+    ASSERT_TRUE(Install(conf).ok());
+    std::vector<BufferDesc> buffers(1);
+    buffers[0].addr = 0x52000;
+    buffers[0].length = 4096;
+    buffers[0].location = "*";
+    MemoryOptions options{};
+    options.perm = kLocalReadWrite;
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, options).ok());
+    EXPECT_EQ(state_->register_calls, 1);
+    ASSERT_EQ(buffers.size(), 1u);
+    EXPECT_EQ(buffers[0].location, "*");
+    EXPECT_EQ(buffers[0].transport_attrs[AscendDirect], "0");
+    ASSERT_TRUE(transport_->removeMemoryBuffer(buffers[0]).ok());
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentPartialRegisterRollsBack) {
+    g_device_count = 4;
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/agent_mode", true);
+    ASSERT_TRUE(Install(conf).ok());
+    state_->fail_register_on = 3;
+    std::vector<BufferDesc> buffers(1);
+    buffers[0].addr = 0x53000;
+    buffers[0].length = 4096;
+    buffers[0].location = "*";
+    EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_calls, 3);
+    EXPECT_EQ(state_->deregister_calls, 2);
+    EXPECT_EQ(buffers.size(), 1u);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentDeregisterRetriesFailedEngine) {
+    g_device_count = 4;
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/agent_mode", true);
+    ASSERT_TRUE(Install(conf).ok());
+    std::vector<BufferDesc> buffers(1);
+    buffers[0].addr = 0x54000;
+    buffers[0].length = 4096;
+    buffers[0].location = "*";
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    state_->fail_deregister_on = 2;
+    EXPECT_FALSE(transport_->removeMemoryBuffer(buffers[0]).ok());
+    EXPECT_TRUE(transport_->removeMemoryBuffer(buffers[0]).ok());
+    EXPECT_EQ(state_->deregister_calls, 5);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentOffKeepsOneEngine) {
+    g_device_count = 4;
+    g_device_id = 0;
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/agent_mode", true);
+    ASSERT_TRUE(Install(conf).ok());
+    std::vector<BufferDesc> buffers(1);
+    buffers[0].addr = 0x56000;
+    buffers[0].length = 4096;
+    buffers[0].location = "*";
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_calls, 1);
+    EXPECT_EQ(buffers.size(), 1u);
+    EXPECT_EQ(buffers[0].transport_attrs[AscendDirect], "0");
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentRequiresAgentMode) {
+    g_device_count = 4;
+    g_device_id = 1;
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    ASSERT_TRUE(Install().ok());
+    std::vector<BufferDesc> buffers(1);
+    buffers[0].addr = 0x56100;
+    buffers[0].length = 4096;
+    buffers[0].location = "*";
+    ASSERT_TRUE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    EXPECT_EQ(state_->register_calls, 1);
+    EXPECT_EQ(buffers.size(), 1u);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentRejectsBufferPool) {
+    g_device_count = 2;
+    setenv("ASCEND_STANDALONE_SINGLE_SEGMENT", "1", 1);
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/ascend_direct/agent_mode", true);
+    ASSERT_TRUE(Install(conf).ok());
+    setenv("ASCEND_BUFFER_POOL", "4:8", 1);
+    std::vector<BufferDesc> buffers(1);
+    buffers[0].addr = 0x55000;
+    buffers[0].length = 4096;
+    buffers[0].location = "*";
+    EXPECT_FALSE(transport_->addMemoryBuffer(buffers, MemoryOptions{}).ok());
+    unsetenv("ASCEND_BUFFER_POOL");
+    EXPECT_EQ(state_->register_calls, 0);
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentRoutesLikeClassic) {
+    const uint64_t dest = 0x60000;
+    const std::map<uint32_t, std::vector<uint32_t>> expected = {
+        {8, {7, 6, 5, 4, 3, 2, 1, 0}},
+        {4, {3, 3, 2, 2, 1, 1, 0, 0}},
+        {2, {1, 1, 1, 1, 0, 0, 0, 0}},
+        {1, {0, 0, 0, 0, 0, 0, 0, 0}}};
+    for (const auto& [servers, indices] : expected) {
+        for (uint32_t rank = 0; rank < 8; ++rank) {
+            SCOPED_TRACE(::testing::Message()
+                         << "servers=" << servers << " rank=" << rank);
+            if (transport_) {
+                (void)transport_->uninstall();
+            }
+            transport_ = std::make_unique<AscendDirectTransport>();
+            g_device_count = 8;
+            g_physical_by_logic.clear();
+            g_device_id = static_cast<int>(rank);
+            ASSERT_TRUE(Install().ok());
+            std::vector<std::string> names;
+            for (uint32_t i = 0; i < servers; ++i) {
+                names.push_back("remote-" + std::to_string(i));
+            }
+            ASSERT_TRUE(metadata_->segmentManager()
+                            .updateLocal([&](SegmentDesc& segment) {
+                                auto& mem =
+                                    std::get<MemorySegmentDesc>(segment.detail);
+                                std::string published = "[";
+                                for (size_t i = 0; i < names.size(); ++i) {
+                                    if (i != 0) published += ",";
+                                    published += "\"" + names[i] + "\"";
+                                }
+                                published += "]";
+                                mem.device_attrs[kHixlNamesAttr] = published;
+                                mem.buffers.clear();
+                                for (uint32_t i = 0; i < servers; ++i) {
+                                    BufferDesc buffer{};
+                                    buffer.addr = dest;
+                                    buffer.length = 8192;
+                                    buffer.location = "*";
+                                    buffer.transport_attrs[AscendDirect] =
+                                        std::to_string(i);
+                                    mem.buffers.push_back(buffer);
+                                }
+                                // A duplicate record must not change the
+                                // choice.
+                                mem.buffers.push_back(mem.buffers.front());
+                                return Status::OK();
+                            })
+                            .ok());
+            const uint32_t selected = indices[rank];
+            ASSERT_TRUE(transport_->allocateSubBatch(batch_, 4).ok());
+            char src[16]{};
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                auto request = MakeRemoteWrite(src, 16, dest);
+                if (repeat == 1) request.opcode = Request::READ;
+                ASSERT_TRUE(
+                    transport_->submitTransferTasks(batch_, {request}).ok());
+                WaitUntilTerminal(*transport_, batch_, repeat);
+                TransferStatus status{};
+                ASSERT_TRUE(
+                    transport_->getTransferStatus(batch_, repeat, status).ok());
+                ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+                EXPECT_EQ(state_->last_remote, names[selected]);
+            }
+            ASSERT_TRUE(transport_->freeSubBatch(batch_).ok());
+            batch_ = nullptr;
+        }
+    }
+}
+
+TEST_F(AscendDirectTransportTest, SingleSegmentUsesSparseAclRank) {
+    g_device_count = 4;
+    g_physical_by_logic = {{0, 4}, {1, 6}, {2, 9}, {3, 11}};
+    g_device_id = 1;
+    ASSERT_TRUE(Install().ok());
+    ASSERT_TRUE(metadata_->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        auto& mem = std::get<MemorySegmentDesc>(segment.detail);
+                        mem.device_attrs[kHixlNamesAttr] =
+                            std::string("[\"phy-4\",\"phy-7\"]");
+                        mem.buffers.clear();
+                        for (int index : {0, 1}) {
+                            BufferDesc buffer{};
+                            buffer.addr = 0x70000;
+                            buffer.length = 4096;
+                            buffer.transport_attrs[AscendDirect] =
+                                std::to_string(index);
+                            mem.buffers.push_back(buffer);
+                        }
+                        return Status::OK();
+                    })
+                    .ok());
+    ASSERT_TRUE(transport_->allocateSubBatch(batch_, 2).ok());
+    char src[16]{};
+    ASSERT_TRUE(
+        transport_
+            ->submitTransferTasks(batch_, {MakeRemoteWrite(src, 16, 0x70000)})
+            .ok());
+    WaitUntilTerminal(*transport_, batch_, 0);
+    TransferStatus status{};
+    ASSERT_TRUE(transport_->getTransferStatus(batch_, 0, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    // Physical 6 is rank 1 of [4,6,9,11], so two candidates select index 1.
+    EXPECT_EQ(state_->last_remote, "phy-7");
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

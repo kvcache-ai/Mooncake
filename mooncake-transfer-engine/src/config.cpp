@@ -113,6 +113,10 @@ static bool peerMemoryModuleLoaded() {
 }
 
 void loadGlobalConfig(GlobalConfig& config) {
+    if (const char* value = std::getenv("ASCEND_STANDALONE_SINGLE_SEGMENT")) {
+        parseBoolConfigEnv(value, "ASCEND_STANDALONE_SINGLE_SEGMENT",
+                           config.ascend_standalone_single_segment);
+    }
     // Without a peer-memory module, ibv_reg_mr() fails with EFAULT at the
     // first GPU buffer, so the dma_buf export is the default there;
     // WITH_NVIDIA_PEERMEM below still decides when set.

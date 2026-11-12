@@ -39,8 +39,10 @@ std::atomic<uint32_t> g_agent_alloc_next{0};
 // without the TE either sets runtime flags or relies on the env default.
 constexpr int kRuntimeAgentMode = 1 << 0;
 constexpr int kRuntimeFabricMem = 1 << 1;
+constexpr int kRuntimeSingleSegment = 1 << 2;
 std::atomic<AscendConfigBoolFn> g_agent_mode_provider{nullptr};
 std::atomic<AscendConfigBoolFn> g_use_fabric_mem_provider{nullptr};
+std::atomic<AscendConfigBoolFn> g_single_segment_provider{nullptr};
 std::atomic<int> g_runtime_flags{-1};
 
 bool AgentModeEnabled() {
@@ -69,6 +71,23 @@ bool FabricMemEnabled() {
     // Classic store semantics: the variable being set enables fabric memory,
     // whatever its value is.
     return std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM") != nullptr;
+}
+
+std::optional<bool> ParseBoolValue(const char* value);
+
+bool SingleSegmentEnabled() {
+    AscendConfigBoolFn provider =
+        g_single_segment_provider.load(std::memory_order_acquire);
+    if (provider != nullptr) {
+        return provider();
+    }
+    const int flags = g_runtime_flags.load(std::memory_order_acquire);
+    if (flags >= 0) {
+        return (flags & kRuntimeSingleSegment) != 0;
+    }
+    const auto parsed =
+        ParseBoolValue(std::getenv("ASCEND_STANDALONE_SINGLE_SEGMENT"));
+    return parsed.value_or(false);
 }
 
 // Small self-contained bool parser (the classic bool_parser.h dependency is a
@@ -813,7 +832,12 @@ void ascend_allocator_set_config_provider(AscendConfigBoolFn agent_mode,
     g_use_fabric_mem_provider.store(use_fabric_mem, std::memory_order_release);
 }
 
-void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem) {
+void ascend_allocator_set_single_segment_provider(AscendConfigBoolFn fn) {
+    g_single_segment_provider.store(fn, std::memory_order_release);
+}
+
+void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem,
+                                        bool single_segment) {
     int flags = 0;
     if (agent_mode) {
         flags |= kRuntimeAgentMode;
@@ -821,7 +845,23 @@ void ascend_allocator_set_runtime_flags(bool agent_mode, bool use_fabric_mem) {
     if (use_fabric_mem) {
         flags |= kRuntimeFabricMem;
     }
+    if (single_segment) {
+        flags |= kRuntimeSingleSegment;
+    }
     g_runtime_flags.store(flags, std::memory_order_release);
+}
+
+size_t ascend_agent_mode_store_chunk_cap(size_t total_size) {
+    if (SingleSegmentEnabled()) {
+        LOG(INFO) << "Standalone single-segment mode: " << total_size
+                  << " bytes shared by all local NPU engines";
+        return 0;
+    }
+    const uint32_t n = ContextManager::getInstance().getDeviceCount();
+    if (n <= 1 || total_size == 0) {
+        return 0;
+    }
+    return total_size / n;
 }
 
 }  // namespace mooncake

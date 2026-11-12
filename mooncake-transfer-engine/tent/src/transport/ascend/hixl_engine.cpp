@@ -299,13 +299,13 @@ Status HixlEngine::deregisterMem(void* addr) {
     // deregisters at teardown after quiesce(), and a runtime
     // removeMemoryBuffer() is the caller's contract.
     auto status = vendor_->DeregisterMem(it->second);
-    addr_to_handle_.erase(it);
     if (status != kHixlOk) {
         LOG(ERROR) << "DeregisterMem failed for " << addr
                    << ", status: " << status
                    << ", errmsg: " << aclGetRecentErrMsg();
         return Status::InternalError("Deregister failed" LOC_MARK);
     }
+    addr_to_handle_.erase(it);
     return Status::OK();
 }
 
