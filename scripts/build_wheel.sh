@@ -13,7 +13,13 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # CMake build directory (default: build). EP and PG device extensions share
 # the existing staging directory and are selected from the CMake cache below.
 BUILD_DIR="${BUILD_DIR:-build}"
-BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+BUILD_DIR_ABS="$(cd "$BUILD_DIR" && pwd)"
+# Release wheels expose mooncake.conductor in every supported variant. Fail
+# before touching staging files if the native API was not built.
+if ! compgen -G "${BUILD_DIR}/mooncake-integration/_conductor.*.so" >/dev/null; then
+    echo "Error: missing _conductor extension; configure with -DWITH_CONDUCTOR=ON and build it" >&2
+    exit 1
+fi
 INCLUDE_STORE_RS="${INCLUDE_STORE_RS:-0}"
 BUILD_ROOT="$(pwd)"
 CMAKE_CACHE="${BUILD_DIR_ABS}/CMakeCache.txt"
@@ -152,6 +158,15 @@ else
     echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
 fi
 
+# Copy _conductor.so to mooncake directory (client API for mooncake.conductor)
+if compgen -G "${BUILD_DIR}/mooncake-integration/_conductor.*.so" >/dev/null; then
+    echo "Copying _conductor.so..."
+    cp ${BUILD_DIR}/mooncake-integration/_conductor.*.so mooncake-wheel/mooncake/
+else
+    echo "Error: required _conductor extension disappeared during staging" >&2
+    exit 1
+fi
+
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
 if [ -f ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
@@ -238,6 +253,15 @@ cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-
 # libraries remain in post-repair staging so patchelf never touches CUDA fatbins.
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
+# Preserve the Conductor server and its build-local runtime dependency before
+# CI deletes build/. These files are only for the E2E server, not wheel contents.
+CONDUCTOR_SMOKE_DIR=$(mktemp -d)
+cleanup_conductor_smoke() {
+    rm -rf "$CONDUCTOR_SMOKE_DIR"
+}
+trap cleanup_conductor_smoke EXIT
+cp "${BUILD_DIR_ABS}/mooncake-conductor/mooncake_conductor" "$CONDUCTOR_SMOKE_DIR/"
+cp "${BUILD_DIR_ABS}/mooncake-common/libasio.so" "$CONDUCTOR_SMOKE_DIR/"
 # Kernel header tree the CUDA EP JIT compiles against at runtime.
 CUDA_EP_JIT_DIR="${BUILD_DIR_ABS}/mooncake_ep_jit"
 
@@ -327,6 +351,7 @@ MIGRATED_PYTHON_MODULES=(
     cli.py
     cli_bench.py
     cli_client.py
+    conductor.py
     transfer_engine_topology_dump.py
     buffer_pool.py
     mooncake_config.py
@@ -362,7 +387,7 @@ cleanup_migrated_python_staging() {
     rm -rf "${STORE_FACADE_STAGING_DIR}"
     rm -rf "${RESHARD_STAGING_DIR}"
 }
-trap cleanup_migrated_python_staging EXIT
+trap 'cleanup_migrated_python_staging; cleanup_conductor_smoke' EXIT
 cleanup_migrated_python_staging
 if [ "$WITH_PG_BUILD" != "1" ] && [ -f "$PG_MODULE_SOURCE" ]; then
     PG_MODULE_BACKUP=$(mktemp)
@@ -391,6 +416,7 @@ cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
     cleanup_migrated_python_staging
+    cleanup_conductor_smoke
 }
 trap cleanup_wheel_metadata_state EXIT
 
@@ -897,6 +923,12 @@ for wheel in "${wheels[@]}"; do
     fi
 done
 
+WHEEL_OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 cd ..
+
+# Validate the final repaired artifact, not the build tree.
+CONDUCTOR_SERVER_LD_LIBRARY_PATH="${CONDUCTOR_SMOKE_DIR}:${LD_LIBRARY_PATH}" \
+    python${PYTHON_VERSION} scripts/smoke_conductor_wheel.py "${WHEEL_OUTPUT_DIR}"/*.whl \
+    --server "${CONDUCTOR_SMOKE_DIR}/mooncake_conductor"
 
 echo "Wheel package built and repaired successfully!"

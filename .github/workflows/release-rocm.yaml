@@ -145,7 +145,7 @@ jobs:
           export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
           rm -rf build && mkdir build && cd build
           cmake -G Ninja .. \
-            -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+            -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DWITH_CONDUCTOR=ON \
             -DENABLE_MULTI_PROTOCOL=ON \
             -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
             -DBUILD_UNIT_TESTS=OFF -DENABLE_DEBUG_SYMBOLS=OFF \

@@ -68,10 +68,14 @@ if ! grep -q '^USE_REDIS:BOOL=ON$' "${BUILD_DIR_ABS}/CMakeCache.txt"; then
     echo "Store-RS Classic TE requires -DUSE_REDIS=ON for Redis transport metadata: ${BUILD_DIR_ABS}" >&2
     exit 1
 fi
+if ! grep -q '^WITH_CONDUCTOR:BOOL=ON$' "${BUILD_DIR_ABS}/CMakeCache.txt"; then
+    echo "Store-RS wheel requires -DWITH_CONDUCTOR=ON for Conductor packaging and smoke tests: ${BUILD_DIR_ABS}" >&2
+    exit 1
+fi
 
 cmake --build "${BUILD_DIR_ABS}" --target \
     engine store transfer_engine mooncake_store \
-    mooncake_master mooncake_client build_store_rs \
+    mooncake_master mooncake_client build_store_rs _conductor mooncake_conductor \
     --parallel "${BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
 
 CLASSIC_TE_SHARED_LIB="${BUILD_DIR_ABS}/mooncake-transfer-engine/src/libtransfer_engine.so"
