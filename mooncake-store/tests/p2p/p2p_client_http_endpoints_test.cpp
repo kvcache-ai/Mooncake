@@ -36,16 +36,18 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
    protected:
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port, uint16_t http_port) {
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
-            /*local_buffer_size=*/0, nullptr, "", rpc_port,
-            /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
-            /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
-            /*route_cache_ttl_ms=*/60 * 1000,
-            /*local_transfer_mode=*/"te",
-            /*local_io_worker_num=*/32, http_port,
-            /*enable_http_server=*/true);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
+                R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
+                /*local_buffer_size=*/0, nullptr, "", rpc_port,
+                /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
+                /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
+                /*route_cache_ttl_ms=*/60 * 1000,
+                /*local_transfer_mode=*/"te",
+                /*local_io_worker_num=*/32, http_port,
+                /*enable_http_server=*/true)
+                .value();
 
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.http_port,
@@ -357,10 +359,12 @@ TEST_F(P2PClientHttpEndpointsTest, DisabledMetricsPreserveErrors) {
 
 TEST_F(P2PClientHttpEndpointsTest, LocalStartupCanJoinThroughHttp) {
     for (size_t senders : {0u, 1u}) {
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            "localhost:" + std::to_string(getFreeTcpPort()), "P2PHANDSHAKE",
-            "tcp", std::nullopt, master_address_,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})");
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                "localhost:" + std::to_string(getFreeTcpPort()), "P2PHANDSHAKE",
+                "tcp", std::nullopt, master_address_,
+                R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})")
+                .value();
         config.start_local_only = true;
         config.client_rpc_port = 0;
         config.http_port = 0;

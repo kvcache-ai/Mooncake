@@ -255,9 +255,8 @@ static constexpr int64_t DEFAULT_DUMMY_CLIENT_LIVE_TTL_SEC = 30;  // in seconds
  *        dummy ping RPC.
  */
 enum class DummyClientStatus {
-    HEALTH = 0,     // Normal operation
-    DISCONNECTION,  // RealClient dropped this client's shm; dummy must
-                    // re-register
+    HEALTH = 0,     // RealClient is initialized and serving.
+    DISCONNECTION,  // RealClient service is unavailable.
 };
 
 /**

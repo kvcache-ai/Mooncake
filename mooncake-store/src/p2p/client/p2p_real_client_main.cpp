@@ -135,14 +135,22 @@ int main(int argc, char* argv[]) {
         static_cast<size_t>(FLAGS_te_async_poll_worker_num),
         FLAGS_p2p_start_local_only,
         static_cast<size_t>(FLAGS_business_coro_worker_num));
+    if (!config) {
+        LOG(ERROR) << "Failed to build P2P client config: " << config.error();
+        return -1;
+    }
 
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(
-        config, /*enable_dummy_service=*/true, FLAGS_threads, FLAGS_port);
+        *config, /*enable_dummy_service=*/true, FLAGS_threads, FLAGS_port);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
     }
 
-    return client_inst->wait_dummy_rpc_server();
+    auto result = client_inst->wait_dummy_rpc_server();
+    if (result != 0) {
+        LOG(ERROR) << "P2P client RPC service failed: " << result;
+    }
+    return result;
 }

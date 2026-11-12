@@ -93,6 +93,12 @@ Client::Client(const std::string& local_hostname,
 
 Client::~Client() { Stop(); }
 
+DummyClientStatus Client::GetServiceStatus() const {
+    return last_ping_success_.load(std::memory_order_acquire)
+               ? DummyClientStatus::HEALTH
+               : DummyClientStatus::DISCONNECTION;
+}
+
 void Client::Stop() {
     if (!local_inflight_tracker_.Close()) {
         return;
@@ -166,6 +172,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         // Start ping thread to monitor master health and trigger remount if
         // needed.
+        last_ping_success_.store(true, std::memory_order_release);
         ping_running_ = true;
         bool is_ha_mode = true;
         std::string current_master_address = master_address;
@@ -181,6 +188,7 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return err;
         }
         // Non-HA mode also enables heartbeat/ping
+        last_ping_success_.store(true, std::memory_order_release);
         ping_running_ = true;
         bool is_ha_mode = false;
         std::string current_master_address = master_server_entry;
@@ -1790,6 +1798,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         // Ping master
         auto ping_result = master_client_.Ping();
         if (ping_result) {
+            last_ping_success_.store(true, std::memory_order_release);
             // Reset ping failure count
             ping_fail_count = 0;
             auto& ping_response = ping_result.value();
@@ -1804,6 +1813,7 @@ void Client::PingThreadMain(bool is_ha_mode,
             continue;
         }
 
+        last_ping_success_.store(false, std::memory_order_release);
         ping_fail_count++;
         if (ping_fail_count < max_ping_fail_count) {
             LOG(ERROR) << "Failed to ping master";
@@ -1839,6 +1849,7 @@ void Client::PingThreadMain(bool is_ha_mode,
             }
 
             current_master_address = master_address;
+            last_ping_success_.store(true, std::memory_order_release);
             LOG(INFO) << "Reconnected to master " << master_address;
             ping_fail_count = 0;
         } else {
@@ -1853,6 +1864,7 @@ void Client::PingThreadMain(bool is_ha_mode,
                     std::chrono::milliseconds(fail_ping_interval_ms));
                 continue;
             }
+            last_ping_success_.store(true, std::memory_order_release);
             LOG(INFO) << "Reconnected to master " << current_master_address;
             ping_fail_count = 0;
         }

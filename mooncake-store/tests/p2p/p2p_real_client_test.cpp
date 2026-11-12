@@ -42,12 +42,14 @@ class P2PRealClientTest : public ::testing::Test {
         ASSERT_EQ(observer.Connect(master_.master_address()), ErrorCode::OK);
 
         for (size_t i = 0; i < count; ++i) {
-            auto config = P2PClientConfigBuilder::build_p2p_real_client(
-                host, "P2PHANDSHAKE", "tcp", std::nullopt,
-                master_.master_address(),
-                R"({"tiers":[{"type":"DRAM","capacity":67108864,"priority":100}]})",
-                /*local_buffer_size=*/16 * 1024 * 1024, nullptr, "",
-                /*client_rpc_port=*/0);
+            auto config =
+                P2PClientConfigBuilder::build_p2p_real_client(
+                    host, "P2PHANDSHAKE", "tcp", std::nullopt,
+                    master_.master_address(),
+                    R"({"tiers":[{"type":"DRAM","capacity":67108864,"priority":100}]})",
+                    /*local_buffer_size=*/16 * 1024 * 1024, nullptr, "",
+                    /*client_rpc_port=*/0)
+                    .value();
             config.enable_http_server = false;
             config.enable_metric_collection = false;
             config.async_sender_thread_count = 0;

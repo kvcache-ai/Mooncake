@@ -45,15 +45,24 @@ int main(int argc, char* argv[]) {
         FLAGS_master_server_address, global_segment_size, local_buffer_size,
         nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
         FLAGS_enable_offload);
-    config.client_rpc_port = static_cast<uint16_t>(FLAGS_client_rpc_port);
+    if (!config) {
+        LOG(ERROR) << "Failed to build centralized client config: "
+                   << config.error();
+        return -1;
+    }
+    config->client_rpc_port = static_cast<uint16_t>(FLAGS_client_rpc_port);
 
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(
-        config, /*enable_dummy_service=*/true, FLAGS_threads, FLAGS_port);
+        *config, /*enable_dummy_service=*/true, FLAGS_threads, FLAGS_port);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
     }
 
-    return client_inst->wait_dummy_rpc_server();
+    auto result = client_inst->wait_dummy_rpc_server();
+    if (result != 0) {
+        LOG(ERROR) << "Centralized client RPC service failed: " << result;
+    }
+    return result;
 }

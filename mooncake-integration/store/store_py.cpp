@@ -992,6 +992,9 @@ void BindCommonMethods(py::module_& m, StoreBinding& store) {
                     "@mooncake_client_" + std::to_string(port) + ".sock");
                 auto ret = dummy_client->setup(config);
                 self.store_ = dummy_client;
+                if (ret != 0) {
+                    LOG(ERROR) << "Dummy setup failed: " << ret;
+                }
                 return ret;
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
@@ -1587,6 +1590,7 @@ void BindP2PMethods(StoreBinding& store) {
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
 
+                py::gil_scoped_release release;
                 auto config = P2PClientConfigBuilder::build_p2p_real_client(
                     local_hostname, metadata_server, protocol,
                     rdma_devices.empty()
@@ -1606,8 +1610,16 @@ void BindP2PMethods(StoreBinding& store) {
                     te_async_poll_worker_num, start_local_only,
                     business_coro_worker_num);
 
-                auto ret = real_client->setup(config);
-                return ret;
+                if (!config) {
+                    LOG(ERROR) << "Store setup configuration failed: "
+                               << config.error();
+                    return to_py_ret(config.error());
+                }
+                auto result = real_client->setup(*config);
+                if (result != 0) {
+                    LOG(ERROR) << "Store native setup failed: " << result;
+                }
+                return result;
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("tiered_backend_config_json"), py::arg("local_buffer_size"),
@@ -1639,6 +1651,7 @@ void BindP2PMethods(StoreBinding& store) {
         .def(
             "setup_p2p_real_client",
             [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {
+                auto real_client = self.init_real_client();
                 ConfigDict config;
                 for (auto item : config_dict) {
                     std::string key = py::str(item.first);
@@ -1646,11 +1659,19 @@ void BindP2PMethods(StoreBinding& store) {
                     config[key] = value;
                 }
 
+                py::gil_scoped_release release;
                 auto p2p_config =
                     P2PClientConfigBuilder::build_p2p_real_client(config);
-                auto real_client = self.init_real_client();
-                auto ret = real_client->setup(p2p_config);
-                return ret;
+                if (!p2p_config) {
+                    LOG(ERROR) << "P2P setup configuration failed: "
+                               << p2p_config.error();
+                    return to_py_ret(p2p_config.error());
+                }
+                auto result = real_client->setup(*p2p_config);
+                if (result != 0) {
+                    LOG(ERROR) << "Store native setup failed: " << result;
+                }
+                return result;
             },
             py::arg("config"),
             "Setup the store in P2P mode with a configuration dictionary.\n"
@@ -1688,6 +1709,26 @@ void BindP2PMethods(StoreBinding& store) {
             "2000).\n"
             "  async_route_queue_size: Async route queue size (default 0).\n"
             "  ipc_socket_path: IPC socket path.\n"
+            "  http_port: Native client HTTP port (default 9003).\n"
+            "  enable_http_server: Enable native client HTTP (default true).\n"
+            "  p2p_key_lease_duration_ms: Key lease duration (default 5000; "
+            "0 uses the built-in default).\n"
+            "  p2p_key_lease_scan_interval_ms: Lease scan interval (default "
+            "1000; 0 uses the built-in default).\n"
+            "  p2p_transfer_direction_mode: 'reverse' or 'forward' "
+            "(default 'reverse').\n"
+            "  runtime_config: JSON text or path; empty uses "
+            "MC_RUNTIME_CONFIG.\n"
+            "  enable_metric_collection: Collect client metrics (default "
+            "true).\n"
+            "  metric_report_interval_seconds: Report interval (default 60; "
+            "0 disables periodic reporting).\n"
+            "  redis_cluster_id: Redis discovery cluster ID.\n"
+            "  redis_username / redis_password: Redis authentication.\n"
+            "  redis_db_index: Redis database index (default 0).\n"
+            "  redis_master_view_ttl_sec: Master view TTL (default 4).\n"
+            "  redis_heartbeat_interval_sec: Redis heartbeat interval "
+            "(default 1).\n"
             "  heartbeat_rpc_port: Dedicated heartbeat RPC port on the master "
             "(0 uses the main RPC port, default 0).");
 }
@@ -1803,6 +1844,7 @@ void BindCentralizedMethods(StoreBinding& store) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
+                py::gil_scoped_release release;
                 auto config = CentralizedClientConfigBuilder::
                     build_centralized_real_client(
                         local_hostname, metadata_server, protocol,
@@ -1813,8 +1855,16 @@ void BindCentralizedMethods(StoreBinding& store) {
                         local_buffer_size, transfer_engine, "", enable_offload,
                         {}, client_rpc_port);
 
-                auto ret = real_client->setup(config);
-                return ret;
+                if (!config) {
+                    LOG(ERROR) << "Store setup configuration failed: "
+                               << config.error();
+                    return to_py_ret(config.error());
+                }
+                auto result = real_client->setup(*config);
+                if (result != 0) {
+                    LOG(ERROR) << "Store native setup failed: " << result;
+                }
+                return result;
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -1834,18 +1884,29 @@ void BindCentralizedMethods(StoreBinding& store) {
                     config[key] = value;
                 }
 
+                py::gil_scoped_release release;
                 auto centralized_config = CentralizedClientConfigBuilder::
                     build_centralized_real_client(config);
-                auto ret = real_client->setup(centralized_config);
-                return ret;
+                if (!centralized_config) {
+                    LOG(ERROR) << "Centralized setup configuration failed: "
+                               << centralized_config.error();
+                    return to_py_ret(centralized_config.error());
+                }
+                auto result = real_client->setup(*centralized_config);
+                if (result != 0) {
+                    LOG(ERROR) << "Store native setup failed: " << result;
+                }
+                return result;
             },
             py::arg("config"),
             "Setup the store with a configuration dictionary.\n"
             "Supported keys:\n"
             "  local_hostname (required): Local hostname.\n"
             "  metadata_server (required): Metadata server address.\n"
-            "  global_segment_size: Global segment size (default 16MB).\n"
-            "  local_buffer_size: Local buffer size (default 16MB).\n"
+            "  global_segment_size: Bytes or capacity text (default 16MB); "
+            "0 or at least 1KB.\n"
+            "  local_buffer_size: Bytes or capacity text (default 16MB); "
+            "0 or between 1KB and 1TB. Invalid sizes return INVALID_PARAMS.\n"
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
             "  master_server_addr: Master server address.\n"

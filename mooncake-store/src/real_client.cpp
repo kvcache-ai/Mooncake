@@ -1534,21 +1534,18 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
 tl::expected<DummyHeartbeatResponse, ErrorCode> RealClient::ping(
     const UUID& client_id) {
     const auto state = state_.load(std::memory_order_acquire);
-    if (state == State::CLOSING || state == State::CLOSED) {
-        LOG(ERROR) << "ping failed, error=" << ErrorCode::SHUTTING_DOWN;
-        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+    if (state != State::READY) {
+        const auto error = state == State::CLOSING || state == State::CLOSED
+                               ? ErrorCode::SHUTTING_DOWN
+                               : ErrorCode::INTERNAL_ERROR;
+        LOG(ERROR) << "ping failed: RealClient is not ready, error=" << error;
+        return tl::unexpected(error);
     }
     DummyHeartbeatResponse resp;
     auto context = find_shm_context(client_id);
-    if (!context) {
-        resp.status = DummyClientStatus::DISCONNECTION;
-        resp.mapped_shm_count = 0;
-        LOG(WARNING) << "receive heartbeat from a disconnected client"
-                     << ", client_id=" << client_id;
-        return resp;
-    }
-    resp.status = DummyClientStatus::HEALTH;
-    {
+    resp.status = client_service_->GetServiceStatus();
+
+    if (context) {
         SharedMutexLocker lock(&context->mutex_, shared_lock);
         resp.mapped_shm_count = context->mapped_shms_.size();
     }

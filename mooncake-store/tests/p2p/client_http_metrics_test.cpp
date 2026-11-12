@@ -48,11 +48,13 @@ class ClientHttpMetricsTest : public ::testing::Test {
             LOG(ERROR) << "Failed to start metrics-test P2P master";
             return false;
         }
-        auto config = P2PClientConfigBuilder::build_p2p_real_client(
-            "127.0.0.1", "P2PHANDSHAKE", "tcp", std::nullopt,
-            p2p_master_->master_address(),
-            R"({"tiers":[{"type":"DRAM","capacity":1048576,"priority":100}]})",
-            1048576, nullptr, "", /*client_rpc_port=*/0);
+        auto config =
+            P2PClientConfigBuilder::build_p2p_real_client(
+                "127.0.0.1", "P2PHANDSHAKE", "tcp", std::nullopt,
+                p2p_master_->master_address(),
+                R"({"tiers":[{"type":"DRAM","capacity":1048576,"priority":100}]})",
+                1048576, nullptr, "", /*client_rpc_port=*/0)
+                .value();
         config.http_port = 0;
         config.labels = labels;
         config.metric_report_interval_seconds = 0;
@@ -84,24 +86,29 @@ class ClientHttpMetricsTest : public ::testing::Test {
 // Test config builder with metrics settings
 TEST_F(ClientHttpMetricsTest, ConfigBuilderMetricsSettings) {
     // Test P2P config with default metrics settings
-    auto p2p_config = P2PClientConfigBuilder::build_p2p_real_client(
-        "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
-        "127.0.0.1:50051",
-        R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})");
+    auto p2p_config =
+        P2PClientConfigBuilder::build_p2p_real_client(
+            "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
+            "127.0.0.1:50051",
+            R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})")
+            .value();
 
     EXPECT_EQ(p2p_config.http_port, 9003);
     EXPECT_TRUE(p2p_config.enable_http_server);
 
     // Test P2P config with custom metrics settings
-    auto p2p_config_custom = P2PClientConfigBuilder::build_p2p_real_client(
-        "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
-        "127.0.0.1:50051",
-        R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
-        nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32,
-        9005,   // http_port
-        false,  // enable_http_server
-        {}      // labels
-    );
+    auto p2p_config_custom =
+        P2PClientConfigBuilder::build_p2p_real_client(
+            "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
+            "127.0.0.1:50051",
+            R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
+            nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te",
+            32,
+            9005,   // http_port
+            false,  // enable_http_server
+            {}      // labels
+            )
+            .value();
 
     EXPECT_EQ(p2p_config_custom.http_port, 9005);
     EXPECT_FALSE(p2p_config_custom.enable_http_server);
@@ -109,14 +116,17 @@ TEST_F(ClientHttpMetricsTest, ConfigBuilderMetricsSettings) {
 
 // Test metrics disabled scenario
 TEST_F(ClientHttpMetricsTest, MetricsDisabled) {
-    auto config = P2PClientConfigBuilder::build_p2p_real_client(
-        "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
-        "127.0.0.1:50051",
-        R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
-        nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32,
-        9003,  // http_port
-        false  // enable_http_server = false
-    );
+    auto config =
+        P2PClientConfigBuilder::build_p2p_real_client(
+            "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
+            "127.0.0.1:50051",
+            R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
+            nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te",
+            32,
+            9003,  // http_port
+            false  // enable_http_server = false
+            )
+            .value();
 
     EXPECT_EQ(config.http_port, 9003);
     EXPECT_FALSE(config.enable_http_server);
@@ -127,15 +137,18 @@ TEST_F(ClientHttpMetricsTest, ConfigWithLabels) {
     std::map<std::string, std::string> labels = {
         {"instance_id", "test_instance"}, {"cluster_id", "test_cluster"}};
 
-    auto config = P2PClientConfigBuilder::build_p2p_real_client(
-        "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
-        "127.0.0.1:50051",
-        R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
-        nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32,
-        9003,   // http_port
-        true,   // enable_http_server
-        labels  // labels
-    );
+    auto config =
+        P2PClientConfigBuilder::build_p2p_real_client(
+            "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
+            "127.0.0.1:50051",
+            R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
+            nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te",
+            32,
+            9003,   // http_port
+            true,   // enable_http_server
+            labels  // labels
+            )
+            .value();
 
     EXPECT_EQ(config.labels.size(), 2);
     EXPECT_EQ(config.labels["instance_id"], "test_instance");

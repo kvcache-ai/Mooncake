@@ -1272,6 +1272,21 @@ std::string P2PClientService::GetHealthStatus() const {
                                                         : toString(state);
 }
 
+DummyClientStatus P2PClientService::GetServiceStatus() const {
+    switch (GetServiceState()) {
+        case P2PClientServiceState::ONLINE:
+        case P2PClientServiceState::DEGRADED:
+        case P2PClientServiceState::LOCAL_ONLY:
+        case P2PClientServiceState::STOPPING:
+            return DummyClientStatus::HEALTH;
+        case P2PClientServiceState::INITIALIZING:
+        case P2PClientServiceState::STOPPED:
+            return DummyClientStatus::DISCONNECTION;
+    }
+    LOG(ERROR) << "Unknown P2P service state";
+    return DummyClientStatus::DISCONNECTION;
+}
+
 // ============================================================================
 // Put Operations
 // ============================================================================
