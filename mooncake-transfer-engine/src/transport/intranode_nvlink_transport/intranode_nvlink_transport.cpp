@@ -469,7 +469,7 @@ Status IntraNodeNvlinkTransport::submitTransfer(
             // Open the peer IPC mapping on the source buffer's device so the
             // copy stays a direct source->target NVLink path. A fresh thread
             // defaults to device 0, and cudaIpcOpenMemHandle binds the
-            // mapping to the calling thread's context (issue #4986).
+            // mapping to the calling thread's context.
             int saved_device = -1;
             cudaGetDevice(&saved_device);
             int src_device = getDeviceForPointer((void *)request.source);
