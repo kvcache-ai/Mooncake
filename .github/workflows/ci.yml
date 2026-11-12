@@ -47,12 +47,14 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Run CPU table and facade contracts without a native build
+    - name: Run CPU table, facade and range-plan contracts without a native build
       env:
-        PYTHONPATH: ${{ github.workspace }}/python
+        # mooncake-wheel holds the pure-Python modules the installed wheel
+        # merges into the package, such as mooncake._partial_read.
+        PYTHONPATH: ${{ github.workspace }}/python:${{ github.workspace }}/mooncake-wheel
       run: |
-        python -m pip install --disable-pip-version-check numpy pytest
-        python -m pytest -q scripts/test_engram_tables.py python/tests/store/test_facade.py
+        python -m pip install --disable-pip-version-check numpy pytest msgpack hypothesis==6.141.0
+        python -m pytest -q scripts/test_engram_tables.py python/tests/store/test_facade.py python/tests/store/test_structured_ranges_properties.py
 
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
