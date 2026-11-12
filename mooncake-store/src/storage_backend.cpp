@@ -2651,34 +2651,46 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
     return {};
 }
 
-tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
-    int64_t bucket_id, std::vector<std::string>& keys,
-    std::vector<StorageObjectMetadata>& metadatas,
-    std::vector<int64_t>& buckets, int64_t limit) {
+tl::expected<BucketStorageBackend::ScanCursor, ErrorCode>
+BucketStorageBackend::BucketScan(ScanCursor cursor,
+                                 std::vector<std::string>& keys,
+                                 std::vector<StorageObjectMetadata>& metadatas,
+                                 std::vector<int64_t>& buckets, int64_t limit) {
+    if (limit <= 0) {
+        LOG(ERROR) << "Bucket scan limit must be positive: " << limit;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     SharedMutexLocker lock(&mutex_, shared_lock);
-    auto bucket_it = buckets_.lower_bound(bucket_id);
-    for (; bucket_it != buckets_.end(); ++bucket_it) {
-        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
-            LOG(ERROR) << "Bucket key count exceeds limit: "
-                       << "bucket_id=" << bucket_it->first
-                       << ", current_size=" << bucket_it->second->keys.size()
-                       << ", limit=" << limit;
-            return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
+    auto bucket_it = buckets_.lower_bound(cursor.bucket_id);
+    // If the resumed bucket was evicted, start at the next bucket's first key.
+    size_t key_index =
+        bucket_it != buckets_.end() && bucket_it->first == cursor.bucket_id
+            ? cursor.key_index
+            : 0;
+    for (; bucket_it != buckets_.end(); ++bucket_it, key_index = 0) {
+        if (keys.size() >= static_cast<size_t>(limit)) {
+            return ScanCursor{bucket_it->first, key_index};
         }
-        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
-            limit) {
-            return bucket_it->first;
+        const auto& bucket = *bucket_it->second;
+        if (key_index >= bucket.keys.size()) {
+            continue;
         }
+        const size_t end =
+            key_index + std::min(bucket.keys.size() - key_index,
+                                 static_cast<size_t>(limit) - keys.size());
         buckets.emplace_back(bucket_it->first);
-        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
-            keys.emplace_back(bucket_it->second->keys[i]);
+        for (size_t i = key_index; i < end; ++i) {
+            keys.emplace_back(bucket.keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
-                bucket_it->first, bucket_it->second->metadatas[i].offset,
-                bucket_it->second->metadatas[i].key_size,
-                bucket_it->second->metadatas[i].data_size, ""});
+                bucket_it->first, bucket.metadatas[i].offset,
+                bucket.metadatas[i].key_size, bucket.metadatas[i].data_size,
+                ""});
+        }
+        if (end < bucket.keys.size()) {
+            return ScanCursor{bucket_it->first, end};
         }
     }
-    return 0;
+    return ScanCursor{0, 0};
 }
 
 tl::expected<OffloadMetadata, ErrorCode>
@@ -4371,7 +4383,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
     std::vector<StorageObjectMetadata> metadatas;
     std::vector<int64_t> buckets;
     auto key_iterator_result =
-        BucketScan(next_bucket_, keys, metadatas, buckets,
+        BucketScan(next_scan_, keys, metadatas, buckets,
                    file_storage_config_.scanmeta_iterator_keys_limit);
     if (!key_iterator_result) {
         LOG(ERROR) << "Bucket scan failed, error : "
@@ -4383,13 +4395,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
         LOG(ERROR) << "Key iterator failed, error : " << handle_result;
         return tl::make_unexpected(handle_result);
     }
-    next_bucket_ = key_iterator_result.value();
+    next_scan_ = key_iterator_result.value();
     return {};
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::HasNext() {
     MutexLocker locker(&iterator_mutex_);
-    return next_bucket_ != 0;
+    return next_scan_.bucket_id != 0;
 }
 
 tl::expected<std::shared_ptr<StorageFile>, ErrorCode>
