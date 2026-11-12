@@ -727,16 +727,6 @@ class RealClient : public PyClient {
         const QueryResultCache *query_result_cache = nullptr,
         bool allow_query_refresh = true);
 
-    enum class RangedReadMetadataMode {
-        // The caller owns the lease, so a key whose cached entry is missing or
-        // expired may be re-queried. Cold keys are resolved with one
-        // Client::BatchQuery for the whole request.
-        kRefreshable,
-        // Snapshot reads must stay strictly off the Master: a missing entry
-        // resolves to INVALID_PARAMS and an expired one to LEASE_EXPIRED.
-        kSnapshot,
-    };
-
     struct RangedReadMetadataPlan {
         std::unordered_map<std::string,
                            tl::expected<RangedReadMetadata, ErrorCode>>
@@ -750,11 +740,13 @@ class RealClient : public PyClient {
     };
 
     // Resolves every key a ranged read needs before planning transfers, in the
-    // order given. Each key appears at most once in `entries`.
+    // order given. Each key appears at most once in `entries`. Same
+    // `allow_query_refresh` contract as resolve_ranged_read_metadata: a
+    // snapshot read never reaches the Master and reports INVALID_PARAMS for a
+    // missing entry and LEASE_EXPIRED for an expired one.
     RangedReadMetadataPlan resolve_ranged_read_metadata_batch(
         const std::vector<std::string> &keys,
-        const QueryResultCache *query_result_cache,
-        RangedReadMetadataMode mode);
+        const QueryResultCache *query_result_cache, bool allow_query_refresh);
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,

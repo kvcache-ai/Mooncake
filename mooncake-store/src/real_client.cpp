@@ -5001,7 +5001,7 @@ RealClient::resolve_ranged_read_metadata(
 RealClient::RangedReadMetadataPlan
 RealClient::resolve_ranged_read_metadata_batch(
     const std::vector<std::string> &keys,
-    const QueryResultCache *query_result_cache, RangedReadMetadataMode mode) {
+    const QueryResultCache *query_result_cache, bool allow_query_refresh) {
     RangedReadMetadataPlan plan{
         .entries = {}, .resolved_at = std::chrono::steady_clock::now()};
 
@@ -5020,7 +5020,7 @@ RealClient::resolve_ranged_read_metadata_batch(
                              key, cached->second));
                 continue;
             }
-            if (mode == RangedReadMetadataMode::kSnapshot) {
+            if (!allow_query_refresh) {
                 // The caller owns a fixed snapshot; report why the entry
                 // cannot be served instead of reaching the Master.
                 plan.entries.emplace(
@@ -5032,7 +5032,7 @@ RealClient::resolve_ranged_read_metadata_batch(
             query_keys.push_back(key);
             continue;
         }
-        if (mode == RangedReadMetadataMode::kSnapshot) {
+        if (!allow_query_refresh) {
             plan.entries.emplace(key,
                                  tl::unexpected(ErrorCode::INVALID_PARAMS));
             continue;
@@ -5460,9 +5460,7 @@ RealClient::get_into_ranges_internal(
     }
 
     auto metadata_plan = resolve_ranged_read_metadata_batch(
-        plan_keys, query_result_cache,
-        allow_query_refresh ? RangedReadMetadataMode::kRefreshable
-                            : RangedReadMetadataMode::kSnapshot);
+        plan_keys, query_result_cache, allow_query_refresh);
     auto &metadata_cache = metadata_plan.entries;
 
     // A ranged read resolves all of its metadata before any range runs, so a
