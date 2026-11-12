@@ -794,10 +794,18 @@ MasterService::MasterService(const MasterServiceConfig& config)
     dynamic_replication_.Start([this](const TenantId& tenant_id,
                                       const std::string& key) {
         // RFC #4700 slice 1: dynamic replica proposals mutate business
-        // metadata, so they stay out of the restore window.
+        // metadata, so they stay out of the restore window. The gate is
+        // advisory only: it is read before the lock is taken, so a callback
+        // that passes it just before the window opens still runs, after the
+        // rebuild, once this lock is granted. Submitting re-resolves the
+        // object here, so the mutation lands on post-restore metadata; what
+        // this site cannot do is order itself before the restore. An
+        // extraction slice has to move the gate under the lock instead of
+        // dropping the lock and keeping the gate.
         if (!AdmitsBusinessWorkers()) {
             return;
         }
+        // [inv:object-metadata] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         TrySubmitDynamicReplicaProposal(ObjectIdentity{tenant_id, key});
     });
@@ -1067,6 +1075,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         }
         const auto observation =
             record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
+                // [inv:segment-registry] [needs:lifecycle-order]
                 std::shared_lock<std::shared_mutex> snapshot_lock(
                     master_state_mutex_);
                 ScopedSegmentAccess segment_access =
@@ -1196,6 +1205,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             MasterMetricManager::instance().on_client_liveness_record_removed(
                 ClientLivenessState::ACTIVE);
         };
+        // [inv:segment-registry] [needs:lifecycle-order]
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
@@ -1761,6 +1771,7 @@ void MasterService::EvictManagedWeightMembersToCold(
                                                            member_keys.end());
     // Not const: ObjectMetadata::IsLeaseExpired takes it by reference.
     auto now = std::chrono::system_clock::now();
+    // [inv:eviction] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // Memory eviction's own reclaimer, without the offload: a member goes cold
     // only when it holds a readable cold replica already.
@@ -1916,6 +1927,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
         return;
     }
 
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
     // Replica ids are never reused, so the replicas name the publication they
@@ -1963,6 +1975,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
 
 void MasterService::FinalizeMetadataEraseAfterDurable(
     route::ObjectRef object, const TenantId& tenant_id) {
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // Act on the pinned publication only: a same-key recreate that landed
     // while the erase was in flight must not be erased, and an object already
@@ -1978,6 +1991,7 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
 void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
     route::ObjectRef object, const OpLogEntry& durable_entry,
     const std::chrono::system_clock::time_point& ttl) {
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
     // Identity gate: the durable cleanup was requested for the publication
@@ -2017,6 +2031,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch,
     const std::chrono::system_clock::time_point& ttl) {
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
     MetadataAccessorRW accessor(this, MakeObjectIdentityForRequest(
@@ -2418,6 +2433,7 @@ auto MasterService::BatchUpdateSoftPin(const std::vector<std::string>& keys,
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     const TenantId normalized_tenant = ResolveRequestTenantId(tenant_id);
     std::vector<tl::expected<void, ErrorCode>> results;
@@ -2509,6 +2525,7 @@ void MasterService::CleanupExpiredSoftPins(
 
 void MasterService::ClearInvalidHandles() {
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+    // [inv:client-registry] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
@@ -2608,6 +2625,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
     bool quota_recompute_needed = false;
     {
+        // [inv:client-registry] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
 
         if (!job.pending_prepare_segments.empty()) {
@@ -2797,6 +2815,7 @@ void MasterService::TaskCleanupThreadFunc() {
             continue;
         }
 
+        // [inv:task-registry] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         {
             auto write_access = task_manager_.get_write_access();
@@ -2836,6 +2855,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+    // [inv:segment-registry] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
@@ -2897,6 +2917,7 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            const UUID& client_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
+    // [inv:segment-registry] [needs:lifecycle-order]
     std::unique_lock<std::shared_mutex> lock(master_state_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
@@ -2942,6 +2963,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+    // [inv:segment-registry] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
@@ -2994,6 +3016,7 @@ auto MasterService::ProbeKey(const std::string& key, const TenantId& tenant_id)
 auto MasterService::ExistKeyImpl(const std::string& key,
                                  const TenantId& tenant_id, bool grant_lease)
     -> tl::expected<bool, ErrorCode> {
+    // [inv:object-metadata] [needs:member-exclusion]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRO accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -3087,6 +3110,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
         return results;
     }
 
+    // [inv:object-metadata] [needs:member-exclusion]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
         MetadataAccessorRO accessor(this, normalized_tenant, keys[i]);
@@ -3104,6 +3128,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
 auto MasterService::GetAllKeys(const TenantId& tenant_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
+    // [inv:object-metadata] [needs:cross-shard-view]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const metadata::Namespace* ns =
         namespaces_.Lookup(ResolveRequestTenantId(tenant_id));
@@ -3857,6 +3882,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     }
     // The ordered writer initializes its sequence from durable_prefix.
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    // [inv:restore-window] [needs:lifecycle-order]
     std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
                        boost::hash<UUID>>
@@ -4455,6 +4481,7 @@ auto MasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name, const std::string& tenant_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
@@ -4713,6 +4740,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // [inv:object-metadata] [needs:cross-shard-view]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const metadata::Namespace* ns =
         namespaces_.Lookup(ResolveRequestTenantId(tenant_id));
@@ -4744,6 +4772,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
 auto MasterService::GetReplicaList(const std::string& key,
                                    const TenantId& tenant_id)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    // [inv:object-metadata] [needs:member-exclusion]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
 
@@ -4858,6 +4887,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     assert(tenant_id.IsValid());
     const auto object_id = MakeObjectIdentity(key, tenant_id);
 
+    // [inv:object-metadata] [needs:member-exclusion]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRO accessor(this, object_id);
 
@@ -4900,6 +4930,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     ReadFollowUps follow_ups;
+    // [inv:object-metadata] [needs:member-exclusion]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
         MasterMetricManager::instance().inc_total_get_nums();
@@ -4928,6 +4959,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
         return results;
     }
 
+    // [inv:object-metadata] [needs:member-exclusion]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
         MetadataAccessorRO accessor(this, tenant_id, keys[i]);
@@ -5427,6 +5459,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         auto now = std::chrono::system_clock::now();
         std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+        // [inv:object-metadata] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         auto retaining_clients = GetRetainingClientIdsLocked();
         client_lock.unlock();
@@ -5493,6 +5526,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -5702,6 +5736,7 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         }
         admission = std::move(admitted.value());
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // Same admission rule as NotifyOffloadSuccess's existing-object path,
     // checked inside the same shared-lock section as the write below: a disk
@@ -5807,6 +5842,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -6002,6 +6038,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         {
             // --- Lock acquisition ---
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+            // [inv:object-metadata] [needs:lifecycle-order]
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             auto retaining_clients = GetRetainingClientIdsLocked();
@@ -6605,6 +6642,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     if (!dynamic_copy) {
         ScopedSegmentAccess segment_access =
@@ -6785,6 +6823,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -6952,6 +6991,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -7030,6 +7070,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     if (src_segment == tgt_segment) {
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
@@ -7149,6 +7190,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -7307,6 +7349,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -7383,6 +7426,7 @@ auto MasterService::RemoveObject(const std::string& key,
                                  const TenantId& tenant_id, bool force,
                                  bool allow_managed_weight)
     -> tl::expected<void, ErrorCode> {
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -7539,6 +7583,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // [inv:object-metadata] [needs:cross-shard-view]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const RemoveResult result = RemoveTenantObjects(
         ResolveRequestTenantId(tenant_id), force,
@@ -7554,6 +7599,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     int64_t total_freed_size = 0;
+    // [inv:object-metadata] [needs:cross-shard-view]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto now = std::chrono::system_clock::now();
     // Tracking which tenants ended up empty costs a hash insert per visited
@@ -7612,6 +7658,7 @@ long MasterService::RemoveAll(bool force) {
 }
 
 long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
+    // [inv:object-metadata] [needs:cross-shard-view]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto now = std::chrono::system_clock::now();
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
@@ -7648,6 +7695,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
@@ -7859,6 +7907,7 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
         bool logical_committed = false;
         std::chrono::system_clock::time_point keep_until{};
         {
+            // [inv:eviction] [needs:lifecycle-order]
             std::shared_lock<std::shared_mutex> snapshot_lock(
                 master_state_mutex_);
             auto now = std::chrono::system_clock::now();
@@ -8016,6 +8065,7 @@ void MasterService::RunKvcsDfsEviction(const DfsUsageSnapshot& usage) {
     const uint64_t target_bytes = usage.used_bytes - low_bytes;
     eviction::Report report;
     {
+        // [inv:eviction] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         report = kvcs_dfs_eviction_->evictor.Run(
             TenantId::Default(),
@@ -8087,6 +8137,7 @@ void MasterService::RunShardDfsEviction() {
 
         auto now = std::chrono::system_clock::now();
         {
+            // [inv:eviction] [needs:lifecycle-order]
             std::shared_lock<std::shared_mutex> snapshot_lock(
                 master_state_mutex_);
 
@@ -8239,6 +8290,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     ErrorCode err = ErrorCode::INTERNAL_ERROR;
     const auto observation =
         record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
+            // [inv:local-ssd] [needs:lifecycle-order]
             std::shared_lock<std::shared_mutex> snapshot_lock(
                 master_state_mutex_);
             err =
@@ -8292,6 +8344,7 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // already passed and survive as a stale owner.
     std::optional<int64_t> reported_capacity;
     {
+        // [inv:local-ssd] [needs:lifecycle-order]
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
     }
@@ -8333,6 +8386,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:local-ssd] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto pending = local_ssd_manager_.SetOffloadingAndTakePending(
         client_id, enable_offloading);
@@ -8370,6 +8424,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
 
 auto MasterService::PollRemoveAll(const UUID& client_id)
     -> tl::expected<bool, ErrorCode> {
+    // [inv:local-ssd] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     return local_ssd_manager_.ConsumeRemoveAll(client_id);
 }
@@ -8386,6 +8441,7 @@ auto MasterService::ReportSsdCapacity(const UUID& client_id,
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:local-ssd] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto capacity =
         local_ssd_manager_.ReportCapacity(client_id, ssd_total_capacity_bytes);
@@ -8441,6 +8497,7 @@ auto MasterService::NotifyOffloadSuccess(
         // NACK sentinel: offload failed on worker. Clean up the
         // offloading_task + dec_refcnt but skip AddReplica.
         if (metadata.data_size < 0) {
+            // [inv:local-ssd] [needs:lifecycle-order]
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
@@ -8466,6 +8523,7 @@ auto MasterService::NotifyOffloadSuccess(
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
+            // [inv:local-ssd] [needs:lifecycle-order]
             std::shared_lock<std::shared_mutex> shared_lock(
                 master_state_mutex_);
             // A disk replica may only be registered for a client whose
@@ -8788,6 +8846,7 @@ size_t MasterService::RunPromotionCandidateRetry() {
     // only the due ones, the longest overdue first, and the batch size bounds
     // how much one round touches.
     {
+        // [inv:promotion-state] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> snap_lock(master_state_mutex_);
         for (auto& [tenant_id, key] :
              promotion_candidates_.Due(now, kPromotionRetryBatchSize)) {
@@ -8824,6 +8883,7 @@ size_t MasterService::RunPromotionCandidateRetry() {
 
     size_t queued = 0;
     {
+        // [inv:promotion-state] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> snap_lock(master_state_mutex_);
         for (const auto& object_id : due_candidates) {
             const auto result =
@@ -9201,6 +9261,7 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:promotion-state] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -9290,6 +9351,7 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:promotion-state] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // Return at most promotion_max_per_heartbeat_ tasks. Each task does
     // a synchronous SSD read + RDMA write on the client side; allowing
@@ -9313,6 +9375,7 @@ auto MasterService::PromotionAllocStart(
     if (!serving_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:promotion-state] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -9435,6 +9498,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -9552,6 +9616,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:promotion-state] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -9684,6 +9749,7 @@ void MasterService::EvictionThreadFunc() {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
             {
+                // [inv:eviction] [needs:lifecycle-order]
                 std::shared_lock<std::shared_mutex> shared_lock(
                     master_state_mutex_);
                 VisitNamespaces([&](const TenantId& /*tenant_id*/,
@@ -10007,6 +10073,7 @@ MasterService::NamespaceEvictionResult MasterService::EvictNamespaceMemory(
     if (target_bytes == 0) {
         return {};
     }
+    // [inv:eviction] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const eviction::Report report = memory_eviction_->evictor.Run(
         tenant_id, eviction::ByteGoal{.target_bytes = target_bytes});
@@ -10021,6 +10088,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     const bool allocation_pressure =
         need_mem_eviction_.exchange(false, std::memory_order_relaxed);
 
+    // [inv:eviction] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // Writes that expired before they finished, and replicas whose release
     // was deferred, go first, so the round judges what is left.
@@ -10068,6 +10136,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     long evicted_count = 0;
     long object_count = 0;
     uint64_t total_freed_size = 0;
+    // [inv:object-metadata] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
 
     auto is_evictable_nof_replica = [](const Replica& replica) {
@@ -10254,6 +10323,7 @@ void MasterService::ClientMonitorFunc() {
                     ClientOffboardingJob job;
                     job.client_id = client_id;
                     job.liveness = record;
+                    // [inv:client-registry] [needs:lifecycle-order]
                     std::shared_lock<std::shared_mutex> snapshot_lock(
                         master_state_mutex_);
                     {
@@ -10365,6 +10435,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
     const std::string& error_reason) {
     size_t metrics_dec_capacity = 0;
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+    // [inv:segment-registry] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
@@ -10623,6 +10694,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         std::tuple<std::string, UUID, std::shared_ptr<ClientLivenessRecord>>>
         serving_sources;
     {
+        // [inv:task-registry] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         MetadataAccessorRO accessor(this, object_id);
         if (!accessor.Exists()) {
@@ -10682,6 +10754,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 
     // Completion paths acquire the Client guard before the object's key.
     // Reacquire and validate in that same order after discovery.
+    // [inv:task-registry] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     MetadataAccessorRO submission_metadata(this, object_id);
     if (!submission_metadata.Exists()) {
@@ -10742,6 +10815,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     UUID select_client;
     std::shared_ptr<ClientLivenessRecord> source_liveness;
     {
+        // [inv:task-registry] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         MetadataAccessorRO accessor(this, object_id);
         if (!accessor.Exists()) {
@@ -10811,6 +10885,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
 
     // Do not hold a key while acquiring the Client guard: MoveEnd
     // takes those locks in the opposite order.
+    // [inv:task-registry] [needs:lifecycle-order]
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     MetadataAccessorRO submission_metadata(this, object_id);
     if (!submission_metadata.Exists()) {
@@ -10865,6 +10940,7 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     if (!serving_guard) {
         return std::vector<TaskAssignment>{};
     }
+    // [inv:task-registry] [needs:none]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto& tasks =
         task_manager_.get_write_access().pop_tasks(client_id, batch_size);
@@ -10885,6 +10961,7 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     if (!retaining_guard) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
+    // [inv:task-registry] [needs:none]
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     auto write_access = task_manager_.get_write_access();
     ErrorCode err = write_access.complete_task(client_id, request.id,
@@ -11172,6 +11249,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 
     std::unordered_set<std::string> blocked_unit_keys;
     {
+        // [inv:task-registry] [needs:cross-shard-view]
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         VisitNamespaces([&](const TenantId& tenant_id,
                             metadata::Namespace& ns) {
@@ -11307,6 +11385,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     std::unordered_set<std::string> remaining_segments;
     std::unordered_set<std::string> remaining_unit_keys;
     {
+        // [inv:task-registry] [needs:lifecycle-order]
         std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
         VisitNamespaces([&](const TenantId& tenant_id,
                             metadata::Namespace& ns) {

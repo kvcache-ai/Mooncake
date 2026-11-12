@@ -100,6 +100,79 @@ class PrefetchTaskMasterTest;
  * quota table, so these two locks are never nested.
  */
 
+/*
+ * @brief Lock-site annotations (RFC #4700).
+ *
+ * Every acquisition of master_state_mutex_ in master_service.cpp carries two
+ * tags on the line above it:
+ *
+ *   [inv:<domain>]   which invariant domain the site belongs to:
+ *                    segment-registry, object-metadata, task-registry,
+ *                    promotion-state, local-ssd, eviction,
+ *                    client-registry, restore-window.
+ *   [needs:<what>]   what the site still needs from the global lock.
+ *
+ * A shared-lock site gets exactly one thing from master_state_mutex_: exclusion
+ * against the four exclusive holders.
+ *
+ *   ReMountSegment              rebuilds the allocator and repairs replicas.
+ *                               Its per-key walk collects Replica* pointers,
+ *                               drops the key locks, then imports and repairs,
+ *                               so anything that frees a replica inside that
+ *                               gap leaves the collected pointers dangling.
+ *   GracefulUnmountSegment      tears a segment down.
+ *   RestoreFromStandbyStateCore rebuilds object metadata wholesale.
+ *   UnmountLocalDiskSegment     deregisters local-disk capacity.
+ *
+ * The second tag is therefore:
+ *
+ *   lifecycle-order  the site must not overlap any of the four above. That
+ *                    includes the remount walk/repair gap, the restore
+ *                    window and local-disk deregistration -- not only segment
+ *                    mount and unmount. Every site that writes, frees or
+ *                    relocates a replica belongs here, and so does every
+ *                    background worker the restore window has to exclude.
+ *   cross-shard-view the site scans several keys and needs the same view of
+ *                    each. That is not a globally consistent snapshot: every
+ *                    other business site holds the same shared lock and
+ *                    mutates one key under that key's slot lock, so a scan
+ *                    still sees different keys at different instants. What
+ *                    the shared lock gives the scan is that none of the four
+ *                    exclusive holders is running while it walks -- no
+ *                    replica is freed and no object is rebuilt underneath
+ *                    it. A shard-set epoch has to preserve exactly that, not
+ *                    add serializability the site never had.
+ *   member-exclusion the site reads master-owned member state that the
+ *                    exclusive holders write: today only
+ *                    invalid_replica_endpoints_, erased by ReMountSegment and
+ *                    reassigned by RestoreFromStandbyStateCore. The lock is
+ *                    a plain mutex around that member here, not an ordering
+ *                    against the lifecycle. The read-only paths that decide
+ *                    "is this replica readable" land here, and their
+ *                    replacement is an atomically published view of the set,
+ *                    not a registry pin.
+ *   none             the site can overlap all four holders safely: it touches
+ *                    neither replica lifetime nor the rebuilt metadata nor
+ *                    member state they write. Only the task-registry sites
+ *                    qualify, because the restore core never touches
+ *                    task_manager_.
+ *
+ * [needs:none] is the pure-removal set and it is deliberately tiny.
+ * Everything else needs its replacement mechanism first -- a
+ * registry-generation pin for lifecycle-order, a shard-set epoch for
+ * cross-shard-view, an atomically published view for member-exclusion. The
+ * tags are greppable on purpose, so each extraction PR reviews exactly one tag
+ * set:
+ *
+ *   grep -c 'needs:none'             mooncake-store/src/master_service.cpp
+ *   grep -c 'needs:lifecycle-order'  mooncake-store/src/master_service.cpp
+ *   grep -c 'needs:cross-shard-view' mooncake-store/src/master_service.cpp
+ *   grep -c 'needs:member-exclusion' mooncake-store/src/master_service.cpp
+ *
+ * The tags describe today's behaviour. They add no synchronization and change
+ * none; the lock order above still holds as written.
+ */
+
 class MasterService {
     friend class MasterStoreBackend;
     friend class test::MasterServiceTestPeer;
