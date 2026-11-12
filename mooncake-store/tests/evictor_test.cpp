@@ -104,8 +104,6 @@ class FakeReclaimer final : public eviction::Reclaimer {
 
 class RecordingObserver final : public eviction::EvictionObserver {
    public:
-    bool SupportsParallel() const override { return false; }
-
     void OnApplied(const eviction::ObjectView& view,
                    const eviction::Effect&) override {
         applied.push_back(view.key);

@@ -135,7 +135,12 @@ class CopiedBucket {
 class Buckets;
 
 // The filed members of one group inside its shard, linked into `buckets` at
-// the latest deadline rank seen across its members.
+// the latest deadline rank seen across its members. `born_seq_` belongs to the
+// group incarnation rather than individual members: if a new key joins an
+// existing group after a scan starts, either it extends the shared group lease
+// (moving the group out of due buckets, and failing StillAt/IsLeaseExpired if
+// the bucket was already copied) or the shared lease remains expired and the
+// whole group is still visited together without stranding the new member.
 class Group {
    public:
     Group(std::shared_ptr<const Lease> lease, uint64_t identity,

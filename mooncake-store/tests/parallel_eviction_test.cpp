@@ -224,6 +224,41 @@ TEST_F(ShardedLeaseIndexTest, GroupIsOneEntryAndRecreationGetsANewIdentity) {
     EXPECT_FALSE(next->Next());
 }
 
+TEST_F(ShardedLeaseIndexTest,
+       GroupMemberJoiningDuringScanHonorsSharedLeaseAndWholeGroupSemantics) {
+    // Expired group: a member joining after Scan() starts is yielded together
+    // with the existing group rather than stranded behind.
+    Publish("a", "g_expired");
+    auto expired_scan = ns_.eviction_index().Scan(now_);
+    Publish("b", "g_expired");
+    auto entry = expired_scan->Next();
+    ASSERT_TRUE(entry);
+    EXPECT_EQ(
+        (std::set<std::string_view>(entry->keys.begin(), entry->keys.end())),
+        (std::set<std::string_view>{"a", "b"}));
+    for (const std::string_view key : entry->keys) {
+        auto guard = ns_.objects.Write(key);
+        ASSERT_TRUE(guard);
+        EXPECT_TRUE(expired_scan->StillAt(*guard, *entry));
+        guard->TearDown();
+    }
+
+    // Live extension on join: moves the group out of due buckets if not yet
+    // copied, and rejects already-copied entries via StillAt.
+    Publish("c", "g_extended");
+    auto scan_before_copy = ns_.eviction_index().Scan(now_);
+    auto scan_after_copy = ns_.eviction_index().Scan(now_);
+    auto copied = scan_after_copy->Next();
+    ASSERT_TRUE(copied);
+    PublishAt("d", now_ + std::chrono::seconds(20), "g_extended");
+    EXPECT_FALSE(scan_before_copy->Next());
+    {
+        auto guard = ns_.objects.Write("c");
+        ASSERT_TRUE(guard);
+        EXPECT_FALSE(scan_after_copy->StillAt(*guard, *copied));
+    }
+}
+
 TEST_F(ShardedLeaseIndexTest, DisjointWorkersSeeEachKeyOnceAcrossShards) {
     constexpr int kCount = 4000;
     for (int i = 0; i < kCount; ++i) {
@@ -776,23 +811,39 @@ TEST_F(ParallelEvictorNativeTest,
 
 TEST_F(ParallelEvictorNativeTest,
        AnObserverWithoutParallelCapabilityKeepsSerialExecution) {
-    struct Observer : eviction::EvictionObserver {
+    struct DefaultSerialObserver : eviction::EvictionObserver {
         uint64_t n = 0;
-        bool SupportsParallel() const override { return false; }
         void OnApplied(const eviction::ObjectView&,
                        const eviction::Effect&) override {
             ++n;
         }
-    } observer;
+    } serial_observer;
     for (int i = 0; i < 50; ++i) {
         Publish(std::to_string(i));
     }
-    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {&observer}, 4);
-    const auto report =
-        evictor.Run(eviction::Scope::All(), {.target_ratio = .1});
-    EXPECT_EQ(report.evicted_objects, 5u);
-    EXPECT_EQ(observer.n, 5u);
-    EXPECT_EQ(report.scan_waves, 0u);
+    eviction::Evictor serial_evictor(namespaces_, policy_, reclaimer_,
+                                     {&serial_observer}, 4);
+    const auto serial_report =
+        serial_evictor.Run(eviction::Scope::All(), {.target_ratio = .1});
+    EXPECT_EQ(serial_report.evicted_objects, 5u);
+    EXPECT_EQ(serial_observer.n, 5u);
+    EXPECT_EQ(serial_report.scan_waves, 0u);
+
+    struct ParallelObserver : eviction::EvictionObserver {
+        std::atomic<uint64_t> n{0};
+        bool SupportsParallel() const override { return true; }
+        void OnApplied(const eviction::ObjectView&,
+                       const eviction::Effect&) override {
+            n.fetch_add(1, std::memory_order_relaxed);
+        }
+    } parallel_observer;
+    eviction::Evictor parallel_evictor(namespaces_, policy_, reclaimer_,
+                                       {&parallel_observer}, 4);
+    const auto parallel_report =
+        parallel_evictor.Run(eviction::Scope::All(), {.target_ratio = .1});
+    EXPECT_GE(parallel_report.evicted_objects, 5u);
+    EXPECT_EQ(parallel_observer.n.load(), parallel_report.evicted_objects);
+    EXPECT_GE(parallel_report.scan_waves, 1u);
 }
 
 }  // namespace
