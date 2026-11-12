@@ -101,9 +101,10 @@ TEST_F(BucketBackendConfigTest, ReadsPartialFlushBooleanValues) {
           Case{"FALSE", false}, Case{"invalid", false}}) {
         SCOPED_TRACE(entry.value);
         env.flush_partial_buckets.Set(entry.value);
-        EXPECT_EQ(
-            BucketBackendConfig::FromEnvironment().value().flush_partial_buckets,
-            entry.enabled);
+        EXPECT_EQ(BucketBackendConfig::FromEnvironment()
+                      .value()
+                      .flush_partial_buckets,
+                  entry.enabled);
     }
 }
 

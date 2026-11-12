@@ -84,8 +84,8 @@ void AgeObserver::OnApplied(const ObjectView& view, const Effect& effect) {
         return;
     }
     MasterMetricManager::instance().observe_evicted_key_age_seconds(
-        std::chrono::duration<double>(
-            std::chrono::system_clock::now() - view.metadata.put_start_time)
+        std::chrono::duration<double>(std::chrono::system_clock::now() -
+                                      view.metadata.put_start_time)
             .count());
 }
 
