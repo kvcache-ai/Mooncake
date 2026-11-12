@@ -733,6 +733,8 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                                       bool remote_accessible,
                                       bool update_metadata) {
     std::lock_guard<std::mutex> lock(register_mutex_);
+    if (pending_cleanup_addrs_.count((uint64_t)addr))
+        return ERR_ADDRESS_OVERLAPPED;
 
     if (globalConfig().trace) {
         LOG(INFO) << "register memory: addr " << addr << ", length " << length;
@@ -757,7 +759,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                           << ", leaving it to other transports";
             }
             skipped_addrs_.insert((uint64_t)addr);
-            return 0;
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Resolve the true hipMalloc base address. Framework caching
@@ -772,6 +774,14 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                                             &alloc_size, (hipDeviceptr_t)addr),
                       "HipTransport: hipMemGetAddressRange failed")) {
             return -1;
+        }
+        const auto offset = (uint64_t)addr - (uint64_t)base_ptr;
+        if (offset > alloc_size || length > alloc_size - offset) {
+            LOG(WARNING) << "HipTransport: skipping buffer " << addr << " + "
+                         << length << " outside allocation " << base_ptr
+                         << " + " << alloc_size;
+            skipped_addrs_.insert((uint64_t)addr);
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Re-registering the same address is idempotent; a new sub-range of
@@ -827,7 +837,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                          << " is not allocated by hipMemCreate, "
                          << "but it can be used as local buffer";
             skipped_addrs_.insert((uint64_t)addr);
-            return 0;
+            return REGISTER_MEMORY_SKIPPED;
         }
 
         // Find whole physical page for memory registration
@@ -905,7 +915,14 @@ int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     // register path, so a concurrent register of another sub-range cannot
     // republish the buffer in between.
     std::lock_guard<std::mutex> lock(register_mutex_);
-    auto alias_it = registered_addr_to_base_.find((uint64_t)addr);
+    const auto key = (uint64_t)addr;
+    if (pending_cleanup_addrs_.count(key)) {
+        if (!update_metadata) return 0;
+        const int rc = metadata_->updateLocalSegmentDesc();
+        if (rc == 0) pending_cleanup_addrs_.erase(key);
+        return rc;
+    }
+    auto alias_it = registered_addr_to_base_.find(key);
     if (alias_it == registered_addr_to_base_.end()) {
         // The address is not one we registered. If it equals a live base or
         // page, slab-level cleanup must not drop the shared registration
@@ -929,8 +946,20 @@ int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     // physical page.
     if (--registered_base_refs_[base] > 0) return 0;
     registered_base_refs_.erase(base);
-    return metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc,
-                                              update_metadata);
+    const int rc = metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc,
+                                                      update_metadata);
+    if (rc == ERR_ADDRESS_NOT_REGISTERED) {
+        registered_addr_to_base_[key] = base;
+        registered_base_refs_[base] = 1;
+        return rc;
+    }
+    if (rc != 0 || !update_metadata) pending_cleanup_addrs_.insert(key);
+    return rc;
+}
+
+bool HipTransport::hasPendingUnregistration(void* addr) {
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    return pending_cleanup_addrs_.count((uint64_t)addr) != 0;
 }
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
@@ -1000,12 +1029,15 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
 int HipTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry>& buffer_list,
     const std::string& location) {
+    bool skipped = false;
     for (auto& buffer : buffer_list) {
         int rc = registerLocalMemory(buffer.addr, buffer.length, location, true,
                                      false);
-        if (rc) return rc;
+        if (rc < 0) return rc;
+        skipped |= rc == REGISTER_MEMORY_SKIPPED;
     }
-    return metadata_->updateLocalSegmentDesc();
+    int rc = metadata_->updateLocalSegmentDesc();
+    return rc == 0 && skipped ? REGISTER_MEMORY_SKIPPED : rc;
 }
 
 int HipTransport::unregisterLocalMemoryBatch(
@@ -1016,7 +1048,15 @@ int HipTransport::unregisterLocalMemoryBatch(
         if (rc && !first_error) first_error = rc;
     }
     int metadata_ret = metadata_->updateLocalSegmentDesc();
-    return first_error ? first_error : metadata_ret;
+    if (metadata_ret == 0) {
+        std::lock_guard<std::mutex> lock(register_mutex_);
+        for (void* addr : addr_list)
+            pending_cleanup_addrs_.erase((uint64_t)addr);
+    }
+    // A missing alias on retry must not hide a failed publication for another
+    // alias in the same batch.
+    if (metadata_ret != 0) return metadata_ret;
+    return first_error;
 }
 
 void* HipTransport::allocatePinnedLocalMemory(size_t size) {
