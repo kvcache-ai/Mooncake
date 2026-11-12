@@ -1,11 +1,11 @@
 name: Run Mooncake CTest suite
-description: Run and validate the source-build CTest suite with shared runtime settings
+description: Run the source-build CTest suite with shared runtime settings
 inputs:
   reserve-rpc-port:
     description: Reserve the Mooncake client RPC port from ephemeral allocation
     default: 'true'
   junit-report:
-    description: Repository-relative JUnit output path (defaults to build/test-results/ctest.xml)
+    description: Optional repository-relative JUnit output path
     default: ''
   label-exclude:
     description: Optional CTest label regex to exclude

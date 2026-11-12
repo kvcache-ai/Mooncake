@@ -79,13 +79,13 @@ jobs:
           set -euo pipefail
           [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid artifact ID"; exit 1; }
           [[ "$CHECKOUT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid source SHA"; exit 1; }
-          [ "$SOURCE_SHA" = "$CHECKOUT_SHA" ] || { echo "::error::Build SHA differs from authorized SHA"; exit 1; }
+          [ "$SOURCE_SHA" = "$CHECKOUT_SHA" ] || { echo "::error::Build SHA differs from requested SHA"; exit 1; }
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" > "$RUN_DIRECTORY/artifact.json"
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" > "$RUN_DIRECTORY/artifact.zip"
           python3 xpu-control/scripts/e2e/python/verify_xpu_ci.py unpack \
             "$RUN_DIRECTORY" "$CHECKOUT_SHA" "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
 
-      - name: Check out authorized test source
+      - name: Check out test source
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_sha }}
@@ -100,7 +100,7 @@ jobs:
         run: |
           set -euo pipefail
           [ "$(git -C xpu-tested-source rev-parse HEAD)" = "$CHECKOUT_SHA" ] || {
-            echo "::error::Checked out source differs from authorized SHA"; exit 1;
+            echo "::error::Checked out source differs from requested SHA"; exit 1;
           }
           run_directory=$(realpath "$RUN_DIRECTORY")
           source_directory=$(realpath "$GITHUB_WORKSPACE/xpu-tested-source")
@@ -112,7 +112,7 @@ jobs:
           [ "$(id -u)" -ne 0 ] || { echo "XPU runner must not run as root" >&2; exit 1; }
           : "${ZE_AFFINITY_MASK:?Set a host-owned two-GPU ZE_AFFINITY_MASK}"
           : "${XPU_IMAGE:?Missing pinned runtime image}"
-          : "${CHECKOUT_SHA:?Missing authorized SHA}"
+          : "${CHECKOUT_SHA:?Missing requested SHA}"
           [[ "$ZE_AFFINITY_MASK" =~ ^(0|[1-9][0-9]*),(0|[1-9][0-9]*)$ ]] || {
             echo "ZE_AFFINITY_MASK must select two whole devices, not subdevices" >&2; exit 1;
           }

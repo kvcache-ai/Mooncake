@@ -61,14 +61,59 @@ with patch.dict(sys.modules, {"verify_rocm_wheel": ROCM}):
 
 
 class HostReportTest(unittest.TestCase):
-    def test_workflow_uses_strict_shared_report_validation(self):
+    def test_workflow_uses_xpu_report_validation(self):
         script = workflow_step("Run host-side unit tests")
-        self.assertIn(
-            "python scripts/ci/check_test_reports.py --require-gtest-status", script
-        )
+        self.assertIn("python scripts/e2e/python/verify_xpu_ci.py reports", script)
         self.assertNotIn("--allow-skipped", script)
         for name in ("config", "ep", "crc32c"):
             self.assertIn(f"xpu-ci-output/reports/{name}.xml", script)
+
+    def test_reports_command(self):
+        completed = (
+            '<testcase classname="Host" name="Pass" status="run" result="completed"/>'
+        )
+        for case, success in (
+            (completed, True),
+            ("", False),
+            ('<testcase classname="Host" name="MissingStatus"/>', False),
+            (completed.replace("/>", "><failure/></testcase>"), False),
+            (completed.replace("/>", "><error/></testcase>"), False),
+            (completed.replace("/>", "><skipped/></testcase>"), False),
+            (completed.replace('result="completed"', 'result="skipped"'), False),
+            (
+                completed.replace(
+                    'status="run" result="completed"',
+                    'status="notrun" result="suppressed"',
+                ),
+                False,
+            ),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                valid = Path(directory) / "valid.xml"
+                report = Path(directory) / "report.xml"
+                valid.write_text(
+                    f"<testsuites><testsuite>{completed}</testsuite></testsuites>"
+                )
+                report.write_text(
+                    f"<testsuites><testsuite>{case}</testsuite></testsuites>"
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(VERIFY.__file__)),
+                        "reports",
+                        str(valid),
+                        str(report),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+
+    def test_reports_command_requires_reports(self):
+        with patch.object(sys, "argv", [VERIFY.__file__, "reports"]):
+            with self.assertRaisesRegex(RuntimeError, "at least one test report"):
+                VERIFY.cli()
 
 
 class BuildDirectoryTest(unittest.TestCase):
@@ -307,29 +352,23 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
         event = E2E_WORKFLOW.get("on", E2E_WORKFLOW.get(True))
         self.assertEqual(event["pull_request_target"]["types"], ["labeled"])
         self.assertNotIn("synchronize", event["pull_request_target"]["types"])
-        self.assertIn("run-e2e-ci", jobs["xpu-authorize"]["if"])
-        self.assertIn("workflow_dispatch", jobs["xpu-authorize"]["if"])
+        self.assertNotIn("xpu-authorize", jobs)
+        self.assertIn("run-e2e-ci", jobs["build-wheel-xpu"]["if"])
+        self.assertIn("workflow_dispatch", jobs["build-wheel-xpu"]["if"])
         self.assertTrue(E2E_WORKFLOW["concurrency"]["cancel-in-progress"])
         self.assertFalse((ROOT / ".github/workflows/xpu-core.yml").exists())
-        self.assertEqual(
-            jobs["xpu-authorize"]["steps"][0]["env"],
-            {
-                "PR_NUMBER": "${{ inputs.pr_number }}",
-                "CHECKOUT_SHA": "${{ inputs.pr_sha }}",
-            },
-        )
-        self.assertEqual(jobs["build-wheel-xpu"]["needs"], "xpu-authorize")
+        self.assertNotIn("needs", jobs["build-wheel-xpu"])
         self.assertEqual(
             jobs["build-wheel-xpu"]["with"]["checkout_ref"],
-            "${{ needs.xpu-authorize.outputs.sha }}",
+            "${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}",
         )
         self.assertEqual(
             jobs["xpu-integration-test"]["needs"],
-            ["xpu-authorize", "build-wheel-xpu"],
+            "build-wheel-xpu",
         )
         self.assertEqual(
             jobs["xpu-integration-test"]["with"]["checkout_sha"],
-            "${{ needs.xpu-authorize.outputs.sha }}",
+            "${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}",
         )
         for name in (
             "artifact_id",
@@ -375,16 +414,12 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
                 "integration-test",
                 "rocm-integration-test",
                 "integration-test-tent",
-                "xpu-authorize",
                 "build-wheel-xpu",
                 "xpu-integration-test",
             },
         )
         self.assertIn("always()", jobs["e2e-gate"]["if"])
-        self.assertEqual(
-            jobs["e2e-gate"]["permissions"]["checks"],
-            "write",
-        )
+        self.assertNotIn("permissions", jobs["e2e-gate"])
         self.assertNotIn("continue-on-error", jobs["e2e-gate"]["steps"][0])
         self.assertEqual(jobs["cleanup-label"]["needs"], ["e2e-gate"])
         integration = yaml.safe_load(
@@ -404,176 +439,9 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
             )
         )
 
-    def run_javascript(self, job, environment, state):
-        script = next(
-            step["with"]["script"]
-            for step in E2E_WORKFLOW["jobs"][job]["steps"]
-            if "script" in step.get("with", {})
-        )
-        harness = r"""
-        const state = JSON.parse(process.env.TEST_STATE);
-        const context = {
-          repo: {owner: 'owner', repo: 'repo'}, actor: 'maintainer',
-          ref: state.ref || 'refs/heads/main', eventName: state.event || 'workflow_dispatch',
-          sha: state.sha || 'c'.repeat(40),
-          payload: state.payload || {}, serverUrl: 'https://github.com', runId: 123
-        };
-        const outputs = {};
-        const core = {
-          setOutput: (key, value) => outputs[key] = value,
-          setFailed: message => { throw new Error(message); },
-          summary: {addRaw() {return this;}, async write() {}}
-        };
-        const github = {rest: {
-          repos: {
-            getCollaboratorPermissionLevel: async () => ({data: {permission: state.permission || 'write'}}),
-            getCommit: async ({ref}) => ({data: {sha: state.commit || ref}})
-          },
-          pulls: {get: async () => ({data: {
-            state: state.pullState || 'open', base: {ref: state.base || 'main'},
-            head: {sha: state.head}
-          }})},
-          checks: {
-            create: async request => { outputs.created = request; return {data: {id: 456}}; },
-            update: async request => { outputs.check = request; }
-          }
-        }};
-        (async () => {
-        SCRIPT
-        })().then(() => console.log(JSON.stringify(outputs)))
-          .catch(error => {
-            console.log(JSON.stringify(outputs));
-            console.error(error.message);
-            process.exitCode = 1;
-          });
-        """
-        return subprocess.run(
-            ["node", "-e", harness.replace("SCRIPT", script)],
-            env={**os.environ, **environment, "TEST_STATE": json.dumps(state)},
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-    def test_authorization_and_stale_head(self):
-        sha = "a" * 40
-        environment = {"PR_NUMBER": "1", "CHECKOUT_SHA": sha}
-        for state, valid in (
-            ({"head": sha}, True),
-            ({"head": sha, "permission": "maintain"}, True),
-            ({"head": sha, "permission": "admin"}, True),
-            ({"head": sha, "permission": "read"}, False),
-            ({"head": "b" * 40}, False),
-            ({"head": sha, "ref": "refs/heads/untrusted"}, False),
-            ({"head": sha, "pullState": "closed"}, False),
-            ({"head": sha, "base": "release"}, False),
-            ({"head": sha, "commit": "b" * 40}, False),
-            (
-                {
-                    "head": sha,
-                    "event": "pull_request_target",
-                    "payload": {"pull_request": {"number": 1, "head": {"sha": sha}}},
-                },
-                True,
-            ),
-            (
-                {
-                    "head": sha,
-                    "event": "pull_request_target",
-                    "payload": {
-                        "pull_request": {"number": 1, "head": {"sha": "b" * 40}}
-                    },
-                },
-                False,
-            ),
-        ):
-            with self.subTest(state=state):
-                result = self.run_javascript("xpu-authorize", environment, state)
-                self.assertEqual(result.returncode == 0, valid, result.stderr)
-                if valid:
-                    outputs = json.loads(result.stdout)
-                    self.assertEqual(outputs["sha"], sha)
-                    self.assertEqual(outputs["created"]["head_sha"], sha)
-
-    def test_dispatch_revision_selection(self):
-        sha = "a" * 40
-        for environment, state, expected in (
-            ({"PR_NUMBER": "", "CHECKOUT_SHA": ""}, {"sha": sha}, sha),
-            ({"PR_NUMBER": "", "CHECKOUT_SHA": sha}, {}, sha),
-            ({"PR_NUMBER": "1", "CHECKOUT_SHA": ""}, {"head": sha}, sha),
-            ({"PR_NUMBER": "", "CHECKOUT_SHA": "main"}, {}, None),
-            ({"PR_NUMBER": "01", "CHECKOUT_SHA": sha}, {}, None),
-            (
-                {"PR_NUMBER": "", "CHECKOUT_SHA": ""},
-                {"ref": "refs/heads/untrusted", "sha": sha},
-                None,
-            ),
-        ):
-            with self.subTest(environment=environment, state=state):
-                result = self.run_javascript("xpu-authorize", environment, state)
-                self.assertEqual(
-                    result.returncode == 0, expected is not None, result.stderr
-                )
-                if expected is not None:
-                    self.assertEqual(json.loads(result.stdout)["sha"], expected)
-
-    def test_gate_requires_success_and_current_head(self):
-        sha = "a" * 40
-        for job in ("xpu-authorize", "build-wheel-xpu", "xpu-integration-test"):
-            for status in ("success", "failure", "cancelled", "skipped", "missing"):
-                needs = {
-                    "xpu-authorize": {
-                        "result": "success",
-                        "outputs": {"sha": sha, "pr": "1", "check_id": "456"},
-                    },
-                    "build-wheel-xpu": {
-                        "result": "success",
-                        "outputs": {"source_sha": sha},
-                    },
-                    "xpu-integration-test": {"result": "success"},
-                }
-                if status == "missing":
-                    del needs[job]
-                else:
-                    needs[job]["result"] = status
-                for head in (sha, "b" * 40):
-                    with self.subTest(job=job, status=status, head=head):
-                        completed = self.run_javascript(
-                            "e2e-gate",
-                            {"NEEDS_JSON": json.dumps(needs)},
-                            {"head": head},
-                        )
-                        valid = status == "success" and head == sha
-                        self.assertEqual(
-                            completed.returncode == 0, valid, completed.stderr
-                        )
-                        if job != "xpu-authorize" or status == "success":
-                            check = json.loads(completed.stdout)["check"]
-                            self.assertEqual(
-                                check["conclusion"], "success" if valid else "failure"
-                            )
-
-    def test_gate_rejects_mismatched_or_missing_build_sha(self):
-        sha = "a" * 40
-        for build_outputs in ({}, {"source_sha": "b" * 40}):
-            needs = {
-                "xpu-authorize": {
-                    "result": "success",
-                    "outputs": {"sha": sha, "pr": "1", "check_id": "456"},
-                },
-                "build-wheel-xpu": {"result": "success", "outputs": build_outputs},
-                "xpu-integration-test": {"result": "success"},
-            }
-            with self.subTest(build_outputs=build_outputs):
-                result = self.run_javascript(
-                    "e2e-gate", {"NEEDS_JSON": json.dumps(needs)}, {"head": sha}
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("build SHA differs", result.stderr)
-
     def test_shared_gate_still_checks_other_platforms(self):
         steps = E2E_WORKFLOW["jobs"]["e2e-gate"]["steps"]
-        self.assertEqual(steps[0]["uses"], "actions/github-script@v7")
+        self.assertEqual(len(steps), 1)
         step = next(step for step in steps if step["name"] == "Check E2E results")
         script = re.sub(r"\$\{\{.*?\}\}", "fixture", step["run"])
         for status in ("success", "failure", "cancelled", "skipped"):

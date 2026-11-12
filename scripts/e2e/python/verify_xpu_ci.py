@@ -23,8 +23,37 @@ import zipfile
 
 from verify_rocm_wheel import find_extension_record, record_digest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ci"))
-validate_report = importlib.import_module("check_test_reports").validate_report
+
+def validate_report(
+    path: str | Path,
+    expected: set[str] | None = None,
+    require_gtest_status: bool = False,
+) -> None:
+    report = Path(path)
+    cases = ET.parse(report).findall(".//testcase")
+    if not cases:
+        raise RuntimeError(f"{report}: no tests executed")
+    if expected is not None:
+        identities = [f"{case.get('classname')}.{case.get('name')}" for case in cases]
+        if len(identities) != len(expected) or set(identities) != expected:
+            raise RuntimeError(f"{report}: test identity mismatch: {identities}")
+    for case in cases:
+        status = case.get("status")
+        result = case.get("result")
+        skipped = case.find("skipped") is not None or (status, result) in {
+            ("run", "skipped"),
+            ("notrun", "suppressed"),
+        }
+        if any(case.find(tag) is not None for tag in ("failure", "error")):
+            raise RuntimeError(f"{report}: test did not pass: {case.attrib}")
+        if skipped:
+            raise RuntimeError(f"{report}: test was skipped: {case.attrib}")
+        if require_gtest_status:
+            completed = (status, result) == ("run", "completed")
+        else:
+            completed = status in (None, "run") and result in (None, "completed")
+        if not completed:
+            raise RuntimeError(f"{report}: test did not pass: {case.attrib}")
 
 
 def main() -> None:
@@ -693,6 +722,10 @@ def cli() -> None:
         store_test(*(Path(arg) for arg in args))
     elif mode == "seccomp":
         prepare_seccomp(Path(args[0]))
+    elif mode == "reports":
+        require(bool(args), "Expected at least one test report")
+        for report in args:
+            validate_report(report, require_gtest_status=True)
     else:
         raise RuntimeError(f"Unknown XPU verification command: {mode}")
 

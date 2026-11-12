@@ -136,7 +136,7 @@ jobs:
             --gtest_output=xml:xpu-ci-output/reports/ep.xml
           "$BUILD_DIR/mooncake-store/tests/crc32c_test" \
             --gtest_output=xml:xpu-ci-output/reports/crc32c.xml
-          python scripts/ci/check_test_reports.py --require-gtest-status \
+          python scripts/e2e/python/verify_xpu_ci.py reports \
             xpu-ci-output/reports/config.xml \
             xpu-ci-output/reports/ep.xml \
             xpu-ci-output/reports/crc32c.xml

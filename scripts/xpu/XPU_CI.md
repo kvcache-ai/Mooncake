@@ -1,9 +1,9 @@
-# XPU hardware core (Stage 2)
+# XPU CI
 
-Stage 1 builds a CPython 3.12 wheel and matching native tests on hosted CPU
-runners. Stage 2 consumes that exact artifact on a fixed two-B60 allocation.
-It does not build while holding GPUs, use models, publish wheels, or enable
-nightly hardware/application coverage (Stage 3).
+The hosted build creates a CPython 3.12 wheel and matching native tests on CPU
+runners. The hardware job consumes that exact artifact on a fixed two-B60
+allocation. It does not build while holding GPUs, use models, publish wheels,
+or run nightly hardware/application tests.
 
 ## Runner contract
 
@@ -58,7 +58,7 @@ EP's oneCCL KVS also excludes loopback during automatic discovery, so CI sets
 additional runner-service settings. XCCL and the native Level Zero IPC fast
 path remain enabled; no network access or fallback-only coverage is introduced.
 
-The runtime uses the same digest-pinned Intel PyTorch image as Stage 1.
+The runtime uses the same digest-pinned Intel PyTorch image as the hosted build.
 Provision compatible Intel GPU drivers and matching SYCL/Level Zero runtimes;
 dependency loading, wheel RECORD/native capabilities, and real GPU arithmetic
 are checked before the suites. The hosted builder also downloads the wheel's
@@ -70,18 +70,19 @@ Level Zero runtime is added to the Mooncake wheel.
 
 ## Trigger and revision binding
 
-After these workflows are available on upstream `main`, a maintainer with
-write/maintain/admin permission can add `run-e2e-ci` to an open PR targeting
-`main`. The shared **E2E CI** entry point runs XPU alongside the existing ROCm,
+After these workflows are available on upstream `main`, adding `run-e2e-ci`
+to a PR targeting `main` triggers the shared **E2E CI** entry point.
+It runs XPU alongside the existing ROCm,
 Ascend and other integration jobs; XPU is required, not an optional selection.
 The existing E2E label cleanup removes the label after the gate; add it again
-to rerun. A new PR head needs new authorization; leaving the label attached
-does not authorize later pushes.
+to rerun. Leaving the label attached does not trigger runs on later pushes.
+Execution permissions and hardware access are managed through GitHub settings,
+not custom workflow authorization logic.
 
-Alternatively dispatch **E2E CI** on trusted `main`, supplying `pr_number`
-(current head) and optionally `pr_sha` (must match), or a full 40-character
-`pr_sha` without a PR. With neither input, XPU tests the dispatch's `main`
-commit. No branch names or implicit latest artifacts are accepted.
+Alternatively dispatch **E2E CI**, supplying a full 40-character `pr_sha`
+to test a specific revision. `pr_number` alone does not select a PR revision.
+Without `pr_sha`, XPU tests the dispatch's commit. Label-triggered runs use
+the PR head SHA from the GitHub event.
 Fork PR heads are supported through their commit SHA.
 
 The hosted builder receives that exact SHA. Hardware downloads its artifact
@@ -89,14 +90,13 @@ by ID in the same run and verifies the API identity, run/attempt, ZIP digest,
 payload/native hashes, source/image provenance, and build/runtime inventories.
 The host runs the trusted workflow-revision harness, not PR host scripts.
 
-The shared `E2E Gate` requires XPU authorization, build, hardware tests and
-cleanup to succeed. Its hosted-only XPU step publishes the `XPU Core` check
-on the authorized commit, rechecking the PR head and build SHA before success.
-Failed, cancelled, skipped, missing or stale required XPU results cannot pass.
-The existing E2E concurrency policy cancels older runs for the same PR;
-an interrupted controller can leave an in-progress check, never a successful
-check. Other platforms retain their existing jobs and gate policy.
-The normal Stage 1 hosted build remains independent and required by the
+The shared `E2E Gate` includes the XPU build and hardware job results using
+the existing gate policy. Cleanup failure fails the hardware job.
+Results are reported through the standard GitHub Actions job checks; there
+is no separately published `XPU Core` check or PR-head API lookup.
+The existing E2E concurrency policy cancels older runs for the same PR.
+Other platforms retain their existing jobs and gate policy.
+The normal hosted build remains independent and required by the
 existing PR CI gate. Nightly still builds only the XPU artifact, without
 running XPU hardware tests.
 
@@ -138,19 +138,16 @@ after failure or cancellation.
 CPU-only regression validation:
 
 ```sh
-python3 -m unittest scripts.ci.tests.test_xpu_ci \
-  scripts.ci.tests.test_run_ctest -v
+python3 -m unittest scripts.ci.tests.test_xpu_ci -v
 ```
 
 XPU CI regressions share one test module and common workflow/module loaders;
 they validate packaging and orchestration contracts, not actual B60 behavior.
-Shared XML report validation lives in `scripts/ci/check_test_reports.py`.
+XPU XML report validation lives in `scripts/e2e/python/verify_xpu_ci.py`.
 Both the hosted XPU tests and hardware suites require GoogleTest's explicit
 `run`/`completed` status and reject skipped cases. Hardware suites additionally
-pass their expected case identities to the same validator. The shared CTest
-action and TENT CI also use it for JUnit reports, preserving CTest's existing
-skip policy via `--allow-skipped`. Targeted CTest steps without XML reports
-retain their native exit-code and `--no-tests=error` checks.
+pass their expected case identities to the same validator. Shared CTest and
+TENT CI retain their existing report and exit-code behavior.
 
 Docker launch, device mapping, traps and cleanup are inline in
 `.github/workflows/integration-test-xpu.yml`. A temporary cleanup helper is
@@ -159,7 +156,8 @@ the exit trap and the `always()` cleanup recheck; it is not mounted into the
 test container.
 
 `scripts/e2e/python/verify_xpu_ci.py` is the single verification entry point:
-no arguments retain the hosted wheel smoke checks; `unpack` verifies the
+no arguments retain the hosted wheel smoke checks; `reports <XML...>` validates
+host-side GoogleTest reports with strict status checks, `unpack` verifies the
 downloaded artifact, `seccomp` prepares the pinned profile, and `run` installs
 the wheel offline and launches the `suite`/`store` hardware checks. There are
 no separate XPU runtime scripts under `scripts/ci/`.
