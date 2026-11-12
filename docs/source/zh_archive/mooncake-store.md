@@ -20,7 +20,7 @@ Mooncake Store 的主要特性包括：
 
 ## 架构
 
-![architecture](../../image/mooncake-store-preview.png)
+![architecture](../image/mooncake-store-preview.png)
 
 如上图所示，Mooncake Store 中有两个关键组件：**Master Service** 和 **Client**。
 
@@ -77,7 +77,7 @@ tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
-![mooncake-store-simple-get](../../image/mooncake-store-simple-get.png)
+![mooncake-store-simple-get](../image/mooncake-store-simple-get.png)
 
 `Get` 将 `object_key` 对应的值写入到提供的 `slices` 中。返回的数据保证完整且正确。每个 slice 必须指向通过 `registerLocalMemory(addr, len)` 预先注册的本地 DRAM/VRAM 内存空间（而不是贡献给分布式内存池的全局 segment）。当开启持久化功能并且在分布式内存池中未找到请求的数据时，`Get` 会回退到从 SSD 加载数据。
 
@@ -89,7 +89,7 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
                                   const ReplicateConfig& config);
 ```
 
-![mooncake-store-simple-put](../../image/mooncake-store-simple-put.png)
+![mooncake-store-simple-put](../image/mooncake-store-simple-put.png)
 
 `Put` 将 `key` 对应的值存储到分布式内存池中。通过 `config` 参数，可以指定所需的副本数量以及优先选择哪个 segment 用于存储该值。当启用持久化功能时，`Put` 还会异步地将数据持久化到 SSD。
 
