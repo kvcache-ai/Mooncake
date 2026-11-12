@@ -461,15 +461,6 @@ int P2PMaster::RunWithHA() {
                              "wait";
                 return 0;
             }
-#ifdef STORE_USE_REDIS
-            if (config_.ha.election_backend == ElectionBackend::REDIS &&
-                !WaitForP2PElectionPriority(config_, master_instance_id,
-                                            *standby, not_stopping)) {
-                LOG(INFO) << "HA shutdown requested during election priority "
-                             "wait";
-                return 0;
-            }
-#endif
         }
 
         LOG(INFO) << "Trying to elect self as leader...";

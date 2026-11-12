@@ -1,26 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <string>
-#include <vector>
 
 #include "p2p/ha/p2p_election_readiness.h"
 
 namespace mooncake {
 namespace {
-
-#ifdef STORE_USE_REDIS
-P2PElectionPriorityCandidate MakePriorityCandidate(
-    std::string instance_id, std::string master_endpoint, std::string role,
-    uint64_t applied_sequence_id) {
-    P2PElectionPriorityCandidate candidate;
-    candidate.instance_id = std::move(instance_id);
-    candidate.master_endpoint = std::move(master_endpoint);
-    candidate.role = std::move(role);
-    candidate.applied_sequence_id = applied_sequence_id;
-    return candidate;
-}
-#endif
 
 TEST(P2PElectionStandbyLagTest, WaitsForUnknownLatest) {
     auto unknown = EvaluateP2PElectionStandbyLag(
@@ -97,36 +82,6 @@ TEST(P2PElectionStandbyReadinessTest, AllowsEmptyClusterStartup) {
     EXPECT_FALSE(empty_cluster.should_wait);
     EXPECT_EQ(empty_cluster.lag_entries, 0U);
 }
-
-#ifdef STORE_USE_REDIS
-TEST(P2PElectionPriorityTest, YieldsToHigherAppliedStandby) {
-    auto decision = EvaluateP2PElectionPriority(
-        {MakePriorityCandidate("standby-low", "10.0.0.2:50051", "standby", 90),
-         MakePriorityCandidate("standby-high", "10.0.0.3:50051", "standby",
-                               120),
-         MakePriorityCandidate("primary-high", "10.0.0.4:50051", "primary",
-                               200)},
-        "self", "10.0.0.1:50051", 100);
-
-    EXPECT_TRUE(decision.should_yield);
-    EXPECT_EQ(decision.candidate.instance_id, "standby-high");
-    EXPECT_EQ(decision.candidate.master_endpoint, "10.0.0.3:50051");
-    EXPECT_EQ(decision.candidate.applied_sequence_id, 120U);
-}
-
-TEST(P2PElectionPriorityTest, IgnoresSelfAndNonStandbyCandidates) {
-    auto decision = EvaluateP2PElectionPriority(
-        {MakePriorityCandidate("previous-self", "10.0.0.1:50051", "standby",
-                               200),
-         MakePriorityCandidate("primary-high", "10.0.0.4:50051", "primary",
-                               300),
-         MakePriorityCandidate("standby-equal", "10.0.0.5:50051", "standby",
-                               100)},
-        "new-self", "10.0.0.1:50051", 100);
-
-    EXPECT_FALSE(decision.should_yield);
-}
-#endif
 
 }  // namespace
 }  // namespace mooncake
