@@ -13,6 +13,8 @@
 #include <future>
 #include <cstdlib>
 
+#include "common/network.h"
+
 #define private public
 #define protected public
 #include "p2p/client/data_manager/v1/data_manager_v1.h"
@@ -20,6 +22,7 @@
 #include "topology.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "common/client_buffer_allocation.h"
 #include "utils.h"
 #include "p2p/client/task_handle.h"
 #include <async_simple/coro/FutureAwaiter.h>

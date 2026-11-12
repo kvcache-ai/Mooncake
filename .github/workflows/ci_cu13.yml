@@ -1,6 +1,8 @@
 # Build CUDA 13 wheels for both Store architectures.
 # TODO(UPG-003.1/UPG-004.1): Replace this workflow with the shared CUDA 13
 # wheel profile and toolchain, preserving the Store architecture dimension.
+# Follow the shared-wheel deferral in ci.yml: F01-T118 / UPG1-F22-B02,
+# workflow integration in UPG1-F22-B04, and UPG2-F01-public-build providers.
 name: 'Build Wheel (CUDA 13)'
 
 on:
@@ -100,7 +102,8 @@ jobs:
           -DENABLE_SCCACHE=ON \
           -DBUILD_BENCHMARK=ON \
           -DUSE_CUDA=ON \
-          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+          -DPython3_EXECUTABLE="$(which python3)"
       shell: bash
 
     - name: Build project

@@ -10,8 +10,10 @@
 #include "allocator.h"
 #include "pyclient.h"
 #include "dummy_client.h"
+#include "shm_helper.h"
 #include "real_client.h"
 #include "types.h"
+#include "version.h"
 
 #include <cstdlib>  // for atexit
 #include <cstdint>
@@ -1559,7 +1561,7 @@ void BindP2PMethods(StoreBinding& store) {
                uint16_t client_rpc_port = 12345,
                uint32_t client_rpc_thread_num = 16,
                size_t lock_shard_count = 1024,
-               size_t route_cache_max_memory = 300 * 1024 * 1024,
+               size_t route_cache_max_memory = 0,
                uint64_t route_cache_ttl_ms = 60 * 1000,
                const std::string& local_transfer_mode = "te",
                size_t local_io_worker_num = 32, uint16_t http_port = 9003,
@@ -1613,7 +1615,7 @@ void BindP2PMethods(StoreBinding& store) {
             py::arg("master_server_addr"), py::arg("client_rpc_port") = 12345,
             py::arg("client_rpc_thread_num") = 16,
             py::arg("lock_shard_count") = 1024,
-            py::arg("route_cache_max_memory") = 300 * 1024 * 1024,
+            py::arg("route_cache_max_memory") = 0,
             py::arg("route_cache_ttl_ms") = 60 * 1000,
             py::arg("local_transfer_mode") = "te",
             py::arg("local_io_worker_num") = 32, py::arg("http_port") = 9003,
@@ -1667,7 +1669,8 @@ void BindP2PMethods(StoreBinding& store) {
             "  client_rpc_port: P2P RPC port (default 12345).\n"
             "  rpc_thread_num: P2P RPC thread count (default 2).\n"
             "  lock_shard_count: Key lock shard count (default 1024).\n"
-            "  route_cache_max_memory_bytes: Route cache max memory in bytes.\n"
+            "  route_cache_max_memory_bytes: Route cache max memory in bytes "
+            "(default 0, disabled).\n"
             "  route_cache_ttl_ms: Route cache TTL in ms.\n"
             "  local_transfer_mode: Local transfer mode, 'te' or 'memcpy' "
             "(default 'te').\n"
@@ -1926,7 +1929,9 @@ void BindCentralizedMethods(StoreBinding& store) {
 
 }  // namespace
 
-PYBIND11_MODULE(store, m) {
+PYBIND11_MODULE(_store, m) {
+    m.attr("_store_architecture") = MOONCAKE_STORE_ARCHITECTURE;
+
     BindCommonTypes(m);
 
     StoreBinding store(m, "MooncakeDistributedStore");

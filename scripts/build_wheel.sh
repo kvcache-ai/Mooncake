@@ -8,11 +8,34 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
-BUILD_DIR=${BUILD_DIR:-build}
 # Get Python version from environment variable or argument
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
+# CMake build directory containing the selected Store architecture.
+BUILD_DIR="${BUILD_DIR:-build}"
+BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+if [ ! -f "${BUILD_DIR}/CMakeCache.txt" ]; then
+    echo "Error: missing ${BUILD_DIR}/CMakeCache.txt" >&2
+    exit 1
+fi
+
+# Only Store enablement and architecture need to be read for identity checks.
+STORE_ENABLED=$(sed -n 's/^WITH_STORE:[^=]*=//p' "${BUILD_DIR}/CMakeCache.txt")
+case "${STORE_ENABLED^^}" in
+    "")
+        echo "Error: WITH_STORE is missing from ${BUILD_DIR}/CMakeCache.txt" >&2
+        exit 1
+        ;;
+    0|OFF|NO|FALSE|N|IGNORE|NOTFOUND|*-NOTFOUND) STORE_ENABLED=OFF ;;
+    *) STORE_ENABLED=ON ;;
+esac
+STORE_CHECK_OPTIONS=(--with-store "$STORE_ENABLED")
+if [ "$STORE_ENABLED" = "ON" ]; then
+    STORE_ARCHITECTURE=$(sed -n 's/^MOONCAKE_STORE_CLIENT_ARCH:[^=]*=//p' "${BUILD_DIR}/CMakeCache.txt")
+    STORE_CHECK_OPTIONS+=(--expected-architecture "$STORE_ARCHITECTURE")
+fi
+
 # Detect CUDA version (env wins, then nvcc, then /usr/local/cuda/version.txt, else 0.0)
 CUDA_VERSION=${CUDA_VERSION:-$(nvcc --version 2>/dev/null | grep -o "release [0-9][0-9]*\.[0-9]*" | awk '{print $2}' || true)}
 if [ -z "$CUDA_VERSION" ] && [ -f /usr/local/cuda/version.txt ]; then
@@ -23,7 +46,7 @@ echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT
 echo "Detected CUDA version ${CUDA_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-asio:${BUILD_DIR_ABS}/mooncake-common/etcd:${BUILD_DIR_ABS}/mooncake-common/k8s-lease:${BUILD_DIR_ABS}/ep_pg_staging:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -37,19 +60,22 @@ echo "Creating directory structure..."
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp "${BUILD_DIR}"/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
-# Copy store.so to mooncake directory
-if [ -f "${BUILD_DIR}"/mooncake-integration/store.*.so ]; then
-    echo "Copying store.so..."
-    cp "${BUILD_DIR}"/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+# The current Asio provider still lives in mooncake-asio (F01-T113).
+cp "${BUILD_DIR}/mooncake-asio/libasio.so" mooncake-wheel/mooncake/libasio.so
+
+# Copy the private C++ Store extension to the mooncake package.
+if compgen -G "${BUILD_DIR}/mooncake-integration/_store.*.so" >/dev/null; then
+    echo "Copying _store extension..."
+    cp "${BUILD_DIR}"/mooncake-integration/_store.*.so mooncake-wheel/mooncake/
     echo "Copying master binary..."
     # Copy master binary
     cp "${BUILD_DIR}/mooncake-store/src/mooncake_master" mooncake-wheel/mooncake/
     # Copy client binary
     cp "${BUILD_DIR}/mooncake-store/src/mooncake_client" mooncake-wheel/mooncake/
-    # Copy async_store.py
-    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
+    # Stage the canonical async Store client for the legacy wheel builder.
+    cp python/mooncake/async_store.py mooncake-wheel/mooncake/async_store.py
 else
-    echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
+    echo "Skipping _store extension (not built - likely WITH_STORE is set to OFF)"
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -58,7 +84,14 @@ if [ -f "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" ]; then
     cp "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" mooncake-wheel/mooncake/libmooncake_store.so
 fi
 
-# Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
+# Copy libmooncake_common.so (only when BUILD_SHARED_LIBS is set).
+if [ -f "${BUILD_DIR}/mooncake-common/src/libmooncake_common.so" ]; then
+    echo "Copying libmooncake_common.so..."
+    cp "${BUILD_DIR}/mooncake-common/src/libmooncake_common.so" mooncake-wheel/mooncake/libmooncake_common.so
+fi
+
+# F01-T117 adds the K8s lease runtime alongside its actual enabled backend.
+# Copy the Go etcd runtime used by TE metadata or Store HA.
 if [ -f "${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so" ]; then
     echo "Copying libetcd_wrapper.so..."
     cp "${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so" mooncake-wheel/mooncake/libetcd_wrapper.so
@@ -102,7 +135,11 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
+python${PYTHON_VERSION} mooncake-wheel/setup.py --check-store-artifacts \
+    mooncake-wheel/mooncake "${STORE_CHECK_OPTIONS[@]}"
+
 if [ "$BUILD_WITH_EP" = "1" ]; then
+    # F01-T113 replaces this legacy EP/PG build with U's real CMake/JIT staging.
     echo "Building Mooncake EP"
     cd mooncake-ep
     if [ -z "$EP_TORCH_VERSIONS" ]; then
@@ -145,33 +182,105 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
 fi
 
 echo "Building wheel package..."
+# Stage migrated Python modules from their canonical source tree.
+MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
+MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
+STORE_FACADE_SOURCE_DIR="python/mooncake/store"
+STORE_FACADE_STAGING_DIR="${MIGRATED_PYTHON_STAGING_DIR}/store"
+MIGRATED_PYTHON_INIT_BACKUP=""
+# Pending sources: F01-T110 (pools), F01-T114 (structured/ranges/fast-copy),
+# F01-T115 (CLI/config), F01-T116 (NoF), and F01-T113 (TE/EP/Reshard).
+MIGRATED_PYTHON_MODULES=(
+    __init__.py
+    py.typed
+    _launcher.py
+)
+cleanup_migrated_python_staging() {
+    for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+        if [ "${module}" = "__init__.py" ]; then
+            continue
+        fi
+        rm -f "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+    done
+    if [ -n "${MIGRATED_PYTHON_INIT_BACKUP}" ]; then
+        cp "${MIGRATED_PYTHON_INIT_BACKUP}" "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py"
+        rm -f "${MIGRATED_PYTHON_INIT_BACKUP}"
+        MIGRATED_PYTHON_INIT_BACKUP=""
+    fi
+    rm -rf "${STORE_FACADE_STAGING_DIR}"
+}
+trap cleanup_migrated_python_staging EXIT
+cleanup_migrated_python_staging
+MIGRATED_PYTHON_INIT_BACKUP=$(mktemp)
+cp "${MIGRATED_PYTHON_STAGING_DIR}/__init__.py" "${MIGRATED_PYTHON_INIT_BACKUP}"
+for module in "${MIGRATED_PYTHON_MODULES[@]}"; do
+    cp "${MIGRATED_PYTHON_SOURCE_DIR}/${module}" \
+       "${MIGRATED_PYTHON_STAGING_DIR}/${module}"
+done
+cp -R "${STORE_FACADE_SOURCE_DIR}" "${STORE_FACADE_STAGING_DIR}"
+
 # Build the wheel package
 cd mooncake-wheel
 
-# Handle package name modification for non-CUDA builds
+# Materialize a local copy of the root README.md so that
+# `readme = "README.md"` resolves inside this directory. Modern
+# setuptools rejects `../`-traversal in the readme path. The file is
+# removed by the EXIT trap below.
+cp ../README.md README.md
+
+WHEEL_DIR="$(pwd)"
+cleanup_wheel_metadata_state() {
+    [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
+    rm -f "${WHEEL_DIR}/README.md"
+    cleanup_migrated_python_staging
+}
+trap cleanup_wheel_metadata_state EXIT
+
+# TODO(F01-T118, replace-in=UPG1-F22-B02): Receive U's release variants and
+# platform-specific tool invocation, external-library exclusions, and NPU ELF
+# repair with supported providers. Owner: F22-B02; resolve Python-floor policy
+# explicitly and validate each approved platform instead of copying flags.
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD"
+BUILD_VARIANT_COUNT=0
+for build_variant in $BUILD_VARIANTS; do
+    if [ "${!build_variant}" = "1" ]; then
+        BUILD_VARIANT_COUNT=$((BUILD_VARIANT_COUNT + 1))
+    fi
+done
+if [ "$BUILD_VARIANT_COUNT" -gt 1 ]; then
+    echo "Error: only one of $BUILD_VARIANTS can be set"
+    exit 1
+fi
+
+# If a previous run was interrupted before the trailing restore (line ~481),
+# pyproject.toml is left in a renamed state and pyproject.toml.backup holds the
+# pristine original. Restore it first so the variant rename below always starts
+# from the clean file and the backup is never overwritten with modified content.
+if [ -f pyproject.toml.backup ]; then
+    echo "Restoring pyproject.toml from leftover backup of a previous run"
+    mv pyproject.toml.backup pyproject.toml
+fi
+
+# Handle package name modification for release build variants
 if [ "$NON_CUDA_BUILD" = "1" ]; then
     echo "Modifying package name for non-CUDA build"
     # Backup original pyproject.toml
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-non-cuda"/' pyproject.toml
-    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Non-CUDA version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "non-cuda"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Non-CUDA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "non-cuda"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA", ||' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-non-cuda"
-else
-    echo "Using standard package name: mooncake-transfer-engine"
-fi
-
-# Handle package name modification for CU13 builds
-if [ "$CU13_BUILD" = "1" ]; then
+elif [ "$CU13_BUILD" = "1" ]; then
     echo "Modifying package name for CU13 build"
     # Backup original pyproject.toml
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
-    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cu13"/' pyproject.toml
-    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (CUDA 13 version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cu13"]/' pyproject.toml
-    echo "Package name modified to: mooncake-transfer-engine-cu13"
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cuda13"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (CUDA 13 version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "cuda13"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-cuda13"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
@@ -181,17 +290,20 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
-pip install --upgrade pip
-# TEMPORARY FIX: auditwheel 6.8.0 corrupts the wheel when used with
-# patchelf < 0.14.4 (upstream pypa/auditwheel#722, fixed in patchelf 0.14.4).
-# The ubuntu-22.04 CI runner only ships patchelf 0.14.3, producing wheels that
-# fail to import with "libgflags.so.2.2: cannot open shared object file".
-# Pin auditwheel to 6.7.0 until the CI wheel is built inside the manylinux
-# container (pytorch/manylinux2_28-builder, patchelf >= 0.14.4), i.e. once
-# ci.yml's test-wheel-ubuntu consumes the build-wheel/mooncake-wheel-ci
-# artifact (main commits #3137 + #3283, first released after v0.3.12).
-# Keep this pin through the v0.3.10 / v0.3.11 / v0.3.12 merges.
-pip install build setuptools wheel "auditwheel==6.7.0"
+# patchelf is installed from PyPI alongside auditwheel: auditwheel >= 6.8
+# requires patchelf >= 0.14.5, but the distro package on Ubuntu 22.04 (and the
+# rocm/musa CI images built on it) is 0.14.3, which makes `auditwheel repair`
+# abort. The PyPI wheel lands ahead of /usr/bin on PATH and works everywhere
+# the Python toolchain does.
+if command -v pip &>/dev/null; then
+    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel patchelf
+elif command -v uv &>/dev/null; then
+    uv pip install --upgrade pip
+    uv pip install build setuptools wheel auditwheel patchelf
+else
+    echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
+    exit 1
+fi
 
 # Create directory for repaired wheels
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
@@ -251,114 +363,14 @@ echo "Detected architecture: $ARCH_SUFFIX"
 echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
-if [ "$PYTHON_VERSION" = "3.8" ]; then
-    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
+echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
+python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
+AUDITWHEEL_CMD="auditwheel"
 
-    echo "python 3.8 auditwheel does not support wild-cards..."
-    PATTERNS=(
-        "libcurl.so*"
-        "libibverbs.so*"
-        "libmlx5.so*"
-        "libnuma.so*"
-        "libstdc++.so*"
-        "libgcc_s.so*"
-        "libc.so*"
-        "libnghttp2.so*"
-        "libidn2.so*"
-        "librtmp.so*"
-        "libssh.so*"
-        "libpsl.so*"
-        "libssl.so*"
-        "libcrypto.so*"
-        "libgssapi_krb5.so*"
-        "libldap.so*"
-        "liblber.so*"
-        "libbrotlidec.so*"
-        "libz.so*"
-        "libnl-route-3.so*"
-        "libnl-3.so*"
-        "libm.so*"
-        "liblzma.so*"
-        "libunistring.so*"
-        "libgnutls.so*"
-        "libhogweed.so*"
-        "libnettle.so*"
-        "libgmp.so*"
-        "libkrb5.so*"
-        "libk5crypto.so*"
-        "libcom_err.so*"
-        "libkrb5support.so*"
-        "libsasl2.so*"
-        "libbrotlicommon.so*"
-        "libp11-kit.so*"
-        "libtasn1.so*"
-        "libkeyutils.so*"
-        "libresolv.so*"
-        "libffi.so*"
-        "libcuda.so*"
-        "libcudart.so*"
-        "libc10.so*"
-        "libc10_cuda.so*"
-        "libtorch.so*"
-        "libtorch_cpu.so*"
-        "libtorch_cuda.so*"
-        "libtorch_python.so*"
-        "libascendcl.so*"
-        "libhccl.so*"
-        "libmsprofiler.so*"
-        "libgert.so*"
-        "libascendcl_impl.so*"
-        "libge_executor.so*"
-        "libascend_dump.so*"
-        "libgraph.so*"
-        "libruntime.so*"
-        "libascend_watchdog.so*"
-        "libprofapi.so*"
-        "liberror_manager.so*"
-        "libascendalog.so*"
-        "libc_sec.so*"
-        "libhccl_alg.so*"
-        "libhccl_plf.so*"
-        "libascend_protobuf.so*"
-        "libhybrid_executor.so*"
-        "libdavinci_executor.so*"
-        "libge_common.so*"
-        "libge_common_base.so*"
-        "liblowering.so*"
-        "libregister.so*"
-        "libexe_graph.so*"
-        "libmmpa.so*"
-        "libplatform.so*"
-        "libgraph_base.so*"
-        "libruntime_common.so*"
-        "libqos_manager.so*"
-        "libascend_trace.so*"
-        "libmetadef*.so"
-        "libadxl*.so"
-    )
-
-    for pattern in "${PATTERNS[@]}"; do
-        for libpath in /usr/local/cuda* /usr/local/cuda-12.8/lib* /usr/lib* /usr/local/lib* /lib*; do
-            if [ -d "$libpath" ]; then
-                for lib in $(find $libpath -name "$pattern" 2>/dev/null); do
-                    # Get just the filename
-                    libname=$(basename "$lib")
-                    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude $libname "
-                done
-            fi
-        done
-    done
-
-    # Manually fix for libcuda since it needs libcuda.so.1 but I didn't get it.
-    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude libcuda.so.1 "
-
-    echo "Running auditwheel with exclude options: $EXCLUDE_OPTS"
-    auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
-else
-    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    python -m build --wheel --outdir ${OUTPUT_DIR}
-    auditwheel repair ${OUTPUT_DIR}/*.whl \
+# Bundle OpenSSL when required: the OSS adapter links libcrypto directly, and
+# target systems may not provide the OpenSSL ABI used by the wheel builder.
+# Keep libssl eligible too, so auditwheel can repair its libcrypto dependency.
+${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
@@ -371,8 +383,6 @@ else
     --exclude librtmp.so* \
     --exclude libssh.so* \
     --exclude libpsl.so* \
-    --exclude libssl.so* \
-    --exclude libcrypto.so* \
     --exclude libgssapi_krb5.so* \
     --exclude libldap.so* \
     --exclude liblber.so* \
@@ -441,8 +451,6 @@ else
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
-fi
-
 
 # Replace original wheel with repaired wheel
 rm -f ${OUTPUT_DIR}/*.whl

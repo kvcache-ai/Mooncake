@@ -21,7 +21,7 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "p2p/client/p2p_client_config_builder.h"
 #include "p2p/client/task_handle.h"
 #include "p2p/common/p2p_types.h"

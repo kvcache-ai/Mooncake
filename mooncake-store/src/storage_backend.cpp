@@ -16,6 +16,7 @@
 
 #include <ylt/struct_pb.hpp>
 
+#include "common/timestamp.h"
 #include "mutex.h"
 #include "utils.h"
 

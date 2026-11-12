@@ -9,7 +9,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include "utils.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 
 namespace mooncake {
 

@@ -13,7 +13,7 @@
 #include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 

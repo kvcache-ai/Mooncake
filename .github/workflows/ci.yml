@@ -1,5 +1,9 @@
 # TODO(UPG-003.1/UPG-004.1): Adopt shared wheel workflows and toolchains;
 # retain the separate P2P workflow.
+# Follow F01-T118 (owner/replace-in=UPG1-F22-B02) for U's wheel profiles
+# and toolchains, with workflow integration under UPG1-F22-B04. U's manylinux
+# builder requires the dependency installer/providers deferred to
+# UPG2-F01-public-build; the current installer only supports apt.
 name: 'Build & Test (Linux)'
 
 on:
@@ -90,7 +94,7 @@ jobs:
         mkdir build
         cd build
         # TODO(UPG-001.1): Enable STORE_USE_REDIS with centralized Redis support.
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DPARALLEL_LINK_JOBS=2
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DPARALLEL_LINK_JOBS=2 -DPython3_EXECUTABLE="$(which python3)"
       shell: bash
 
     - name: Build project
@@ -177,18 +181,6 @@ jobs:
           echo "✅ Coverage collected successfully"
         fi
 
-    - name: Generate Python version tag
-      id: generate_tag_build
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    - name: Build Python wheel
-      run: |
-        # Build wheel with specific Python version
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
   build-musa:
     if: >-
       github.event_name == 'push' ||
@@ -210,7 +202,7 @@ jobs:
         bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
+        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DPython3_EXECUTABLE="$(which python3)"
       shell: bash
 
     - name: Build project
@@ -251,7 +243,7 @@ jobs:
     - name: Verify wheel file exists
       run: |
         ls -la mooncake-wheel/dist/
-        if [ ! -f mooncake-wheel/dist/*.whl ]; then
+        if ! compgen -G "mooncake-wheel/dist/*.whl" >/dev/null; then
           echo "ERROR: No wheel file found in mooncake-wheel/dist/"
           exit 1
         fi
@@ -441,7 +433,7 @@ jobs:
         mkdir build
         cd build
         # TODO(UPG-001.1): Enable STORE_USE_REDIS with centralized Redis support.
-        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DPython3_EXECUTABLE="$(which python3)"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -515,6 +507,10 @@ jobs:
         name: mooncake-wheel-ubuntu-centralized-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
+  # TODO: During UPG1-F22-B04 (CI/nightly migration), move this legacy Docker
+  # check to U's nightly flow. Remove this job and its Buildx setup after the
+  # replacement validates centralized image builds. Keep Buildx setup wherever
+  # the replacement still uses docker buildx build.
   build-docker:
     name: Build Docker Image
     if: >-
@@ -526,7 +522,7 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      uses: docker/setup-buildx-action@v3
 
     - name: Build Docker image
       run: docker build -t mooncake-app .

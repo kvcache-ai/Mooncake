@@ -40,6 +40,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/network.h"
 #include "p2p/master/p2p_master_client.h"
 #include "rpc_types.h"
 #include "test_p2p_server_helpers.h"

@@ -1,9 +1,103 @@
+import argparse
+from importlib.machinery import EXTENSION_SUFFIXES
 import sys
 import platform
 from pathlib import Path
 import subprocess
-from setuptools import setup, Distribution
-from wheel.bdist_wheel import bdist_wheel
+
+
+def read_architecture(command):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.exit(f"Error: cannot read Store architecture from {command}: {exc}")
+    if result.returncode:
+        sys.exit(
+            f"Error: Store identity command failed ({result.returncode}): {command}\n"
+            f"{result.stdout}{result.stderr}"
+        )
+    values = [
+        line.partition("=")[2]
+        for line in result.stdout.splitlines()
+        if line.startswith("architecture=")
+    ]
+    if len(values) != 1 or values[0] not in ("centralized", "p2p"):
+        sys.exit(
+            f"Error: invalid Store architecture from {command}:\n"
+            f"{result.stdout}{result.stderr}"
+        )
+    return values[0]
+
+
+def check_store_artifacts(package_dir, with_store=None, expected_architecture=None):
+    package_dir = Path(package_dir).resolve()
+    binaries = [package_dir / name for name in ("mooncake_master", "mooncake_client")]
+    extensions = list(package_dir.glob("_store.*so"))
+    legacy_extensions = list(package_dir.glob("store.*so"))
+    present = extensions + legacy_extensions + [p for p in binaries if p.exists()]
+
+    # A standalone legacy sdist has no CMake cache; any Store artifact requires
+    # the complete trio. The two packaging entry points pass the actual option.
+    enabled = with_store == "ON" if with_store else bool(present)
+    if not enabled:
+        if present:
+            sys.exit(f"Error: Store artifacts remain with WITH_STORE=OFF: {present}")
+        return
+    if legacy_extensions:
+        sys.exit(f"Error: obsolete Store extensions in {package_dir}: {legacy_extensions}")
+    if len(extensions) != 1 or extensions[0].name not in {
+        "_store" + suffix for suffix in EXTENSION_SUFFIXES
+    }:
+        sys.exit(
+            f"Error: expected one _store extension for {sys.executable} in "
+            f"{package_dir}, found {extensions}"
+        )
+    for binary in binaries:
+        if not binary.is_file():
+            sys.exit(f"Error: missing required Store binary: {binary}")
+
+    architectures = {
+        binary.name: read_architecture([str(binary), "--version"])
+        for binary in binaries
+    }
+    # Load exactly the staged extension without importing a source-tree facade
+    # or consulting MOONCAKE_STORE_BACKEND.
+    architectures["_store"] = read_architecture(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import importlib.util, sys; "
+            "spec = importlib.util.spec_from_file_location('_store', sys.argv[1]); "
+            "module = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(module); "
+            "print('architecture=' + module._store_architecture)",
+            str(extensions[0]),
+        ]
+    )
+    if len(set(architectures.values())) != 1 or (
+        expected_architecture
+        and architectures["_store"] != expected_architecture
+    ):
+        sys.exit(
+            f"Error: Store architecture mismatch in {package_dir}: "
+            f"expected={expected_architecture}, actual={architectures}"
+        )
+
+
+# CMake and the release script share this check without starting setuptools.
+if sys.argv[1:2] == ["--check-store-artifacts"]:
+    parser = argparse.ArgumentParser(description="Check native Store build identities")
+    parser.add_argument("package_dir", type=Path)
+    parser.add_argument("--with-store", choices=("ON", "OFF"))
+    parser.add_argument("--expected-architecture", choices=("centralized", "p2p"))
+    args = parser.parse_args(sys.argv[2:])
+    check_store_artifacts(args.package_dir, args.with_store, args.expected_architecture)
+    sys.exit(0)
+
+
+from setuptools import setup, Distribution  # noqa: E402
+from wheel.bdist_wheel import bdist_wheel  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Platform guard
@@ -167,25 +261,7 @@ class CustomBdistWheel(bdist_wheel):
 # ---------------------------------------------------------------------------
 # setup()
 # ---------------------------------------------------------------------------
-package_dir = Path(__file__).resolve().parent / "mooncake"
-store_binaries = [package_dir / name for name in ("mooncake_master", "mooncake_client")]
-if any(binary.exists() for binary in store_binaries):
-    architectures = {}
-    for binary in store_binaries:
-        output = subprocess.check_output(
-            [str(binary), "--version"], text=True, timeout=10
-        )
-        values = [line.partition("=")[2] for line in output.splitlines()
-                  if line.startswith("architecture=")]
-        if len(values) != 1 or values[0] not in ("centralized", "p2p"):
-            sys.exit(f"Error: invalid Store architecture in {binary} --version")
-        architectures[binary.name] = values[0]
-    if architectures["mooncake_master"] != architectures["mooncake_client"]:
-        sys.exit(
-            "Error: Store architecture mismatch: "
-            f"mooncake_master={architectures['mooncake_master']}, "
-            f"mooncake_client={architectures['mooncake_client']}"
-        )
+check_store_artifacts(Path(__file__).resolve().parent / "mooncake")
 
 setup(
     distclass=BinaryDistribution,

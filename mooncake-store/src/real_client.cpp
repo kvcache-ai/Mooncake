@@ -24,10 +24,11 @@
 #include "centralized_client_config_builder.h"
 #endif
 #include "real_client.h"
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
+#include "common/result.h"
 #include "default_config.h"
 
 namespace mooncake {

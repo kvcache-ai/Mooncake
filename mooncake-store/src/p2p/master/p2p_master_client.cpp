@@ -1,7 +1,7 @@
 #include "p2p/master/p2p_master_client.h"
 
 #include "p2p/master/p2p_rpc_service.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "version.h"
 
 namespace mooncake {

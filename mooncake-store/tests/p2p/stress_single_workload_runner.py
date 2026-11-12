@@ -162,7 +162,7 @@ def parse_metrics(output):
 def run_benchmark_config(rounds, threads, value_size, ops, rpc_threads, ram_buffer_size_gb,
                          batch=1, p2p_local_transfer_mode="te",
                          local_io_worker_num=32,
-                         route_cache_max_memory_mb=300, route_cache_ttl_ms=60000):
+                         route_cache_max_memory_mb=0, route_cache_ttl_ms=60000):
     """Run a specific P2P configuration."""
     master_cmd = (
         f"{MASTER_BIN} --rpc_port={RPC_PORT} --metrics_port={METRICS_PORT} "
@@ -250,8 +250,8 @@ def main():
                         help="P2P local transfer mode: te|memcpy (list: te,memcpy)")
     parser.add_argument("--local_io_worker_num", type=str, default="32",
                         help="Local I/O workers (V1 memcpy mode, list: 4,16,32)")
-    parser.add_argument("--route_cache_max_memory_mb", type=str, default="300",
-                        help="Max memory for RouteCache in MB (P2P mode, list: 100,300,600)")
+    parser.add_argument("--route_cache_max_memory_mb", type=str, default="0",
+                        help="Max memory for RouteCache in MB (0 disables it, list: 0,100,300)")
     parser.add_argument("--route_cache_ttl_ms", type=str, default="60000",
                         help="TTL for RouteCache entries in ms (P2P mode, list: 60000,300000)")
     # Flags

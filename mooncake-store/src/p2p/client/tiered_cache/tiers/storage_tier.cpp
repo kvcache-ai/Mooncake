@@ -7,6 +7,7 @@
 #include "p2p/client/tiered_cache/tiers/storage_tier.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "p2p/client/tiered_cache/copier_registry.h"
+#include "common/client_buffer_allocation.h"
 #include "utils.h"
 
 namespace mooncake {

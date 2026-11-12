@@ -1,4 +1,4 @@
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -9,6 +9,7 @@
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 
+#include "common/client_buffer_allocation.h"
 #include "utils.h"
 
 namespace mooncake {
