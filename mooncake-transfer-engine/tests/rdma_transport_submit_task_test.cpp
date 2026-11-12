@@ -157,6 +157,24 @@ class SubmitTransferTaskTest : public ::testing::Test {
         triggerError(req, task);
         return task.slice_list.front()->rdma.source_lkey;
     }
+
+    // Submits one WRITE from [source, source + length) and returns the status.
+    Status submitSingle(uint64_t source, size_t length,
+                        int advise_retry_cnt = 0) {
+        Transport::TransferRequest req;
+        req.opcode = Transport::TransferRequest::WRITE;
+        req.source = reinterpret_cast<void *>(source);
+        req.length = length;
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = 0;
+        req.advise_retry_cnt = advise_retry_cnt;
+        Transport::TransferTask task;
+        task.request = &req;
+        task.batch_id = transport_->allocateBatchID(1);
+        auto status = transport_->submitTransferTask({&task});
+        EXPECT_EQ(transport_->freeBatchID(task.batch_id), Status::OK());
+        return status;
+    }
 };
 
 TEST_F(SubmitTransferTaskTest, NicHintUsesExistingTailPadding) {
@@ -191,6 +209,31 @@ TEST_F(SubmitTransferTaskTest, EmptyNicHintPreservesDefaultSelection) {
               lkeyForDevice(local_device_id_));
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TEST_F(SubmitTransferTaskTest, CongestionModeConflictRemainsUnknown) {
+    using adaptive_congestion_control::Mode;
+    const auto submittedMode = [this] {
+        Transport::TransferRequest request;
+        Transport::TransferTask task;
+        triggerError(request, task);
+        return task.rdma_congestion_control_mode;
+    };
+    EXPECT_FALSE(submittedMode().observed);
+
+    RdmaTransportTestPeer::recordCongestionMode(*transport_, Mode::kEnforce);
+    RdmaTransportTestPeer::recordCongestionMode(*transport_, Mode::kEnforce);
+    const auto consistent = submittedMode();
+    ASSERT_TRUE(consistent.observed);
+    EXPECT_EQ(consistent.value, TaskCongestionControllerMode::kEnforce);
+
+    RdmaTransportTestPeer::recordCongestionMode(*transport_, Mode::kOff);
+    EXPECT_FALSE(submittedMode().observed);
+
+    RdmaTransportTestPeer::recordCongestionMode(*transport_, Mode::kEnforce);
+    EXPECT_FALSE(submittedMode().observed);
+}
+#endif
+
 TEST_F(SubmitTransferTaskTest, NicHintUsesWildcardWhenAbsentFromLocation) {
     Transport::TransferRequest request;
     request.nic_hint = global_device_id_;
@@ -203,6 +246,29 @@ TEST_F(SubmitTransferTaskTest, SubmitRetryDropsNicHint) {
     request.nic_hint = global_device_id_;
     request.advise_retry_cnt = 1;
 
+    EXPECT_EQ(selectedLkey(request), lkeyForDevice(local_device_id_));
+}
+
+TEST_F(SubmitTransferTaskTest, SparseLocalRegistrationSkipsUnregisteredHca) {
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(
+        desc->topology.parse(R"({"cpu:0": [["mlx5_local"], ["mlx5_global"]],)"
+                             R"("cpu:1": [["mlx5_global"], []]})"),
+        0);
+    desc->buffers[0].lkey[local_device_id_] = 0;
+    desc->buffers[0].rkey[local_device_id_] = 0;
+
+    Transport::TransferRequest request;
+    EXPECT_EQ(selectedLkey(request), lkeyForDevice(global_device_id_));
+}
+
+TEST_F(SubmitTransferTaskTest, LocalOnlyRegistrationUsesLkey) {
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    desc->buffers[0].rkey.clear();
+
+    Transport::TransferRequest request;
     EXPECT_EQ(selectedLkey(request), lkeyForDevice(local_device_id_));
 }
 
@@ -304,6 +370,59 @@ TEST_F(SubmitTransferTaskTest, GroupedRequestsReportFailurePerRequest) {
               Status::OK());
     EXPECT_EQ(request_statuses, std::vector(2, status.s));
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+// The two causes of AddressNotRegistered need different fixes, so the error
+// says which one it is.
+TEST_F(SubmitTransferTaskTest, UnregisteredSourceReportsNoCoveringBuffer) {
+    auto status = submitSingle(kBufferAddr + 4 * block_size_, block_size_);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    EXPECT_NE(status.message().find("no selectable registered buffer covers"),
+              std::string_view::npos)
+        << status.message();
+}
+
+TEST_F(SubmitTransferTaskTest, InactiveRnicsAreNamedForRegisteredSource) {
+    for (const auto &context : transport_->getContextList())
+        context->set_active(false);
+    auto status = submitSingle(kBufferAddr, block_size_);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    const std::string message(status.message());
+    EXPECT_NE(message.find("selected RNIC(s) inactive: mlx5_local"),
+              std::string::npos)
+        << message;
+    // Only RNICs that selection picked are named; cpu:0 never picks
+    // mlx5_global.
+    EXPECT_EQ(message.find("mlx5_global"), std::string::npos) << message;
+}
+
+// With the retry budget already spent, the per-slice loop does not run and
+// only the request-level pick is known.
+TEST_F(SubmitTransferTaskTest, InactiveRnicIsNamedWithoutSliceRetries) {
+    for (const auto &context : transport_->getContextList())
+        context->set_active(false);
+    auto status =
+        submitSingle(kBufferAddr, block_size_, globalConfig().retry_cnt);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    EXPECT_NE(status.message().find("selected RNIC(s) inactive: mlx5_local"),
+              std::string_view::npos)
+        << status.message();
+}
+
+// A covering buffer that selectDevice() still rejects, here because its
+// location maps to no RNIC, must not be blamed on the RNICs, which are active.
+TEST_F(SubmitTransferTaskTest, TopologyMissIsNotReportedAsInactiveRnic) {
+    auto desc = std::make_shared<SegmentDesc>(
+        *metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID));
+    desc->topology.clear();
+    metadata_->addLocalSegment(LOCAL_SEGMENT_ID, desc->name, std::move(desc));
+    auto status = submitSingle(kBufferAddr, block_size_);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    const std::string message(status.message());
+    EXPECT_NE(message.find("no selectable registered buffer covers"),
+              std::string::npos)
+        << message;
+    EXPECT_EQ(message.find("RNIC"), std::string::npos) << message;
 }
 
 TEST_F(SubmitTransferTaskTest,

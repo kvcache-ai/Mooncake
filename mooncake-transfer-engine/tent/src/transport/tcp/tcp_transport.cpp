@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <thread>
 
 #include "tent/common/status.h"
@@ -32,6 +33,19 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+Status DecodeTcpIdentity(const std::string &process_attr,
+                         const std::string &buffer_attr,
+                         TcpDataPlaneIdentity *identity) {
+    if (!decodeTcpProcessAttr(process_attr, &identity->process) ||
+        !decodeTcpRegistrationAttr(buffer_attr, &identity->registration_id)) {
+        return Status::NeedsRefreshCache(
+            "Malformed TCP data-plane metadata" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 static std::string ExtractHost(const std::string &endpoint) {
     if (!endpoint.empty() && endpoint.front() == '[') {
         auto end = endpoint.find(']');
@@ -57,17 +71,29 @@ static bool IsLoopbackEndpoint(const std::string &endpoint) {
            host == "localhost" || host == "::1";
 }
 
+}  // namespace
+
 TcpTransport::TcpTransport() : installed_(false) {}
 
-TcpTransport::~TcpTransport() { uninstall(); }
+TcpTransport::~TcpTransport() {
+    auto status = uninstallImpl(true);
+    if (!status.ok()) {
+        LOG(ERROR) << "Forced TCP transport teardown failed: "
+                   << status.ToString();
+    }
+}
 
 Status TcpTransport::install(std::string &local_segment_name,
                              std::shared_ptr<ControlService> metadata,
                              std::shared_ptr<Topology> local_topology,
                              std::shared_ptr<Config> conf) {
+    std::lock_guard<std::mutex> registration_lock(registration_mutex_);
     if (installed_) {
         return Status::InvalidArgument(
             "TCP transport has been installed" LOC_MARK);
+    }
+    if (!metadata) {
+        return Status::InvalidArgument("TCP metadata is null" LOC_MARK);
     }
 
     metadata_ = metadata;
@@ -84,13 +110,78 @@ Status TcpTransport::install(std::string &local_segment_name,
         params_.max_concurrent_tasks =
             conf->get("transports/tcp/max_concurrent_tasks",
                       params_.max_concurrent_tasks);
+        params_.allow_unsafe_legacy_data_rpc =
+            conf->get("transports/tcp/allow_unsafe_legacy_data_rpc",
+                      params_.allow_unsafe_legacy_data_rpc);
     }
 
     if (params_.max_concurrent_tasks == 0) {
+        metadata_.reset();
         return Status::InvalidArgument(
             "transports/tcp/max_concurrent_tasks must be greater than "
             "0" LOC_MARK);
     }
+    Status reopened = metadata_->tcpBufferRegistry().reopen();
+    if (!reopened.ok()) {
+        metadata_.reset();
+        return reopened;
+    }
+
+    std::optional<std::string> previous_attr;
+    auto local = metadata_->segmentManager().getLocal();
+    if (!local || local->type != SegmentType::Memory) {
+        metadata_->tcpBufferRegistry().close();
+        metadata_.reset();
+        return Status::InvalidMetadataType(
+            "TCP requires a local memory segment" LOC_MARK);
+    }
+    const auto &attrs = local->getMemory().transport_attrs;
+    auto previous = attrs.find(static_cast<int>(TransportType::TCP));
+    if (previous != attrs.end()) previous_attr = previous->second;
+
+    const std::string process_attr =
+        encodeTcpProcessAttr(metadata_->tcpProcessIdentity());
+    Status published = metadata_->segmentManager().updateLocal(
+        [&](SegmentDesc &desc) -> Status {
+            if (desc.type != SegmentType::Memory) {
+                return Status::InvalidMetadataType(
+                    "TCP local segment changed type" LOC_MARK);
+            }
+            std::get<MemorySegmentDesc>(desc.detail)
+                .transport_attrs[static_cast<int>(TransportType::TCP)] =
+                process_attr;
+            return Status::OK();
+        });
+    if (published.ok()) {
+        published = metadata_->segmentManager().synchronizeLocal();
+    }
+    if (!published.ok()) {
+        Status rollback = metadata_->segmentManager().updateLocal(
+            [&](SegmentDesc &desc) -> Status {
+                auto &current =
+                    std::get<MemorySegmentDesc>(desc.detail).transport_attrs;
+                if (previous_attr) {
+                    current[static_cast<int>(TransportType::TCP)] =
+                        *previous_attr;
+                } else {
+                    current.erase(static_cast<int>(TransportType::TCP));
+                }
+                return Status::OK();
+            });
+        if (rollback.ok()) {
+            rollback = metadata_->segmentManager().synchronizeLocal();
+        }
+        if (!rollback.ok()) {
+            LOG(ERROR) << "TCP metadata rollback failed: "
+                       << rollback.ToString();
+        }
+        metadata_->tcpBufferRegistry().close();
+        metadata_.reset();
+        return published;
+    }
+
+    metadata_->setUnsafeLegacyTcpDataRpcEnabled(
+        params_.allow_unsafe_legacy_data_rpc);
 
     shutting_down_.store(false, std::memory_order_release);
     thread_pool_ = std::make_unique<ThreadPool>(params_.max_concurrent_tasks);
@@ -112,18 +203,51 @@ Status TcpTransport::install(std::string &local_segment_name,
 
     LOG(INFO) << "TCP transport installed: max_retry_count="
               << params_.max_retry_count
-              << " max_concurrent_tasks=" << params_.max_concurrent_tasks;
+              << " max_concurrent_tasks=" << params_.max_concurrent_tasks
+              << " allow_unsafe_legacy_data_rpc="
+              << params_.allow_unsafe_legacy_data_rpc;
     return Status::OK();
 }
 
-Status TcpTransport::uninstall() {
+Status TcpTransport::uninstall() { return uninstallImpl(false); }
+
+Status TcpTransport::uninstallImpl(bool force) {
+    std::lock_guard<std::mutex> registration_lock(registration_mutex_);
+    Status result = Status::OK();
     if (installed_) {
-        if (metadata_) metadata_->setNotifyCallback(nullptr);
+        if (metadata_) {
+            auto &registry = metadata_->tcpBufferRegistry();
+            if (!force && !registry.empty()) {
+                return Status::InvalidArgument(
+                    "Cannot uninstall TCP transport with registered "
+                    "buffers" LOC_MARK);
+            }
+            metadata_->setUnsafeLegacyTcpDataRpcEnabled(false);
+            registry.close(force);
+            metadata_->setNotifyCallback(nullptr);
+        }
         quiesce();
+        if (metadata_) {
+            Status removed = metadata_->segmentManager().updateLocal(
+                [](SegmentDesc &desc) -> Status {
+                    if (desc.type != SegmentType::Memory) {
+                        return Status::InvalidMetadataType(
+                            "TCP local segment changed type" LOC_MARK);
+                    }
+                    std::get<MemorySegmentDesc>(desc.detail)
+                        .transport_attrs.erase(
+                            static_cast<int>(TransportType::TCP));
+                    return Status::OK();
+                });
+            if (removed.ok()) {
+                removed = metadata_->segmentManager().synchronizeLocal();
+            }
+            if (!removed.ok()) result = removed;
+        }
         metadata_.reset();
         installed_ = false;
     }
-    return Status::OK();
+    return result;
 }
 
 Status TcpTransport::quiesce() {
@@ -206,11 +330,51 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status TcpTransport::addMemoryBuffer(BufferDesc &desc,
                                      const MemoryOptions &options) {
-    desc.transports.push_back(TransportType::TCP);
+    std::lock_guard<std::mutex> registration_lock(registration_mutex_);
+    if (!metadata_) {
+        return Status::InternalError("TCP transport is not installed" LOC_MARK);
+    }
+    uint64_t registration_id = 0;
+    CHECK_STATUS(metadata_->tcpBufferRegistry().add(
+        desc.addr, desc.length, options.perm, &registration_id));
+    try {
+        desc.transport_attrs[TransportType::TCP] =
+            encodeTcpRegistrationAttr(registration_id);
+        if (std::find(desc.transports.begin(), desc.transports.end(),
+                      TransportType::TCP) == desc.transports.end()) {
+            desc.transports.push_back(TransportType::TCP);
+        }
+    } catch (...) {
+        (void)metadata_->tcpBufferRegistry().remove(registration_id);
+        desc.transport_attrs.erase(TransportType::TCP);
+        desc.transports.erase(
+            std::remove(desc.transports.begin(), desc.transports.end(),
+                        TransportType::TCP),
+            desc.transports.end());
+        return Status::InternalError(
+            "Unable to publish TCP buffer registration" LOC_MARK);
+    }
     return Status::OK();
 }
 
 Status TcpTransport::removeMemoryBuffer(BufferDesc &desc) {
+    std::lock_guard<std::mutex> registration_lock(registration_mutex_);
+    auto attr = desc.transport_attrs.find(TransportType::TCP);
+    if (attr == desc.transport_attrs.end()) return Status::OK();
+    if (!metadata_) {
+        return Status::InternalError("TCP transport is not installed" LOC_MARK);
+    }
+    uint64_t registration_id = 0;
+    if (!decodeTcpRegistrationAttr(attr->second, &registration_id)) {
+        return Status::InvalidArgument(
+            "Malformed TCP buffer metadata" LOC_MARK);
+    }
+    CHECK_STATUS(metadata_->tcpBufferRegistry().remove(registration_id));
+    desc.transport_attrs.erase(attr);
+    desc.transports.erase(
+        std::remove(desc.transports.begin(), desc.transports.end(),
+                    TransportType::TCP),
+        desc.transports.end());
     return Status::OK();
 }
 
@@ -264,9 +428,17 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         return Status::InternalError("Transport shutting down");
 
     std::string rpc_server_addr;
+    std::optional<TcpDataPlaneIdentity> identity;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,
-                          task->request.target_id, rpc_server_addr);
+                          task->request.target_id, rpc_server_addr, identity);
+    if (status.IsAddressNotRegistered()) {
+        CHECK_STATUS(metadata_->segmentManager().invalidateRemote(
+            task->request.target_id));
+        status = findRemoteSegment(
+            task->request.target_offset, task->request.length,
+            task->request.target_id, rpc_server_addr, identity);
+    }
     if (!status.ok()) return status;
 
     Status last_error;
@@ -294,13 +466,23 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         }
 
         if (task->request.opcode == Request::WRITE) {
-            status = ControlClient::sendData(
-                rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+            status =
+                identity
+                    ? ControlClient::sendDataV2(
+                          rpc_server_addr, task->request.target_offset,
+                          task->request.source, task->request.length, *identity)
+                    : ControlClient::sendData(
+                          rpc_server_addr, task->request.target_offset,
+                          task->request.source, task->request.length);
         } else {
-            status = ControlClient::recvData(
-                rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+            status =
+                identity
+                    ? ControlClient::recvDataV2(
+                          rpc_server_addr, task->request.target_offset,
+                          task->request.source, task->request.length, *identity)
+                    : ControlClient::recvData(
+                          rpc_server_addr, task->request.target_offset,
+                          task->request.source, task->request.length);
         }
 
         if (status.ok()) return Status::OK();
@@ -310,6 +492,17 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
                 << " failed: " << status.ToString();
         LOG_EVERY_N(WARNING, 1000) << "TCP transfer attempt " << attempt
                                    << " failed: " << status.ToString();
+
+        if (status.IsNeedsRefreshCache()) {
+            CHECK_STATUS(metadata_->segmentManager().invalidateRemote(
+                task->request.target_id));
+            if (attempt == params_.max_retry_count) break;
+            auto resolve = findRemoteSegment(
+                task->request.target_offset, task->request.length,
+                task->request.target_id, rpc_server_addr, identity);
+            if (!resolve.ok()) return resolve;
+            continue;
+        }
 
         if (task->request.opcode == Request::WRITE &&
             status.IsRpcServiceError() && !status.IsRpcConnectionError()) {
@@ -329,7 +522,7 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
             if (attempt == params_.max_retry_count) break;
             auto resolve = findRemoteSegment(
                 task->request.target_offset, task->request.length,
-                task->request.target_id, rpc_server_addr);
+                task->request.target_id, rpc_server_addr, identity);
             if (!resolve.ok()) return resolve;
         }
     }
@@ -337,11 +530,16 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
     return last_error;
 }
 
-Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
-                                       uint64_t target_id,
-                                       std::string &rpc_server_addr) {
+Status TcpTransport::findRemoteSegment(
+    uint64_t dest_addr, uint64_t length, uint64_t target_id,
+    std::string &rpc_server_addr,
+    std::optional<TcpDataPlaneIdentity> &identity) {
     return metadata_->segmentManager().withCachedSegment(
         target_id, [&](SegmentDesc *segment) {
+            if (segment == nullptr || segment->type != SegmentType::Memory) {
+                return Status::NeedsRefreshCache(
+                    "TCP target is not a memory segment" LOC_MARK);
+            }
             auto buffer = segment->findBuffer(dest_addr, length);
             rpc_server_addr = segment->rpc_server_addr;
             if (!buffer) {
@@ -352,6 +550,30 @@ Status TcpTransport::findRemoteSegment(uint64_t dest_addr, uint64_t length,
                 return Status::NeedsRefreshCache(
                     "Empty RPC server addr" LOC_MARK);
             }
+            const auto process = segment->getMemory().transport_attrs.find(
+                static_cast<int>(TransportType::TCP));
+            const auto registration =
+                buffer->transport_attrs.find(TransportType::TCP);
+            const bool has_process =
+                process != segment->getMemory().transport_attrs.end();
+            const bool has_registration =
+                registration != buffer->transport_attrs.end();
+            if (!has_registration) {
+                identity.reset();
+                if (has_process) {
+                    return Status::AddressNotRegistered(
+                        "TCP target buffer is not registered for TCP" LOC_MARK);
+                }
+                return Status::OK();
+            }
+            if (!has_process) {
+                return Status::NeedsRefreshCache(
+                    "Incomplete TCP data-plane metadata" LOC_MARK);
+            }
+            TcpDataPlaneIdentity decoded;
+            CHECK_STATUS(DecodeTcpIdentity(process->second,
+                                           registration->second, &decoded));
+            identity = decoded;
             return Status::OK();
         });
 }

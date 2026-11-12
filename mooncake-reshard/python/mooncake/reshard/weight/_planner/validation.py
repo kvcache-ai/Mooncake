@@ -23,6 +23,11 @@ def _validate_logical_target_coverage(logical_plan: LogicalTransferPlan) -> None
         for part in logical_plan.target_placement.parts
         for fragment in part.fragments
     }
+    target_by_id = {
+        fragment.placement_fragment_id: fragment
+        for part in target_parts.values()
+        for fragment in part.fragments
+    }
     operation_participants: set[ParticipantId] = set()
     operations_by_fragment: dict[
         PlacementFragmentId, list[LogicalTransferOperation]
@@ -35,9 +40,9 @@ def _validate_logical_target_coverage(logical_plan: LogicalTransferPlan) -> None
         target_participant_id = participant_by_fragment.get(
             target.placement_fragment_id
         )
-        if target_participant_id is None or not any(
-            fragment == target
-            for fragment in target_parts[target_participant_id].fragments
+        if (
+            target_participant_id is None
+            or target_by_id.get(target.placement_fragment_id) != target
         ):
             raise ValueError(
                 "logical plan and target placement fragment snapshots differ"
@@ -113,6 +118,11 @@ def _validate_logical_source_placement(logical_plan: LogicalTransferPlan) -> Non
         for part in source_placement.parts
         for fragment in part.fragments
     }
+    source_by_id = {
+        fragment.placement_fragment_id: fragment
+        for part in source_parts.values()
+        for fragment in part.fragments
+    }
     operation_participants: set[ParticipantId] = set()
     for operation in logical_plan.operations:
         source = operation.source
@@ -121,9 +131,9 @@ def _validate_logical_source_placement(logical_plan: LogicalTransferPlan) -> Non
         source_participant_id = participant_by_fragment.get(
             source.placement_fragment_id
         )
-        if source_participant_id is None or not any(
-            fragment == source
-            for fragment in source_parts[source_participant_id].fragments
+        if (
+            source_participant_id is None
+            or source_by_id.get(source.placement_fragment_id) != source
         ):
             raise ValueError(
                 "logical plan and source placement fragment snapshots differ"

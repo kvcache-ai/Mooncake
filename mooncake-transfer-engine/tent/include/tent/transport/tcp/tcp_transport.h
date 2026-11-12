@@ -22,6 +22,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 
@@ -37,6 +38,7 @@ struct TcpParams {
     uint64_t retry_base_delay_ms = 100;   // 100ms initial backoff
     uint64_t retry_max_delay_ms = 2'000;  // 2s max backoff
     size_t max_concurrent_tasks = 16;     // worker thread pool size
+    bool allow_unsafe_legacy_data_rpc = false;
 };
 
 // Next sleep used by doTransferWithRetry after a failed attempt. Kept as a
@@ -118,12 +120,15 @@ class TcpTransport : public Transport {
     virtual Status receiveNotification(std::vector<Notification> &notify_list);
 
    private:
+    Status uninstallImpl(bool force);
+
     void startTransfer(TcpTask *task);
 
     Status doTransferWithRetry(TcpTask *task);
 
     Status findRemoteSegment(uint64_t dest_addr, uint64_t length,
-                             uint64_t target_id, std::string &rpc_server_addr);
+                             uint64_t target_id, std::string &rpc_server_addr,
+                             std::optional<TcpDataPlaneIdentity> &identity);
 
    private:
     bool installed_;
@@ -131,6 +136,7 @@ class TcpTransport : public Transport {
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
     TcpParams params_;
+    std::mutex registration_mutex_;
     std::mutex lifecycle_mutex_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::atomic<bool> shutting_down_{false};

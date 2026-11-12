@@ -33,8 +33,6 @@ from mooncake._structured_ranges import (
     execute_ranges as _execute_member_ranges,
     prepare_ranges as _prepare_member_ranges,
 )
-from mooncake.store import ReplicateConfig
-
 import msgpack as _msgpack
 
 # -- C fast-path: concat_arrays_into(list[ndarray], dest_ptr) ----------------
@@ -6977,6 +6975,11 @@ def _copy_write_config(config: Any) -> Any:
 
 
 def _config_with_group_id(config: Any, group_id: str) -> Any:
+    # Imported lazily at the sole call site so the planning and raw-read
+    # helpers stay importable without a native store build, matching the
+    # CPU contracts CI lane.
+    from mooncake.store import ReplicateConfig
+
     configured_ids = getattr(_config_for_grouped_keys(config, 1), "group_ids", None)
     if configured_ids and configured_ids[0] and configured_ids[0] != group_id:
         raise ValueError("config.group_ids conflicts with the DataProto storage group")

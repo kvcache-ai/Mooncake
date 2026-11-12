@@ -639,6 +639,14 @@ increase(mooncake_te_read_size_bytes_sum[2m])
   / (increase(mooncake_te_read_latency_us_sum[2m]) / 1e6)
 ```
 
+## Task Congestion Diagnostics
+
+:::{toctree}
+:maxdepth: 1
+
+task-congestion-status-api
+:::
+
 ## Supported Protocols
 
 :::{toctree}
