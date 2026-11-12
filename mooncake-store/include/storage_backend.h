@@ -985,10 +985,19 @@ class BucketStorageBackend : public StorageBackendInterface {
     size_t UngroupedOffloadingObjectsSize() const;
 
     /**
-     * @brief Append at most limit keys, continuing inside a bucket if needed.
-     * @param cursor The bucket and key position to start scanning from.
-     * @return The cursor for the next batch; bucket_id == 0 means scan
-     * complete.
+     * @brief Iterate over stored object metadata from the given cursor,
+     * continuing inside a bucket when the batch limit is reached.
+     * @param cursor The bucket ID and key index to start scanning from.
+     * @param keys Output vector to receive object keys.
+     * @param metadatas Output vector to receive metadata corresponding to keys.
+     * @param buckets Output vector to receive IDs of buckets included in the
+     * batch.
+     * @param limit Maximum number of keys in the output batch; must be
+     * positive.
+     * @return tl::expected<ScanCursor, ErrorCode>
+     * - On success: the bucket ID and key index for the next batch, or
+     * bucket_id == 0 if all data has been scanned.
+     * - On failure: INVALID_PARAMS if limit is nonpositive.
      */
     tl::expected<ScanCursor, ErrorCode> BucketScan(
         ScanCursor cursor, std::vector<std::string>& keys,
