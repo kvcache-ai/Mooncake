@@ -394,6 +394,7 @@ struct MasterService::MemoryEviction {
         std::vector<eviction::EvictionObserver*> observers{&metrics, &log};
         if (!settings.through_oplog) {
             observers.push_back(&kv_events);
+            observers.push_back(&age);
         }
         return observers;
     }
@@ -406,6 +407,7 @@ struct MasterService::MemoryEviction {
     KvEventObserver kv_events;
     eviction::MetricsObserver metrics;
     eviction::LogObserver log;
+    eviction::AgeObserver age;
     // Last, so everything it refers to is built first.
     eviction::Evictor evictor;
 };
@@ -10025,6 +10027,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Writes that expired before they finished, and replicas whose release
     // was deferred, go first, so the round judges what is left.
     const auto now = std::chrono::system_clock::now();
+    const auto cycle_start = std::chrono::steady_clock::now();
     VisitNamespaces(
         [&](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
             DiscardExpiredProcessingReplicas(ns, now);
@@ -10053,6 +10056,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         metrics.inc_eviction_fail();
         metrics.inc_mem_eviction_fail();
     }
+    MasterMetricManager::instance().observe_eviction_duration_ms(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - cycle_start)
+            .count());
 }
 
 void MasterService::NoFBatchEvict(double evict_ratio_target,
