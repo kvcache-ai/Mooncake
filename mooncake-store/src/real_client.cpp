@@ -5472,8 +5472,8 @@ RealClient::get_into_ranges_internal(
     // and the file-backed paths only reject an expired lease after the read
     // has already been served. Renew halfway through the lease counted from
     // when it was obtained (the plan time for a planned entry, the renewal
-    // time for a renewed one), so resolving every key up front never makes a
-    // later range more likely to fail with LEASE_EXPIRED.
+    // time for a renewed one). A key's first range renews earlier still; see
+    // first_range_refresh_at below.
     auto ranged_read_refresh_at =
         [](std::chrono::steady_clock::time_point obtained_at,
            const QueryResult &query_result) {
@@ -5489,13 +5489,27 @@ RealClient::get_into_ranges_internal(
         const RangedReadMetadata *metadata;
         std::optional<RangedReadMetadata> renewal;
         std::chrono::steady_clock::time_point refresh_at;
+        bool served_first_range = false;
     };
+    // A planned descriptor can be most of a lease old by the time its key is
+    // reached, and one range read may outlast what is left. So a key's first
+    // range renews past a small slice of the lease rather than its midpoint,
+    // which keeps nearly a full lease available at use time the way a lazy
+    // query did; later ranges fall back to the ordinary midpoint cadence.
+    auto first_range_refresh_at =
+        [](std::chrono::steady_clock::time_point obtained_at,
+           const QueryResult &query_result) {
+            const auto lease = query_result.lease_timeout - obtained_at;
+            if (lease <= std::chrono::nanoseconds::zero()) return obtained_at;
+            return obtained_at + lease / 8;
+        };
     auto acquire_ranged_read_lease = [&](const RangedReadMetadata &metadata) {
         return RangedReadLease{
             .metadata = &metadata,
             .renewal = std::nullopt,
-            .refresh_at = ranged_read_refresh_at(metadata_plan.resolved_at,
-                                                 metadata.query_result)};
+            .refresh_at = first_range_refresh_at(metadata_plan.resolved_at,
+                                                 metadata.query_result),
+            .served_first_range = false};
     };
     // Returns the error that made the descriptor unusable, or nullopt when it
     // is still fresh enough to serve the next range. A snapshot read never
@@ -5503,13 +5517,30 @@ RealClient::get_into_ranges_internal(
     auto renew_ranged_read_lease =
         [&](const std::string &key,
             RangedReadLease &lease) -> std::optional<ErrorCode> {
-        if (!allow_query_refresh ||
-            std::chrono::steady_clock::now() < lease.refresh_at) {
+        if (!allow_query_refresh) return std::nullopt;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < lease.refresh_at) {
+            if (!lease.served_first_range) {
+                lease.served_first_range = true;
+                lease.refresh_at =
+                    ranged_read_refresh_at(now, lease.metadata->query_result);
+            }
             return std::nullopt;
         }
-        auto renewed = resolve_ranged_read_metadata(key);
+        // Query through the caller's cache so a still-live cached descriptor
+        // stays the one this request reads; only an absent or expired entry is
+        // asked for again.
+        auto renewed = resolve_ranged_read_metadata(key, query_result_cache);
         if (!renewed) return renewed.error();
         const auto renewed_at = std::chrono::steady_clock::now();
+        lease.served_first_range = true;
+        if (lease.metadata->query_result.lease_timeout ==
+            renewed->query_result.lease_timeout) {
+            // Nothing was extended: the caller's own descriptor came back, so
+            // stop asking until that lease really runs out.
+            lease.refresh_at = lease.metadata->query_result.lease_timeout;
+            return std::nullopt;
+        }
         // Replica descriptors are not assignable, so construct in place.
         lease.renewal.reset();
         lease.renewal.emplace(std::move(*renewed));

@@ -1392,6 +1392,108 @@ TEST_F(RealClientTest, RangedReadRenewsFileBackedLeasesAcrossKeys) {
     }
 }
 
+TEST_F(RealClientTest, RangedReadPreservesLiveCallerCacheDescriptor) {
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_cached_descriptor";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    // A caller descriptor that is well inside its lease. Renewal must extend
+    // what the caller described, not swap in whatever is current.
+    PyClient::QueryResultCache cache;
+    cache.emplace(
+        key, QueryResult(std::vector<Replica::Descriptor>(queries[0]->replicas),
+                         std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(80)));
+    // Replace the object, then let planning run past the renewal threshold so
+    // the request wants to refresh before its first range.
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', original.size());
+    const auto single_before = RpcCount("GetReplicaList");
+    const auto batch_before = RpcCount("BatchGetReplicaList");
+    auto result =
+        py_client_->get_into_ranges({destination->ptr()}, {{key}}, {{{0}}},
+                                    {{{0}}}, {{{original.size()}}}, &cache);
+
+    EXPECT_EQ(result, (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{static_cast<int64_t>(original.size())}}}));
+    EXPECT_EQ(
+        std::string(static_cast<char*>(destination->ptr()), original.size()),
+        original);
+    // The still-live caller descriptor is reused as-is, so nothing is asked of
+    // the Master and the upserted copy is never substituted for it.
+    EXPECT_EQ(RpcCount("GetReplicaList"), single_before);
+    EXPECT_EQ(RpcCount("BatchGetReplicaList"), batch_before);
+}
+
+TEST_F(RealClientTest, RangedReadRenewsAKeyReachedAfterItsPlanLeaseAged) {
+    // Resolving every key up front hands out one shared lease. A key reached
+    // after that lease has aged must still get nearly a full lease before its
+    // first range, the way the old per-key lazy query did, instead of being
+    // served with whatever the plan-time lease still has left.
+    ScopedEnvVar enable_metrics("MC_STORE_CLIENT_METRIC", "1");
+    constexpr uint64_t kLeaseTtlMs = 20;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kLeaseTtlMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     FLAGS_protocol, "", master_address_),
+              0);
+
+    // Two front keys are read first so the target key is reached once the
+    // plan-time lease has aged past a small slice of it, but well before the
+    // midpoint a lazy policy would wait for.
+    constexpr size_t kFrontRange = 8 * 1024 * 1024;
+    constexpr size_t kTargetRange = 1024 * 1024;
+    std::vector<std::string> keys = {
+        "ranged_late_front_0", "ranged_late_front_1", "ranged_late_target"};
+    std::vector<std::string> payloads;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t size = i < 2 ? kFrontRange : kTargetRange;
+        payloads.emplace_back(size, '\0');
+        auto& payload = payloads.back();
+        for (size_t b = 0; b < payload.size(); b += 4096) {
+            payload[b] = static_cast<char>((i * 37 + b) % 251);
+        }
+        ASSERT_EQ(py_client_->put(keys[i], std::span<const char>(payload)), 0);
+    }
+
+    auto destination =
+        py_client_->allocate_client_buffer(kFrontRange * 2 + kTargetRange);
+    ASSERT_TRUE(destination.has_value());
+    std::memset(destination->ptr(), '?', kFrontRange * 2 + kTargetRange);
+    const auto single_before = RpcCount("GetReplicaList");
+    auto result = py_client_->get_into_ranges(
+        {destination->ptr()}, {keys}, {{{0}, {kFrontRange}, {kFrontRange * 2}}},
+        {{{0}, {0}, {0}}}, {{{kFrontRange}, {kFrontRange}, {kTargetRange}}});
+
+    ASSERT_EQ(result.size(), 1);
+    ASSERT_EQ(result[0].size(), keys.size());
+    const auto* bytes = static_cast<const char*>(destination->ptr());
+    size_t offset = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const size_t size = i < 2 ? kFrontRange : kTargetRange;
+        ASSERT_EQ(result[0][i].size(), 1) << keys[i];
+        EXPECT_EQ(result[0][i][0], static_cast<int64_t>(size)) << keys[i];
+        EXPECT_EQ(std::string(bytes + offset, size), payloads[i]) << keys[i];
+        offset += size;
+    }
+    // The target key was reached after its plan-time lease aged past the
+    // first-range threshold, so a renewal must have been requested before its
+    // read. A lazy policy waits for the midpoint and issues nothing here.
+    EXPECT_GT(RpcCount("GetReplicaList") - single_before, 0);
+}
+
 TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
     StartMasterAndSetupClient();
     const std::string key = "ranged_snapshot_upsert";
