@@ -28,6 +28,9 @@
 #include <thread>
 
 #include "tent/transport/rdma/bw_arbitration.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "tent/transport/rdma/congestion_control.h"
+#endif
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/promotion_policy.h"
 #include "tent/transport/rdma/shared_quota.h"
@@ -299,6 +302,18 @@ Status Workers::stop() {
         worker.thread.join();
     }
     monitor_.join();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (transport_->rdma_congestion_control_) {
+        for (size_t id = 0; id < num_workers_; ++id) {
+            for (auto& [_, slices] : worker_context_[id].requests) {
+                for (auto* slice : slices) {
+                    transport_->rdma_congestion_control_->releaseUnposted(
+                        slice);
+                }
+            }
+        }
+    }
+#endif
     delete[] worker_context_;
     worker_context_ = nullptr;
     return Status::OK();
@@ -515,6 +530,10 @@ bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
     if (slice->word == PENDING &&
         !slice->task->cancel_requested.load(std::memory_order_acquire))
         return false;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (transport_->rdma_congestion_control_)
+        transport_->rdma_congestion_control_->releaseUnposted(slice);
+#endif
     // Retire it the way a sweep would -- charge, count and set entry all go
     // back where they came from, each idempotently, since whichever path
     // resolved the slice may already have run them -- and updateSliceStatus
@@ -814,6 +833,11 @@ void Workers::asyncPostSend() {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
             for (auto slice : clone) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+                if (transport_->rdma_congestion_control_)
+                    transport_->rdma_congestion_control_->releaseUnposted(
+                        slice);
+#endif
                 if (dropUnpostableSlice(worker, slice)) {
                     // Canceled after admit() armed a probe/trial: roll back.
                     cancelSliceProbe(slice);
@@ -858,6 +882,16 @@ void Workers::asyncPostSend() {
                             getCurrentTimeInNano());
         }
 
+        size_t admitted_count = slices.size();
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (transport_->rdma_congestion_control_) {
+            admitted_count = transport_->rdma_congestion_control_->admitPrefix(
+                path.local_device_id, slices.front()->target_machine_id,
+                path.remote_device_id, endpoint.get(), slices);
+        }
+#endif
+        if (admitted_count == 0) continue;
+
         // Everything a completion's poller must find is written before the
         // work request can reach the wire: with a shared queue pair another
         // lane may poll the completion before submitSlices returns, and a
@@ -866,7 +900,8 @@ void Workers::asyncPostSend() {
         const uint64_t post_ts = getCurrentTimeInNano();
         int num_submitted = endpoint->submitSlices(
             slices, tl_wid,
-            [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); });
+            [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); },
+            admitted_count);
         int first_failed = num_submitted;
         for (int id = 0; id < num_submitted; ++id) {
             if (slices[id]->failed) {
@@ -890,6 +925,10 @@ void Workers::asyncPostSend() {
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
             if (!slice->failed) continue;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            if (transport_->rdma_congestion_control_)
+                transport_->rdma_congestion_control_->releaseUnposted(slice);
+#endif
             // Rejected by the hardware: it never went on the wire, so take
             // back what the hook put in place.
             worker.inflight_slice_set.erase(slice);
@@ -919,6 +958,15 @@ void Workers::asyncPostSend() {
                 submitFromTick(worker, slice);
             }
         }
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (transport_->rdma_congestion_control_) {
+            for (size_t id = static_cast<size_t>(num_submitted);
+                 id < admitted_count; ++id) {
+                transport_->rdma_congestion_control_->releaseUnposted(
+                    slices[id]);
+            }
+        }
+#endif
 
         if (num_submitted) {
             slices.erase(slices.begin(), slices.begin() + num_submitted);
@@ -1081,6 +1129,11 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                 slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
         }
     } completion_paid{slice, completion_owed};
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (transport_->rdma_congestion_control_)
+        transport_->rdma_congestion_control_->complete(slice, wc.status,
+                                                       wc.vendor_err);
+#endif
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
     // per completion).
@@ -1538,6 +1591,10 @@ bool Workers::activateContext(int dev_id, RdmaContext& context) {
     // becomes selectable so no worker scores it on the old rate.
     refreshLinkSpeed(dev_id, context);
     if (device_selector_) device_selector_->setDeviceAvailable(dev_id, true);
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    if (transport_->rdma_congestion_control_)
+        transport_->rdma_congestion_control_->resetDevice(dev_id);
+#endif
     return true;
 }
 
@@ -1593,6 +1650,10 @@ void Workers::monitorThread() {
     auto last_reclaim_time = std::chrono::steady_clock::now();
 
     while (running_) {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (transport_->rdma_congestion_control_)
+            transport_->rdma_congestion_control_->tick(getCurrentTimeInNano());
+#endif
         // Periodic endpoint reclaim: runs every 1 second to drain waiting_list_
         // Under failure load, insertions stall but endpoints still need cleanup
         auto current_time = std::chrono::steady_clock::now();

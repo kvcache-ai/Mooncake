@@ -30,6 +30,9 @@
 
 #include "tent/runtime/transport.h"
 #include "tent/runtime/slab.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "adaptive_congestion_control.h"
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -164,6 +167,15 @@ struct RdmaSlice {
     // can still be reading the slice, so the storage must outlive the
     // batch: see RdmaTransport::freeSubBatch() and Workers::handleCompletion().
     std::atomic<int> completions_owed{0};
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    // One permit describes this slice's current physical posting attempt.
+    // It is acquired after route resolution and settled by the CQ handler.
+    // Transport teardown settles any permit that did not reach a CQ.
+    adaptive_congestion_control::Permit rdma_congestion_control_permit;
+    void* rdma_congestion_control_route = nullptr;
+    RdmaEndPoint* rdma_congestion_control_endpoint = nullptr;
+    uint64_t rdma_congestion_control_endpoint_generation = 0;
+#endif
     TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
     // Worker lane that enqueued this slice: the one whose inflight_slice_set
