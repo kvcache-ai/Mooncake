@@ -964,17 +964,7 @@ class Buffer:
         try:
             from mooncake.pg import get_active_ranks
 
-            res = get_active_ranks(self.backend).to(device=device, dtype=dtype)
-            if res.numel() == self.group_size:
-                # If all ranks report inactive (e.g. uninitialized Coordinator view),
-                # treat all ranks as active.
-                if (res != 0).sum().item() == 0:
-                    return torch.ones((self.group_size,), dtype=dtype, device=device)
-                # Local rank must always be active if this process is executing.
-                if res[self.rank].item() == 0:
-                    res = res.clone()
-                    res[self.rank] = 1
-            return res
+            return get_active_ranks(self.backend).to(device=device, dtype=dtype)
         except Exception:
             return torch.ones((self.group_size,), dtype=dtype, device=device)
 

@@ -309,17 +309,17 @@ elseif(WITH_EP OR WITH_PG)
       DEPENDS mooncake_pg_device
       VERBATIM)
   endif()
+endif()
 
-  if(WITH_EP AND (USE_CUDA OR USE_HYGON))
-    add_custom_target(
-      mooncake_ep_device_stage ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "$<TARGET_FILE:mooncake_ep_device>" "${EP_PG_STAGING_DIR}/"
-      COMMENT "Staging Mooncake EP CUDA device library"
-      DEPENDS mooncake_ep_device
-      VERBATIM)
-  endif()
+if(WITH_EP AND (USE_CUDA OR USE_HYGON))
+  add_custom_target(
+    mooncake_ep_device_stage ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:mooncake_ep_device>" "${EP_PG_STAGING_DIR}/"
+    COMMENT "Staging Mooncake EP device library"
+    DEPENDS mooncake_ep_device
+    VERBATIM)
 endif()
 
 add_subdirectory(mooncake-integration)
