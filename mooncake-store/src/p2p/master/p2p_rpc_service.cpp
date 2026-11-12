@@ -185,22 +185,38 @@ void P2PMasterRpcService::init_http_server() {
                 "primary/RUNNING\"}");
             return;
         }
-        if (stepdown_requested_.exchange(true)) {
-            resp.set_status_and_content(
-                status_type::service_unavailable,
-                "{\"success\":false,\"error\":\"stepdown already requested\"}");
-            return;
+        StepdownRequest request{*cooldown, *drain_timeout};
+        bool already_requested;
+        {
+            std::lock_guard<std::mutex> lock(stepdown_mutex_);
+            already_requested = stepdown_request_.has_value();
+            if (already_requested) {
+                request = *stepdown_request_;
+            } else {
+                stepdown_request_ = request;
+            }
         }
-        LOG(INFO) << "P2P master stepdown requested"
-                  << ", cooldown_sec=" << *cooldown
-                  << ", drain_timeout_ms=" << *drain_timeout;
-        stepdown_callback_(*cooldown, *drain_timeout);
-        resp.set_status_and_content(status_type::ok,
-                                    "{\"success\":true,\"message\":\"stepdown "
-                                    "accepted\",\"cooldown_sec\":" +
-                                        std::to_string(*cooldown) +
-                                        ",\"drain_timeout_ms\":" +
-                                        std::to_string(*drain_timeout) + "}");
+        if (already_requested) {
+            VLOG(1) << "P2P master stepdown request already pending"
+                    << ", cooldown_sec=" << request.cooldown_sec
+                    << ", drain_timeout_ms=" << request.drain_timeout_ms
+                    << ", requested_cooldown_sec=" << *cooldown
+                    << ", requested_drain_timeout_ms=" << *drain_timeout;
+        } else {
+            LOG(INFO) << "P2P master stepdown requested"
+                      << ", cooldown_sec=" << request.cooldown_sec
+                      << ", drain_timeout_ms=" << request.drain_timeout_ms;
+            stepdown_callback_(request.cooldown_sec, request.drain_timeout_ms);
+        }
+        resp.set_status_and_content(
+            status_type::ok,
+            "{\"success\":true,\"message\":\"stepdown "
+            "accepted\",\"cooldown_sec\":" +
+                std::to_string(request.cooldown_sec) +
+                ",\"drain_timeout_ms\":" +
+                std::to_string(request.drain_timeout_ms) +
+                ",\"already_requested\":" +
+                (already_requested ? "true" : "false") + "}");
     });
 
     http_server_.set_http_handler<GET>(

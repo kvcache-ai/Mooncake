@@ -7,6 +7,7 @@
 #include <functional>
 #include <string>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -118,7 +119,14 @@ class P2PMasterRpcService final {
     std::mutex metric_report_mutex_;
     std::condition_variable metric_report_cv_;
     std::function<void(uint32_t, uint32_t)> stepdown_callback_;
-    std::atomic<bool> stepdown_requested_{false};
+    struct StepdownRequest {
+        uint32_t cooldown_sec;
+        uint32_t drain_timeout_ms;
+    };
+    // Publish the first request and both parameters together. Never hold this
+    // mutex while invoking the supervisor, which may wait for active RPCs.
+    std::mutex stepdown_mutex_;
+    std::optional<StepdownRequest> stepdown_request_;
     uint32_t heartbeat_rpc_port_ = 0;
 };
 
