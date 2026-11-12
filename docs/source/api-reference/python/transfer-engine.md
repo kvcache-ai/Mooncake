@@ -591,6 +591,21 @@ Reads bytes from a buffer at the specified address and returns them as a Python 
 
 ### Memory Registration
 
+#### enable_shared_memory_registration()
+
+```python
+engine.enable_shared_memory_registration()
+```
+
+After initializing a classic engine, call this before registering any buffers or
+sharing the engine with a Store client. It returns `0` on success and a negative
+error code otherwise. All registrations become remote-accessible and published;
+identical and contained regions share a reference-counted registration. Every
+successful registration must be balanced by a release at the same start address.
+See {ref}`the C++ shared registration contract <shared-memory-registration>`
+for lifetime requirements, rejected overlaps, and cleanup failures. TENT does not
+support this mode.
+
 #### register_memory()
 
 ```python
