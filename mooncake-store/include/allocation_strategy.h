@@ -65,10 +65,10 @@ class AllocatorManager {
     std::shared_ptr<SegmentAllocatorRegistration> addAllocator(
         const std::string& name,
         const std::shared_ptr<BufferAllocatorBase>& allocator,
-        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        ClientSessionSharedPtr owner_session) {
         auto registration = std::shared_ptr<SegmentAllocatorRegistration>(
-            new SegmentAllocatorRegistration(allocator,
-                                             std::move(client_liveness)));
+            new SegmentAllocatorRegistration(
+                allocator, SegmentLifetime(std::move(owner_session))));
         addRegistration(name, registration);
         return registration;
     }
@@ -109,32 +109,37 @@ class AllocatorManager {
         return registration_removed;
     }
 
-    struct Replacement {
+    struct RegistrationReplacement {
         std::string name;
-        std::shared_ptr<BufferAllocatorBase> expected;
-        std::shared_ptr<BufferAllocatorBase> replacement;
+        std::shared_ptr<SegmentAllocatorRegistration> expected;
+        std::shared_ptr<SegmentAllocatorRegistration> replacement;
     };
 
-    bool replaceAllocators(const std::vector<Replacement>& replacements) {
-        std::vector<decltype(allocators_)::mapped_type::iterator> targets;
+    bool replaceRegistrations(
+        const std::vector<RegistrationReplacement>& replacements) {
+        // Slot addresses remain stable: validation never resizes the per-name
+        // vectors, and commit only overwrites their elements.
+        std::vector<std::shared_ptr<SegmentAllocatorRegistration>*> targets;
         targets.reserve(replacements.size());
         for (const auto& replacement : replacements) {
             auto it = allocators_.find(replacement.name);
             if (it == allocators_.end() || !replacement.replacement) {
                 return false;
             }
-            auto target = std::find_if(
-                it->second.begin(), it->second.end(),
-                [&replacement](const auto& registration) {
-                    return registration->GetAllocator() == replacement.expected;
-                });
+            auto target = std::find(it->second.begin(), it->second.end(),
+                                    replacement.expected);
             if (target == it->second.end()) {
                 return false;
             }
-            targets.push_back(target);
+            auto* slot = std::addressof(*target);
+            if (std::find(targets.begin(), targets.end(), slot) !=
+                targets.end()) {
+                return false;
+            }
+            targets.push_back(slot);
         }
         for (size_t i = 0; i < replacements.size(); ++i) {
-            (*targets[i])->BindAllocator(replacements[i].replacement);
+            *targets[i] = replacements[i].replacement;
         }
         return true;
     }
@@ -171,7 +176,7 @@ class AllocatorManager {
         return it != allocators_.end() &&
                std::any_of(it->second.begin(), it->second.end(),
                            [](const auto& registration) {
-                               return registration->IsServing();
+                               return registration->IsAllocatable();
                            });
     }
 
@@ -461,11 +466,14 @@ class RandomAllocationStrategy : public AllocationStrategy {
             for (size_t i = 0; i < num_segs; ++i) {
                 const auto& registration =
                     (*allocators)[(i + seg_offset) % num_segs];
-                if (!preferred_hca_names.empty() &&
-                    HcaAffinityTier(
-                        registration->GetAllocator()->GetLocalityHandle().get(),
-                        preferred_hca_names) != tier) {
-                    continue;
+                if (!preferred_hca_names.empty()) {
+                    const auto& allocator = registration->GetAllocator();
+                    if (HcaAffinityTier(
+                            allocator ? allocator->GetLocalityHandle().get()
+                                      : nullptr,
+                            preferred_hca_names) != tier) {
+                        continue;
+                    }
                 }
                 if (auto buffer = registration->Allocate(slice_length)) {
                     return buffer;
@@ -647,10 +655,13 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
         uint64_t total_capacity = 0;
         uint64_t total_free = 0;
         for (const auto& registration : *allocators) {
-            if (!registration->IsServing()) {
+            if (!registration->IsAllocatable()) {
                 continue;
             }
-            const auto buffer_allocator = registration->GetAllocator();
+            const auto& buffer_allocator = registration->GetAllocator();
+            if (!buffer_allocator) {
+                continue;
+            }
             const auto capacity =
                 static_cast<uint64_t>(buffer_allocator->capacity());
             total_capacity += capacity;
@@ -729,7 +740,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
 
         std::unique_ptr<AllocatedBuffer> buffer;
         for (const auto& registration : *cxl_allocators) {
-            if (registration->IsServing()) {
+            if (registration->IsAllocatable()) {
                 buffer = registration->Allocate(slice_length);
                 if (buffer) {
                     break;
