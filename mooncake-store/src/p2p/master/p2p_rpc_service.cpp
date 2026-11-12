@@ -24,6 +24,27 @@ namespace {
 
 constexpr uint32_t kDefaultStepDownCooldownSec = 30;
 constexpr uint32_t kMaxStepDownCooldownSec = 3600;
+constexpr uint32_t kDefaultStepDownDrainTimeoutMs = 3000;
+constexpr uint32_t kMaxStepDownDrainTimeoutMs = 30000;
+
+tl::expected<uint32_t, std::string> ParseUint32Query(std::string_view value,
+                                                     uint32_t default_value,
+                                                     uint32_t max_value,
+                                                     std::string_view name) {
+    if (value.empty()) {
+        return default_value;
+    }
+    uint32_t parsed = 0;
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (error != std::errc{} || end != value.data() + value.size() ||
+        parsed > max_value) {
+        return tl::make_unexpected(std::string(name) +
+                                   " must be an integer in [0, " +
+                                   std::to_string(max_value) + "]");
+    }
+    return parsed;
+}
 
 std::string GetMasterMetricsSummary() {
     std::string summary =
@@ -63,7 +84,7 @@ P2PMasterRpcService::~P2PMasterRpcService() {
 }
 
 void P2PMasterRpcService::SetStepdownCallback(
-    std::function<void(uint32_t)> callback) {
+    std::function<void(uint32_t, uint32_t)> callback) {
     stepdown_callback_ = std::move(callback);
 }
 
@@ -120,24 +141,28 @@ void P2PMasterRpcService::init_http_server() {
         POST>("/ha/stepdown", [this](coro_http_request& req,
                                      coro_http_response& resp) {
         resp.add_header("Content-Type", "application/json; charset=utf-8");
-        uint32_t cooldown_sec = kDefaultStepDownCooldownSec;
-        const auto cooldown = req.get_query_value("cooldown_sec");
-        if (!cooldown.empty()) {
-            const auto [end, error] = std::from_chars(
-                cooldown.data(), cooldown.data() + cooldown.size(),
-                cooldown_sec);
-            if (error != std::errc{} ||
-                end != cooldown.data() + cooldown.size() ||
-                cooldown_sec > kMaxStepDownCooldownSec) {
-                LOG_EVERY_N(WARNING, 30)
-                    << "Rejected P2P master stepdown: cooldown_sec must be an "
-                       "integer in [0, 3600]";
-                resp.set_status_and_content(
-                    status_type::bad_request,
-                    "{\"success\":false,\"error\":\"cooldown_sec must be an "
-                    "integer in [0, 3600]\"}");
-                return;
-            }
+        const auto cooldown = ParseUint32Query(
+            req.get_query_value("cooldown_sec"), kDefaultStepDownCooldownSec,
+            kMaxStepDownCooldownSec, "cooldown_sec");
+        if (!cooldown) {
+            LOG_EVERY_N(WARNING, 30)
+                << "Rejected P2P master stepdown: " << cooldown.error();
+            resp.set_status_and_content(
+                status_type::bad_request,
+                "{\"success\":false,\"error\":\"" + cooldown.error() + "\"}");
+            return;
+        }
+        const auto drain_timeout =
+            ParseUint32Query(req.get_query_value("drain_timeout_ms"),
+                             kDefaultStepDownDrainTimeoutMs,
+                             kMaxStepDownDrainTimeoutMs, "drain_timeout_ms");
+        if (!drain_timeout) {
+            LOG_EVERY_N(WARNING, 30)
+                << "Rejected P2P master stepdown: " << drain_timeout.error();
+            resp.set_status_and_content(status_type::bad_request,
+                                        "{\"success\":false,\"error\":\"" +
+                                            drain_timeout.error() + "\"}");
+            return;
         }
         if (!stepdown_callback_) {
             resp.set_status_and_content(
@@ -167,12 +192,15 @@ void P2PMasterRpcService::init_http_server() {
             return;
         }
         LOG(INFO) << "P2P master stepdown requested"
-                  << ", cooldown_sec=" << cooldown_sec;
-        stepdown_callback_(cooldown_sec);
+                  << ", cooldown_sec=" << *cooldown
+                  << ", drain_timeout_ms=" << *drain_timeout;
+        stepdown_callback_(*cooldown, *drain_timeout);
         resp.set_status_and_content(status_type::ok,
                                     "{\"success\":true,\"message\":\"stepdown "
                                     "accepted\",\"cooldown_sec\":" +
-                                        std::to_string(cooldown_sec) + "}");
+                                        std::to_string(*cooldown) +
+                                        ",\"drain_timeout_ms\":" +
+                                        std::to_string(*drain_timeout) + "}");
     });
 
     http_server_.set_http_handler<GET>(

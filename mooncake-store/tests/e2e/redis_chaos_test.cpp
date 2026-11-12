@@ -817,15 +817,21 @@ TEST_F(RedisGracefulShutdownTest, PrimaryStepDownPausesReelection) {
     const std::string url =
         "http://127.0.0.1:" + std::to_string(54051 + leader);
     coro_http::coro_http_client client;
-    auto response = client.post(url + "/ha/stepdown?cooldown_sec=5", "",
-                                coro_http::req_content_type::octet_stream);
+    auto response =
+        client.post(url + "/ha/stepdown?cooldown_sec=5&drain_timeout_ms=1234",
+                    "", coro_http::req_content_type::octet_stream);
     ASSERT_EQ(response.status, 200) << response.resp_body;
     ASSERT_NE(response.resp_body.find("\"cooldown_sec\":5"),
+              std::string_view::npos);
+    ASSERT_NE(response.resp_body.find("\"drain_timeout_ms\":1234"),
               std::string_view::npos);
     ASSERT_TRUE(WaitForMasterLogSince(leader,
                                       "HA election paused after stepdown",
                                       log_offset, std::chrono::seconds(3)));
     ExpectPromptSuccessor(leader, version, start);
+    EXPECT_TRUE(WaitForMasterLogSince(
+        leader, "OpLog drain completed, drain_timeout_ms=1234", log_offset,
+        std::chrono::seconds(1)));
 
     // Standby diagnostics remain reachable while election is paused.
     coro_http::coro_http_client status_client;

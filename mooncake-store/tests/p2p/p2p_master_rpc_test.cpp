@@ -456,6 +456,7 @@ class GatedOpLogStore final : public mooncake::test::MockOpLogStore {
         {
             std::lock_guard<std::mutex> lock(event_mutex_);
             ++drain_events_;
+            drain_timeout_ms_ = timeout_ms;
             draining_ = true;
         }
         return mooncake::test::MockOpLogStore::DrainWriting(timeout_ms);
@@ -478,6 +479,11 @@ class GatedOpLogStore final : public mooncake::test::MockOpLogStore {
         return drain_events_;
     }
 
+    uint32_t DrainTimeoutMs() const {
+        std::lock_guard<std::mutex> lock(event_mutex_);
+        return drain_timeout_ms_;
+    }
+
     size_t Writes() const {
         std::lock_guard<std::mutex> lock(event_mutex_);
         return write_events_;
@@ -490,6 +496,7 @@ class GatedOpLogStore final : public mooncake::test::MockOpLogStore {
 
    private:
     std::promise<void> release_promise_;
+    uint32_t drain_timeout_ms_{0};
     std::shared_future<void> release_;
     std::promise<void> write_entered_promise_;
     std::promise<void> second_write_promise_;
@@ -725,18 +732,25 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     auto server = std::make_unique<coro_rpc::coro_rpc_server>(
         2, port, "127.0.0.1", std::chrono::seconds(0), false);
     std::atomic<bool> stepdown_requested{false};
-    service->SetStepdownCallback([&server, &stepdown_requested](uint32_t) {
-        stepdown_requested.store(true, std::memory_order_seq_cst);
-        server->stop();
-    });
+    std::atomic<uint32_t> drain_timeout_ms{0};
+    service->SetStepdownCallback(
+        [&server, &stepdown_requested, &drain_timeout_ms](uint32_t,
+                                                          uint32_t timeout_ms) {
+            drain_timeout_ms.store(timeout_ms);
+            stepdown_requested.store(true, std::memory_order_seq_cst);
+            server->stop();
+        });
 
-    std::packaged_task<int()> run([&master, &server, &service, &oplog_store] {
+    std::packaged_task<int()> run([&master, &server, &service, oplog_manager,
+                                   &drain_timeout_ms] {
         return master.RunActiveRpcServers(
             *server, *service,
             [] {
                 HAStatusManager::instance().SetRoleState("primary", "RUNNING");
             },
-            [&oplog_store] { (void)oplog_store->DrainWriting(3000); });
+            [oplog_manager, &drain_timeout_ms] {
+                (void)oplog_manager->DrainWriting(drain_timeout_ms.load());
+            });
     });
     auto run_result = run.get_future();
     std::thread run_thread(std::move(run));
@@ -809,7 +823,7 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     std::thread stepdown([&service] {
         const auto response = HttpPostForTest(
             "http://127.0.0.1:" + std::to_string(service->GetHttpPort()) +
-            "/ha/stepdown");
+            "/ha/stepdown?cooldown_sec=0&drain_timeout_ms=1234");
         EXPECT_EQ(response.status, 200);
     });
     while (!stepdown_requested.load(std::memory_order_seq_cst) &&
@@ -831,6 +845,7 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     stepdown.join();
     EXPECT_EQ(run_result.get(), 0);
     EXPECT_GT(oplog_store->Drains(), 0u);
+    EXPECT_EQ(oplog_store->DrainTimeoutMs(), 1234u);
     EXPECT_GT(oplog_store->Writes(), 0u);
     EXPECT_EQ(oplog_store->WritesAfterDrain(), 0u);
 

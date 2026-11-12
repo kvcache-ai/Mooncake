@@ -178,7 +178,7 @@ class ScopedStandbyRegistryProviders final {
 
 std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     const P2PMasterConfig& config, ViewVersionId view_version,
-    std::function<void(uint32_t)> stepdown_callback = {}) {
+    std::function<void(uint32_t, uint32_t)> stepdown_callback = {}) {
     auto service = std::make_unique<P2PMasterRpcService>(config, view_version);
     if (stepdown_callback) {
         service->SetStepdownCallback(std::move(stepdown_callback));
@@ -567,6 +567,8 @@ int P2PMaster::RunWithHA() {
 
         std::atomic<bool> leadership_lost{false};
         std::atomic<bool> active_stepdown_requested{false};
+        // Published with active_stepdown_requested's release/acquire pair.
+        uint32_t stepdown_drain_timeout_ms = 0;
         std::atomic<OpLogManager*> primary_oplog_manager{nullptr};
         const auto stop_for_leadership_loss = [&server, &leadership_lost,
                                                &primary_oplog_manager] {
@@ -584,10 +586,13 @@ int P2PMaster::RunWithHA() {
         };
         const auto stop_for_active_stepdown = [&server,
                                                &active_stepdown_requested,
-                                               &election_paused_until](
-                                                  uint32_t cooldown_sec) {
+                                               &election_paused_until,
+                                               &stepdown_drain_timeout_ms](
+                                                  uint32_t cooldown_sec,
+                                                  uint32_t drain_timeout_ms) {
             election_paused_until = std::chrono::steady_clock::now() +
                                     std::chrono::seconds(cooldown_sec);
+            stepdown_drain_timeout_ms = drain_timeout_ms;
             // Active stepdown is voluntary: close the write request entry
             // first, then let RunActiveRpcServers wait for accepted handlers
             // and drain confirmed writes while this primary still renews its
@@ -655,17 +660,19 @@ int P2PMaster::RunWithHA() {
 
         HAStatusManager::instance().SetRoleState("primary", "STARTING");
         auto drain_after_stepdown = [&active_stepdown_requested,
-                                     &leadership_lost, &primary_oplog_manager] {
+                                     &leadership_lost, &primary_oplog_manager,
+                                     &stepdown_drain_timeout_ms] {
             if (!active_stepdown_requested.load(std::memory_order_acquire) ||
                 leadership_lost.load(std::memory_order_acquire)) {
                 return;
             }
             if (auto* manager =
                     primary_oplog_manager.load(std::memory_order_acquire)) {
-                auto drain = manager->DrainWriting(3000);
+                auto drain = manager->DrainWriting(stepdown_drain_timeout_ms);
                 if (!drain.drained) {
                     LOG(WARNING)
                         << "P2P primary stepdown OpLog drain incomplete"
+                        << ", drain_timeout_ms=" << stepdown_drain_timeout_ms
                         << ", queued=" << drain.queued_count
                         << ", inflight=" << drain.inflight_count
                         << ", committed_sequence_id="
@@ -673,11 +680,13 @@ int P2PMaster::RunWithHA() {
                         << ", max_known_sequence_id="
                         << drain.max_known_sequence_id;
                 } else {
-                    LOG(INFO) << "P2P primary stepdown OpLog drain completed"
-                              << ", committed_sequence_id="
-                              << drain.committed_sequence_id
-                              << ", max_known_sequence_id="
-                              << drain.max_known_sequence_id;
+                    LOG(INFO)
+                        << "P2P primary stepdown OpLog drain completed"
+                        << ", drain_timeout_ms=" << stepdown_drain_timeout_ms
+                        << ", committed_sequence_id="
+                        << drain.committed_sequence_id
+                        << ", max_known_sequence_id="
+                        << drain.max_known_sequence_id;
                 }
             }
         };
