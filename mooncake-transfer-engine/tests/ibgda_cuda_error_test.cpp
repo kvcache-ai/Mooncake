@@ -70,12 +70,10 @@ TEST(IbgdaCudaErrorTest, PeerTableSetupStopsOnAddressCopyFailure) {
     constexpr int kSuccess = 0;
     constexpr int kFailure = 7;
     int key_copy_count = 0;
-    int cleanup_count = 0;
     std::size_t failed_operation = 99;
 
     const int status = initializePeerAddressTable(
-        kSuccess, [&] { ++cleanup_count; }, &failed_operation,
-        [] { return kFailure; },
+        kSuccess, &failed_operation, [] { return kFailure; },
         [&] {
             ++key_copy_count;
             return kSuccess;
@@ -84,22 +82,42 @@ TEST(IbgdaCudaErrorTest, PeerTableSetupStopsOnAddressCopyFailure) {
     EXPECT_EQ(status, kFailure);
     EXPECT_EQ(failed_operation, 0);
     EXPECT_EQ(key_copy_count, 0);
-    EXPECT_EQ(cleanup_count, 1);
 }
 
-TEST(IbgdaCudaErrorTest, PeerTableSetupCleansUpOnKeyCopyFailure) {
+TEST(IbgdaCudaErrorTest, PeerTableSetupPropagatesKeyCopyFailure) {
     constexpr int kSuccess = 0;
     constexpr int kFailure = 9;
-    int cleanup_count = 0;
     std::size_t failed_operation = 99;
 
     const int status = initializePeerAddressTable(
-        kSuccess, [&] { ++cleanup_count; }, &failed_operation,
-        [] { return kSuccess; }, [] { return kFailure; });
+        kSuccess, &failed_operation, [] { return kSuccess; },
+        [] { return kFailure; });
 
     EXPECT_EQ(status, kFailure);
     EXPECT_EQ(failed_operation, 1);
-    EXPECT_EQ(cleanup_count, 1);
+}
+
+TEST(IbgdaCudaErrorTest, PeerTableSetupCopiesAddressAndKeyOnSuccess) {
+    constexpr int kSuccess = 0;
+    int address = 0;
+    int key = 0;
+    std::size_t failed_operation = 99;
+
+    const int status = initializePeerAddressTable(
+        kSuccess, &failed_operation,
+        [&] {
+            address = 42;
+            return kSuccess;
+        },
+        [&] {
+            key = 7;
+            return kSuccess;
+        });
+
+    EXPECT_EQ(status, kSuccess);
+    EXPECT_EQ(address, 42);
+    EXPECT_EQ(key, 7);
+    EXPECT_EQ(failed_operation, 99);
 }
 
 }  // namespace

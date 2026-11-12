@@ -554,6 +554,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                      const std::vector<int64_t>& subnet_prefixes,
                      const std::vector<int64_t>& interface_ids,
                      const std::vector<int>& active_ranks_mask) override {
+        // Partial peer updates share this transport with live connections.
+        // Keep their QPs and advertised QPNs intact on failure; the caller
+        // owns rollback or reset of the affected peer slots.
         for (int i = 0; i < num_qps_; ++i) {
             int peer_rank = i * num_ranks_ / num_qps_;
             if (active_ranks_mask[peer_rank] == 0) continue;
@@ -585,12 +588,10 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                            << " udp_sport=" << ah_attr.dlid
                            << " hop_limit=" << (int)ah_attr.grh.hop_limit
                            << ")";
-                destroyQueuePairs();
                 return -1;
             }
             if (mlx5gda_modify_rc_qp_rtr2rts(qps_[i])) {
                 LOG(ERROR) << "[EP IBGDA] rtr2rts failed for QP " << i;
-                destroyQueuePairs();
                 return -1;
             }
         }
@@ -604,7 +605,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                                 : static_cast<uint32_t>(remote_keys[i]);
             size_t failed_operation = 0;
             const auto cuda_status = initializePeerAddressTable(
-                cudaSuccess, [this] { destroyQueuePairs(); }, &failed_operation,
+                cudaSuccess, &failed_operation,
                 [&] {
                     return cudaMemcpy(
                         static_cast<char*>(raddrs_) + i * sizeof(uint64_t),

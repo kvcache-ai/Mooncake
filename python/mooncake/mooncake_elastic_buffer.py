@@ -460,7 +460,6 @@ class ElasticBuffer:
 
         self.backend = group
         self._generation: Optional[Tuple[int, ...]] = None
-        self._rdma_connection_disabled = False
 
         # Native Mooncake transport/runtime.  This keeps the legacy Buffer ABI
         # untouched while giving ElasticBuffer users a dedicated native entrypoint.
@@ -748,30 +747,43 @@ class ElasticBuffer:
 
         if self.transport == "nccl":
             return
+        if not is_update:
+            self._started_with_ibgda = not bool(self.runtime.ibgda_disabled())
         if self._store_collectives is not None:
             self._connect_native_from_store(ep, is_update)
             return
 
+        was_disabled = bool(self.runtime.ibgda_disabled())
+        collective_device = _bootstrap_collective_device(self.group)
+        ibgda_state = torch.tensor(
+            [int(was_disabled), int(not was_disabled)],
+            dtype=torch.int32,
+            device=collective_device,
+        )
+        dist.all_reduce(ibgda_state, op=dist.ReduceOp.MAX, group=self.group)
+        if bool(ibgda_state[0].item()) and bool(ibgda_state[1].item()):
+            raise RuntimeError(
+                "ElasticBuffer ranks disagree on IBGDA readiness; native peer "
+                "synchronization cannot safely continue."
+            )
+
         if is_update:
-            if (
-                not bool(self.runtime.ibgda_disabled())
-                and not self._rdma_connection_disabled
-            ):
+            if not was_disabled:
                 self.runtime.update_local_qpns()
             ibgda_failed = torch.tensor(
-                [int(self.runtime.ibgda_disabled())],
+                [int(self._started_with_ibgda and self.runtime.ibgda_disabled())],
                 dtype=torch.int32,
-                device="cuda",
+                device=collective_device,
             )
             dist.all_reduce(ibgda_failed, op=dist.ReduceOp.MAX, group=self.group)
             if bool(ibgda_failed.item()):
-                self._rdma_connection_disabled = True
-                return self._connect_native(False)
+                raise RuntimeError(
+                    "ElasticBuffer IBGDA was disabled while refreshing local QPs "
+                    "on at least one rank; native peer synchronization cannot "
+                    "safely continue."
+                )
 
-        if (
-            not bool(self.runtime.ibgda_disabled())
-            and not self._rdma_connection_disabled
-        ):
+        if not bool(self.runtime.ibgda_disabled()):
             raddr, rkey = self.runtime.get_mr_info()
             raddr_tensor = torch.tensor([raddr], dtype=torch.int64, device="cuda")
             raddrs = [
@@ -841,6 +853,18 @@ class ElasticBuffer:
                 interface_ids_list,
                 active_ranks_mask,
             )
+            ibgda_failed = torch.tensor(
+                [int(self.runtime.ibgda_disabled())],
+                dtype=torch.int32,
+                device=collective_device,
+            )
+            dist.all_reduce(ibgda_failed, op=dist.ReduceOp.MAX, group=self.group)
+            if bool(ibgda_failed.item()):
+                raise RuntimeError(
+                    "ElasticBuffer native IBGDA peer synchronization disabled "
+                    "the transport on at least one rank; native peer "
+                    "synchronization cannot safely continue."
+                )
 
         try:
             local_handle_ints = self.runtime.get_ipc_handle()
@@ -877,7 +901,7 @@ class ElasticBuffer:
 
     def _connect_native_from_store(self, ep: Any, is_update: bool) -> None:
         was_disabled = bool(self.runtime.ibgda_disabled())
-        if is_update:
+        if is_update and not was_disabled:
             self.runtime.update_local_qpns()
         ibgda_disabled = bool(self.runtime.ibgda_disabled())
 
@@ -898,7 +922,14 @@ class ElasticBuffer:
         local_handle = tuple(int(value) for value in self.runtime.get_ipc_handle())
         peers = self._store_collectives.all_gather(
             "peer-bootstrap",
-            (was_disabled, ibgda_disabled, metadata, max_qp_count, local_handle),
+            (
+                was_disabled,
+                ibgda_disabled,
+                metadata,
+                max_qp_count,
+                local_handle,
+                self._started_with_ibgda,
+            ),
         )
         if (
             len({peer[0] for peer in peers}) != 1
@@ -908,9 +939,8 @@ class ElasticBuffer:
                 "ElasticBuffer ranks disagree on IBGDA readiness; native peer "
                 "synchronization cannot safely continue."
             )
-        was_disabled = peers[0][0]
         ibgda_disabled = peers[0][1]
-        if is_update and not was_disabled and ibgda_disabled:
+        if is_update and ibgda_disabled and any(peer[5] for peer in peers):
             raise RuntimeError(
                 "ElasticBuffer IBGDA was disabled while refreshing local QPs; "
                 "the fixed-world Store path cannot silently fall back."

@@ -39,16 +39,18 @@ Status initializeQueuePairDeviceContext(Status success, Cleanup&& cleanup,
                                       std::forward<CopyContext>(copy_context));
 }
 
-template <typename Status, typename Cleanup, typename CopyAddress,
-          typename CopyKey>
-Status initializePeerAddressTable(Status success, Cleanup&& cleanup,
-                                  std::size_t* failed_operation,
+template <typename Status, typename CopyAddress, typename CopyKey>
+Status initializePeerAddressTable(Status success, std::size_t* failed_operation,
                                   CopyAddress&& copy_address,
                                   CopyKey&& copy_key) {
-    return runCudaOperationsOrCleanup(success, std::forward<Cleanup>(cleanup),
-                                      failed_operation,
-                                      std::forward<CopyAddress>(copy_address),
-                                      std::forward<CopyKey>(copy_key));
+    Status result = std::forward<CopyAddress>(copy_address)();
+    if (result != success) {
+        if (failed_operation) *failed_operation = 0;
+        return result;
+    }
+    result = std::forward<CopyKey>(copy_key)();
+    if (result != success && failed_operation) *failed_operation = 1;
+    return result;
 }
 
 }  // namespace mooncake::device
