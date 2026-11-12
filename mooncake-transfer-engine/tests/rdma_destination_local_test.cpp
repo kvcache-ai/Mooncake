@@ -82,6 +82,9 @@ class DestinationRail : public ::testing::Test {
         buffer.addr = 4096;
         buffer.length = 1024;
         buffer.name = gpus("gpu:1");
+        // Device selection skips HCAs without keys for the buffer.
+        buffer.lkey = {1, 2};
+        buffer.rkey = {1, 2};
         peer.buffers.push_back(buffer);
     }
     void TearDown() override {
