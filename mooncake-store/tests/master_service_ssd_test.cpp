@@ -571,6 +571,105 @@ TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r1.error());
 }
 
+// A key whose only replica sits on `owner`'s local disk: written and
+// offloaded on the owner's memory segment, which is then unmounted.
+void LeaveOnlyALocalDiskReplica(MasterService& service, const UUID& owner,
+                                const std::string& key) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "owner_memory";
+    segment.base = 0x400000000ULL;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+    ASSERT_TRUE(service.MountSegment(segment, owner).has_value());
+    ASSERT_TRUE(service.MountLocalDiskSegment(owner, true).has_value());
+    PutAndOffload(service, owner, key, 1024, "owner_disk");
+    ASSERT_TRUE(service.UnmountSegment(segment.id, owner).has_value());
+}
+
+TEST_F(MasterServiceSSDTest, PutStartKeepsALiveOwnersLocalDiskReplica) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID owner = generate_uuid();
+    LeaveOnlyALocalDiskReplica(*service, owner, "key");
+    MountMemoryAndLocalDisk(*service, generate_uuid(), "writer_memory",
+                            0x500000000ULL);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put = service->PutStart(generate_uuid(), "key", TenantId::Default(),
+                                 1024, config);
+    ASSERT_FALSE(put.has_value());
+    EXPECT_EQ(put.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+}
+
+TEST_F(MasterServiceSSDTest, UpsertStartKeepsALiveOwnersLocalDiskReplica) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID owner = generate_uuid();
+    LeaveOnlyALocalDiskReplica(*service, owner, "key");
+    MountMemoryAndLocalDisk(*service, generate_uuid(), "writer_memory",
+                            0x500000000ULL);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service
+                    ->UpsertStart(generate_uuid(), "key", TenantId::Default(),
+                                  1024, config)
+                    .has_value());
+    auto hold = MasterServiceTestPeer::WriteObject(
+        *service,
+        MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), "key"});
+    ASSERT_TRUE(hold.has_value());
+    EXPECT_TRUE(hold->metadata().HasReplica([](const Replica& replica) {
+        return replica.is_local_disk_replica();
+    }));
+}
+
+TEST_F(MasterServiceSSDTest, PutStartKeepsASuspectedOwnersLocalDiskReplica) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID owner = generate_uuid();
+    LeaveOnlyALocalDiskReplica(*service, owner, "key");
+    MountMemoryAndLocalDisk(*service, generate_uuid(), "writer_memory",
+                            0x500000000ULL);
+    auto record = MasterServiceTestPeer(*service).FindClientRecord(owner);
+    ASSERT_TRUE(record);
+    // Zero timeouts: one evaluation marks the owner suspected, not offline.
+    ASSERT_EQ(record->Evaluate(ClientLivenessRecord::Clock::now(),
+                               std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put = service->PutStart(generate_uuid(), "key", TenantId::Default(),
+                                 1024, config);
+    ASSERT_FALSE(put.has_value());
+    EXPECT_EQ(put.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+}
+
+TEST_F(MasterServiceSSDTest, PutStartReplacesAnOfflineOwnersLocalDiskReplica) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID owner = generate_uuid();
+    LeaveOnlyALocalDiskReplica(*service, owner, "key");
+    MountMemoryAndLocalDisk(*service, generate_uuid(), "writer_memory",
+                            0x500000000ULL);
+    auto record = MasterServiceTestPeer(*service).FindClientRecord(owner);
+    ASSERT_TRUE(record);
+    const auto now = ClientLivenessRecord::Clock::now();
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_SUSPECTED);
+    ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
+                               std::chrono::seconds::zero()),
+              ClientLivenessTransition::BECAME_OFFLINE);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    EXPECT_TRUE(service
+                    ->PutStart(generate_uuid(), "key", TenantId::Default(),
+                               1024, config)
+                    .has_value());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
