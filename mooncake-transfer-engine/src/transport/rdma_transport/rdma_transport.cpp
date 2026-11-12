@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <set>
 #include <thread>
@@ -1788,13 +1789,20 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
                        uint64_t offset, std::string_view hint,
                        std::string_view local_hca, int retry_count,
                        bool by_local_hca) {
+    // Drop topology candidates without valid keys for this buffer before the
+    // selection rule applies. An entry that exists but has no such candidate
+    // fails rather than falling back to the wildcard entry, which would leave
+    // the buffer's location or the peer-affinity mapping.
+    const std::function<bool(int)> device_filter = [desc, &buffer](int id) {
+        return RdmaTransport::hasValidKeys(desc, buffer, id);
+    };
     if (by_local_hca) {
         const auto location = resolveBufferLocation(buffer, offset);
         int device_id = desc->topology.selectDeviceByLocalHca(
-            location, local_hca, retry_count);
-        if (device_id >= 0) return device_id;
-        return desc->topology.selectDeviceByLocalHca(kWildcardLocation,
-                                                     local_hca, retry_count);
+            location, local_hca, retry_count, device_filter);
+        if (device_id != ERR_DEVICE_NOT_FOUND) return device_id;
+        return desc->topology.selectDeviceByLocalHca(
+            kWildcardLocation, local_hca, retry_count, device_filter);
     }
 
     std::string location = buffer.name;
@@ -1806,17 +1814,22 @@ int pickTopologyDevice(RdmaTransport::SegmentDesc *desc,
     // A named hint is an explicit override: try the buffer location first,
     // then the global HCA set. Do not call the hint-taking selectDevice()
     // overload here because it applies normal selection immediately on a
-    // location miss, making the wildcard attempt unreachable.
+    // location miss, making the wildcard attempt unreachable. A hinted HCA
+    // without valid keys for the buffer is treated like an unknown hint name.
     if (!hint.empty()) {
         int device_id = desc->topology.getDeviceIndex(location, hint);
-        if (device_id >= 0) return device_id;
+        if (RdmaTransport::hasValidKeys(desc, buffer, device_id))
+            return device_id;
         device_id = desc->topology.getDeviceIndex(kWildcardLocation, hint);
-        if (device_id >= 0) return device_id;
+        if (RdmaTransport::hasValidKeys(desc, buffer, device_id))
+            return device_id;
     }
 
-    int device_id = desc->topology.selectDevice(location, retry_count);
-    if (device_id >= 0) return device_id;
-    return desc->topology.selectDevice(kWildcardLocation, retry_count);
+    int device_id =
+        desc->topology.selectDevice(location, retry_count, device_filter);
+    if (device_id != ERR_DEVICE_NOT_FOUND) return device_id;
+    return desc->topology.selectDevice(kWildcardLocation, retry_count,
+                                       device_filter);
 }
 
 int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
@@ -1844,8 +1857,7 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
             const size_t nkeys =
                 by_local_hca ? buffer.lkey.size() : buffer.rkey.size();
             if (static_cast<size_t>(hint_device_id) < nkeys &&
-                (desc->devices.empty() ||
-                 static_cast<size_t>(hint_device_id) < desc->devices.size())) {
+                RdmaTransport::hasValidKeys(desc, buffer, hint_device_id)) {
                 selected = hint_device_id;
             }
         }
@@ -1873,7 +1885,35 @@ int selectDeviceImpl(RdmaTransport::SegmentDesc *desc, uint64_t offset,
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 
+// The device is within the segment and `keys` holds a nonzero key for it.
+bool isKeyedDevice(
+    const RdmaTransport::SegmentDesc *desc,
+    const std::vector<TransferMetadata::BufferDesc::mr_key_t> &keys,
+    int device_id) {
+    if (device_id < 0) return false;
+    const size_t id = static_cast<size_t>(device_id);
+    if (!desc->devices.empty() && id >= desc->devices.size()) return false;
+    return id < keys.size() && keys[id] != 0;
+}
+
 }  // namespace
+
+bool RdmaTransport::hasValidLkey(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    return isKeyedDevice(desc, buffer.lkey, device_id);
+}
+
+bool RdmaTransport::hasValidRkey(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    return isKeyedDevice(desc, buffer.rkey, device_id);
+}
+
+bool RdmaTransport::hasValidKeys(const SegmentDesc *desc,
+                                 const BufferDesc &buffer, int device_id) {
+    if (buffer.lkey.empty() && buffer.rkey.empty()) return false;
+    return (buffer.lkey.empty() || hasValidLkey(desc, buffer, device_id)) &&
+           (buffer.rkey.empty() || hasValidRkey(desc, buffer, device_id));
+}
 
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, std::string_view hint,
