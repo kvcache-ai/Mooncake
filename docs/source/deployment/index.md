@@ -12,6 +12,7 @@ Kubernetes environments.
 | [Mooncake Store Deployment and Tuning](mooncake-store-deployment-guide) | Configure Store clients, metadata services, storage tiers, and production tuning. |
 | [Store-RS](store-rs/index) | Build, deploy, configure, and validate the Rust-native Store implementation. |
 | [Store-RS Cold-Tier Validation](store-rs/cold-tier) | Review cold-tier validation status and current test entry points. |
+| [Traffic Recording and Replay](traffic-recording) | Record Master RPC requests to local files, inspect the request stream, and replay recorded traffic. |
 | [KV Cache Sharing and Isolation](kv-cache-sharing-and-isolation) | Define cache-sharing boundaries across models, releases, request groups, and Mooncake tenants. |
 | [Kubernetes Deployment](kubernetes-deployment-guide/index) | Deploy Mooncake Store and Transfer Engine integrations on Kubernetes. |
 | [SSD Storage](ssd/index) | Configure local SSD offload or a shared NVMe-over-Fabrics storage pool. |

@@ -7,13 +7,16 @@
 #include <thread>
 
 #include <glog/logging.h>
-#include <ylt/coro_rpc/coro_rpc_server.hpp>
-
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
+#include "master_rpc_server.h"
 #include "types.h"
 
 namespace mooncake {
+
+EmbeddedMaster::EmbeddedMaster() = default;
+
+EmbeddedMaster::~EmbeddedMaster() { Stop(); }
 
 bool EmbeddedMaster::Start(InProcMasterConfig config) {
     if (server_) {
@@ -43,9 +46,10 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
             http_metadata_port_ = meta_server_->port();
         }
 
-        server_ = std::make_unique<coro_rpc::coro_rpc_server>(
-            /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"127.0.0.1",
-            std::chrono::seconds(0), /*tcp_no_delay=*/true);
+        server_ = std::make_unique<MasterRpcServer>(
+            /*rpc_thread_num=*/4, /*rpc_port=*/rpc_port_,
+            /*rpc_address=*/"127.0.0.1", std::chrono::seconds(0),
+            /*enable_tcp_no_delay=*/true, /*enable_recording=*/false);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
 #ifdef YLT_ENABLE_IBV
@@ -148,7 +152,7 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
         wrapped_->MarkReadyForServing();
         wrapped_->ActivateServing();
 
-        RegisterRpcService(*server_, *wrapped_);
+        server_->Register(*wrapped_, nullptr);
 
         auto ec = server_->async_start();
         if (ec.hasResult()) {
@@ -157,7 +161,7 @@ bool EmbeddedMaster::Start(InProcMasterConfig config) {
             Stop();
             return false;
         }
-        rpc_port_ = server_->port();
+        rpc_port_ = static_cast<int>(server_->port());
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         LOG(INFO) << "Embedded master started on " << master_address()
                   << ", metrics_port=" << http_metrics_port_

@@ -100,6 +100,10 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     hot_standby_service.cpp
     metadata_store.cpp
     standby_state_machine.cpp
+    traffic/traffic_admin.cpp
+    traffic/traffic_config.cpp
+    traffic/traffic_redaction.cpp
+    traffic/traffic_recorder.cpp
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
@@ -368,6 +372,17 @@ if(STORE_USE_K8S_LEASE)
       OBJECT_DEPENDS
       "${CMAKE_BINARY_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.h")
 endif()
+
+# File output for the traffic recorder. Kept separate from the recorder core so
+# the format and sink can be tested and reviewed without the RPC integration.
+# Later traffic PRs link this library instead of compiling file_sink.cpp a
+# second time into mooncake_store.
+add_library(mooncake_traffic_file_sink STATIC traffic/file_sink.cpp)
+target_include_directories(
+  mooncake_traffic_file_sink
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_link_libraries(mooncake_traffic_file_sink PUBLIC glog::glog)
 
 # NoF support code that is SPDK-free (page-registration bookkeeping,
 # probe-context pooling, and controller env parsing). Built in every
@@ -693,6 +708,7 @@ target_include_directories(mooncake_store_master
 target_link_libraries(
   mooncake_store_master
   PRIVATE mooncake_local_ssd
+          mooncake_traffic_file_sink
           cachelib_memory_allocator
           ${ETCD_WRAPPER_LIB}
           glog::glog
@@ -736,6 +752,7 @@ target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store
   PUBLIC mooncake_local_ssd
+         mooncake_traffic_file_sink
          cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
          glog::glog

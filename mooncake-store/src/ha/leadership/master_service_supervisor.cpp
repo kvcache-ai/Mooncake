@@ -26,6 +26,7 @@
 #include "rpc_service.h"
 #include "rpc_worker_pool.h"
 #include "shutdown_request.h"
+#include "master_rpc_server.h"
 
 namespace mooncake {
 namespace ha {
@@ -263,10 +264,9 @@ class ServingShutdownTrigger {
         while (!stop_.load(std::memory_order_acquire)) {
             if (ShutdownObserved(shutdown_requested_)) {
                 // on_shutdown_ runs with the mutex unlocked on purpose:
-                // Stop() must be able to signal and join while the callback
-                // is inside server.stop(). If that callback blocks, the
-                // join in Stop() waits, and the watchdog is what bounds the
-                // whole process, not this interlock.
+                // Stop() must be able to signal and join while this callback
+                // stops the RPC server and drains traffic recording. If the
+                // callback blocks, the watchdog bounds the whole process.
                 lock.unlock();
                 on_shutdown_();
                 return;
@@ -726,9 +726,10 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
 
         LOG(INFO) << "Starting serve phase...";
-        coro_rpc::coro_rpc_server server(
-            config.rpc_thread_num, config.rpc_port, config.rpc_address,
-            config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
+        MasterRpcServer server(config.rpc_thread_num, config.rpc_port,
+                               config.rpc_address, config.rpc_conn_timeout,
+                               config.rpc_enable_tcp_no_delay,
+                               /*enable_recording=*/true);
         if (RpcProtocolConfig::FromEnvironment().use_rdma) {
 #ifdef YLT_ENABLE_IBV
             server.init_ibv();
@@ -877,8 +878,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             config.handler_worker_thread_num != 0
                 ? config.handler_worker_thread_num
                 : config.rpc_thread_num);
-        mooncake::RegisterRpcService(server, *wrapped_master_service,
-                                     worker_pool.get());
+        server.Register(*wrapped_master_service, worker_pool.get());
 
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
             *leadership_session, [&server, &admin_server, &serving_state,
