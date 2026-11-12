@@ -38,7 +38,7 @@ class Namespace final : private route::RouteObserver {
    public:
     // `policy`, when set, outlives the namespace; `attachment` is what it hung
     // on this namespace when it was created. Without an `eviction_index` the
-    // namespace ranks its objects by lease (LeaseEvictionIndex).
+    // namespace uses the sharded lease bucket index.
     explicit Namespace(TenantId id = {}, NamespacePolicy* policy = nullptr,
                        std::unique_ptr<PolicyAttachment> attachment = nullptr,
                        std::unique_ptr<EvictionIndex> eviction_index = nullptr)
@@ -133,6 +133,10 @@ class Namespace final : private route::RouteObserver {
 
     static bool IsInitial(const route::SlotOwnerState& owner) {
         return !owner.in_flight_listed && !owner.eviction_filed &&
+               owner.eviction_shard == 0 && owner.eviction_rank == 0 &&
+               owner.eviction_identity == 0 && owner.eviction_born_seq == 0 &&
+               owner.eviction_refile_seq == 0 &&
+               owner.eviction_group == nullptr &&
                owner.policy_words == decltype(owner.policy_words){};
     }
 

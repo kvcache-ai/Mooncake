@@ -293,6 +293,14 @@ add_store_test(group_index_test group_index_test.cpp)
 add_store_test(metadata_namespace_test metadata_namespace_test.cpp)
 add_store_test(metadata_namespace_table_test metadata_namespace_table_test.cpp)
 add_store_test(eviction_index_test eviction_index_test.cpp)
+# These tests exercise metadata and the evictor without a transport runtime.
+add_executable(parallel_eviction_test parallel_eviction_test.cpp)
+target_link_libraries(
+  parallel_eviction_test
+  PRIVATE mooncake_store_master cachelib_memory_allocator glog::glog gtest_main
+          yalantinglibs::yalantinglibs)
+add_test(NAME parallel_eviction_test COMMAND parallel_eviction_test)
+set_tests_properties(parallel_eviction_test PROPERTIES TIMEOUT 90)
 add_store_test(evictor_test evictor_test.cpp)
 add_store_test(client_readonly_query_test client_readonly_query_test.cpp)
 add_store_test(prefetch_throttle_test prefetch_throttle_test.cpp)

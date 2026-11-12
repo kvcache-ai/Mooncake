@@ -155,7 +155,8 @@ class EvictFailingBatchHaKvBackend : public EvictFakeBatchHaKvBackend {
     size_t transaction_calls_{0};
 };
 
-class MasterServiceEvictScenarioTest : public ::testing::Test {
+class MasterServiceEvictScenarioTest
+    : public ::testing::TestWithParam<uint32_t> {
    protected:
     static constexpr uint64_t kObjectSize = 1_KB;
 
@@ -174,15 +175,18 @@ class MasterServiceEvictScenarioTest : public ::testing::Test {
     }
 
     MasterServiceConfig EvictConfig(bool allow_soft_pin_eviction = false) {
-        return MasterServiceConfig::builder()
-            .set_memory_allocator(BufferAllocatorType::OFFSET)
-            .set_default_kv_lease_ttl(0)
-            .set_default_kv_soft_pin_ttl(60 * 60 * 1000)
-            .set_allow_evict_soft_pinned_objects(allow_soft_pin_eviction)
-            .set_eviction_ratio(0.0)
-            .set_eviction_high_watermark_ratio(1.0)
-            .set_client_live_ttl_sec(3600)
-            .build();
+        auto config =
+            MasterServiceConfig::builder()
+                .set_memory_allocator(BufferAllocatorType::OFFSET)
+                .set_default_kv_lease_ttl(0)
+                .set_default_kv_soft_pin_ttl(60 * 60 * 1000)
+                .set_allow_evict_soft_pinned_objects(allow_soft_pin_eviction)
+                .set_eviction_ratio(0.0)
+                .set_eviction_high_watermark_ratio(1.0)
+                .set_client_live_ttl_sec(3600)
+                .build();
+        config.eviction_worker_threads = GetParam();
+        return config;
     }
 
     MasterServiceConfig PressureConfig(bool allow_soft_pin_eviction = false) {
@@ -261,7 +265,36 @@ class MasterServiceEvictScenarioTest : public ::testing::Test {
     std::vector<std::string> policy_files_;
 };
 
-TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtLowRatio) {
+TEST(MasterServiceEvictionConfigTest, DefaultsToAutomaticWorkers) {
+    EXPECT_EQ(MasterServiceConfig{}.eviction_worker_threads, 0u);
+    EXPECT_EQ(MasterServiceConfig::builder().build().eviction_worker_threads,
+              0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(ScanWorkers, MasterServiceEvictScenarioTest,
+                         ::testing::Values(0u, 1u, 4u));
+
+TEST_P(MasterServiceEvictScenarioTest, ReclaimsAcrossRangesAndKeepsLiveLeases) {
+    constexpr size_t kExpired = 33000;
+    constexpr size_t kLive = 1000;
+    MasterScenario scenario("parallel bucket range reclamation", EvictConfig());
+    scenario.Given(MemoryNode("memory").Capacity(128 * 1024 * 1024))
+        .Given(IndexedObjects(0, kExpired)
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        .Given(IndexedObjects(kExpired, kExpired + kLive)
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(std::chrono::system_clock::now() +
+                                std::chrono::hours(1)))
+        .When(EvictMemory(1.0))
+        .Then(ReadableCount(IndexedObjects(0, kExpired + kLive), kLive))
+        .Then(IndexedObjects(0, kExpired).DoNotExist())
+        .Then(IndexedObjects(kExpired, kExpired + kLive).AreReadable());
+}
+
+TEST_P(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtLowRatio) {
     constexpr size_t kObjectCount = 400;
     constexpr size_t kExpectedEvicted = 20;
 
@@ -280,7 +313,7 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtLowRatio) {
 
 // A put of an object the store already holds renews its lease, as a read does:
 // the oldest object, put again, is no longer the first to go.
-TEST_F(MasterServiceEvictScenarioTest, PutOfHeldObjectRenewsItsEvictionRank) {
+TEST_P(MasterServiceEvictScenarioTest, PutOfHeldObjectRenewsItsEvictionRank) {
     constexpr size_t kObjectCount = 400;
     constexpr size_t kExpectedEvicted = 20;
 
@@ -301,7 +334,7 @@ TEST_F(MasterServiceEvictScenarioTest, PutOfHeldObjectRenewsItsEvictionRank) {
         .Then(IndexedObjects(kExpectedEvicted + 1, kObjectCount).AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest, TargetEqualsLowerBoundEvictsExactCount) {
+TEST_P(MasterServiceEvictScenarioTest, TargetEqualsLowerBoundEvictsExactCount) {
     constexpr size_t kObjectCount = 250;
     constexpr size_t kExpectedEvicted = 25;
 
@@ -318,7 +351,7 @@ TEST_F(MasterServiceEvictScenarioTest, TargetEqualsLowerBoundEvictsExactCount) {
         .Then(Object(Key(kExpectedEvicted)).IsReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest, SoftPinnedObjectsAreFallbackCandidates) {
+TEST_P(MasterServiceEvictScenarioTest, SoftPinnedObjectsAreFallbackCandidates) {
     constexpr size_t kUnpinnedCount = 10;
     constexpr size_t kSoftPinnedCount = 10;
     constexpr size_t kExpectedSoftPinnedEvicted = 6;
@@ -348,7 +381,7 @@ TEST_F(MasterServiceEvictScenarioTest, SoftPinnedObjectsAreFallbackCandidates) {
                   .AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest, EvictsWholeGroupTogether) {
+TEST_P(MasterServiceEvictScenarioTest, EvictsWholeGroupTogether) {
     constexpr size_t kObjectCount = 10;
     constexpr size_t kGroupSize = 3;
     const auto base = ExpiredBase();
@@ -374,7 +407,7 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsWholeGroupTogether) {
         .Then(IndexedObjects(kGroupSize, kObjectCount).AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest, ActiveGroupMemberBlocksWholeGroup) {
+TEST_P(MasterServiceEvictScenarioTest, ActiveGroupMemberBlocksWholeGroup) {
     constexpr size_t kObjectCount = 10;
     constexpr size_t kGroupSize = 3;
     const auto base = ExpiredBase();
@@ -399,7 +432,7 @@ TEST_F(MasterServiceEvictScenarioTest, ActiveGroupMemberBlocksWholeGroup) {
         .Then(Object(Key(kGroupSize)).DoesNotExist());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        ProbedObjectsStayEvictableWhileLeasedObjectsSurvive) {
     auto config = EvictConfig();
     config.default_kv_lease_ttl = 60 * 60 * 1000;
@@ -424,7 +457,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(Objects({"leased_a", "leased_b"}).DoNotExist());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        LastHitOnlyLeasesOnlyTheSelectedCandidate) {
     auto config = EvictConfig();
     config.default_kv_lease_ttl = 60 * 60 * 1000;
@@ -453,7 +486,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(Objects({"p2_state", "p2_conv"}).DoNotExist());
 }
 
-TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {
+TEST_P(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {
     constexpr size_t kObjectCount = 200;
     constexpr size_t kExpectedEvicted = 160;
 
@@ -470,7 +503,7 @@ TEST_F(MasterServiceEvictScenarioTest, EvictsExactOldestObjectsAtHighRatio) {
         .Then(IndexedObjects(kExpectedEvicted, kObjectCount).AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        ReserveAbsorbsBlockedCandidatesAndMeetsTarget) {
     constexpr size_t kBlockedCount = 12;
     constexpr size_t kPlainCount = 1200;
@@ -507,7 +540,7 @@ TEST_F(MasterServiceEvictScenarioTest,
                   .DoNotExist());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        RefillAfterReserveExhaustionStillMeetsTarget) {
     constexpr size_t kBlockedCount = 1160;
     constexpr size_t kPlainCount = 200;
@@ -540,7 +573,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(IndexedObjects(0, kBlockedCount + 1).AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest, OpLogRecordsEvictedTenantAndKey) {
+TEST_P(MasterServiceEvictScenarioTest, OpLogRecordsEvictedTenantAndKey) {
     const std::string cluster_id = "evict_scenario_oplog";
     auto backend = std::make_shared<EvictFakeBatchHaKvBackend>();
     MasterScenario scenario("eviction writes tenant-scoped oplog",
@@ -566,7 +599,7 @@ TEST_F(MasterServiceEvictScenarioTest, OpLogRecordsEvictedTenantAndKey) {
     EXPECT_EQ(batch.entries[0].object_key, "cold");
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        OpLogDurabilityGatesTenantQuotaReclamation) {
     const std::string cluster_id = "evict_scenario_durability";
     const std::string tenant = TenantId::Default().value();
@@ -600,7 +633,7 @@ TEST_F(MasterServiceEvictScenarioTest,
                       .Eventually());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        OpLogReservationFailureLeavesEvictionCandidateReadable) {
     const std::string cluster_id = "evict_scenario_oplog_failure";
     auto backend = std::make_shared<EvictFailingBatchHaKvBackend>();
@@ -632,7 +665,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(Object("cold").IsReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        GlobalEvictReclaimsOnlySelectedTenantQuota) {
     MasterScenario scenario(
         "global eviction preserves tenant isolation",
@@ -661,7 +694,7 @@ TEST_F(MasterServiceEvictScenarioTest,
 
 // Admission does not evict. A tenant at its ceiling is rejected outright and
 // the background watermark pass is what makes room -- within that tenant only.
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        TenantOverQuotaRejectsAdmissionAndBackgroundPassReclaims) {
     MasterScenario scenario(
         "over-quota admission rejects; the tenant pass makes room",
@@ -706,7 +739,7 @@ TEST_F(MasterServiceEvictScenarioTest,
 // objects remain readable. Sizes are chosen so each armed cycle reclaims
 // exactly one expired one-megabyte object.
 
-TEST_F(MasterServiceEvictScenarioTest, AllocationPressureEvictsOldestFirst) {
+TEST_P(MasterServiceEvictScenarioTest, AllocationPressureEvictsOldestFirst) {
     constexpr uint64_t kLargeObject = 1024 * 1024;
     MasterScenario scenario("allocation pressure evicts the oldest objects",
                             PressureConfig());
@@ -723,7 +756,7 @@ TEST_F(MasterServiceEvictScenarioTest, AllocationPressureEvictsOldestFirst) {
         .Then(ReadableCount(IndexedObjects(0, 15), 12));
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        ClientRequestedSoftPinsSurviveAllocationPressure) {
     constexpr uint64_t kObjectSize = 1024 * 1024;
     MasterScenario scenario("client-requested soft pins survive pressure",
@@ -742,7 +775,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(ReadableCount(IndexedObjects(2, 14), 9));
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        PressureEvictsUnpinnedObjectsBeforeSoftPinned) {
     constexpr uint64_t kLargeObject = 1024 * 1024;
     const auto active_pin =
@@ -767,7 +800,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(IndexedObjects(5, 15).AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        PressureEvictsSoftPinnedAsFallbackWhenAllowed) {
     constexpr uint64_t kLargeObject = 1024 * 1024;
     const auto active_pin =
@@ -788,7 +821,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(IndexedObjects(3, 15).AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        PressureCannotReclaimSoftPinnedWhenDisallowed) {
     constexpr uint64_t kLargeObject = 1024 * 1024;
     const auto active_pin =
@@ -809,7 +842,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(IndexedObjects(0, 14).AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest, HardPinnedObjectsSurvivePressure) {
+TEST_P(MasterServiceEvictScenarioTest, HardPinnedObjectsSurvivePressure) {
     constexpr uint64_t kLargeObject = 1024 * 1024;
     MasterScenario scenario("hard pins survive pressure until forced removal",
                             PressureConfig());
@@ -833,7 +866,7 @@ TEST_F(MasterServiceEvictScenarioTest, HardPinnedObjectsSurvivePressure) {
         .Then(Object(Key(0)).DoesNotExist());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        PressureSparesHardPinnedAndSoftPinnedInOrder) {
     constexpr uint64_t kLargeObject = 1024 * 1024;
     const auto active_pin =
@@ -864,7 +897,7 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(IndexedObjects(5, 15).AreReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest, PressureEvictionExpandsToWholeGroup) {
+TEST_P(MasterServiceEvictScenarioTest, PressureEvictionExpandsToWholeGroup) {
     constexpr uint64_t kGroupObject = 2 * 1024 * 1024;
     MasterScenario scenario("pressure eviction expands to the whole group",
                             PressureConfig());
@@ -882,7 +915,7 @@ TEST_F(MasterServiceEvictScenarioTest, PressureEvictionExpandsToWholeGroup) {
         .Then(Object("grouped_evict_trigger").IsReadable());
 }
 
-TEST_F(MasterServiceEvictScenarioTest,
+TEST_P(MasterServiceEvictScenarioTest,
        LeasedGroupMemberShieldsWholeGroupFromPressure) {
     constexpr uint64_t kGroupObject = 2 * 1024 * 1024;
     auto config = PressureConfig();
