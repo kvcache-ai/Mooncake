@@ -33,13 +33,16 @@
 #include <json/json.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <future>
@@ -1863,6 +1866,132 @@ TEST(TcpWriteVisibilityTest, V2ReadRoundTripAndRejectedRead) {
     // And the pool must still be usable afterwards.
     r.target_offset = h.remote_base;
     EXPECT_EQ(runOne(h.engine.get(), r), TransferStatusEnum::COMPLETED);
+}
+
+// Issue #4441: the data port must not act as a raw memory-access primitive.
+// Unlike the tests above, which go through the initiator (and its own
+// metadata checks), this drives the real server with hand-crafted headers
+// from a bare socket, the way an unauthenticated peer would, and pins that
+// every request outside a registered buffer is refused before any byte of
+// the target is read or written, in both protocol versions.
+TEST(TcpWriteVisibilityTest, RawPeerCannotAccessUnregisteredMemory) {
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    std::string metadata_server = env ? env : "P2PHANDSHAKE";
+    constexpr size_t kPoolSize = 1ull << 20;
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17948", kPoolSize);
+    ASSERT_TRUE(h.ok) << "engine/segment setup failed";
+
+    auto desc = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_GT(desc->tcp_data_port, 0);
+    // The data listener binds the wildcard address, so loopback reaches it
+    // even when the advertised host is a name or another local address.
+    in_addr host_addr{};
+    std::string host = desc->tcp_data_host;
+    if (inet_pton(AF_INET, host.c_str(), &host_addr) != 1) {
+        host = "127.0.0.1";
+        ASSERT_EQ(inet_pton(AF_INET, host.c_str(), &host_addr), 1);
+    }
+
+    // Live process memory that was never registered with the engine.
+    constexpr size_t kSecretSize = 4096;
+    std::vector<unsigned char> secret(kSecretSize, 0xC3);
+    const uint64_t secret_addr = reinterpret_cast<uint64_t>(secret.data());
+
+    constexpr uint8_t kRead = static_cast<uint8_t>(TransferRequest::READ);
+    constexpr uint8_t kWrite = static_cast<uint8_t>(TransferRequest::WRITE);
+    constexpr uint8_t kV2 = 0x80;
+    constexpr uint64_t kRejected = (0x4D435456ull << 32) | 1;
+
+    // Sends one header (plus `payload` bytes for WRITE) on a fresh
+    // connection and returns everything the server sends before closing, or
+    // the first `stop_after` bytes for sessions the server keeps open.
+    auto exchange = [&](uint64_t addr, uint64_t size, uint8_t opcode,
+                        size_t payload,
+                        size_t stop_after = SIZE_MAX) -> std::string {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        EXPECT_GE(fd, 0);
+        if (fd < 0) return "<socket failed>";
+        timeval tv{5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(static_cast<uint16_t>(desc->tcp_data_port));
+        sa.sin_addr = host_addr;
+        if (connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+            ADD_FAILURE() << "connect to " << host << ":" << desc->tcp_data_port
+                          << " failed";
+            close(fd);
+            return "<connect failed>";
+        }
+        TestSessionHeader header{};
+        header.size = htole64(size);
+        header.addr = htole64(addr);
+        header.opcode = opcode;
+        EXPECT_EQ(send(fd, &header, sizeof(header), MSG_NOSIGNAL),
+                  (ssize_t)sizeof(header));
+        // The server may already have closed; a failed send is fine here.
+        std::vector<char> body(payload, 0x11);
+        if (payload) (void)send(fd, body.data(), payload, MSG_NOSIGNAL);
+
+        std::string received;
+        char buf[4096];
+        for (;;) {
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            if (n > 0) {
+                received.append(buf, n);
+                if (received.size() >= stop_after) break;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno != ECONNRESET)
+                ADD_FAILURE() << "server did not close a rejected session";
+            break;
+        }
+        close(fd);
+        return received;
+    };
+    auto rejected_frame = [&] {
+        uint64_t frame = htole64(kRejected);
+        return std::string(reinterpret_cast<char*>(&frame), sizeof(frame));
+    };
+
+    struct Case {
+        const char* name;
+        uint64_t addr;
+        uint64_t size;
+    };
+    const Case cases[] = {
+        {"unregistered heap", secret_addr, kSecretSize},
+        {"straddles pool end", h.remote_base + kPoolSize - 16, 32},
+        {"one past pool end", h.remote_base + kPoolSize, 1},
+        {"addr+size wraps", h.remote_base, ~0ull - 7},
+        {"zero size", h.remote_base, 0},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        // v1: no status channel; the only acceptable answer is a close with
+        // zero payload bytes (anything else is leaked target memory).
+        EXPECT_EQ(exchange(c.addr, c.size, kRead, 0), "");
+        // v2: exactly one rejection frame, then close.
+        EXPECT_EQ(exchange(c.addr, c.size, kRead | kV2, 0), rejected_frame());
+        // v1 WRITE carries a body so that a missing check would actually
+        // clobber the target. v2 WRITE stays header-only: closing with an
+        // unread body makes the kernel send RST, which could race the
+        // rejection frame.
+        const size_t payload = std::min<uint64_t>(c.size, kSecretSize);
+        EXPECT_EQ(exchange(c.addr, c.size, kWrite, payload), "");
+        EXPECT_EQ(exchange(c.addr, c.size, kWrite | kV2, 0), rejected_frame());
+    }
+    // The rejected WRITEs closed the session before any body was applied.
+    EXPECT_TRUE(std::all_of(secret.begin(), secret.end(),
+                            [](unsigned char b) { return b == 0xC3; }));
+
+    // Sanity: the same raw path is honored for a registered range, so the
+    // rejections above are address validation, not a broken harness.
+    memset(h.pool, 0x7E, 64);
+    EXPECT_EQ(exchange(h.remote_base, 64, kRead, 0, 64), std::string(64, 0x7E));
 }
 
 TEST(TcpWriteVisibilityTest, GroupedScatterReadWritePreservesEveryFragment) {
