@@ -42,12 +42,10 @@
 #include "config/distributed_storage_config.h"
 #include "config/rpc_protocol_config.h"
 #include "store_rpc_client_io_context.h"
-#include "bool_parser.h"
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
-#include "config/egm_store_pool_config.h"
+#include "config/client_config.h"
 #include "config/hugepage_config.h"
-#include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
 #include "common/network.h"
@@ -1019,26 +1017,33 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_embedded_master) {
-    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
-                          global_segment_size, local_buffer_size, protocol,
-                          rdma_devices, master_server_addr, transfer_engine,
-                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
-                          start_offload_rpc_server, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port,
-                          enable_embedded_master);
+    return Setup(ClientConfig{
+        .local_hostname = local_hostname,
+        .metadata_server = metadata_server,
+        .global_segment_size = global_segment_size,
+        .local_buffer_size = local_buffer_size,
+        .protocol = protocol,
+        .rdma_devices = rdma_devices,
+        .master_server_addr = master_server_addr,
+        .transfer_engine = transfer_engine,
+        .ipc_socket_path = ipc_socket_path,
+        .local_rpc_port = local_rpc_port,
+        .enable_ssd_offload = enable_ssd_offload,
+        .start_offload_rpc_server = start_offload_rpc_server,
+        .ssd_offload_path = ssd_offload_path,
+        .tenant_id = tenant_id,
+        .enable_client_http_server = enable_client_http_server,
+        .client_http_port = client_http_port,
+        .enable_embedded_master = enable_embedded_master,
+        // Preserve the legacy argument adapter's per-instance prefetch
+        // settings.
+        .enable_ssd_prefetch = enable_ssd_prefetch_,
+        .ssd_prefetch_cooldown_sec = ssd_prefetch_cooldown_sec_,
+        .ssd_prefetch_dedup_ttl_sec = ssd_prefetch_dedup_ttl_sec_,
+    });
 }
 
-tl::expected<void, ErrorCode> RealClient::setup_internal(
-    const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
-    const std::string &metadata_server, size_t global_segment_size,
-    size_t local_buffer_size, const std::string &protocol,
-    const std::string &rdma_devices, const std::string &master_server_addr,
-    const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path, int local_rpc_port,
-    bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path, const std::string &tenant_id,
-    bool enable_client_http_server, int client_http_port,
-    bool enable_embedded_master) {
+tl::expected<void, ErrorCode> RealClient::Setup(const ClientConfig &input) {
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
     if (client_) {
@@ -1073,19 +1078,53 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
+    ClientConfig config = input;
+    const bool embedded_master_from_environment =
+        !config.enable_embedded_master &&
+        Environ::Process().GetTypedOr(
+            EmbeddedMasterEnvironmentVariables::MOONCAKE_ENABLE_EMBEDDED_MASTER,
+            false);
+    config.ResolveOverrides(embedded_master_from_environment,
+                            FLAGS_enable_http_server, FLAGS_http_port);
+    if (config.protocol == "cxl") {
+        config.cxl_device_size =
+            CxlSegmentConfig::FromEnvironment().device_size;
+    }
+    const bool uses_kvcs =
+        DistributedStorageConfig::FromEnvironment().UsesKvcs();
+    if (config.enable_ssd_offload || uses_kvcs) {
+        config.ResolveFileStorage(FileStorageConfig::FromEnvironment(),
+                                  uses_kvcs);
+    }
+    const auto valid = config.Validate();
+    if (!valid) return tl::unexpected(valid.error());
+
+    const auto &egm_config = config.egm;
+    const auto &local_hostname = config.local_hostname;
+    const auto &metadata_server = config.metadata_server;
+    auto global_segment_size = config.global_segment_size;
+    const auto local_buffer_size = config.local_buffer_size;
+    const auto &protocol = config.protocol;
+    const auto &rdma_devices = config.rdma_devices;
+    const auto &master_server_addr = *config.master_server_addr;
+    const auto &transfer_engine = config.transfer_engine;
+    const auto &ipc_socket_path = config.ipc_socket_path;
+    const auto local_rpc_port = config.local_rpc_port;
+    const auto enable_ssd_offload = config.enable_ssd_offload;
+    const auto start_offload_rpc_server = config.start_offload_rpc_server;
+    const auto &tenant_id = config.tenant_id;
+    const auto enable_client_http_server = config.enable_client_http_server;
+    const auto client_http_port = config.client_http_port;
+    const auto enable_embedded_master = config.enable_embedded_master;
+    enable_ssd_prefetch_ = config.enable_ssd_prefetch;
+    ssd_prefetch_cooldown_sec_ = config.ssd_prefetch_cooldown_sec;
+    ssd_prefetch_dedup_ttl_sec_ = config.ssd_prefetch_dedup_ttl_sec;
+
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
 
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
-    if (!enable_embedded_master &&
-        Environ::Process().GetTypedOr(
-            EmbeddedMasterEnvironmentVariables::MOONCAKE_ENABLE_EMBEDDED_MASTER,
-            false)) {
-        LOG(INFO) << "enable_embedded_master inferred from "
-                     "MOONCAKE_ENABLE_EMBEDDED_MASTER";
-        enable_embedded_master = true;
-    }
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
         auto ascend_setup = setup_ascend_internal(local_buffer_size);
@@ -1107,12 +1146,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
              ? std::nullopt
              : std::make_optional(rdma_devices));
 
-    // Validate required parameters
-    if (local_hostname.empty()) {
-        LOG(ERROR) << "local_hostname is empty";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     std::string resolved_master_server_addr = master_server_addr;
     std::string resolved_metadata_server = metadata_server;
     if (enable_embedded_master) {
@@ -1121,14 +1154,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             return tl::unexpected(started.error());
         }
         resolved_master_server_addr = started.value();
-        if (resolved_metadata_server.empty() && !transfer_engine) {
-            resolved_metadata_server = "P2PHANDSHAKE";
-        }
-    } else if (resolved_metadata_server.empty() && !transfer_engine) {
-        // An existing transfer engine already owns its metadata connection;
-        // Client::Create reuses it without initialization.
-        LOG(ERROR) << "metadata_server is empty";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Check if hostname already contains a port
@@ -1259,12 +1284,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // registration limit split it into balanced chunks; other transports use
     // one segment.
     if (protocol == "cxl") {
-        const auto cxl_config = CxlSegmentConfig::FromEnvironment();
-        if (!cxl_config.device_size.has_value()) {
-            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        const size_t cxl_dev_size = *cxl_config.device_size;
+        const size_t cxl_dev_size = *config.cxl_device_size;
 
         void *ptr = client_->GetBaseAddr();
         LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
@@ -1616,19 +1636,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
-    const auto distributed_config = DistributedStorageConfig::FromEnvironment();
-    const bool enable_kvcs = distributed_config.UsesKvcs();
-    if (enable_ssd_offload || enable_kvcs) {
-        auto file_storage_config = FileStorageConfig::FromEnvironment();
-        if (enable_kvcs) {
-            file_storage_config.storage_backend_type =
-                StorageBackendType::kDistributed;
-        }
-        if (!ssd_offload_path.empty()) {
-            file_storage_config.storage_filepath = ssd_offload_path;
-        }
+    if (config.file_storage) {
         file_storage_ = std::make_shared<FileStorage>(
-            file_storage_config, client_, this->local_rpc_addr,
+            *config.file_storage, client_, this->local_rpc_addr,
             client_->GetSsdMetricPtr());
         auto init_result = file_storage_->Init();
         if (!init_result) {
@@ -1676,19 +1686,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                   << CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC << "="
                   << ssd_prefetch_dedup_ttl_sec_ << "s";
     }
-    const bool should_start_http_server =
-        enable_client_http_server || FLAGS_enable_http_server;
-    const int selected_http_port =
-        enable_client_http_server ? client_http_port : FLAGS_http_port;
-    if (should_start_http_server) {
-        if (selected_http_port <= 0 || selected_http_port > 65535) {
-            LOG(ERROR) << "Invalid client HTTP server port: "
-                       << selected_http_port;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (start_http_server(selected_http_port) != 0) {
+    if (enable_client_http_server) {
+        if (start_http_server(client_http_port) != 0) {
             LOG(WARNING) << "Failed to start client HTTP server on port "
-                         << selected_http_port
+                         << client_http_port
                          << "; continuing without HTTP endpoints";
         }
     }
@@ -1712,195 +1713,19 @@ int RealClient::setup_real(
         tenant_id, enable_client_http_server, client_http_port));
 }
 
-namespace {
-// Helper to get value from config dict with default
-inline std::string get_config(const ConfigDict &config, const std::string &key,
-                              const std::string &default_value = "") {
-    auto it = config.find(key);
-    return (it != config.end()) ? it->second : default_value;
-}
-
-inline std::optional<size_t> get_config_size(const ConfigDict &config,
-                                             const std::string &key,
-                                             size_t default_value) {
-    auto it = config.find(key);
-    if (it == config.end()) {
-        return default_value;
-    }
-
-    auto parsed_size_opt = try_string_to_byte_size(it->second);
-    if (!parsed_size_opt.has_value()) {
-        LOG(ERROR) << "Invalid size value for config key '" << key
-                   << "': " << it->second;
-        return std::nullopt;
-    }
-    return static_cast<size_t>(parsed_size_opt.value());
-}
-
-inline bool get_config_bool(const ConfigDict &config, const std::string &key,
-                            bool default_value) {
-    auto it = config.find(key);
-    if (it == config.end()) {
-        return default_value;
-    }
-
-    const auto parsed = TryParseBool(it->second);
-    if (parsed.has_value()) {
-        return *parsed;
-    }
-
-    LOG(WARNING) << "Invalid boolean value for config key '" << key
-                 << "': " << it->second << ", using default: " << default_value;
-    return default_value;
-}
-
-inline std::optional<int> get_config_int(const ConfigDict &config,
-                                         const std::string &key,
-                                         int default_value) {
-    auto it = config.find(key);
-    if (it == config.end()) {
-        return default_value;
-    }
-
-    const auto parsed_value =
-        TryParseInteger<int>(it->second, {.trim_ascii_whitespace = true});
-    if (!parsed_value.has_value()) {
-        LOG(ERROR) << "Invalid integer value for config key '" << key
-                   << "': " << it->second;
-        return std::nullopt;
-    }
-    return *parsed_value;
-}
-}  // namespace
-
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const ConfigDict &config) {
-    // Extract required parameters (no defaults)
-    std::string local_hostname = get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
-    std::string metadata_server =
-        get_config(config, CONFIG_KEY_METADATA_SERVER);
-    bool enable_embedded_master =
-        get_config_bool(config, CONFIG_KEY_ENABLE_EMBEDDED_MASTER, false);
-    if (!enable_embedded_master) {
-        enable_embedded_master = Environ::Process().GetTypedOr(
-            EmbeddedMasterEnvironmentVariables::MOONCAKE_ENABLE_EMBEDDED_MASTER,
-            false);
-    }
-
-    // Validate required parameters
-    if (local_hostname.empty()) {
-        LOG(ERROR) << "Missing required config: " << CONFIG_KEY_LOCAL_HOSTNAME;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (metadata_server.empty()) {
-        if (enable_embedded_master) {
-            metadata_server = "P2PHANDSHAKE";
-        } else {
-            LOG(ERROR) << "Missing required config: "
-                       << CONFIG_KEY_METADATA_SERVER;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-    }
-
-    // Extract optional parameters with defaults
-    auto global_segment_size_opt = get_config_size(
-        config, CONFIG_KEY_GLOBAL_SEGMENT_SIZE, DEFAULT_GLOBAL_SEGMENT_SIZE);
-    if (!global_segment_size_opt.has_value()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto local_buffer_size_opt = get_config_size(
-        config, CONFIG_KEY_LOCAL_BUFFER_SIZE, DEFAULT_LOCAL_BUFFER_SIZE);
-    if (!local_buffer_size_opt.has_value()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    size_t global_segment_size = global_segment_size_opt.value();
-    size_t local_buffer_size = local_buffer_size_opt.value();
-    std::string protocol =
-        get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
-    std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
-    std::string master_server_addr = get_config(
-        config, CONFIG_KEY_MASTER_SERVER_ADDR,
-        enable_embedded_master ? std::string() : DEFAULT_MASTER_SERVER_ADDR);
-    std::string ipc_socket_path =
-        get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
-
-    // A size of 0 keeps the pure client/server setup semantics.
-    // global_segment_size is a total capacity; protocols with a registration
-    // limit split it into mountable chunks below.
-    auto validate_min_size = [](const char *key, size_t value) {
-        if (value != 0 && value < MIN_SEGMENT_SIZE) {
-            LOG(ERROR) << "Invalid " << key << ": " << value
-                       << ", must be 0 or at least " << MIN_SEGMENT_SIZE;
-            return false;
-        }
-        return true;
-    };
-    auto validate_single_segment_size = [](const char *key, size_t value) {
-        if ((value != 0 && value < MIN_SEGMENT_SIZE) ||
-            value > MAX_SEGMENT_SIZE) {
-            LOG(ERROR) << "Invalid " << key << ": " << value
-                       << ", must be 0 or between " << MIN_SEGMENT_SIZE
-                       << " and " << MAX_SEGMENT_SIZE;
-            return false;
-        }
-        return true;
-    };
-    if (!validate_min_size(CONFIG_KEY_GLOBAL_SEGMENT_SIZE,
-                           global_segment_size) ||
-        !validate_single_segment_size(CONFIG_KEY_LOCAL_BUFFER_SIZE,
-                                      local_buffer_size)) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::string ssd_offload_path = get_config(config, "ssd_offload_path");
-    std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
-    bool enable_ssd_offload =
-        get_config_bool(config, "enable_ssd_offload", false);
-    bool enable_client_http_server =
-        get_config_bool(config, CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, false);
-    auto client_http_port_opt = get_config_int(
-        config, CONFIG_KEY_CLIENT_HTTP_PORT, DEFAULT_CLIENT_HTTP_PORT);
-    if (!client_http_port_opt.has_value()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    int client_http_port = client_http_port_opt.value();
-
-    // SSD prefetch knobs (all default off; see
-    // docs/source/design/store/ssd-prefetch.md).
-    enable_ssd_prefetch_ =
-        get_config_bool(config, CONFIG_KEY_ENABLE_SSD_PREFETCH, false);
-    auto prefetch_cooldown_opt =
-        get_config_size(config, CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC,
-                        DEFAULT_SSD_PREFETCH_COOLDOWN_SEC);
-    auto prefetch_dedup_ttl_opt =
-        get_config_size(config, CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC,
-                        DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC);
-    if (!prefetch_cooldown_opt.has_value() ||
-        !prefetch_dedup_ttl_opt.has_value()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    ssd_prefetch_cooldown_sec_ =
-        static_cast<int64_t>(prefetch_cooldown_opt.value());
-    ssd_prefetch_dedup_ttl_sec_ =
-        static_cast<int64_t>(prefetch_dedup_ttl_opt.value());
-
-    auto egm_config =
-        ParseEgmStorePoolConfig(config, protocol, global_segment_size);
-    if (!egm_config) return tl::unexpected(egm_config.error());
+    auto parsed = ParseClientConfig(config);
+    if (!parsed) return tl::unexpected(parsed.error());
     try {
-        auto result = setup_internal(
-            *egm_config, local_hostname, metadata_server, global_segment_size,
-            local_buffer_size, protocol, rdma_devices, master_server_addr,
-            nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
-            ssd_offload_path, tenant_id, enable_client_http_server,
-            client_http_port, enable_embedded_master);
-        if (!result && egm_config->enabled) {
+        auto result = Setup(*parsed);
+        if (!result && parsed->egm.enabled) {
             (void)tearDownAll_internal();
         }
         return result;
     } catch (...) {
-        // The Python wrapper still owns this client when setup throws.
-        if (egm_config->enabled) (void)tearDownAll_internal();
+        // EGM setup can own registrations even when initialization fails.
+        if (parsed->egm.enabled) (void)tearDownAll_internal();
         throw;
     }
 }

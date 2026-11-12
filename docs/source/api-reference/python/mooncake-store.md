@@ -1166,6 +1166,15 @@ the positional overload.
 - `enable_client_http_server` (bool): Enable the client-local `/health`, `/metrics`, `/metrics/summary`, and `/version` HTTP endpoints. Defaults to `False`.
 - `client_http_port` (int): Port for the client-local HTTP endpoints. Defaults to `9300`.
 
+Both overloads validate setup inputs before creating the transfer runtime,
+starting an embedded master, or allocating Store memory. Each segment size may
+be `0` to disable that allocation; otherwise it must be at least 1 KiB.
+`local_buffer_size` is limited to 1 TiB, while `global_segment_size` is total
+capacity and may span multiple registrations. An enabled client HTTP server
+requires a port in `1..65535`. CXL setup requires `MC_CXL_DEV_SIZE` to be set,
+and enabled FileStorage configuration must pass its path and limit checks.
+Invalid inputs return an error status before these resources are created.
+
 **Store segment pinned memory:** CUDA-enabled builds can register Store-managed
 host segments as pinned memory when `MC_STORE_PIN_MEMORY_MAX_BYTES` is set to a
 positive process-wide quota; unset, empty, `0`, or invalid values disable it.
