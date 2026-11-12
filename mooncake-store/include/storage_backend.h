@@ -1065,23 +1065,24 @@ class BucketStorageBackend : public StorageBackendInterface {
     size_t UngroupedOffloadingObjectsSize() const;
 
     /**
-     * @brief Iterate over the metadata of stored objects starting from a
-     * specified cursor.
+     * @brief Iterate over stored object metadata from the given cursor,
+     * continuing inside a bucket when the batch limit is reached.
      * @param cursor The bucket ID and key index to start scanning from.
-     * @param keys          Output vector to receive object keys
-     * @param metadatas     Output vector to receive object metadata
-     * @param buckets       Output vector to receive corresponding destination
-     * bucket IDs
-     * @param limit         Maximum number of entries to return in this call
+     * @param keys Output vector to receive object keys.
+     * @param metadatas Output vector to receive metadata corresponding to keys.
+     * @param buckets Output vector to receive IDs of buckets included in the
+     * batch.
+     * @param limit Maximum number of keys in the output batch; must be
+     * positive.
      * @param pins          Optional output. When non-null, every returned
      *                      bucket is pinned (see BucketScanPin) for the
      *                      caller. The caller must keep the pins alive until
      *                      the batch's metadata has been registered with the
      *                      master; dropping them re-enables eviction.
      * @return tl::expected<ScanCursor, ErrorCode>
-     * - On success: the cursor for the next batch (bucket_id == 0 if all data
-     * has been scanned).
-     * - On failure: returns an error code (e.g., BUCKET_NOT_FOUND, IO_ERROR).
+     * - On success: the bucket ID and key index for the next batch, or
+     * bucket_id == 0 if all data has been scanned.
+     * - On failure: INVALID_PARAMS if limit is nonpositive.
      */
     tl::expected<ScanCursor, ErrorCode> BucketScan(
         ScanCursor cursor, std::vector<std::string>& keys,
