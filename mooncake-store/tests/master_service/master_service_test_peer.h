@@ -137,17 +137,17 @@ class MasterServiceTestPeer {
     }
 
     static auto& ClientLivenessRecords(MasterService& service) {
-        return service.client_liveness_records_;
+        return service.client_sessions_.records_;
     }
     static const auto& ClientLivenessRecords(const MasterService& service) {
-        return service.client_liveness_records_;
+        return service.client_sessions_.records_;
     }
 
     static auto& ClientMutex(MasterService& service) {
-        return service.client_mutex_;
+        return service.client_sessions_.mutex_;
     }
     static const auto& ClientMutex(const MasterService& service) {
-        return service.client_mutex_;
+        return service.client_sessions_.mutex_;
     }
 
     static auto& DynamicReplicationWindows(MasterService& service) {
@@ -498,7 +498,7 @@ class MasterServiceTestPeer {
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const {
-        return service_.FindClientRecord(client_id);
+        return service_.client_sessions_.Find(client_id);
     }
 
     // Resolves the namespace, creating it through the table's factory on first
