@@ -38,7 +38,7 @@ __global__ void enqueueTaskKernel(int opType, size_t dataSize,
     __threadfence_system();
     tasks[taskId].active = true;
 
-    // Spin-wait until CPU proxy sets DONE
+    // Spin-wait until the host worker thread releases the slot
     while (tasks[taskId].active) {
         __threadfence_system();
     }

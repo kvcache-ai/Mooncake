@@ -15,7 +15,6 @@ enum WorkerTaskStatus {
     IDLE = 0,
     TRANSFERRED_1 = 1,
     SIGNALED_1 = 2,
-    DONE = 3,
 };
 
 static constexpr size_t kInvalidTaskId = static_cast<size_t>(-1);
@@ -474,7 +473,11 @@ void MooncakeWorker::startWorker() {
                                       group->globalRank);
                         }
 
-                        task_status[i].store(DONE, std::memory_order_release);
+                        // The slot is idle again once it is released: the GPU
+                        // may publish the slot's next task before this thread
+                        // looks at the slot again, and that task starts from
+                        // IDLE.
+                        task_status[i].store(IDLE, std::memory_order_release);
                         task.active = false;
                         if (hasCallback_[i]) {
                             // Move the callback to release the captured values
