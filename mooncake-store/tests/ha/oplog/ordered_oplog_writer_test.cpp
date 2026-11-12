@@ -2375,4 +2375,79 @@ TEST(OrderedOpLogWriterTimeoutTest,
         ::testing::ExitedWithCode(0), "");
 }
 
+TEST(OrderedOpLogWriterTimeoutTest,
+     StopDrainsMixedWaitersWhileDispatchFallbackIsBlocked) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(
+        ([] {
+            for (bool start : {false, true}) {
+                TimeoutGate dispatch_gate(
+                    "durable_wait_before_dispatch_failure");
+                OrderedOpLogWriter writer(
+                    {}, [](const auto&, const auto&) { return ErrorCode::OK; });
+                if (start) writer.Start();
+                std::promise<void> callback_entered_promise;
+                auto callback_entered = callback_entered_promise.get_future();
+                std::promise<void> release_callback_promise;
+                auto release_callback =
+                    release_callback_promise.get_future().share();
+                std::atomic<int> callback_count{0};
+                // Stop triggers completion after every continuation is
+                // registered; these deadlines cannot race registration.
+                auto first = writer.AwaitDurable(1, std::chrono::hours(1))
+                                 .thenValue([&](ErrorCode error) {
+                                     ++callback_count;
+                                     callback_entered_promise.set_value();
+                                     release_callback.wait();
+                                     return error;
+                                 });
+                std::atomic<int> later_count{0};
+                auto later = writer.AwaitDurable(2, std::chrono::hours(1))
+                                 .thenValue([&](ErrorCode error) {
+                                     ++later_count;
+                                     return error;
+                                 });
+                auto untimed = writer.AwaitDurable(3);
+
+                auto stopped =
+                    std::async(std::launch::async, [&] { writer.Stop(); });
+                if (!dispatch_gate.WaitForHit() || !dispatch_gate.Release())
+                    std::_Exit(1);
+                if (callback_entered.wait_for(std::chrono::seconds(5)) !=
+                    std::future_status::ready)
+                    std::_Exit(1);
+                if (stopped.wait_for(std::chrono::seconds(5)) !=
+                    std::future_status::ready)
+                    std::_Exit(1);
+                stopped.get();
+
+                const auto deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!later.hasResult() &&
+                       std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::yield();
+                // A blocked fallback must not prevent either finite or
+                // unbounded waits from observing shutdown.
+                if (first.hasResult() || !later.hasResult() ||
+                    !untimed.hasResult())
+                    std::_Exit(1);
+                if (std::move(later).get() !=
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+                    std::move(untimed).get() !=
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)
+                    std::_Exit(1);
+                writer.Stop();
+                if (callback_count != 1 || later_count != 1) std::_Exit(1);
+
+                release_callback_promise.set_value();
+                if (std::move(first).get() !=
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS)
+                    std::_Exit(1);
+                dispatch_gate.Close();
+            }
+            std::_Exit(0);
+        }()),
+        ::testing::ExitedWithCode(0), "");
+}
+
 }  // namespace mooncake::test
