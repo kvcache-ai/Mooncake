@@ -35,6 +35,12 @@ namespace tent {
 
 class MnnvlTransportTestPeer {
    public:
+    static std::shared_ptr<CudaSharedMemory> mapping(MnnvlTransport& transport,
+                                                     SegmentID peer,
+                                                     uint64_t address) {
+        return transport.relocate_map_.at(peer).at(address);
+    }
+
     static Status relocate(MnnvlTransport& transport, uint64_t& address,
                            uint64_t length, SegmentID target_id) {
         return transport.relocateSharedMemoryAddress(address, length,
@@ -312,6 +318,64 @@ TEST(MnnvlTransportTest, RelocateFailsCleanlyWhenPeerIsGone) {
     EXPECT_FALSE(MnnvlTransportTestPeer::relocate(
                      transport, dest_addr, kBufferLength, LOCAL_SEGMENT_ID)
                      .ok());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(MnnvlTransportTest, PosixSharedMemoryCreationMappingAndTeardown) {
+    PeerFdExporter exporter;
+    if (!exporter.forkOk() || !exporter.valid() || exporter.childStatus() != 0)
+        GTEST_SKIP() << "Requires CUDA POSIX-FD shared memory";
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithMnnvlHandle(
+                    *metadata, exporter.mnnvlHandle(), kRemoteAddress,
+                    exporter.mappedSize())
+                    .ok());
+    MnnvlTransport transport;
+    std::string name = "mnnvl_test_segment";
+    ASSERT_TRUE(
+        transport.install(name, metadata, nullptr, makePosixFdConfig()).ok());
+    MemoryOptions options;
+    options.type = MNNVL;
+    options.location = "cuda:0";
+    void* local = nullptr;
+    auto status =
+        transport.allocateLocalMemory(&local, kBufferLength + 1, options);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    CUmemGenericAllocationHandle allocation;
+    ASSERT_EQ(cuMemRetainAllocationHandle(&allocation, local), CUDA_SUCCESS);
+    ASSERT_EQ(cuMemRelease(allocation), CUDA_SUCCESS);
+    ASSERT_EQ(cudaMemset(local, 0x35, kBufferLength + 1), cudaSuccess);
+    ASSERT_TRUE(transport.freeLocalMemory(local, kBufferLength + 1).ok());
+
+    uint64_t address = kRemoteAddress + 64;
+    ASSERT_TRUE(MnnvlTransportTestPeer::relocate(
+                    transport, address, kBufferLength - 64, LOCAL_SEGMENT_ID)
+                    .ok());
+    uint32_t value = 0;
+    ASSERT_EQ(cudaMemcpy(&value, reinterpret_cast<void*>(address),
+                         sizeof(value), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(value, kPattern);
+    auto previous = MnnvlTransportTestPeer::mapping(transport, LOCAL_SEGMENT_ID,
+                                                    kRemoteAddress);
+    ASSERT_TRUE(previous->mapped());
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_FALSE(previous->mapped());
+
+    // Thread-local views can outlive uninstall; they must not reuse a released
+    // mapping when the same transport is installed again.
+    ASSERT_TRUE(
+        transport.install(name, metadata, nullptr, makePosixFdConfig()).ok());
+    address = kRemoteAddress + 64;
+    ASSERT_TRUE(MnnvlTransportTestPeer::relocate(
+                    transport, address, kBufferLength - 64, LOCAL_SEGMENT_ID)
+                    .ok());
+    auto current = MnnvlTransportTestPeer::mapping(transport, LOCAL_SEGMENT_ID,
+                                                   kRemoteAddress);
+    EXPECT_NE(current.get(), previous.get());
+    EXPECT_TRUE(current->mapped());
     ASSERT_TRUE(transport.uninstall().ok());
 }
 

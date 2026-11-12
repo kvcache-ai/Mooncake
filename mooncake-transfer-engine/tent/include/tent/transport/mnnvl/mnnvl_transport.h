@@ -21,6 +21,7 @@
 
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -88,20 +89,21 @@ class MnnvlTransport : public Transport {
 
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
-    virtual const char *getName() const { return "mnnvl"; }
-
-    virtual Status allocateLocalMemory(void **addr, size_t size,
-                                       MemoryOptions &options);
-
-    virtual Status freeLocalMemory(void *addr, size_t size);
+    const char *getName() const override { return "mnnvl"; }
+    bool supportsGlobalAddressing() const override { return true; }
+    Status allocateLocalMemory(void **addr, size_t size,
+                               MemoryOptions &options) override;
+    Status freeLocalMemory(void *addr, size_t size) override;
+    Status mapRemoteMemory(SegmentID peer, void *address, size_t size) override;
+    Status unmapRemoteMemory(SegmentID peer, void *address) override;
 
    private:
     void startTransfer(std::vector<MnnvlTask *> &tasks, MnnvlSubBatch *batch);
 
-    void *createSharedMemory(const std::string &path, size_t size);
-
-    Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
+    Status relocateSharedMemoryAddress(uint64_t &address, uint64_t length,
                                        uint64_t target_id);
+    Status getOrMapRemoteMemory(uint64_t &address, uint64_t length,
+                                SegmentID peer, bool fixed_address);
 
     Status setPeerAccess();
 
@@ -112,15 +114,9 @@ class MnnvlTransport : public Transport {
     std::shared_ptr<ControlService> metadata_;
     CudaPlatform *platform_;
 
-    struct OpenedMnnvlEntry {
-        void *mnnvl_addr;
-        uint64_t length;
-        int cuda_id;
-    };
-
+    using Memory = std::shared_ptr<CudaSharedMemory>;
     using HashMap =
-        std::unordered_map<SegmentID,
-                           std::unordered_map<uint64_t, OpenedMnnvlEntry>>;
+        std::unordered_map<SegmentID, std::unordered_map<uint64_t, Memory>>;
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;
@@ -129,11 +125,9 @@ class MnnvlTransport : public Transport {
     std::string machine_id_;
 
     std::mutex allocate_mutex_;
-    // VMM allocations owned by this transport: base address -> mapped extent
-    // (rounded to the allocation granularity), needed to unmap on free.
-    std::unordered_map<void *, size_t> allocate_set_;
+    std::unordered_map<void *, Memory> allocate_set_;
+    std::unordered_map<uint64_t, Memory> registered_memory_;
     uint64_t async_memcpy_threshold_;
-    bool supported_;
     CUmemAllocationHandleType handle_type_;
 
     bool host_register_;

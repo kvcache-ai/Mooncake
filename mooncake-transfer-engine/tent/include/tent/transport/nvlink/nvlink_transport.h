@@ -17,11 +17,11 @@
 
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <cuda.h>
@@ -88,15 +88,21 @@ class NVLinkTransport : public Transport {
 
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
-    virtual const char *getName() const { return "nvlink"; }
+    const char *getName() const override { return "nvlink"; }
+    bool supportsGlobalAddressing() const override { return true; }
+    Status allocateLocalMemory(void **addr, size_t size,
+                               MemoryOptions &options) override;
+    Status freeLocalMemory(void *addr, size_t size) override;
+    Status mapRemoteMemory(SegmentID peer, void *address, size_t size) override;
+    Status unmapRemoteMemory(SegmentID peer, void *address) override;
 
    private:
     void startTransfer(std::vector<NVLinkTask *> &tasks, NVLinkSubBatch *batch);
 
-    void *createSharedMemory(const std::string &path, size_t size);
-
-    Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
+    Status relocateSharedMemoryAddress(uint64_t &address, uint64_t length,
                                        uint64_t target_id);
+    Status getOrMapRemoteMemory(uint64_t &address, uint64_t length,
+                                SegmentID peer, bool fixed_address);
 
     Status setPeerAccess();
 
@@ -109,15 +115,9 @@ class NVLinkTransport : public Transport {
     std::shared_ptr<ControlService> metadata_;
     CudaPlatform *platform_;
 
-    struct OpenedShmEntry {
-        void *shm_addr;
-        uint64_t length;
-        int cuda_id;
-    };
-
+    using Memory = std::shared_ptr<CudaSharedMemory>;
     using HashMap =
-        std::unordered_map<SegmentID,
-                           std::unordered_map<uint64_t, OpenedShmEntry>>;
+        std::unordered_map<SegmentID, std::unordered_map<uint64_t, Memory>>;
 
     RWSpinlock relocate_lock_;
     HashMap relocate_map_;
@@ -127,12 +127,9 @@ class NVLinkTransport : public Transport {
     uint64_t async_memcpy_threshold_;
     bool host_register_;
 
-    mutable std::mutex register_mutex_;
-    // cudaMalloc base address -> serialized cudaIpcMemHandle_t for that
-    // segment. Multiple BufferDescs can sub-allocate within one cudaMalloc
-    // segment (torch caching allocator); every one of them must carry the
-    // segment's IPC handle or NVLink submission for that buffer fails.
-    std::unordered_map<uint64_t, std::string> registered_base_addrs_;
+    std::mutex allocate_mutex_;
+    std::unordered_map<void *, Memory> allocate_set_;
+    std::unordered_map<uint64_t, Memory> registered_memory_;
 };
 }  // namespace tent
 }  // namespace mooncake
