@@ -14,6 +14,8 @@
 #include "dummy_client.h"
 #include "real_client.h"
 #include "types.h"
+#include "kv_cache_kind.h"
+#include "replica.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
 #include "device/accelerator_registry.h"
@@ -2178,6 +2180,17 @@ PYBIND11_MODULE(_store, m) {
         .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
+    py::enum_<KVCacheKind>(m, "KVCacheKind")
+        .value("UNSPECIFIED", KVCacheKind::UNSPECIFIED)
+        .value("FULL", KVCacheKind::FULL)
+        .value("SWA", KVCacheKind::SWA)
+        .value("DSA", KVCacheKind::DSA)
+        .value("INDEXER", KVCacheKind::INDEXER)
+        .value("MLA", KVCacheKind::MLA)
+        .value("MAMBA", KVCacheKind::MAMBA)
+        .value("LINEAR", KVCacheKind::LINEAR)
+        .export_values();
+
     py::enum_<SoftPinAction>(m, "SoftPinAction")
         .value("PRESERVE", SoftPinAction::PRESERVE)
         .value("ENABLE", SoftPinAction::ENABLE)
@@ -2200,6 +2213,18 @@ PYBIND11_MODULE(_store, m) {
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
+        .def_property(
+            "kv_cache_kinds",
+            [](const ReplicateConfig &config)
+                -> std::optional<std::vector<KVCacheKind>> {
+                if (!config.kv_cache_kinds) return std::nullopt;
+                return *config.kv_cache_kinds;
+            },
+            [](ReplicateConfig &config,
+               std::optional<std::vector<KVCacheKind>> kinds) {
+                config.kv_cache_kinds.reset();
+                if (kinds) config.kv_cache_kinds = std::move(*kinds);
+            })
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
         .def_property(
             "session_ids",

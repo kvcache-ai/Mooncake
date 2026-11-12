@@ -51,6 +51,8 @@ enum class SkipReason : uint8_t {
     kDeferred,
     // The policy never takes it while soft pinned.
     kSoftPinned,
+    // The object's KV cache kind is configured PROTECT.
+    kKindProtected,
     // Another component evicts it, such as a managed weight's lifecycle.
     kExternalEvict,
     // No replica the policy would release.
