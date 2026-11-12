@@ -737,9 +737,9 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     std::atomic<bool> stepdown_requested{false};
     std::atomic<uint32_t> drain_timeout_ms{0};
     service->SetStepdownCallback(
-        [&server, &stepdown_requested, &drain_timeout_ms](uint32_t,
-                                                          uint32_t timeout_ms) {
-            drain_timeout_ms.store(timeout_ms);
+        [&server, &stepdown_requested, &drain_timeout_ms](
+            const P2PMasterRpcService::StepdownRequest& request) {
+            drain_timeout_ms.store(request.drain_timeout_ms);
             stepdown_requested.store(true, std::memory_order_seq_cst);
             server->stop();
         });

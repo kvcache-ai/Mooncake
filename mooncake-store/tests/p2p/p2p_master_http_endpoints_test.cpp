@@ -141,6 +141,12 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         return {resp.status, std::string(resp.resp_body)};
     }
 
+    static int64_t UnixTimeMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+
     static std::vector<std::string> SplitLines(std::string_view body) {
         std::vector<std::string> lines;
         size_t start = 0;
@@ -337,15 +343,23 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
     config.metrics.http_port = 0;
     P2PMasterRpcService service(config);
     HAStatusManager::instance().SetRoleState("primary", "RUNNING");
-    service.SetStepdownCallback([&](uint32_t seconds, uint32_t timeout_ms) {
-        cooldown_sec.store(seconds);
-        drain_timeout_ms.store(timeout_ms);
-    });
+    std::promise<P2PMasterRpcService::StepdownRequest> accepted_request;
+    auto accepted = accepted_request.get_future();
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest& request) {
+            cooldown_sec.store(request.cooldown_sec);
+            drain_timeout_ms.store(request.drain_timeout_ms);
+            accepted_request.set_value(request);
+        });
     service.init();
 
+    const auto before_ms = UnixTimeMs();
+    const auto steady_before = std::chrono::steady_clock::now();
     const auto response =
         HttpPost("http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
                  "/ha/stepdown");
+    const auto steady_after = std::chrono::steady_clock::now();
+    const auto after_ms = UnixTimeMs();
     ASSERT_EQ(response.status, 200) << "body=" << response.resp_body;
     const auto body = ParseJson(response.resp_body, "stepdown");
     EXPECT_TRUE(body["success"].asBool());
@@ -355,6 +369,18 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointInvokesCallback) {
     EXPECT_EQ(cooldown_sec.load(), 30u);
     EXPECT_EQ(body["drain_timeout_ms"].asUInt(), 3000u);
     EXPECT_EQ(drain_timeout_ms.load(), 3000u);
+    ASSERT_TRUE(body["election_paused_until_ms"].isInt64());
+    const auto deadline_ms = body["election_paused_until_ms"].asInt64();
+    EXPECT_GE(deadline_ms, before_ms + 30000);
+    EXPECT_LE(deadline_ms, after_ms + 30000);
+    ASSERT_EQ(accepted.wait_for(std::chrono::seconds(3)),
+              std::future_status::ready);
+    const auto request = accepted.get();
+    EXPECT_EQ(request.election_paused_until_ms, deadline_ms);
+    EXPECT_GE(request.election_paused_until,
+              steady_before + std::chrono::seconds(30));
+    EXPECT_LE(request.election_paused_until,
+              steady_after + std::chrono::seconds(30));
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesCooldown) {
@@ -367,10 +393,11 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesCooldown) {
     config.metrics.http_port = 0;
     P2PMasterRpcService service(config);
     HAStatusManager::instance().SetRoleState("primary", "RUNNING");
-    service.SetStepdownCallback([&](uint32_t seconds, uint32_t) {
-        cooldown_sec.store(seconds);
-        callback_count.fetch_add(1);
-    });
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest& request) {
+            cooldown_sec.store(request.cooldown_sec);
+            callback_count.fetch_add(1);
+        });
     service.init();
     const std::string url =
         "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
@@ -387,6 +414,16 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesCooldown) {
         ParseJson(accepted.resp_body, "stepdown")["cooldown_sec"].asUInt(), 7u);
     EXPECT_EQ(cooldown_sec.load(), 7u);
     EXPECT_EQ(callback_count.load(), 1u);
+    const auto deadline_ms =
+        ParseJson(accepted.resp_body, "stepdown")["election_paused_until_ms"]
+            .asInt64();
+    // A later retry must not refresh the deadline, even with the same cooldown.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto retry = HttpPost(url + "7");
+    ASSERT_EQ(retry.status, 200) << retry.resp_body;
+    EXPECT_EQ(ParseJson(retry.resp_body, "stepdown")["election_paused_until_ms"]
+                  .asInt64(),
+              deadline_ms);
     // A duplicate request must not overwrite the accepted cooldown.
     const auto duplicate = HttpPost(url + "0");
     ASSERT_EQ(duplicate.status, 200) << duplicate.resp_body;
@@ -395,6 +432,8 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesCooldown) {
     EXPECT_TRUE(duplicate_body["already_requested"].asBool());
     EXPECT_EQ(duplicate_body["cooldown_sec"].asUInt(), 7u);
     EXPECT_EQ(duplicate_body["drain_timeout_ms"].asUInt(), 3000u);
+    EXPECT_EQ(duplicate_body["election_paused_until_ms"].asInt64(),
+              deadline_ms);
     EXPECT_EQ(cooldown_sec.load(), 7u);
     EXPECT_EQ(callback_count.load(), 1u);
 }
@@ -410,11 +449,12 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointValidatesDrainTimeout) {
     config.metrics.http_port = 0;
     P2PMasterRpcService service(config);
     HAStatusManager::instance().SetRoleState("primary", "RUNNING");
-    service.SetStepdownCallback([&](uint32_t seconds, uint32_t timeout_ms) {
-        cooldown_sec.store(seconds);
-        drain_timeout_ms.store(timeout_ms);
-        callback_count.fetch_add(1);
-    });
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest& request) {
+            cooldown_sec.store(request.cooldown_sec);
+            drain_timeout_ms.store(request.drain_timeout_ms);
+            callback_count.fetch_add(1);
+        });
     service.init();
     const std::string url =
         "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
@@ -457,6 +497,7 @@ TEST_F(P2PMasterHttpEndpointsTest,
     std::atomic<uint32_t> callback_count{0};
     std::atomic<uint32_t> accepted_cooldown{0};
     std::atomic<uint32_t> accepted_drain{0};
+    std::atomic<int64_t> accepted_deadline_ms{0};
     std::promise<void> callback_entered;
     auto entered = callback_entered.get_future();
     std::promise<void> release_callback;
@@ -469,14 +510,16 @@ TEST_F(P2PMasterHttpEndpointsTest,
     config.metrics.http_port = 0;
     P2PMasterRpcService service(config);
     HAStatusManager::instance().SetRoleState("primary", "RUNNING");
-    service.SetStepdownCallback([&](uint32_t seconds, uint32_t timeout_ms) {
-        if (callback_count.fetch_add(1) == 0) {
-            accepted_cooldown.store(seconds);
-            accepted_drain.store(timeout_ms);
-            callback_entered.set_value();
-        }
-        released.wait();
-    });
+    service.SetStepdownCallback(
+        [&](const P2PMasterRpcService::StepdownRequest& request) {
+            if (callback_count.fetch_add(1) == 0) {
+                accepted_cooldown.store(request.cooldown_sec);
+                accepted_drain.store(request.drain_timeout_ms);
+                accepted_deadline_ms.store(request.election_paused_until_ms);
+                callback_entered.set_value();
+            }
+            released.wait();
+        });
     service.init();
     const std::string base_url =
         "http://127.0.0.1:" + std::to_string(service.GetHttpPort());
@@ -547,6 +590,10 @@ TEST_F(P2PMasterHttpEndpointsTest,
         }
         EXPECT_EQ(body["cooldown_sec"].asUInt(), accepted_cooldown.load());
         EXPECT_EQ(body["drain_timeout_ms"].asUInt(), accepted_drain.load());
+        EXPECT_TRUE(body["election_paused_until_ms"].isInt64());
+        EXPECT_GT(accepted_deadline_ms.load(), 0);
+        EXPECT_EQ(body["election_paused_until_ms"].asInt64(),
+                  accepted_deadline_ms.load());
     }
     EXPECT_EQ(first_responses, 1u);
     EXPECT_EQ(callback_count.load(), 1u);
@@ -569,15 +616,18 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointAcceptsParameterBounds) {
         config.metrics.http_port = 0;
         P2PMasterRpcService service(config);
         HAStatusManager::instance().SetRoleState("primary", "RUNNING");
-        service.SetStepdownCallback([&](uint32_t value, uint32_t timeout) {
-            cooldown_sec.store(value);
-            drain_timeout_ms.store(timeout);
-        });
+        service.SetStepdownCallback(
+            [&](const P2PMasterRpcService::StepdownRequest& request) {
+                cooldown_sec.store(request.cooldown_sec);
+                drain_timeout_ms.store(request.drain_timeout_ms);
+            });
         service.init();
+        const auto before_ms = UnixTimeMs();
         const auto response = HttpPost(
             "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +
             "/ha/stepdown?cooldown_sec=" + std::to_string(seconds) +
             "&drain_timeout_ms=" + std::to_string(timeout_ms));
+        const auto after_ms = UnixTimeMs();
         ASSERT_EQ(response.status, 200) << response.resp_body;
         EXPECT_EQ(cooldown_sec.load(), seconds);
         EXPECT_EQ(
@@ -587,6 +637,12 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointAcceptsParameterBounds) {
         EXPECT_EQ(ParseJson(response.resp_body, "stepdown")["drain_timeout_ms"]
                       .asUInt(),
                   timeout_ms);
+        const auto body = ParseJson(response.resp_body, "stepdown");
+        ASSERT_TRUE(body["election_paused_until_ms"].isInt64());
+        const auto deadline_ms = body["election_paused_until_ms"].asInt64();
+        EXPECT_GE(deadline_ms,
+                  before_ms + static_cast<int64_t>(seconds) * 1000);
+        EXPECT_LE(deadline_ms, after_ms + static_cast<int64_t>(seconds) * 1000);
     }
 }
 
@@ -599,7 +655,9 @@ TEST_F(P2PMasterHttpEndpointsTest, StepdownEndpointRequiresRunningPrimary) {
     config.metrics.http_port = 0;
     P2PMasterRpcService service(config);
     service.SetStepdownCallback(
-        [&](uint32_t, uint32_t) { callback_count.fetch_add(1); });
+        [&](const P2PMasterRpcService::StepdownRequest&) {
+            callback_count.fetch_add(1);
+        });
     service.init();
     const std::string url =
         "http://127.0.0.1:" + std::to_string(service.GetHttpPort()) +

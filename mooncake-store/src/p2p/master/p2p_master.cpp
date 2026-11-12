@@ -178,7 +178,7 @@ class ScopedStandbyRegistryProviders final {
 
 std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     const P2PMasterConfig& config, ViewVersionId view_version,
-    std::function<void(uint32_t, uint32_t)> stepdown_callback = {}) {
+    P2PMasterRpcService::StepdownCallback stepdown_callback = {}) {
     auto service = std::make_unique<P2PMasterRpcService>(config, view_version);
     if (stepdown_callback) {
         service->SetStepdownCallback(std::move(stepdown_callback));
@@ -614,22 +614,20 @@ int P2PMaster::RunWithHA() {
             }
             server->stop();
         };
-        const auto stop_for_active_stepdown = [&server,
-                                               &active_stepdown_requested,
-                                               &election_paused_until,
-                                               &stepdown_drain_timeout_ms](
-                                                  uint32_t cooldown_sec,
-                                                  uint32_t drain_timeout_ms) {
-            election_paused_until = std::chrono::steady_clock::now() +
-                                    std::chrono::seconds(cooldown_sec);
-            stepdown_drain_timeout_ms = drain_timeout_ms;
-            // Active stepdown is voluntary: close the write request entry
-            // first, then let RunActiveRpcServers wait for accepted handlers
-            // and drain confirmed writes while this primary still renews its
-            // lease.
-            active_stepdown_requested.store(true, std::memory_order_release);
-            server->stop();
-        };
+        const auto stop_for_active_stepdown =
+            [&server, &active_stepdown_requested, &election_paused_until,
+             &stepdown_drain_timeout_ms](
+                const P2PMasterRpcService::StepdownRequest& request) {
+                election_paused_until = request.election_paused_until;
+                stepdown_drain_timeout_ms = request.drain_timeout_ms;
+                // Active stepdown is voluntary: close the write request entry
+                // first, then let RunActiveRpcServers wait for accepted
+                // handlers and drain confirmed writes while this primary still
+                // renews its lease.
+                active_stepdown_requested.store(true,
+                                                std::memory_order_release);
+                server->stop();
+            };
         auto keep_leader_thread = std::thread(
             [view = master_view.get(), lease_id, stop_for_leadership_loss] {
                 view->KeepLeader(lease_id);

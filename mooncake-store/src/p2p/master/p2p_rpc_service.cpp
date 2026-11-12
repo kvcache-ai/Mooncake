@@ -83,8 +83,7 @@ P2PMasterRpcService::~P2PMasterRpcService() {
     }
 }
 
-void P2PMasterRpcService::SetStepdownCallback(
-    std::function<void(uint32_t, uint32_t)> callback) {
+void P2PMasterRpcService::SetStepdownCallback(StepdownCallback callback) {
     stepdown_callback_ = std::move(callback);
 }
 
@@ -193,6 +192,15 @@ void P2PMasterRpcService::init_http_server() {
             if (already_requested) {
                 request = *stepdown_request_;
             } else {
+                const auto duration =
+                    std::chrono::seconds(request.cooldown_sec);
+                request.election_paused_until =
+                    std::chrono::steady_clock::now() + duration;
+                request.election_paused_until_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        (std::chrono::system_clock::now() + duration)
+                            .time_since_epoch())
+                        .count();
                 stepdown_request_ = request;
             }
         }
@@ -200,13 +208,17 @@ void P2PMasterRpcService::init_http_server() {
             VLOG(1) << "P2P master stepdown request already pending"
                     << ", cooldown_sec=" << request.cooldown_sec
                     << ", drain_timeout_ms=" << request.drain_timeout_ms
+                    << ", election_paused_until_ms="
+                    << request.election_paused_until_ms
                     << ", requested_cooldown_sec=" << *cooldown
                     << ", requested_drain_timeout_ms=" << *drain_timeout;
         } else {
             LOG(INFO) << "P2P master stepdown requested"
                       << ", cooldown_sec=" << request.cooldown_sec
-                      << ", drain_timeout_ms=" << request.drain_timeout_ms;
-            stepdown_callback_(request.cooldown_sec, request.drain_timeout_ms);
+                      << ", drain_timeout_ms=" << request.drain_timeout_ms
+                      << ", election_paused_until_ms="
+                      << request.election_paused_until_ms;
+            stepdown_callback_(request);
         }
         resp.set_status_and_content(
             status_type::ok,
@@ -215,6 +227,8 @@ void P2PMasterRpcService::init_http_server() {
                 std::to_string(request.cooldown_sec) +
                 ",\"drain_timeout_ms\":" +
                 std::to_string(request.drain_timeout_ms) +
+                ",\"election_paused_until_ms\":" +
+                std::to_string(request.election_paused_until_ms) +
                 ",\"already_requested\":" +
                 (already_requested ? "true" : "false") + "}");
     });
