@@ -27,6 +27,11 @@
 
 namespace mooncake {
 
+// Granularity at which SPDK registers memory for NoF (see NofPageRegistry) and
+// therefore the finest granularity at which the RDMA memory map can hand out
+// an rkey. NoF sub-IOs must never straddle one of these boundaries.
+static constexpr uint64_t kNofRegisterPageBytes = 2ULL << 20;
+
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
     if (!raw_value || raw_value[0] == '\0') {
@@ -567,10 +572,30 @@ void NofWorkerPool::workerThread(int work_idx) {
                             static_cast<uint64_t>(avail_blocks) * block_size;
                         const uint64_t sent_bytes =
                             task->byte_length - task->remaining_bytes;
+                        const uintptr_t submit_addr =
+                            reinterpret_cast<uintptr_t>(task->ptr) + sent_bytes;
+                        // Keep every sub-IO inside one SPDK-registered page.
+                        // spdk_mem_register() is charged in whole 2MB pages,
+                        // and in iova=pa mode the RDMA memory map merges two
+                        // pages into one MR only when their physical addresses
+                        // are adjacent (spdk_mem_map_translate(),
+                        // lib/env_dpdk/memory.c). A fragmented hugepage pool
+                        // therefore yields one MR per 2MB page, and a
+                        // contiguous SGL that crosses a page boundary is
+                        // translated with the first page's rkey while its tail
+                        // lies outside that MR: the target then fails the
+                        // READ/WRITE with REM_ACCESS_ERR. Chunking on page
+                        // boundaries makes every SGL entry self-contained.
+                        // submit_addr is block-aligned and block_size divides
+                        // the page size, so this stays block-aligned.
+                        const uint64_t to_page_end =
+                            (kNofRegisterPageBytes -
+                             (submit_addr & (kNofRegisterPageBytes - 1))) /
+                            block_size * block_size;
                         const uint32_t submit_bytes =
                             static_cast<uint32_t>(std::min<uint64_t>(
                                 {avail_bytes, task->remaining_bytes,
-                                 chunk_bytes}));
+                                 chunk_bytes, to_page_end}));
                         const uint64_t submit_off =
                             task->byte_offset + sent_bytes;
                         void* submit_ptr =
@@ -1110,8 +1135,7 @@ TransferSubmitter::TransferSubmitter(
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code, void* ptr, size_t size,
-    TransferIntent intent) {
+    TransferRequest::OpCode op_code, TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1144,11 +1168,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         auto& ssd_desc = replica.get_nof_descriptor();
         auto& handle = ssd_desc.buffer_descriptor;
 
-        if (!ptr || (size == 0)) {
-            return std::nullopt;
-        }
-
-        future = submitNofOperation(handle, ptr, size, op_code);
+        future = submitNofOperation(handle, slices, op_code);
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
     }
@@ -1985,7 +2005,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
-    const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code) {
     if (!nof_pool_) {
         // Runtime form of the former "NoF transfer requested while USE_NOF
@@ -1994,11 +2014,10 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
                       "(no initiator in this process)";
         return std::nullopt;
     }
-    if (handle.transport_endpoint_.empty() || handle.size_ < size) {
+    if (slices.empty() || handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Invalid NoF request endpoint="
                    << handle.transport_endpoint_
-                   << ", buffer_size=" << handle.size_
-                   << ", request_size=" << size;
+                   << ", slices=" << slices.size();
         return std::nullopt;
     }
 
@@ -2012,27 +2031,69 @@ std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
 
     uint32_t block_size = nof_initiator_->GetBlockSize(seg_handle);
     // Without SGL, ptr must be block-aligned; with SGL (supports_sgl) the
-    // requirement relaxes to dma_alignment.
+    // requirement relaxes to dma_alignment. Each slice is its own DMA, so the
+    // requirement applies to every slice, not just to the first one.
     const auto caps = nof_initiator_->GetCapabilities();
     const uint64_t ptr_alignment =
         caps.supports_sgl ? caps.dma_alignment : block_size;
-    if (block_size == kInvalidBlockSize ||
-        handle.buffer_address_ % block_size != 0 || size % block_size != 0 ||
-        reinterpret_cast<std::uintptr_t>(ptr) % ptr_alignment != 0) {
+    if (block_size == kInvalidBlockSize) {
+        LOG(ERROR) << "NoF segment reports an invalid block size, endpoint="
+                   << handle.transport_endpoint_;
+        return std::nullopt;
+    }
+    if (handle.buffer_address_ % block_size != 0) {
         LOG(ERROR) << "NoF request offset=" << handle.buffer_address_
-                   << ", ptr=" << ptr << ", size=" << size
                    << " is not aligned to block size " << block_size;
+        return std::nullopt;
+    }
+
+    // Validate every slice before submitting any of them: rejecting halfway
+    // through would leave the earlier DMAs running against a state that
+    // nothing is waiting for.
+    uint64_t total_size = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto& slice = slices[i];
+        if (slice.ptr == nullptr || slice.size % block_size != 0 ||
+            reinterpret_cast<std::uintptr_t>(slice.ptr) % ptr_alignment != 0) {
+            LOG(ERROR) << "NoF slice " << i << "/" << slices.size()
+                       << " ptr=" << slice.ptr << ", size=" << slice.size
+                       << " is not aligned to block size " << block_size
+                       << " (ptr_alignment=" << ptr_alignment << ")";
+            return std::nullopt;
+        }
+        if (slice.size > std::numeric_limits<uint64_t>::max() - total_size) {
+            LOG(ERROR) << "NoF slice sizes overflow, slices=" << slices.size();
+            return std::nullopt;
+        }
+        total_size += slice.size;
+    }
+    if (total_size == 0 || handle.size_ < total_size) {
+        LOG(ERROR) << "Invalid NoF request endpoint="
+                   << handle.transport_endpoint_
+                   << ", buffer_size=" << handle.size_
+                   << ", request_size=" << total_size;
         return std::nullopt;
     }
 
     const NofIOOp op =
         (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;
     auto state = std::make_shared<NofOperationState>();
-    NofTask task(seg_handle, ptr, handle.buffer_address_, size, op, state);
-    task.metric = nof_metric_;
-    nof_pool_->submitTask(std::move(task));
+    state->set_pending_tasks(static_cast<int>(slices.size()));
 
-    VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_;
+    // Slices land back to back from buffer_address_, so slice i goes to
+    // buffer_address_ + sum(sizes[0..i-1]) -- the same remote layout a single
+    // concatenated DMA would have produced. Every slice size is a multiple of
+    // block_size, so each derived remote offset stays block-aligned.
+    uint64_t byte_offset = handle.buffer_address_;
+    for (const auto& slice : slices) {
+        NofTask task(seg_handle, slice.ptr, byte_offset, slice.size, op, state);
+        task.metric = nof_metric_;
+        nof_pool_->submitTask(std::move(task));
+        byte_offset += slice.size;
+    }
+
+    VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_
+            << " slices=" << slices.size() << " bytes=" << total_size;
     return TransferFuture(state);
 }
 

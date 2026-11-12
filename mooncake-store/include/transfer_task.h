@@ -186,12 +186,37 @@ class NofOperationState : public OperationState {
         return result_.has_value();
     }
 
+    /**
+     * @brief Declare how many NofTask objects will report into this state.
+     *
+     * A local buffer that is not contiguous becomes several independent DMA
+     * chains, one NofTask each. The operation is complete only after every
+     * one of them has reported, which also guarantees the caller cannot reuse
+     * the buffer while a DMA is still in flight.
+     *
+     * Must be called before the tasks are submitted. Defaults to 1.
+     */
+    void set_pending_tasks(int count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_tasks_ = count > 0 ? count : 1;
+    }
+
     void set_completed(ErrorCode error_code, std::string error_detail = "") {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            assert(!result_.has_value());
-            result_.emplace(error_code);
-            error_detail_ = std::move(error_detail);
+            if (result_.has_value()) {
+                // Already settled; a late report must not resurrect it.
+                return;
+            }
+            if (error_code != ErrorCode::OK && first_error_ == ErrorCode::OK) {
+                // Keep the first failure and its detail.
+                first_error_ = error_code;
+                error_detail_ = std::move(error_detail);
+            }
+            if (--pending_tasks_ > 0) {
+                return;  // other slices are still in flight
+            }
+            result_.emplace(first_error_);
         }
         cv_.notify_all();
     }
@@ -214,6 +239,9 @@ class NofOperationState : public OperationState {
 
    private:
     std::string error_detail_;
+    // NofTasks that still owe a report before the operation settles.
+    int pending_tasks_{1};
+    ErrorCode first_error_{ErrorCode::OK};
 };
 
 class FilereadOperationState : public OperationState {
@@ -631,7 +659,7 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submit(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        TransferRequest::OpCode op_code, void* ptr = nullptr, size_t size = 0,
+        TransferRequest::OpCode op_code,
         TransferIntent intent = TransferIntent::kUnspecified);
 
     /**
@@ -732,7 +760,8 @@ class TransferSubmitter {
      * @brief Submit NoF (NVMe-oF) operation asynchronously
      */
     std::optional<TransferFuture> submitNofOperation(
-        const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices,
         const TransferRequest::OpCode op_code);
 
     /**
