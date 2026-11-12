@@ -1474,12 +1474,16 @@ Status RdmaTransport::submitTransferTask(
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
+            // Selected but inactive RNICs, named in the error below.
+            std::set<int> inactive_device_ids;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
                 auto &request_context = context_list_[request_device_id];
                 if (request_context && request_context->active()) {
                     found_device = true;
                     buffer_id = request_buffer_id;
                     device_id = request_device_id;
+                } else if (request_context) {
+                    inactive_device_ids.insert(request_device_id);
                 }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
@@ -1504,7 +1508,10 @@ Status RdmaTransport::submitTransferTask(
                        static_cast<size_t>(device_id) < context_list_.size());
                 auto &context = context_list_[device_id];
                 assert(context.get());
-                if (!context->active()) continue;
+                if (!context->active()) {
+                    inactive_device_ids.insert(device_id);
+                    continue;
+                }
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
                            local_segment_desc->buffers.size());
@@ -1518,13 +1525,29 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
+                std::string reason;
+                if (inactive_device_ids.empty()) {
+                    reason = "no selectable registered buffer covers " +
+                             std::to_string(slice->length) +
+                             " bytes at this address; registered buffers: " +
+                             std::to_string(local_segment_desc->buffers.size());
+                } else {
+                    reason = "selected RNIC(s) inactive:";
+                    const char *separator = " ";
+                    for (const int device_id : inactive_device_ids) {
+                        reason += separator;
+                        reason += context_list_[device_id]->deviceName();
+                        separator = ", ";
+                    }
+                }
                 fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
-                    << source_addr;
+                    << source_addr << " (" << reason << ")";
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active device(s): " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)) +
+                    " (" + reason + ")");
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {

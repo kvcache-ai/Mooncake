@@ -1665,6 +1665,37 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
         0);
 }
 
+// Callers that ignore the return value otherwise only see per-region warnings
+// for the regions that failed, not that the rest were rolled back as well.
+TEST_F(TransportTest, RegisterLocalMemoryBatchLogsRollback) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto failing = std::make_shared<BatchResultTransport>();
+    failing->setRegisterResult(ERR_MEMORY);
+    TransferEngineImplTestPeer::replaceTransports(engine,
+                                                  {{"failing", failing}});
+
+    std::array<char, 2> buffer{};
+    std::vector<BufferEntry> entries = {
+        {buffer.data(), 1},
+        {buffer.data() + 1, 1},
+    };
+    const bool saved_logtostderr = FLAGS_logtostderr;
+    FLAGS_logtostderr = true;
+    ::testing::internal::CaptureStderr();
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), ERR_MEMORY);
+    const std::string log = ::testing::internal::GetCapturedStderr();
+    FLAGS_logtostderr = saved_logtostderr;
+
+    EXPECT_NE(log.find("Failed to register a batch of 2 memory region(s) with "
+                       "transport batch-result (ret=" +
+                       std::to_string(ERR_MEMORY) + ")"),
+              std::string::npos)
+        << log;
+    EXPECT_NE(log.find("unregistering the whole batch"), std::string::npos)
+        << log;
+}
+
 TEST_F(TransportTest, TaskCompletedSendsNotifyBeforeBatchCounterCatchesUp) {
     TransferEngineImpl engine(false);
     ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);

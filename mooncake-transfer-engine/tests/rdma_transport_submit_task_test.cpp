@@ -157,6 +157,24 @@ class SubmitTransferTaskTest : public ::testing::Test {
         triggerError(req, task);
         return task.slice_list.front()->rdma.source_lkey;
     }
+
+    // Submits one WRITE from [source, source + length) and returns the status.
+    Status submitSingle(uint64_t source, size_t length,
+                        int advise_retry_cnt = 0) {
+        Transport::TransferRequest req;
+        req.opcode = Transport::TransferRequest::WRITE;
+        req.source = reinterpret_cast<void *>(source);
+        req.length = length;
+        req.target_id = LOCAL_SEGMENT_ID;
+        req.target_offset = 0;
+        req.advise_retry_cnt = advise_retry_cnt;
+        Transport::TransferTask task;
+        task.request = &req;
+        task.batch_id = transport_->allocateBatchID(1);
+        auto status = transport_->submitTransferTask({&task});
+        EXPECT_EQ(transport_->freeBatchID(task.batch_id), Status::OK());
+        return status;
+    }
 };
 
 TEST_F(SubmitTransferTaskTest, NicHintUsesExistingTailPadding) {
@@ -352,6 +370,59 @@ TEST_F(SubmitTransferTaskTest, GroupedRequestsReportFailurePerRequest) {
               Status::OK());
     EXPECT_EQ(request_statuses, std::vector(2, status.s));
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
+
+// The two causes of AddressNotRegistered need different fixes, so the error
+// says which one it is.
+TEST_F(SubmitTransferTaskTest, UnregisteredSourceReportsNoCoveringBuffer) {
+    auto status = submitSingle(kBufferAddr + 4 * block_size_, block_size_);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    EXPECT_NE(status.message().find("no selectable registered buffer covers"),
+              std::string_view::npos)
+        << status.message();
+}
+
+TEST_F(SubmitTransferTaskTest, InactiveRnicsAreNamedForRegisteredSource) {
+    for (const auto &context : transport_->getContextList())
+        context->set_active(false);
+    auto status = submitSingle(kBufferAddr, block_size_);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    const std::string message(status.message());
+    EXPECT_NE(message.find("selected RNIC(s) inactive: mlx5_local"),
+              std::string::npos)
+        << message;
+    // Only RNICs that selection picked are named; cpu:0 never picks
+    // mlx5_global.
+    EXPECT_EQ(message.find("mlx5_global"), std::string::npos) << message;
+}
+
+// With the retry budget already spent, the per-slice loop does not run and
+// only the request-level pick is known.
+TEST_F(SubmitTransferTaskTest, InactiveRnicIsNamedWithoutSliceRetries) {
+    for (const auto &context : transport_->getContextList())
+        context->set_active(false);
+    auto status =
+        submitSingle(kBufferAddr, block_size_, globalConfig().retry_cnt);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    EXPECT_NE(status.message().find("selected RNIC(s) inactive: mlx5_local"),
+              std::string_view::npos)
+        << status.message();
+}
+
+// A covering buffer that selectDevice() still rejects, here because its
+// location maps to no RNIC, must not be blamed on the RNICs, which are active.
+TEST_F(SubmitTransferTaskTest, TopologyMissIsNotReportedAsInactiveRnic) {
+    auto desc = std::make_shared<SegmentDesc>(
+        *metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID));
+    desc->topology.clear();
+    metadata_->addLocalSegment(LOCAL_SEGMENT_ID, desc->name, std::move(desc));
+    auto status = submitSingle(kBufferAddr, block_size_);
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    const std::string message(status.message());
+    EXPECT_NE(message.find("no selectable registered buffer covers"),
+              std::string::npos)
+        << message;
+    EXPECT_EQ(message.find("RNIC"), std::string::npos) << message;
 }
 
 TEST_F(SubmitTransferTaskTest,
