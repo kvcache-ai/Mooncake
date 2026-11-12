@@ -223,8 +223,6 @@ class DummyClient : public PyClient {
     std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
 
    private:
-    friend class DummyClientRpcErrorTest;
-
     struct PreparedBuffer {
         void *original = nullptr;
         void *dummy = nullptr;
