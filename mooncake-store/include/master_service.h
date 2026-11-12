@@ -1225,13 +1225,33 @@ class MasterService {
     // the namespaces so that it outlives them.
     NamespacePolicy* policy_ = nullptr;
 
+    // Subscribes KV event state transitions to every namespace's object route.
+    // Declared before `namespaces_` so it outlives every namespace.
+    class KvRouteObserver final : public metadata::NamespaceObserver {
+       public:
+        explicit KvRouteObserver(MasterService& service) : service_(service) {}
+        void OnBeforeTearDown(const TenantId& tenant_id,
+                              const route::WriteGuard& guard) override {
+            service_.OnKvBeforeTearDown(tenant_id, guard);
+        }
+        void OnWriteRelease(const TenantId& tenant_id,
+                            const route::WriteGuard& guard) override {
+            service_.OnKvWriteRelease(tenant_id, guard);
+        }
+
+       private:
+        MasterService& service_;
+    };
+    KvRouteObserver kv_route_observer_{*this};
+
     // One namespace per tenant id written to, each owning that tenant's object
     // route; a namespace stays put once created (see NamespaceTable).
     metadata::NamespaceTable namespaces_{[this](const TenantId& tenant_id) {
         return std::make_unique<metadata::Namespace>(
             tenant_id, policy_,
             policy_ == nullptr ? nullptr
-                               : policy_->OnNamespaceCreated(tenant_id));
+                               : policy_->OnNamespaceCreated(tenant_id),
+            nullptr, &kv_route_observer_);
     }};
     MasterStoreBackend weight_backend_{*this};
     tl::expected<void, ErrorCode> RemoveObject(const std::string& key,
@@ -1341,10 +1361,8 @@ class MasterService {
     // its key, under that key's lock: the tasks in flight on it, its replicas'
     // resources and its KV events. The key stays held, so the caller may
     // publish a replacement.
-    void EraseMetadata(
-        metadata::Namespace& ns, const route::WriteGuard& hold,
-        EraseMode erase_mode,
-        const std::vector<std::string>& previous_media_hint = {});
+    void EraseMetadata(metadata::Namespace& ns, const route::WriteGuard& hold,
+                       EraseMode erase_mode = EraseMode::kFull);
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids);
@@ -1777,13 +1795,8 @@ class MasterService {
 
         // Erases the held object and everything keyed to it; the key stays
         // held, so the caller may publish a replacement under it.
-        void Erase(const std::vector<std::string>& previous_media_hint = {}) {
-            Erase(EraseMode::kFull, previous_media_hint);
-        }
-        void Erase(EraseMode erase_mode,
-                   const std::vector<std::string>& previous_media_hint = {}) {
-            service_->EraseMetadata(*ns_, *guard_, erase_mode,
-                                    previous_media_hint);
+        void Erase(EraseMode erase_mode = EraseMode::kFull) {
+            service_->EraseMetadata(*ns_, *guard_, erase_mode);
         }
 
         void EraseFromProcessing() {
@@ -2195,25 +2208,22 @@ class MasterService {
         drain_jobs_ GUARDED_BY(job_mutex_);
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
+    bool kv_events_enabled_{false};
 
     // RemoveAll holds no lock across its walk, so a concurrent commit can land
     // in a tenant or stripe it already passed. Publishing `cleared` from the
     // scan's own bookkeeping would then order it after that commit's `stored`
-    // and tell subscribers to drop a live object. Every
-    // announcement of a newly available object bumps its tenant's epoch, and a
-    // clear is published only if the epoch still matches the value read before
-    // the scan began. A racing commit therefore suppresses the
-    // clear instead of superseding it; subscribers fall back to the per-object
-    // `removed` stream, which is what they saw before `cleared` existed.
+    // and tell subscribers to drop a live object. Every announcement of a newly
+    // available object bumps its tenant's atomic epoch before taking the
+    // publisher's queue lock, and `cleared` re-checks that epoch under the same
+    // queue lock before enqueuing.
     //
     // Slots are a fixed hashed array rather than a per-tenant map so the
     // structure cannot grow with tenant churn. A hash collision makes two
     // tenants share an epoch, which can only suppress a clear that was safe to
     // send — never publish one that was not.
     static constexpr size_t kKvTenantEpochSlots = 1024;
-    mutable std::mutex kv_tenant_epoch_mutex_;
-    std::array<uint64_t, kKvTenantEpochSlots> kv_tenant_epochs_
-        GUARDED_BY(kv_tenant_epoch_mutex_) = {};
+    std::array<std::atomic<uint64_t>, kKvTenantEpochSlots> kv_tenant_epochs_{};
     // Set from KvEventsEnabled() at construction. Kept separate so tests can
     // exercise the ordering rule without a live ZMQ publisher.
     bool kv_track_tenant_epochs_{false};
@@ -2226,85 +2236,50 @@ class MasterService {
     static size_t KvTenantEpochSlot(const std::string& tenant) {
         return std::hash<std::string>{}(tenant) % kKvTenantEpochSlots;
     }
-    // Called while the object's key lock is held, before the `stored` is
-    // enqueued, so any clear that observes the old epoch has not yet published.
     void BumpKvTenantEpoch(const std::string& tenant) {
         if (!kv_track_tenant_epochs_) {
             return;
         }
-        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
-        ++kv_tenant_epochs_[KvTenantEpochSlot(tenant)];
+        kv_tenant_epochs_[KvTenantEpochSlot(tenant)].fetch_add(
+            1, std::memory_order_acq_rel);
     }
-    uint64_t ReadKvTenantEpoch(const std::string& tenant) {
+    uint64_t ReadKvTenantEpoch(const std::string& tenant) const {
         if (!kv_track_tenant_epochs_) {
             return 0;
         }
-        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
-        return kv_tenant_epochs_[KvTenantEpochSlot(tenant)];
+        return kv_tenant_epochs_[KvTenantEpochSlot(tenant)].load(
+            std::memory_order_acquire);
     }
-    // A whole-array copy taken before a scan begins. The global RemoveAll does
-    // not know which tenants it will meet, and reading a tenant's epoch only
-    // once the scan reaches it is too late — see the call site.
     std::array<uint64_t, kKvTenantEpochSlots> SnapshotKvTenantEpochs(
-        bool needed) {
+        bool needed) const {
+        std::array<uint64_t, kKvTenantEpochSlots> snapshot{};
         if (!needed || !kv_track_tenant_epochs_) {
-            return {};
+            return snapshot;
         }
-        std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
-        return kv_tenant_epochs_;
+        for (size_t i = 0; i < kKvTenantEpochSlots; ++i) {
+            snapshot[i] = kv_tenant_epochs_[i].load(std::memory_order_acquire);
+        }
+        return snapshot;
     }
-    // Re-reads the epoch and publishes under the same lock that guards the
-    // bump, so a commit cannot slip between the check and the enqueue.
     void PublishKvClearedIfEpochUnchanged(const TenantId& tenant_id,
                                           uint64_t expected_epoch);
 
-    // Gated snapshots for the call sites that capture a pre-mutation medium
-    // set. They run on hot metadata paths, so skip the VisitReplicas walk
-    // entirely when no publisher is listening.
-    // Cleanup paths recover previously announced media only for invalid
-    // COMPLETE replicas selected by their own removal predicate.
-    std::vector<std::string> KvMediaSnapshot(
-        const ObjectMetadata& metadata,
-        const std::function<bool(const Replica&)>& should_include_invalid =
-            {}) {
-        return KvEventsEnabled()
-                   ? KvMediaForMetadata(metadata, should_include_invalid)
-                   : std::vector<std::string>{};
-    }
-    std::vector<std::string> KvRemovalSnapshot(const ObjectMetadata& metadata) {
-        return KvEventsEnabled() ? KvMediaForRemoval(metadata)
-                                 : std::vector<std::string>{};
-    }
+    struct KvMediaMasks {
+        // COMPLETE replicas whose handles are still valid (eligible to be
+        // announced as `stored`).
+        uint8_t live{0};
+        // COMPLETE and pending REMOVED replicas still resident in `metadata`.
+        // Keep already-announced tiers until cleanup or durable finalization
+        // erases their records; REMOVED replicas cannot announce new tiers.
+        uint8_t retained{0};
+    };
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
-    static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata,
-        const std::function<bool(const Replica&)>& should_include_invalid = {});
-    // Removal paths may run after replicas have transitioned to PROCESSING or
-    // REMOVED. Keep their former medium visible as a conservative hint even
-    // though only COMPLETE replicas count as currently available media.
-    static std::vector<std::string> KvMediaForRemoval(
-        const ObjectMetadata& metadata);
-    // The medium is derived from the object's full replica set, not from the
-    // replica type that triggered the commit, so no replica type is taken.
-    void PublishKvStored(const std::string& key, const ObjectMetadata& metadata,
-                         const TenantId& tenant_id);
-    void SyncKvObjectState(
-        const std::string& key, const ObjectMetadata& metadata,
-        const TenantId& tenant_id,
-        const std::vector<std::string>& previous_media_hint = {});
-    void PublishKvRemoved(
-        const std::string& key, const ObjectMetadata& metadata,
-        const TenantId& tenant_id,
-        const std::vector<std::string>& previous_media_hint = {});
-    // evicted_replica_count is the number of replicas the caller actually
-    // dropped. It is deliberately not a byte count: a zero-length object still
-    // needs its removal announced.
-    void PublishKvRemovedAfterEvict(const std::string& key,
-                                    size_t evicted_replica_count,
-                                    const std::string& medium,
-                                    const ObjectMetadata& metadata,
-                                    const TenantId& tenant_id);
+    static KvMediaMasks KvMediaMasksForMetadata(const ObjectMetadata& metadata);
+    void OnKvBeforeTearDown(const TenantId& tenant_id,
+                            const route::WriteGuard& guard);
+    void OnKvWriteRelease(const TenantId& tenant_id,
+                          const route::WriteGuard& guard);
     void PublishKvCleared(const TenantId& tenant_id);
 
     // OpLog publishing

@@ -518,16 +518,6 @@ class MasterServiceTestPeer {
         return service_.IsReplicaReadable(replica);
     }
 
-    static std::vector<std::string> KvMediaForMetadata(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForMetadata(metadata);
-    }
-
-    static std::vector<std::string> KvMediaForRemoval(
-        const ObjectMetadata& metadata) {
-        return MasterService::KvMediaForRemoval(metadata);
-    }
-
     void LoadTenantQuotaPoliciesFromStoreOrThrow() {
         service_.tenant_quota_policy_->manager_.LoadPoliciesOrThrow();
     }

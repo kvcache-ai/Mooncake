@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 
 #include "common/heap_optional.h"
 #include "object_runtime_state.h"
@@ -18,6 +19,10 @@ namespace route {
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
+    // The storage media tiers announced to KV event subscribers for this
+    // publication. Kept in the padding after `is_processing`, so it adds zero
+    // bytes to KeySlot.
+    uint8_t announced_kv_media{0};
     HeapOptional<ReplicationTask> replication_task;
     HeapOptional<OffloadingTask> offloading_task;
     HeapOptional<PromotionTask> promotion_task;

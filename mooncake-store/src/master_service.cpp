@@ -340,27 +340,6 @@ struct MasterService::MemoryEviction {
         MasterService& service_;
     };
 
-    // Announces that an object lost memory. With the OpLog on, the durable
-    // finalize announces it instead.
-    class KvEventObserver final : public eviction::EvictionObserver {
-       public:
-        explicit KvEventObserver(MasterService& service,
-                                 const char* medium = "cpu")
-            : service_(service), medium_(medium) {}
-
-        void OnApplied(const eviction::ObjectView& view,
-                       const eviction::Effect& effect) override {
-            if (effect.released_bytes > 0) {
-                service_.PublishKvRemovedAfterEvict(
-                    view.key, 1, medium_, view.metadata, view.tenant_id);
-            }
-        }
-
-       private:
-        MasterService& service_;
-        const char* medium_;
-    };
-
     struct Settings {
         bool through_oplog = false;
         bool allow_evict_soft_pinned = false;
@@ -374,7 +353,6 @@ struct MasterService::MemoryEviction {
           oplog(service),
           offload_queue(service),
           offloading(immediate, offload_queue, settings.offload),
-          kv_events(service),
           log(settings.offload.cap),
           evictor(service.namespaces_, policy,
                   settings.through_oplog
@@ -382,20 +360,11 @@ struct MasterService::MemoryEviction {
                   : settings.offload_on_evict
                       ? static_cast<eviction::Reclaimer&>(offloading)
                       : static_cast<eviction::Reclaimer&>(immediate),
-                  Observers(settings)) {}
+                  {&metrics, &log}) {}
 
     static bool InPlan(const eviction::Plan& plan, const Replica& replica) {
         return std::find(plan.release.begin(), plan.release.end(),
                          replica.id()) != plan.release.end();
-    }
-
-    std::vector<eviction::EvictionObserver*> Observers(
-        const Settings& settings) {
-        std::vector<eviction::EvictionObserver*> observers{&metrics, &log};
-        if (!settings.through_oplog) {
-            observers.push_back(&kv_events);
-        }
-        return observers;
     }
 
     Policy policy;
@@ -403,7 +372,6 @@ struct MasterService::MemoryEviction {
     OpLogReclaimer oplog;
     OffloadQueue offload_queue;
     eviction::OffloadingReclaimer offloading;
-    KvEventObserver kv_events;
     eviction::MetricsObserver metrics;
     eviction::LogObserver log;
     // Last, so everything it refers to is built first.
@@ -450,13 +418,10 @@ struct MasterService::KvcsDfsEviction {
         : policy(service, allow_soft_pinned,
                  MemoryEviction::ReplicaKind::kKvcsDfs),
           reclaimer(service),
-          kv_events(service, "disk"),
-          evictor(service.namespaces_, policy, reclaimer,
-                  {&metrics, &kv_events}) {}
+          evictor(service.namespaces_, policy, reclaimer, {&metrics}) {}
 
     MemoryEviction::Policy policy;
     Reclaimer reclaimer;
-    MemoryEviction::KvEventObserver kv_events;
     eviction::MetricsObserver metrics;
     eviction::Evictor evictor;
 };
@@ -709,7 +674,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
     InitDfsAllocatorFromEnvironment(config);
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
-    kv_track_tenant_epochs_ = KvEventsEnabled();
+    kv_events_enabled_ = kv_event_publisher_ && kv_event_publisher_->enabled();
+    kv_track_tenant_epochs_ = kv_events_enabled_;
 
     if (enable_oplog_ && !cluster_id_.empty()) {
         if (config.ha_backend_connstring.empty()) {
@@ -1791,11 +1757,6 @@ void MasterService::EvictManagedWeightMembersToCold(
         if (!effect) {
             break;
         }
-        // With the OpLog on, the durable finalize announces it instead.
-        if (!enable_oplog_) {
-            PublishKvRemovedAfterEvict(member_key, effect->detached.size(),
-                                       "cpu", metadata, tenant_id);
-        }
         if (effect->needs_teardown) {
             reclaimer.TearDown(*ns, *hold);
         }
@@ -1912,10 +1873,6 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
 
     std::unordered_set<ReplicaID> ids(replica_ids.begin(), replica_ids.end());
     auto& metadata = accessor.Get();
-    // The replicas being finalized are already marked REMOVED, so the normal
-    // completed-replica view no longer contains their media. Preserve the
-    // pre-removal view for the event delta.
-    const auto previous_media = KvRemovalSnapshot(metadata);
     auto erased_replicas = PopReplicasWithCacheTotalAccounting(
         metadata, [&ids](const Replica& replica) {
             return replica.status() == ReplicaStatus::REMOVED &&
@@ -1935,13 +1892,9 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetState(),
                                           erased_replica_ids);
     if (!metadata.IsValid()) {
-        accessor.Erase(previous_media);
-    } else {
-        SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
-                          previous_media);
-        if (metadata.AllReplicas(&Replica::fn_is_completed)) {
-            accessor.EraseFromProcessing();
-        }
+        accessor.Erase();
+    } else if (metadata.AllReplicas(&Replica::fn_is_completed)) {
+        accessor.EraseFromProcessing();
     }
 }
 
@@ -1973,10 +1926,6 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
     }
 
     auto& metadata = accessor.Get();
-    // Snapshot before popping: the pop is what makes a medium disappear, and
-    // the publisher needs the pre-pop set to compute the removal delta. Mirrors
-    // FinalizeExpiredReplicationTaskAfterDurable.
-    const auto previous_media = KvRemovalSnapshot(metadata);
     auto replicas = PopReplicasWithCacheTotalAccounting(
         metadata, &Replica::fn_is_processing);
     if (!replicas.empty()) {
@@ -1985,13 +1934,9 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
         discarded_replicas_.emplace_back(std::move(replicas), ttl);
     }
     if (!metadata.IsValid()) {
-        accessor.Erase(previous_media);
-    } else {
-        SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
-                          previous_media);
-        if (accessor.InProcessing()) {
-            accessor.EraseFromProcessing();
-        }
+        accessor.Erase();
+    } else if (accessor.InProcessing()) {
+        accessor.EraseFromProcessing();
     }
 }
 
@@ -2026,10 +1971,6 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
         source->dec_refcnt();
     }
 
-    // Snapshot the visible media before popping: targets are matched by id
-    // regardless of status, so a completed replica can be dropped here and its
-    // medium would otherwise be unrecoverable for the remove delta.
-    const auto previous_media = KvRemovalSnapshot(metadata);
     std::unordered_set<ReplicaID> ids(target_ids.begin(), target_ids.end());
     auto replicas = PopReplicasWithCacheTotalAccounting(
         metadata,
@@ -2053,12 +1994,8 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
                                                 accessor.GetState());
     }
     if (!metadata.IsValid()) {
-        accessor.Erase(previous_media);
+        accessor.Erase();
     } else {
-        // Publish before EraseReplicationTask, which may drop an emptied
-        // tenant and invalidate the metadata reference.
-        SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
-                          previous_media);
         accessor.EraseReplicationTask();
     }
 }
@@ -2163,24 +2100,16 @@ void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
     if (enable_ha_ && enable_oplog_) {
         return;
     }
-    const TenantId& tenant_id = accessor.GetTenantId();
     ObjectMetadata& metadata = accessor.Get();
-    // Gate the snapshot on the publisher being live: this runs on every
-    // read-write metadata access, and the VisitReplicas walk plus vector
-    // allocation is pure overhead when KV events are off (the default).
-    const auto is_invalid_memory = [](const Replica& replica) {
-        return replica.has_invalid_mem_handle();
-    };
-    const auto previous_kv_media = KvMediaSnapshot(metadata, is_invalid_memory);
     // Erase invalid memory replicas (those with unmounted segments). No
     // client_mutex_ needed since we only check memory replicas.
     std::vector<ReplicaID> removed_replica_ids;
-    EraseReplicasWithCacheTotalAccounting(metadata, is_invalid_memory,
-                                          &removed_replica_ids);
+    EraseReplicasWithCacheTotalAccounting(
+        metadata,
+        [](const Replica& replica) { return replica.has_invalid_mem_handle(); },
+        &removed_replica_ids);
     CancelPromotionTaskForRemovedReplicas(metadata, accessor.GetState(),
                                           removed_replica_ids);
-    SyncKvObjectState(accessor.GetKey(), metadata, tenant_id,
-                      previous_kv_media);
     // If no valid replicas remain, delete the whole object, and with it every
     // task in flight for it.
     if (!metadata.IsValid()) {
@@ -2193,30 +2122,15 @@ void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
 // replication's source refcount. Callers no longer need to clean these up
 // before calling. What the object charged its tenant goes with it when the
 // key's lock is let go.
-void MasterService::EraseMetadata(
-    metadata::Namespace& ns, const route::WriteGuard& hold,
-    EraseMode erase_mode, const std::vector<std::string>& previous_media_hint) {
+void MasterService::EraseMetadata(metadata::Namespace& ns,
+                                  const route::WriteGuard& hold,
+                                  EraseMode erase_mode) {
     auto& metadata = hold.metadata();
     auto& state = hold.state();
     const std::string& key = hold.key();
     const TenantId& tenant_id = ns.id();
     if (erase_mode == EraseMode::kFull) {
         ns.BeforeTearDown(hold);
-    }
-
-    // Preserve the publisher's state while a size-changing upsert temporarily
-    // removes the old metadata. A complete erase emits one remove event per
-    // media that was previously visible.
-    if (erase_mode == EraseMode::kReplace) {
-        // Union rather than replace: the caller hint may only describe one
-        // tier, so a medium still visible in metadata must not be dropped
-        // from the remove delta.
-        auto previous_media = KvRemovalSnapshot(metadata);
-        previous_media.insert(previous_media.end(), previous_media_hint.begin(),
-                              previous_media_hint.end());
-        SyncKvObjectState(key, metadata, tenant_id, previous_media);
-    } else {
-        PublishKvRemoved(key, metadata, tenant_id, previous_media_hint);
     }
 
     // Clean up offloading_task + dec_refcnt before erasing metadata.
@@ -3600,6 +3514,8 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
+        accessor.GetState().announced_kv_media =
+            KvMediaMasksForMetadata(metadata).live;
         installed.emplace_back(object.tenant_id,
                                route::ObjectRef{object.user_key, generation});
     }
@@ -4198,6 +4114,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
         for (const auto& [tenant, ref] : installed) {
             MetadataAccessorRW accessor(this, tenant, ref);
             if (accessor.IsPublished()) {
+                accessor.GetState().announced_kv_media = 0;
                 accessor.Erase();
             }
         }
@@ -4453,7 +4370,6 @@ auto MasterService::BatchReplicaClear(
         }
 
         auto& metadata = accessor.Get();
-        const auto previous_kv_media = KvMediaSnapshot(metadata);
 
         // Security check: Ensure the requesting client owns the object.
         if (metadata.client_id != client_id) {
@@ -4607,9 +4523,6 @@ auto MasterService::BatchReplicaClear(
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
                 accessor.Erase();
-            } else {
-                SyncKvObjectState(key, metadata, normalized_tenant,
-                                  previous_kv_media);
             }
 
             cleared_keys.emplace_back(key);
@@ -5621,7 +5534,6 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     SyncCacheTotalAccounting(metadata);
     // TODO: add inc_nof_cache_nums() (ranhaojia)
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
-    PublishKvStored(key, metadata, object_id.tenant_id);
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
@@ -5693,7 +5605,6 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             ObjectDataType::UNKNOWN, std::string{}, object_id.tenant_id, key);
     }
     auto& metadata = accessor.Get();
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
     if (replica.type() != ReplicaType::LOCAL_DISK) {
         LOG(ERROR) << "Invalid replica type: " << replica.type()
                    << ". Expected ReplicaType::LOCAL_DISK.";
@@ -5745,8 +5656,6 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
         SyncCacheTotalAccounting(metadata);
-        SyncKvObjectState(key, metadata, object_id.tenant_id,
-                          previous_kv_media);
         return true;
     }
 
@@ -5783,7 +5692,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     auto& metadata = accessor.Get();
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
                    << key << ", was PutStart-ed by " << metadata.client_id;
@@ -5871,8 +5779,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         accessor.Erase();
         return {};
     }
-
-    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
 
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
@@ -6186,8 +6092,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
-                    const auto previous_kv_media = KvMediaSnapshot(metadata);
-
                     // Mark COMPLETE → PROCESSING so readers won't see stale
                     // data mid-transfer.  The key becomes unreadable until
                     // UpsertEnd.
@@ -6203,8 +6107,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.BeginSoftPinAction(
                         soft_pin_request, std::move(eligible_replica_ids));
                     SyncCacheTotalAccounting(metadata);
-                    SyncKvObjectState(key, metadata, object_id.tenant_id,
-                                      previous_kv_media);
 
                     accessor.GetState().is_processing = true;
 
@@ -6246,7 +6148,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 allocation_session_id = metadata.session_id;
                 allocation_residency_affinity_id =
                     metadata.residency_affinity_id;
-                const auto previous_kv_media = KvMediaSnapshot(metadata);
                 // A leased memory snapshot still references the old replica
                 // descriptors. Allocate the replacement before removing the
                 // old metadata so an allocation failure leaves the old object
@@ -6291,7 +6192,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // The replacement is published under this same lock, so no
                 // reader or writer finds the key between the two objects.
                 // `metadata` is not used past this point.
-                accessor.Erase(EraseMode::kReplace, previous_kv_media);
+                accessor.Erase(EraseMode::kReplace);
 
                 VLOG(1) << "key=" << key
                         << ", action=upsert_start_case_c_reallocate";
@@ -6421,7 +6322,6 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
     if (weight_manager_.IsManagedGroup(metadata.group_id)) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
 
     const bool supports_dfs_condition = replica_type == ReplicaType::DFS &&
                                         expected_replica_id != nullptr &&
@@ -6507,7 +6407,6 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     }
 
-    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     if (!metadata.IsValid()) {
         accessor.Erase();
     }
@@ -6786,7 +6685,6 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     }
 
     auto& metadata = accessor.Get();
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr || !source->is_completed() ||
@@ -6899,8 +6797,6 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     SyncCacheTotalAccounting(metadata);
 
     accessor.EraseReplicationTask();
-
-    SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
 
     return all_complete ? tl::expected<void, ErrorCode>()
                         : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
@@ -7140,7 +7036,6 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     }
 
     auto& metadata = accessor.Get();
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr || !source->is_completed() ||
@@ -7257,8 +7152,6 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     }
 
     accessor.EraseReplicationTask();
-
-    SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
 
     return {};
 }
@@ -7732,15 +7625,13 @@ bool MasterService::CleanupStaleHandles(const std::string& key,
 }
 
 bool MasterService::CleanupStaleHandles(
-    const std::string& key, const TenantId& tenant_id, ObjectMetadata& metadata,
-    route::ObjectState& state,
+    const std::string& /*key*/, const TenantId& /*tenant_id*/,
+    ObjectMetadata& metadata, route::ObjectState& state,
     const std::function<bool(const Replica&)>& is_stale) {
-    const auto previous_kv_media = KvMediaSnapshot(metadata, is_stale);
     std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(metadata, is_stale,
                                           &removed_replica_ids);
     CancelPromotionTaskForRemovedReplicas(metadata, state, removed_replica_ids);
-    SyncKvObjectState(key, metadata, tenant_id, previous_kv_media);
 
     // Return true if no valid replicas remain after cleanup
     return !metadata.IsValid();
@@ -7879,8 +7770,6 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                         });
                     if (erased > 0) {
                         keep_until = std::max(keep_until, lease_deadline);
-                        PublishKvRemovedAfterEvict(candidate.key, erased,
-                                                   "disk", metadata, tenant_id);
                         if (!metadata.IsValid()) {
                             accessor.Erase();
                         }
@@ -8097,8 +7986,6 @@ void MasterService::RunShardDfsEviction() {
                                !replica.is_processing();
                     });
                 if (erased > 0) {
-                    PublishKvRemovedAfterEvict(candidate.key, erased, "disk",
-                                               metadata, tenant_id);
                     if (!metadata.IsValid()) {
                         accessor.Erase();
                     }
@@ -8447,7 +8334,6 @@ auto MasterService::NotifyOffloadSuccess(
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
-                const auto previous_kv_media = KvMediaSnapshot(obj_metadata);
                 auto& offloading_task = accessor.GetState().offloading_task;
                 if (offloading_task &&
                     replica.type() != ReplicaType::LOCAL_DISK) {
@@ -8504,9 +8390,6 @@ auto MasterService::NotifyOffloadSuccess(
                             });
                     }
                     handled_existing_object = true;
-                    SyncKvObjectState(request_object_id.user_key, obj_metadata,
-                                      request_object_id.tenant_id,
-                                      previous_kv_media);
                 }
             }
         }
@@ -9395,7 +9278,6 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
-    const auto previous_kv_media = KvMediaSnapshot(metadata);
 
     // Look up the in-flight task to find the exact replica we staged. A
     // concurrent Put on this key may have created other PROCESSING MEMORY
@@ -9485,7 +9367,6 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (!committed) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
-    SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     if (from_prefetch) {
         // Prefetch-promoted keys get the same read lease as exist/get so the
         // DRAM replica survives until the follow-up get() arrives.
@@ -10133,7 +10014,6 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
         total_freed_size += metadata.TotalLength() * erased;
         evicted_count++;
-        PublishKvRemovedAfterEvict(key, erased, "disk", metadata, tenant_id);
         if (!metadata.IsValid()) {
             accessor.Erase();
         }
@@ -11387,170 +11267,90 @@ KvEventConfig MasterService::BuildKvEventConfig(
 
 // Every non-memory replica type, including DFS, is normalized to the "disk"
 // medium so subscribers see one logical tier per storage class.
-std::vector<std::string> MasterService::KvMediaForMetadata(
-    const ObjectMetadata& metadata,
-    const std::function<bool(const Replica&)>& should_include_invalid) {
-    bool has_cpu = false;
-    bool has_disk = false;
-    metadata.VisitReplicas(
-        [](const Replica& replica) { return replica.is_completed(); },
-        [&](const Replica& replica) {
-            if (replica.is_memory_replica() &&
-                (!replica.has_invalid_mem_handle() ||
-                 (should_include_invalid && should_include_invalid(replica)))) {
-                has_cpu = true;
-            } else if (replica.is_nof_replica() &&
-                       (!replica.has_invalid_nof_handle() ||
-                        (should_include_invalid &&
-                         should_include_invalid(replica)))) {
-                has_disk = true;
-            } else if (replica.is_disk_replica() ||
-                       replica.is_local_disk_replica() ||
-                       replica.is_dfs_replica()) {
-                has_disk = true;
-            }
-        });
-    std::vector<std::string> media;
-    if (has_cpu) {
-        media.emplace_back("cpu");
-    }
-    if (has_disk) {
-        media.emplace_back("disk");
-    }
-    return media;
-}
-
-std::vector<std::string> MasterService::KvMediaForRemoval(
+MasterService::KvMediaMasks MasterService::KvMediaMasksForMetadata(
     const ObjectMetadata& metadata) {
-    auto media = KvMediaForMetadata(metadata);
-    bool has_cpu = std::find(media.begin(), media.end(), "cpu") != media.end();
-    bool has_disk =
-        std::find(media.begin(), media.end(), "disk") != media.end();
-    // KvMediaForMetadata above only counts completed replicas. A removal path
-    // can run after a replica has moved to PROCESSING or REMOVED, and both
-    // states still had their medium announced to subscribers, so both must
-    // appear in the removal delta or the tier is never retracted.
-    // Segment teardown also invalidates allocation handles before metadata is
-    // swept. Such COMPLETE replicas have already disappeared from the readable
-    // media set, but their formerly announced tier still needs a retraction.
-    metadata.VisitReplicas(
-        [](const Replica& replica) {
-            return replica.status() == ReplicaStatus::REMOVED ||
-                   replica.status() == ReplicaStatus::PROCESSING ||
-                   (replica.is_completed() &&
-                    (replica.has_invalid_mem_handle() ||
-                     replica.has_invalid_nof_handle()));
-        },
-        [&](const Replica& replica) {
-            if (replica.is_memory_replica()) {
-                has_cpu = true;
-            } else if (replica.is_nof_replica() || replica.is_disk_replica() ||
-                       replica.is_local_disk_replica() ||
-                       replica.is_dfs_replica()) {
-                has_disk = true;
+    KvMediaMasks masks;
+    for (const Replica& replica : metadata.GetAllReplicas()) {
+        const bool complete = replica.is_completed();
+        // HA removal marks replicas before the OpLog is durable. Retain their
+        // announced tiers until the finalizer erases them, but still exclude
+        // PROCESSING so UpsertStart retracts the old tier.
+        if (!complete && replica.status() != ReplicaStatus::REMOVED) {
+            continue;
+        }
+        if (replica.is_memory_replica()) {
+            masks.retained |= KvEventPublisher::kMediumCpu;
+            if (complete && !replica.has_invalid_mem_handle()) {
+                masks.live |= KvEventPublisher::kMediumCpu;
             }
-        });
-    if (has_cpu &&
-        std::find(media.begin(), media.end(), "cpu") == media.end()) {
-        media.emplace_back("cpu");
+        } else if (replica.is_nof_replica()) {
+            masks.retained |= KvEventPublisher::kMediumDisk;
+            if (complete && !replica.has_invalid_nof_handle()) {
+                masks.live |= KvEventPublisher::kMediumDisk;
+            }
+        } else if (replica.is_local_disk_replica()) {
+            masks.retained |= KvEventPublisher::kMediumDisk;
+            if (complete && !replica.has_stale_local_disk_client()) {
+                masks.live |= KvEventPublisher::kMediumDisk;
+            }
+        } else if (replica.is_disk_replica() || replica.is_dfs_replica()) {
+            masks.retained |= KvEventPublisher::kMediumDisk;
+            if (complete) {
+                masks.live |= KvEventPublisher::kMediumDisk;
+            }
+        }
     }
-    if (has_disk &&
-        std::find(media.begin(), media.end(), "disk") == media.end()) {
-        media.emplace_back("disk");
-    }
-    return media;
+    return masks;
 }
 
-void MasterService::PublishKvStored(const std::string& key,
-                                    const ObjectMetadata& metadata,
-                                    const TenantId& tenant_id) {
-    // The epoch is bumped even when no publisher is listening so that the
-    // ordering rule is testable, and always before the enqueue below: a
-    // concurrent RemoveAll must either see the new epoch and withhold its
-    // `cleared`, or have already published it ahead of this `stored`.
-    BumpKvTenantEpoch(tenant_id.value());
-    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+void MasterService::OnKvBeforeTearDown(const TenantId& tenant_id,
+                                       const route::WriteGuard& guard) {
+    route::ObjectState& state = guard.state();
+    const uint8_t announced = state.announced_kv_media;
+    state.announced_kv_media = 0;
+    if (!kv_events_enabled_ || announced == 0) {
         return;
     }
-    kv_event_publisher_->PublishCommitted(key, KvMediaForMetadata(metadata),
-                                          tenant_id.value(), metadata.group_id,
-                                          metadata.session_id);
+    kv_event_publisher_->PublishTransition(guard.key(), tenant_id.value(),
+                                           guard.metadata().group_id,
+                                           std::string_view{}, announced, 0);
 }
 
-void MasterService::SyncKvObjectState(
-    const std::string& key, const ObjectMetadata& metadata,
-    const TenantId& tenant_id,
-    const std::vector<std::string>& previous_media_hint) {
-    const bool publishing =
-        kv_event_publisher_ && kv_event_publisher_->enabled();
-    if (!publishing && !kv_track_tenant_epochs_) {
+void MasterService::OnKvWriteRelease(const TenantId& tenant_id,
+                                     const route::WriteGuard& guard) {
+    if (!kv_events_enabled_ && !kv_track_tenant_epochs_) {
         return;
     }
-    auto current_media = KvMediaForMetadata(metadata);
-    // Only an object that still has a medium can contradict a `cleared`. Sync
-    // calls that end with no medium left are retractions, which a clear may
-    // safely follow.
-    if (!current_media.empty()) {
+    if (!guard.has_object()) {
+        return;
+    }
+    route::ObjectState& state = guard.state();
+    const ObjectMetadata& metadata = guard.metadata();
+    const uint8_t old_mask = state.announced_kv_media;
+
+    const KvMediaMasks masks = KvMediaMasksForMetadata(metadata);
+    const uint8_t removed = old_mask & ~masks.retained;
+    const uint8_t stored = static_cast<uint8_t>(masks.live & ~old_mask);
+    state.announced_kv_media =
+        static_cast<uint8_t>((old_mask & ~removed) | stored);
+
+    if ((removed | stored) == 0) {
+        return;
+    }
+    // Only a newly announced tier can contradict a concurrent `cleared` scan;
+    // pure retractions safely precede or follow `cleared`.
+    if (stored != 0) {
         BumpKvTenantEpoch(tenant_id.value());
     }
-    if (!publishing) {
-        return;
+    if (kv_events_enabled_) {
+        kv_event_publisher_->PublishTransition(
+            guard.key(), tenant_id.value(), metadata.group_id,
+            metadata.session_id, removed, stored);
     }
-    kv_event_publisher_->SyncObjectState(key, current_media, tenant_id.value(),
-                                         metadata.group_id, previous_media_hint,
-                                         metadata.session_id);
-}
-
-void MasterService::PublishKvRemoved(
-    const std::string& key, const ObjectMetadata& metadata,
-    const TenantId& tenant_id,
-    const std::vector<std::string>& previous_media_hint) {
-    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
-        return;
-    }
-    auto previous_media = KvRemovalSnapshot(metadata);
-    previous_media.insert(previous_media.end(), previous_media_hint.begin(),
-                          previous_media_hint.end());
-    kv_event_publisher_->PublishObjectRemoved(
-        key, tenant_id.value(), metadata.group_id, previous_media);
-}
-
-void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
-                                               size_t evicted_replica_count,
-                                               const std::string& medium,
-                                               const ObjectMetadata& metadata,
-                                               const TenantId& tenant_id) {
-    if (evicted_replica_count == 0) {
-        return;
-    }
-    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
-        return;
-    }
-    if (!metadata.IsValid()) {
-        // EraseMetadata can only retract media still represented in metadata.
-        // The last replica may already have been detached; announce its
-        // medium here unless the pending erase will do so itself.
-        const auto remaining_media = KvRemovalSnapshot(metadata);
-        if (std::find(remaining_media.begin(), remaining_media.end(), medium) ==
-            remaining_media.end()) {
-            kv_event_publisher_->PublishRemoved(key, medium, tenant_id,
-                                                metadata.group_id);
-        }
-        return;
-    }
-    // The object survives. Feeding the evicted medium in as part of the
-    // previous set lets the delta drop it, unless another replica still lives
-    // on it.
-    auto previous_media = KvMediaForMetadata(metadata);
-    if (std::find(previous_media.begin(), previous_media.end(), medium) ==
-        previous_media.end()) {
-        previous_media.push_back(medium);
-    }
-    SyncKvObjectState(key, metadata, tenant_id, previous_media);
 }
 
 void MasterService::PublishKvCleared(const TenantId& tenant_id) {
-    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+    if (!kv_events_enabled_) {
         return;
     }
     kv_event_publisher_->PublishCleared(tenant_id.value());
@@ -11562,24 +11362,20 @@ void MasterService::PublishKvClearedIfEpochUnchanged(const TenantId& tenant_id,
         PublishKvCleared(tenant_id);
         return;
     }
-    // Holding the epoch lock across the publish is what makes this a barrier
-    // rather than a racy re-check: a commit that wants to announce this tenant
-    // has to wait for the lock, and will then find the clear already enqueued.
-    std::lock_guard<std::mutex> lock(kv_tenant_epoch_mutex_);
-    if (kv_tenant_epochs_[KvTenantEpochSlot(tenant_id.value())] !=
-        expected_epoch) {
-        // A commit landed in an already-scanned stripe. Its `stored` is on the
-        // wire, so a clear here would retract a live object.
+    const auto& epoch = kv_tenant_epochs_[KvTenantEpochSlot(tenant_id.value())];
+    const bool unchanged =
+        kv_event_publisher_
+            ? kv_event_publisher_->PublishClearedIfUnchanged(
+                  tenant_id.value(), epoch, expected_epoch)
+            : (epoch.load(std::memory_order_acquire) == expected_epoch);
+    if (!unchanged) {
         kv_cleared_suppressed_by_epoch_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     kv_cleared_published_.fetch_add(1, std::memory_order_relaxed);
-    PublishKvCleared(tenant_id);
 }
 
-bool MasterService::KvEventsEnabled() const {
-    return kv_event_publisher_ && kv_event_publisher_->enabled();
-}
+bool MasterService::KvEventsEnabled() const { return kv_events_enabled_; }
 
 KvEventPublisher::Stats MasterService::GetKvEventStats() const {
     if (!kv_event_publisher_) {

@@ -1690,6 +1690,7 @@ TEST_F(MasterServiceTest, DfsReplicaNormalizesToDiskMediumForKvEvents) {
 
     {
         MasterService service;
+        MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
         const auto context = PrepareSimpleSegment(service);
         ReplicateConfig config;
         config.replica_num = 1;
@@ -1704,45 +1705,42 @@ TEST_F(MasterServiceTest, DfsReplicaNormalizesToDiskMediumForKvEvents) {
                                 TenantId::Default(), ReplicaType::ALL)
                         .has_value());
 
-        // Memory + DFS collapse to exactly the two logical tiers, sorted the
-        // same way the publisher sorts them.
-        auto media = KvMediaForKey(service, "dfs_kv_media");
+        // Memory + DFS collapse to the two logical KV media bits on the route.
+        auto media = AnnouncedKvMediaForKey(service, "dfs_kv_media");
         ASSERT_TRUE(media.has_value());
-        EXPECT_EQ(std::vector<std::string>({"cpu", "disk"}), *media);
-
-        auto removal_media = KvRemovalMediaForKey(service, "dfs_kv_media");
-        ASSERT_TRUE(removal_media.has_value());
-        EXPECT_EQ(std::vector<std::string>({"cpu", "disk"}), *removal_media);
+        EXPECT_EQ(KvEventPublisher::kMediumCpu | KvEventPublisher::kMediumDisk,
+                  *media);
     }
 
     std::error_code ec;
     std::filesystem::remove_all(dfs_root, ec);
 }
 
-// A removal path can run while a replica is still PROCESSING. That medium was
-// never announced as available, but the removal snapshot must still name it:
-// otherwise a tier that a subscriber may have seen is never retracted. The
-// contrast with KvMediaForKey, which counts only completed replicas, is the
-// whole point of having two helpers.
-TEST_F(MasterServiceTest, ProcessingReplicaMediumAppearsInRemovalSnapshot) {
+// PutStart without PutEnd leaves the replica PROCESSING; the route observer
+// keeps announced_kv_media at 0, so revoking the uncommitted write tears down
+// the slot without bumping the tenant epoch or retracting an unannounced tier.
+TEST_F(MasterServiceTest, ProcessingReplicaRemainsUnannouncedOnRoute) {
     MasterService service;
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // PutStart without PutEnd leaves the replica PROCESSING.
     auto start = service.PutStart(context.client_id, "processing_kv_media",
                                   TenantId::Default(), 4096, config);
     ASSERT_TRUE(start.has_value());
 
-    auto media = KvMediaForKey(service, "processing_kv_media");
+    auto media = AnnouncedKvMediaForKey(service, "processing_kv_media");
     ASSERT_TRUE(media.has_value());
-    EXPECT_TRUE(media->empty()) << "a PROCESSING replica is not yet available "
-                                   "and must not be announced";
+    EXPECT_EQ(0u, *media) << "a PROCESSING replica is not yet available and "
+                             "must not be marked announced";
 
-    auto removal_media = KvRemovalMediaForKey(service, "processing_kv_media");
-    ASSERT_TRUE(removal_media.has_value());
-    EXPECT_EQ(std::vector<std::string>({"cpu"}), *removal_media);
+    ASSERT_TRUE(service
+                    .PutRevoke(context.client_id, "processing_kv_media",
+                               TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_FALSE(
+        AnnouncedKvMediaForKey(service, "processing_kv_media").has_value());
 }
 
 // A RemoveAll whose oplog slot reservation fails must leave the object in

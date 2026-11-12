@@ -34,19 +34,33 @@
 namespace mooncake {
 namespace metadata {
 
+// Observes object state transitions across write guards and teardowns on a
+// namespace's route, under the held key's write lock (leaf locks only).
+class NamespaceObserver {
+   public:
+    virtual ~NamespaceObserver() = default;
+    virtual void OnBeforeTearDown(const TenantId& /*tenant_id*/,
+                                  const route::WriteGuard& /*guard*/) {}
+    virtual void OnWriteRelease(const TenantId& tenant_id,
+                                const route::WriteGuard& guard) = 0;
+};
+
 class Namespace final : private route::RouteObserver {
    public:
-    // `policy`, when set, outlives the namespace; `attachment` is what it hung
-    // on this namespace when it was created. Without an `eviction_index` the
-    // namespace ranks its objects by lease (LeaseEvictionIndex).
+    // `policy` and `observer`, when set, outlive the namespace; `attachment`
+    // is what `policy` hung on this namespace when it was created. Without an
+    // `eviction_index` the namespace ranks its objects by lease
+    // (LeaseEvictionIndex).
     explicit Namespace(TenantId id = {}, NamespacePolicy* policy = nullptr,
                        std::unique_ptr<PolicyAttachment> attachment = nullptr,
-                       std::unique_ptr<EvictionIndex> eviction_index = nullptr)
+                       std::unique_ptr<EvictionIndex> eviction_index = nullptr,
+                       NamespaceObserver* observer = nullptr)
         // The route is built first, so it reads the index before it moves.
         : objects(this, eviction_index != nullptr &&
                             eviction_index->observes_reads()),
           id_(std::move(id)),
           policy_(policy),
+          observer_(observer),
           attachment_(std::move(attachment)),
           eviction_index_(eviction_index != nullptr
                               ? std::move(eviction_index)
@@ -119,11 +133,20 @@ class Namespace final : private route::RouteObserver {
         return PolicyContext{id_, attachment_.get(), guard};
     }
 
+    void OnBeforeTearDown(const route::WriteGuard& guard) override {
+        if (observer_ != nullptr) {
+            observer_->OnBeforeTearDown(id_, guard);
+        }
+    }
+
     void OnWriteRelease(const route::WriteGuard& guard) override {
         SyncInFlight(guard);
         eviction_index_->OnWrite(guard);
         if (policy_ != nullptr) {
             policy_->OnWriteRelease(Context(guard));
+        }
+        if (observer_ != nullptr) {
+            observer_->OnWriteRelease(id_, guard);
         }
         // A key with no object may be dropped once this guard lets go, or
         // published again, so whatever is kept on it must be back to its
@@ -179,6 +202,7 @@ class Namespace final : private route::RouteObserver {
 
     const TenantId id_;
     NamespacePolicy* const policy_;
+    NamespaceObserver* const observer_;
     const std::unique_ptr<PolicyAttachment> attachment_;
 
     // The keys with work in flight, and the keys eviction may visit.

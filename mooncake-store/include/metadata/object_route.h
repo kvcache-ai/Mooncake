@@ -268,6 +268,8 @@ inline void SlotHandle::reset() noexcept {
 // route built to report them, since every read pays for the call.
 class RouteObserver {
    public:
+    // Runs inside Guard::TearDown while the object's record is still alive.
+    virtual void OnBeforeTearDown(const WriteGuard& /*guard*/) {}
     virtual void OnWriteRelease(const WriteGuard& guard) = 0;
     virtual void OnReadRelease(const ReadGuard& /*guard*/) {}
 
@@ -558,6 +560,9 @@ void Guard<kMode>::TearDown() const
 {
     if (!has_object()) {
         LOG(FATAL) << "TearDown on key " << key() << ", which holds no object";
+    }
+    if (handed_out_ && route_->observer_ != nullptr) {
+        route_->observer_->OnBeforeTearDown(*this);
     }
     route_->TearDownLocked(*slot_);
 }
