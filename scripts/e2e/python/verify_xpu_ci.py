@@ -186,7 +186,9 @@ def verify_provenance(root: Path, sha: str, image: str, run: str) -> None:
 
 def unpack(directory: Path, sha: str, artifact_id: str, checksum: str) -> None:
     info = json.loads((directory / "artifact.json").read_text())
-    run = f"{os.environ['GITHUB_RUN_ID']}/{os.environ['GITHUB_RUN_ATTEMPT']}"
+    attempt = os.environ["XPU_BUILD_ATTEMPT"]
+    require(re.fullmatch(r"[1-9][0-9]*", attempt) is not None, "Invalid build attempt")
+    run = f"{os.environ['GITHUB_RUN_ID']}/{attempt}"
     expected_name = f"mooncake-xpu-ci-py312-{sha}-{run.replace('/', '-')}"
     checksum = checksum.removeprefix("sha256:")
     require(

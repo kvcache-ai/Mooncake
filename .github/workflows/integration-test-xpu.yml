@@ -15,6 +15,9 @@ on:
       artifact_digest:
         type: string
         required: true
+      artifact_attempt:
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -68,6 +71,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_ID: ${{ inputs.artifact_id }}
           ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+          XPU_BUILD_ATTEMPT: ${{ inputs.artifact_attempt }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           CHECKOUT_SHA: ${{ inputs.checkout_sha }}
           RUN_DIRECTORY: ${{ steps.run.outputs.directory }}

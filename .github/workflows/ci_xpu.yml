@@ -18,6 +18,8 @@ on:
         value: ${{ jobs.build-wheel-xpu.outputs.artifact_id }}
       artifact_digest:
         value: ${{ jobs.build-wheel-xpu.outputs.artifact_digest }}
+      artifact_attempt:
+        value: ${{ jobs.build-wheel-xpu.outputs.artifact_attempt }}
   workflow_dispatch:
 
 permissions:
@@ -36,6 +38,7 @@ jobs:
       source_sha: ${{ steps.source.outputs.sha }}
       artifact_id: ${{ steps.artifact.outputs.artifact-id }}
       artifact_digest: ${{ steps.artifact.outputs.artifact-digest }}
+      artifact_attempt: ${{ steps.source.outputs.attempt }}
     env:
       XPU_BUILD: "1"
       PYTHON_VERSION: "3.12"
@@ -64,6 +67,7 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Install toolchain and dependencies
         run: |

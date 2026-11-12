@@ -113,6 +113,7 @@ jobs:
       source_sha: ${{ needs.build-wheel-xpu.outputs.source_sha }}
       artifact_id: ${{ needs.build-wheel-xpu.outputs.artifact_id }}
       artifact_digest: ${{ needs.build-wheel-xpu.outputs.artifact_digest }}
+      artifact_attempt: ${{ needs.build-wheel-xpu.outputs.artifact_attempt }}
 
   ascend-test:
     if: >

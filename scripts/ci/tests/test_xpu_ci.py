@@ -331,11 +331,42 @@ echo dependency > xpu-ci-output/python-deps/dependency.whl
             jobs["xpu-integration-test"]["with"]["checkout_sha"],
             "${{ needs.xpu-authorize.outputs.sha }}",
         )
-        for name in ("artifact_id", "artifact_digest", "source_sha"):
+        for name in (
+            "artifact_id",
+            "artifact_digest",
+            "artifact_attempt",
+            "source_sha",
+        ):
             self.assertEqual(
                 jobs["xpu-integration-test"]["with"][name],
                 "${{ needs.build-wheel-xpu.outputs." + name + " }}",
             )
+        build_event = WORKFLOW.get("on", WORKFLOW.get(True))
+        self.assertEqual(
+            build_event["workflow_call"]["outputs"]["artifact_attempt"]["value"],
+            "${{ jobs.build-wheel-xpu.outputs.artifact_attempt }}",
+        )
+        self.assertEqual(
+            WORKFLOW["jobs"]["build-wheel-xpu"]["outputs"]["artifact_attempt"],
+            "${{ steps.source.outputs.attempt }}",
+        )
+        self.assertIn(
+            'echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"',
+            workflow_step("Record selected source"),
+        )
+        hardware_event = INTEGRATION.get("on", INTEGRATION.get(True))
+        self.assertEqual(
+            hardware_event["workflow_call"]["inputs"]["artifact_attempt"],
+            {"type": "string", "required": True},
+        )
+        download = next(
+            step
+            for step in INTEGRATION["jobs"]["core"]["steps"]
+            if step.get("name") == "Download exact build artifact"
+        )
+        self.assertEqual(
+            download["env"]["XPU_BUILD_ATTEMPT"], "${{ inputs.artifact_attempt }}"
+        )
         self.assertEqual(
             set(jobs["e2e-gate"]["needs"]),
             {
@@ -851,7 +882,8 @@ class ArtifactTest(unittest.TestCase):
             }
             environment = {
                 "GITHUB_RUN_ID": "123",
-                "GITHUB_RUN_ATTEMPT": "2",
+                "GITHUB_RUN_ATTEMPT": "3",
+                "XPU_BUILD_ATTEMPT": "2",
                 "XPU_IMAGE": image,
             }
             for change in (
@@ -869,6 +901,12 @@ class ArtifactTest(unittest.TestCase):
                         VERIFY.unpack(root, sha, "42", checksum)
             (root / "artifact.json").write_text(json.dumps(original))
             with patch.dict(os.environ, environment):
+                for attempt in ("", "0", "-1", "2/3", "3"):
+                    with self.subTest(attempt=attempt), patch.dict(
+                        os.environ, {"XPU_BUILD_ATTEMPT": attempt}
+                    ):
+                        with self.assertRaises(RuntimeError):
+                            VERIFY.unpack(root, sha, "42", checksum)
                 with self.assertRaises(RuntimeError):
                     VERIFY.unpack(root, sha, "42", "0" * 64)
                 VERIFY.unpack(root, sha, "42", checksum)
@@ -877,6 +915,8 @@ class ArtifactTest(unittest.TestCase):
                 VERIFY.verify_provenance(bundle, "c" * 40, image, "123/2")
             with self.assertRaises(RuntimeError):
                 VERIFY.verify_provenance(bundle, sha, image + "changed", "123/2")
+            with self.assertRaises(RuntimeError):
+                VERIFY.verify_provenance(bundle, sha, image, "123/3")
             (bundle / wheel).write_bytes(b"corrupted")
             with self.assertRaises(RuntimeError):
                 VERIFY.verify_hashes(bundle, {"provenance.txt"})
@@ -905,7 +945,12 @@ class ArtifactTest(unittest.TestCase):
                     )
                 )
                 with patch.dict(
-                    os.environ, {"GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1"}
+                    os.environ,
+                    {
+                        "GITHUB_RUN_ID": "1",
+                        "GITHUB_RUN_ATTEMPT": "1",
+                        "XPU_BUILD_ATTEMPT": "1",
+                    },
                 ):
                     with self.assertRaises(RuntimeError):
                         VERIFY.unpack(root, "a" * 40, "1", checksum)
