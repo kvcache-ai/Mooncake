@@ -40,6 +40,12 @@ namespace tent {
 class TENTBenchRunner : public BenchRunner {
    public:
     TENTBenchRunner();
+    double deadlineDropThreshold() const override { return drop_threshold_; }
+    TransferResult runTransfer(uint64_t local_addr, uint64_t target_id,
+                               uint64_t target_addr, uint64_t block_size,
+                               uint64_t batch_size, OpCode opcode,
+                               uint64_t deadline_ns,
+                               IntentType intent_type) override;
     ~TENTBenchRunner();
 
     TENTBenchRunner(const TENTBenchRunner&) = delete;
@@ -133,6 +139,11 @@ class TENTBenchRunner : public BenchRunner {
     explicit TENTBenchRunner(std::unique_ptr<TransferEngine> engine)
         : engine_(std::move(engine)) {}
 
+    friend class TENTTransferTestRunner;
+    TENTBenchRunner(std::unique_ptr<TransferEngine> engine,
+                    double drop_threshold)
+        : engine_(std::move(engine)), drop_threshold_(drop_threshold) {}
+
     int allocateBuffers();
 
     int freeBuffers();
@@ -147,6 +158,7 @@ class TENTBenchRunner : public BenchRunner {
 
    private:
     std::unique_ptr<TransferEngine> engine_;
+    double drop_threshold_ = 0.0;
     std::vector<void*> pinned_buffer_list_;
     // Parallel to pinned_buffer_list_: the seg_type each buffer belongs to
     // ("dram" or "vram"). Populated by allocateBuffers; used by
