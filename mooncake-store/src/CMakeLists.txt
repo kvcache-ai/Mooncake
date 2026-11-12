@@ -109,6 +109,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
+    gather_read.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -172,6 +173,24 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
 
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
+  add_executable(store_gather_read_test ../tests/gather_read_test.cpp)
+  target_link_libraries(store_gather_read_test PRIVATE mooncake_store gtest
+                                                       gtest_main)
+  add_test(NAME store_gather_read_test COMMAND store_gather_read_test)
+  # Intercept calls from the static Store archive for deterministic transport
+  # failures. ELF wrappers do not intercept calls inside a shared Store.
+  if(UNIX
+     AND NOT APPLE
+     AND NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(store_gather_read_test
+                               PRIVATE MOONCAKE_GATHER_TEST_WRAPPED_SUBMIT)
+    target_link_options(
+      store_gather_read_test
+      PRIVATE
+      "-Wl,--wrap=_ZN8mooncake14TransferEngine14submitTransferEmRKSt6vectorINS_9Transport15TransferRequestESaIS3_EE"
+      "-Wl,--wrap=_ZN8mooncake14TransferEngine17getTransferStatusEmmRNS_9Transport14TransferStatusE"
+    )
+  endif()
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")

@@ -16,6 +16,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 
 #include <cassert>
+#include <cstring>
 #include <exception>
 #include <optional>
 #include <set>
@@ -49,6 +50,92 @@ class CallbackInvocationGuard {
 // ControlClient::notify() tells apart from a notification not taken yet.
 constexpr char kMalformedNotification[] = "malformed notification: ";
 constexpr char kNotifyCallbackFailed[] = "notify callback failed: ";
+constexpr std::string_view kLegacyTcpNeedsRefreshPrefix = "NeedsRefreshCache: ";
+
+bool isLegacyTcpNeedsRefresh(std::string_view response) {
+    return response.size() >= kLegacyTcpNeedsRefreshPrefix.size() &&
+           response.substr(0, kLegacyTcpNeedsRefreshPrefix.size()) ==
+               kLegacyTcpNeedsRefreshPrefix;
+}
+
+std::string legacyTcpNeedsRefresh(std::string_view reason) {
+    std::string response(kLegacyTcpNeedsRefreshPrefix);
+    response.append(reason);
+    return response;
+}
+
+enum class TcpDataV2Status : uint8_t {
+    kOk = 0,
+    kStaleIdentity = 1,
+    kRejected = 2,
+    kError = 3,
+};
+
+struct TcpDataV2Desc {
+    uint64_t process_high;
+    uint64_t process_low;
+    uint64_t registration_id;
+    uint64_t peer_mem_addr;
+    uint64_t length;
+};
+static_assert(sizeof(TcpDataV2Desc) == kTcpDataV2HeaderBytes);
+
+TcpDataV2Desc encodeTcpDataV2Desc(uint64_t peer_mem_addr, size_t length,
+                                  const TcpDataPlaneIdentity& identity) {
+    return {htole64(identity.process.high), htole64(identity.process.low),
+            htole64(identity.registration_id), htole64(peer_mem_addr),
+            htole64(length)};
+}
+
+Status decodeTcpDataV2Status(const std::string& response) {
+    if (response.empty()) {
+        return Status::RpcServiceError("TCP data v2 response is empty");
+    }
+    const auto code = static_cast<TcpDataV2Status>(response[0]);
+    const auto message = [&] {
+        return std::string(response.begin() + 1, response.end());
+    };
+    switch (code) {
+        case TcpDataV2Status::kOk:
+            return Status::OK();
+        case TcpDataV2Status::kStaleIdentity:
+            return Status::NeedsRefreshCache(
+                response.size() == 1 ? "stale TCP data-plane identity"
+                                     : message());
+        case TcpDataV2Status::kRejected:
+            return Status::AddressNotRegistered(
+                response.size() == 1 ? "TCP data-plane access rejected"
+                                     : message());
+        case TcpDataV2Status::kError:
+            return Status::RpcServiceError(response.size() == 1
+                                               ? "TCP data-plane request failed"
+                                               : message());
+    }
+    return Status::RpcServiceError("invalid TCP data v2 response status");
+}
+
+void failTcpDataV2(std::string& response, TcpDataV2Status code,
+                   std::string message) {
+    response.assign(1, static_cast<char>(code));
+    response.append(std::move(message));
+}
+
+Status acquireLegacyTcpLease(TcpBufferRegistry& registry,
+                             const BufferDesc& buffer, uint64_t address,
+                             uint64_t length, bool write,
+                             TcpBufferRegistry::Lease* lease) {
+    const auto attr = buffer.transport_attrs.find(TransportType::TCP);
+    if (attr == buffer.transport_attrs.end()) {
+        return Status::NeedsRefreshCache(
+            "legacy TCP buffer has no registration identity" LOC_MARK);
+    }
+    uint64_t registration_id = 0;
+    if (!decodeTcpRegistrationAttr(attr->second, &registration_id)) {
+        return Status::InvalidArgument(
+            "malformed TCP buffer registration" LOC_MARK);
+    }
+    return registry.acquire(registration_id, address, length, write, lease);
+}
 
 }  // namespace
 
@@ -146,6 +233,9 @@ Status ControlClient::sendData(const std::string& server_addr,
     auto status = tl_rpc_agent.callOwned(server_addr, SendData,
                                          std::move(request), response);
     if (!status.ok()) return status;
+    if (isLegacyTcpNeedsRefresh(response)) {
+        return Status::NeedsRefreshCache(response);
+    }
     if (!response.empty()) return Status::RpcServiceError(response);
     return Status::OK();
 }
@@ -161,10 +251,76 @@ Status ControlClient::recvData(const std::string& server_addr,
     memcpy(&request[0], &desc, sizeof(desc));
     auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
     if (!status.ok()) return status;
-    if (response.size() != length)
-        return Status::RpcServiceError(
-            response.empty() ? "RecvData failed: empty response" : response);
-    return Platform::getLoader().copy(local_mem_addr, response.data(), length);
+    if (response.size() == length) {
+        return Platform::getLoader().copy(local_mem_addr, response.data(),
+                                          length);
+    }
+    if (isLegacyTcpNeedsRefresh(response)) {
+        return Status::NeedsRefreshCache(response);
+    }
+    return Status::RpcServiceError(
+        response.empty() ? "RecvData failed: empty response" : response);
+}
+
+Status ControlClient::sendDataV2(const std::string& server_addr,
+                                 uint64_t peer_mem_addr, void* local_mem_addr,
+                                 size_t length,
+                                 const TcpDataPlaneIdentity& identity) {
+    if (length > kTcpMaxWriteV2Bytes) {
+        return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
+    }
+    const auto desc = encodeTcpDataV2Desc(peer_mem_addr, length, identity);
+    std::string request;
+    request.reserve(sizeof(desc) + length);
+    request.resize(sizeof(desc));
+    memcpy(request.data(), &desc, sizeof(desc));
+    auto& loader = Platform::getLoader();
+    if (loader.getMemoryType(local_mem_addr) == MTYPE_CPU) {
+        request.append(reinterpret_cast<const char*>(local_mem_addr), length);
+    } else {
+        request.resize(sizeof(desc) + length);
+        CHECK_STATUS(
+            loader.copy(request.data() + sizeof(desc), local_mem_addr, length));
+    }
+    std::string response;
+    auto status = tl_rpc_agent.callOwned(server_addr, SendDataV2,
+                                         std::move(request), response);
+    if (status.IsRpcFunctionNotFound()) {
+        // The old peer rejected the id before entering a data handler. It is
+        // therefore safe for TcpTransport to refresh metadata and replay even
+        // a WRITE through the legacy RPC selected by the new snapshot.
+        return Status::NeedsRefreshCache(
+            "peer does not support TCP data RPC v2");
+    }
+    if (!status.ok()) return status;
+    CHECK_STATUS(decodeTcpDataV2Status(response));
+    return response.size() == 1 ? Status::OK()
+                                : Status::RpcServiceError(
+                                      "TCP data v2 response length mismatch");
+}
+
+Status ControlClient::recvDataV2(const std::string& server_addr,
+                                 uint64_t peer_mem_addr, void* local_mem_addr,
+                                 size_t length,
+                                 const TcpDataPlaneIdentity& identity) {
+    if (length > kTcpMaxReadBytes) {
+        return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
+    }
+    const auto desc = encodeTcpDataV2Desc(peer_mem_addr, length, identity);
+    std::string request(reinterpret_cast<const char*>(&desc), sizeof(desc));
+    std::string response;
+    auto status = tl_rpc_agent.call(server_addr, RecvDataV2, request, response);
+    if (status.IsRpcFunctionNotFound()) {
+        return Status::NeedsRefreshCache(
+            "peer does not support TCP data RPC v2");
+    }
+    if (!status.ok()) return status;
+    CHECK_STATUS(decodeTcpDataV2Status(response));
+    if (response.size() != length + 1) {
+        return Status::RpcServiceError("TCP data v2 response length mismatch");
+    }
+    return Platform::getLoader().copy(local_mem_addr, response.data() + 1,
+                                      length);
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {
@@ -293,7 +449,10 @@ void ControlClient::unpinStageBufferAsync(const std::string& server_addr,
 ControlService::ControlService(const std::string& type,
                                const std::string& servers,
                                TransferEngineImpl* impl)
-    : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
+    : tcp_process_identity_(makeTcpProcessIdentity()),
+      bootstrap_callback_(nullptr),
+      notify_callback_(nullptr),
+      impl_(impl) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
@@ -331,6 +490,18 @@ ControlService::ControlService(const std::string& type,
         RecvData,
         [this](const std::string_view& request, std::string& response) {
             onRecvData(request, response);
+        },
+        /*offload=*/true);
+    rpc_server_->registerFunction(
+        SendDataV2,
+        [this](const std::string_view& request, std::string& response) {
+            onSendDataV2(request, response);
+        },
+        /*offload=*/true);
+    rpc_server_->registerFunction(
+        RecvDataV2,
+        [this](const std::string_view& request, std::string& response) {
+            onRecvDataV2(request, response);
         },
         /*offload=*/true);
     rpc_server_->registerFunction(
@@ -536,10 +707,24 @@ void ControlService::onSendData(const std::string_view& request,
         response = "SendData failed: invalid request size";
         return;
     }
+    if (!unsafe_legacy_tcp_data_rpc_enabled_.load(std::memory_order_acquire)) {
+        response = legacyTcpNeedsRefresh("legacy TCP data RPC is disabled");
+        return;
+    }
 
     if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
         if (buffer->permission != kGlobalReadWrite) {
             response = "SendData failed: remote write permission denied";
+            return;
+        }
+        TcpBufferRegistry::Lease lease;
+        auto acquired = acquireLegacyTcpLease(
+            tcp_buffer_registry_, *buffer, peer_mem_addr, length, true, &lease);
+        if (!acquired.ok()) {
+            response =
+                acquired.IsNeedsRefreshCache() || acquired.IsTooManyRequests()
+                    ? legacyTcpNeedsRefresh(acquired.ToString())
+                    : "SendData failed: " + acquired.ToString();
             return;
         }
         auto status =
@@ -580,11 +765,25 @@ void ControlService::onRecvData(const std::string_view& request,
         fail("RecvData failed: length exceeds maximum allowed");
         return;
     }
+    if (!unsafe_legacy_tcp_data_rpc_enabled_.load(std::memory_order_acquire)) {
+        fail(legacyTcpNeedsRefresh("legacy TCP data RPC is disabled"));
+        return;
+    }
 
     if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
         if (buffer->permission != kGlobalReadOnly &&
             buffer->permission != kGlobalReadWrite) {
             fail("RecvData failed: remote read permission denied");
+            return;
+        }
+        TcpBufferRegistry::Lease lease;
+        auto acquired =
+            acquireLegacyTcpLease(tcp_buffer_registry_, *buffer, peer_mem_addr,
+                                  length, false, &lease);
+        if (!acquired.ok()) {
+            fail(acquired.IsNeedsRefreshCache() || acquired.IsTooManyRequests()
+                     ? legacyTcpNeedsRefresh(acquired.ToString())
+                     : "RecvData failed: " + acquired.ToString());
             return;
         }
         auto& loader = Platform::getLoader();
@@ -602,6 +801,105 @@ void ControlService::onRecvData(const std::string_view& request,
         }
     } else {
         fail("RecvData failed: target address not in registered buffer");
+    }
+}
+
+void ControlService::onSendDataV2(const std::string_view& request,
+                                  std::string& response) {
+    if (request.size() < sizeof(TcpDataV2Desc)) {
+        failTcpDataV2(response, TcpDataV2Status::kError,
+                      "TCP data v2 request is too short");
+        return;
+    }
+    TcpDataV2Desc encoded;
+    memcpy(&encoded, request.data(), sizeof(encoded));
+    const TcpProcessIdentity process{le64toh(encoded.process_high),
+                                     le64toh(encoded.process_low)};
+    const uint64_t registration_id = le64toh(encoded.registration_id);
+    const uint64_t peer_mem_addr = le64toh(encoded.peer_mem_addr);
+    const uint64_t length = le64toh(encoded.length);
+    if (length > kTcpMaxWriteV2Bytes ||
+        request.size() != sizeof(encoded) + length) {
+        failTcpDataV2(response, TcpDataV2Status::kError,
+                      "TCP data v2 request size is invalid");
+        return;
+    }
+    if (process != tcp_process_identity_) {
+        failTcpDataV2(response, TcpDataV2Status::kStaleIdentity,
+                      "stale TCP process identity");
+        return;
+    }
+    TcpBufferRegistry::Lease lease;
+    Status acquired = tcp_buffer_registry_.acquire(
+        registration_id, peer_mem_addr, length, true, &lease);
+    if (!acquired.ok()) {
+        failTcpDataV2(
+            response,
+            acquired.IsNeedsRefreshCache() || acquired.IsTooManyRequests()
+                ? TcpDataV2Status::kStaleIdentity
+                : TcpDataV2Status::kRejected,
+            acquired.ToString());
+        return;
+    }
+    Status copied = Platform::getLoader().copy(
+        reinterpret_cast<void*>(peer_mem_addr),
+        const_cast<char*>(request.data() + sizeof(encoded)), length);
+    if (!copied.ok()) {
+        failTcpDataV2(response, TcpDataV2Status::kError, copied.ToString());
+        return;
+    }
+    response.assign(1, static_cast<char>(TcpDataV2Status::kOk));
+}
+
+void ControlService::onRecvDataV2(const std::string_view& request,
+                                  std::string& response) {
+    if (request.size() != sizeof(TcpDataV2Desc)) {
+        failTcpDataV2(response, TcpDataV2Status::kError,
+                      "TCP data v2 request size is invalid");
+        return;
+    }
+    TcpDataV2Desc encoded;
+    memcpy(&encoded, request.data(), sizeof(encoded));
+    const TcpProcessIdentity process{le64toh(encoded.process_high),
+                                     le64toh(encoded.process_low)};
+    const uint64_t registration_id = le64toh(encoded.registration_id);
+    const uint64_t peer_mem_addr = le64toh(encoded.peer_mem_addr);
+    const uint64_t length = le64toh(encoded.length);
+    if (length > kTcpMaxReadBytes) {
+        failTcpDataV2(response, TcpDataV2Status::kError,
+                      "TCP data v2 request length is invalid");
+        return;
+    }
+    if (process != tcp_process_identity_) {
+        failTcpDataV2(response, TcpDataV2Status::kStaleIdentity,
+                      "stale TCP process identity");
+        return;
+    }
+    TcpBufferRegistry::Lease lease;
+    Status acquired = tcp_buffer_registry_.acquire(
+        registration_id, peer_mem_addr, length, false, &lease);
+    if (!acquired.ok()) {
+        failTcpDataV2(
+            response,
+            acquired.IsNeedsRefreshCache() || acquired.IsTooManyRequests()
+                ? TcpDataV2Status::kStaleIdentity
+                : TcpDataV2Status::kRejected,
+            acquired.ToString());
+        return;
+    }
+    response.assign(1, static_cast<char>(TcpDataV2Status::kOk));
+    auto& loader = Platform::getLoader();
+    if (loader.getMemoryType(reinterpret_cast<void*>(peer_mem_addr)) ==
+        MTYPE_CPU) {
+        response.append(reinterpret_cast<const char*>(peer_mem_addr), length);
+    } else {
+        response.resize(length + 1);
+        Status copied =
+            loader.copy(response.data() + 1,
+                        reinterpret_cast<void*>(peer_mem_addr), length);
+        if (!copied.ok()) {
+            failTcpDataV2(response, TcpDataV2Status::kError, copied.ToString());
+        }
     }
 }
 

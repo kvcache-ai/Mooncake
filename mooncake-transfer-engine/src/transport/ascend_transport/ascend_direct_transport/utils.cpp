@@ -201,18 +201,23 @@ std::string GenAdxlEngineName(const std::string& ip, const uint64_t port) {
     return ip + ":" + std::to_string(port);
 }
 
-uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id) {
+uint16_t FindAdxlListenPort(int32_t base_port, int32_t device_id,
+                            const std::vector<uint16_t>& excluded_ports) {
     int32_t physical_dev_id;
     CHECK_ACL(aclrtGetPhyDevIdByLogicDevId(device_id, &physical_dev_id));
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
     const int min_port = base_port + physical_dev_id * kPortRange;
-    const int max_port = base_port + (physical_dev_id + 1) * kPortRange;
+    const int max_port = base_port + (physical_dev_id + 1) * kPortRange - 1;
     LOG(INFO) << "Find available between " << min_port << " and " << max_port;
     bool use_ipv6 = globalConfig().use_ipv6;
     int sockfd;
     for (int attempt = 0; attempt < kMaxGenPortAttempts; ++attempt) {
         int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
+        if (std::find(excluded_ports.begin(), excluded_ports.end(), port) !=
+            excluded_ports.end()) {
+            continue;
+        }
         sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
