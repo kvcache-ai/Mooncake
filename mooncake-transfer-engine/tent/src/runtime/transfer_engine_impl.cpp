@@ -3913,8 +3913,15 @@ Status TransferEngineImpl::submitAndWaitTransfer(
 Status TransferEngineImpl::waitTransfer(
     BatchID batch_id, std::vector<TransferStatus>* status_list,
     uint64_t timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(timeout_ms);
+    // A deadline beyond a year is treated as unbounded: converting a larger
+    // unsigned value to the clock duration overflows.
+    constexpr auto kMaxTimeout =
+        std::chrono::milliseconds(std::chrono::hours(24 * 365));
+    const auto deadline =
+        timeout_ms > static_cast<uint64_t>(kMaxTimeout.count())
+            ? std::chrono::steady_clock::time_point::max()
+            : std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(timeout_ms);
     const auto timed_out = [&] {
         return timeout_ms != 0 && std::chrono::steady_clock::now() >= deadline;
     };
@@ -3939,8 +3946,7 @@ Status TransferEngineImpl::waitTransfer(
                 (void)cancelTransfer(batch_id, task_id);
         CHECK_STATUS(refillDispatchWindow());
         if (!status_list)
-            return Status::InternalError(
-                "Transfer via stage buffer failed" LOC_MARK);
+            return Status::TimedOut("waitTransfer timed out" LOC_MARK);
         return getTransferStatus(batch_id, *status_list);
     }
 
