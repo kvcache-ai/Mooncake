@@ -11441,7 +11441,7 @@ KvEventConfig MasterService::BuildKvEventConfig(
 // medium so subscribers see one logical tier per storage class.
 std::vector<std::string> MasterService::KvMediaForMetadata(
     const ObjectMetadata& metadata,
-    const std::function<bool(const Replica&)>& include_invalid) {
+    const std::function<bool(const Replica&)>& should_include_invalid) {
     bool has_cpu = false;
     bool has_disk = false;
     metadata.VisitReplicas(
@@ -11449,11 +11449,12 @@ std::vector<std::string> MasterService::KvMediaForMetadata(
         [&](const Replica& replica) {
             if (replica.is_memory_replica() &&
                 (!replica.has_invalid_mem_handle() ||
-                 (include_invalid && include_invalid(replica)))) {
+                 (should_include_invalid && should_include_invalid(replica)))) {
                 has_cpu = true;
             } else if (replica.is_nof_replica() &&
                        (!replica.has_invalid_nof_handle() ||
-                        (include_invalid && include_invalid(replica)))) {
+                        (should_include_invalid &&
+                         should_include_invalid(replica)))) {
                 has_disk = true;
             } else if (replica.is_disk_replica() ||
                        replica.is_local_disk_replica() ||

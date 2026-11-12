@@ -2274,9 +2274,11 @@ class MasterService {
     // COMPLETE replicas selected by their own removal predicate.
     std::vector<std::string> KvMediaSnapshot(
         const ObjectMetadata& metadata,
-        const std::function<bool(const Replica&)>& include_invalid = {}) {
-        return KvEventsEnabled() ? KvMediaForMetadata(metadata, include_invalid)
-                                 : std::vector<std::string>{};
+        const std::function<bool(const Replica&)>& should_include_invalid =
+            {}) {
+        return KvEventsEnabled()
+                   ? KvMediaForMetadata(metadata, should_include_invalid)
+                   : std::vector<std::string>{};
     }
     std::vector<std::string> KvRemovalSnapshot(const ObjectMetadata& metadata) {
         return KvEventsEnabled() ? KvMediaForRemoval(metadata)
@@ -2286,7 +2288,7 @@ class MasterService {
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
     static std::vector<std::string> KvMediaForMetadata(
         const ObjectMetadata& metadata,
-        const std::function<bool(const Replica&)>& include_invalid = {});
+        const std::function<bool(const Replica&)>& should_include_invalid = {});
     // Removal paths may run after replicas have transitioned to PROCESSING or
     // REMOVED. Keep their former medium visible as a conservative hint even
     // though only COMPLETE replicas count as currently available media.
