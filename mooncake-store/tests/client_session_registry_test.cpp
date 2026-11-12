@@ -129,6 +129,8 @@ TEST_F(ClientSessionRegistryTest, SessionScopesExposeOnlyReadOnlyIdentity) {
     EXPECT_TRUE(guard->Session()->IsServing());
 }
 
+// Replica staleness checks bind directly to the retained ClientSessionSharedPtr
+// rather than consulting ClientSessionRegistry under its lock.
 TEST_F(ClientSessionRegistryTest, LocalDiskCleanupNeedsNoRegistryAccess) {
     ClientSessionRegistry registry;
     auto record = Register(registry);
@@ -182,21 +184,31 @@ TEST_F(ClientSessionRegistryTest,
         registration->UpdateHostId("failed-host");
         return ErrorCode::INVALID_PARAMS;
     };
+
+    // 1. Provisional session and its staged host hint are discarded on failure.
     EXPECT_EQ(fail(), ErrorCode::INVALID_PARAMS);
     EXPECT_FALSE(Find(registry, kClient));
     EXPECT_TRUE(registry.GetHostId(kClient).empty());
+
+    // 2. Existing session survives failure, and its committed host hint is not
+    // overwritten by an uncommitted registration attempt.
     auto record = Register(registry);
+    registry.UpdateHostId(kClient, "committed-host");
     Suspect(record);
     EXPECT_EQ(fail(), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(Find(registry, kClient), record);
     EXPECT_EQ(record->state(), State::SUSPECTED);
-    EXPECT_EQ(registry.GetHostId(kClient), "failed-host");
+    EXPECT_EQ(registry.GetHostId(kClient), "committed-host");
+
+    // 3. Committing publishes both the liveness recovery and the staged hint.
     {
         auto registration = registry.BeginRegistration(kClient, kInitial + 12s);
         ASSERT_TRUE(registration);
+        registration->UpdateHostId("updated-host");
         registration->Commit();
     }
     EXPECT_EQ(record->state(), State::ACTIVE);
+    EXPECT_EQ(registry.GetHostId(kClient), "updated-host");
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
 }
 
@@ -207,12 +219,18 @@ TEST_F(ClientSessionRegistryTest, ExceptionsDiscardOnlyUncommittedNewRecords) {
         EXPECT_TRUE(registration);
         throw std::runtime_error("mount failed");
     };
+
+    // Uncommitted provisional record is rolled back when stack unwinding runs.
     EXPECT_THROW(fail(), std::runtime_error);
     EXPECT_FALSE(Find(registry, kClient));
+
+    // Previously committed record is preserved if a later registration throws.
     auto existing = Register(registry);
     EXPECT_THROW(fail(), std::runtime_error);
     EXPECT_EQ(Find(registry, kClient), existing);
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+
+    // Exceptions thrown after Commit() keep the newly registered session.
     const UUID other{3, 4};
     const auto fail_after_commit = [&] {
         auto registration = registry.BeginRegistration(other);
@@ -340,6 +358,8 @@ TEST_F(ClientSessionRegistryTest, MovedRegistrationOwnsRollbackAndCommit) {
     ClientSessionRegistry registry;
     std::optional<ClientSessionRegistry::Registration> moved;
     std::weak_ptr<const ClientLivenessRecord> provisional;
+
+    // 1. Provisional rollback ownership transfers to the moved-to scope.
     {
         auto registration = registry.BeginRegistration(kClient);
         ASSERT_TRUE(registration);
@@ -352,6 +372,8 @@ TEST_F(ClientSessionRegistryTest, MovedRegistrationOwnsRollbackAndCommit) {
     moved.reset();
     EXPECT_TRUE(provisional.expired());
     EXPECT_FALSE(Find(registry, kClient));
+
+    // 2. Committing on the moved-to scope publishes remount readiness.
     {
         auto remount = registry.BeginRemount(kClient);
         moved.emplace(std::move(*remount));
@@ -359,6 +381,8 @@ TEST_F(ClientSessionRegistryTest, MovedRegistrationOwnsRollbackAndCommit) {
     }
     moved.reset();
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::OK);
+
+    // 3. Moving an already-committed scope preserves the committed record.
     {
         auto registration = registry.BeginRegistration(kClient);
         registration->Commit();
@@ -557,6 +581,51 @@ TEST_F(ClientSessionRegistryTest,
     EXPECT_TRUE(remover.get());
     EXPECT_EQ(old->state(), State::ACTIVE);
     EXPECT_FALSE(late_acquirer.get());
+}
+
+TEST_F(ClientSessionRegistryTest,
+       ExpireSessionsClearsMetadataBeforeRetireCallback) {
+    ClientSessionRegistry registry;
+    auto record = Register(registry);
+    {
+        auto remount = registry.BeginRemount(kClient);
+        ASSERT_TRUE(remount);
+        remount->UpdateHostId("host-a");
+        remount->Commit();
+    }
+    ASSERT_EQ(registry.GetHostId(kClient), "host-a");
+
+    // First expiry pass moves ACTIVE -> SUSPECTED without retiring resources.
+    bool reserved = false;
+    bool retired = false;
+    registry.ExpireSessions(
+        kInitial + 10s, 10s, 20s, [&] { reserved = true; },
+        [&](const UUID&, const ClientSessionSharedPtr&) { retired = true; });
+    EXPECT_EQ(record->state(), State::SUSPECTED);
+    EXPECT_FALSE(reserved);
+    EXPECT_FALSE(retired);
+    EXPECT_EQ(registry.GetHostId(kClient), "host-a");
+
+    // Second expiry pass reserves retirement before OFFLINE, clears readiness
+    // and host hints, and passes the terminal session to the retire callback.
+    registry.ExpireSessions(
+        kInitial + 30s, 10s, 20s,
+        [&] {
+            EXPECT_EQ(record->state(), State::SUSPECTED);
+            reserved = true;
+        },
+        [&](const UUID& id, const ClientSessionSharedPtr& session) {
+            EXPECT_TRUE(reserved);
+            EXPECT_EQ(id, kClient);
+            EXPECT_EQ(session, record);
+            EXPECT_EQ(session->state(), State::OFFLINE);
+            EXPECT_TRUE(registry.GetHostId(kClient).empty());
+            EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
+            retired = true;
+        });
+    EXPECT_TRUE(retired);
+    EXPECT_EQ(Find(registry, kClient), record);
+    EXPECT_TRUE(registry.Remove(kClient, record));
 }
 
 }  // namespace
