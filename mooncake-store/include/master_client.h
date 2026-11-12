@@ -112,6 +112,11 @@ class MasterClient {
     ~MasterClient();
 
     void EnableHaConnectionPolicy();
+    tl::expected<void, ErrorCode> PublishGatherEndpoint(
+        const std::string& owner, const std::string& endpoint,
+        bool remove = false);
+    tl::expected<std::string, ErrorCode> ResolveGatherEndpoint(
+        const std::string& owner);
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
 

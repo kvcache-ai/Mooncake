@@ -124,7 +124,8 @@ class ConductorWheelGateTest(unittest.TestCase):
 
 class ConductorServerPreservationTest(unittest.TestCase):
     def test_server_survives_build_cleanup_and_is_removed_on_exit(self):
-        script = (Path(SMOKE.__file__).parent / "build_wheel.sh").read_text()
+        script_path = Path(SMOKE.__file__).parent / "build_wheel.sh"
+        script = script_path.read_text()
         # Execute the actual staging/cleanup block, without building a GPU wheel.
         start = script.index("# Preserve the Conductor server")
         end = script.index("# Release builds still compile with -g", start)
@@ -155,6 +156,7 @@ class ConductorServerPreservationTest(unittest.TestCase):
                         build_arg = str(build) if absolute else build.name
                         command = (
                             "set -e\n"
+                            f"source {shlex.quote(str(script_path))}\n"
                             f"BUILD_DIR={shlex.quote(build_arg)}\n"
                             f"BUILD_DIR_ABS={shlex.quote(str(build))}\n"
                             'DEVICE_STAGING_DIR="$BUILD_DIR_ABS/ep_pg_staging"\n'
@@ -170,7 +172,8 @@ class ConductorServerPreservationTest(unittest.TestCase):
                             + 'printf "%s" "$CONDUCTOR_SMOKE_DIR" > preserved-path\n'
                             + f"exit {exit_code}\n"
                         )
-                        env = dict(os.environ, CI="false", FREE_BUILD_DIR="0")
+                        env = dict(os.environ, CI="false")
+                        env.pop("FREE_BUILD_DIR", None)
                         env[cleanup_flag] = "true" if cleanup_flag == "CI" else "1"
                         result = subprocess.run(
                             ["bash", "-c", command],
