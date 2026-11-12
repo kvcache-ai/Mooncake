@@ -534,10 +534,23 @@ TEST_P(MasterServiceEvictScenarioTest,
                    .CompleteOn("memory")
                    .ExpiredFrom(base + std::chrono::nanoseconds(plain_begin)))
         .When(EvictMemory(0.05))
-        .Then(ReadableCount(IndexedObjects(0, total), total - kExpectedEvicted))
-        .Then(IndexedObjects(0, kBlockedCount + 1).AreReadable())
-        .Then(IndexedObjects(plain_begin, plain_begin + kAlwaysEvictedPlain)
-                  .DoNotExist());
+        .Then(IndexedObjects(0, kBlockedCount + 1).AreReadable());
+
+    if (GetParam() <= 1) {
+        scenario
+            .Then(ReadableCount(IndexedObjects(0, total),
+                                total - kExpectedEvicted))
+            .Then(IndexedObjects(plain_begin, plain_begin + kAlwaysEvictedPlain)
+                      .DoNotExist());
+    } else {
+        // Plain objects fall in one 100ms rank bucket across multiple shards,
+        // so parallel workers may overshoot by at most one in-flight entry per
+        // peer worker and pull from each shard concurrently.
+        const size_t max_overshoot = GetParam() - 1;
+        scenario.Then(ReadableCountBetween(
+            IndexedObjects(0, total), total - kExpectedEvicted - max_overshoot,
+            total - kExpectedEvicted));
+    }
 }
 
 TEST_P(MasterServiceEvictScenarioTest,

@@ -351,8 +351,6 @@ struct MasterService::MemoryEviction {
                                  const char* medium = "cpu")
             : service_(service), medium_(medium) {}
 
-        bool SupportsParallel() const override { return true; }
-
         void OnApplied(const eviction::ObjectView& view,
                        const eviction::Effect& effect) override {
             if (effect.released_bytes > 0) {

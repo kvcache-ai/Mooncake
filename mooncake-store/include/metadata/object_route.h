@@ -104,6 +104,44 @@ struct SlotOwnerState {
     void* eviction_group{nullptr};
     // Two words for the owner's namespace policy.
     std::array<uint64_t, 2> policy_words{};
+
+    void FileStandalone(uint16_t shard, int64_t rank, uint64_t identity,
+                        uint64_t born_seq) noexcept {
+        eviction_filed = true;
+        eviction_shard = shard;
+        eviction_rank = rank;
+        eviction_identity = identity;
+        eviction_born_seq = born_seq;
+        eviction_refile_seq = 0;
+        eviction_group = nullptr;
+    }
+
+    void FileGroup(uint16_t shard, int64_t rank, uint64_t identity,
+                   void* group) noexcept {
+        eviction_filed = true;
+        eviction_shard = shard;
+        eviction_rank = rank;
+        eviction_identity = identity;
+        eviction_born_seq = 0;
+        eviction_refile_seq = 0;
+        eviction_group = group;
+    }
+
+    void ClearEviction() noexcept {
+        eviction_filed = false;
+        eviction_shard = 0;
+        eviction_rank = 0;
+        eviction_identity = 0;
+        eviction_born_seq = 0;
+        eviction_refile_seq = 0;
+        eviction_group = nullptr;
+    }
+
+    [[nodiscard]] bool HasInitialEviction() const noexcept {
+        return !eviction_filed && eviction_shard == 0 && eviction_rank == 0 &&
+               eviction_identity == 0 && eviction_born_seq == 0 &&
+               eviction_refile_seq == 0 && eviction_group == nullptr;
+    }
 };
 
 // A slot's lock as a guard or cursor holds it in `kMode`.

@@ -560,8 +560,9 @@ TEST_F(ParallelEvictorNativeTest, AutomaticWorkersGrowAndShrinkWithFiledKeys) {
         fixed.Run(TenantId{}, eviction::ByteGoal{.target_bytes = 1}).workers,
         4u);
     reclaimer_.parallel_safe = false;
+    eviction::Evictor serial(namespaces, policy_, reclaimer_, {});
     EXPECT_EQ(
-        evictor.Run(TenantId{}, eviction::ByteGoal{.target_bytes = 1}).workers,
+        serial.Run(TenantId{}, eviction::ByteGoal{.target_bytes = 1}).workers,
         1u);
 }
 
@@ -600,11 +601,52 @@ TEST_F(ParallelEvictorNativeTest, GroupIsNotSplitByGoal) {
         guard.metadata().lease_->SetDeadline(
             Clock::time_point{metadata::LeaseEvictionIndex::kBucketWidth});
     }
-    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {}, 1);
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {}, 4);
     const auto report =
         evictor.Run(eviction::Scope::All(), {.target_ratio = .01});
     EXPECT_EQ(report.evicted_objects, 10u);
     EXPECT_EQ(report.Count(eviction::Outcome::kDropped), 10u);
+    auto& ns = namespaces_.GetOrCreate(TenantId{});
+    for (int i = 0; i < 90; ++i) {
+        EXPECT_TRUE(ns.objects.Read("k" + std::to_string(i)));
+    }
+}
+
+TEST_F(ParallelEvictorNativeTest,
+       OlderRankSkippedWidensIntoNextRankWithoutSkippingIntermediateRank) {
+    auto& ns = namespaces_.GetOrCreate(TenantId{});
+    auto publish_at = [&](const std::string& key, Clock::time_point deadline) {
+        auto guard = ns.objects.WriteKey(key);
+        std::vector<Replica> replicas;
+        replicas.emplace_back(allocator_->allocate(128),
+                              ReplicaStatus::COMPLETE);
+        (void)guard.Publish(UUID{1, 2}, Clock::time_point{}, 128,
+                            std::move(replicas), std::nullopt, false,
+                            ObjectDataType::UNKNOWN, "", TenantId{}, key);
+        SpinLocker locker(&guard.metadata().lock);
+        guard.metadata().lease_->SetDeadline(deadline);
+    };
+    const auto w = metadata::LeaseEvictionIndex::kBucketWidth;
+    for (int i = 0; i < 5; ++i) {
+        publish_at("r0_" + std::to_string(i), Clock::time_point{});
+        auto read = ns.objects.Read("r0_" + std::to_string(i));
+        read->metadata().lease_->ExtendTo(Clock::now() + std::chrono::hours(1));
+    }
+    for (int i = 0; i < 5; ++i) {
+        publish_at("r1_" + std::to_string(i), Clock::time_point{w});
+    }
+    for (int i = 0; i < 10; ++i) {
+        publish_at("r2_" + std::to_string(i), Clock::time_point{2 * w});
+    }
+
+    eviction::Evictor evictor(namespaces_, policy_, reclaimer_, {}, 4);
+    const auto report =
+        evictor.Run(eviction::Scope::All(), {.target_ratio = .1});
+    EXPECT_EQ(report.evicted_objects, 2u);
+    EXPECT_EQ(report.scan_waves, 2u);
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_TRUE(ns.objects.Read("r2_" + std::to_string(i)));
+    }
 }
 
 TEST_F(ParallelEvictorNativeTest,
@@ -737,6 +779,7 @@ TEST_F(ParallelEvictorNativeTest,
        AnObserverWithoutParallelCapabilityKeepsSerialExecution) {
     struct Observer : eviction::EvictionObserver {
         uint64_t n = 0;
+        bool SupportsParallel() const override { return false; }
         void OnApplied(const eviction::ObjectView&,
                        const eviction::Effect&) override {
             ++n;

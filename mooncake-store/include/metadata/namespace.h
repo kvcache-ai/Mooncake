@@ -132,11 +132,7 @@ class Namespace final : private route::RouteObserver {
     }
 
     static bool IsInitial(const route::SlotOwnerState& owner) {
-        return !owner.in_flight_listed && !owner.eviction_filed &&
-               owner.eviction_shard == 0 && owner.eviction_rank == 0 &&
-               owner.eviction_identity == 0 && owner.eviction_born_seq == 0 &&
-               owner.eviction_refile_seq == 0 &&
-               owner.eviction_group == nullptr &&
+        return !owner.in_flight_listed && owner.HasInitialEviction() &&
                owner.policy_words == decltype(owner.policy_words){};
     }
 

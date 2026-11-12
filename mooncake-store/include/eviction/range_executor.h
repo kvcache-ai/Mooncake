@@ -58,8 +58,9 @@ class RangeExecutor {
         }
     }
 
-    // Runs every wave on `pool`, one task per worker thread it owns.
-    RangeResult Run(ThreadPool& pool) {
+    // Runs every wave on `pool` (or inline when `pool` is null), one task per
+    // worker thread it owns.
+    RangeResult Run(ThreadPool* pool) {
         RangeResult result;
         do {
             ++result.waves;
@@ -83,8 +84,12 @@ class RangeExecutor {
     // Runs the wave's workers. A single worker is no fan-out at all, so it runs
     // here on the calling thread. Otherwise the wave is over only when every
     // admitted task has finished.
-    void RunWorkers(ThreadPool& pool) {
-        const auto workers = static_cast<uint32_t>(pool.size());
+    void RunWorkers(ThreadPool* pool) {
+        if (pool == nullptr) {
+            RunWorker(0);
+            return;
+        }
+        const auto workers = static_cast<uint32_t>(pool->size());
         if (workers == 0) {
             throw std::invalid_argument("invalid range executor size");
         }
@@ -100,7 +105,7 @@ class RangeExecutor {
             auto task = std::make_shared<std::packaged_task<void()>>(
                 [this, worker] { RunWorker(worker); });
             auto future = task->get_future();
-            pool.enqueue([task] { (*task)(); });
+            pool->enqueue([task] { (*task)(); });
             pending.push_back(std::move(future));
         }
 
@@ -189,7 +194,7 @@ class RangeExecutor {
 // and cursor.Widen() keeps reaching more of the index. `pool` must outlive the
 // run and stay running until it returns.
 template <typename Cursor, typename Visit>
-RangeResult RunRanges(Cursor& cursor, ThreadPool& pool, uint64_t goal,
+RangeResult RunRanges(Cursor& cursor, ThreadPool* pool, uint64_t goal,
                       Visit&& visit, uint64_t range_slots = 16 * 1024) {
     if (goal == 0) {
         return {};
@@ -197,6 +202,13 @@ RangeResult RunRanges(Cursor& cursor, ThreadPool& pool, uint64_t goal,
     detail::RangeExecutor<Cursor, Visit> executor(cursor, goal, range_slots,
                                                   visit);
     return executor.Run(pool);
+}
+
+template <typename Cursor, typename Visit>
+RangeResult RunRanges(Cursor& cursor, ThreadPool& pool, uint64_t goal,
+                      Visit&& visit, uint64_t range_slots = 16 * 1024) {
+    return RunRanges(cursor, &pool, goal, std::forward<Visit>(visit),
+                     range_slots);
 }
 
 }  // namespace mooncake::eviction

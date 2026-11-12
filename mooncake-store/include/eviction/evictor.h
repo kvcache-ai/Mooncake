@@ -29,7 +29,7 @@
 // entries, so it never stops halfway through a group's deferred members.
 //
 // Serial execution holds at most one key lock at a time. Range workers hold
-// one per worker; callbacks must explicitly support parallel execution. All
+// one per worker; callbacks must support parallel execution. All
 // replicas are freed outside their key lock and workers join before fallback.
 // Parallel runs serialize access to their persistent pool. What the caller
 // holds across Run, it holds for the whole run.
@@ -99,13 +99,13 @@ class Evictor {
     Report RunFor(const Scope& scope, const Aim& aim);
     std::vector<metadata::Namespace*> CollectNamespaces(
         const Scope& scope) const;
-    bool CanRunInParallel() const;
-    ThreadPool& EnsureWorkerPool(uint32_t worker_count, uint64_t filed_keys);
+    ThreadPool* EnsureWorkerPool(uint32_t worker_count, uint64_t filed_keys);
 
     metadata::NamespaceTable& namespaces_;
     const EvictionPolicy& policy_;
     Reclaimer& reclaimer_;
     const std::vector<EvictionObserver*> observers_;
+    const bool parallel_safe_;
     // Where the next run starts among the namespaces it visits.
     std::atomic<size_t> next_start_{0};
     // 0 = ceil(filed keys / 16M), capped at 64. Explicit values aid local

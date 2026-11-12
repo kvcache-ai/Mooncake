@@ -72,119 +72,33 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
     void OnWrite(const route::WriteGuard& guard) override {
         route::SlotOwnerState& owner = guard.owner_state();
-        const bool file = guard.has_object() && Qualifies(guard.metadata());
-        if (!file && !owner.eviction_filed) {
-            return;
-        }
-
-        const Rank rank = file ? RankOf(guard.metadata()) : 0;
-        const Lease* const lease =
-            file ? GroupLeaseOf(guard.metadata()) : nullptr;
-        const uint64_t standalone_id =
-            (file && lease == nullptr)
-                ? (guard.generation() & ~kGroupIdentityBit)
-                : 0;
-
-        Group* const filed_group = GroupOf(owner);
-        const bool same_group =
-            (filed_group != nullptr ? filed_group->lease() : nullptr) == lease;
-        const bool same_standalone = lease == nullptr &&
-                                     filed_group == nullptr &&
-                                     owner.eviction_identity == standalone_id;
-
-        if (file && owner.eviction_filed && rank == owner.eviction_rank &&
-            ((lease != nullptr && same_group) || same_standalone)) {
-            return;
-        }
-
-        if (!file) {
-            Shard& shard = shards_[owner.eviction_shard];
-            {
-                std::lock_guard<std::mutex> lock(shard.mutex);
-                UnfileFromShard(shard, guard.slot(), owner);
+        if (!guard.has_object() || !Qualifies(guard.metadata())) {
+            if (owner.eviction_filed) {
+                Unfile(guard.slot(), owner);
             }
-            size_.fetch_sub(1, std::memory_order_relaxed);
             return;
         }
 
-        if (owner.eviction_filed && same_standalone) {
-            Shard& shard = shards_[owner.eviction_shard];
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            shard.buckets.Remove(owner.eviction_rank, guard.slot());
-            const uint64_t seq = ++shard.seq;
-            owner.eviction_rank = rank;
-            owner.eviction_refile_seq = seq;
-            shard.buckets.Add(rank, guard.slot(), seq);
+        const ObjectMetadata& metadata = guard.metadata();
+        const Rank rank = RankOf(metadata);
+        const Lease* const group_lease = GroupLeaseOf(metadata);
+        const uint64_t standalone_id = guard.generation() & ~kGroupIdentityBit;
+
+        if (IsSameFiledEntry(owner, group_lease, standalone_id)) {
+            if (rank != owner.eviction_rank) {
+                UpdateRankInPlace(guard.slot(), owner, rank);
+            }
             return;
         }
 
-        if (owner.eviction_filed && lease != nullptr && same_group) {
-            Shard& shard = shards_[owner.eviction_shard];
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            filed_group->MoveTo(rank, shard.seq);
-            owner.eviction_rank = rank;
-            return;
+        if (owner.eviction_filed) {
+            Unfile(guard.slot(), owner);
         }
 
-        const bool was_filed = owner.eviction_filed;
-        if (was_filed) {
-            Shard& old_shard = shards_[owner.eviction_shard];
-            std::lock_guard<std::mutex> lock(old_shard.mutex);
-            UnfileFromShard(old_shard, guard.slot(), owner);
-        }
-
-        if (lease == nullptr) {
-            uint16_t chosen_shard = 0;
-            std::unique_lock<std::mutex> lock =
-                LockStandaloneShard(chosen_shard);
-            Shard& shard = shards_[chosen_shard];
-            ++shard.size;
-            const uint64_t born = ++shard.seq;
-            shard.buckets.Add(rank, guard.slot(), /*refile_seq=*/0);
-            owner.eviction_filed = true;
-            owner.eviction_shard = chosen_shard;
-            owner.eviction_rank = rank;
-            owner.eviction_identity = standalone_id;
-            owner.eviction_born_seq = born;
-            owner.eviction_refile_seq = 0;
-            owner.eviction_group = nullptr;
+        if (group_lease == nullptr) {
+            FileStandalone(guard.slot(), owner, rank, standalone_id);
         } else {
-            const uint16_t group_shard = GroupShardFor(lease);
-            std::shared_ptr<const Lease> held_lease;
-            {
-                SpinLocker locker(&guard.metadata().lock);
-                held_lease = guard.metadata().lease_;
-            }
-            Shard& shard = shards_[group_shard];
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            ++shard.size;
-            auto it = shard.groups.find(lease);
-            if (it == shard.groups.end()) {
-                const uint64_t incarnation =
-                    (static_cast<uint64_t>(group_shard) << 48) |
-                    (++shard.groups_created);
-                const uint64_t born = ++shard.seq;
-                it = shard.groups
-                         .emplace(lease, std::make_unique<Group>(
-                                             std::move(held_lease), incarnation,
-                                             born, rank, shard.buckets))
-                         .first;
-            } else {
-                it->second->MoveTo(rank, shard.seq);
-            }
-            it->second->Join(guard.slot());
-            owner.eviction_filed = true;
-            owner.eviction_shard = group_shard;
-            owner.eviction_rank = rank;
-            owner.eviction_identity =
-                kGroupIdentityBit | it->second->incarnation();
-            owner.eviction_born_seq = 0;
-            owner.eviction_refile_seq = 0;
-            owner.eviction_group = it->second.get();
-        }
-
-        if (!was_filed) {
-            size_.fetch_add(1, std::memory_order_relaxed);
+            FileInGroup(guard.slot(), owner, metadata, group_lease, rank);
         }
     }
 
@@ -280,9 +194,6 @@ class LeaseEvictionIndex final : public EvictionIndex {
 
         [[nodiscard]] const Lease* lease() const { return lease_.get(); }
         [[nodiscard]] uint64_t incarnation() const { return incarnation_; }
-        [[nodiscard]] uint64_t born_seq() const { return born_seq_; }
-        [[nodiscard]] uint64_t refile_seq() const { return refile_seq_; }
-        [[nodiscard]] size_t member_count() const { return members_.size(); }
 
         void MoveTo(Rank rank, uint64_t& shard_seq) {
             if (rank == rank_) {
@@ -306,15 +217,21 @@ class LeaseEvictionIndex final : public EvictionIndex {
             return members_.empty();
         }
 
+       private:
+        friend class Buckets;
+
+        using Hook = boost::intrusive::list_member_hook<
+            boost::intrusive::link_mode<boost::intrusive::safe_link>>;
+
+        [[nodiscard]] uint64_t born_seq() const { return born_seq_; }
+        [[nodiscard]] uint64_t refile_seq() const { return refile_seq_; }
+        [[nodiscard]] size_t member_count() const { return members_.size(); }
+
         void AppendKeys(Copy& out) const {
             for (const route::KeySlot& slot : members_) {
                 out.AddKey(slot.key());
             }
         }
-
-       private:
-        using Hook = boost::intrusive::list_member_hook<
-            boost::intrusive::link_mode<boost::intrusive::safe_link>>;
 
         const std::shared_ptr<const Lease> lease_;
         const uint64_t incarnation_;
@@ -325,7 +242,6 @@ class LeaseEvictionIndex final : public EvictionIndex {
         SlotList members_;
         Hook hook_;
 
-       public:
         using List = boost::intrusive::list<
             Group, boost::intrusive::member_hook<Group, Hook, &Group::hook_>>;
     };
@@ -494,6 +410,7 @@ class LeaseEvictionIndex final : public EvictionIndex {
         Rank rank = 0;
         uint64_t min_refile_seq = 0;
         mutable uint64_t observed_seq = 0;
+        size_t key_count = 0;
         uint16_t shard = 0;
     };
 
@@ -610,10 +527,12 @@ class LeaseEvictionIndex final : public EvictionIndex {
                         continue;
                     }
                     if (rank > prev_band) {
-                        schedule_.push_back(WorkUnit{.rank = rank,
-                                                     .min_refile_seq = 0,
-                                                     .observed_seq = 0,
-                                                     .shard = s});
+                        schedule_.push_back(
+                            WorkUnit{.rank = rank,
+                                     .min_refile_seq = 0,
+                                     .observed_seq = 0,
+                                     .key_count = bucket.TotalKeys(),
+                                     .shard = s});
                         continue;
                     }
                     uint64_t floor = prev_wave_seq;
@@ -626,12 +545,16 @@ class LeaseEvictionIndex final : public EvictionIndex {
                             WorkUnit{.rank = rank,
                                      .min_refile_seq = floor + 1,
                                      .observed_seq = 0,
+                                     .key_count = 0,
                                      .shard = s});
                     }
                 }
             }
 
             SortSchedule();
+            if (prev_band < std::numeric_limits<Rank>::max()) {
+                CapScheduleToTarget(prev_band + 1);
+            }
             return !schedule_.empty();
         }
 
@@ -700,11 +623,13 @@ class LeaseEvictionIndex final : public EvictionIndex {
                 wave_seq_[s] = shard.seq;
                 for (const auto& [rank, bucket] : shard.buckets.map()) {
                     if (rank <= band_rank_) {
+                        const size_t keys = bucket.TotalKeys();
                         schedule_.push_back(WorkUnit{.rank = rank,
                                                      .min_refile_seq = 0,
                                                      .observed_seq = 0,
+                                                     .key_count = keys,
                                                      .shard = s});
-                        scheduled_keys += bucket.TotalKeys();
+                        scheduled_keys += keys;
                     }
                 }
             }
@@ -718,18 +643,48 @@ class LeaseEvictionIndex final : public EvictionIndex {
                     const Shard& shard = index_.shards_[s];
                     std::lock_guard<std::mutex> lock(shard.mutex);
                     wave_seq_[s] = shard.seq;
-                    for (const auto& [rank, _] : shard.buckets.map()) {
+                    for (const auto& [rank, bucket] : shard.buckets.map()) {
                         if (rank > prev_band && rank <= last_rank_) {
-                            schedule_.push_back(WorkUnit{.rank = rank,
-                                                         .min_refile_seq = 0,
-                                                         .observed_seq = 0,
-                                                         .shard = s});
+                            schedule_.push_back(
+                                WorkUnit{.rank = rank,
+                                         .min_refile_seq = 0,
+                                         .observed_seq = 0,
+                                         .key_count = bucket.TotalKeys(),
+                                         .shard = s});
                         }
                     }
                 }
             }
 
             SortSchedule();
+            CapScheduleToTarget(std::numeric_limits<Rank>::min());
+        }
+
+        // Truncates `schedule_` at the earliest complete rank (>= `min_rank`)
+        // whose cumulative fresh keys reach `target_`, so parallel workers do
+        // not advance into newer rank buckets while an older rank has enough
+        // candidates. If skips leave the wave short, `Widen()` advances past
+        // `band_rank_`.
+        void CapScheduleToTarget(Rank min_rank) const {
+            if (target_ == 0 || schedule_.empty()) {
+                return;
+            }
+            size_t accumulated = 0;
+            size_t i = 0;
+            while (i < schedule_.size()) {
+                const Rank rank = schedule_[i].rank;
+                while (i < schedule_.size() && schedule_[i].rank == rank) {
+                    if (schedule_[i].min_refile_seq == 0) {
+                        accumulated += schedule_[i].key_count;
+                    }
+                    ++i;
+                }
+                if (rank >= min_rank && accumulated >= target_) {
+                    schedule_.resize(i);
+                    band_rank_ = rank;
+                    return;
+                }
+            }
         }
 
         void SortSchedule() const {
@@ -842,18 +797,27 @@ class LeaseEvictionIndex final : public EvictionIndex {
         return metadata.lease_.get();
     }
 
-    static void UnfileFromShard(Shard& shard, route::KeySlot& slot,
-                                route::SlotOwnerState& owner) {
+    static bool IsSameFiledEntry(const route::SlotOwnerState& owner,
+                                 const Lease* group_lease,
+                                 uint64_t standalone_id) {
+        if (!owner.eviction_filed) {
+            return false;
+        }
+        const Group* const filed_group = GroupOf(owner);
+        if (group_lease == nullptr) {
+            return filed_group == nullptr &&
+                   owner.eviction_identity == standalone_id;
+        }
+        return filed_group != nullptr && filed_group->lease() == group_lease;
+    }
+
+    void Unfile(route::KeySlot& slot, route::SlotOwnerState& owner) {
+        Shard& shard = shards_[owner.eviction_shard];
+        std::lock_guard<std::mutex> lock(shard.mutex);
         --shard.size;
         Group* const group = GroupOf(owner);
         const Rank old_rank = owner.eviction_rank;
-        owner.eviction_filed = false;
-        owner.eviction_shard = 0;
-        owner.eviction_rank = 0;
-        owner.eviction_identity = 0;
-        owner.eviction_born_seq = 0;
-        owner.eviction_refile_seq = 0;
-        owner.eviction_group = nullptr;
+        owner.ClearEviction();
         if (group == nullptr) {
             shard.buckets.Remove(old_rank, slot);
         } else if (group->Leave(slot)) {
@@ -861,12 +825,72 @@ class LeaseEvictionIndex final : public EvictionIndex {
         }
     }
 
+    void UpdateRankInPlace(route::KeySlot& slot, route::SlotOwnerState& owner,
+                           Rank rank) {
+        Shard& shard = shards_[owner.eviction_shard];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        Group* const filed_group = GroupOf(owner);
+        if (filed_group == nullptr) {
+            shard.buckets.Remove(owner.eviction_rank, slot);
+            const uint64_t seq = ++shard.seq;
+            owner.eviction_rank = rank;
+            owner.eviction_refile_seq = seq;
+            shard.buckets.Add(rank, slot, seq);
+        } else {
+            filed_group->MoveTo(rank, shard.seq);
+            owner.eviction_rank = rank;
+        }
+    }
+
+    void FileStandalone(route::KeySlot& slot, route::SlotOwnerState& owner,
+                        Rank rank, uint64_t standalone_id) {
+        uint16_t chosen_shard = 0;
+        std::unique_lock<std::mutex> lock = LockStandaloneShard(chosen_shard);
+        Shard& shard = shards_[chosen_shard];
+        ++shard.size;
+        const uint64_t born = ++shard.seq;
+        shard.buckets.Add(rank, slot, /*refile_seq=*/0);
+        owner.FileStandalone(chosen_shard, rank, standalone_id, born);
+    }
+
+    void FileInGroup(route::KeySlot& slot, route::SlotOwnerState& owner,
+                     const ObjectMetadata& metadata, const Lease* group_lease,
+                     Rank rank) {
+        const uint16_t group_shard = GroupShardFor(group_lease);
+        Shard& shard = shards_[group_shard];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        ++shard.size;
+        auto it = shard.groups.find(group_lease);
+        if (it == shard.groups.end()) {
+            std::shared_ptr<const Lease> held_lease;
+            {
+                SpinLocker locker(&metadata.lock);
+                held_lease = metadata.lease_;
+            }
+            const uint64_t incarnation =
+                (static_cast<uint64_t>(group_shard) << 48) |
+                (++shard.groups_created);
+            const uint64_t born = ++shard.seq;
+            it = shard.groups
+                     .emplace(group_lease,
+                              std::make_unique<Group>(std::move(held_lease),
+                                                      incarnation, born, rank,
+                                                      shard.buckets))
+                     .first;
+        } else {
+            it->second->MoveTo(rank, shard.seq);
+        }
+        it->second->Join(slot);
+        owner.FileGroup(group_shard, rank,
+                        kGroupIdentityBit | it->second->incarnation(),
+                        it->second.get());
+    }
+
     static inline std::atomic<uint64_t> next_index_id_{1};
 
     const uint64_t id_;
     mutable std::atomic<uint16_t> next_hint_shard_{0};
     mutable std::array<Shard, kShards> shards_;
-    std::atomic<size_t> size_{0};
 };
 
 }  // namespace metadata

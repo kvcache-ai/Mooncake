@@ -40,6 +40,15 @@ uint32_t ChooseWorkerCount(uint32_t configured_workers, uint64_t filed_keys) {
         std::clamp<uint64_t>(auto_workers, 1, kMaxEvictionWorkers));
 }
 
+bool CanRunInParallel(const EvictionPolicy& policy, const Reclaimer& reclaimer,
+                      const std::vector<EvictionObserver*>& observers) {
+    return policy.SupportsParallel() && reclaimer.SupportsParallel() &&
+           std::all_of(observers.begin(), observers.end(),
+                       [](const EvictionObserver* observer) {
+                           return observer->SupportsParallel();
+                       });
+}
+
 }  // namespace
 
 // Either goal, as a run holds each namespace to it.
@@ -117,8 +126,9 @@ class Evictor::Pass {
     // Claims disjoint slot ranges across `workers` until `goal` is met, then
     // runs the soft-pin fallback serially once all worker frees have finished.
     void RunParallel(metadata::EvictionIndex::RangeCursor& ranges,
-                     ThreadPool& workers, uint64_t goal) {
-        const auto worker_count = static_cast<uint32_t>(workers.size());
+                     ThreadPool* workers, uint64_t goal) {
+        const uint32_t worker_count =
+            workers ? static_cast<uint32_t>(workers->size()) : 1u;
         std::vector<Report> local_reports(worker_count);
         std::vector<Pass> worker_passes;
         worker_passes.reserve(worker_count);
@@ -306,6 +316,7 @@ Evictor::Evictor(metadata::NamespaceTable& namespaces,
       policy_(policy),
       reclaimer_(reclaimer),
       observers_(std::move(observers)),
+      parallel_safe_(CanRunInParallel(policy_, reclaimer_, observers_)),
       worker_threads_(worker_threads) {
     if (worker_threads > kMaxEvictionWorkers) {
         throw std::invalid_argument("eviction workers must be in [0, 64]");
@@ -346,34 +357,33 @@ std::vector<metadata::Namespace*> Evictor::CollectNamespaces(
     return namespaces;
 }
 
-bool Evictor::CanRunInParallel() const {
-    return policy_.SupportsParallel() && reclaimer_.SupportsParallel() &&
-           std::all_of(observers_.begin(), observers_.end(),
-                       [](const EvictionObserver* observer) {
-                           return observer->SupportsParallel();
-                       });
-}
-
-ThreadPool& Evictor::EnsureWorkerPool(uint32_t worker_count,
+ThreadPool* Evictor::EnsureWorkerPool(uint32_t worker_count,
                                       uint64_t filed_keys) {
+    if (worker_count <= 1) {
+        if (workers_) {
+            workers_.reset();
+            LOG(INFO) << "[EVICT-WORKERS] filed=" << filed_keys
+                      << ", workers=1";
+        }
+        return nullptr;
+    }
     if (!workers_ || workers_->size() != worker_count) {
         workers_ = std::make_unique<ThreadPool>(worker_count);
         LOG(INFO) << "[EVICT-WORKERS] filed=" << filed_keys
                   << ", workers=" << worker_count;
     }
-    return *workers_;
+    return workers_.get();
 }
 
 Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
     std::unique_lock run_lock(run_mutex_, std::defer_lock);
-    if (worker_threads_ != 1) {
+    if (parallel_safe_ && worker_threads_ != 1) {
         run_lock.lock();
     }
 
     const std::vector<metadata::Namespace*> namespaces =
         CollectNamespaces(scope);
     const Clock::time_point now = Clock::now();
-    const bool parallel_safe = CanRunInParallel();
 
     Report report;
     // Snapshot every namespace's share before reclaiming any namespace, so
@@ -401,14 +411,16 @@ Report Evictor::RunFor(const Scope& scope, const Aim& aim) {
         const size_t i = (start + n) % namespaces.size();
         metadata::Namespace& ns = *namespaces[i];
         NamespaceScan& scan = scans[i];
-        if (!scan.ranges || !parallel_safe) {
+        if (!scan.ranges || !parallel_safe_) {
             Pass(*this, ns, scan.Cursor(), aim, report, now).RunSerial();
             continue;
         }
 
         const uint64_t filed = scan.ranges->Total();
         const uint32_t worker_count = ChooseWorkerCount(worker_threads_, filed);
-        ThreadPool& pool = EnsureWorkerPool(worker_count, filed);
+        ThreadPool* pool = run_lock.owns_lock()
+                               ? EnsureWorkerPool(worker_count, filed)
+                               : nullptr;
         report.workers = std::max(report.workers, worker_count);
         Pass(*this, ns, *scan.ranges, aim, report, now)
             .RunParallel(*scan.ranges, pool, scan.goal);
