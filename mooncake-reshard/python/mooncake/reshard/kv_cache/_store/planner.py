@@ -206,7 +206,7 @@ def _load_ranges(
     for part in parts:
         end = part.head_start + part.head_count
         for layer in part.layer_ids:
-            for component in KVCacheComponent:
+            for component in layout.descriptor.components:
                 key = (layer, component)
                 for start, stop, candidates in indexes[key].cover(part.head_start, end):
                     (fragment,) = candidates
