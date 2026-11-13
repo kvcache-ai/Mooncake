@@ -63,6 +63,20 @@ struct GlobalConfig {
     // one it honors the operator's value, clamped to the hardware.  The RDMA
     // transport passes max_wr to ibv_create_qp() and is unaffected.
     bool max_wr_from_env = false;
+    // Receive queue depth of the RDMA transport's data RC QPs.  The transport
+    // only posts one-sided READ/WRITE on these QPs and never posts a receive,
+    // so the receive queue is never used.  0 keeps the historical behavior
+    // (max_recv_wr == max_wr); a positive value (1-65535, clamped to the
+    // device's max_qp_wr) shrinks it.  Override via MC_MAX_RECV_WR.
+    size_t max_recv_wr = 0;
+    // Outstanding RDMA READ/atomic depth of the RDMA transport's data RC QPs.
+    // max_rd_atomic is the initiator depth (set at RTS); max_dest_rd_atomic
+    // is the responder depth (set at RTR).  0 keeps the device-derived default
+    // (the device's max_qp_init_rd_atom / max_qp_rd_atom, capped at 16); a
+    // positive value (1-255) requests that depth, clamped to the device's
+    // limit.  Override via MC_MAX_RD_ATOMIC / MC_MAX_DEST_RD_ATOMIC.
+    int max_rd_atomic = 0;
+    int max_dest_rd_atomic = 0;
     // 1 = signal every RDMA WR (historical). >1 enables unsignaled WRs with
     // a signaled completion every N WRs plus the end of each ibv_post_send
     // chain. Override via MC_RDMA_SIGNAL_INTERVAL.

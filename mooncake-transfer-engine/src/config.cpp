@@ -239,6 +239,36 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* max_recv_wr_env = std::getenv("MC_MAX_RECV_WR");
+    if (max_recv_wr_env) {
+        int val = atoi(max_recv_wr_env);
+        if (val > 0 && val <= UINT16_MAX)
+            config.max_recv_wr = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_RECV_WR";
+    }
+
+    const char* max_rd_atomic_env = std::getenv("MC_MAX_RD_ATOMIC");
+    if (max_rd_atomic_env) {
+        int val = atoi(max_rd_atomic_env);
+        if (val > 0 && val <= UINT8_MAX)
+            config.max_rd_atomic = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_RD_ATOMIC";
+    }
+
+    const char* max_dest_rd_atomic_env = std::getenv("MC_MAX_DEST_RD_ATOMIC");
+    if (max_dest_rd_atomic_env) {
+        int val = atoi(max_dest_rd_atomic_env);
+        if (val > 0 && val <= UINT8_MAX)
+            config.max_dest_rd_atomic = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_MAX_DEST_RD_ATOMIC";
+    }
+
     const char* signal_interval_env = std::getenv("MC_RDMA_SIGNAL_INTERVAL");
     if (signal_interval_env) {
         int val = atoi(signal_interval_env);
@@ -914,6 +944,8 @@ void updateGlobalConfig(ibv_device_attr& device_attr) {
         config.num_cq_per_ctx = device_attr.max_cq;
     if (config.max_wr > (size_t)device_attr.max_qp_wr)
         config.max_wr = device_attr.max_qp_wr;
+    if (config.max_recv_wr > (size_t)device_attr.max_qp_wr)
+        config.max_recv_wr = device_attr.max_qp_wr;
     if (config.max_sge > (size_t)device_attr.max_sge)
         config.max_sge = device_attr.max_sge;
     if (config.max_cqe > (size_t)device_attr.max_cqe)
@@ -937,6 +969,17 @@ void dumpGlobalConfig() {
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
+    LOG(INFO) << "max_recv_wr = "
+              << (config.max_recv_wr ? std::to_string(config.max_recv_wr)
+                                     : std::string("<unset, = max_wr>"));
+    LOG(INFO) << "max_rd_atomic = "
+              << (config.max_rd_atomic
+                      ? std::to_string(config.max_rd_atomic)
+                      : std::string("<unset, device default>"));
+    LOG(INFO) << "max_dest_rd_atomic = "
+              << (config.max_dest_rd_atomic
+                      ? std::to_string(config.max_dest_rd_atomic)
+                      : std::string("<unset, device default>"));
     LOG(INFO) << "rdma_signal_interval = " << config.rdma_signal_interval;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
