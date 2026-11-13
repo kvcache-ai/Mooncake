@@ -53,6 +53,16 @@ class AcceleratorDevice {
     virtual void SetContext(int32_t device_id) const = 0;
     virtual bool Copy(void* dst, const void* src, size_t size,
                       CopyDirection direction) const = 0;
+    // Batched copies. CopyAsync starts a copy on the current context that
+    // may still be running when it returns; Synchronize waits for every copy
+    // this thread started with CopyAsync and returns false if any failed.
+    // After any CopyAsync, including a failed one, call Synchronize before
+    // the buffers are reused or freed. The default runs Copy synchronously.
+    virtual bool CopyAsync(void* dst, const void* src, size_t size,
+                           CopyDirection direction) const {
+        return Copy(dst, src, size, direction);
+    }
+    virtual bool Synchronize() const { return true; }
     virtual PinnedHostBuffer AllocatePinnedHost(size_t size) const = 0;
 };
 

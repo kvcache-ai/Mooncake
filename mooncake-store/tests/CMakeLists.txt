@@ -357,6 +357,7 @@ if(USE_CUDA)
 elseif(USE_XPU)
   # -fsycl already propagates from transfer_engine (TENT platform_xpu).
   target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_XPU_H2D)
+  add_store_test(xpu_accelerator_device_test xpu_accelerator_device_test.cpp)
 endif()
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(host_port_fix_test host_port_fix_test.cpp)

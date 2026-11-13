@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -724,6 +725,43 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
     queue_cv_.notify_one();
 }
 
+bool MemcpyOperationsOverlap(const std::vector<MemcpyOperation>& operations) {
+    struct Range {
+        uintptr_t begin;
+        uintptr_t end;
+        bool written;
+    };
+    constexpr uintptr_t kMaxAddress = std::numeric_limits<uintptr_t>::max();
+    std::vector<Range> ranges;
+    ranges.reserve(operations.size() * 2);
+    for (const auto& op : operations) {
+        if (op.size == 0) continue;
+        const auto src = reinterpret_cast<uintptr_t>(op.src);
+        const auto dst = reinterpret_cast<uintptr_t>(op.dest);
+        // A wrapped end would sort below its begin and hide an overlap, so
+        // such a range is never batched.
+        if (op.size > kMaxAddress - src || op.size > kMaxAddress - dst)
+            return true;
+        ranges.push_back({src, src + op.size, false});
+        ranges.push_back({dst, dst + op.size, true});
+    }
+    std::sort(ranges.begin(), ranges.end(),
+              [](const Range& a, const Range& b) { return a.begin < b.begin; });
+    // Sweep in start order: a range overlaps an earlier one exactly when it
+    // starts before the furthest end seen so far. Only overlaps involving a
+    // written range matter.
+    uintptr_t furthest_end = 0;
+    uintptr_t furthest_written_end = 0;
+    for (const auto& r : ranges) {
+        if (r.begin < furthest_written_end) return true;
+        if (r.written && r.begin < furthest_end) return true;
+        furthest_end = std::max(furthest_end, r.end);
+        if (r.written)
+            furthest_written_end = std::max(furthest_written_end, r.end);
+    }
+    return false;
+}
+
 void MemcpyWorkerPool::workerThread() {
     VLOG(2) << "MemcpyWorkerPool worker thread started";
 
@@ -749,8 +787,23 @@ void MemcpyWorkerPool::workerThread() {
 
         // Execute the task if we have one
         if (task.state) {
+            // Accelerators with copies started by CopyAsync that have not
+            // been waited for. They must be waited for before the task
+            // completes, even on failure: the caller may then free the
+            // buffers.
+            std::vector<const device::AcceleratorDevice*> pending;
+            auto synchronize_pending = [&pending] {
+                bool synced = true;
+                for (auto* accelerator : pending)
+                    synced = accelerator->Synchronize() && synced;
+                pending.clear();
+                return synced;
+            };
             try {
                 bool ok = true;
+                // Decided at the first accelerator copy: whether its copies
+                // may run without waiting for each other.
+                std::optional<bool> batch;
                 auto runtime_accelerator =
                     device::GetAcceleratorRegistry().RuntimeAccelerators();
                 for (const auto& op : task.operations) {
@@ -791,9 +844,23 @@ void MemcpyWorkerPool::workerThread() {
                             device_id = dst_info.device_id;
                             direction = device::CopyDirection::kHostToDevice;
                         }
+                        if (!batch) {
+                            batch = task.operations.size() > 1 &&
+                                    !MemcpyOperationsOverlap(task.operations);
+                        }
                         accelerator->SetContext(device_id);
-                        if (!accelerator->Copy(op.dest, op.src, op.size,
-                                               direction)) {
+                        bool started;
+                        if (*batch) {
+                            if (std::find(pending.begin(), pending.end(),
+                                          accelerator) == pending.end())
+                                pending.push_back(accelerator);
+                            started = accelerator->CopyAsync(
+                                op.dest, op.src, op.size, direction);
+                        } else {
+                            started = accelerator->Copy(op.dest, op.src,
+                                                        op.size, direction);
+                        }
+                        if (!started) {
                             LOG(ERROR) << "GPU memcpy failed: src_dev="
                                        << src_info.device_id
                                        << " dst_dev=" << dst_info.device_id
@@ -803,6 +870,11 @@ void MemcpyWorkerPool::workerThread() {
                         }
                     }
                 }
+                if (!synchronize_pending()) {
+                    LOG(ERROR) << "GPU memcpy failed while waiting for "
+                                  "batched copies";
+                    ok = false;
+                }
 
                 VLOG(2) << "Memcpy task completed with "
                         << task.operations.size() << " operations"
@@ -811,6 +883,7 @@ void MemcpyWorkerPool::workerThread() {
                                              : ErrorCode::TRANSFER_FAIL);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
+                synchronize_pending();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             }
         }
