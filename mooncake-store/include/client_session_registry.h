@@ -51,7 +51,8 @@ class ClientSessionRegistry {
     // an ACTIVE session if missing, or rejecting admission if OFFLINE.
     // Holds the registry write lock and session retaining guard until the scope
     // exits (including after Commit()).
-    // - BeginRegistration: Commit() renews liveness (recovering SUSPECTED).
+    // - BeginRegistration: Commit() renews liveness at commit time (recovering
+    //   SUSPECTED). An explicit observed_at overrides the clock for tests.
     // - BeginRemount: Commit() marks remount readiness without renewing
     //   liveness.
     [[nodiscard]] std::optional<Registration> BeginRegistration(
@@ -94,8 +95,9 @@ class ClientSessionRegistry {
 
     std::optional<SessionGuard> TryAcquireSession(const UUID& id,
                                                   bool require_serving) const;
-    std::optional<Registration> Begin(const UUID& id, RegistrationKind kind,
-                                      Clock::time_point observed_at);
+    std::optional<Registration> Begin(
+        const UUID& id, RegistrationKind kind,
+        std::optional<Clock::time_point> observed_at);
     Record Find(const UUID& id) const;
     void ClearSessionMetadataLocked(const UUID& id);
     void EraseLocked(const UUID& id, const Record& record);
@@ -151,9 +153,9 @@ class ClientSessionRegistry::Registration {
     friend class ClientSessionRegistry;
     Registration(ClientSessionRegistry& registry,
                  std::unique_lock<std::shared_mutex> lock, const UUID& id,
-                 RegistrationKind kind, Clock::time_point observed_at,
-                 Record record, ClientLivenessRecord::RetainingGuard guard,
-                 bool provisional);
+                 RegistrationKind kind,
+                 std::optional<Clock::time_point> observed_at, Record record,
+                 ClientLivenessRecord::RetainingGuard guard, bool provisional);
 
     ClientSessionRegistry& registry_;
     // Destruction order is load-bearing: guard_ unlocks transition_mutex_
@@ -162,7 +164,7 @@ class ClientSessionRegistry::Registration {
     std::unique_lock<std::shared_mutex> lock_;
     UUID id_;
     RegistrationKind kind_;
-    Clock::time_point observed_at_;
+    std::optional<Clock::time_point> observed_at_;
     std::optional<std::string> pending_host_id_;
     Record record_;
     ClientLivenessRecord::RetainingGuard guard_;

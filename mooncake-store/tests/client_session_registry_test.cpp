@@ -212,6 +212,43 @@ TEST_F(ClientSessionRegistryTest,
     EXPECT_EQ(registry.Ping(kClient), ClientStatus::NEED_REMOUNT);
 }
 
+TEST_F(ClientSessionRegistryTest, RegistrationSamplesLivenessAtCommit) {
+    constexpr auto active_ttl = 10ms;
+    for (const bool existing : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "existing=" << existing);
+        ClientSessionRegistry registry;
+        if (existing) {
+            auto record = Register(registry);
+            Suspect(record);
+        }
+
+        Clock::time_point before_commit;
+        Clock::time_point after_commit;
+        {
+            auto registration = registry.BeginRegistration(kClient);
+            ASSERT_TRUE(registration);
+            // Model resource installation taking longer than the active TTL.
+            std::this_thread::sleep_for(2 * active_ttl);
+            before_commit = Clock::now();
+            registration->Commit();
+            after_commit = Clock::now();
+        }
+
+        const auto record = Find(registry, kClient);
+        ASSERT_TRUE(record);
+        EXPECT_EQ(record->state(), State::ACTIVE);
+        // Sampled bounds keep these checks independent of scheduling delays
+        // after Commit(): a full active TTL starts at the commit, not Begin().
+        EXPECT_EQ(
+            record->Evaluate(before_commit + active_ttl - Clock::duration{1},
+                             active_ttl, 20s),
+            Transition::NONE);
+        EXPECT_TRUE(registry.TryAcquireServingSession(kClient));
+        EXPECT_EQ(record->Evaluate(after_commit + active_ttl, active_ttl, 20s),
+                  Transition::BECAME_SUSPECTED);
+    }
+}
+
 TEST_F(ClientSessionRegistryTest, ExceptionsDiscardOnlyUncommittedNewRecords) {
     ClientSessionRegistry registry;
     const auto fail = [&] {
@@ -254,7 +291,9 @@ TEST_F(ClientSessionRegistryTest,
         remount->Commit();
         EXPECT_FALSE(remount->NeedsRemount());
     }
-    Suspect(record);
+    // Remount must preserve the original registration's expiry deadline.
+    EXPECT_EQ(record->Evaluate(kInitial + 10s, 10s, 20s),
+              Transition::BECAME_SUSPECTED);
     EXPECT_EQ(record->state(), State::SUSPECTED);
     {
         auto remount = registry.BeginRemount(kClient);

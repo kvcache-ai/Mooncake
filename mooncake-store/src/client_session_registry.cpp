@@ -49,8 +49,7 @@ ClientSessionRegistry::TryAcquireServingSession(const UUID& id) const {
 std::optional<ClientSessionRegistry::Registration>
 ClientSessionRegistry::BeginRegistration(
     const UUID& id, std::optional<Clock::time_point> observed_at) {
-    return Begin(id, RegistrationKind::Register,
-                 observed_at.value_or(Clock::now()));
+    return Begin(id, RegistrationKind::Register, observed_at);
 }
 
 std::optional<ClientSessionRegistry::Registration>
@@ -59,13 +58,14 @@ ClientSessionRegistry::BeginRemount(const UUID& id) {
 }
 
 std::optional<ClientSessionRegistry::Registration> ClientSessionRegistry::Begin(
-    const UUID& id, RegistrationKind kind, Clock::time_point observed_at) {
+    const UUID& id, RegistrationKind kind,
+    std::optional<Clock::time_point> observed_at) {
     std::unique_lock lock(mutex_);
     const auto it = records_.find(id);
     const bool provisional = (it == records_.end());
-    Record record =
-        provisional ? std::make_shared<ClientLivenessRecord>(id, observed_at)
-                    : it->second;
+    Record record = provisional ? std::make_shared<ClientLivenessRecord>(
+                                      id, observed_at.value_or(Clock::now()))
+                                : it->second;
     auto guard = record->TryAcquireRetainingGuard();
     if (!guard) {
         return std::nullopt;
@@ -80,8 +80,9 @@ std::optional<ClientSessionRegistry::Registration> ClientSessionRegistry::Begin(
 
 ClientSessionRegistry::Registration::Registration(
     ClientSessionRegistry& registry, std::unique_lock<std::shared_mutex> lock,
-    const UUID& id, RegistrationKind kind, Clock::time_point observed_at,
-    Record record, ClientLivenessRecord::RetainingGuard guard, bool provisional)
+    const UUID& id, RegistrationKind kind,
+    std::optional<Clock::time_point> observed_at, Record record,
+    ClientLivenessRecord::RetainingGuard guard, bool provisional)
     : registry_(registry),
       lock_(std::move(lock)),
       id_(id),
@@ -118,8 +119,11 @@ void ClientSessionRegistry::Registration::UpdateHostId(
 void ClientSessionRegistry::Registration::Commit() {
     CHECK(lock_.owns_lock() && !committed_);
     if (kind_ == RegistrationKind::Register) {
-        // The transition guard is held throughout resource installation.
-        if (record_->CommitObservationLocked(observed_at_, record_->state()) ==
+        // Sample after lock acquisition and resource installation so neither
+        // consumes the successfully registered client's active TTL. Keep an
+        // explicit timestamp only for deterministic tests.
+        const auto now = observed_at_.value_or(Clock::now());
+        if (record_->CommitObservationLocked(now, record_->state()) ==
             ClientLivenessObservation::RECOVERED_ACTIVE) {
             MasterMetricManager::instance().client_liveness_recovered();
             LOG(INFO) << "client_id=" << id_
