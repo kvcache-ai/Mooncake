@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 
 #include <atomic>
 #include <chrono>
@@ -56,9 +57,37 @@ struct P2PHotStandbyServiceTestAccess {
     static bool RecoveryStopping(P2PHotStandbyService& service) {
         return service.recovery_stopping_.load();
     }
+
+    static ErrorCode ResyncFromSnapshot(P2PHotStandbyService& service) {
+        std::lock_guard<std::mutex> lock(service.mutex_);
+        return service.ResyncFromSnapshotLocked();
+    }
 };
 
 namespace {
+
+class ScopedRecoveryLogCapture : public google::LogSink {
+   public:
+    ScopedRecoveryLogCapture() { google::AddLogSink(this); }
+    ~ScopedRecoveryLogCapture() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity severity, const char*, const char*, int,
+              const struct ::tm*, const char* message, size_t length) override {
+        if (severity >= google::GLOG_WARNING) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            messages_.emplace_back(severity, std::string(message, length));
+        }
+    }
+
+    std::vector<std::pair<google::LogSeverity, std::string>> Messages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::vector<std::pair<google::LogSeverity, std::string>> messages_;
+};
 
 struct ControlledNotifierState {
     std::mutex mutex;
@@ -967,6 +996,15 @@ TEST_F(P2PHotStandbyServiceTest,
     EXPECT_EQ(
         standby_selection.endpoints,
         (std::vector<std::string>{"standby-high:52051", "standby-low:52051"}));
+    EXPECT_EQ(standby_selection.alive_count, 6u);
+    EXPECT_EQ(standby_selection.qualified_standby_count, 2u);
+    EXPECT_EQ(standby_selection.primary_fallback_count, 0u);
+    EXPECT_EQ(standby_selection.excluded_count, 4u);
+    EXPECT_EQ(standby_selection.excluded_self_count, 1u);
+    EXPECT_EQ(standby_selection.excluded_unavailable_count, 1u);
+    EXPECT_EQ(standby_selection.excluded_stale_count, 1u);
+    EXPECT_EQ(standby_selection.excluded_primary_not_used_count, 1u);
+    EXPECT_EQ(standby_selection.excluded_role_count, 0u);
 
     auto primary_selection = SelectP2PSnapshotSources(
         {make_source("primary-low", "primary", false, 200, "primary-low:52051"),
@@ -982,6 +1020,15 @@ TEST_F(P2PHotStandbyServiceTest,
     EXPECT_EQ(
         primary_selection.endpoints,
         (std::vector<std::string>{"primary-high:52051", "primary-low:52051"}));
+    EXPECT_EQ(primary_selection.alive_count, 6u);
+    EXPECT_EQ(primary_selection.qualified_standby_count, 0u);
+    EXPECT_EQ(primary_selection.primary_fallback_count, 2u);
+    EXPECT_EQ(primary_selection.excluded_count, 4u);
+    EXPECT_EQ(primary_selection.excluded_self_count, 1u);
+    EXPECT_EQ(primary_selection.excluded_unavailable_count, 2u);
+    EXPECT_EQ(primary_selection.excluded_stale_count, 1u);
+    EXPECT_EQ(primary_selection.excluded_primary_not_used_count, 0u);
+    EXPECT_EQ(primary_selection.excluded_role_count, 0u);
 
     auto restarted_self_by_endpoint =
         make_source("previous-self", "primary", false, 1000, "self:52051");
@@ -993,8 +1040,111 @@ TEST_F(P2PHotStandbyServiceTest,
     EXPECT_TRUE(restart_selection.used_primary_fallback);
     EXPECT_EQ(restart_selection.endpoints,
               (std::vector<std::string>{"remote:52051"}));
+    EXPECT_EQ(restart_selection.alive_count, 2u);
+    EXPECT_EQ(restart_selection.primary_fallback_count, 1u);
+    EXPECT_EQ(restart_selection.excluded_count, 1u);
+    EXPECT_EQ(restart_selection.excluded_self_count, 1u);
+
+    // Multiple exclusion conditions still account for each source once;
+    // transitional and unknown roles must not disappear from diagnostics.
+    auto unavailable_selection = SelectP2PSnapshotSources(
+        {make_source("self", "standby", false, 0, ""),
+         make_source("no-endpoint", "standby", false, 0, ""),
+         make_source("stale", "standby", false, 99, "stale:52051"),
+         make_source("starting", "starting", true, 100, "starting:52051"),
+         make_source("promoting", "promoting", true, 100, "promoting:52051"),
+         make_source("unknown", "unknown", true, 100, "unknown:52051")},
+        "self", "self:50051", "self:52051", 100);
+    EXPECT_TRUE(unavailable_selection.endpoints.empty());
+    EXPECT_FALSE(unavailable_selection.used_primary_fallback);
+    EXPECT_EQ(unavailable_selection.alive_count, 6u);
+    EXPECT_EQ(unavailable_selection.excluded_count, 6u);
+    EXPECT_EQ(unavailable_selection.excluded_self_count, 1u);
+    EXPECT_EQ(unavailable_selection.excluded_unavailable_count, 1u);
+    EXPECT_EQ(unavailable_selection.excluded_stale_count, 1u);
+    EXPECT_EQ(unavailable_selection.excluded_primary_not_used_count, 0u);
+    EXPECT_EQ(unavailable_selection.excluded_role_count, 3u);
+
+    auto empty_selection = SelectP2PSnapshotSources({}, "self", "", "", 100);
+    EXPECT_TRUE(empty_selection.endpoints.empty());
+    EXPECT_EQ(empty_selection.alive_count, 0u);
+    EXPECT_EQ(empty_selection.excluded_count, 0u);
 }
 #endif
+
+TEST_F(P2PHotStandbyServiceTest,
+       SnapshotResyncFailuresAggregateSourcesWithoutDuplicateErrors) {
+    auto config = MakeStandbyConfig();
+    config.snapshot_source_endpoints = {"invalid-source-a", "invalid-source-b"};
+    P2PHotStandbyService standby(config);
+    ScopedRecoveryLogCapture logs;
+    // Exercise a whole log interval without relying on counters left by other
+    // tests. No network or retry sleeps are needed for invalid endpoints.
+    for (int i = 0; i < 51; ++i) {
+        ASSERT_EQ(P2PHotStandbyServiceTestAccess::ResyncFromSnapshot(standby),
+                  ErrorCode::INTERNAL_ERROR);
+    }
+    const auto messages = logs.Messages();
+    ASSERT_GE(messages.size(), 1u);
+    ASSERT_LE(messages.size(), 2u);
+    for (const auto& [severity, message] : messages) {
+        EXPECT_EQ(severity, google::GLOG_WARNING);
+        EXPECT_NE(message.find("all snapshot sources failed"),
+                  std::string::npos);
+        EXPECT_NE(message.find("invalid-source-a: INVALID_PARAMS"),
+                  std::string::npos);
+        EXPECT_NE(message.find("invalid-source-b: INVALID_PARAMS"),
+                  std::string::npos);
+        EXPECT_NE(message.find("source_count=2"), std::string::npos);
+        EXPECT_NE(message.find("omitted_errors=0"), std::string::npos);
+    }
+}
+
+TEST_F(P2PHotStandbyServiceTest, SnapshotFailureSummaryBoundsReportedSources) {
+    auto config = MakeStandbyConfig();
+    for (int i = 0; i < 10; ++i) {
+        config.snapshot_source_endpoints.push_back("invalid-" +
+                                                   std::to_string(i));
+    }
+    P2PHotStandbyService standby(config);
+    ScopedRecoveryLogCapture logs;
+    for (int i = 0; i < 51; ++i) {
+        ASSERT_EQ(P2PHotStandbyServiceTestAccess::ResyncFromSnapshot(standby),
+                  ErrorCode::INTERNAL_ERROR);
+    }
+    const auto messages = logs.Messages();
+    ASSERT_GE(messages.size(), 1u);
+    ASSERT_LE(messages.size(), 2u);
+    for (const auto& [severity, message] : messages) {
+        EXPECT_EQ(severity, google::GLOG_WARNING);
+        EXPECT_NE(message.find("source_count=10"), std::string::npos);
+        EXPECT_NE(message.find("omitted_errors=2"), std::string::npos);
+        size_t error_count = 0;
+        for (size_t pos = message.find("INVALID_PARAMS");
+             pos != std::string::npos;
+             pos = message.find("INVALID_PARAMS", pos + 1)) {
+            ++error_count;
+        }
+        EXPECT_EQ(error_count, 8u);
+    }
+}
+
+TEST_F(P2PHotStandbyServiceTest, MissingSnapshotSourcesAreRateLimited) {
+    P2PHotStandbyService standby(MakeStandbyConfig());
+    ScopedRecoveryLogCapture logs;
+    for (int i = 0; i < 51; ++i) {
+        ASSERT_EQ(P2PHotStandbyServiceTestAccess::ResyncFromSnapshot(standby),
+                  ErrorCode::INTERNAL_ERROR);
+    }
+    const auto messages = logs.Messages();
+    ASSERT_GE(messages.size(), 1u);
+    ASSERT_LE(messages.size(), 2u);
+    for (const auto& [severity, message] : messages) {
+        EXPECT_EQ(severity, google::GLOG_WARNING);
+        EXPECT_NE(message.find("no snapshot source available"),
+                  std::string::npos);
+    }
+}
 
 TEST_F(P2PHotStandbyServiceTest,
        SnapshotRejectsInvalidChunksAndLimitsSessions) {

@@ -67,6 +67,16 @@ struct P2PStandbySyncStatus {
 struct P2PSnapshotSourceSelection {
     std::vector<std::string> endpoints;
     bool used_primary_fallback{false};
+    size_t alive_count{0};
+    size_t qualified_standby_count{0};
+    size_t primary_fallback_count{0};
+    size_t excluded_count{0};
+    // Exclusion reasons are mutually exclusive.
+    size_t excluded_self_count{0};
+    size_t excluded_unavailable_count{0};
+    size_t excluded_stale_count{0};
+    size_t excluded_primary_not_used_count{0};
+    size_t excluded_role_count{0};
 };
 
 P2PSnapshotSourceSelection SelectP2PSnapshotSources(

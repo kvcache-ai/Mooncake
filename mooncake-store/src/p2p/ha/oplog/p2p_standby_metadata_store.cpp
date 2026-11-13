@@ -65,7 +65,7 @@ bool P2PStandbyMetadataStore::PublishRoute(const std::string& key,
     route.last_sequence_id = sequence_id;
     if (std::find(route.locations.begin(), route.locations.end(), location) !=
         route.locations.end()) {
-        VLOG(1) << "P2PStandbyMetadataStore::PublishRoute key=" << key
+        VLOG(2) << "P2PStandbyMetadataStore::PublishRoute key=" << key
                 << " client=" << location.client_id.first << ":"
                 << location.client_id.second
                 << " seg=" << location.segment_id.first << ":"
@@ -75,7 +75,7 @@ bool P2PStandbyMetadataStore::PublishRoute(const std::string& key,
     }
 
     route.locations.push_back(location);
-    VLOG(1) << "P2PStandbyMetadataStore::PublishRoute key=" << key
+    VLOG(2) << "P2PStandbyMetadataStore::PublishRoute key=" << key
             << " client=" << location.client_id.first << ":"
             << location.client_id.second << " seg=" << location.segment_id.first
             << ":" << location.segment_id.second
@@ -88,17 +88,17 @@ void P2PStandbyMetadataStore::WithdrawRoute(const std::string& key,
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = routes_.find(key);
     if (it == routes_.end()) {
-        VLOG(1) << "P2PStandbyMetadataStore::WithdrawRoute key=" << key
+        VLOG(2) << "P2PStandbyMetadataStore::WithdrawRoute key=" << key
                 << " not found, ignoring";
         return;
     }
     std::erase(it->second.locations, location);
     if (it->second.locations.empty()) {
         routes_.erase(it);
-        VLOG(1) << "P2PStandbyMetadataStore::WithdrawRoute key=" << key
+        VLOG(2) << "P2PStandbyMetadataStore::WithdrawRoute key=" << key
                 << " removed (no replicas left)";
     } else {
-        VLOG(1) << "P2PStandbyMetadataStore::WithdrawRoute key=" << key
+        VLOG(2) << "P2PStandbyMetadataStore::WithdrawRoute key=" << key
                 << " remaining_replicas=" << it->second.locations.size();
     }
 }
@@ -123,7 +123,7 @@ void P2PStandbyMetadataStore::RegisterClient(
         }
     }
 
-    VLOG(1) << "P2PStandbyMetadataStore::RegisterClient "
+    VLOG(2) << "P2PStandbyMetadataStore::RegisterClient "
             << "client=" << client_id.first << ":" << client_id.second
             << " ip=" << ip_address << ":" << rpc_port
             << " segments=" << segments.size();
@@ -146,7 +146,7 @@ void P2PStandbyMetadataStore::UnregisterClient(const UUID& client_id) {
         }
     }
 
-    VLOG(1) << "P2PStandbyMetadataStore::UnregisterClient "
+    VLOG(2) << "P2PStandbyMetadataStore::UnregisterClient "
             << "client=" << client_id.first << ":" << client_id.second;
 }
 
@@ -159,14 +159,14 @@ void P2PStandbyMetadataStore::MountSegment(const UUID& client_id,
     // Check if segment already exists
     for (const auto& seg : info.segments) {
         if (seg.id == segment.id) {
-            VLOG(1) << "P2PStandbyMetadataStore::MountSegment "
+            VLOG(2) << "P2PStandbyMetadataStore::MountSegment "
                     << "segment already exists, ignoring";
             return;
         }
     }
 
     info.segments.push_back(segment);
-    VLOG(1) << "P2PStandbyMetadataStore::MountSegment "
+    VLOG(2) << "P2PStandbyMetadataStore::MountSegment "
             << "client=" << client_id.first << ":" << client_id.second
             << " segment=" << segment.id.first << ":" << segment.id.second
             << " total_segments=" << info.segments.size();
@@ -182,7 +182,7 @@ void P2PStandbyMetadataStore::UnmountSegment(const P2PRouteLocation& location) {
     }
     RemoveLocationLocked(location);
 
-    VLOG(1) << "P2PStandbyMetadataStore::UnmountSegment "
+    VLOG(2) << "P2PStandbyMetadataStore::UnmountSegment "
             << "segment=" << location.segment_id.first << ":"
             << location.segment_id.second
             << " client=" << location.client_id.first << ":"
@@ -193,7 +193,7 @@ void P2PStandbyMetadataStore::RemoveAllMetadata() {
     std::lock_guard<std::mutex> lock(mutex_);
     routes_.clear();
     clients_.clear();
-    VLOG(1) << "P2PStandbyMetadataStore::RemoveAllMetadata";
+    VLOG(2) << "P2PStandbyMetadataStore::RemoveAllMetadata";
 }
 
 // ============================================================================
