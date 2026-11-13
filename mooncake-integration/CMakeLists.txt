@@ -157,7 +157,7 @@ if(NOT SKBUILD)
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/__init__.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/py.typed"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/http_metadata_server.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_launcher.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"

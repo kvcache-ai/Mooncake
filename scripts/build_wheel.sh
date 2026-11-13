@@ -193,6 +193,7 @@ MIGRATED_PYTHON_INIT_BACKUP=""
 MIGRATED_PYTHON_MODULES=(
     __init__.py
     py.typed
+    http_metadata_server.py
     _launcher.py
     cli.py
     cli_client.py

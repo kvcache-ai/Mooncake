@@ -62,6 +62,10 @@ class TransferEngine {
 
     ~TransferEngine();
 
+    const std::string& getMetadataConnectionString() const {
+        return metadata_conn_string_;
+    }
+
     int init(const std::string& metadata_conn_string,
              const std::string& local_server_name,
              const std::string& ip_or_host_name = "",
@@ -162,6 +166,7 @@ class TransferEngine {
    private:
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::string metadata_conn_string_;
     bool use_tent_{false};
 };
 }  // namespace mooncake

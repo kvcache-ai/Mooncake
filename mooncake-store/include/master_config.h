@@ -3,6 +3,7 @@
 #include <optional>
 #include <stdexcept>
 
+#include "config/metrics_bootstrap_config.h"
 #include "config_helper.h"
 #include "types.h"
 
@@ -10,14 +11,7 @@ namespace mooncake {
 
 // The configuration for the master server
 struct MasterConfig {
-    bool enable_metric_reporting;
-    uint32_t metrics_port;
-    // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
-    // Stage: UPG1 / F02 Block 6 (metadata/RPC/admin entry) / IMPLEMENTATION.
-    // Replace the flat metrics fields with fixed U MasterConfig::metrics
-    // (MetricsBootstrapConfig); remove this temporary host scalar.
-    // Due: before F02 Block 6 / B05 implementation acceptance.
-    std::string metrics_host = "0.0.0.0";
+    MetricsBootstrapConfig metrics;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
@@ -43,6 +37,7 @@ struct MasterConfig {
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
+    bool enable_metadata_cleanup_on_timeout = false;
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
 
@@ -118,13 +113,13 @@ class MasterServiceSupervisorConfig {
     // From MasterConfig
     MasterServiceSupervisorConfig(const MasterConfig& config) {
         // Set required parameters using RequiredParam
-        enable_metric_reporting = config.enable_metric_reporting;
-        metrics_port = static_cast<int>(config.metrics_port);
+        enable_metric_reporting = config.metrics.enabled;
+        metrics_port = static_cast<int>(config.metrics.port);
         // TODO-REF(F02-T011, receiver=UPG1-F12-S50):
         // Stage: UPG1 / F12-S50 (centralized HA) / IMPLEMENTATION.
         // Replace this scalar copy with fixed U supervisor metrics wiring.
         // Due: before F12-S50 implementation acceptance; final TODO closure.
-        metrics_host = config.metrics_host;
+        metrics_host = config.metrics.host;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
@@ -267,14 +262,6 @@ class WrappedMasterServiceConfig {
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
             config.allow_evict_soft_pinned_objects;
-        enable_metric_reporting = config.enable_metric_reporting;
-        http_port = static_cast<uint16_t>(config.metrics_port);
-        // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
-        // Stage: UPG1 / F02 Block 6 (metadata/RPC/admin entry) / IMPLEMENTATION.
-        // Remove this non-HA HTTP copy; pass U metrics.host directly to
-        // the independent MasterAdminServer constructor instead.
-        // Due: before F02 Block 6 / B05 implementation acceptance.
-        http_host = config.metrics_host;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;

@@ -227,8 +227,14 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels) {
+    // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
+    // must publish the engine's actual endpoint rather than the Store hostname.
+    const auto& resolved_metadata =
+        transfer_engine && metadata_connstring.empty()
+            ? transfer_engine->getMetadataConnectionString()
+            : metadata_connstring;
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, protocol, labels));
+        new Client(local_hostname, resolved_metadata, protocol, labels));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -2707,14 +2713,41 @@ tl::expected<void, ErrorCode> Client::BatchGetIntoOffloadObjectInternal(
 
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+#ifdef YLT_ENABLE_IBV
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
+#endif
+    // Configure reasonable retry limits for SSD offload RPC connections.
+    // - connect_retry_count: Maximum connection retry attempts (default: 3)
+    // - reconnect_wait_time: Wait time between retries (default: 1000ms)
+    // - host_alive_detect_duration: Duration for background alive detection.
+    //   Set to 0 to disable infinite background reconnection attempts when
+    //   a Store node goes down. This prevents continuous "Connection refused"
+    //   logs. When Master cleans up stale local_disk replicas (via
+    //   CleanupStaleHandles), new requests won't route to dead nodes anyway.
+    pool_conf.connect_retry_count = 3;
+    pool_conf.reconnect_wait_time = std::chrono::milliseconds{1000};
+    pool_conf.host_alive_detect_duration = std::chrono::milliseconds{0};
+
+    // Honour the same timeout overrides as the master pool. Without this the
+    // connect timeout stays at coro_rpc's built-in 30s, so a read that picks a
+    // peer which is gone blocks for connect_retry_count * 30s plus the waits
+    // between retries -- 91s with the defaults above -- and no configuration
+    // can shorten it. Defaults are unchanged when the variables are unset.
+    detail::ApplyRpcTimeoutOverrides(pool_conf.client_config,
+                                     RpcTimeoutConfig::FromEnvironment());
+
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
             pool_conf);
+    // TODO-REF(F02-T013, receiver=UPG1-F14-I07):
+    // Source: UPG1-F02-B09; owner: UPG1-F14-I07.
+    // Stage: UPG1 / F14-I07 / RPC isolation implementation; due before I07
+    // acceptance. Replace this old IO-pool ownership with fixed U
+    // ClientRequester using GetStoreRpcClientIoContextPool and its drain/
+    // keep-alive lifecycle. Close with source/lifetime proof, review and SHA.
 }
 
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>

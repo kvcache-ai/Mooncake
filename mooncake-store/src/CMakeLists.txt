@@ -246,6 +246,9 @@ target_include_directories(mooncake_store
 
 # Select the implementation of the standard Store targets.
 if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
+    target_sources(mooncake_store_shared_objects PRIVATE
+        config/rpc_protocol_config.cpp
+        config/rpc_timeout_config.cpp)
     # Sources and entry points of the selected centralized implementation.
     set(MOONCAKE_STORE_CENTRALIZED_MASTER_SOURCES
         master_service.cpp
@@ -254,6 +257,7 @@ if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
         ha_helper.cpp
         segment.cpp
         rpc_service.cpp
+        master_admin_service.cpp
         http_metadata_server.cpp
         task_manager.cpp
     )

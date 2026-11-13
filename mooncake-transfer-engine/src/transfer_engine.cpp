@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "error.h"
+
 #ifndef USE_TENT
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
@@ -32,11 +34,14 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name,
                          uint64_t rpc_port) {
-    return impl_->init(metadata_conn_string, local_server_name, ip_or_host_name,
-                       rpc_port);
+    const int result = impl_->init(metadata_conn_string, local_server_name,
+                                   ip_or_host_name, rpc_port);
+    if (result == 0) metadata_conn_string_ = metadata_conn_string;
+    return result;
 }
 
 int TransferEngine::freeEngine() {
+    metadata_conn_string_.clear();
     if (impl_) {
         impl_->freeEngine();
         impl_.reset();
@@ -260,8 +265,10 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& ip_or_host_name,
                          uint64_t rpc_port) {
     if (!use_tent_) {
-        return impl_->init(metadata_conn_string, local_server_name,
-                           ip_or_host_name, rpc_port);
+        const int result = impl_->init(metadata_conn_string, local_server_name,
+                                       ip_or_host_name, rpc_port);
+        if (result == 0) metadata_conn_string_ = metadata_conn_string;
+        return result;
     } else {
         auto config = std::make_shared<mooncake::tent::Config>();
         if (!local_server_name.empty())
@@ -275,11 +282,14 @@ int TransferEngine::init(const std::string& metadata_conn_string,
             if (!servers.empty()) config->set("metadata_servers", servers);
         }
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
-        return impl_tent_->available() ? 0 : 1;
+        if (!impl_tent_->available()) return ERR_CONTEXT;
+        metadata_conn_string_ = metadata_conn_string;
+        return 0;
     }
 }
 
 int TransferEngine::freeEngine() {
+    metadata_conn_string_.clear();
     if (!use_tent_ && impl_) {
         impl_->freeEngine();
         impl_.reset();

@@ -1,3 +1,5 @@
+#include "config/rpc_protocol_config.h"
+
 #include "ha_helper.h"
 #include "etcd_helper.h"
 #include "rpc_service.h"
@@ -119,9 +121,13 @@ int MasterServiceSupervisor::Start() {
         coro_rpc::coro_rpc_server server(
             config_.rpc_thread_num, config_.rpc_port, config_.rpc_address,
             config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
 
         LOG(INFO) << "Init leader election helper...";

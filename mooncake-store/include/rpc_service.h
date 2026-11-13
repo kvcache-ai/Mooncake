@@ -2,6 +2,7 @@
 
 #include <csignal>
 #include <atomic>
+#include <memory>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <thread>
@@ -27,7 +28,19 @@ class WrappedMasterService {
     void init_http_server();
 
     bool http_server_started() const { return http_server_started_; }
-    uint16_t http_port() const { return http_server_.port(); }
+    uint16_t http_port() const { return http_server_ ? http_server_->port() : 0; }
+
+    // TODO-REF(F02-T015, receiver=UPG1-F06-S80):
+    // Source: UPG1-F02-B05; owner: UPG1-F14-S65 (admin closure).
+    // Stage: UPG1 / F06-S80 / read-only admin implementation.
+    // Due: before S80 acceptance. Replace these old directory-query forwards
+    // with fixed U admin providers and their restore/namespace contracts;
+    // close with source, side-effect checks, review and receiving commit.
+    auto GetAllKeysForAdmin() { return master_service_.GetAllKeys(); }
+    auto GetAllSegmentsForAdmin() { return master_service_.GetAllSegments(); }
+    auto QuerySegmentForAdmin(const std::string& name) {
+        return master_service_.QuerySegments(name);
+    }
 
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
@@ -153,7 +166,7 @@ class WrappedMasterService {
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;
-    coro_http::coro_http_server http_server_;
+    std::unique_ptr<coro_http::coro_http_server> http_server_;
     std::atomic<bool> metric_report_running_;
     bool http_server_started_ = false;
 };

@@ -15,6 +15,8 @@
 #include "ha_helper.h"
 #include "http_metadata_server.h"
 #include "rpc_service.h"
+#include "master_admin_service.h"
+#include "config/rpc_protocol_config.h"
 #include "types.h"
 
 #include "master_config.h"
@@ -98,6 +100,13 @@ DEFINE_int32(http_metadata_server_port, 8080,
              "Port for HTTP metadata server to listen on");
 DEFINE_string(http_metadata_server_host, "0.0.0.0",
               "Host for HTTP metadata server to bind to");
+
+DEFINE_bool(
+    enable_metadata_cleanup_on_timeout, false,
+    "Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) "
+    "when client heartbeat times out. Works in two modes: (1) co-located "
+    "(enable_http_metadata_server=true) via in-process removal, or "
+    "(2) separately-deployed metadata server via async HTTP DELETE.");
 
 DEFINE_uint64(put_start_discard_timeout_sec,
               mooncake::DEFAULT_PUT_START_DISCARD_TIMEOUT,
@@ -243,6 +252,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("http_metadata_server_host",
                              &master_config.http_metadata_server_host,
                              FLAGS_http_metadata_server_host);
+    default_config.GetBool("enable_metadata_cleanup_on_timeout",
+                           &master_config.enable_metadata_cleanup_on_timeout,
+                           FLAGS_enable_metadata_cleanup_on_timeout);
     default_config.GetUInt64("put_start_discard_timeout_sec",
                              &master_config.put_start_discard_timeout_sec,
                              FLAGS_put_start_discard_timeout_sec);
@@ -440,6 +452,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.http_metadata_server_host =
             FLAGS_http_metadata_server_host;
     }
+    if ((google::GetCommandLineFlagInfo("enable_metadata_cleanup_on_timeout",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_metadata_cleanup_on_timeout =
+            FLAGS_enable_metadata_cleanup_on_timeout;
+    }
     if ((google::GetCommandLineFlagInfo("put_start_discard_timeout_sec",
                                         &info) &&
          !info.is_default) ||
@@ -543,17 +562,9 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
     try {
-        // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
-        // Stage: UPG1 / F02 Block 6 (metadata/RPC/admin entry) / IMPLEMENTATION.
-        // Replace this flat-copy adapter with U direct assignment to
-        // MasterConfig::metrics, including U source and error handling.
-        // Due: before F02 Block 6 / B05 implementation acceptance.
-        const auto metrics = mooncake::ResolveMetricsBootstrapConfig(
+        master_config.metrics = mooncake::ResolveMetricsBootstrapConfig(
             conf_path.empty() ? nullptr : &default_config,
             GetMetricsBootstrapCommandLineOverrides());
-        master_config.enable_metric_reporting = metrics.enabled;
-        master_config.metrics_port = metrics.port;
-        master_config.metrics_host = metrics.host;
     } catch (const std::exception& error) {
         LOG(ERROR) << "Failed to resolve master metrics configuration: "
                    << error.what();
@@ -577,16 +588,22 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    std::string protocol = "tcp";
-    if (value && std::string_view(value) == "rdma") {
-        protocol = "rdma";
+    const auto rpc_protocol_config =
+        mooncake::RpcProtocolConfig::FromEnvironment();
+#ifdef YLT_ENABLE_IBV
+    const std::string protocol = rpc_protocol_config.use_rdma ? "rdma" : "tcp";
+#else
+    const std::string protocol = "tcp";
+    if (rpc_protocol_config.use_rdma) {
+        LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP RPC";
     }
+#endif
+
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
-        << ", enable_metric_reporting=" << master_config.enable_metric_reporting
-        << ", metrics_port=" << master_config.metrics_port
+        << ", enable_metric_reporting=" << master_config.metrics.enabled
+        << ", metrics_port=" << master_config.metrics.port
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
         << ", allow_evict_soft_pinned_objects="
@@ -633,6 +650,21 @@ int main(int argc, char* argv[]) {
         << ", cxl_path=" << master_config.cxl_path
         << ", cxl_size=" << master_config.cxl_size;
 
+    // TODO(F02-T012, replace-in=UPG1-F14-S24):
+    // Fixed U: d01447808d10af78011e9203d53796a15a032a03.
+    // Source: UPG1-F02-B05; owner: UPG1-F14-S24.
+    // Stage: UPG1 / F14-S24 / asynchronous offboarding implementation;
+    // Due: before S24 acceptance. Replace this explicit unavailable guard
+    // with fixed U ResolveMetadataServerForCleanup, Wrapped cleanup wiring,
+    // MasterService cleanupHttpMetadata and the stopped/joined queue owner.
+    // HA fencing/stop: F12-S50 and F13-S25 implementation, before each task's
+    // acceptance. Close after identity/re-registration/late-DELETE checks,
+    // review and receiving commits; do not silently accept this option.
+    if (master_config.enable_metadata_cleanup_on_timeout) {
+        LOG(ERROR) << "Metadata cleanup on timeout is not available in this build";
+        return 1;
+    }
+
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
     if (master_config.enable_http_metadata_server) {
@@ -661,23 +693,37 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        if (rpc_protocol_config.use_rdma) {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#else
+            LOG(WARNING)
+                << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
         }
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(master_config, version));
-
-        // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
-        // Stage: UPG1 / F02 Block 6 (metadata/RPC/admin entry) / IMPLEMENTATION.
-        // Replace this old-owner check with fixed U MasterAdminServer::Start
-        // in the non-HA startup path; remove this temporary adapter.
-        // Due: before F02 Block 6 / B05 implementation acceptance.
-        if (!wrapped_master_service.http_server_started()) {
+        auto wrapped_master_service =
+            std::make_shared<mooncake::WrappedMasterService>(
+                mooncake::WrappedMasterServiceConfig(master_config, version));
+        mooncake::MasterAdminServer admin_server(
+            static_cast<uint16_t>(master_config.metrics.port),
+            master_config.metrics.enabled, master_config.metrics.host);
+        if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;
         }
-        mooncake::RegisterRpcService(server, wrapped_master_service);
+        admin_server.SetRuntimeState(
+            mooncake::ha::MasterRuntimeState::kServing);
+        admin_server.SetServiceDelegate(wrapped_master_service);
+        admin_server.SetServiceAvailable(true);
+
+        // TODO-REF(F02-T015, receiver=UPG1-F13-S56):
+        // Source: UPG1-F02-B05; owner: UPG1-F14-S65 (admin closure).
+        // Stage: UPG1 / F13-S56 / restore admission implementation;
+        // Due: before S56 acceptance. Replace this legacy registration with
+        // U MarkReadyForServing/ActivateServing and the real restore owner.
+        // F14-I07 supplies U RpcWorkerPool before I07 acceptance. Close with
+        // lifecycle/owner verification, review and receiving commits.
+        mooncake::RegisterRpcService(server, *wrapped_master_service);
         return server.start();
     }
 }

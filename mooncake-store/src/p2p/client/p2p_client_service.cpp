@@ -74,8 +74,12 @@ P2PClientService::P2PClientService(
 
 std::optional<std::shared_ptr<P2PClientService>> P2PClientService::Create(
     const P2PClientConfig& config) {
+    const auto& resolved_metadata =
+        config.transfer_engine && config.metadata_connstring.empty()
+            ? config.transfer_engine->getMetadataConnectionString()
+            : config.metadata_connstring;
     auto client = std::make_shared<P2PClientService>(
-        config.metadata_connstring, config.http_port, config.enable_http_server,
+        resolved_metadata, config.http_port, config.enable_http_server,
         config.labels, config.enable_metric_collection);
 
     auto err = client->Init(config);
@@ -1269,7 +1273,8 @@ ErrorCode P2PClientService::HandleStopEvent() {
     if (data_manager_) {
         data_manager_->Stop();
     }
-    auto buffer_error = resources_.ReleaseLocalBuffer(false);
+    // Match U local-buffer teardown: unregister with metadata updates enabled.
+    auto buffer_error = resources_.ReleaseLocalBuffer(true);
     if (buffer_error != ErrorCode::OK) {
         LOG(ERROR) << "Stop event: local buffer release failed, error="
                    << buffer_error;

@@ -2,13 +2,20 @@
 
 #include <csignal>
 #include <memory>
+#include <variant>
+#include <type_traits>
 #include <string>
 #include <vector>
 #include <cstdlib>
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#ifdef YLT_ENABLE_IBV
+#include <ylt/coro_io/ibverbs/ib_socket.hpp>
+#endif
 
+#include "config/rpc_protocol_config.h"
+#include "config/rpc_timeout_config.h"
 #include "client_metric.h"
 #include "replica.h"
 #include "types.h"
@@ -20,6 +27,46 @@ namespace mooncake {
 
 static const std::string kDefaultMasterAddress = "localhost:50051";
 
+namespace detail {
+
+template <typename Variant, typename T>
+struct variant_contains : std::false_type {};
+
+template <typename... Ts, typename T>
+struct variant_contains<std::variant<Ts...>, T>
+    : std::bool_constant<(std::is_same_v<Ts, T> || ...)> {};
+
+template <typename Variant, typename T>
+inline constexpr bool variant_contains_v =
+    variant_contains<std::decay_t<Variant>, T>::value;
+
+template <typename SocketConfigVariant>
+inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
+#ifdef YLT_ENABLE_IBV
+    if constexpr (variant_contains_v<SocketConfigVariant,
+                                     coro_io::ib_socket_t::config_t>) {
+        socket_config = coro_io::ib_socket_t::config_t{};
+    }
+#endif
+}
+
+// Applies the RPC timeout overrides to any mooncake-store RPC client config.
+// Shared by the client->master pool and the store->store offload pool so the
+// two cannot drift. Absent overrides leave the caller's defaults in place.
+// A negative request timeout disables the per-request timer.
+template <typename ClientConfig>
+inline void ApplyRpcTimeoutOverrides(ClientConfig& client_config,
+                                     const RpcTimeoutConfig& config) {
+    if (config.request_timeout.has_value()) {
+        client_config.request_timeout_duration = *config.request_timeout;
+    }
+    if (config.connect_timeout.has_value()) {
+        client_config.connect_timeout_duration = *config.connect_timeout;
+    }
+}
+
+}  // namespace detail
+
 /**
  * @brief Client for interacting with the mooncake master service
  */
@@ -29,11 +76,21 @@ class MasterClient {
         : client_id_(client_id), metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
-            pool_conf.client_config.socket_config =
-                coro_io::ib_socket_t::config_t{};
+        if (RpcProtocolConfig::FromEnvironment().use_rdma) {
+            detail::MaybeEnableRdmaSocketConfig(
+                pool_conf.client_config.socket_config);
         }
+        detail::ApplyRpcTimeoutOverrides(pool_conf.client_config,
+                                        RpcTimeoutConfig::FromEnvironment());
+        // TODO(F02-T013, replace-in=UPG1-F14-I07):
+        // Fixed U: d01447808d10af78011e9203d53796a15a032a03.
+        // Source: UPG1-F02-B09; owner: UPG1-F14-I07.
+        // Stage: UPG1 / F14-I07 / RPC isolation implementation; due before
+        // I07 acceptance. HA control/probe policy: F12-S50 HA implementation,
+        // due before S50 acceptance. Replace this legacy pool/accessor with
+        // fixed U master_client.h MakeMasterRpcClientPoolConfig and the
+        // real Store RPC IO context/accessor provider. Close with U source,
+        // lifetime/timeout verification, review and the receiving commit.
         client_pools_ =
             std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
                 pool_conf);
