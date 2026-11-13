@@ -9,6 +9,42 @@ use serde::{Deserialize, Serialize};
 pub use classic::{ClassicEngineConfig, ClassicTransferEngine, ClassicTransportProtocol};
 pub use tent::{SegmentBuffer, SegmentInfo, SegmentKind, TentEngine, TentEngineConfig};
 
+/// Ascend device-memory helpers used by the client when a put_from source or a
+/// get_into destination is NPU memory: the store copies through host memory on
+/// the CPU, so device ranges must be staged with ACL copies.
+///
+/// Returns `None` when the ACL helper is unavailable (non-ascend build or the
+/// TENT shim is not loaded), `Some(false)` for host memory.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn ascend_pointer_is_device(addr: *mut c_void) -> Option<bool> {
+    let rc = unsafe { mooncake_store_rs_transport_sys::tent::tentAclPointerIsDevice(addr) };
+    match rc {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn ascend_copy_d2h(dst: *mut c_void, src: *const c_void, len: usize) -> Result<(), String> {
+    let rc = unsafe { mooncake_store_rs_transport_sys::tent::tentAclMemcpyD2H(dst, src, len) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!("ACL D2H copy failed (rc={rc})"))
+    }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn ascend_copy_h2d(dst: *mut c_void, src: *const c_void, len: usize) -> Result<(), String> {
+    let rc = unsafe { mooncake_store_rs_transport_sys::tent::tentAclMemcpyH2D(dst, src, len) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!("ACL H2D copy failed (rc={rc})"))
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TransportEngineKind {
     ClassicTe,

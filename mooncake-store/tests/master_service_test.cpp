@@ -4384,7 +4384,7 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(service.UnmountSegment(retired.id, owner));
     // Retirement invalidates old snapshots before metadata cleanup.
     EXPECT_EQ(service.GetKeyCount(), keys.size());
-    EXPECT_FALSE(retired_registration->IsServing());
+    EXPECT_FALSE(retired_registration->IsAllocatable());
     EXPECT_EQ(retired_registration->Allocate(1024), nullptr);
     EXPECT_FALSE(old_buffer->isAvailable());
     for (const auto& key : keys) {

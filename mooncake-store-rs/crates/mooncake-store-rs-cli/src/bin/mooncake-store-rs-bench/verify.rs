@@ -3,6 +3,7 @@ use mooncake_store_client::{
 };
 use tracing::{error, info, warn};
 
+use crate::aligned_buffer::AlignedBuffer;
 use crate::cli::{GlobalArgs, ReadInterface, VerifyArgs, WriteInterface};
 use crate::datagen::{ensure_payload, make_key, make_seed, payload};
 use crate::setup::BenchCluster;
@@ -53,19 +54,52 @@ fn verify_read_width(interface: ReadInterface, batch_size: usize) -> usize {
     }
 }
 
+/// All verify checks share one long-lived registered buffer. TENT/HIXL
+/// registration state does not reliably survive repeated register calls for
+/// new host buffers (the next transfer fails with "Client memory verification
+/// failed, memory is not registered"), so register once and carve slices.
+const VERIFY_SHARED_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+struct SharedRegisteredBuffer {
+    buffer: AlignedBuffer,
+    client: usize,
+}
+
+fn shared_registered_buffer(
+    client: &StoreClient,
+) -> Result<std::sync::MutexGuard<'static, SharedRegisteredBuffer>, String> {
+    static SHARED: std::sync::OnceLock<std::sync::Mutex<SharedRegisteredBuffer>> =
+        std::sync::OnceLock::new();
+    let shared = SHARED.get_or_init(|| {
+        let mut buffer = AlignedBuffer::zeroed(VERIFY_SHARED_BUFFER_BYTES);
+        client
+            .register_buffer(buffer.as_mut_ptr().cast(), buffer.len())
+            .expect("verify shared buffer registration must succeed");
+        std::sync::Mutex::new(SharedRegisteredBuffer {
+            buffer,
+            client: client as *const StoreClient as usize,
+        })
+    });
+    let guard = shared
+        .lock()
+        .map_err(|_| "verify shared buffer lock poisoned".to_string())?;
+    if guard.client != client as *const StoreClient as usize {
+        return Err("verify shared buffer was registered for a different client".to_string());
+    }
+    Ok(guard)
+}
+
 fn with_registered_buffer<T, F>(client: &StoreClient, size: usize, f: F) -> Result<T, String>
 where
     F: FnOnce(&mut [u8]) -> Result<T, String>,
 {
-    let mut storage = vec![0u8; size];
-    client
-        .register_buffer(storage.as_mut_ptr().cast(), storage.len())
-        .map_err(|error| error.to_string())?;
-    let result = f(storage.as_mut_slice());
-    if let Err(error) = client.unregister_buffer(storage.as_mut_ptr().cast(), storage.len()) {
-        warn!("verify unregister_buffer failed during cleanup: {error}");
+    if size > VERIFY_SHARED_BUFFER_BYTES {
+        return Err(format!(
+            "verify buffer request {size} exceeds shared buffer {VERIFY_SHARED_BUFFER_BYTES}"
+        ));
     }
-    result
+    let mut shared = shared_registered_buffer(client)?;
+    f(&mut shared.buffer.as_mut_slice()[..size])
 }
 
 fn execute_verify_write(
@@ -145,7 +179,7 @@ fn execute_verify_read(
         ReadInterface::BatchGetInto => {
             let mut buffers = requests
                 .iter()
-                .map(|_| vec![0u8; value_size])
+                .map(|_| AlignedBuffer::zeroed(value_size))
                 .collect::<Vec<_>>();
             let mut gets = requests
                 .iter()
@@ -157,6 +191,7 @@ fn execute_verify_read(
             let sizes = reader
                 .batch_get_into(&mut gets)
                 .map_err(|error| error.to_string())?;
+            let mut values = Vec::with_capacity(requests.len());
             for (request, (buffer, size)) in requests.iter().zip(buffers.iter_mut().zip(sizes)) {
                 if size != value_size {
                     return Err(format!(
@@ -164,9 +199,9 @@ fn execute_verify_read(
                         request.key
                     ));
                 }
-                buffer.truncate(size);
+                values.push(buffer.as_mut_slice()[..size].to_vec());
             }
-            Ok(buffers)
+            Ok(values)
         }
     }
 }
@@ -272,14 +307,16 @@ pub fn run_verify(global: GlobalArgs, args: VerifyArgs) -> Result<(), Box<dyn st
                     value: &value,
                 }],
             )?;
-            let mut buf = vec![0u8; value_size];
-            let size = reader.get_into(&key, &mut buf).map_err(|e| e.to_string())?;
+            let mut buf = AlignedBuffer::zeroed(value_size);
+            let size = reader
+                .get_into(&key, buf.as_mut_slice())
+                .map_err(|e| e.to_string())?;
             if size != value_size {
                 return Err(format!(
                     "get_into returned {size} bytes, expected {value_size}"
                 ));
             }
-            ensure_payload("get-into-buffer", &value, &buf)
+            ensure_payload("get-into-buffer", &value, buf.as_mut_slice())
         }));
     }
 
