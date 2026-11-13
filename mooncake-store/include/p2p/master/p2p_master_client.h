@@ -39,19 +39,7 @@ inline const std::string kDefaultP2PMasterAddress = "localhost:50051";
 class P2PMasterClient final {
    public:
     P2PMasterClient(const UUID& client_id,
-                    P2PMasterClientMetric* metrics = nullptr)
-        : client_id_(client_id), metrics_(metrics) {
-        coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
-            pool_conf{};
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
-            pool_conf.client_config.socket_config =
-                coro_io::ib_socket_t::config_t{};
-        }
-        client_pools_ =
-            std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-                pool_conf);
-    }
+                    P2PMasterClientMetric* metrics = nullptr);
 
     ~P2PMasterClient() = default;
 
@@ -162,6 +150,15 @@ class P2PMasterClient final {
     invoke_rpc_async_with_pool(
         std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>> pool,
         Args&&... args) {
+        return invoke_rpc_async_with_pool_config<ServiceMethod, ReturnType>(
+            pool, coro_rpc::request_config_t{}, std::forward<Args>(args)...);
+    }
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
+    invoke_rpc_async_with_pool_config(
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>> pool,
+        coro_rpc::request_config_t config, Args&&... args) {
         if (metrics_) {
             metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
         }
@@ -176,7 +173,7 @@ class P2PMasterClient final {
         auto ret = co_await pool->send_request(
             [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
                 return client.send_request<ServiceMethod>(
-                    std::forward<Args>(args)...);
+                    config, std::forward<Args>(args)...);
             });
         if (!ret.has_value()) {
             LOG(ERROR) << "Client not available";
@@ -285,10 +282,20 @@ class P2PMasterClient final {
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_via(
         RpcClientAccessor& accessor, Args&&... args) {
+        return invoke_rpc_via_config<ServiceMethod, ReturnType>(
+            accessor, coro_rpc::request_config_t{},
+            std::forward<Args>(args)...);
+    }
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_via_config(
+        RpcClientAccessor& accessor, coro_rpc::request_config_t config,
+        Args&&... args) {
         try {
             return async_simple::coro::syncAwait(
-                invoke_rpc_async_with_pool<ServiceMethod, ReturnType>(
-                    accessor.GetClientPool(), std::forward<Args>(args)...));
+                invoke_rpc_async_with_pool_config<ServiceMethod, ReturnType>(
+                    accessor.GetClientPool(), config,
+                    std::forward<Args>(args)...));
         } catch (const std::exception& e) {
             LOG(ERROR) << "P2P master RPC threw: "
                        << RpcNameTraits<ServiceMethod>::value
@@ -308,6 +315,8 @@ class P2PMasterClient final {
     P2PMasterClientMetric* metrics_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        heartbeat_client_pools_;
 
     mutable Mutex connect_mutex_;
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);

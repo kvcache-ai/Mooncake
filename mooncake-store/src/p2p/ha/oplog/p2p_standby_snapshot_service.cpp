@@ -594,9 +594,15 @@ ErrorCode RedisMasterRegistry::Refresh(const RedisMasterRegistryEntry& entry) {
         metadata_key_.size(), entry.instance_id.data(),
         entry.instance_id.size(), static_cast<long long>(now_ms),
         metadata.data(), metadata.size()));
-    return reply && reply->type != REDIS_REPLY_ERROR
-               ? ErrorCode::OK
-               : ErrorCode::INTERNAL_ERROR;
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        LOG_EVERY_N(WARNING, 30)
+            << "Redis Master registry refresh failed"
+            << ", instance_id=" << entry.instance_id << ", role=" << entry.role
+            << ", error="
+            << RedisUtil::FormatCommandError(ctx.get(), reply.get());
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode RedisMasterRegistry::Remove(const std::string& instance_id) {
@@ -621,9 +627,13 @@ ErrorCode RedisMasterRegistry::Remove(const std::string& instance_id) {
         ctx.get(), "EVAL %s 2 %b %b %b", kRemoveScript, heartbeat_key_.data(),
         heartbeat_key_.size(), metadata_key_.data(), metadata_key_.size(),
         instance_id.data(), instance_id.size()));
-    return reply && reply->type != REDIS_REPLY_ERROR
-               ? ErrorCode::OK
-               : ErrorCode::INTERNAL_ERROR;
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        LOG(ERROR) << "Redis Master registry remove failed"
+                   << ", instance_id=" << instance_id << ", error="
+                   << RedisUtil::FormatCommandError(ctx.get(), reply.get());
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode RedisMasterRegistry::DiscoverAlive(
@@ -658,11 +668,16 @@ ErrorCode RedisMasterRegistry::DiscoverAlive(
         ctx.get(), "EVAL %s 2 %b %b %lld", kDiscoverScript,
         heartbeat_key_.data(), heartbeat_key_.size(), metadata_key_.data(),
         metadata_key_.size(), static_cast<long long>(cutoff_ms)));
-    if (!reply || reply->type != REDIS_REPLY_ARRAY ||
-        reply->elements % 2 != 0) {
+    if (!reply || reply->type == REDIS_REPLY_ERROR) {
+        LOG(ERROR) << "Redis Master registry discover failed"
+                   << ", ttl_sec=" << ttl.count() << ", error="
+                   << RedisUtil::FormatCommandError(ctx.get(), reply.get());
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (reply->type != REDIS_REPLY_ARRAY || reply->elements % 2 != 0) {
         LOG(ERROR) << "Redis Master registry discover got invalid Redis reply"
-                   << ", reply_type=" << (reply ? reply->type : -1)
-                   << ", element_count=" << (reply ? reply->elements : 0);
+                   << ", reply_type=" << reply->type
+                   << ", element_count=" << reply->elements;
         return ErrorCode::INTERNAL_ERROR;
     }
     for (size_t i = 0; i < reply->elements; i += 2) {
@@ -830,11 +845,6 @@ void RedisMasterRegistryHeartbeat::Run() {
                                 ? ""
                                 : "Redis registry heartbeat refresh failed: " +
                                       toString(refresh_result));
-        if (refresh_result != ErrorCode::OK) {
-            LOG(WARNING) << "Redis Master registry heartbeat failed"
-                         << ", instance_id=" << entry.instance_id
-                         << ", role=" << entry.role;
-        }
         lock.lock();
     }
 }

@@ -1,6 +1,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <ylt/struct_json/json_reader.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -20,6 +22,8 @@
 #include "p2p/master/p2p_master_client.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "ha/oplog/mock_oplog_store.h"
+#include "p2p/ha/ha_status.h"
+#include "p2p/ha/p2p_status_http_server.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "utils.h"
@@ -455,6 +459,7 @@ class GatedOpLogStore final : public mooncake::test::MockOpLogStore {
         {
             std::lock_guard<std::mutex> lock(event_mutex_);
             ++drain_events_;
+            drain_timeout_ms_ = timeout_ms;
             draining_ = true;
         }
         return mooncake::test::MockOpLogStore::DrainWriting(timeout_ms);
@@ -477,6 +482,11 @@ class GatedOpLogStore final : public mooncake::test::MockOpLogStore {
         return drain_events_;
     }
 
+    uint32_t DrainTimeoutMs() const {
+        std::lock_guard<std::mutex> lock(event_mutex_);
+        return drain_timeout_ms_;
+    }
+
     size_t Writes() const {
         std::lock_guard<std::mutex> lock(event_mutex_);
         return write_events_;
@@ -489,6 +499,7 @@ class GatedOpLogStore final : public mooncake::test::MockOpLogStore {
 
    private:
     std::promise<void> release_promise_;
+    uint32_t drain_timeout_ms_{0};
     std::shared_future<void> release_;
     std::promise<void> write_entered_promise_;
     std::promise<void> second_write_promise_;
@@ -566,7 +577,13 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
         server_->register_handler<&GatedRpcHandler::WaitForRelease>(&handler_);
 
         std::packaged_task<int()> run([this] {
-            return master_->RunActiveRpcServers(*server_, *service_);
+            return master_->RunActiveRpcServers(
+                *server_, *service_, {},
+                [this] {
+                    handler_exited_before_drain_ = handler_.HasExited();
+                    after_stop_called_ = true;
+                },
+                [this] { return shutdown_requested_.load(); });
         });
         run_result_ = run.get_future();
         run_thread_ = std::thread(std::move(run));
@@ -646,6 +663,9 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
     std::future<int> run_result_;
     std::future<void> request_result_;
     std::future<void> stop_result_;
+    std::atomic<bool> shutdown_requested_{false};
+    std::atomic<bool> after_stop_called_{false};
+    bool handler_exited_before_drain_{false};
 };
 
 TEST_P(P2PMasterRpcShutdownTest, RunnerWaitsForInFlightRpcAfterListenerCloses) {
@@ -669,6 +689,7 @@ TEST_P(P2PMasterRpcShutdownTest, RunnerWaitsForInFlightRpcAfterListenerCloses) {
     EXPECT_EQ(stop_result_.wait_for(std::chrono::milliseconds(0)),
               std::future_status::timeout);
     EXPECT_FALSE(handler_.HasExited());
+    EXPECT_FALSE(after_stop_called_.load());
 
     handler_.Release();
     ASSERT_EQ(run_result_.wait_for(kTimeout), std::future_status::ready);
@@ -677,10 +698,35 @@ TEST_P(P2PMasterRpcShutdownTest, RunnerWaitsForInFlightRpcAfterListenerCloses) {
     const int run_result = run_result_.get();
     EXPECT_TRUE(run_result == 0 || run_result == -1);
     EXPECT_TRUE(handler_.HasExited());
+    EXPECT_TRUE(after_stop_called_.load());
+    EXPECT_TRUE(handler_exited_before_drain_);
     ASSERT_EQ(stop_result_.wait_for(kTimeout), std::future_status::ready);
     stop_result_.get();
     ASSERT_EQ(request_result_.wait_for(kTimeout), std::future_status::ready);
     request_result_.get();
+    if (heartbeat_port_ > 0) {
+        EXPECT_TRUE(WaitForListenerClosed(heartbeat_port_));
+    }
+}
+
+TEST_P(P2PMasterRpcShutdownTest, ShutdownDrainsOnlyAfterInFlightRpcReturns) {
+    std::packaged_task<void()> request([this] {
+        (void)async_simple::coro::syncAwait(
+            client_->call_for<&GatedRpcHandler::WaitForRelease>(kTimeout));
+    });
+    request_result_ = request.get_future();
+    request_thread_ = std::thread(std::move(request));
+    ASSERT_EQ(handler_.WaitForEntry(kTimeout), std::future_status::ready);
+    shutdown_requested_ = true;
+    ASSERT_TRUE(WaitForListenerClosed(server_->port()));
+    EXPECT_FALSE(after_stop_called_.load());
+    EXPECT_EQ(run_result_.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    handler_.Release();
+    ASSERT_EQ(run_result_.wait_for(kTimeout), std::future_status::ready);
+    EXPECT_EQ(run_result_.get(), 0);
+    EXPECT_TRUE(after_stop_called_.load());
+    EXPECT_TRUE(handler_exited_before_drain_);
     if (heartbeat_port_ > 0) {
         EXPECT_TRUE(WaitForListenerClosed(heartbeat_port_));
     }
@@ -691,8 +737,12 @@ INSTANTIATE_TEST_SUITE_P(HeartbeatModes, P2PMasterRpcShutdownTest,
 
 TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     constexpr auto kTimeout = std::chrono::seconds(5);
+    struct StatusResetGuard {
+        ~StatusResetGuard() { HAStatusManager::instance().Reset(); }
+    } reset_guard;
 
     P2PMasterConfig config;
+    config.ha.enabled = true;
     config.rpc.address = "127.0.0.1";
     config.rpc.port = 0;
     config.rpc.thread_num = 2;
@@ -720,15 +770,28 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     auto server = std::make_unique<coro_rpc::coro_rpc_server>(
         2, port, "127.0.0.1", std::chrono::seconds(0), false);
     std::atomic<bool> stepdown_requested{false};
-    service->SetStepdownCallback([&server, &stepdown_requested] {
-        stepdown_requested.store(true, std::memory_order_seq_cst);
-        server->stop();
-    });
+    std::atomic<uint32_t> drain_timeout_ms{0};
+    service->SetStepdownCallback(
+        [&server, &stepdown_requested, &drain_timeout_ms](
+            const P2PMasterRpcService::StepdownRequest& request) {
+            drain_timeout_ms.store(request.drain_timeout_ms);
+            stepdown_requested.store(true, std::memory_order_seq_cst);
+            server->stop();
+        });
 
-    std::packaged_task<int()> run([&master, &server, &service, &oplog_store] {
+    std::packaged_task<int()> run([&master, &server, &service, oplog_manager,
+                                   &drain_timeout_ms, &stepdown_requested] {
         return master.RunActiveRpcServers(
-            *server, *service, /*before_start=*/{},
-            [&oplog_store] { (void)oplog_store->DrainWriting(3000); });
+            *server, *service,
+            [] {
+                HAStatusManager::instance().SetRoleState("primary", "RUNNING");
+            },
+            [oplog_manager, &drain_timeout_ms] {
+                P2PMaster::DrainOpLogBeforeStop(*oplog_manager,
+                                                drain_timeout_ms.load());
+            },
+            /*stopping=*/{},
+            [&stepdown_requested] { return stepdown_requested.load(); });
     });
     auto run_result = run.get_future();
     std::thread run_thread(std::move(run));
@@ -752,6 +815,12 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
                                           .ip_address = "127.0.0.1",
                                           .rpc_port = kClientPort})
                         .has_value());
+    }
+    // Establish both business connections before opening the separate
+    // heartbeat connections. The server assigns connections round-robin to
+    // two workers; interleaving heartbeats would put both writers on the same
+    // worker, so the first blocked write would prevent the second from running.
+    for (size_t i = 0; i < clients.size(); ++i) {
         ASSERT_TRUE(
             clients[i]
                 ->Heartbeat({.client_id = client_ids[i],
@@ -795,7 +864,7 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     std::thread stepdown([&service] {
         const auto response = HttpPostForTest(
             "http://127.0.0.1:" + std::to_string(service->GetHttpPort()) +
-            "/ha/stepdown");
+            "/ha/stepdown?cooldown_sec=0&drain_timeout_ms=1234");
         EXPECT_EQ(response.status, 200);
     });
     while (!stepdown_requested.load(std::memory_order_seq_cst) &&
@@ -817,10 +886,138 @@ TEST_F(P2PMasterRpcTest, StepdownDrainsOpLogAfterActiveWritesStop) {
     stepdown.join();
     EXPECT_EQ(run_result.get(), 0);
     EXPECT_GT(oplog_store->Drains(), 0u);
+    EXPECT_EQ(oplog_store->DrainTimeoutMs(), 1234u);
     EXPECT_GT(oplog_store->Writes(), 0u);
     EXPECT_EQ(oplog_store->WritesAfterDrain(), 0u);
 
     run_thread.join();
+}
+
+TEST_F(P2PMasterRpcTest, StepdownDrainDiagnosticsSurviveDemotionAndRecover) {
+    struct StatusResetGuard {
+        ~StatusResetGuard() { HAStatusManager::instance().Reset(); }
+    } reset_guard;
+    auto& status = HAStatusManager::instance();
+    status.Reset();
+    status.Configure(true, "stepdown_diagnostics", "local");
+    status.SetMasterView("local", 1);
+    status.SetRoleState("primary", "RUNNING");
+
+    struct ControlledDrainStore final : mooncake::test::MockOpLogStore {
+        OpLogDrainResult result{false, 2, 1, 10, 13};
+        uint32_t last_timeout_ms{0};
+        OpLogDrainResult DrainWriting(uint32_t timeout_ms) override {
+            last_timeout_ms = timeout_ms;
+            return result;
+        }
+    };
+    auto store = std::make_shared<ControlledDrainStore>();
+    OpLogManager manager;
+    manager.SetOpLogStore(store);
+    P2PStatusHttpServer diagnostics(/*port=*/0);
+    diagnostics.Start();
+    ASSERT_NE(diagnostics.port(), 0);
+    auto read_json = [&](const char* path) {
+        coro_http::coro_http_client client;
+        auto response = client.get(
+            "http://127.0.0.1:" + std::to_string(diagnostics.port()) + path);
+        EXPECT_EQ(response.status, 200) << response.resp_body;
+        return std::string(response.resp_body);
+    };
+    auto read_doctor = [&] {
+        HADoctorReport report;
+        struct_json::from_json(report, read_json("/ha/doctor"));
+        return report;
+    };
+    auto read_last_error = [&] {
+        HAStatusSnapshot snapshot;
+        struct_json::from_json(snapshot, read_json("/ha/status"));
+        return snapshot.last_error;
+    };
+    auto find_drain = [](const HADoctorReport& report) {
+        return std::find_if(report.issues.begin(), report.issues.end(),
+                            [](const auto& issue) {
+                                return issue.code == "OPLOG_DRAIN_INCOMPLETE";
+                            });
+    };
+
+    // Exercise the same drain/diagnostic path as the real HA supervisor.
+    P2PMaster::DrainOpLogBeforeStop(manager, 1234);
+    EXPECT_EQ(store->last_timeout_ms, 1234u);
+    auto report = read_doctor();
+    auto issue = find_drain(report);
+    ASSERT_NE(issue, report.issues.end());
+    EXPECT_EQ(report.health, "degraded");
+    EXPECT_EQ(issue->category, "oplog");
+    EXPECT_EQ(issue->component, "oplog_writer");
+    EXPECT_EQ(issue->severity, "warning");
+    for (const auto* detail :
+         {"drain_timeout_ms=1234", "queued=2", "inflight=1",
+          "committed_sequence_id=10", "max_known_sequence_id=13"}) {
+        EXPECT_NE(issue->message.find(detail), std::string::npos);
+    }
+    const auto drain_error = issue->message;
+    EXPECT_EQ(read_last_error(), drain_error);
+
+    // Reproduce demotion and the next supervisor round, including replacing
+    // the HTTP server. Per-round issues clear; the failed drain stays visible.
+    status.SetRoleState("standby", "STEPPED_DOWN");
+    status.SetDoctorIssue("ELECTION_FAILED", "old round failure");
+    diagnostics.Stop();
+    status.ClearDoctorIssues(/*preserve_stepdown_drain=*/true);
+    status.Configure(true, "stepdown_diagnostics", "local");
+    status.SetRoleState("standby", "WATCHING");
+    diagnostics.Start();
+    ASSERT_NE(diagnostics.port(), 0);
+    report = read_doctor();
+    issue = find_drain(report);
+    ASSERT_NE(issue, report.issues.end());
+    EXPECT_EQ(report.issues.size(), 1u);
+    EXPECT_EQ(report.health, "degraded");
+    EXPECT_EQ(issue->message, drain_error);
+    EXPECT_EQ(read_last_error(), drain_error);
+
+    // A later successful drain clears this failure and its last_error.
+    status.SetRoleState("primary", "RUNNING");
+    store->result = {true, 0, 0, 13, 13};
+    P2PMaster::DrainOpLogBeforeStop(manager, 3000);
+    report = read_doctor();
+    EXPECT_EQ(find_drain(report), report.issues.end());
+    EXPECT_EQ(report.health, "ok");
+    EXPECT_TRUE(read_last_error().empty());
+
+    // Recovery must not erase an unrelated, more recent error.
+    store->result = {false, 2, 1, 10, 13};
+    P2PMaster::DrainOpLogBeforeStop(manager, 0);
+    status.SetLastError("unrelated registry failure");
+    store->result = {true, 0, 0, 13, 13};
+    P2PMaster::DrainOpLogBeforeStop(manager, 3000);
+    report = read_doctor();
+    EXPECT_EQ(find_drain(report), report.issues.end());
+    EXPECT_EQ(read_last_error(), "unrelated registry failure");
+
+    store->result = {false, 2, 1, 10, 13};
+    EXPECT_FALSE(P2PMaster::DrainOpLogBeforeStop(manager, 50, "shutdown"));
+    EXPECT_NE(read_last_error().find("shutdown OpLog drain incomplete"),
+              std::string::npos);
+    // A successful drain clears an older drain failure from either reason.
+    store->result = {true, 0, 0, 13, 13};
+    EXPECT_TRUE(P2PMaster::DrainOpLogBeforeStop(manager, 3000));
+    EXPECT_TRUE(read_last_error().empty());
+    store->result = {false, 2, 1, 10, 13};
+    EXPECT_FALSE(P2PMaster::DrainOpLogBeforeStop(manager, 0));
+    store->result = {true, 0, 0, 13, 13};
+    EXPECT_TRUE(P2PMaster::DrainOpLogBeforeStop(manager, 3000, "shutdown"));
+    EXPECT_TRUE(read_last_error().empty());
+
+    store->result = {false, 2, 1, 10, 13};
+    P2PMaster::DrainOpLogBeforeStop(manager, 0);
+    status
+        .ClearDoctorIssues();  // Explicit clearing keeps its original meaning.
+    report = read_doctor();
+    EXPECT_EQ(find_drain(report), report.issues.end());
+    status.Reset();
+    EXPECT_TRUE(read_last_error().empty());
 }
 
 }  // namespace

@@ -1,10 +1,14 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <mutex>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -34,6 +38,16 @@ inline constexpr uint64_t kP2PMetricReportIntervalSeconds = 10;
  */
 class P2PMasterRpcService final {
    public:
+    struct StepdownRequest {
+        uint32_t cooldown_sec;
+        uint32_t drain_timeout_ms;
+        // Both deadlines are fixed when the first request is accepted. Use the
+        // monotonic deadline for waiting; the Unix timestamp is for callers.
+        std::chrono::steady_clock::time_point election_paused_until{};
+        int64_t election_paused_until_ms{0};
+    };
+    using StepdownCallback = std::function<void(const StepdownRequest&)>;
+
     explicit P2PMasterRpcService(const P2PMasterConfig& config,
                                  ViewVersionId view_version = 0);
     ~P2PMasterRpcService();
@@ -44,8 +58,9 @@ class P2PMasterRpcService final {
     void init();
     uint16_t GetHttpPort() const { return http_server_.port(); }
     // The embedding supervisor supplies this callback so that accepting a
-    // stepdown request can stop the active RPC server.
-    void SetStepdownCallback(std::function<void()> callback);
+    // stepdown request can stop the active RPC server, drain the OpLog, and
+    // pause reelection until the accepted monotonic deadline.
+    void SetStepdownCallback(StepdownCallback callback);
     P2PMasterService& GetMasterService() { return master_service_; }
     const P2PMasterService& GetMasterService() const { return master_service_; }
 
@@ -111,8 +126,13 @@ class P2PMasterRpcService final {
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
-    std::function<void()> stepdown_callback_;
-    std::atomic<bool> stepdown_requested_{false};
+    std::mutex metric_report_mutex_;
+    std::condition_variable metric_report_cv_;
+    StepdownCallback stepdown_callback_;
+    // Publish the first request's parameters and deadlines together. Never hold
+    // this mutex while invoking the supervisor, which may wait for active RPCs.
+    std::mutex stepdown_mutex_;
+    std::optional<StepdownRequest> stepdown_request_;
     uint32_t heartbeat_rpc_port_ = 0;
 };
 

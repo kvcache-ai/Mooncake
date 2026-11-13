@@ -129,6 +129,60 @@ TEST(P2PClientHATest, StoresRedisDiscoveryConfig) {
               config.redis_heartbeat_interval_sec);
 }
 
+TEST(P2PClientHATest, RedisHAHeartbeatFailureThresholdFollowsViewTTL) {
+    auto client = MakeClient();
+    client.master_server_entry_ = "redis://127.0.0.1:6379";
+    P2PClientConfig config;
+    client.SetMasterDiscoveryConfig(config);
+
+    EXPECT_EQ(client.GetHeartbeatFailureThreshold(), 4);
+
+    config.redis_master_view_ttl_sec = 5;
+    config.redis_heartbeat_interval_sec = 2;
+    client.SetMasterDiscoveryConfig(config);
+    EXPECT_EQ(client.GetHeartbeatFailureThreshold(), 5);
+}
+
+TEST(P2PClientHATest, RedisHAHeartbeatFailureThresholdHasMinimum) {
+    auto client = MakeClient();
+    client.master_server_entry_ = "redis://127.0.0.1:6379";
+    P2PClientConfig config;
+    config.redis_master_view_ttl_sec = 1;
+    config.redis_heartbeat_interval_sec = 1;
+    client.SetMasterDiscoveryConfig(config);
+
+    EXPECT_EQ(client.GetHeartbeatFailureThreshold(), 2);
+}
+
+TEST(P2PClientHATest, RedisKeepLeaderIntervalDoesNotAffectClientThreshold) {
+    auto client = MakeClient();
+    client.master_server_entry_ = "redis://127.0.0.1:6379";
+    P2PClientConfig config;
+    config.redis_master_view_ttl_sec = 6;
+    config.redis_heartbeat_interval_sec = 1;
+    client.SetMasterDiscoveryConfig(config);
+
+    EXPECT_EQ(client.GetHeartbeatFailureThreshold(), 6);
+
+    config.redis_heartbeat_interval_sec = 5;
+    client.SetMasterDiscoveryConfig(config);
+
+    EXPECT_EQ(client.GetHeartbeatFailureThreshold(), 6);
+}
+
+TEST(P2PClientHATest, NonRedisHeartbeatFailureThresholdKeepsDefault) {
+    auto client = MakeClient();
+    P2PClientConfig config;
+    config.redis_master_view_ttl_sec = 4;
+    config.redis_heartbeat_interval_sec = 1;
+    client.SetMasterDiscoveryConfig(config);
+
+    client.master_server_entry_ = "127.0.0.1:50051";
+    EXPECT_EQ(client.GetHeartbeatFailureThreshold(), 10);
+    client.master_server_entry_ = "etcd://127.0.0.1:2379";
+    EXPECT_EQ(client.GetHeartbeatFailureThreshold(), 10);
+}
+
 TEST(P2PClientHATest, EtcdMasterViewKeyUsesConfiguredClusterId) {
     EXPECT_EQ(BuildP2PEtcdMasterViewKey("cluster-a"),
               "mooncake-store/cluster-a/master_view");

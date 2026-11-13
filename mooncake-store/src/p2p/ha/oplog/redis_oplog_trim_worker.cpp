@@ -166,7 +166,8 @@ ErrorCode RedisOpLogTrimWorker::ReadSequenceKey(redisContext* ctx,
         (redisReply*)redisCommand(ctx, "GET %b", key.data(), key.size()));
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
         LOG(ERROR) << "RedisOpLogTrimWorker: GET sequence key failed"
-                   << ", key=" << key;
+                   << ", key=" << key << ", error="
+                   << RedisUtil::FormatCommandError(ctx, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (reply->type == REDIS_REPLY_NIL) {
@@ -202,7 +203,8 @@ ErrorCode RedisOpLogTrimWorker::AdvanceTrimmed(redisContext* ctx,
         trimmed_key.size(), target_seq.data(), target_seq.size()));
     if (!reply || reply->type == REDIS_REPLY_ERROR) {
         LOG(ERROR) << "RedisOpLogTrimWorker: advance trimmed EVAL failed"
-                   << ", target=" << target;
+                   << ", target=" << target << ", error="
+                   << RedisUtil::FormatCommandError(ctx, reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     if (reply->type != REDIS_REPLY_STRING ||
@@ -215,6 +217,7 @@ ErrorCode RedisOpLogTrimWorker::AdvanceTrimmed(redisContext* ctx,
 }
 
 ErrorCode RedisOpLogTrimWorker::CollectGarbage(redisContext* ctx,
+                                               uint64_t latest,
                                                uint64_t trimmed,
                                                uint64_t& deleted_to) const {
     deleted_to = 0;
@@ -224,6 +227,11 @@ ErrorCode RedisOpLogTrimWorker::CollectGarbage(redisContext* ctx,
     uint64_t gc_cursor = 0;
     auto err = ReadSequenceKey(ctx, gc_cursor_key, gc_cursor);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogTrimWorker: failed to read gc cursor"
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", latest_sequence_id=" << latest
+                   << ", trimmed_sequence_id=" << trimmed
+                   << ", error=" << toString(err);
         return err;
     }
     HAMetricManager::instance().set_oplog_gc_cursor_sequence_id(
@@ -244,7 +252,15 @@ ErrorCode RedisOpLogTrimWorker::CollectGarbage(redisContext* ctx,
         if (redisAppendCommand(ctx, "DEL %b", entry_key.data(),
                                entry_key.size()) != REDIS_OK) {
             LOG(ERROR) << "RedisOpLogTrimWorker: append DEL failed"
-                       << ", sequence_id=" << sequence_id;
+                       << ", sequence_id=" << sequence_id
+                       << ", cluster_id=" << config_.cluster_id
+                       << ", latest_sequence_id=" << latest
+                       << ", trimmed_sequence_id=" << trimmed
+                       << ", gc_cursor=" << gc_cursor
+                       << ", batch_start=" << batch_start
+                       << ", batch_end=" << batch_end
+                       << ", batch_count=" << batch_count << ", error="
+                       << RedisUtil::FormatCommandError(ctx, nullptr);
             return ErrorCode::INTERNAL_ERROR;
         }
     }
@@ -255,13 +271,29 @@ ErrorCode RedisOpLogTrimWorker::CollectGarbage(redisContext* ctx,
                 REDIS_OK ||
             !raw_reply) {
             LOG(ERROR) << "RedisOpLogTrimWorker: DEL failed"
-                       << ", sequence_id=" << sequence_id;
+                       << ", sequence_id=" << sequence_id
+                       << ", cluster_id=" << config_.cluster_id
+                       << ", latest_sequence_id=" << latest
+                       << ", trimmed_sequence_id=" << trimmed
+                       << ", gc_cursor=" << gc_cursor
+                       << ", batch_start=" << batch_start
+                       << ", batch_end=" << batch_end
+                       << ", batch_count=" << batch_count << ", error="
+                       << RedisUtil::FormatCommandError(ctx, raw_reply);
             return ErrorCode::INTERNAL_ERROR;
         }
         RedisReplyPtr del_reply(raw_reply);
         if (del_reply->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "RedisOpLogTrimWorker: DEL error"
-                       << ", sequence_id=" << sequence_id;
+                       << ", sequence_id=" << sequence_id
+                       << ", cluster_id=" << config_.cluster_id
+                       << ", latest_sequence_id=" << latest
+                       << ", trimmed_sequence_id=" << trimmed
+                       << ", gc_cursor=" << gc_cursor
+                       << ", batch_start=" << batch_start
+                       << ", batch_end=" << batch_end
+                       << ", batch_count=" << batch_count << ", error="
+                       << RedisUtil::FormatCommandError(ctx, del_reply.get());
             return ErrorCode::INTERNAL_ERROR;
         }
     }
@@ -272,7 +304,15 @@ ErrorCode RedisOpLogTrimWorker::CollectGarbage(redisContext* ctx,
         cursor_seq.data(), cursor_seq.size()));
     if (!update_reply || update_reply->type == REDIS_REPLY_ERROR) {
         LOG(ERROR) << "RedisOpLogTrimWorker: SET gc cursor failed"
-                   << ", gc_cursor=" << batch_end;
+                   << ", gc_cursor=" << batch_end
+                   << ", previous_gc_cursor=" << gc_cursor
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", latest_sequence_id=" << latest
+                   << ", trimmed_sequence_id=" << trimmed
+                   << ", batch_start=" << batch_start
+                   << ", batch_end=" << batch_end
+                   << ", batch_count=" << batch_count << ", error="
+                   << RedisUtil::FormatCommandError(ctx, update_reply.get());
         return ErrorCode::INTERNAL_ERROR;
     }
     deleted_to = batch_end;
@@ -355,7 +395,8 @@ ErrorCode RedisOpLogTrimWorker::TrimOnce() {
     }
 
     uint64_t deleted_to = 0;
-    err = CollectGarbage(ctx.get(), logical_trimmed, deleted_to);
+    err = CollectGarbage(ctx.get(), latest_sequence_id, logical_trimmed,
+                         deleted_to);
     if (err != ErrorCode::OK) {
         return err;
     }

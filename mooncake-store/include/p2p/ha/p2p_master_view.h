@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -21,6 +22,11 @@ class P2PMasterView {
                              ViewVersionId& version, EtcdLeaseId& lease_id) = 0;
     virtual void KeepLeader(EtcdLeaseId lease_id) = 0;
     virtual void CancelKeepAlive(EtcdLeaseId lease_id) = 0;
+    virtual void SetShouldElect(std::function<bool()> should_elect) {}
+    // The etcd view currently inherits this no-op; it does not cancel a
+    // blocking etcd election or watch.
+    virtual void CancelElection() {}
+    virtual ErrorCode ReleaseLeader() { return ErrorCode::OK; }
     virtual int GetLeaderLeaseTTLSeconds() const = 0;
     virtual ErrorCode GetMasterView(std::string& master_address,
                                     ViewVersionId& version) = 0;
@@ -58,6 +64,9 @@ class P2PRedisMasterView final : public P2PMasterView {
                      EtcdLeaseId& lease_id) override;
     void KeepLeader(EtcdLeaseId lease_id) override;
     void CancelKeepAlive(EtcdLeaseId lease_id) override;
+    void SetShouldElect(std::function<bool()> should_elect) override;
+    void CancelElection() override;
+    ErrorCode ReleaseLeader() override;
     int GetLeaderLeaseTTLSeconds() const override;
     ErrorCode GetMasterView(std::string& master_address,
                             ViewVersionId& version) override;

@@ -25,7 +25,8 @@ DEFINE_int32(redis_db_index, 0,
 DEFINE_int32(redis_master_view_ttl_sec, 4,
              "Redis master view TTL for redis:// master discovery");
 DEFINE_int32(redis_heartbeat_interval_sec, 1,
-             "Redis heartbeat interval for redis:// master discovery");
+             "Master-side Redis master view refresh interval for redis:// "
+             "master discovery, must be < redis_master_view_ttl_sec");
 DEFINE_uint32(
     heartbeat_rpc_port, 0,
     "Port of the master's dedicated heartbeat RPC server. When > 0, "
