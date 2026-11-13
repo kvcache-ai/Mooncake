@@ -136,6 +136,10 @@ TEST_F(OpLogManagerTest, InitialSequenceUsesBothWatermarks) {
         const uint64_t expected = std::max(restored, uint64_t{100}) + 1;
         const auto entry = manager.AllocateEntry(OpType::PUT_END, "new-key");
         EXPECT_EQ(entry.sequence_id, expected);
+        const auto buffered = manager.GetBufferedEntriesAfter(expected - 1);
+        ASSERT_TRUE(buffered.has_value());
+        ASSERT_EQ(buffered->size(), 1);
+        EXPECT_EQ(buffered->front().sequence_id, expected);
     }
 }
 
@@ -148,6 +152,9 @@ TEST_F(OpLogManagerTest, InitialSequenceRejectsExhaustionWithoutMutation) {
     EXPECT_EQ(M().SetInitialSequenceId(0), ErrorCode::INVALID_PARAMS);
     EXPECT_EQ(M().GetLastSequenceId(), 0);
     EXPECT_EQ(M().GetEntryCount(), 0);
+    ASSERT_EQ(store->UpdateLatestSequenceId(100), ErrorCode::OK);
+    ASSERT_EQ(M().SetInitialSequenceId(0), ErrorCode::OK);
+    EXPECT_EQ(M().AllocateEntry(OpType::PUT_END, "new-key").sequence_id, 101);
 }
 
 TEST_F(OpLogManagerTest, InitialLatestReadDoesNotBlockStopWriting) {
