@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <thread>
 #include <unistd.h>
 
 #include "common.h"
@@ -513,6 +514,100 @@ int TransferExecutorBase::disconnect(size_t engine_idx,
     return 0;
 }
 
+void TransferExecutorBase::drainLocalCopies() {
+    // Device copies keep running until Poll() sees their completion flags or
+    // their deadline. New copies stay rejected while peers_quiesced_ is set.
+    while (true) {
+        bool pending = false;
+        for (const auto& engine : local_copy_engines_) {
+            if (engine && engine->HasPending()) {
+                pending = true;
+                break;
+            }
+        }
+        if (!pending) {
+            return;
+        }
+        pollLocalCopies();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+int TransferExecutorBase::disconnectAllPeers() {
+    // The caller may keep using this thread after the call, and the next
+    // unregister saves whatever context it finds. Put the caller's context
+    // back even though Disconnect below binds each engine's own context.
+    aclrtContext saved_ctx = nullptr;
+    if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
+        saved_ctx = nullptr;
+    }
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
+            (void)aclrtSetCurrentContext(saved_ctx);
+        }
+    });
+
+    {
+        std::unique_lock<std::mutex> lock(transfer_lifecycle_mutex_);
+        peers_quiesced_ = true;
+        transfer_lifecycle_cv_.wait(
+            lock, [this] { return active_sync_transfers_ == 0; });
+    }
+
+    // Query-thread Disconnect runs before active_async_tasks_ drops to 0, so
+    // this returns only after those Adxl calls have finished. Do not hold
+    // connection_mutex_ across the wait: the query thread needs it.
+    drainInFlightTransfers();
+    drainLocalCopies();
+
+    int result = 0;
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        for (auto engine_it = connected_segments_.begin();
+             engine_it != connected_segments_.end();) {
+            const size_t engine_idx = engine_it->first;
+            if (engine_idx >= adxl_engines_.size() ||
+                engine_idx >= local_engine_contexts_.size() ||
+                adxl_engines_[engine_idx] == nullptr) {
+                LOG(ERROR)
+                    << "disconnectAllPeers skipped invalid engine index: "
+                    << engine_idx;
+                result = -1;
+                ++engine_it;
+                continue;
+            }
+            (void)aclrtSetCurrentContext(local_engine_contexts_[engine_idx]);
+            auto& peers = engine_it->second;
+            for (auto peer_it = peers.begin(); peer_it != peers.end();) {
+                const auto status = adxl_engines_[engine_idx]->Disconnect(
+                    peer_it->c_str(), params_.connect_timeout);
+                if (status != adxl::SUCCESS && status != adxl::NOT_CONNECTED) {
+                    LOG(ERROR)
+                        << "Failed to disconnect AdxlEngine: " << *peer_it
+                        << ", status: " << status
+                        << ", errmsg: " << aclGetRecentErrMsg();
+                    result = -1;
+                    ++peer_it;
+                } else {
+                    peer_it = peers.erase(peer_it);
+                }
+            }
+            if (peers.empty()) {
+                engine_it = connected_segments_.erase(engine_it);
+            } else {
+                ++engine_it;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(transfer_lifecycle_mutex_);
+        peers_quiesced_ = false;
+    }
+    transfer_lifecycle_cv_.notify_all();
+    return result;
+}
+
 void TransferExecutorBase::disconnectAllForEngine(size_t engine_idx) {
     if (engine_idx >= adxl_engines_.size() ||
         engine_idx >= local_engine_contexts_.size() ||
@@ -874,6 +969,15 @@ void TransferExecutorBase::processGroupedSliceList(
                 ? local_copy_engines_[local_engine_idx].get()
                 : nullptr;
         if (need_local_copy && local_copy_engine != nullptr) {
+            {
+                std::lock_guard<std::mutex> lifecycle_lock(
+                    transfer_lifecycle_mutex_);
+                if (peers_quiesced_) {
+                    markSlicesFailed(slice_list);
+                    return;
+                }
+                ++active_sync_transfers_;
+            }
             if (VLOG_IS_ON(1)) {
                 size_t copy_bytes = 0;
                 for (auto* slice : slice_list) {
@@ -894,11 +998,32 @@ void TransferExecutorBase::processGroupedSliceList(
                            std::chrono::steady_clock::now() - start)
                            .count()
                     << "us";
+            {
+                std::lock_guard<std::mutex> lifecycle_lock(
+                    transfer_lifecycle_mutex_);
+                --active_sync_transfers_;
+            }
+            transfer_lifecycle_cv_.notify_all();
             return;
         }
 
+        {
+            std::lock_guard<std::mutex> lifecycle_lock(
+                transfer_lifecycle_mutex_);
+            if (peers_quiesced_) {
+                markSlicesFailed(slice_list);
+                return;
+            }
+            ++active_sync_transfers_;
+        }
         result = execute(local_engine_idx, target_adxl_engine_name, operation,
                          slice_list);
+        {
+            std::lock_guard<std::mutex> lifecycle_lock(
+                transfer_lifecycle_mutex_);
+            --active_sync_transfers_;
+        }
+        transfer_lifecycle_cv_.notify_all();
         if (result.ret == 0 || !result.retryable ||
             retry + 1 >= kTransferRetryTimes) {
             break;

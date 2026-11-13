@@ -295,6 +295,8 @@ class TransferEnginePy {
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
 
+    int disconnectAllPeers();
+
     int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses,
                             std::vector<size_t> capacities,
                             const std::string &location = kWildcardLocation);

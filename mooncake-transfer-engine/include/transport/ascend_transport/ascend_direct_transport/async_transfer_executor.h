@@ -45,6 +45,9 @@ class AsyncTransferExecutor : public TransferExecutorBase {
         adxl::TransferOp operation,
         const std::vector<Transport::Slice*>& slice_list) override;
 
+   protected:
+    void drainInFlightTransfers() override;
+
    private:
     struct QueryBatch {
         std::vector<Transport::Slice*> slices;
