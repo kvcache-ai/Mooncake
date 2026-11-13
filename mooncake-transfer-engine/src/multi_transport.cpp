@@ -262,11 +262,11 @@ void MultiTransport::discardQueuedCompletion(BatchID batch_id) {
 
 Status MultiTransport::enableBatchCompletionNotification(BatchID batch_id) {
     if (completion_fd_ < 0) {
-        return Status::NotSupportedTransport(
+        return Status::CompletionNotificationUnsupported(
             "completion eventfd is not available");
     }
     if (globalConfig().slice_timeout > 0) {
-        return Status::NotSupportedTransport(
+        return Status::CompletionNotificationUnsupported(
             "completion notification requires slice_timeout disabled; "
             "timeouts are enforced only by foreground status polling");
     }
@@ -312,7 +312,7 @@ void MultiTransport::enqueueTerminal(BatchID batch_id, TransferStatus status) {
 Status MultiTransport::drainCompletions(std::vector<BatchCompletion>& out) {
     out.clear();
     if (completion_fd_ < 0) {
-        return Status::NotSupportedTransport(
+        return Status::CompletionNotificationUnsupported(
             "completion eventfd is not available");
     }
 #ifdef __linux__
@@ -511,7 +511,7 @@ Status MultiTransport::submitTransfer(
         transports.begin(), transports.end(),
         [](Transport* t) { return t->supportsBatchCompletionCounter(); });
     if (batch_desc.event_enabled && !all_counter) {
-        return Status::NotSupportedTransport(
+        return Status::CompletionNotificationUnsupported(
             "event-enabled batch requires a transport that publishes "
             "completion without foreground polling");
     }
@@ -621,7 +621,7 @@ Status MultiTransport::mp_submitTransfer(
     // Explicit-protocol dispatch retains transport-specific polling and is
     // not a polling-free eventfd path.
     if (batch_desc.event_enabled) {
-        return Status::NotSupportedTransport(
+        return Status::CompletionNotificationUnsupported(
             "event-enabled batch does not support mp_submitTransfer");
     }
     batch_desc.counter_eligible = false;

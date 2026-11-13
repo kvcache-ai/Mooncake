@@ -463,7 +463,8 @@ TEST_F(BatchCounterWait, CompletionFdWakesWithoutStatusPoll) {
 #ifndef __linux__
     EXPECT_EQ(multi.completionFd(), -1);
     std::vector<BatchCompletion> done;
-    EXPECT_TRUE(multi.drainCompletions(done).IsNotSupportedTransport());
+    EXPECT_TRUE(
+        multi.drainCompletions(done).IsCompletionNotificationUnsupported());
 #else
     ASSERT_GE(multi.completionFd(), 0);
     auto b = batch(2);
@@ -666,11 +667,28 @@ TEST_F(BatchCounterWait, OptInOnPollDrivenTransportFailsAtSubmit) {
     auto b = batch(1);
     ASSERT_TRUE(enable(b).ok());
     auto status = submit(b, {2});  // tcp probe: not counter-capable
-    EXPECT_TRUE(status.IsNotSupportedTransport());
+    EXPECT_TRUE(status.IsCompletionNotificationUnsupported());
     pollfd pfd{};
     pfd.fd = multi.completionFd();
     pfd.events = POLLIN;
     EXPECT_EQ(::poll(&pfd, 1, 0), 0);
+#endif
+}
+
+TEST_F(BatchCounterWait, MissingTransportIsNotACompletionFallback) {
+#ifndef __linux__
+    GTEST_SKIP();
+#else
+    auto d = std::make_shared<TransferMetadata::SegmentDesc>();
+    d->name = "peer:4";
+    d->protocol = "cxl";  // not installed
+    auto name = d->name;
+    md->addLocalSegment(4, name, std::move(d));
+    auto b = batch(1);
+    ASSERT_TRUE(enable(b).ok());
+    auto status = submit(b, {4});
+    EXPECT_TRUE(status.IsNotSupportedTransport());
+    EXPECT_FALSE(status.IsCompletionNotificationUnsupported());
 #endif
 }
 
@@ -680,7 +698,7 @@ TEST_F(BatchCounterWait, EnableRejectedWhenSliceTimeoutRequiresPolling) {
 #else
     globalConfig().slice_timeout = 1;
     auto b = batch(1);
-    EXPECT_TRUE(enable(b).IsNotSupportedTransport());
+    EXPECT_TRUE(enable(b).IsCompletionNotificationUnsupported());
 #endif
 }
 

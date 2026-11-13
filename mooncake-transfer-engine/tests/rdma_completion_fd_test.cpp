@@ -224,6 +224,18 @@ TEST_F(RdmaCompletionFdTest, OptInShortBatchWakesWithoutStatusQuery) {
     release(batch);
 }
 
+TEST_F(RdmaCompletionFdTest, SubmitWithNotifyRejectedWhenEventEnabled) {
+    BatchID batch = sender_->allocateBatchID(1);
+    ASSERT_TRUE(sender_->enableBatchCompletionNotification(batch).ok());
+    TransferRequest request{};
+    request.opcode = TransferRequest::WRITE;
+    request.length = 1;
+    TransferMetadata::NotifyDesc notify{"peer", "msg"};
+    EXPECT_TRUE(sender_->submitTransferWithNotify(batch, {request}, notify)
+                    .IsInvalidArgument());
+    release(batch);
+}
+
 TEST_F(RdmaCompletionFdTest, StaleRkeyFailsFromCq) {
     // The doomed region is larger than slice_size (64 KiB), so one task is
     // many slices. openSegment caches the rkey. Unregister without publishing

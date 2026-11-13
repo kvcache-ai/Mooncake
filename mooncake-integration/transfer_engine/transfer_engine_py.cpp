@@ -1280,7 +1280,7 @@ batch_id_t TransferEnginePy::batchTransferAsync(
                            << enable.ToString();
                 // Only "fall back to polling" needs a distinct signal.
                 // Every other failure keeps the pre-existing return-0 path.
-                if (enable.IsNotSupportedTransport()) {
+                if (enable.IsCompletionNotificationUnsupported()) {
                     throw CompletionNotificationFallback(enable.ToString());
                 }
                 return 0;
@@ -1290,7 +1290,8 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         Status s = engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
-            if (enable_completion_notification && s.IsNotSupportedTransport()) {
+            if (enable_completion_notification &&
+                s.IsCompletionNotificationUnsupported()) {
                 throw CompletionNotificationFallback(s.ToString());
             }
             return 0;

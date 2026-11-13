@@ -1144,7 +1144,7 @@ int TransferEngine::completionFd() const {
 
 Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
     if (use_tent_) {
-        return Status::NotSupportedTransport(
+        return Status::CompletionNotificationUnsupported(
             "completion notification is not available for the TENT runtime");
     }
     return impl_->enableBatchCompletionNotification(batch_id);
@@ -1153,7 +1153,7 @@ Status TransferEngine::enableBatchCompletionNotification(BatchID batch_id) {
 Status TransferEngine::drainCompletions(std::vector<BatchCompletion>& out) {
     if (use_tent_) {
         out.clear();
-        return Status::NotSupportedTransport(
+        return Status::CompletionNotificationUnsupported(
             "completion eventfd is not available for the TENT runtime");
     }
     return impl_->drainCompletions(out);

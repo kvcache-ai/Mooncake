@@ -103,7 +103,9 @@ async def run(engine):
 Notes:
 
 - Local completion only. Peer notify still goes through
-  `getBatchTransferStatus` → `sendNotifyByID`.
+  `getBatchTransferStatus` → `sendNotifyByID`, so
+  `submitTransferWithNotify` rejects an event-enabled batch with
+  `InvalidArgument`. Send the notify after draining instead.
 - v1 does not publish `TIMEOUT` / `CANCELED` onto the fd.
 - Closing the fd does not by itself wake a poller blocked on a dup.
   Engine destruction writes the counter first; that write is the wake.

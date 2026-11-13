@@ -156,6 +156,14 @@ class TransferEngineImpl {
         if (entries.empty()) {
             return Status::InvalidArgument("entries must not be empty");
         }
+        // The notify is stored after submit and sent only from
+        // getBatchTransferStatus. An event-enabled batch can be drained and
+        // freed before it is stored and is not polled, so reject it.
+        if (Transport::toBatchDesc(batch_id).event_enabled) {
+            return Status::InvalidArgument(
+                "submitTransferWithNotify is not supported on an "
+                "event-enabled batch; send the notify after draining");
+        }
         auto target_id = entries[0].target_id;
         Status s = multi_transports_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
