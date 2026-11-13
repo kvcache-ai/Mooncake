@@ -822,7 +822,6 @@ int TransferEngineImpl::registerSharedMemory(
                 if (addr - base < region.length &&
                     buffer.length <= region.length - (addr - base)) {
                     if (region.releasing) return ERR_CONTEXT;
-                    // Sharing must not silently change NIC/location selection.
                     if (region.location != location)
                         return ERR_INVALID_ARGUMENT;
                     bases.push_back(base);
@@ -833,8 +832,6 @@ int TransferEngineImpl::registerSharedMemory(
             bases.push_back(addr);
         }
     }
-    // The strict path checks overlaps and rolls back failed new registrations.
-    // References are committed only after the entire new batch succeeds.
     if (!new_buffers.empty()) {
         int ret = registerLocalMemoryBatchImpl(new_buffers, location);
         if (ret) return ret;
@@ -858,7 +855,6 @@ int TransferEngineImpl::unregisterSharedMemory(
         for (auto ptr : addresses) {
             auto addr = reinterpret_cast<uintptr_t>(ptr);
             if (!unique.insert(addr).second) return ERR_INVALID_ARGUMENT;
-            // An arbitrary interior pointer is not a registration lease.
             if (!shared_memory_users_.count(addr))
                 return ERR_ADDRESS_NOT_REGISTERED;
             auto region = std::prev(local_memory_regions_.upper_bound(addr));
@@ -872,8 +868,7 @@ int TransferEngineImpl::unregisterSharedMemory(
             }
         }
     }
-    // A partial cleanup cannot be shared again. Retry missing members as
-    // already cleaned, and publish even when a transport failed.
+    // On retry, some transports may have already unregistered the region.
     if (!expired.empty()) {
         int first_error = 0;
         for (auto transport : multi_transports_->listTransports()) {

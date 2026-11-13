@@ -167,11 +167,7 @@ class TransferEngine {
 
     int removeLocalSegment(const std::string& segment_name);
 
-    // Opt in before registering any memory or starting concurrent callers.
-    // Classic TE only: all registrations become remote-accessible and
-    // published. Identical/contained regions share a registration until their
-    // last release. Callers must keep the whole allocation alive until every
-    // user releases it.
+    // Enable before registering memory or starting concurrent callers.
     int enableSharedMemoryRegistration();
 
     int registerLocalMemory(void* addr, size_t length,

@@ -462,8 +462,6 @@ class TransferEngineImpl {
                                      const std::string& location);
     int unregisterLocalMemoryBatchImpl(const std::vector<void*>& addresses);
 
-    // Serializes shared registration transactions across transport calls.
-    // The mode is selected during initialization and cannot be disabled.
     bool shared_memory_registration_ = false;
     std::mutex shared_registration_mutex_;
     std::map<uintptr_t, size_t> shared_memory_users_;

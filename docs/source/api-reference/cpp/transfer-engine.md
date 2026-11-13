@@ -189,35 +189,17 @@ For the RDMA transfer process, the source pointer `TransferRequest::source` must
 int enableSharedMemoryRegistration();
 ```
 
-Enables shared registrations on a classic Transfer Engine before any memory is
-registered or concurrent callers start. Returns `0` on success,
-`ERR_INVALID_ARGUMENT` if registrations already exist, and `ERR_NOT_IMPLEMENTED`
-on TENT. Repeated calls after successful enablement return `0`.
+Call before registering memory or starting concurrent callers. Classic TE only;
+TENT and explicit `mp_*` registration are unsupported. Returns `0` on success.
+Identical or contained regions with matching locations share a registration;
+partial overlaps remain errors. Register whole allocations before their views.
+Shared registrations are always remote-accessible and published, regardless of
+`remote_accessible` or `update_metadata`.
 
-Use this when a Store client and another component share one engine and the same
-allocation. The standard single and batch registration APIs then have these
-semantics:
-
-- Every registration is remote-accessible and published from the outset, even
-  when a caller passes `remote_accessible=false` or `update_metadata=false`.
-  This avoids unregistering live memory to upgrade RDMA permissions later.
-- An identical region or a view fully contained in an existing registration
-  acquires a reference. The `location` strings must match. Partial overlaps,
-  extending an existing registration, and overlaps among new regions in one
-  batch remain errors. Register the whole allocation before its views.
-- Each successful registration requires one matching release at its requested
-  start address. Arbitrary interior pointers and duplicate addresses in a batch
-  are rejected. The physical registration survives until its last reference is
-  released. Callers must keep the whole allocation alive until then; reference
-  counting does not manage allocation ownership or wait for transfers.
-- A failed registration batch does not acquire references to existing regions.
-  Failed cleanup retains references for retry and prevents the affected region
-  from being acquired again until cleanup succeeds.
-
-Without this opt-in, duplicate registrations remain errors. Explicit
-`mp_registerLocalMemory` / `mp_unregisterLocalMemory` calls are unsupported in
-shared mode. Store clients must still call their own buffer registration API so
-their zero-copy bookkeeping stays intact.
+Release each registration at its requested start address. Keep the allocation
+alive until all users release it, and finish transfers before release. Failed
+cleanup can be retried; affected regions cannot be acquired until it succeeds.
+Store clients must still use their own buffer registration API.
 
 #### TransferEngine::registerLocalMemory
 
