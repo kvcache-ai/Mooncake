@@ -298,6 +298,16 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     return impl_->getTransferStatus(batch_id, task_id, status);
 }
 
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
+}
+
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     return impl_->getBatchTransferStatus(batch_id, status);
@@ -1053,6 +1063,32 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         return impl_->getTransferStatus(batch_id, task_id, status);
     }
+}
+
+template <typename Output>
+static Status unsupportedTaskCongestionQuery(BatchID batch_id, Output& output,
+                                             const Output& reset) {
+    output = reset;
+    if (batch_id == 0 || batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument("Invalid Batch ID");
+    return Status::NotImplemented(
+        "Task congestion queries are not supported by the TENT backend");
+}
+
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    if (use_tent_)
+        return unsupportedTaskCongestionQuery(batch_id, state,
+                                              TaskCongestionState::kUnknown);
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    if (use_tent_)
+        return unsupportedTaskCongestionQuery(batch_id, detail,
+                                              TaskCongestionDetail{});
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
 }
 
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,

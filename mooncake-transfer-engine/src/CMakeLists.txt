@@ -81,7 +81,8 @@ target_include_directories(
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
          $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/../include>
          $<INSTALL_INTERFACE:include>
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+          ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment)
 target_compile_definitions(transfer_engine PRIVATE MOONCAKE_USE_ETCD
                                                    CMAKE_INCLUDE)
 target_link_libraries(
@@ -141,6 +142,11 @@ if(USE_MACA)
   endif()
   target_include_directories(transfer_engine PRIVATE ${MACA_INCLUDE_DIR})
   target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
+endif()
+
+if(USE_ENFLAME)
+  target_include_directories(transfer_engine PRIVATE ${MC_TOPS_PATH}/include)
+  target_link_libraries(transfer_engine PUBLIC topsrt efrt rt)
 endif()
 
 if(USE_MUSA)

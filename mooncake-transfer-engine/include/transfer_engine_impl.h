@@ -235,6 +235,18 @@ class TransferEngineImpl {
 
     int probePeerAliveByID(SegmentID target_id);
 
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const {
+        return multi_transports_->getTaskCongestionState(batch_id, task_id,
+                                                         state);
+    }
+
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const {
+        return multi_transports_->getTaskCongestionDetail(batch_id, task_id,
+                                                          detail);
+    }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) {
         Status result =
@@ -453,6 +465,8 @@ class TransferEngineImpl {
     void insertMemoryRegionLocked(const MemoryRegion& region);
 
     void eraseMemoryRegionLocked(void* addr);
+
+    void clearSkipRegistrationLocked(void* addr);
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;

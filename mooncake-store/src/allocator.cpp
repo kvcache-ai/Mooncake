@@ -32,6 +32,40 @@ bool IsValidAllocation(const LiveAllocation& allocation,
 
 }  // namespace
 
+struct SegmentLifetime::State {
+    explicit State(ClientSessionSharedPtr owner) : session(std::move(owner)) {}
+
+    std::atomic<bool> valid{true};
+    // Retained directly by State and immutable from construction, so serving
+    // and affiliation checks need neither an atomic shared_ptr load nor a
+    // reference-count increment.
+    const ClientSessionSharedPtr session;
+};
+
+SegmentLifetime::SegmentLifetime(ClientSessionSharedPtr session)
+    : state_(std::make_shared<State>(std::move(session))) {}
+
+bool SegmentLifetime::isValid() const noexcept {
+    return !state_ || state_->valid.load(std::memory_order_acquire);
+}
+
+bool SegmentLifetime::isServing() const noexcept {
+    return isValid() &&
+           (!state_ || !state_->session || state_->session->IsServing());
+}
+
+const ClientSessionSharedPtr& SegmentLifetime::getClientSession()
+    const noexcept {
+    static const ClientSessionSharedPtr kNoSession;
+    return state_ ? state_->session : kNoSession;
+}
+
+void SegmentLifetime::Invalidate() noexcept {
+    if (state_) {
+        state_->valid.store(false, std::memory_order_release);
+    }
+}
+
 void BufferAllocatorBase::AttachUsageTracker(
     const std::shared_ptr<StorageUsageTracker>& usage_tracker) {
     if (!usage_tracker || usage_registration_) {

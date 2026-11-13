@@ -1,6 +1,6 @@
 use super::super::{
     current_time_ms, ClientEpoch, ClientLease, ClientRuntimeId, LocalMemoryConfig, ObjectRoute,
-    Result, RouteTrafficReport, SharedRestorePromotionQueue, StorageOwnerState,
+    Result, SharedRestorePromotionQueue, StorageOwnerState,
 };
 use super::{AsyncOffloadHandle, AsyncRestorePromotionHandle};
 use std::sync::{atomic::Ordering, Arc};
@@ -80,6 +80,16 @@ impl ColdTierHandle {
     }
 
     pub(in super::super) fn background_tick(storage_owner: &StorageOwnerState) {
+        // Always drain the owner-local cold delete queue first. It is a cheap
+        // point lookup per due token and must not be gated behind cold-tier
+        // enablement or local-device presence: a node that owns cold routes can
+        // otherwise accumulate reclaim tokens it never drains, and under
+        // EmbeddedWrh there is no index-scan fallback.
+        if let Err(error) = storage_owner
+            .process_cold_pending_deletes(super::super::PENDING_DELETE_CONFIRMATION_BATCH)
+        {
+            tracing::warn!(error = %error, "background owner-local cold delete reclaim failed");
+        }
         if super::cold_tier_disabled() {
             storage_owner.record_cold_tier_observability_snapshots();
             return;
@@ -114,22 +124,7 @@ impl ColdTierHandle {
         if !self.active || super::cold_tier_disabled() {
             return None;
         }
-        storage_owner.track_route(route);
-        Self::publish_initial_cold_backing_for_tracked_route(storage_owner, route)
-    }
-
-    pub(in super::super) fn on_routes_tracked(
-        storage_owner: &StorageOwnerState,
-        routes: &[ObjectRoute],
-    ) -> RouteTrafficReport {
-        let report = storage_owner.track_routes(routes);
-        if super::cold_tier_disabled() {
-            return report;
-        }
-        for route in routes {
-            Self::publish_initial_cold_backing_for_tracked_route(storage_owner, route);
-        }
-        report
+        Self::publish_initial_cold_backing(storage_owner, route)
     }
 
     pub(in super::super) fn kick_offload_for_allocator_eviction(storage_owner: &StorageOwnerState) {
@@ -145,7 +140,7 @@ impl ColdTierHandle {
         }
     }
 
-    fn publish_initial_cold_backing_for_tracked_route(
+    fn publish_initial_cold_backing(
         storage_owner: &StorageOwnerState,
         route: &ObjectRoute,
     ) -> Option<ObjectRoute> {

@@ -28,16 +28,27 @@
 
 namespace mooncake {
 
+bool isDtkDeviceMemory(void* addr) {
+    hipPointerAttribute_t attr{};
+    if (hipPointerGetAttributes(&attr, addr) != hipSuccess ||
+        attr.type != hipMemoryTypeDevice) {
+        (void)hipGetLastError();
+        return false;
+    }
+    return true;
+}
+
+bool localSegmentHasHylink(const std::shared_ptr<TransferMetadata>& metadata) {
+    if (!metadata) return false;
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    return desc && desc->protocol.find("hylink") != std::string::npos;
+}
+
 namespace {
 
 constexpr uint32_t kHylinkMagic = 0x4B4C5948u;  // 'HYLK'
 constexpr uint16_t kHylinkVersion = 1;
 constexpr uint16_t kFlagFabric = 2u;
-constexpr auto kDtkFabricHandleType =
-    static_cast<hipMemAllocationHandleType>(0x8);
-constexpr size_t kDtkFabricHandleBytes = 512;
-using DtkFabricHandle = std::array<unsigned char, kDtkFabricHandleBytes>;
-
 #pragma pack(push, 1)
 struct HylinkBlobHeader {
     uint32_t magic;
@@ -236,11 +247,7 @@ HylinkTransport::HylinkTransport() = default;
 
 HylinkTransport::~HylinkTransport() {
     RWSpinlock::WriteGuard guard(remap_lock_);
-    for (auto& segment : remap_) {
-        for (auto& buffer : segment.second) {
-            for (auto& device : buffer.second) closeMapping(device.second);
-        }
-    }
+    for (auto& entry : remap_) closeMapping(entry.second);
     remap_.clear();
     std::lock_guard<std::mutex> streams(stream_pool_mutex_);
     for (auto& pool : stream_pools_) {
@@ -411,6 +418,7 @@ void HylinkTransport::closeMapping(OpenedMapping& mapping) {
     mapping.shm_addr = nullptr;
     mapping.fabric_handle = nullptr;
     mapping.length = 0;
+    mapping.shareable.reset();
 }
 
 Status HylinkTransport::startAsyncTransfer(const TransferRequest& request,
@@ -577,11 +585,21 @@ int HylinkTransport::registerLocalMemory(void* addr, size_t length,
     hipPointerAttribute_t attr;
     hipError_t attr_err = hipPointerGetAttributes(&attr, addr);
     if (attr_err != hipSuccess || attr.type != hipMemoryTypeDevice) {
+        // This transport exports device fabric allocations only.
+        // In multi-protocol builds, skip addresses not identified as device
+        // memory and leave them to other transports. Otherwise, reject them
+        // rather than report success without a HyLink buffer.
         (void)hipGetLastError();
+#ifdef ENABLE_MULTI_PROTOCOL
         if (globalConfig().trace) {
             LOG(INFO) << "HylinkTransport: skipping non-device memory " << addr;
         }
         return 0;
+#else
+        LOG(ERROR) << "HylinkTransport: memory at " << addr
+                   << " is not device memory";
+        return -1;
+#endif
     }
 
     int saved = 0;
@@ -616,9 +634,12 @@ int HylinkTransport::registerLocalMemory(void* addr, size_t length,
         hipMemGenericAllocationHandle_t handle = nullptr;
         hipError_t retain_err = hipMemRetainAllocationHandle(&handle, base);
         if (retain_err != hipSuccess || !handle) {
+            // HyLink owns device memory when installed alongside RDMA.
+            // Reject allocations that cannot be exported: RDMA skips device
+            // memory, so reporting success here would leave no usable path.
             (void)hipGetLastError();
-            LOG(ERROR) << "HylinkTransport: memory at " << addr
-                       << " is not a DTK fabric allocation";
+            LOG(ERROR) << "HylinkTransport: device memory at " << addr
+                       << " cannot be exported as a DTK fabric allocation";
             (void)hipSetDevice(saved);
             return -1;
         }
@@ -652,22 +673,37 @@ int HylinkTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     } else {
         (void)hipGetLastError();
     }
-    {
-        std::lock_guard<std::mutex> lock(register_mutex_);
-        registered_exports_.erase(key);
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    auto registered = registered_exports_.find(key);
+    // Registration skips host memory. Do not remove another transport's
+    // metadata when unregistering an address that HyLink never exported.
+    if (registered == registered_exports_.end()) return 0;
+
+    int ret = metadata_->removeLocalMemoryBuffer(
+        reinterpret_cast<void*>(key),
+        [](const BufferDesc& desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+            return desc.protocol == "hylink";
+#else
+            (void)desc;
+            return true;
+#endif
+        },
+        false);
+    if (ret != 0 && ret != ERR_ADDRESS_NOT_REGISTERED) return ret;
+    // When publication is requested, retain the export record on failure
+    // so this transport can retry after removing its local metadata.
+    if (update_metadata) {
+        ret = metadata_->updateLocalSegmentDesc();
+        if (ret != 0) return ret;
     }
-    return metadata_->removeLocalMemoryBuffer(reinterpret_cast<void*>(key),
-                                              update_metadata);
+    registered_exports_.erase(registered);
+    return 0;
 }
 
 int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                                  uint64_t length,
                                                  uint64_t target_id) {
-    int device_id = 0;
-    if (hipGetDevice(&device_id) != hipSuccess) {
-        (void)hipGetLastError();
-        return ERR_INVALID_ARGUMENT;
-    }
     auto desc = metadata_->getSegmentDescByID(target_id);
     if (!desc) {
         LOG(ERROR) << "HylinkTransport: missing segment " << target_id;
@@ -683,38 +719,35 @@ int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         if (!entry.protocol.empty() && entry.protocol != "hylink") continue;
 #endif
 
+        const auto key = std::make_pair(target_id, entry.addr);
         {
             remap_lock_.lockShared();
-            auto segment = remap_.find(target_id);
-            if (segment != remap_.end()) {
-                auto buffer = segment->second.find(entry.addr);
-                if (buffer != segment->second.end()) {
-                    auto mapping = buffer->second.find(device_id);
-                    if (mapping != buffer->second.end()) {
-                        dest_addr = dest_addr - entry.addr +
-                                    reinterpret_cast<uint64_t>(
-                                        mapping->second.shm_addr);
-                        remap_lock_.unlockShared();
-                        return 0;
-                    }
-                }
+            auto mapping = remap_.find(key);
+            if (mapping != remap_.end()) {
+                dest_addr =
+                    dest_addr - entry.addr +
+                    reinterpret_cast<uint64_t>(mapping->second.shm_addr);
+                remap_lock_.unlockShared();
+                return 0;
             }
             remap_lock_.unlockShared();
         }
 
         RWSpinlock::WriteGuard guard(remap_lock_);
-        auto& device_map = remap_[target_id][entry.addr];
-        auto existing = device_map.find(device_id);
-        if (existing == device_map.end()) {
-            DtkFabricHandle fabric{};
-            if (!decodeFabric(entry.shm_name, fabric)) {
+        auto existing = remap_.find(key);
+        if (existing == remap_.end()) {
+            OpenedMapping opened;
+            opened.length = entry.length;
+            // DTK fabric workaround: avoid reusing a stack handle address
+            // across imports; keep each blob alive with its mapping.
+            opened.shareable = std::make_unique<DtkFabricHandle>();
+            if (!decodeFabric(entry.shm_name, *opened.shareable)) {
                 LOG(ERROR) << "HylinkTransport: malformed fabric handle";
                 return -1;
             }
-            OpenedMapping opened;
-            opened.length = entry.length;
             hipError_t err = hipMemImportFromShareableHandle(
-                &opened.fabric_handle, fabric.data(), kDtkFabricHandleType);
+                &opened.fabric_handle, opened.shareable->data(),
+                kDtkFabricHandleType);
             if (err != hipSuccess) {
                 LOG(ERROR) << "HylinkTransport: import failed: "
                            << hipGetErrorString(err);
@@ -736,17 +769,25 @@ int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                            << hipGetErrorString(err);
                 return -1;
             }
-            if (hipSetDevice(device_id) != hipSuccess) {
-                closeMapping(opened);
+            int device_count = 0;
+            err = hipGetDeviceCount(&device_count);
+            if (err != hipSuccess || device_count <= 0) {
                 (void)hipGetLastError();
+                closeMapping(opened);
+                LOG(ERROR) << "HylinkTransport: cannot enumerate devices for "
+                              "fabric mapping, count="
+                           << device_count
+                           << ", error=" << hipGetErrorString(err);
                 return -1;
             }
-            hipMemAccessDesc access{};
-            access.location.type = hipMemLocationTypeDevice;
-            access.location.id = device_id;
-            access.flags = hipMemAccessFlagsProtReadWrite;
+            std::vector<hipMemAccessDesc> access(device_count);
+            for (int i = 0; i < device_count; ++i) {
+                access[i].location.type = hipMemLocationTypeDevice;
+                access[i].location.id = i;
+                access[i].flags = hipMemAccessFlagsProtReadWrite;
+            }
             err = hipMemSetAccess((hipDeviceptr_t)opened.shm_addr,
-                                  opened.length, &access, 1);
+                                  opened.length, access.data(), access.size());
             if (err != hipSuccess) {
                 (void)hipGetLastError();
                 closeMapping(opened);
@@ -754,10 +795,7 @@ int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                            << hipGetErrorString(err);
                 return -1;
             }
-            LOG(INFO) << "HylinkTransport: opened DTK fabric mapping for "
-                      << (void*)entry.addr << " on device " << device_id;
-            device_map.emplace(device_id, opened);
-            existing = device_map.find(device_id);
+            existing = remap_.emplace(key, std::move(opened)).first;
         }
         dest_addr = dest_addr - entry.addr +
                     reinterpret_cast<uint64_t>(existing->second.shm_addr);

@@ -501,6 +501,9 @@ Client::~Client() {
     if (storage_heartbeat_thread_.joinable()) {
         storage_heartbeat_thread_.join();
     }
+    if (!gather_endpoint_.empty())
+        (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
+                                                   gather_endpoint_, true);
 
     leader_monitor_running_ = false;
     if (leader_monitor_thread_.joinable()) {
@@ -516,6 +519,10 @@ Client::~Client() {
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
     task_thread_pool_.stop();
+
+    // Unmount callbacks must finish before the service and sources are drained.
+    gather_service_.reset();
+    gather_clients_.clear();
 
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
@@ -1109,11 +1116,30 @@ ErrorCode Client::InitTransferEngine(
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "cxi") {
+            // Auto-discovery is RDMA-only, so populate the topology with the
+            // CXI NICs before installing the transport (an empty device list
+            // means "all NICs"); otherwise CxiTransport finds no devices.
+            std::vector<std::string> devices;
+            if (device_names.has_value() && !device_names->empty()) {
+                devices = ParseDeviceNames(device_names.value());
+            }
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete for CXI. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
             try {
                 transport = transfer_engine_->installTransport("cxi", nullptr);
             } catch (std::exception& e) {
                 LOG(ERROR) << "cxi_transport_install_failed error_message=\""
                            << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install CXI transport";
+                return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
@@ -3968,6 +3994,8 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
+    if (gather_service_)
+        gather_service_->removeSource(reinterpret_cast<void*>(it->second.base));
     int rc = transfer_engine_->unregisterLocalMemory(
         reinterpret_cast<void*>(it->second.base));
     if (rc != 0) {
@@ -4059,9 +4087,36 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.te_endpoint = local_hostname_;
         }
 
+        // Only CPU memory on classic RDMA owners enables gather.
+        // Service setup failure leaves the existing direct path available.
+        if (SupportsGatherRead() && protocol == "rdma" &&
+            !device::GetAcceleratorRegistry()
+                 .RuntimeAccelerators()
+                 .FindDeviceForPointer(buffer)) {
+            try {
+                if (!gather_service_) {
+                    auto service = std::make_unique<store::GatherReadService>(
+                        transfer_engine_, store::GatherReadOptions{},
+                        GetSegmentEndpoint());
+                    service->start("0.0.0.0");
+                    gather_endpoint_ = buildHostNameWithPort(
+                        getHostNameWithoutPort(
+                            transfer_engine_->getLocalIpAndPort()),
+                        service->port());
+                    gather_service_ = std::move(service);
+                    (void)master_client_.PublishGatherEndpoint(
+                        GetSegmentEndpoint(), gather_endpoint_);
+                }
+                gather_service_->addSource(const_cast<void*>(buffer), size);
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Store gather unavailable: " << e.what();
+            }
+        }
         auto mount_result = master_client_.MountSegment(segment);
         if (!mount_result) {
             ErrorCode err = mount_result.error();
+            if (gather_service_)
+                gather_service_->removeSource(const_cast<void*>(buffer));
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
             return tl::unexpected(err);
@@ -4156,6 +4211,9 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
             std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
             auto it = gracefully_unmounting_segments_.find(segment_id);
             if (it != gracefully_unmounting_segments_.end()) {
+                if (gather_service_)
+                    gather_service_->removeSource(
+                        reinterpret_cast<void*>(it->second.base));
                 int rc = transfer_engine_->unregisterLocalMemory(
                     reinterpret_cast<void*>(it->second.base));
                 if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
@@ -5702,6 +5760,16 @@ void Client::StorageHeartbeatThreadMain() {
                                      [this] { return master_client_.Ping(); })
                                : master_client_.Ping();
         if (ping_result) {
+            // Ephemeral gather discovery survives Master restart/failover
+            // through the existing owner heartbeat, not snapshot metadata.
+            std::string gather_endpoint;
+            {
+                std::lock_guard lock(mounted_segments_mutex_);
+                gather_endpoint = gather_endpoint_;
+            }
+            if (!gather_endpoint.empty())
+                (void)master_client_.PublishGatherEndpoint(GetSegmentEndpoint(),
+                                                           gather_endpoint);
             // Reset ping failure count
             ping_fail_count = 0;
             last_ping_success_.store(true);
@@ -6037,6 +6105,56 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
         }
     }
     return false;
+}
+
+std::optional<store::GatherReadOperation> Client::SubmitGatherRead(
+    const std::string& endpoint,
+    const std::vector<store::GatherReadRange>& ranges, void* destination,
+    size_t capacity) {
+    if (!SupportsGatherRead() || endpoint.empty()) return std::nullopt;
+    std::shared_ptr<GatherPeer> peer_ptr;
+    {
+        std::lock_guard lock(gather_clients_mutex_);
+        auto& slot = gather_clients_[endpoint];
+        if (!slot) slot = std::make_shared<GatherPeer>();
+        peer_ptr = slot;
+    }
+    auto& peer = *peer_ptr;
+    std::lock_guard lock(peer.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= peer.refresh_at) {
+        auto discovered = master_client_.ResolveGatherEndpoint(endpoint);
+        const std::string resolved = discovered ? *discovered : "";
+        if (resolved != peer.endpoint) peer.clients.clear();
+        peer.endpoint = resolved;
+        peer.refresh_at = now + std::chrono::seconds(resolved.empty() ? 5 : 30);
+    }
+    if (peer.endpoint.empty()) return std::nullopt;
+    auto& clients = peer.clients;
+    std::erase_if(clients,
+                  [](const auto& client) { return client->retired(); });
+    auto it =
+        std::find_if(clients.begin(), clients.end(),
+                     [](const auto& client) { return client->available(); });
+    if (it == clients.end()) {
+        if (clients.size() >= 64) return std::nullopt;
+        try {
+            clients.push_back(std::make_unique<store::GatherReadClient>(
+                transfer_engine_, peer.endpoint, std::chrono::seconds(60),
+                endpoint));
+        } catch (const std::exception& e) {
+            peer.refresh_at = now + std::chrono::seconds(5);
+            peer.endpoint.clear();
+            clients.clear();
+            LOG(WARNING) << "Store gather connection unavailable: " << e.what();
+            return std::nullopt;
+        }
+        it = std::prev(clients.end());
+    }
+    // The synchronous get_into_ranges caller owns the destination and its
+    // registration until all operations (including recovery fences) finish.
+    return (*it)->submitGatherRead(ranges, destination, capacity,
+                                   transfer_engine_);
 }
 
 }  // namespace mooncake

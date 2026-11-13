@@ -330,22 +330,26 @@ Status HylinkTransport::install(std::string& local_segment_name,
         conf_.reset();
         return peer_status;
     }
-    installed_ = true;
+    {
+        RWSpinlock::WriteGuard guard(relocate_lock_);
+        installed_ = true;
+    }
     LOG(INFO) << "HylinkTransport installed ("
               << (hylinkUseVmm() ? "DTK fabric handle" : "HIP IPC") << ")";
     return Status::OK();
 }
 
 Status HylinkTransport::uninstall() {
-    if (!installed_) return Status::OK();
     {
+        // installed_ and metadata_ are published under relocate_lock_. Clear
+        // the map before releasing the lock so a first-time relocate cannot
+        // insert a mapping that this uninstall would never close.
         RWSpinlock::WriteGuard guard(relocate_lock_);
-        for (auto& segment : relocate_map_) {
-            for (auto& entry : segment.second)
-                for (auto& dev : entry.second) closeMapping(dev.second);
-        }
+        if (!installed_) return Status::OK();
+        installed_ = false;
+        for (auto& entry : relocate_map_) closeMapping(entry.second);
         relocate_map_.clear();
-        relocate_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        metadata_.reset();
     }
     {
         std::lock_guard<std::mutex> lock(stream_pool_mutex_);
@@ -359,8 +363,6 @@ Status HylinkTransport::uninstall() {
         stream_cursors_.clear();
         if (have_device) (void)hipSetDevice(saved);
     }
-    metadata_.reset();
-    installed_ = false;
     return Status::OK();
 }
 
@@ -383,6 +385,7 @@ void HylinkTransport::closeMapping(OpenedMapping& mapping) {
     mapping.shm_addr = nullptr;
     mapping.fabric_handle = nullptr;
     mapping.kind = HylinkHandleKind::kNone;
+    mapping.shareable.reset();
 }
 
 Status HylinkTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
@@ -479,7 +482,7 @@ Status HylinkTransport::startAsyncTransfer(const Request& request,
     uint64_t target_addr = request.target_offset;
     if (request.target_id != LOCAL_SEGMENT_ID) {
         status = relocateSharedMemoryAddress(target_addr, request.length,
-                                             request.target_id, device_id);
+                                             request.target_id);
     }
     if (status.ok()) {
         task.device_id = device_id;
@@ -733,63 +736,58 @@ Status HylinkTransport::removeMemoryBuffer(BufferDesc& desc) {
 Status HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                                     uint64_t length,
                                                     uint64_t target_id,
-                                                    int device_id,
                                                     HylinkHandleKind* kind) {
-    thread_local RelocateMap tl_relocate_map;
-    thread_local uint64_t tl_epoch = 0;
-    const uint64_t epoch = relocate_epoch_.load(std::memory_order_acquire);
-    if (tl_epoch != epoch) {
-        tl_relocate_map.clear();
-        tl_epoch = epoch;
-    }
-    auto cached = tl_relocate_map.find(target_id);
-    if (cached != tl_relocate_map.end()) {
-        for (auto& entry : cached->second) {
-            if (entry.second.empty()) continue;
-            const auto& any = entry.second.begin()->second;
-            if (entry.first > dest_addr ||
-                dest_addr + length > entry.first + any.length)
-                continue;
-            // An imported fabric VA can be granted only once, to one device.
-            // A miss here opens a new import+map for this GPU.
-            const int map_key =
-                any.kind == HylinkHandleKind::kFabric ? device_id : -1;
-            auto found = entry.second.find(map_key);
-            if (found == entry.second.end()) break;
-            const auto& mapping = found->second;
-            dest_addr = dest_addr - entry.first +
-                        reinterpret_cast<uint64_t>(mapping.shm_addr);
-            if (kind) *kind = mapping.kind;
-            return Status::OK();
+    std::shared_ptr<ControlService> metadata;
+    {
+        RWSpinlock::ReadGuard guard(relocate_lock_);
+        if (!installed_ || !metadata_) {
+            return Status::InvalidArgument(
+                "hylink transport is not installed" LOC_MARK);
         }
+        metadata = metadata_;
     }
 
-    RWSpinlock::WriteGuard guard(relocate_lock_);
-    BufferDesc* buffer = nullptr;
+    uint64_t buffer_addr = 0;
+    uint64_t buffer_length = 0;
+    std::string shm_path;
     bool same_machine = false;
     SegmentDescRef pin;
-    CHECK_STATUS(metadata_->segmentManager().withCachedSegment(
+    CHECK_STATUS(metadata->segmentManager().withCachedSegment(
         target_id, pin, [&](SegmentDesc* segment) {
-            buffer = segment->findBuffer(dest_addr, length);
+            BufferDesc* buffer = segment->findBuffer(dest_addr, length);
             if (!buffer || buffer->shm_path.empty()) {
                 return Status::NeedsRefreshCache(
                     "hylink target buffer has no export handle" LOC_MARK);
             }
+            buffer_addr = buffer->addr;
+            buffer_length = buffer->length;
+            shm_path = buffer->shm_path;
             same_machine = !segment->machine_id.empty() &&
                            segment->machine_id == machine_id_;
             return Status::OK();
         }));
 
-    auto segment_entries = relocate_map_.find(target_id);
-    // Fabric: one import+map+SetAccess per local GPU. IPC is shared (key -1).
-    const int map_key = hylinkUseVmm() ? device_id : -1;
-    const bool already_open =
-        segment_entries != relocate_map_.end() &&
-        segment_entries->second.count(buffer->addr) != 0 &&
-        segment_entries->second.at(buffer->addr).count(map_key) != 0;
-    if (!already_open) {
+    const auto key = std::make_pair(target_id, buffer_addr);
+    {
+        RWSpinlock::ReadGuard guard(relocate_lock_);
+        auto mapping = relocate_map_.find(key);
+        if (mapping != relocate_map_.end()) {
+            if (kind) *kind = mapping->second.kind;
+            dest_addr = dest_addr - buffer_addr +
+                        reinterpret_cast<uint64_t>(mapping->second.shm_addr);
+            return Status::OK();
+        }
+    }
+
+    RWSpinlock::WriteGuard guard(relocate_lock_);
+    if (!installed_) {
+        return Status::InvalidArgument(
+            "hylink transport is not installed" LOC_MARK);
+    }
+    auto existing = relocate_map_.find(key);
+    if (existing == relocate_map_.end()) {
         ExportedHandle exported;
-        if (!decodeExport(buffer->shm_path, exported)) {
+        if (!decodeExport(shm_path, exported)) {
             return Status::InvalidArgument(
                 "hylink target buffer has a malformed handle" LOC_MARK);
         }
@@ -798,7 +796,7 @@ Status HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         // mapping. =0 opens a HIP IPC handle, which cannot cross machines.
         void* mapped = nullptr;
         OpenedMapping opened;
-        opened.length = buffer->length;
+        opened.length = buffer_length;
         if (!hylinkUseVmm()) {
             if (!exported.has_ipc) {
                 return Status::InvalidArgument(
@@ -813,12 +811,16 @@ Status HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                           hipIpcMemLazyEnablePeerAccess));
             opened.kind = HylinkHandleKind::kIpc;
             LOG(INFO) << "HylinkTransport: opened intra-node IPC mapping for "
-                      << (void*)buffer->addr;
+                      << (void*)buffer_addr;
         } else if (exported.has_fabric) {
-            const size_t map_length = buffer->length;
+            const size_t map_length = buffer_length;
+            // DTK fabric workaround: avoid reusing a stack handle address
+            // across imports; keep each blob alive with its mapping.
+            opened.shareable =
+                std::make_unique<DtkFabricHandle>(exported.fabric);
             hipMemGenericAllocationHandle_t handle = nullptr;
             CHECK_HIP(hipMemImportFromShareableHandle(
-                &handle, exported.fabric.data(), kDtkFabricHandleType));
+                &handle, opened.shareable->data(), kDtkFabricHandleType));
             hipError_t err = hipMemAddressReserve((hipDeviceptr_t*)&mapped,
                                                   map_length, 0, nullptr, 0);
             if (err != hipSuccess) {
@@ -838,19 +840,33 @@ Status HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
             opened.fabric_handle = handle;
             LOG(INFO) << "HylinkTransport: opened "
                       << (same_machine ? "same-node" : "cross-node")
-                      << " DTK fabric mapping for " << (void*)buffer->addr;
+                      << " DTK fabric mapping for " << (void*)buffer_addr;
         } else {
             return Status::InvalidArgument(
                 "hylink target buffer has no usable handle" LOC_MARK);
         }
         opened.shm_addr = mapped;
         if (opened.kind == HylinkHandleKind::kFabric) {
-            hipMemAccessDesc access{};
-            access.location.type = hipMemLocationTypeDevice;
-            access.location.id = device_id;
-            access.flags = hipMemAccessFlagsProtReadWrite;
-            hipError_t access_err = hipMemSetAccess(
-                (hipDeviceptr_t)opened.shm_addr, opened.length, &access, 1);
+            int device_count = 0;
+            hipError_t count_err = hipGetDeviceCount(&device_count);
+            if (count_err != hipSuccess || device_count <= 0) {
+                (void)hipGetLastError();
+                closeMapping(opened);
+                return Status::InternalError(
+                    std::string(
+                        "cannot enumerate devices for fabric mapping, count=") +
+                    std::to_string(device_count) +
+                    ", error=" + hipGetErrorString(count_err) + LOC_MARK);
+            }
+            std::vector<hipMemAccessDesc> access(device_count);
+            for (int i = 0; i < device_count; ++i) {
+                access[i].location.type = hipMemLocationTypeDevice;
+                access[i].location.id = i;
+                access[i].flags = hipMemAccessFlagsProtReadWrite;
+            }
+            hipError_t access_err =
+                hipMemSetAccess((hipDeviceptr_t)opened.shm_addr, opened.length,
+                                access.data(), access.size());
             if (access_err != hipSuccess) {
                 (void)hipGetLastError();
                 closeMapping(opened);
@@ -859,15 +875,11 @@ Status HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                     hipGetErrorString(access_err) + LOC_MARK);
             }
         }
-        relocate_map_[target_id][buffer->addr][map_key] = opened;
+        existing = relocate_map_.emplace(key, std::move(opened)).first;
     }
-    tl_relocate_map = relocate_map_;
-    tl_epoch = relocate_epoch_.load(std::memory_order_acquire);
-
-    auto& mapping = relocate_map_.at(target_id).at(buffer->addr).at(map_key);
-    auto shm_addr = mapping.shm_addr;
-    if (kind) *kind = mapping.kind;
-    dest_addr = dest_addr - buffer->addr + reinterpret_cast<uint64_t>(shm_addr);
+    if (kind) *kind = existing->second.kind;
+    dest_addr = dest_addr - buffer_addr +
+                reinterpret_cast<uint64_t>(existing->second.shm_addr);
     return Status::OK();
 }
 

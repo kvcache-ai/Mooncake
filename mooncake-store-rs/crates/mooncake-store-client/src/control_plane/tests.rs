@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
+use std::ops::Bound;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -25,22 +27,27 @@ use crate::control_plane::pb;
 use crate::control_plane::pb::control_plane_service_server::ControlPlaneService as _;
 use crate::observability::{metrics_test_lock, render_prometheus_metrics, reset_metrics};
 use mooncake_store_core::{
-    CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, ColdBackingReplica, ColdBackingRoute, ColdBackingState,
-    CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
-    RouteCasRequest, RouteState, RouteVersion, SegmentName, SegmentReservation, StoreError,
+    AllocationRouteIdentity, CasResult, ClientEndpointSet, ClientEpoch, ClientLease,
+    ClientLifecycleState, ClientRuntimeId, ClientStableId, ColdBackingReplica, ColdBackingRoute,
+    ColdBackingState, CompatibilityDescriptor, NamespaceScope, ObjectKey, ObjectRoute,
+    ReplicaRoute, ReplicaTier, RouteCasRequest, RouteState, RouteVersion, SegmentName,
+    SegmentReservation, StoreError,
 };
+use mooncake_store_route::RouteOwnerPageQuery;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 #[derive(Default)]
 struct TestAuthority {
     routes: Mutex<BTreeMap<String, ObjectRoute>>,
+    delete_versions: Mutex<BTreeMap<String, RouteVersion>>,
+    route_epoch: AtomicU64,
 }
 
 impl TestAuthority {
     fn insert(&self, route: ObjectRoute) {
         self.routes.lock().insert(route.key.0.clone(), route);
+        self.route_epoch.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -52,6 +59,29 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
         Ok(self.routes.lock().get(&key.0).cloned())
+    }
+
+    fn get_route_record(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<mooncake_store_route::RouteAuthorityRecord> {
+        Ok(mooncake_store_route::RouteAuthorityRecord {
+            route: self.get_route(namespace, authority, key)?,
+            delete_version: self.delete_versions.lock().get(&key.0).copied(),
+        })
+    }
+
+    fn batch_get_route_records(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<mooncake_store_core::Result<mooncake_store_route::RouteAuthorityRecord>> {
+        keys.iter()
+            .map(|key| self.get_route_record(namespace, authority, key))
+            .collect()
     }
 
     fn list_routes_by_replica_owner(
@@ -75,27 +105,37 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
         _authority: &ClientStableId,
         owner: &ClientRuntimeId,
         cursor: Option<&str>,
+        snapshot_epoch: Option<u64>,
         limit: usize,
     ) -> mooncake_store_core::Result<mooncake_store_route::RouteOwnerPage> {
-        let routes = self.routes.lock();
-        let mut matching = routes
-            .iter()
-            .filter(|(key, route)| {
-                cursor.map_or(true, |cursor| key.as_str() > cursor)
-                    && route.replicas.iter().any(|replica| &replica.owner == owner)
-            })
+        let route_table = self.routes.lock();
+        let current_epoch = self.route_epoch.load(Ordering::SeqCst);
+        if let Some(snapshot_epoch) = snapshot_epoch.filter(|epoch| *epoch != current_epoch) {
+            return Err(StoreError::StaleEpoch(format!(
+                "test authority snapshot changed: expected epoch {snapshot_epoch}, current epoch {current_epoch}"
+            )));
+        }
+        let limit = limit.max(1);
+        let start = cursor.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut routes = Vec::with_capacity(limit);
+        for route in route_table
+            .range::<str, _>((start, Bound::Unbounded))
+            .filter(|(_, route)| route.replicas.iter().any(|replica| &replica.owner == owner))
             .map(|(_, route)| route.clone())
-            .take(limit.max(1).saturating_add(1))
-            .collect::<Vec<_>>();
-        let next_cursor = if matching.len() > limit.max(1) {
-            matching.pop();
-            matching.last().map(|route| route.key.0.clone())
-        } else {
-            None
-        };
+        {
+            if routes.len() == limit {
+                return Ok(mooncake_store_route::RouteOwnerPage {
+                    next_cursor: routes.last().map(|route: &ObjectRoute| route.key.0.clone()),
+                    routes,
+                    snapshot_epoch: Some(current_epoch),
+                });
+            }
+            routes.push(route);
+        }
         Ok(mooncake_store_route::RouteOwnerPage {
-            routes: matching,
-            next_cursor,
+            routes,
+            next_cursor: None,
+            snapshot_epoch: Some(current_epoch),
         })
     }
 
@@ -120,10 +160,12 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
                     routes.remove(&key.0);
                 }
             }
+            self.route_epoch.fetch_add(1, Ordering::SeqCst);
         }
         Ok(CasResult {
             applied,
             current,
+            delete_version: None,
             version_floor: None,
         })
     }
@@ -144,6 +186,7 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
                 routes.remove(&key.0);
             }
         }
+        self.route_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -152,6 +195,7 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
 struct TestAllocator {
     next_offset: Mutex<u64>,
     released: Mutex<Vec<ReleaseOp>>,
+    pending_publication_reserves: AtomicUsize,
 }
 
 impl AllocatorService for TestAllocator {
@@ -168,6 +212,7 @@ impl AllocatorService for TestAllocator {
             segment_name: SegmentName::new("auto-segment"),
             offset_bytes,
             length_bytes,
+            allocation_id: offset_bytes.saturating_add(1),
         })
     }
 
@@ -182,6 +227,7 @@ impl AllocatorService for TestAllocator {
             segment_name: segment_name.clone(),
             offset_bytes: 4_096,
             length_bytes,
+            allocation_id: 4_097,
         })
     }
 
@@ -191,19 +237,41 @@ impl AllocatorService for TestAllocator {
         segment_name: &SegmentName,
         offset_bytes: u64,
         length_bytes: u64,
+        allocation_id: u64,
     ) -> mooncake_store_core::Result<()> {
         self.released.lock().push(ReleaseOp {
             segment_name: segment_name.clone(),
             offset_bytes,
             length_bytes,
+            allocation_id,
         });
         Ok(())
+    }
+    fn batch_reserve_any_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: &[u64],
+    ) -> Vec<mooncake_store_core::Result<SegmentReservation>> {
+        self.pending_publication_reserves
+            .fetch_add(length_bytes.len(), Ordering::Relaxed);
+        self.batch_reserve_any(owner, length_bytes)
+    }
+
+    fn batch_reserve_specific_with_pending_publication(
+        &self,
+        owner: &ClientRuntimeId,
+        requests: &[ReserveSpecificOp],
+    ) -> Vec<mooncake_store_core::Result<SegmentReservation>> {
+        self.pending_publication_reserves
+            .fetch_add(requests.len(), Ordering::Relaxed);
+        self.batch_reserve_specific(owner, requests)
     }
 }
 
 #[derive(Default)]
 struct TestEviction {
     reported: Mutex<Vec<ObjectKey>>,
+    delete_pending: Mutex<Vec<super::DeletePendingEntry>>,
 }
 
 impl EvictionService for TestEviction {
@@ -228,6 +296,14 @@ impl EvictionService for TestEviction {
             .map(|replica| replica.length)
             .sum();
         Ok(RouteTrafficReport::new(routes.len(), bytes))
+    }
+
+    fn batch_notify_delete_pending(
+        &self,
+        entries: &[super::DeletePendingEntry],
+    ) -> mooncake_store_core::Result<usize> {
+        self.delete_pending.lock().extend_from_slice(entries);
+        Ok(entries.len())
     }
 }
 
@@ -272,6 +348,13 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         request: Request<pb::ListRoutesByReplicaOwnerRequest>,
     ) -> std::result::Result<Response<pb::ListRoutesByReplicaOwnerReply>, Status> {
         self.inner.list_routes_by_replica_owner(request).await
+    }
+
+    async fn get_allocation_route_references(
+        &self,
+        request: Request<pb::GetAllocationRouteReferencesRequest>,
+    ) -> std::result::Result<Response<pb::GetAllocationRouteReferencesReply>, Status> {
+        self.inner.get_allocation_route_references(request).await
     }
 
     async fn batch_compare_and_swap_routes(
@@ -447,6 +530,12 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         _request: Request<tonic::Streaming<pb::ControlStreamRequest>>,
     ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
         Err(Status::unavailable("stream disabled"))
+    }
+    async fn batch_notify_delete_pending(
+        &self,
+        request: Request<pb::BatchNotifyDeletePendingRequest>,
+    ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
+        self.inner.batch_notify_delete_pending(request).await
     }
 }
 
@@ -580,6 +669,13 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
         self.inner.list_routes_by_replica_owner(request).await
     }
 
+    async fn get_allocation_route_references(
+        &self,
+        request: Request<pb::GetAllocationRouteReferencesRequest>,
+    ) -> std::result::Result<Response<pb::GetAllocationRouteReferencesReply>, Status> {
+        self.inner.get_allocation_route_references(request).await
+    }
+
     async fn batch_compare_and_swap_routes(
         &self,
         request: Request<pb::BatchCompareAndSwapRoutesRequest>,
@@ -754,6 +850,12 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
     ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
         Err(Status::unavailable("stream disabled"))
     }
+    async fn batch_notify_delete_pending(
+        &self,
+        request: Request<pb::BatchNotifyDeletePendingRequest>,
+    ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
+        self.inner.batch_notify_delete_pending(request).await
+    }
 }
 
 struct DelayedUnaryHandle {
@@ -885,6 +987,13 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
         request: Request<pb::ListRoutesByReplicaOwnerRequest>,
     ) -> std::result::Result<Response<pb::ListRoutesByReplicaOwnerReply>, Status> {
         self.inner.list_routes_by_replica_owner(request).await
+    }
+
+    async fn get_allocation_route_references(
+        &self,
+        request: Request<pb::GetAllocationRouteReferencesRequest>,
+    ) -> std::result::Result<Response<pb::GetAllocationRouteReferencesReply>, Status> {
+        self.inner.get_allocation_route_references(request).await
     }
 
     async fn batch_compare_and_swap_routes(
@@ -1068,6 +1177,12 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
     ) -> std::result::Result<Response<Self::ControlStreamStream>, Status> {
         Err(Status::unavailable("stream disabled"))
     }
+    async fn batch_notify_delete_pending(
+        &self,
+        request: Request<pb::BatchNotifyDeletePendingRequest>,
+    ) -> std::result::Result<Response<pb::BatchNotifyDeletePendingReply>, Status> {
+        self.inner.batch_notify_delete_pending(request).await
+    }
 }
 
 struct InvalidMigrationStatusHandle {
@@ -1190,6 +1305,7 @@ fn sample_route(key: &str, version: u64, owner: &ClientRuntimeId) -> ObjectRoute
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: SegmentName::new("segment-a"),
+            allocation_id: Some(73),
             offset: Some(128),
             segment_offset: 128,
             length: 16,
@@ -1218,6 +1334,32 @@ fn sample_lease(address: &str) -> ClientLease {
         endpoints,
         expires_at_ms: 10_000,
     }
+}
+
+#[test]
+fn pending_publication_reservation_requires_explicit_allocator_support() {
+    let allocator = LegacyOnlyAllocator;
+    let owner = sample_owner();
+
+    let any = allocator.batch_reserve_any_with_pending_publication(&owner, &[64, 128]);
+    assert_eq!(any.len(), 2);
+    assert!(
+        any.iter()
+            .all(|result| matches!(result, Err(StoreError::Unsupported(_)))),
+        "a legacy allocator must not silently reserve without recording PendingPublish"
+    );
+
+    let specific = allocator.batch_reserve_specific_with_pending_publication(
+        &owner,
+        &[ReserveSpecificOp {
+            segment_name: SegmentName::new("segment-a"),
+            length_bytes: 64,
+        }],
+    );
+    assert!(
+        matches!(specific.as_slice(), [Err(StoreError::Unsupported(_))]),
+        "a legacy allocator must reject lifecycle-specific reservations"
+    );
 }
 
 fn prometheus_sample_value(metrics: &str, sample: &str) -> u64 {
@@ -1356,11 +1498,51 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
         1
     );
     assert_eq!(eviction.reported.lock().len(), 3);
+    let delete_route = sample_route("delete-pending", 1, &owner);
+    let delete_replica = delete_route
+        .replicas
+        .first()
+        .expect("sample route should have one replica");
+    let delete_entry = super::DeletePendingEntry {
+        route_key: delete_route.key.clone(),
+        identity: Some(AllocationRouteIdentity {
+            owner: owner.clone(),
+            segment_name: delete_replica.segment_name.clone(),
+            offset_bytes: delete_replica.segment_offset,
+            length_bytes: delete_replica.length,
+            allocation_id: delete_replica
+                .allocation_id
+                .expect("sample route should carry allocation generation"),
+        }),
+        cold_backing: None,
+        reclaim_grace_ms: 0,
+        prepare_only: false,
+        expected_route_version: Some(delete_route.version),
+    };
+    assert_eq!(
+        client
+            .batch_notify_delete_pending(&lease, std::slice::from_ref(&delete_entry))
+            .expect("delete notification should succeed"),
+        1
+    );
+    assert_eq!(eviction.delete_pending.lock().as_slice(), &[delete_entry]);
 
     let single_reservation = client
         .reserve_any(&lease, &owner, 32)
         .expect("single reserve_any should succeed");
     assert_eq!(single_reservation.length_bytes, 32);
+    assert_eq!(
+        allocator
+            .pending_publication_reserves
+            .load(Ordering::Relaxed),
+        0,
+        "legacy reserve must not opt a mixed-version owner into the lifecycle ledger"
+    );
+
+    let publication_reservation = client
+        .reserve_any_with_pending_publication(&lease, &owner, 20)
+        .expect("publication reserve_any should succeed");
+    assert_eq!(publication_reservation.length_bytes, 20);
 
     let batch_any = client
         .batch_reserve_any(&lease, &owner, &[8, 16])
@@ -1398,6 +1580,25 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
         "segment-c"
     );
 
+    let publication_specific = client
+        .batch_reserve_specific_with_pending_publication(
+            &lease,
+            &owner,
+            &[ReserveSpecificOp {
+                segment_name: SegmentName::new("segment-publication"),
+                length_bytes: 12,
+            }],
+        )
+        .expect("publication batch reserve_specific should succeed");
+    assert!(publication_specific[0].is_ok());
+    assert_eq!(
+        allocator
+            .pending_publication_reserves
+            .load(Ordering::Relaxed),
+        2,
+        "only explicit publication reserves may create lifecycle pending state"
+    );
+
     let release_results = client
         .batch_release(
             &lease,
@@ -1406,15 +1607,153 @@ fn control_plane_client_round_trips_routes_and_allocator_calls() {
                 segment_name: SegmentName::new("segment-c"),
                 offset_bytes: 4_096,
                 length_bytes: 48,
+                allocation_id: batch_specific[0]
+                    .as_ref()
+                    .expect("batch reserve_specific should return a reservation")
+                    .allocation_id,
             }],
         )
         .expect("batch release should succeed");
     assert!(release_results[0].is_ok());
     assert_eq!(allocator.released.lock().len(), 1);
+    assert_eq!(allocator.released.lock()[0].allocation_id, 4_097);
 
     client.clear_channels();
     assert_eq!(client.active_stream_sessions(), 0);
     drop(client);
+    handle.shutdown();
+}
+
+#[test]
+fn control_plane_owner_route_pages_bound_large_control_replies() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    // 256 routes must exceed the server's 1 MiB response budget so this
+    // exercises byte-bounded pagination rather than only the 256-route cap.
+    let padding = "x".repeat(8 * 1024);
+    for index in 0..2048 {
+        let key = format!("route-{index:04}-{padding}");
+        authority.insert(sample_route(&key, 1, &owner));
+    }
+
+    let mut handle = ControlPlaneHandle::spawn("127.0.0.1", authority, allocator, eviction)
+        .expect("control plane server should start");
+    let lease = sample_lease(handle.address());
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+    let authority_id = ClientStableId::new("authority");
+    let mut cursor = None;
+    let mut snapshot_epoch = None;
+    let mut keys = Vec::new();
+    let mut page_count = 0usize;
+
+    loop {
+        let page = client
+            .list_routes_by_replica_owner_page(
+                &lease,
+                "ns-a",
+                &authority_id,
+                RouteOwnerPageQuery {
+                    owner: owner.clone(),
+                    cursor: cursor.clone(),
+                    snapshot_epoch,
+                    limit: 4096,
+                },
+            )
+            .expect("paged owner listing should succeed");
+        assert!(
+            page.routes.len() <= 256,
+            "server must clamp a caller page size to the bounded reply limit"
+        );
+        if page.next_cursor.is_some() {
+            assert!(
+                page.routes.len() < 256,
+                "the byte budget must split a non-terminal oversized owner page"
+            );
+        }
+        assert!(
+            page.routes
+                .windows(2)
+                .all(|routes| routes[0].key.0 < routes[1].key.0),
+            "routes within a page must be ordered by cursor key"
+        );
+        keys.extend(page.routes.into_iter().map(|route| route.key.0));
+        page_count = page_count.saturating_add(1);
+        snapshot_epoch = page.snapshot_epoch;
+        assert!(
+            snapshot_epoch.is_some(),
+            "every owner-route page must carry a snapshot epoch"
+        );
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        assert_ne!(cursor.as_deref(), Some(next_cursor.as_str()));
+        cursor = Some(next_cursor);
+    }
+
+    assert!(page_count > 1, "large listings must require multiple pages");
+    assert_eq!(keys.len(), 2048);
+    assert!(keys.windows(2).all(|keys| keys[0] < keys[1]));
+    assert!(keys
+        .first()
+        .is_some_and(|key| key.starts_with("route-0000-")));
+    assert!(client.active_stream_sessions() >= 1);
+    handle.shutdown();
+}
+
+#[test]
+fn control_plane_owner_route_snapshot_rejects_mutation_between_pages() {
+    let authority = Arc::new(TestAuthority::default());
+    let allocator = Arc::new(TestAllocator::default());
+    let eviction = Arc::new(TestEviction::default());
+    let owner = sample_owner();
+    authority.insert(sample_route("route-a", 1, &owner));
+    authority.insert(sample_route("route-b", 1, &owner));
+
+    let mut handle = ControlPlaneHandle::spawn("127.0.0.1", authority.clone(), allocator, eviction)
+        .expect("control plane server should start");
+    let lease = sample_lease(handle.address());
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+    let authority_id = ClientStableId::new("authority");
+
+    let first = client
+        .list_routes_by_replica_owner_page(
+            &lease,
+            "ns-a",
+            &authority_id,
+            RouteOwnerPageQuery {
+                owner: owner.clone(),
+                cursor: None,
+                snapshot_epoch: None,
+                limit: 1,
+            },
+        )
+        .expect("first page should establish an owner-route snapshot");
+    let cursor = first
+        .next_cursor
+        .as_deref()
+        .expect("two routes should require a continuation page");
+    let snapshot_epoch = first
+        .snapshot_epoch
+        .expect("first page must carry a snapshot epoch");
+
+    authority.insert(sample_route("route-b", 2, &owner));
+
+    let error = client
+        .list_routes_by_replica_owner_page(
+            &lease,
+            "ns-a",
+            &authority_id,
+            RouteOwnerPageQuery {
+                owner: owner.clone(),
+                cursor: Some(cursor.to_string()),
+                snapshot_epoch: Some(snapshot_epoch),
+                limit: 1,
+            },
+        )
+        .expect_err("a changed owner route set must invalidate its continuation page");
+    assert!(matches!(error, StoreError::StaleEpoch(_)));
     handle.shutdown();
 }
 
@@ -1768,6 +2107,9 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let decoded = decode_error(Some(pb_error(StoreError::Conflict("boom".to_string()))))
         .expect_err("error detail should decode into store error");
     assert!(matches!(decoded, StoreError::Conflict(_)));
+    let backpressure = decode_error(Some(pb_error(StoreError::Backpressure("busy".to_string()))))
+        .expect_err("backpressure detail should decode into store error");
+    assert!(matches!(backpressure, StoreError::Backpressure(_)));
 
     ensure_batch_len("get", 2, 2).expect("matching lengths should pass");
     let error = ensure_batch_len("get", 2, 1).expect_err("mismatched lengths must fail");
@@ -1824,6 +2166,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let cas = CasResult {
         applied: true,
         current: Some(route.clone()),
+        delete_version: None,
         version_floor: None,
     };
     assert_eq!(
@@ -1834,6 +2177,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let cas_with_floor = CasResult {
         applied: false,
         current: None,
+        delete_version: None,
         version_floor: Some(RouteVersion(42)),
     };
     assert_eq!(
@@ -1842,11 +2186,24 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
         cas_with_floor
     );
 
+    let cas_with_marker = CasResult {
+        applied: false,
+        current: None,
+        delete_version: Some(RouteVersion(43)),
+        version_floor: None,
+    };
+    assert_eq!(
+        try_cas_result(pb_cas_result(&cas_with_marker))
+            .expect("cas result with delete_version should round-trip"),
+        cas_with_marker
+    );
+
     let reservation = SegmentReservation {
         owner: runtime.clone(),
         segment_name: SegmentName::new("segment-r"),
         offset_bytes: 7,
         length_bytes: 11,
+        allocation_id: 99,
     };
     assert_eq!(
         try_segment_reservation(pb_segment_reservation(&reservation))
@@ -1857,6 +2214,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let replica_error = try_replica_route(pb::ReplicaRoute {
         owner: None,
         segment_name: "segment-a".to_string(),
+        allocation_id: None,
         offset: Some(0),
         segment_offset: 0,
         length: 1,
@@ -1925,6 +2283,7 @@ fn object_route_round_trip_preserves_namespace_fields() {
         replicas: vec![ReplicaRoute {
             owner,
             segment_name: SegmentName::new("segment-a"),
+            allocation_id: Some(91),
             offset: Some(128),
             segment_offset: 64,
             length: 16,
@@ -2000,6 +2359,160 @@ fn control_plane_client_short_circuits_empty_batches_and_rejects_bad_uris() {
         .batch_get_routes(&lease, "ns", &authority, &[ObjectKey::new("bad-key")])
         .expect_err("invalid control uri should fail");
     assert!(matches!(error, StoreError::Transport(_)));
+}
+
+#[test]
+fn route_get_preserves_delete_marker_over_control_plane_transport() {
+    let authority = Arc::new(TestAuthority::default());
+    authority
+        .delete_versions
+        .lock()
+        .insert("deleted".to_string(), RouteVersion(43));
+    authority.insert(sample_route("live", 44, &sample_owner()));
+    let mut handle = ControlPlaneHandle::spawn(
+        "127.0.0.1",
+        authority,
+        Arc::new(TestAllocator::default()),
+        Arc::new(TestEviction::default()),
+    )
+    .expect("control plane server should start");
+    let client = ControlPlaneClient::new().expect("control plane client should start");
+    let response = mooncake_store_route::RouteControlTransport::send_route_control(
+        &client,
+        &sample_lease(handle.address()),
+        mooncake_store_route::RouteControlRequest::BatchGet {
+            namespace: "ns-a".to_string(),
+            authority: ClientStableId::new("authority"),
+            keys: vec![ObjectKey::new("deleted"), ObjectKey::new("live")],
+        },
+    )
+    .expect("route records should cross the control plane");
+    let mooncake_store_route::RouteControlResponse::BatchGet(records) = response else {
+        panic!("expected route records");
+    };
+    assert_eq!(records.len(), 2);
+    let deleted = records[0].as_ref().expect("deleted record should decode");
+    assert!(deleted.route.is_none());
+    assert_eq!(deleted.delete_version, Some(RouteVersion(43)));
+    let live = records[1].as_ref().expect("live record should decode");
+    assert_eq!(
+        live.route.as_ref().map(|route| route.version),
+        Some(RouteVersion(44))
+    );
+    assert_eq!(live.delete_version, None);
+    handle.shutdown();
+}
+
+#[test]
+fn versioned_delete_markers_cross_control_plane_without_tombstone_routes() {
+    use mooncake_store_core::MetadataBackend;
+    use mooncake_store_route::{RouteControlRequest, RouteControlResponse, RouteControlTransport};
+    use mooncake_store_rs_metadata::InMemoryMetadataBackend;
+    use mooncake_store_test_utils::transport::TestTransport;
+
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store = crate::StoreClientBuilder::new(metadata.clone(), "marker-wire-authority")
+        .state(ClientLifecycleState::Active)
+        .transport(Arc::new(TestTransport::new("marker-wire-segment")))
+        .build(u64::MAX)
+        .expect("route authority should build");
+    let lease = store.lease();
+    let namespace = metadata.route_namespace();
+    let authority = lease.runtime.stable_id.clone();
+    let client = ControlPlaneClient::new().expect("control plane client should build");
+    let keys = [
+        ObjectKey::new("missing-marker"),
+        ObjectKey::new("stale-marker"),
+    ];
+    let replace = |requests| {
+        let response = client
+            .send_route_control(
+                &lease,
+                RouteControlRequest::BatchReplace {
+                    namespace: namespace.clone(),
+                    authority: authority.clone(),
+                    requests,
+                },
+            )
+            .expect("replacement should cross the control plane");
+        let RouteControlResponse::BatchReplace(results) = response else {
+            panic!("expected replacement results");
+        };
+        for result in results {
+            result.expect("authority should accept replacement");
+        }
+    };
+    let read = || {
+        let response = client
+            .send_route_control(
+                &lease,
+                RouteControlRequest::BatchGet {
+                    namespace: namespace.clone(),
+                    authority: authority.clone(),
+                    keys: keys.to_vec(),
+                },
+            )
+            .expect("records should cross the control plane");
+        let RouteControlResponse::BatchGet(records) = response else {
+            panic!("expected authority records");
+        };
+        records
+            .into_iter()
+            .map(|record| record.expect("record should decode"))
+            .collect::<Vec<_>>()
+    };
+    replace(vec![RouteCasRequest {
+        key: keys[1].clone(),
+        expected: None,
+        next: Some(sample_route(&keys[1].0, 1, &lease.runtime)),
+    }]);
+    replace(
+        keys.iter()
+            .map(|key| RouteCasRequest {
+                key: key.clone(),
+                expected: Some(RouteVersion(43)),
+                next: None,
+            })
+            .collect(),
+    );
+    for record in read() {
+        assert!(record.route.is_none());
+        assert_eq!(record.delete_version, Some(RouteVersion(43)));
+    }
+    for version in [42, 43] {
+        replace(
+            keys.iter()
+                .map(|key| RouteCasRequest {
+                    key: key.clone(),
+                    expected: None,
+                    next: Some(sample_route(&key.0, version, &lease.runtime)),
+                })
+                .collect(),
+        );
+        for record in read() {
+            assert!(record.route.is_none());
+            assert_eq!(record.delete_version, Some(RouteVersion(43)));
+        }
+    }
+    replace(
+        keys.iter()
+            .map(|key| {
+                let mut route = sample_route(&key.0, 44, &lease.runtime);
+                route.replicas[0].allocation_id = Some(71);
+                RouteCasRequest {
+                    key: key.clone(),
+                    expected: None,
+                    next: Some(route),
+                }
+            })
+            .collect(),
+    );
+    for record in read() {
+        let route = record.route.expect("newer live route must be retained");
+        assert_eq!(route.version, RouteVersion(44));
+        assert_eq!(route.replicas[0].allocation_id, Some(71));
+        assert_eq!(record.delete_version, None);
+    }
 }
 
 #[test]
@@ -2082,6 +2595,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: Some(pb_runtime_id(&owner)),
                 cursor: None,
                 limit: 1,
+                snapshot_epoch: None,
             }))
             .await
             .expect("first owner route page should reply")
@@ -2097,6 +2611,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: Some(pb_runtime_id(&owner)),
                 cursor: first_page.next_cursor,
                 limit: 1,
+                snapshot_epoch: None,
             }))
             .await
             .expect("second owner route page should reply")
@@ -2112,6 +2627,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: None,
                 cursor: None,
                 limit: 0,
+                snapshot_epoch: None,
             }))
             .await
             .expect_err("missing owner should be rejected");
@@ -2152,6 +2668,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 entries: vec![pb::RouteReplaceEntry {
                     key: "broken".to_string(),
                     next: Some(invalid_route),
+                    delete_version: None,
                 }],
             }))
             .await
@@ -2164,6 +2681,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .reserve_any(Request::new(pb::ReserveAnyRequest {
                 owner: None,
                 length_bytes: 64,
+                pending_publication: false,
             }))
             .await
             .expect("reserve_any should reply")
@@ -2174,6 +2692,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             .batch_reserve_any(Request::new(pb::BatchReserveAnyRequest {
                 owner: None,
                 length_bytes: vec![8, 16],
+                pending_publication: false,
             }))
             .await
             .expect_err("batch reserve_any requires owner");
@@ -2184,6 +2703,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 owner: None,
                 segment_name: "segment-a".to_string(),
                 length_bytes: 32,
+                pending_publication: false,
             }))
             .await
             .expect("reserve_specific should reply")
@@ -2197,6 +2717,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                     segment_name: "segment-a".to_string(),
                     length_bytes: 32,
                 }],
+                pending_publication: false,
             }))
             .await
             .expect_err("batch reserve_specific requires owner");
@@ -2208,6 +2729,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                 segment_name: "segment-a".to_string(),
                 offset_bytes: 0,
                 length_bytes: 8,
+                allocation_id: 0,
             }))
             .await
             .expect("release should reply")
@@ -2221,6 +2743,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
                     segment_name: "segment-a".to_string(),
                     offset_bytes: 0,
                     length_bytes: 8,
+                    allocation_id: 0,
                 }],
             }))
             .await
@@ -2379,6 +2902,7 @@ fn owner_route_rpc_defaults_and_clamps_page_limit() {
                     owner: Some(pb_runtime_id(&owner)),
                     cursor: None,
                     limit,
+                    snapshot_epoch: None,
                 }))
                 .await
                 .expect("bounded owner route request should reply")
@@ -2481,11 +3005,16 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
                 segment_name: SegmentName::new("segment-z"),
                 offset_bytes: 4_096,
                 length_bytes: 24,
+                allocation_id: reserve_specific[0]
+                    .as_ref()
+                    .expect("fallback reserve_specific should return a reservation")
+                    .allocation_id,
             }],
         )
         .expect("fallback release should succeed");
     assert!(release[0].is_ok());
     assert_eq!(allocator.released.lock().len(), 1);
+    assert_eq!(allocator.released.lock()[0].allocation_id, 4_097);
 
     assert_eq!(
         client
@@ -2500,9 +3029,245 @@ fn control_plane_client_falls_back_to_unary_when_streaming_is_disabled() {
         1
     );
     assert_eq!(eviction.reported.lock().len(), 2);
+    let delete_route = sample_route("delete-fallback", 1, &owner);
+    let delete_replica = delete_route
+        .replicas
+        .first()
+        .expect("sample route should have one replica");
+    let delete_entry = super::DeletePendingEntry {
+        route_key: delete_route.key.clone(),
+        identity: Some(AllocationRouteIdentity {
+            owner: owner.clone(),
+            segment_name: delete_replica.segment_name.clone(),
+            offset_bytes: delete_replica.segment_offset,
+            length_bytes: delete_replica.length,
+            allocation_id: delete_replica
+                .allocation_id
+                .expect("sample route should carry allocation generation"),
+        }),
+        cold_backing: None,
+        reclaim_grace_ms: 0,
+        prepare_only: false,
+        expected_route_version: Some(delete_route.version),
+    };
+    assert_eq!(
+        client
+            .batch_notify_delete_pending(&lease, std::slice::from_ref(&delete_entry))
+            .expect("fallback delete notification should succeed"),
+        1
+    );
+    assert_eq!(eviction.delete_pending.lock().as_slice(), &[delete_entry]);
 
     client.clear_channels();
     assert_eq!(client.active_stream_sessions(), 0);
     drop(client);
     handle.shutdown();
+}
+
+struct LegacyOnlyAllocator;
+
+impl AllocatorService for LegacyOnlyAllocator {
+    fn reserve_any(
+        &self,
+        _owner: &ClientRuntimeId,
+        _length_bytes: u64,
+    ) -> mooncake_store_core::Result<SegmentReservation> {
+        Err(StoreError::Unsupported("test allocator".to_string()))
+    }
+
+    fn reserve_specific(
+        &self,
+        _owner: &ClientRuntimeId,
+        _segment_name: &SegmentName,
+        _length_bytes: u64,
+    ) -> mooncake_store_core::Result<SegmentReservation> {
+        Err(StoreError::Unsupported("test allocator".to_string()))
+    }
+
+    fn release(
+        &self,
+        _owner: &ClientRuntimeId,
+        _segment_name: &SegmentName,
+        _offset_bytes: u64,
+        _length_bytes: u64,
+        _allocation_id: u64,
+    ) -> mooncake_store_core::Result<()> {
+        Err(StoreError::Unsupported("test allocator".to_string()))
+    }
+}
+
+struct GatedRpcAllocator {
+    inner: TestAllocator,
+    entered: std::sync::mpsc::Sender<()>,
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl GatedRpcAllocator {
+    fn wait_for_release(&self) {
+        self.entered
+            .send(())
+            .expect("test should observe allocator entry");
+        let (lock, ready) = &*self.gate;
+        let mut released = lock.lock().expect("allocator gate should lock");
+        while !*released {
+            released = ready.wait(released).expect("allocator gate should wait");
+        }
+    }
+}
+
+impl AllocatorService for GatedRpcAllocator {
+    fn reserve_any(
+        &self,
+        owner: &ClientRuntimeId,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<SegmentReservation> {
+        self.wait_for_release();
+        self.inner.reserve_any(owner, length_bytes)
+    }
+
+    fn reserve_specific(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        length_bytes: u64,
+    ) -> mooncake_store_core::Result<SegmentReservation> {
+        self.wait_for_release();
+        self.inner
+            .reserve_specific(owner, segment_name, length_bytes)
+    }
+
+    fn release(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        offset_bytes: u64,
+        length_bytes: u64,
+        allocation_id: u64,
+    ) -> mooncake_store_core::Result<()> {
+        self.inner.release(
+            owner,
+            segment_name,
+            offset_bytes,
+            length_bytes,
+            allocation_id,
+        )
+    }
+}
+
+#[test]
+fn allocator_reservation_rpcs_preserve_unrelated_route_rpc_progress() {
+    with_env_var(CONTROL_PLANE_SERVER_THREADS_ENV, Some("1"), || {
+        let mut observed = Vec::new();
+        for operation in 0..4 {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let allocator = Arc::new(GatedRpcAllocator {
+                inner: TestAllocator::default(),
+                entered: entered_tx,
+                gate: gate.clone(),
+            });
+            let authority = Arc::new(TestAuthority::default());
+            let owner = sample_owner();
+            authority.insert(sample_route("unrelated-route", 1, &owner));
+            let mut handle = ControlPlaneHandle::spawn(
+                "127.0.0.1",
+                authority,
+                allocator,
+                Arc::new(TestEviction::default()),
+            )
+            .expect("server should start");
+            let lease = sample_lease(handle.address());
+            let client = ControlPlaneClient::with_request_timeout(Duration::from_millis(300))
+                .expect("client should start");
+            let authority_id = ClientStableId::new("authority");
+            let keys = [ObjectKey::new("unrelated-route")];
+            client
+                .batch_get_routes(&lease, "ns-a", &authority_id, &keys)
+                .expect("route channel should warm before allocator blocks");
+            let endpoint = format!("http://{}", handle.address());
+            let reservation = thread::spawn(move || {
+                RuntimeBuilder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("RPC runtime should start")
+                    .block_on(async move {
+                        let channel = tonic::transport::Endpoint::from_shared(endpoint)
+                            .expect("endpoint should parse")
+                            .timeout(Duration::from_secs(5))
+                            .connect()
+                            .await
+                            .expect("RPC channel should connect");
+                        let mut rpc =
+                            pb::control_plane_service_client::ControlPlaneServiceClient::new(
+                                channel,
+                            );
+                        let owner = Some(pb_runtime_id(&owner));
+                        match operation {
+                            0 => rpc
+                                .reserve_any(pb::ReserveAnyRequest {
+                                    owner,
+                                    length_bytes: 16,
+                                    pending_publication: false,
+                                })
+                                .await
+                                .map(|_| ()),
+                            1 => rpc
+                                .batch_reserve_any(pb::BatchReserveAnyRequest {
+                                    owner,
+                                    length_bytes: vec![16],
+                                    pending_publication: false,
+                                })
+                                .await
+                                .map(|_| ()),
+                            2 => rpc
+                                .reserve_specific(pb::ReserveSpecificRequest {
+                                    owner,
+                                    segment_name: "segment-a".to_string(),
+                                    length_bytes: 16,
+                                    pending_publication: false,
+                                })
+                                .await
+                                .map(|_| ()),
+                            _ => rpc
+                                .batch_reserve_specific(pb::BatchReserveSpecificRequest {
+                                    owner,
+                                    entries: vec![pb::ReserveSpecificEntry {
+                                        segment_name: "segment-a".to_string(),
+                                        length_bytes: 16,
+                                    }],
+                                    pending_publication: false,
+                                })
+                                .await
+                                .map(|_| ()),
+                        }
+                    })
+            });
+            let entered = entered_rx.recv_timeout(Duration::from_secs(3));
+            let progress = client.batch_get_routes(&lease, "ns-a", &authority_id, &keys);
+            let (lock, ready) = &*gate;
+            *lock.lock().expect("gate should lock") = true;
+            ready.notify_all();
+            let reservation_result = reservation
+                .join()
+                .expect("reservation thread should finish");
+            handle.shutdown();
+            assert!(
+                entered.is_ok(),
+                "allocator operation {operation} must enter its synchronous service"
+            );
+            assert!(
+                reservation_result.is_ok(),
+                "reservation {operation} should finish after release: {reservation_result:?}"
+            );
+            eprintln!(
+                "allocator RPC {operation}: unrelated route progress = {}",
+                progress.is_ok()
+            );
+            observed.push((operation, progress));
+        }
+        assert!(
+            observed.iter().all(|(_, result)| result.is_ok()),
+            "allocator RPCs must not block unrelated real route RPCs: {observed:?}"
+        );
+    });
 }
