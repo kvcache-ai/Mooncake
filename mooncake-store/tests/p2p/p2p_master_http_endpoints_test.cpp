@@ -1032,11 +1032,22 @@ TEST_F(P2PMasterHttpEndpointsTest, HADoctorTimesOnlyBusyLatestStalls) {
     // Draining work disarms the timer.
     status.SetOpLogWriteProgress(12, 0);
     EXPECT_EQ(doctor()["health"].asString(), "ok");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
 
     // A stopped writer clears cache and rejects late callbacks from the
     // previous worker.
     status.SetOpLogWriteProgress(12, 1);
     status.SetOpLogWriterRunning(false);
+    status.SetOpLogWriteProgress(12, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_EQ(doctor()["health"].asString(), "ok");
+
+    // Clearing diagnostics also disarms an active writer and ignores its
+    // late progress callback.
+    status.SetOpLogWriterRunning(true);
+    status.SetOpLogWriteProgress(12, 1);
+    status.ClearDoctorIssues();
     status.SetOpLogWriteProgress(12, 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     EXPECT_EQ(doctor()["health"].asString(), "ok");
