@@ -6470,7 +6470,9 @@ TEST_F(MasterServiceHATest, InvalidUnmountLogEntryKeepsTheAllocatorLive) {
         // Seed the registry directly to represent state admitted by an older
         // master that did not validate its mount record before installing it.
         auto access = manager.getSegmentAccess();
-        ASSERT_EQ(ErrorCode::OK, access.MountSegment(segment, client, nullptr));
+        auto session = std::make_shared<ClientLivenessRecord>(
+            client, ClientLivenessRecord::Clock::now());
+        ASSERT_EQ(ErrorCode::OK, access.MountSegment(segment, session));
     }
     for (int attempt = 0; attempt < 2; ++attempt) {
         const auto result = service.UnmountSegment(segment.id, client);
