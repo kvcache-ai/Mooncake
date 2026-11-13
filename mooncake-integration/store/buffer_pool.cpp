@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "dummy_client.h"
 #include "pyclient.h"
 #include "real_client.h"
 #include "types.h"
@@ -185,6 +186,7 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
     std::unordered_set<uintptr_t> in_use_;
     bool closed_ = false;
     bool closing_ = false;
+    bool allocation_failed_ = false;
     size_t total_bytes_ = 0;
     size_t reserved_bytes_ = 0;
     size_t reserved_regions_ = 0;
@@ -286,12 +288,15 @@ BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
         throw std::runtime_error(
             "alignment must be a power of two and at least sizeof(void*)");
     }
-    if (!py_client_->client_buffer_allocator_ ||
-        py_client_->client_buffer_allocator_->size() == 0) {
+    if (auto dummy = std::dynamic_pointer_cast<DummyClient>(py_client_)) {
+        local_buffer_capacity_ = dummy->local_buffer_size();
+    } else if (py_client_->client_buffer_allocator_) {
+        local_buffer_capacity_ = py_client_->client_buffer_allocator_->size();
+    }
+    if (local_buffer_capacity_ == 0) {
         throw std::runtime_error(
             "BufferPool requires a store configured with a local buffer");
     }
-    local_buffer_capacity_ = py_client_->client_buffer_allocator_->size();
     if (max_bytes == 0) {
         if (local_buffer_capacity_ >
             std::numeric_limits<size_t>::max() - local_buffer_capacity_) {
@@ -398,9 +403,16 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
     std::shared_ptr<BufferHandle> handle;
     bool overflow_registered = false;
     try {
-        if (auto alloc_result =
-                py_client_->client_buffer_allocator_->allocate(allocation_size);
-            alloc_result.has_value()) {
+        if (auto dummy = std::dynamic_pointer_cast<DummyClient>(py_client_)) {
+            auto allocation = dummy->allocate_shared_buffer(allocation_size);
+            if (!allocation)
+                throw std::runtime_error("BufferPool SHM allocation failed");
+            handle = std::make_shared<BufferHandle>(std::move(*allocation));
+            overflow_registered = true;
+        } else if (auto alloc_result =
+                       py_client_->client_buffer_allocator_->allocate(
+                           allocation_size);
+                   alloc_result.has_value()) {
             handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
         } else {
             handle = allocate_overflow_unlocked(allocation_size);
@@ -409,6 +421,12 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
     } catch (...) {
         lock.lock();
         unreserve_locked(allocation_size);
+        if (std::dynamic_pointer_cast<DummyClient>(py_client_)) {
+            // Registration failure can leave a receiver mapping live. Charge
+            // the retained mapping and stop this pool from allocating again.
+            total_bytes_ += allocation_size;
+            allocation_failed_ = true;
+        }
         throw;
     }
     lock.lock();
@@ -463,6 +481,11 @@ void BufferPoolNative::unregister_overflow_unlocked(const Region &region) {
     int ret = py::cast<int>(store_obj_.attr("unregister_buffer")(
         reinterpret_cast<uintptr_t>(region.handle->ptr())));
     if (ret != 0) {
+        auto dummy = std::dynamic_pointer_cast<DummyClient>(py_client_);
+        if (dummy &&
+            dummy->shared_buffer_is_unregistered(region.handle->ptr())) {
+            return;
+        }
         throw std::runtime_error("overflow buffer unregistration failed");
     }
 }
@@ -525,6 +548,9 @@ bool BufferPoolNative::has_capacity_for_locked(size_t size_class) const {
 }
 
 void BufferPoolNative::raise_if_open_locked() const {
+    if (allocation_failed_) {
+        throw std::runtime_error("buffer pool allocation previously failed");
+    }
     if (closed_) {
         throw std::runtime_error("buffer pool is closed");
     }

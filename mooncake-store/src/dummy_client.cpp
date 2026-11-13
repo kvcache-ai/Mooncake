@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 
 #include "real_client.h"
 #include "dummy_client.h"
@@ -564,8 +565,13 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                 return -1;
             }
         }
-        local_buffer_shm->registered = true;
-        local_buffer_shm->is_local = true;
+        {
+            std::lock_guard<std::mutex> lock(
+                local_buffer_shm->registration_mutex);
+            local_buffer_shm->registered = true;
+            local_buffer_shm->is_local = true;
+            local_buffer_size_ = local_buffer_size;
+        }
 
         // Best-effort: request hot cache shm from real client
         if (request_hot_cache_fd() != 0) {
@@ -588,6 +594,7 @@ int DummyClient::tearDownAll() {
         LOG(ERROR) << "Failed to free dummy local shared memory";
     }
     local_buffer_base_ = nullptr;
+    local_buffer_size_ = 0;
 
     // Cleanup hot cache shm mapping
     if (hot_cache_base_) {
@@ -683,6 +690,17 @@ std::optional<size_t> DummyClient::external_buffer_remaining(
 
 bool DummyClient::is_registered_buffer(void* buffer, size_t size) const {
     if (buffer == nullptr) return size == 0;
+    if (shm_helper_ != nullptr) {
+        auto shm = shm_helper_->get_shm(buffer);
+        if (shm) {
+            std::lock_guard<std::mutex> lock(shm->registration_mutex);
+            const auto address = reinterpret_cast<uintptr_t>(buffer);
+            const auto base = reinterpret_cast<uintptr_t>(shm->base_addr);
+            return shm->registered && base != 0 && address >= base &&
+                   address - base < shm->size &&
+                   size <= shm->size - (address - base);
+        }
+    }
     auto remaining = external_buffer_remaining(buffer);
     return remaining.has_value() && size <= *remaining;
 }
@@ -1046,6 +1064,8 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
     if (!shm) {
         return register_external_buffer(buffer, size);
     }
+    std::lock_guard<std::mutex> registration_lock(shm->registration_mutex);
+    if (shm->base_addr == nullptr) return -1;
     if (shm_helper_->is_hugepage()) {
         const size_t alignment = get_hugepage_size_from_env();
         if (alignment != 0 &&
@@ -1073,7 +1093,7 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
     }
 
     // If this shm is not registered with RealClient yet, do it now
-    if (!shm->registered) {
+    if (shm->base_addr == nullptr || !shm->registered) {
         if (register_shm_via_ipc(shm.get(), shm->is_local) != 0) {
             LOG(ERROR) << "Failed to implicitly register new SHM via IPC";
             return -1;
@@ -1131,7 +1151,8 @@ int DummyClient::unregister_buffer(void* buffer) {
     if (!shm) {
         return unregister_external_buffer(buffer);
     }
-    if (!shm->registered) {
+    std::lock_guard<std::mutex> registration_lock(shm->registration_mutex);
+    if (shm->base_addr == nullptr || !shm->registered) {
         LOG(ERROR) << "Buffer is not registered with RealClient";
         return -1;
     }
@@ -1169,6 +1190,38 @@ uint64_t DummyClient::alloc_from_mem_pool(size_t size) {
         LOG(ERROR) << "Failed to allocate from mem pool: " << e.what();
         return 0;
     }
+}
+
+std::optional<BufferHandle> DummyClient::allocate_shared_buffer(size_t size) {
+    if (shm_helper_ == nullptr || size == 0) return std::nullopt;
+    void* ptr = shm_helper_->allocate(size);
+    if (register_buffer(ptr, size) != 0) {
+        // Registration failure is ambiguous: retain the mapping instead of
+        // recycling an address that the receiver may still reference.
+        throw std::runtime_error("BufferPool SHM registration failed");
+    }
+    auto shm = shm_helper_->get_shm(ptr);
+    auto* helper = shm_helper_;
+    return BufferHandle(ptr, size, [helper, shm, ptr]() {
+        {
+            std::lock_guard<std::mutex> lock(shm->registration_mutex);
+            if (shm->registered) {
+                LOG(ERROR) << "Retaining registered BufferPool SHM at " << ptr;
+                return;
+            }
+        }
+        if (helper->free(ptr) != 0) {
+            LOG(ERROR) << "Failed to free BufferPool SHM at " << ptr;
+        }
+    });
+}
+
+bool DummyClient::shared_buffer_is_unregistered(void* buffer) const {
+    if (shm_helper_ == nullptr) return false;
+    auto shm = shm_helper_->get_shm(buffer);
+    if (!shm) return false;
+    std::lock_guard<std::mutex> lock(shm->registration_mutex);
+    return !shm->registered;
 }
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
@@ -2126,9 +2179,11 @@ void DummyClient::ping_thread_main() {
             while (ping_running_) {
                 // Re-register ALL shms
                 bool all_registered = true;
-                const auto& shms = shm_helper_->get_shms();
+                const auto shms = shm_helper_->get_shms();
                 for (const auto& shm_ptr : shms) {
-                    if (shm_ptr->registered) {
+                    std::lock_guard<std::mutex> registration_lock(
+                        shm_ptr->registration_mutex);
+                    if (shm_ptr->base_addr != nullptr && shm_ptr->registered) {
                         if (globalConfig().ascend_agent_mode) {
                             if (register_ascend_shm(shm_ptr.get(),
                                                     shm_ptr->is_local) != 0) {

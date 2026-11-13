@@ -222,6 +222,12 @@ class DummyClient : public PyClient {
 
     std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
 
+    // Allocate a BufferPool-owned SHM region without consuming transfer
+    // staging. The pool unregisters the region before releasing the handle.
+    std::optional<BufferHandle> allocate_shared_buffer(size_t size);
+    bool shared_buffer_is_unregistered(void *buffer) const;
+    size_t local_buffer_size() const { return local_buffer_size_; }
+
    private:
     struct PreparedBuffer {
         void *original = nullptr;
@@ -348,6 +354,7 @@ class DummyClient : public PyClient {
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
     void *local_buffer_base_ = nullptr;
+    size_t local_buffer_size_ = 0;
 
     // Hot cache shm mapping (obtained from real client via IPC)
     void *hot_cache_base_ = nullptr;
