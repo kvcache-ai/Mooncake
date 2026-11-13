@@ -17313,8 +17313,11 @@ fn evacuation_blocks_stale_release_after_incomplete_owner_scan() {
     )
     .expect("authority membership should refresh");
     let route_directory = build_route_directory(
-        RouteControlMode::EmbeddedWrh,
-        3,
+        crate::route_directory::RouteDirectoryBuildConfig {
+            mode: RouteControlMode::EmbeddedWrh,
+            route_topk: 3,
+            delete_marker_budget_bytes: 0,
+        },
         metadata.clone(),
         &empty_authority,
         Arc::new(
