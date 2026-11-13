@@ -466,8 +466,18 @@ Status IntraNodeNvlinkTransport::submitTransfer(
         ++task_id;
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
+            // Open the peer IPC mapping on the source buffer's device so the
+            // copy stays a direct source->target NVLink path. A fresh thread
+            // defaults to device 0, and cudaIpcOpenMemHandle binds the
+            // mapping to the calling thread's context.
+            int saved_device = -1;
+            cudaGetDevice(&saved_device);
+            int src_device = getDeviceForPointer((void *)request.source);
+            if (src_device < 0) src_device = saved_device;
+            if (src_device != saved_device) cudaSetDevice(src_device);
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
+            if (src_device != saved_device) cudaSetDevice(saved_device);
             if (rc) return Status::Memory("device memory not registered");
         }
         task.total_bytes = request.length;
@@ -588,8 +598,18 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
         auto &request = *task.request;
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
+            // Open the peer IPC mapping on the source buffer's device so the
+            // copy stays a direct source->target NVLink path. A fresh thread
+            // defaults to device 0, and cudaIpcOpenMemHandle binds the
+            // mapping to the calling thread's context (issue #4986).
+            int saved_device = -1;
+            cudaGetDevice(&saved_device);
+            int src_device = getDeviceForPointer((void *)request.source);
+            if (src_device < 0) src_device = saved_device;
+            if (src_device != saved_device) cudaSetDevice(src_device);
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
+            if (src_device != saved_device) cudaSetDevice(saved_device);
             if (rc) return Status::Memory("device memory not registered");
         }
         task.total_bytes = request.length;
