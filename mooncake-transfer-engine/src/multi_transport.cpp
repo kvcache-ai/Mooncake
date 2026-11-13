@@ -116,6 +116,7 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     batch_desc_set_[batch_desc->id] = batch_desc;
     batch_desc_lock_.unlock();
 #endif
+    trackLiveBatch(batch_desc->id);
     return batch_desc->id;
 }
 
@@ -202,6 +203,7 @@ Status MultiTransport::tryFreeBatchID(
     if (before_delete) {
         before_delete();
     }
+    untrackLiveBatch(batch_id);
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
@@ -1208,3 +1210,78 @@ void* MultiTransport::getBaseAddr() {
 }
 
 }  // namespace mooncake
+
+void MultiTransport::trackLiveBatch(BatchID batch_id) {
+    std::lock_guard<std::mutex> guard(live_batches_mutex_);
+    live_batches_.insert(batch_id);
+}
+
+void MultiTransport::untrackLiveBatch(BatchID batch_id) {
+    std::lock_guard<std::mutex> guard(live_batches_mutex_);
+    live_batches_.erase(batch_id);
+}
+
+bool MultiTransport::memoryReferencedByBatch(BatchID batch_id, void* addr,
+                                             size_t length) const {
+    if (!batch_id || batch_id == (BatchID)ERR_MEMORY) return false;
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    const uintptr_t a0 = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t a1 = length ? (a0 + length) : (a0 + 1);
+    for (auto& task : batch_desc.task_list) {
+        if (__atomic_load_n(&task.is_finished, __ATOMIC_ACQUIRE)) continue;
+        if (task.request) {
+            const uintptr_t s =
+                reinterpret_cast<uintptr_t>(task.request->source);
+            const size_t n = task.request->length;
+            const uintptr_t s1 = s + (n ? n : 1);
+            if (s < a1 && a0 < s1) return true;
+        }
+        for (auto* slice : task.slice_list) {
+            if (!slice) continue;
+            const uintptr_t s = reinterpret_cast<uintptr_t>(slice->source_addr);
+            const size_t n = slice->length;
+            const uintptr_t s1 = s + (n ? n : 1);
+            if (s < a1 && a0 < s1) return true;
+        }
+    }
+    return false;
+}
+
+bool MultiTransport::memoryBusyLocked(void* addr, size_t length) const {
+    for (BatchID batch_id : live_batches_) {
+        if (memoryReferencedByBatch(batch_id, addr, length)) return true;
+    }
+    return false;
+}
+
+Status MultiTransport::waitMemoryIdle(void* addr, size_t length,
+                                      int64_t timeout_ms) {
+    if (!addr) return Status::InvalidArgument("addr is null");
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(std::max<int64_t>(timeout_ms, 0));
+    for (;;) {
+        bool busy = false;
+        {
+            std::lock_guard<std::mutex> live_guard(live_batches_mutex_);
+            busy = memoryBusyLocked(addr, length);
+        }
+        if (!busy) {
+            std::lock_guard<std::mutex> def_guard(deferred_cleanup_mutex_);
+            for (const auto& entry : deferred_cleanup_batches_) {
+                if (memoryReferencedByBatch(entry.first, addr, length)) {
+                    busy = true;
+                    break;
+                }
+            }
+        }
+        if (!busy) return Status::OK();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status::BatchBusy(
+                "unregisterLocalMemory blocked: transfers still reference "
+                "buffer");
+        }
+        deferred_cleanup_cv_.notify_one();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
