@@ -378,7 +378,9 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
 
     std::optional<BatchOpLogSnapshotCapture> StartCapture(
         size_t object_count,
-        const WeightMetadataSnapshot* weight_metadata = nullptr) {
+        const WeightMetadataSnapshot* weight_metadata = nullptr,
+        const std::vector<std::pair<std::string, ObjectReplicaMutation>>&
+            object_mutations = {}) {
         backend_ = std::make_shared<FakeHaKvBackend>();
         auto batch = MakeObjectBatch(object_count);
         const auto append = [&](OpType type, const std::string& key,
@@ -435,6 +437,9 @@ class BatchOpLogSnapshotWriterTest : public ::testing::Test {
                     }
                 }
             }
+        }
+        for (const auto& [key, mutation] : object_mutations) {
+            append(OpType::OBJECT_STORAGE_MUTATION, key, mutation);
         }
         if (!batch.entries.empty()) {
             EXPECT_EQ(ErrorCode::OK,
@@ -1295,6 +1300,78 @@ TEST_F(BatchOpLogSnapshotWriterTest,
     ASSERT_TRUE(object_store.UploadBuffer(weight_key, weight_bytes));
     EXPECT_FALSE(provider.RestoreBaseline(restored, registry));
     EXPECT_TRUE(restored.SnapshotWeightMetadata().metadata.empty());
+}
+
+TEST_F(BatchOpLogSnapshotWriterTest,
+       RestoresObjectUploadObligationsWithoutTheOriginalLog) {
+    ObjectReplicaTarget target{
+        "s3", "http://localhost:9000", "test", "us-east-1", "objects/", true};
+    ObjectUploadRecord pending{target,
+                               "default",
+                               "pending",
+                               {1, 2},
+                               900,
+                               {"attempt-900", 1024},
+                               ObjectUploadPhase::AUTHORIZED,
+                               0,
+                               false};
+    auto retired = pending;
+    retired.key = "retired";
+    retired.replica_id = 901;
+    retired.object.object_key = "attempt-901";
+    auto retirement = retired;
+    retirement.phase = ObjectUploadPhase::RETIRED;
+    retirement.not_before_ms = 2000;
+    auto capture =
+        StartCapture(1, nullptr,
+                     {
+                         {pending.key, {target, {pending}, {}, {}, false}},
+                         {retired.key, {target, {retired}, {}, {}, false}},
+                         {retired.key, {target, {retirement}, {}, {}, false}},
+                     });
+    ASSERT_TRUE(capture);
+    ASSERT_EQ(capture->last_included_seq, 4);
+    const auto expected =
+        struct_pack::serialize<std::string>(capture->object_storage);
+    FakeObjectStore objects;
+    BatchOpLogSnapshotWriter writer(objects);
+    auto descriptor =
+        writer.Write(*standby_, *capture, "snapshots", "1-45", 2, 1234);
+    ASSERT_TRUE(descriptor) << descriptor.error();
+    const auto decoded = ha::DecodeBatchOpLogSnapshotDescriptor(*descriptor);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->schema_version,
+              ha::kBatchOpLogObjectSnapshotSchemaVersion);
+    standby_->Stop();
+    FakeHaKvBackend compacted;
+    ASSERT_EQ(compacted.Put(ha::BuildBatchOpLogSnapshotLatestKey(kClusterId),
+                            *descriptor),
+              ErrorCode::OK);
+    ASSERT_EQ(
+        compacted.Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey(kClusterId),
+                      "1"),
+        ErrorCode::OK);
+    ASSERT_EQ(
+        compacted.Put(BuildDurablePrefixKey(kClusterId),
+                      EncodeDurablePrefix({.batch_id = 1, .last_seq = 4})),
+        ErrorCode::OK);
+    BatchOpLogSnapshotProvider provider(kClusterId, compacted, objects,
+                                        "snapshots");
+    StandbyMetadataStore restored;
+    StandbySegmentRegistry registry;
+    ASSERT_TRUE(provider.RestoreBaseline(restored, registry));
+    EXPECT_EQ(
+        struct_pack::serialize<std::string>(restored.SnapshotObjectReplicas()),
+        expected);
+    EXPECT_TRUE(restored.Exists("tenant", "key-0"));
+
+    // The baseline must fail closed if this new artifact is corrupt.
+    objects.PutExisting(
+        ha::BuildBatchOpLogSnapshotObjectStorageKey("snapshots", "1-45"));
+    StandbyMetadataStore corrupt;
+    StandbySegmentRegistry empty_registry;
+    EXPECT_FALSE(provider.RestoreBaseline(corrupt, empty_registry));
+    EXPECT_FALSE(corrupt.Exists("tenant", "key-0"));
 }
 
 TEST_F(BatchOpLogSnapshotWriterTest,
