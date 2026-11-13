@@ -148,10 +148,7 @@ class Environment:
         self.prefix = self.cluster + "/"
         self.failpoints = self.output / "failpoints"
         self.failpoints.mkdir()
-        if args.scenario == "performance":
-            os.environ.pop("MOONCAKE_TEST_FAILPOINT_DIR", None)
-        else:
-            os.environ["MOONCAKE_TEST_FAILPOINT_DIR"] = str(self.failpoints)
+        os.environ["MOONCAKE_TEST_FAILPOINT_DIR"] = str(self.failpoints)
         self.control = {
             "lock": threading.Lock(),
             "events": [],
@@ -173,17 +170,11 @@ class Environment:
         self.proxy.daemon_threads = True
         self.proxy.control = self.control
         threading.Thread(target=self.proxy.serve_forever, daemon=True).start()
-        self.endpoint = (
-            args.endpoint
-            if args.scenario == "performance"
-            else f"http://127.0.0.1:{self.proxy.server_port}"
-        )
+        self.endpoint = f"http://127.0.0.1:{self.proxy.server_port}"
         self.etcd_port, self.peer_port = free_port(), free_port()
         self.address = f"etcd://127.0.0.1:{self.etcd_port}"
         os.environ["MC_STORE_CLUSTER_ID"] = self.cluster
-        os.environ["MOONCAKE_STORE_CHECKSUM"] = (
-            "0" if args.scenario == "performance" else "1"
-        )
+        os.environ["MOONCAKE_STORE_CHECKSUM"] = "1"
         sys.path.insert(0, str(args.build / "mooncake-integration"))
         import _store as store
 
@@ -235,8 +226,8 @@ class Environment:
                 str(self.args.build / "mooncake-store/src/mooncake_master"),
                 f"--port={port}",
                 "--rpc_address=127.0.0.1",
-                f"--rpc_thread_num={8 if self.args.scenario == 'performance' else 4}",
-                f"--handler_worker_thread_num={64 if self.args.scenario == 'performance' else 8}",
+                "--rpc_thread_num=4",
+                "--handler_worker_thread_num=8",
                 "--enable_ha=true",
                 "--enable_oplog=true",
                 "--enable_metric_reporting=false",
@@ -258,7 +249,7 @@ class Environment:
                 f"--object_storage_cleanup_interval_ms={cleanup_interval_ms}",
                 f"--object_storage_maintenance_batch_size={maintenance_batch_size}",
                 f"--default_kv_lease_ttl={10000 if self.args.scenario == 'gc' else 3000}ms",
-                f"--ha_leader_lease_ttl_sec={30 if self.args.scenario == 'performance' else 5}",
+                "--ha_leader_lease_ttl_sec=5",
                 f"--put_start_discard_timeout_sec={2 if self.args.scenario == 'import' else 30}",
                 f"--put_start_release_timeout_sec={5 if self.args.scenario == 'import' else 600}",
             ],
@@ -1061,50 +1052,6 @@ def run_gc(args):
         env.close()
 
 
-def run_performance(args):
-    import copy
-
-    for mode, enabled in (("object", True), ("memory", False), ("memory", True)):
-        case = copy.copy(args)
-        case.output = args.output / f"{mode}-enabled-{enabled}"
-        env = Environment(case)
-        try:
-            _, port = env.master(max_pending_records=10000, enabled=enabled)
-            sizes = (65536, 1048576, 16777216) if mode == "object" else (65536, 1048576)
-            callers = (1, 8, 32) if mode == "object" else (1, 32)
-            for size in sizes:
-                for concurrency in callers:
-                    for trial in range(3):
-                        label = f"{size}-{concurrency}-{trial}"
-                        csv = env.output / f"performance-{label}.csv"
-                        error_log = open(env.output / f"performance-{label}.log", "wb")
-                        try:
-                            with open(csv, "wb") as output:
-                                subprocess.run(
-                                    [
-                                        str(
-                                            args.build
-                                            / "mooncake-store/benchmarks/object_storage_bench"
-                                        ),
-                                        f"--master=127.0.0.1:{port}",
-                                        f"--mode={mode}",
-                                        f"--bytes={size}",
-                                        f"--concurrency={concurrency}",
-                                        f"--iterations={4 if size == 16777216 else 32}",
-                                        f"--metrics_output={env.output / ('metrics-' + label + '.txt')}",
-                                    ],
-                                    stdout=output,
-                                    stderr=error_log,
-                                    check=True,
-                                    timeout=300,
-                                )
-                        finally:
-                            error_log.close()
-                        env.report("performance " + label)
-        finally:
-            env.close()
-
-
 def run(args):
     functions = {
         "basic": run_basic,
@@ -1116,7 +1063,6 @@ def run(args):
         "snapshot": run_snapshot,
         "import": run_import,
         "gc": run_gc,
-        "performance": run_performance,
     }
     functions[args.scenario](args)
 
@@ -1135,7 +1081,6 @@ if __name__ == "__main__":
             "snapshot",
             "import",
             "gc",
-            "performance",
         ),
         default="basic",
     )
