@@ -393,16 +393,20 @@ DEFINE_string(object_storage_bucket, "", "Object service bucket");
 DEFINE_string(object_storage_region, "us-east-1", "Object service region");
 DEFINE_string(object_storage_prefix, "", "Immutable object namespace prefix");
 DEFINE_bool(object_storage_path_style, false, "Use path-style object requests");
-DEFINE_uint64(object_storage_max_records, 10000,
-              "Maximum retained upload and cleanup obligations");
+DEFINE_uint64(
+    object_storage_max_pending_records, 10000,
+    "Admission threshold for uncommitted uploads and retired objects; "
+    "committed referenced objects do not count");
 DEFINE_uint64(object_storage_max_object_bytes, 268435456,
               "Maximum object size");
 DEFINE_uint64(object_storage_max_staging_bytes, 1073741824,
               "Maximum object staging bytes per client");
 DEFINE_uint64(object_storage_maintenance_batch_size, 32,
-              "Maximum cleanup records per round");
+              "Maximum pending records per worker callback; due backlog "
+              "continues in the next callback without an interval wait");
 DEFINE_uint64(object_storage_cleanup_interval_ms, 10000,
-              "Cleanup round interval");
+              "Retry/recheck interval for failed DELETEs, unknown uploads and "
+              "unfinished writes; not a delay between healthy cleanup batches");
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
@@ -734,9 +738,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("object_storage_path_style",
                            &master_config.object_storage.target.path_style,
                            FLAGS_object_storage_path_style);
-    default_config.GetUInt64("object_storage_max_records",
-                             &master_config.object_storage.max_records,
-                             FLAGS_object_storage_max_records);
+    default_config.GetUInt64("object_storage_max_pending_records",
+                             &master_config.object_storage.max_pending_records,
+                             FLAGS_object_storage_max_pending_records);
     default_config.GetUInt64("object_storage_max_object_bytes",
                              &master_config.object_storage.max_object_bytes,
                              FLAGS_object_storage_max_object_bytes);
@@ -1264,11 +1268,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set)
         master_config.object_storage.target.path_style =
             FLAGS_object_storage_path_style;
-    if ((google::GetCommandLineFlagInfo("object_storage_max_records", &info) &&
+    if ((google::GetCommandLineFlagInfo("object_storage_max_pending_records",
+                                        &info) &&
          !info.is_default) ||
         !conf_set)
-        master_config.object_storage.max_records =
-            FLAGS_object_storage_max_records;
+        master_config.object_storage.max_pending_records =
+            FLAGS_object_storage_max_pending_records;
     if ((google::GetCommandLineFlagInfo("object_storage_max_object_bytes",
                                         &info) &&
          !info.is_default) ||

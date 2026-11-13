@@ -68,12 +68,27 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             fail = self.command == "PUT" and control["fail_put"] > 0
             if fail:
                 control["fail_put"] -= 1
+            elif (
+                self.command == "DELETE"
+                and control["fail_delete"] > 0
+                and self.path == control["fail_delete_path"]
+            ):
+                control["fail_delete"] -= 1
+                fail = True
         if self.command == "PUT" and control["pause_put"]:
             control["pause_put"] = False
             control["put_paused"].set()
             assert control["put_release"].wait(30), "Timed out waiting to release PUT"
+        if self.command == "DELETE" and self.path == control["pause_delete_path"]:
+            control["pause_delete_path"] = None
+            control["delete_paused"].set()
+            assert control["delete_release"].wait(
+                30
+            ), "Timed out waiting to release DELETE"
         if fail:
-            status, headers, data = 503, {}, b""
+            # A non-retryable DELETE response isolates the Master's retry
+            # scheduling from the adapter's own transient HTTP retries.
+            status, headers, data = (400 if self.command == "DELETE" else 503), {}, b""
         else:
             status, headers, data = forward(
                 control["backend"], self.command, self.path, dict(self.headers), body
@@ -144,6 +159,11 @@ class Environment:
             "pending": [],
             "hold_put": False,
             "fail_put": 0,
+            "fail_delete": 0,
+            "fail_delete_path": None,
+            "pause_delete_path": None,
+            "delete_paused": threading.Event(),
+            "delete_release": threading.Event(),
             "backend": args.endpoint,
             "pause_put": False,
             "put_paused": threading.Event(),
@@ -200,7 +220,14 @@ class Environment:
         self.children.append(child)
         return child
 
-    def master(self, ready=True, max_records=1000, enabled=True):
+    def master(
+        self,
+        ready=True,
+        max_pending_records=1000,
+        enabled=True,
+        maintenance_batch_size=32,
+        cleanup_interval_ms=200,
+    ):
         port = free_port()
         child = self.spawn(
             "master",
@@ -227,8 +254,9 @@ class Environment:
                 "--object_storage_region=us-east-1",
                 "--object_storage_path_style=true",
                 f"--object_storage_prefix={self.prefix}",
-                f"--object_storage_max_records={max_records}",
-                "--object_storage_cleanup_interval_ms=200",
+                f"--object_storage_max_pending_records={max_pending_records}",
+                f"--object_storage_cleanup_interval_ms={cleanup_interval_ms}",
+                f"--object_storage_maintenance_batch_size={maintenance_batch_size}",
                 f"--default_kv_lease_ttl={10000 if self.args.scenario == 'gc' else 3000}ms",
                 f"--ha_leader_lease_ttl_sec={30 if self.args.scenario == 'performance' else 5}",
                 f"--put_start_discard_timeout_sec={2 if self.args.scenario == 'import' else 30}",
@@ -469,7 +497,7 @@ def run_basic(args):
 def run_budget(args):
     env = Environment(args)
     try:
-        env.master(max_records=1)
+        _, port = env.master(max_pending_records=1)
         owner = env.client(64 << 20)
         writer = env.client()
         object_config = env.store.ReplicateConfig()
@@ -477,9 +505,39 @@ def run_budget(args):
         memory_config = env.store.ReplicateConfig()
         old, new = b"old!" * 1024, b"new!" * 1024
         assert writer.put("budget", old, object_config) == 0
+        assert writer.put("stable", old, object_config) == 0
+        assert len(env.names()) == 2
+        env.report("committed objects exceed the pending-work budget")
+        driver_log = open(env.output / "protocol.log", "wb")
+        env.logs.append(driver_log)
+        driver = subprocess.Popen(
+            [str(args.build / "mooncake-store/tests/object_storage_protocol_client")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=driver_log,
+            text=True,
+        )
+        env.children.append(driver)
+
+        def command(text):
+            driver.stdin.write(text + "\n")
+            driver.stdin.flush()
+            response = driver.stdout.readline().split()
+            assert response, "Protocol driver exited"
+            return response
+
+        assert command(f"connect 127.0.0.1:{port}") == ["0"]
+        started = command("start")
+        assert started[0] == "0", started
+        env.s3.put_object(Bucket=args.bucket, Key=env.prefix + started[2], Body=old)
+        assert command("uploaded") == ["0"]
+        assert writer.get("reused-attempt") in (None, b"")
         assert writer.upsert("budget", new, object_config) != 0
         assert writer.get("budget") == old
-        env.report("rejected replacement preserves committed old value")
+        env.report("uploaded but uncommitted object retains admission slot")
+        assert command("revoke") == ["0"]
+        assert writer.remove("stable", True) == 0
+        env.report("revoke and delete remain available above the pending budget")
         assert writer.upsert("budget", new, memory_config) == 0
         deadline = time.monotonic() + 15
         while env.names() and time.monotonic() < deadline:
@@ -498,12 +556,102 @@ def run_budget(args):
         # A plain memory write session can inherit an exact attempt while the
         # old object is pending cleanup. It must reject and revoke cleanly.
         assert writer.remove("budget-next", True) == 0
-        assert writer.batch_put_session_start(
+        session_results = writer.batch_put_session_start(
             ["budget-next"], [len(new)], memory_config
-        ) == [-600]
+        )
+        assert session_results == [-600], session_results
         assert writer.put("budget-next", b"session-recreated", memory_config) == 0
         assert writer.get("budget-next") == b"session-recreated"
         env.report("tracked memory write session rejected and exact allocation revoked")
+        assert owner is not None
+    finally:
+        env.close()
+
+
+def run_cleanup(args):
+    env = Environment(args)
+    try:
+        primary, port = env.master(
+            max_pending_records=2,
+            maintenance_batch_size=2,
+            cleanup_interval_ms=60000,
+        )
+        owner = env.client()
+        writer = env.client()
+        config = env.store.ReplicateConfig()
+        config.replica_num = 0
+        config.os_replica_num = 1
+        driver_log = open(env.output / "protocol.log", "wb")
+        env.logs.append(driver_log)
+        driver = subprocess.Popen(
+            [str(args.build / "mooncake-store/tests/object_storage_protocol_client")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=driver_log,
+            text=True,
+        )
+        env.children.append(driver)
+
+        def command(text):
+            driver.stdin.write(text + "\n")
+            driver.stdin.flush()
+            response = driver.stdout.readline().split()
+            assert response, "Protocol driver exited"
+            return response
+
+        assert command(f"connect 127.0.0.1:{port}") == ["0"]
+        started = command("start_object")
+        assert started[0] == "0", started
+        physical = env.prefix + started[2]
+        env.s3.put_object(Bucket=args.bucket, Key=physical, Body=b"X" * 4096)
+        assert command("uploaded") == ["0"]
+        assert command("end") == ["0"]
+        assert writer.get("reused-attempt") == b"X" * 4096
+        keys = [f"cleanup-{i}" for i in range(8)]
+        for key in keys:
+            assert writer.put(key, key.encode() * 4096, config) == 0
+        assert len(env.names()) == len(keys) + 1
+        failed_path = f"/{args.bucket}/{physical}"
+        with env.control["lock"]:
+            env.control["fail_delete"] = 1
+            env.control["fail_delete_path"] = failed_path
+            env.control["pause_delete_path"] = failed_path
+        assert writer.remove("reused-attempt", True) == 0
+        for key in keys:
+            assert writer.remove(key, True) == 0
+        try:
+            assert env.control["delete_paused"].wait(15), "DELETE did not reach barrier"
+            assert command("uploaded") == ["0"]
+        finally:
+            env.control["delete_release"].set()
+        wait_for(
+            lambda: env.names() == {physical},
+            "healthy backlog drains across batches despite one DELETE failure",
+            timeout=30,
+        )
+        assert (
+            sum(
+                method == "DELETE" and path == failed_path
+                for _, method, path in env.control["events"]
+            )
+            == 1
+        )
+        env.report(
+            "continuous batches, failed DELETE backoff and duplicate notification isolation"
+        )
+        # Restoring the retired records must rebuild scheduling and admission.
+        # Failed DELETEs may be retried after failover; their in-memory retry
+        # deadlines are not a durability contract.
+        primary.kill()
+        primary.wait(timeout=15)
+        env.master(
+            max_pending_records=2, maintenance_batch_size=2, cleanup_interval_ms=10000
+        )
+        recovered = env.client()
+        wait_for(lambda: not env.names(), "recovered cleanup backlog", timeout=30)
+        assert recovered.put("after-cleanup", b"new", config) == 0
+        assert recovered.get("after-cleanup") == b"new"
+        env.report("restart rebuilds pending work and resumes admission")
         assert owner is not None
     finally:
         env.close()
@@ -921,7 +1069,7 @@ def run_performance(args):
         case.output = args.output / f"{mode}-enabled-{enabled}"
         env = Environment(case)
         try:
-            _, port = env.master(max_records=10000, enabled=enabled)
+            _, port = env.master(max_pending_records=10000, enabled=enabled)
             sizes = (65536, 1048576, 16777216) if mode == "object" else (65536, 1048576)
             callers = (1, 8, 32) if mode == "object" else (1, 32)
             for size in sizes:
@@ -962,6 +1110,7 @@ def run(args):
         "basic": run_basic,
         "object-only": run_basic,
         "budget": run_budget,
+        "cleanup": run_cleanup,
         "faults": run_faults,
         "stale": run_stale,
         "snapshot": run_snapshot,
@@ -980,6 +1129,7 @@ if __name__ == "__main__":
             "basic",
             "object-only",
             "budget",
+            "cleanup",
             "faults",
             "stale",
             "snapshot",

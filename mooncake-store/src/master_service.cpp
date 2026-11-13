@@ -482,9 +482,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
           // is in flight; the restore itself owns the metadata transition.
           if (AdmitsBusinessWorkers()) {
               ClearInvalidHandles();
-              MaintainObjectStorage();
           }
       }),
+      object_storage_worker_([this] { MaintainObjectStorage(); }),
       kvcs_capacity_refresh_worker_([this] { RefreshKvcsDfsUsage(); }),
       enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
@@ -756,6 +756,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     client_offboarding_worker_.Start();
     VLOG(1) << "action=start_client_offboarding_worker";
     if (dfs_kvcs_capacity_provider_) kvcs_capacity_refresh_worker_.Start();
+    if (object_uploads_) object_storage_worker_.Start();
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -971,6 +972,7 @@ MasterService::~MasterService() {
     }
     graceful_unmount_scheduler_.Stop();
     replica_cleanup_worker_.Stop();
+    object_storage_worker_.Stop();
     kvcs_capacity_refresh_worker_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
@@ -3771,6 +3773,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     lifecycle_state_.store(result.has_value() ? RestoreLifecycleState::kReady
                                               : RestoreLifecycleState::kFailed,
                            std::memory_order_release);
+    if (result && object_uploads_) object_storage_worker_.Schedule();
     LOG(INFO) << "Restore lifecycle -> "
               << RestoreLifecycleStateToString(lifecycle_state_.load());
     return result;
@@ -9744,7 +9747,6 @@ void MasterService::EvictionThreadFunc() {
             continue;
         }
 
-        if (object_uploads_) replica_cleanup_worker_.Schedule();
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||

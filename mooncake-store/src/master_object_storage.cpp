@@ -164,11 +164,19 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
     for (const auto& record : mutation.records)
         if (!object_uploads_->FindObjectUpload(record.object.object_key))
             ++new_records;
-    if (new_records && (object_uploads_->ObjectUploadCount() >=
-                            object_storage_config_.max_records ||
-                        new_records > object_storage_config_.max_records -
-                                          object_uploads_->ObjectUploadCount()))
+    if (new_records &&
+        (object_pending_deadlines_.size() >=
+             object_storage_config_.max_pending_records ||
+         new_records > object_storage_config_.max_pending_records -
+                           object_pending_deadlines_.size()))
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    // Remember transition boundaries before applying the candidate. Repeated
+    // notifications must not postpone an existing cleanup/recheck deadline.
+    std::unordered_map<std::string, ObjectUploadRecord> old_records;
+    for (const auto& record : mutation.records) {
+        auto old = object_uploads_->FindObjectUpload(record.object.object_key);
+        if (old) old_records.emplace(record.object.object_key, std::move(*old));
+    }
     // Validate before enqueue without publishing candidate logical metadata.
     StandbyMetadataStore validation;
     if (!validation.RestoreObjectReplicas({mutation.target, previous}) ||
@@ -190,8 +198,42 @@ MasterService::CommitObjectAware(OrderedOpLogWriter::Reservation&& reservation,
     for (const auto& record : mutation.records)
         object_upload_sequences_[record.object.object_key] =
             pending->sequence_id();
-    for (const auto& name : mutation.forget)
+    const auto logical =
+        object_uploads_->GetMetadata(entry.tenant_id, entry.object_key);
+    const auto now = ObjectNowMs();
+    for (const auto& record : mutation.records) {
+        const auto& name = record.object.object_key;
+        const bool committed =
+            record.phase == ObjectUploadPhase::UPLOADED && logical &&
+            std::any_of(
+                logical->replicas.begin(), logical->replicas.end(),
+                [&](const auto& replica) {
+                    return replica.is_object_storage_replica() &&
+                           replica.status == ReplicaStatus::COMPLETE &&
+                           replica.id == record.replica_id &&
+                           replica.get_object_storage_descriptor().object_key ==
+                               name;
+                });
+        if (committed) {
+            SetObjectWorkLocked(name, std::nullopt);
+            continue;
+        }
+        const auto old = old_records.find(name);
+        if (!object_pending_deadlines_.contains(name) ||
+            old == old_records.end() || old->second.phase != record.phase ||
+            old->second.not_before_ms != record.not_before_ms ||
+            old->second.upload_finished != record.upload_finished) {
+            SetObjectWorkLocked(
+                name, record.phase == ObjectUploadPhase::RETIRED
+                          ? std::max(now, record.not_before_ms)
+                          : now + object_storage_config_.cleanup_interval_ms);
+        }
+    }
+    for (const auto& name : mutation.forget) {
         object_upload_sequences_.erase(name);
+        SetObjectWorkLocked(name, std::nullopt);
+    }
+    ScheduleObjectWorkLocked();
     if (!mutation.forget.empty() && !object_uploads_->FirstObjectUploadForKey(
                                         entry.tenant_id, entry.object_key))
         object_uploads_->Remove(entry.tenant_id, entry.object_key);
@@ -529,96 +571,146 @@ tl::expected<void, ErrorCode> MasterService::RevokeObjectStorageWrite(
     return {};
 }
 
+// object_storage_mutex_ protects admission and both scheduling indexes.
+void MasterService::SetObjectWorkLocked(const std::string& name,
+                                        std::optional<uint64_t> deadline) {
+    auto existing = object_pending_deadlines_.find(name);
+    if (existing != object_pending_deadlines_.end()) {
+        object_work_.erase({existing->second.deadline_ms, name});
+        object_pending_deadlines_.erase(existing);
+    }
+    if (deadline) {
+        object_pending_deadlines_.emplace(
+            name, ObjectPendingWork{*deadline, ++object_work_generation_});
+        object_work_.emplace(*deadline, name);
+    }
+}
+
+void MasterService::ScheduleObjectWorkLocked() {
+    if (object_work_.empty()) return;
+    const auto now = ObjectNowMs();
+    const auto due = object_work_.begin()->first;
+    const auto delay = due > now ? due - now : 0;
+    object_storage_worker_.ScheduleAt(BackgroundWorker::Clock::now() +
+                                      std::chrono::milliseconds(delay));
+}
+
 void MasterService::MaintainObjectStorage() {
-    if (!object_uploads_ ||
-        std::chrono::steady_clock::now() < object_cleanup_after_)
+    if (!AdmitsBusinessWorkers()) {
+        object_storage_worker_.ScheduleAt(
+            BackgroundWorker::Clock::now() +
+            std::chrono::milliseconds(
+                object_storage_config_.cleanup_interval_ms));
         return;
-    object_cleanup_after_ =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(object_storage_config_.cleanup_interval_ms);
-    auto records = object_uploads_->ObjectUploadChunk(
-        object_scan_cursor_, object_storage_config_.maintenance_batch_size);
-    object_scan_cursor_ =
-        records.empty() ? std::string{} : records.back().object.object_key;
-    std::erase_if(records, [](const auto& record) {
-        return record.phase == ObjectUploadPhase::RETIRED;
-    });
-    auto retired = object_uploads_->RetiredObjectUploadChunk(
-        object_cleanup_cursor_, object_storage_config_.maintenance_batch_size);
-    object_cleanup_cursor_ =
-        retired.empty() ? std::string{} : retired.back().object.object_key;
-    records.insert(records.end(), retired.begin(), retired.end());
-    for (auto record : records) {
-        const TenantId tenant(record.tenant_id);
-        {
-            std::shared_lock lock(master_state_mutex_);
-            MetadataAccessorRW accessor(this, {tenant, record.key});
-            auto current =
-                object_uploads_->FindObjectUpload(record.object.object_key);
-            if (!current) continue;
-            record = *current;
-            bool live = accessor.Exists() &&
-                        accessor.Get().GetReplicaByID(record.replica_id);
-            auto logical =
-                object_uploads_->GetMetadata(record.tenant_id, record.key);
-            if (logical) {
-                for (const auto& replica : logical->replicas)
-                    if (replica.id == record.replica_id) live = true;
-            }
-            if (record.phase != ObjectUploadPhase::RETIRED && !live) {
-                record.phase = ObjectUploadPhase::RETIRED;
-                record.not_before_ms =
-                    std::max(record.not_before_ms,
-                             ObjectNowMs() + default_kv_lease_ttl_);
-                ObjectReplicaMutation mutation;
-                mutation.target = record.target;
-                mutation.records.push_back(record);
-                auto appended = AppendOpLogWithDurableFinalize(
-                    OpType::OBJECT_STORAGE_MUTATION, record.tenant_id,
-                    record.key, EncodeObjectMutation(mutation), {});
-                if (!appended) continue;
-            }
-            if (record.phase != ObjectUploadPhase::RETIRED ||
-                record.not_before_ms > ObjectNowMs())
-                continue;
-        }
+    }
+    for (uint64_t i = 0;
+         i < object_storage_config_.maintenance_batch_size &&
+         object_storage_worker_.IsRunning() && AdmitsBusinessWorkers();
+         ++i) {
+        std::string name;
         uint64_t sequence;
+        uint64_t generation;
         {
             std::lock_guard lock(object_storage_mutex_);
-            auto it = object_upload_sequences_.find(record.object.object_key);
-            if (it == object_upload_sequences_.end()) continue;
-            sequence = it->second;
+            if (object_work_.empty() ||
+                object_work_.begin()->first > ObjectNowMs())
+                break;
+            name = object_work_.begin()->second;
+            sequence = object_upload_sequences_.at(name);
+            generation = object_pending_deadlines_.at(name).generation;
         }
-        // Never perform a destructive side effect for an undurable retirement.
-        if (!WaitObjectDurable(sequence)) continue;
-        auto deleted =
-            object_storage_adapter_->Delete(record.object.object_key);
-        if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND &&
-            deleted.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            LOG(WARNING) << "Object cleanup failed: "
-                         << toString(deleted.error());
-            break;
+        auto process = [&] {
+            auto record = object_uploads_->FindObjectUpload(name);
+            if (!record) return;
+            const TenantId tenant(record->tenant_id);
+            {
+                std::shared_lock lock(master_state_mutex_);
+                if (!AdmitsBusinessWorkers()) return;
+                MetadataAccessorRW accessor(this, {tenant, record->key});
+                record = object_uploads_->FindObjectUpload(name);
+                if (!record) return;
+                bool live = accessor.Exists() &&
+                            accessor.Get().GetReplicaByID(record->replica_id);
+                auto logical = object_uploads_->GetMetadata(record->tenant_id,
+                                                            record->key);
+                if (logical) {
+                    for (const auto& replica : logical->replicas)
+                        if (replica.id == record->replica_id) live = true;
+                }
+                if (record->phase != ObjectUploadPhase::RETIRED) {
+                    if (!live) {
+                        record->phase = ObjectUploadPhase::RETIRED;
+                        record->not_before_ms =
+                            std::max(record->not_before_ms,
+                                     ObjectNowMs() + default_kv_lease_ttl_);
+                        ObjectReplicaMutation mutation;
+                        mutation.target = record->target;
+                        mutation.records.push_back(*record);
+                        auto appended = AppendOpLogWithDurableFinalize(
+                            OpType::OBJECT_STORAGE_MUTATION, record->tenant_id,
+                            record->key, EncodeObjectMutation(mutation), {});
+                        if (!appended)
+                            LOG(WARNING) << "Cannot retire object: "
+                                         << toString(appended.error());
+                    }
+                    return;
+                }
+                if (record->not_before_ms > ObjectNowMs()) return;
+                // Capture the fresh retirement sequence under the key lock.
+                std::lock_guard object_lock(object_storage_mutex_);
+                sequence = object_upload_sequences_.at(name);
+            }
+            // No destructive side effect for an undurable retirement, and no
+            // business locks held across a durability wait or remote DELETE.
+            if (!WaitObjectDurable(sequence)) return;
+            auto deleted = object_storage_adapter_->Delete(name);
+            if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND &&
+                deleted.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(WARNING)
+                    << "Object cleanup failed: " << toString(deleted.error());
+                return;
+            }
+            if (!record->upload_finished) return;
+            std::shared_lock lock(master_state_mutex_);
+            if (!AdmitsBusinessWorkers()) return;
+            MetadataAccessorRW accessor(this, {tenant, record->key});
+            auto current = object_uploads_->FindObjectUpload(name);
+            if (!current || current->phase != ObjectUploadPhase::RETIRED ||
+                !current->upload_finished ||
+                current->not_before_ms > ObjectNowMs())
+                return;
+            ObjectReplicaMutation mutation;
+            mutation.target = current->target;
+            mutation.forget.push_back(name);
+            auto appended = AppendOpLogWithDurableFinalize(
+                OpType::OBJECT_STORAGE_MUTATION, current->tenant_id,
+                current->key, EncodeObjectMutation(mutation),
+                [](const OpLogEntry&) {
+                    TestFailPoint::Wait("object_cleanup_forgotten");
+                });
+            if (!appended)
+                LOG(WARNING) << "Cannot persist object cleanup: "
+                             << toString(appended.error());
+        };
+        process();
+        {
+            std::lock_guard lock(object_storage_mutex_);
+            const auto current = object_pending_deadlines_.find(name);
+            // A concurrent completion/retirement has its own new deadline.
+            // Do not overwrite it with this older attempt's retry schedule.
+            // A duplicate notification can advance the log sequence without
+            // changing the work. It must not bypass a failed DELETE's backoff.
+            if (current != object_pending_deadlines_.end() &&
+                current->second.generation == generation)
+                SetObjectWorkLocked(
+                    name,
+                    std::max(current->second.deadline_ms,
+                             ObjectNowMs() +
+                                 object_storage_config_.cleanup_interval_ms));
         }
-        if (!record.upload_finished) continue;
-        std::shared_lock lock(master_state_mutex_);
-        MetadataAccessorRW accessor(this, {tenant, record.key});
-        auto current =
-            object_uploads_->FindObjectUpload(record.object.object_key);
-        if (!current || current->phase != ObjectUploadPhase::RETIRED ||
-            !current->upload_finished || current->not_before_ms > ObjectNowMs())
-            continue;
-        ObjectReplicaMutation mutation;
-        mutation.target = record.target;
-        mutation.forget.push_back(record.object.object_key);
-        auto appended = AppendOpLogWithDurableFinalize(
-            OpType::OBJECT_STORAGE_MUTATION, record.tenant_id, record.key,
-            EncodeObjectMutation(mutation), [](const OpLogEntry&) {
-                TestFailPoint::Wait("object_cleanup_forgotten");
-            });
-        if (!appended)
-            LOG(WARNING) << "Cannot persist object cleanup: "
-                         << toString(appended.error());
     }
+    std::lock_guard lock(object_storage_mutex_);
+    ScheduleObjectWorkLocked();
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreObjectStorage(
@@ -661,9 +753,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreObjectStorage(
         std::lock_guard lock(object_storage_mutex_);
         object_upload_sequences_.clear();
         object_storage_last_sequence_ = 0;
-        object_cleanup_cursor_.clear();
-        object_scan_cursor_.clear();
-        object_cleanup_after_ = {};
+        object_pending_deadlines_.clear();
+        object_work_.clear();
     }
     if (!snapshot.target) return {};
     const auto deadline = ObjectNowMs() + default_kv_lease_ttl_;

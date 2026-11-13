@@ -1,8 +1,10 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
@@ -14,6 +16,7 @@ namespace mooncake {
 // owner; Schedule() may be called concurrently from other threads.
 class BackgroundWorker {
    public:
+    using Clock = std::chrono::steady_clock;
     using Callback = std::function<void()>;
 
     explicit BackgroundWorker(Callback callback)
@@ -30,7 +33,7 @@ class BackgroundWorker {
             return;
         }
         running_ = true;
-        requested_ = false;
+        requested_at_.reset();
         thread_ = std::thread(&BackgroundWorker::ThreadFunc, this);
     }
 
@@ -41,7 +44,7 @@ class BackgroundWorker {
                 return;
             }
             running_ = false;
-            requested_ = false;
+            requested_at_.reset();
         }
         cv_.notify_all();
         if (thread_.joinable()) {
@@ -49,15 +52,26 @@ class BackgroundWorker {
         }
     }
 
-    void Schedule() {
+    void Schedule() { ScheduleAt(Clock::now()); }
+
+    // Keep the earliest pending wakeup; an immediate Schedule() can interrupt
+    // a timed wait. Callbacks may schedule their next run without holding
+    // locks.
+    void ScheduleAt(Clock::time_point deadline) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!running_) {
                 return;
             }
-            requested_ = true;
+            if (!requested_at_ || deadline < *requested_at_)
+                requested_at_ = deadline;
         }
         cv_.notify_one();
+    }
+
+    bool IsRunning() {
+        std::lock_guard lock(mutex_);
+        return running_;
     }
 
    private:
@@ -65,11 +79,20 @@ class BackgroundWorker {
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return !running_ || requested_; });
+                while (running_) {
+                    if (!requested_at_) {
+                        cv_.wait(lock);
+                    } else if (*requested_at_ > Clock::now()) {
+                        const auto deadline = *requested_at_;
+                        cv_.wait_until(lock, deadline);
+                    } else {
+                        break;
+                    }
+                }
                 if (!running_) {
                     return;
                 }
-                requested_ = false;
+                requested_at_.reset();
             }
             callback_();
         }
@@ -80,7 +103,7 @@ class BackgroundWorker {
     std::condition_variable cv_;
     std::thread thread_;
     bool running_{false};
-    bool requested_{false};
+    std::optional<Clock::time_point> requested_at_;
 };
 
 }  // namespace mooncake

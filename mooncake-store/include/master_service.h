@@ -23,6 +23,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <utility>
 #include <vector>
 #include <ylt/util/expected.hpp>
@@ -1580,6 +1581,7 @@ class MasterService {
     DeadlineScheduler<GracefulUnmountDeadlineRecord>
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
+    BackgroundWorker object_storage_worker_;
     BackgroundWorker kvcs_capacity_refresh_worker_;
     const bool enable_async_segment_cleanup_;
 
@@ -2335,9 +2337,18 @@ class MasterService {
     std::unique_ptr<StandbyMetadataStore> object_uploads_;
     std::mutex object_storage_mutex_;
     std::unordered_map<std::string, uint64_t> object_upload_sequences_;
-    std::string object_cleanup_cursor_;
-    std::string object_scan_cursor_;
-    std::chrono::steady_clock::time_point object_cleanup_after_{};
+    // Pending work only: committed, referenced objects consume no admission
+    // slots. Both indexes are rebuilt from recovered records and metadata.
+    struct ObjectPendingWork {
+        uint64_t deadline_ms;
+        uint64_t generation;
+    };
+    std::unordered_map<std::string, ObjectPendingWork>
+        object_pending_deadlines_;
+    uint64_t object_work_generation_{0};
+    std::set<std::pair<uint64_t, std::string>> object_work_;
+    void SetObjectWorkLocked(const std::string&, std::optional<uint64_t>);
+    void ScheduleObjectWorkLocked();
     void InitObjectStorage(const MasterServiceConfig&);
     void MaintainObjectStorage();
     tl::expected<void, ErrorCode> AuthorizeObjectStorage(const UUID&,

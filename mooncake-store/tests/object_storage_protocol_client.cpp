@@ -61,9 +61,11 @@ int main(int argc, char** argv) {
                 error = result.error();
             else if (!*result)
                 return 5;
-        } else if ((command == "start" || command == "start_memory")) {
+        } else if ((command == "start" || command == "start_memory" ||
+                    command == "start_object")) {
             mooncake::ReplicateConfig config;
-            config.os_replica_num = command == "start" ? 1 : 0;
+            config.replica_num = command == "start_object" ? 0 : 1;
+            config.os_replica_num = command == "start_memory" ? 0 : 1;
             auto result = client.PutStart(key, {4096}, config);
             if (!result)
                 error = result.error();
@@ -79,9 +81,13 @@ int main(int argc, char** argv) {
                 if (!current) return 2;
                 if (!old) old = current;
             }
-        } else if (command == "not_started" && current) {
+        } else if ((command == "not_started" || command == "uploaded") &&
+                   current) {
             auto result = client.FinishObjectStorageUpload(
-                current->token, mooncake::ObjectUploadOutcome::NOT_STARTED);
+                current->token,
+                command == "uploaded"
+                    ? mooncake::ObjectUploadOutcome::COMPLETE
+                    : mooncake::ObjectUploadOutcome::NOT_STARTED);
             if (!result) error = result.error();
         } else if (command == "revoke" && current) {
             auto result = client.RevokeObjectStorageWrite(key, *current);
@@ -89,6 +95,10 @@ int main(int argc, char** argv) {
         } else if (command == "partial_end" && current) {
             auto result = client.PutEnd({key, std::nullopt, current},
                                         mooncake::ReplicaType::MEMORY);
+            if (!result) error = result.error();
+        } else if (command == "end" && current) {
+            auto result = client.PutEnd({key, std::nullopt, current},
+                                        mooncake::ReplicaType::ALL);
             if (!result) error = result.error();
         } else if (command == "old_end" && old) {
             auto result = client.PutEnd({key, std::nullopt, old},
@@ -105,7 +115,8 @@ int main(int argc, char** argv) {
             return 3;
         }
         std::cout << static_cast<int>(error);
-        if ((command == "start" || command == "start_memory") &&
+        if ((command == "start" || command == "start_memory" ||
+             command == "start_object") &&
             error == mooncake::ErrorCode::OK)
             std::cout << ' ' << current->replica_id << ' ' << current->token;
         if (command == "begin_import" && importing)
