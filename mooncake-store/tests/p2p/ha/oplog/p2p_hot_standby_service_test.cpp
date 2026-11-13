@@ -1865,6 +1865,59 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
     auto blocked = restored_master.GetReadRoute("key-restore");
     ASSERT_FALSE(blocked.has_value());
     EXPECT_EQ(blocked.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    P2PGetWriteRouteRequest route_req;
+    route_req.client_id = {99, 99};
+    route_req.key = "new-key-after-restore";
+    route_req.object_size = 1024;
+
+    // Another handoff must retain unready clients and their routes without
+    // making them available before the client confirms ONLINE.
+    const auto exported_before_heartbeat =
+        restored_master.ExportMetadataForStandby();
+    ASSERT_TRUE(exported_before_heartbeat.clients.contains(client_id));
+    ASSERT_TRUE(exported_before_heartbeat.routes.contains("key-restore"));
+    {
+        P2PMasterService next_restored_master(MakeMasterConfig());
+        ASSERT_EQ(next_restored_master.RestoreFromStandbyMetadata(
+                      exported_before_heartbeat, promoted_sequence_id),
+                  ErrorCode::OK);
+        auto next_read = next_restored_master.GetReadRoute("key-restore");
+        ASSERT_FALSE(next_read.has_value());
+        EXPECT_EQ(next_read.error(), ErrorCode::REPLICA_IS_NOT_READY);
+        auto next_write = next_restored_master.GetWriteRoute(route_req);
+        ASSERT_FALSE(next_write.has_value());
+        EXPECT_EQ(next_write.error(), ErrorCode::NO_AVAILABLE_CANDIDATE);
+
+        auto next_heartbeat = next_restored_master.Heartbeat(
+            {.client_id = client_id, .tasks = {}});
+        ASSERT_TRUE(next_heartbeat.has_value());
+        EXPECT_EQ(next_heartbeat->status, P2PClientStatus::HEALTH);
+        next_read = next_restored_master.GetReadRoute("key-restore");
+        ASSERT_FALSE(next_read.has_value());
+        EXPECT_EQ(next_read.error(), ErrorCode::REPLICA_IS_NOT_READY);
+        next_write = next_restored_master.GetWriteRoute(route_req);
+        ASSERT_FALSE(next_write.has_value());
+        EXPECT_EQ(next_write.error(), ErrorCode::NO_AVAILABLE_CANDIDATE);
+
+        ASSERT_TRUE(
+            next_restored_master
+                .Heartbeat({.client_id = client_id,
+                            .tasks = {},
+                            .service_state = P2PClientServiceState::ONLINE})
+                .has_value());
+        next_read = next_restored_master.GetReadRoute("key-restore");
+        ASSERT_TRUE(next_read.has_value());
+        ASSERT_EQ(next_read->size(), 1);
+        EXPECT_EQ(next_read->front().client_id, client_id);
+        EXPECT_EQ(next_read->front().segment_id, segment_id);
+        EXPECT_EQ(next_read->front().object_size, 2048);
+        next_write = next_restored_master.GetWriteRoute(route_req);
+        ASSERT_TRUE(next_write.has_value());
+        ASSERT_EQ(next_write->size(), 1);
+        EXPECT_EQ(next_write->front().client_id, client_id);
+    }
+
     auto heartbeat = restored_master.Heartbeat({.client_id = client_id});
     ASSERT_TRUE(heartbeat.has_value());
     ASSERT_TRUE(restored_master
@@ -1893,10 +1946,6 @@ TEST_F(P2PHotStandbyServiceTest, RestoreExportedMetadataIntoP2PMasterService) {
     EXPECT_EQ(route.rpc_port, 50051);
     EXPECT_EQ(route.object_size, 2048);
 
-    P2PGetWriteRouteRequest route_req;
-    route_req.client_id = {99, 99};
-    route_req.key = "new-key-after-restore";
-    route_req.object_size = 1024;
     auto route_result = restored_master.GetWriteRoute(route_req);
     ASSERT_TRUE(route_result.has_value()) << toString(route_result.error());
     ASSERT_FALSE(route_result.value().empty());
