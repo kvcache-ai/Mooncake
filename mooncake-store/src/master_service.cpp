@@ -1491,7 +1491,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         for (const auto& [tenant_id, object] : affected_objects) {
             MetadataAccessorRW accessor(this, tenant_id, object);
             if (accessor.IsPublished()) {
-                accessor.Get().GrantReadLease(
+                // Protect the object for one TTL, as clients may now read it,
+                // but keep its restored eviction order: granting a read lease
+                // would give every object on the segment the same deadline
+                // and make eviction pick among them at random.
+                accessor.Get().GrantRestoreLease(
                     std::chrono::milliseconds(default_kv_lease_ttl_));
             }
         }
@@ -3607,6 +3611,25 @@ tl::expected<void, ErrorCode> MasterService::PublishRestoredObjects(
         auto& metadata = accessor.Get();
         metadata.MutablePart(0).SetChecksum(standby_meta.object_checksum);
         metadata.session_id = standby_meta.session_id.value_or("");
+        // Keep the eviction order the object had on the old primary. The
+        // lease deadline stays unset; remount grants the protection lease.
+        // An order is never later than the restore, so every object written
+        // after promotion ranks as newer than all restored ones.
+        const uint64_t order_ms = standby_meta.eviction_order_ms.value_or(0);
+        if (order_ms != 0) {
+            // Cap in milliseconds before converting: a corrupt record could
+            // otherwise overflow the nanosecond clock.
+            const auto now_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch())
+                    .count();
+            const uint64_t capped_ms = std::min(
+                order_ms, static_cast<uint64_t>(std::max<int64_t>(now_ms, 0)));
+            SpinLocker locker(&metadata.lock);
+            metadata.lease_->SetRestoredOrder(
+                std::chrono::system_clock::time_point(
+                    std::chrono::milliseconds(capped_ms)));
+        }
         installed.emplace_back(object.tenant_id,
                                route::ObjectRef{object.user_key, generation});
     }
@@ -11730,6 +11753,18 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
     LOG(INFO) << "HTTP metadata cleanup worker stopped";
 }
 
+namespace {
+
+// Eviction order of `metadata` for the standby copy, in ms since the epoch.
+uint64_t EvictionOrderMsForOpLog(const ObjectMetadata& metadata) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        metadata.EvictionOrder().time_since_epoch())
+                        .count();
+    return ms > 0 ? static_cast<uint64_t>(ms) : 0;
+}
+
+}  // namespace
+
 std::string MasterService::SerializeMetadataForOpLog(
     const ObjectMetadata& metadata) const {
     const auto all_replicas = metadata.GetAllReplicas();
@@ -11756,6 +11791,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.hard_pinned = metadata.IsHardPinned();
     payload.object_checksum = metadata.GetPart(0).checksum();
     payload.residency_affinity_id = metadata.residency_affinity_id;
+    payload.eviction_order_ms = EvictionOrderMsForOpLog(metadata);
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
