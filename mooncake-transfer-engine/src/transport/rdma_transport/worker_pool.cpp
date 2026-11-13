@@ -1891,6 +1891,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             if (owner_thread == thread_id && !defer_local_redispatch) {
                 collective_slice_queue_[thread_id][*peer_nic_path].push_back(
                     slice);
+                pending_slice_state_[thread_id].fetch_or(
+                    kCollectiveSlicePendingBit, std::memory_order_release);
             } else {
                 enqueueSliceToOwner(slice);
                 shared_redispatch_count++;

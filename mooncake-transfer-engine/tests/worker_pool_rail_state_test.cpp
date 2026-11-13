@@ -127,6 +127,33 @@ class WorkerPoolTestPeer {
         pool.redispatch(slices, 0);
     }
 
+    static int redispatchReadyToOwner(WorkerPool &pool, Transport::Slice *slice,
+                                      const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return owner;
+        std::vector<Transport::Slice *> slices{slice};
+        pool.redispatch(slices, owner, false, false, true);
+        return owner;
+    }
+
+    static size_t collectiveQueuedForPeer(WorkerPool &pool,
+                                          const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return 0;
+        const auto &queues = pool.collective_slice_queue_[owner];
+        const auto it = queues.find(path);
+        return it == queues.end() ? 0 : it->second.size();
+    }
+
+    static void clearCollectiveForPeer(WorkerPool &pool,
+                                       const std::string &path) {
+        const int owner = pool.postingThreadForPeer(path);
+        if (owner < 0) return;
+        pool.collective_slice_queue_[owner].erase(path);
+        pool.pending_slice_state_[owner].fetch_and(
+            ~WorkerPool::kCollectiveSlicePendingBit, std::memory_order_release);
+    }
+
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     static size_t admitHandedOffSlices(WorkerPool &pool) {
         size_t admitted = 0;
@@ -711,6 +738,46 @@ TEST_F(WorkerPoolRailStateTest, PendingControlWorkPreventsIdleWithoutSlices) {
     EXPECT_TRUE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
     WorkerPoolTestPeer::clearPendingControlWork(*worker_pool_);
     EXPECT_FALSE(WorkerPoolTestPeer::hasPendingWork(*worker_pool_));
+}
+
+TEST_F(WorkerPoolRailStateTest,
+       LocalRedispatchPublishesCollectivePendingState) {
+    constexpr SegmentID kTargetId = 88;
+    constexpr uint64_t kBufferAddr = 0x20000;
+    constexpr const char *kPendingPeer = "pending-peer";
+    constexpr const char *kPendingPeerPath = "pending-peer@mlx5_bond_0";
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = kPendingPeer;
+    desc->protocol = "rdma";
+    desc->devices.push_back({"mlx5_bond_0", 1, "", ""});
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = kBufferAddr;
+    buffer.length = 4096;
+    buffer.rkey = {11};
+    desc->buffers.push_back(buffer);
+    ASSERT_EQ(desc->topology.parse(R"({"cpu:0": [["mlx5_bond_0"], []]})"), 0);
+    ASSERT_EQ(
+        metadata_->addLocalSegment(kTargetId, kPendingPeer, std::move(desc)),
+        0);
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+
+    Transport::Slice slice{};
+    slice.target_id = kTargetId;
+    slice.rdma.dest_addr = kBufferAddr;
+    slice.rdma.max_retry_cnt = 2;
+    slice.length = 64;
+
+    ASSERT_GE(WorkerPoolTestPeer::redispatchReadyToOwner(*worker_pool_, &slice,
+                                                         kPendingPeerPath),
+              0);
+    EXPECT_EQ(WorkerPoolTestPeer::collectiveQueuedForPeer(*worker_pool_,
+                                                          kPendingPeerPath),
+              1u);
+    EXPECT_EQ(
+        WorkerPoolTestPeer::pendingForPeer(*worker_pool_, kPendingPeerPath) & 1,
+        1u);
+    WorkerPoolTestPeer::clearCollectiveForPeer(*worker_pool_, kPendingPeerPath);
 }
 
 TEST_F(WorkerPoolRailStateTest, FailuresBelowThresholdDoNotPauseCount) {
