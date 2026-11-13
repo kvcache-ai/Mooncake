@@ -146,7 +146,7 @@ class EvictorTest : public ::testing::Test {
     static void SetDeadline(const ObjectMetadata& metadata,
                             Clock::time_point deadline) {
         SpinLocker locker(&metadata.lock);
-        metadata.lease_->SetDeadline(deadline);
+        metadata.GetLease().SetDeadline(deadline);
     }
 
     // Publishes `key` in `tenant`'s namespace with its lease ending at
