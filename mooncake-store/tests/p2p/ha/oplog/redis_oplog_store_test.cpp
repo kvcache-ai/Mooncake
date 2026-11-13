@@ -920,30 +920,33 @@ TEST_F(RedisOpLogStoreTest, RejectsInvalidWriteBatchSize) {
 }
 
 TEST_F(RedisOpLogStoreTest, ConfiguredBatchSizeAboveDefaultIsUsed) {
+    auto writer = OpLogStoreFactory::Create(
+        OpLogStoreType::REDIS, cluster_id_, OpLogStoreRole::WRITER,
+        redis_endpoint_, /*poll_interval_ms=*/10, redis_password_,
+        redis_username_, /*db_index=*/0,
+        /*async_queue_max_entries=*/100000, /*overflow_mode=*/"reject",
+        /*best_effort_max_retries=*/3, /*async_write_batch_size=*/128);
+    ASSERT_NE(nullptr, writer);
+    ResetPipelineTrace();
+    // Release held appends before writer destruction, including ASSERT exits.
+    struct TraceCleanup {
+        ~TraceCleanup() { StopPipelineTrace(); }
+    } cleanup;
     max_pipelined_sets.store(0);
-    RedisOpLogStore store(cluster_id_, redis_endpoint_, /*enable_write=*/true,
-                          /*poll_interval_ms=*/10, redis_password_,
-                          redis_username_, /*db_index=*/0,
-                          /*async_queue_max_entries=*/100000,
-                          OpLogAsyncQueueOverflowMode::REJECT,
-                          /*best_effort_max_retries=*/3,
-                          /*async_write_batch_size=*/128);
-    ASSERT_EQ(ErrorCode::OK, store.Init());
 
+    // Hold each worker's first append until enough entries are queued to
+    // require a batch larger than the default, regardless of scheduling.
     for (uint64_t seq = 2; seq <= 1000; ++seq) {
-        ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(MakeEntry(seq), false));
+        ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(seq), false));
     }
-    ASSERT_EQ(ErrorCode::OK, store.WriteOpLog(MakeEntry(1), true));
+    hold_initial_pipeline.store(false);
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    ASSERT_TRUE(writer->DrainWriting(10000).drained);
+    writer->StopWriting();
 
     auto reader = CreateReader();
     uint64_t latest = 0;
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    do {
-        ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
-        if (latest == 1000u) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
     EXPECT_EQ(1000u, latest);
     EXPECT_GT(max_pipelined_sets.load(), 64u);
     EXPECT_LE(max_pipelined_sets.load(), 128u);
