@@ -6,7 +6,10 @@
 #include <algorithm>
 #include <chrono>
 #include <future>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -32,6 +35,15 @@ class RedisElectionHelperTestPeer {
     static bool PollLeaderOnce(RedisElectionHelper& helper,
                                redisContext*& context) {
         return helper.PollLeaderOnce(context);
+    }
+
+    // Called before starting election; identify only this helper's socket.
+    static long long SubscriptionClientId(RedisElectionHelper& helper) {
+        std::lock_guard<std::mutex> lock(helper.subscribe_mutex_);
+        if (!helper.subscribe_ctx_) return 0;
+        RedisReplyPtr reply(
+            (redisReply*)redisCommand(helper.subscribe_ctx_, "CLIENT ID"));
+        return reply && reply->type == REDIS_REPLY_INTEGER ? reply->integer : 0;
     }
 };
 }  // namespace mooncake
@@ -1428,6 +1440,239 @@ TEST_F(RedisElectionHelperTest, WatchLeaderDetectsExpiredLeader) {
     elect_thread.join();
     ASSERT_GT(second_version, first_version);
 }
+
+class RedisElectionWatchRetryTest : public RedisElectionHelperTest,
+                                    public ::testing::WithParamInterface<bool> {
+   protected:
+    template <typename Predicate>
+    bool WaitUntil(Predicate predicate) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+            if (predicate()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < deadline);
+        return false;
+    }
+
+    bool WatchFailed() {
+        return HAStatusManager::instance().SerializeDoctorJson().find(
+                   "ELECTION_WATCH_FAILED") != std::string::npos;
+    }
+
+    std::map<long long, std::string> ClientCommands() {
+        RedisReplyPtr reply(
+            (redisReply*)redisCommand(admin_.get(), "CLIENT LIST"));
+        if (!reply || reply->type != REDIS_REPLY_STRING) return {};
+        std::map<long long, std::string> clients;
+        std::istringstream lines(std::string(reply->str, reply->len));
+        std::string line;
+        while (std::getline(lines, line)) {
+            std::istringstream fields(line);
+            std::string field, command;
+            long long id = 0;
+            while (fields >> field) {
+                if (field.starts_with("id=")) {
+                    id = std::stoll(field.substr(3));
+                } else if (field.starts_with("cmd=")) {
+                    command = field.substr(4);
+                }
+            }
+            if (id > 0) clients.emplace(id, std::move(command));
+        }
+        return clients;
+    }
+
+    long long PollingClientId() {
+        long long polling_id = 0;
+        for (const auto& [id, command] : ClientCommands()) {
+            if (command == "get" && !clients_before_watch_.contains(id)) {
+                // Never guess a target when more than one client matches.
+                if (polling_id != 0) return 0;
+                polling_id = id;
+            }
+        }
+        return polling_id;
+    }
+
+    long long SubscriberCount() {
+        // Mooncake's channel name differs from kvpool's hash-tagged channel.
+        const auto channel = "mooncake:" + FLAGS_cluster_id + "leader_event";
+        RedisReplyPtr reply((redisReply*)redisCommand(
+            admin_.get(), "PUBSUB NUMSUB %b", channel.data(), channel.size()));
+        return reply && reply->type == REDIS_REPLY_ARRAY &&
+                       reply->elements == 2 && reply->element[1] &&
+                       reply->element[1]->type == REDIS_REPLY_INTEGER
+                   ? reply->element[1]->integer
+                   : -1;
+    }
+
+    uint64_t PollingFallbacks() {
+        std::istringstream metrics(
+            HAMetricManager::instance().serialize_metrics());
+        const std::string prefix = "ha_election_polling_fallbacks_total ";
+        std::string line;
+        while (std::getline(metrics, line)) {
+            if (line.starts_with(prefix)) {
+                return std::stoull(line.substr(prefix.size()));
+            }
+        }
+        return 0;
+    }
+
+    void KillClient(long long id) {
+        ASSERT_GT(id, 0);
+        RedisReplyPtr reply(
+            (redisReply*)redisCommand(admin_.get(), "CLIENT KILL ID %lld", id));
+        ASSERT_TRUE(reply && reply->type == REDIS_REPLY_INTEGER);
+        ASSERT_EQ(reply->integer, 1);
+    }
+
+    void SetUp() override {
+        RedisElectionHelperTest::SetUp();
+        auto& status = HAStatusManager::instance();
+        status.Reset();
+        status.Configure(true, FLAGS_cluster_id, "test-standby");
+        status.SetRoleState("standby", "WATCHING");
+        if (GetParam() && !FLAGS_redis_supports_client_kill) {
+            GTEST_SKIP() << "Polling fallback requires CLIENT KILL";
+        }
+        auto [host, port] = ParseRedisEndpoint();
+        admin_.reset(redisConnect(host.c_str(), port));
+        ASSERT_TRUE(AuthenticateRedisContext(admin_.get(), FLAGS_redis_username,
+                                             FLAGS_redis_password));
+        key_ = "mooncake:{" + FLAGS_cluster_id + "}:master_view";
+        leader_value_ = RedisElectionHelper::SerializeLeaderValue(
+            "old-primary:50051", 1, 30);
+        ASSERT_NO_FATAL_FAILURE(RestorePollingGet());
+        helper_ = std::make_unique<RedisElectionHelper>(
+            FLAGS_cluster_id, FLAGS_redis_endpoint, FLAGS_redis_password, 0, 1,
+            1, FLAGS_redis_username);
+        ASSERT_EQ(helper_->Connect(), ErrorCode::OK);
+        clients_before_watch_ = ClientCommands();
+        ASSERT_FALSE(clients_before_watch_.empty());
+        const auto fallbacks = PollingFallbacks();
+        if (GetParam()) {
+            // Break only the unopened subscription to force polling fallback.
+            ASSERT_NO_FATAL_FAILURE(KillClient(
+                RedisElectionHelperTestPeer::SubscriptionClientId(*helper_)));
+        }
+        election_ = std::async(std::launch::async, [&] {
+            helper_->ElectLeader("new-primary:50051", version_, lease_);
+        });
+        ASSERT_TRUE(WaitUntil([&] {
+            return PollingClientId() > 0 &&
+                   (GetParam() ? PollingFallbacks() > fallbacks &&
+                                     SubscriberCount() == 0
+                               : SubscriberCount() == 1);
+        }));
+        EXPECT_FALSE(WatchFailed());
+    }
+
+    void TearDown() override {
+        // Cancel before waiting, including after fatal setup/test assertions.
+        if (helper_) helper_->CancelElection();
+        if (election_.valid()) election_.get();
+        helper_.reset();
+        HAStatusManager::instance().Reset();
+        RedisElectionHelperTest::TearDown();
+    }
+
+    void BreakPollingGet() {
+        // Change type atomically: no absent-key window may trigger election.
+        RedisReplyPtr reply((redisReply*)redisCommand(
+            admin_.get(), "EVAL %s 1 %b",
+            "redis.call('DEL', KEYS[1]); "
+            "return redis.call('LPUSH', KEYS[1], 'wrongtype')",
+            key_.data(), key_.size()));
+        ASSERT_TRUE(reply && reply->type == REDIS_REPLY_INTEGER);
+    }
+
+    void RestorePollingGet() {
+        RedisReplyPtr reply((redisReply*)redisCommand(
+            admin_.get(), "SET %b %b EX 30", key_.data(), key_.size(),
+            leader_value_.data(), leader_value_.size()));
+        ASSERT_TRUE(reply && reply->type == REDIS_REPLY_STATUS);
+    }
+
+    void ExpireLeaderAndExpectElection() {
+        EXPECT_EQ(election_.wait_for(std::chrono::milliseconds(0)),
+                  std::future_status::timeout);
+        // Expiration sends no leader_event notification.
+        RedisReplyPtr reply((redisReply*)redisCommand(
+            admin_.get(), "PEXPIRE %b 100", key_.data(), key_.size()));
+        ASSERT_TRUE(reply && reply->type == REDIS_REPLY_INTEGER &&
+                    reply->integer == 1);
+        ASSERT_EQ(election_.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        election_.get();
+        EXPECT_GT(version_, 0);
+        EXPECT_GT(lease_, 0);
+        EXPECT_FALSE(WatchFailed());
+    }
+
+    std::unique_ptr<redisContext, decltype(&redisFree)> admin_{nullptr,
+                                                               redisFree};
+    std::unique_ptr<RedisElectionHelper> helper_;
+    std::future<void> election_;
+    std::map<long long, std::string> clients_before_watch_;
+    std::string key_;
+    std::string leader_value_;
+    ViewVersionId version_{0};
+    int lease_{0};
+};
+
+TEST_P(RedisElectionWatchRetryTest, RecoversGetErrorsWithoutNotification) {
+    ASSERT_NO_FATAL_FAILURE(BreakPollingGet());
+    ASSERT_TRUE(WaitUntil([&] { return WatchFailed(); }));
+    // Reconnecting successfully cannot clear a still-failing GET.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_TRUE(WatchFailed());
+    auto& status = HAStatusManager::instance();
+    EXPECT_NE(status.SerializeDoctorJson().find("WRONGTYPE"),
+              std::string::npos);
+    status.SetDoctorIssue("OPLOG_READ_FAILED", "independent read failure");
+    ASSERT_NO_FATAL_FAILURE(RestorePollingGet());
+    ASSERT_TRUE(WaitUntil([&] { return !WatchFailed(); }));
+    EXPECT_NE(status.SerializeDoctorJson().find("OPLOG_READ_FAILED"),
+              std::string::npos);
+    EXPECT_EQ(SubscriberCount(), GetParam() ? 0 : 1);
+    ASSERT_NO_FATAL_FAILURE(ExpireLeaderAndExpectElection());
+}
+
+TEST_P(RedisElectionWatchRetryTest, CancellationClearsWatchFailure) {
+    ASSERT_NO_FATAL_FAILURE(BreakPollingGet());
+    ASSERT_TRUE(WaitUntil([&] { return WatchFailed(); }));
+    helper_->CancelElection();
+    ASSERT_EQ(election_.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    election_.get();
+    EXPECT_EQ(version_, 0);
+    EXPECT_EQ(lease_, 0);
+    EXPECT_FALSE(WatchFailed());
+}
+
+TEST_P(RedisElectionWatchRetryTest, RecoversLostPollingConnection) {
+    if (!FLAGS_redis_supports_client_kill) {
+        GTEST_SKIP() << "Connection loss requires CLIENT KILL";
+    }
+    const auto polling_id = PollingClientId();
+    // Leave the election, Pub/Sub and unrelated clients connected.
+    ASSERT_NO_FATAL_FAILURE(KillClient(polling_id));
+    ASSERT_TRUE(WaitUntil([&] { return WatchFailed(); }));
+    ASSERT_TRUE(WaitUntil([&] {
+        const auto recovered_id = PollingClientId();
+        return recovered_id > 0 && recovered_id != polling_id && !WatchFailed();
+    }));
+    EXPECT_EQ(SubscriberCount(), GetParam() ? 0 : 1);
+    ASSERT_NO_FATAL_FAILURE(ExpireLeaderAndExpectElection());
+}
+
+INSTANTIATE_TEST_SUITE_P(WatchModes, RedisElectionWatchRetryTest,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                             return info.param ? "Polling" : "PubSub";
+                         });
 
 }  // namespace testing
 }  // namespace mooncake
