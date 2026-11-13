@@ -172,11 +172,12 @@ TEST_F(OpLogManagerTest, InitialLatestReadDoesNotBlockStopWriting) {
     M().SetOpLogStore(store);
     auto initialize = std::async(std::launch::async,
                                  [&] { return M().SetInitialSequenceId(100); });
-    ASSERT_EQ(entered.wait_for(std::chrono::seconds(1)),
+    // Nonfatal checks keep release reachable before either future is joined.
+    EXPECT_EQ(entered.wait_for(std::chrono::seconds(1)),
               std::future_status::ready);
     auto stop =
         std::async(std::launch::async, [&] { M().RequestStopWriting(); });
-    ASSERT_EQ(stop.wait_for(std::chrono::milliseconds(200)),
+    EXPECT_EQ(stop.wait_for(std::chrono::milliseconds(200)),
               std::future_status::ready);
     store->release.set_value();
     stop.get();
