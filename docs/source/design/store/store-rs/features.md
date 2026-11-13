@@ -327,19 +327,18 @@ pure probes and do not report hits.
 
 ### Route-owner CAS reclaim
 
-When capacity pressure forces eviction:
+The storage owner claims an exact allocation generation before route CAS and
+checks the current allocator record and read pins before release. An explicitly
+applied CAS uses the local commit path. Conflicts restore tracking; unknown
+outcomes retain a pending token until authority confirmation resolves them.
+A missing lookup alone does not authorize release.
 
-- the storage owner first checks a bounded cursor slice of currently tracked local replicas for stale/orphan allocations whose authoritative route no longer references the local bytes
-- stale/orphan local allocations found in that bounded slice are reclaimed before the storage owner considers a live CLOCK victim
-- repeated reserve retries are rate-limited so pressure spikes do not repeatedly rescan the full tracked key set before every live eviction attempt
-- pending local reservations remain protected until their publish/timeout window expires, so fresh writes are not reclaimed early
-- `reclaim_grace_ms` applies to scheduled cleanup; eviction pressure may reclaim stale/orphan local bytes earlier after an authoritative active route has already moved away
-- route-missing/current-absent lookups are treated as inconclusive and do not release allocator bytes in this path; confirmed-deleted ghost reclaim is handled by a separate proof path
-- the storage owner picks a CLOCK victim
-- the matching route owner removes that replica with CAS
-- only after CAS succeeds does the storage owner release the local allocation
-
-This preserves route correctness during eviction and keeps reclaim coupled to the authoritative route version.
+Lifecycle-capable owners also retain pending publication and delete work.
+Lost writer notifications are recovered by exact reference queries, with
+bounded due batches, retry and reclaim grace. Legacy compatibility maintenance
+remains separate from the ordinary CLOCK victim path. See the
+[allocation lifecycle](allocation-lifecycle.md) for the protocol and rollout
+boundaries.
 
 ### Where local eviction runs
 
