@@ -12,9 +12,16 @@ namespace mooncake {
 struct MasterConfig {
     bool enable_metric_reporting;
     uint32_t metrics_port;
+    // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
+    // Stage: UPG1 / F02 Block 6 (metadata/RPC/admin entry) / IMPLEMENTATION.
+    // Replace the flat metrics fields with fixed U MasterConfig::metrics
+    // (MetricsBootstrapConfig); remove this temporary host scalar.
+    // Due: before F02 Block 6 / B05 implementation acceptance.
+    std::string metrics_host = "0.0.0.0";
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
+    std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
@@ -75,6 +82,12 @@ class MasterServiceSupervisorConfig {
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
     // Parameters with default values (optional parameters)
+    // TODO-REF(F02-T011, receiver=UPG1-F12-S50):
+    // Stage: UPG1 / F12-S50 (centralized HA) / IMPLEMENTATION.
+    // Replace this legacy scalar with U supervisor typed metrics/admin
+    // ownership; remove this temporary field.
+    // Due: before F12-S50 implementation acceptance; final TODO closure.
+    std::string metrics_host = "0.0.0.0";
     std::string rpc_address = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
@@ -107,6 +120,11 @@ class MasterServiceSupervisorConfig {
         // Set required parameters using RequiredParam
         enable_metric_reporting = config.enable_metric_reporting;
         metrics_port = static_cast<int>(config.metrics_port);
+        // TODO-REF(F02-T011, receiver=UPG1-F12-S50):
+        // Stage: UPG1 / F12-S50 (centralized HA) / IMPLEMENTATION.
+        // Replace this scalar copy with fixed U supervisor metrics wiring.
+        // Due: before F12-S50 implementation acceptance; final TODO closure.
+        metrics_host = config.metrics_host;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
@@ -204,6 +222,12 @@ class WrappedMasterServiceConfig {
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
     uint16_t http_port = 9003;
+    // TODO-REF(F02-T011, receiver=UPG1-F12-S50):
+    // Stage: UPG1 / F12-S50 (centralized HA) / IMPLEMENTATION.
+    // Remove this shared Wrapped HTTP field once both non-HA (Block 6)
+    // and HA startup use fixed U MasterAdminServer.
+    // Due: before F12-S50 implementation acceptance; final TODO closure.
+    std::string http_host = "0.0.0.0";
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -245,6 +269,12 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
+        // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
+        // Stage: UPG1 / F02 Block 6 (metadata/RPC/admin entry) / IMPLEMENTATION.
+        // Remove this non-HA HTTP copy; pass U metrics.host directly to
+        // the independent MasterAdminServer constructor instead.
+        // Due: before F02 Block 6 / B05 implementation acceptance.
+        http_host = config.metrics_host;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;
@@ -290,6 +320,12 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
+        // TODO-REF(F02-T011, receiver=UPG1-F12-S50):
+        // Stage: UPG1 / F12-S50 (centralized HA) / IMPLEMENTATION.
+        // Remove this old-supervisor-to-Wrapped HTTP copy when fixed U
+        // supervisor creates and owns MasterAdminServer.
+        // Due: before F12-S50 implementation acceptance; final TODO closure.
+        http_host = config.metrics_host;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;

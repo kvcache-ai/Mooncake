@@ -32,13 +32,16 @@
 #include "p2p/ha/oplog/redis_oplog_trim_worker.h"
 #endif
 
+#include "common.h"
+
 namespace mooncake {
 namespace {
 
 std::unique_ptr<coro_rpc::coro_rpc_server> CreateRpcServer(
     const P2PMasterConfig& config) {
     auto server = std::make_unique<coro_rpc::coro_rpc_server>(
-        config.rpc.thread_num, config.rpc.port, config.rpc.address,
+        config.rpc.thread_num,
+        buildHostNameWithPort(config.rpc.address, config.rpc.port),
         std::chrono::seconds(config.rpc.connection_timeout_seconds),
         config.rpc.enable_tcp_no_delay);
     const char* protocol = std::getenv("MC_RPC_PROTOCOL");
@@ -195,7 +198,8 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
     if (dedicated_heartbeat) {
         heartbeat_server.emplace(
             std::max<uint32_t>(1u, config_.rpc.heartbeat_thread_num),
-            config_.rpc.heartbeat_port, config_.rpc.address,
+            buildHostNameWithPort(config_.rpc.address,
+                                  config_.rpc.heartbeat_port),
             std::chrono::seconds(config_.rpc.connection_timeout_seconds),
             config_.rpc.enable_tcp_no_delay);
         RegisterP2PHeartbeatRpcService(*heartbeat_server, p2p_service);
@@ -246,7 +250,7 @@ int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
 int P2PMaster::RunStandalone() {
     HAStatusManager::instance().Configure(
         /*ha_enabled=*/false, config_.cluster_id,
-        config_.rpc.address + ":" + std::to_string(config_.rpc.port),
+        buildHostNameWithPort(config_.rpc.address, config_.rpc.port),
         config_.oplog.latest_stall_timeout_sec,
         config_.oplog.catchup_stall_timeout_sec);
     HAStatusManager::instance().SetRoleState("disabled", "STANDALONE");
@@ -269,7 +273,7 @@ int P2PMaster::RunWithHA() {
     }
 #endif  // STORE_USE_REDIS
     const std::string local_endpoint =
-        config_.rpc.address + ":" + std::to_string(config_.rpc.port);
+        buildHostNameWithPort(config_.rpc.address, config_.rpc.port);
     std::optional<P2PPrimaryDemotionHandoff> demoted_primary_handoff;
     while (true) {
         HAStatusManager::instance().ClearDoctorIssues();
@@ -277,7 +281,8 @@ int P2PMaster::RunWithHA() {
         // blocks inside ElectLeader below, so start the diagnostic server
         // before the active (primary-only) HTTP server exists.
         P2PStatusHttpServer status_http_server(
-            static_cast<uint16_t>(config_.metrics.http_port));
+            static_cast<uint16_t>(config_.metrics.http_port),
+            config_.metrics.host);
         status_http_server.Start();
         auto server = CreateRpcServer(config_);
         std::unique_ptr<P2PMasterView> master_view;
@@ -562,7 +567,8 @@ int P2PMaster::RunWithHA() {
                                                  primary_service));
             primary_snapshot_server =
                 std::make_unique<coro_rpc::coro_rpc_server>(
-                    1, config_.ha.snapshot_service_port, config_.rpc.address);
+                    1, buildHostNameWithPort(
+                           config_.rpc.address, config_.ha.snapshot_service_port));
             RegisterP2PStandbySnapshotRpcHandlers(
                 *primary_snapshot_server, primary_snapshot_service.get());
             auto snapshot_result = primary_snapshot_server->async_start();

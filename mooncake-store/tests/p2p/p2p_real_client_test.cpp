@@ -529,15 +529,18 @@ TEST_F(P2PRealClientTest, IPv6LoopbackPutGet) {
         GTEST_SKIP() << "IPv6 loopback unavailable: " << std::strerror(error);
     }
 
-    ASSERT_NO_FATAL_FAILURE(StartClients(1, "[::1]"));
+    ASSERT_NO_FATAL_FAILURE(StartClients(2, "[::1]"));
     P2PWriteRouteConfig local;
     local.remote_weight = 0.0;
     const std::string value = "P2P RealClient IPv6 loopback";
     ASSERT_EQ(clients_[0]->put("ipv6_loopback", value, local), 0);
     ExpectValue(clients_[0]->get_buffer("ipv6_loopback"), value);
+    // The second client must contact the published IPv6 peer RPC endpoint.
+    ExpectValue(clients_[1]->get_buffer("ipv6_loopback"), value);
     const auto descriptors = clients_[0]->get_replica_desc("ipv6_loopback");
     ASSERT_EQ(descriptors.size(), 1);
     EXPECT_EQ(descriptors.front().ip_address, "::1");
+    EXPECT_NE(descriptors.front().rpc_port, 0);
     EXPECT_EQ(descriptors.front().object_size, value.size());
 }
 

@@ -9,6 +9,8 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include "common/network.h"
+#include "config/metrics_bootstrap_config_loader.h"
 #include "default_config.h"
 #include "ha_helper.h"
 #include "http_metadata_server.h"
@@ -29,6 +31,10 @@ DEFINE_int32(
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
+DEFINE_string(metrics_host,
+              std::string(mooncake::MetricsBootstrapConfig::kDefaultHost),
+              "Address for the HTTP metrics/admin server to listen on. "
+              "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects");
 DEFINE_uint64(default_kv_soft_pin_ttl, mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS,
@@ -51,6 +57,9 @@ DEFINE_int32(
     "Port for RPC server to listen on (0 = use port, preferred over port)");
 DEFINE_string(rpc_address, "0.0.0.0",
               "Address for RPC server to bind to, required in HA mode");
+DEFINE_string(rpc_interface, "",
+              "Network interface name for RPC server address resolution. "
+              "When set, its IPv4 address overrides rpc_address");
 DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
@@ -119,6 +128,55 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+
+namespace {
+
+mooncake::MetricsBootstrapCommandLineOverrides
+GetMetricsBootstrapCommandLineOverrides() {
+    mooncake::MetricsBootstrapCommandLineOverrides command_line;
+    google::CommandLineFlagInfo info;
+    if (google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
+        !info.is_default) {
+        command_line.enabled = FLAGS_enable_metric_reporting;
+    }
+    if (google::GetCommandLineFlagInfo("metrics_port", &info) &&
+        !info.is_default) {
+        command_line.port = static_cast<uint32_t>(FLAGS_metrics_port);
+    }
+    if (google::GetCommandLineFlagInfo("metrics_host", &info) &&
+        !info.is_default) {
+        command_line.host = FLAGS_metrics_host;
+    }
+    return command_line;
+}
+
+void ResolveRpcAddressFromInterfaceOrDie(
+    mooncake::MasterConfig& master_config) {
+    if (master_config.rpc_interface.empty()) {
+        return;
+    }
+
+    if (!master_config.rpc_address.empty() &&
+        master_config.rpc_address != "0.0.0.0") {
+        LOG(WARNING) << "rpc_interface is set. Overriding rpc_address="
+                     << master_config.rpc_address;
+    }
+
+    auto resolved_address =
+        mooncake::GetInterfaceIPv4Address(master_config.rpc_interface);
+    if (!resolved_address) {
+        LOG(FATAL) << "Failed to resolve rpc_interface="
+                   << master_config.rpc_interface << ": "
+                   << resolved_address.error();
+    }
+
+    master_config.rpc_address = resolved_address.value();
+    LOG(INFO) << "Resolved rpc_interface=" << master_config.rpc_interface
+              << " to rpc_address=" << master_config.rpc_address;
+}
+
+}  // namespace
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -128,17 +186,14 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cxl_path);
     default_config.GetUInt64("cxl_size", &master_config.cxl_size,
                              FLAGS_cxl_size);
-    default_config.GetBool("enable_metric_reporting",
-                           &master_config.enable_metric_reporting,
-                           FLAGS_enable_metric_reporting);
-    default_config.GetUInt32("metrics_port", &master_config.metrics_port,
-                             FLAGS_metrics_port);
     default_config.GetUInt32("rpc_port", &master_config.rpc_port,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
                              FLAGS_rpc_thread_num);
     default_config.GetString("rpc_address", &master_config.rpc_address,
                              FLAGS_rpc_address);
+    default_config.GetString("rpc_interface", &master_config.rpc_interface,
+                             FLAGS_rpc_interface);
     default_config.GetInt32("rpc_conn_timeout_seconds",
                             &master_config.rpc_conn_timeout_seconds,
                             FLAGS_rpc_conn_timeout_seconds);
@@ -283,6 +338,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.rpc_address = FLAGS_rpc_address;
     }
+    if ((google::GetCommandLineFlagInfo("rpc_interface", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.rpc_interface = FLAGS_rpc_interface;
+    }
     if ((google::GetCommandLineFlagInfo("rpc_conn_timeout_seconds", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -292,16 +352,6 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
-    }
-    if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.enable_metric_reporting = FLAGS_enable_metric_reporting;
-    }
-    if ((google::GetCommandLineFlagInfo("metrics_port", &info) &&
-         !info.is_default) ||
-        !conf_set) {
-        master_config.metrics_port = FLAGS_metrics_port;
     }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
@@ -480,8 +530,8 @@ int main(int argc, char* argv[]) {
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_config_path;
+    mooncake::DefaultConfig default_config;
     if (!conf_path.empty()) {
-        mooncake::DefaultConfig default_config;
         default_config.SetPath(conf_path);
         try {
             default_config.Load();
@@ -492,6 +542,24 @@ int main(int argc, char* argv[]) {
         InitMasterConf(default_config, master_config);
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    try {
+        // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
+        // Stage: UPG1 / F02 Block 6 (metadata/RPC/admin entry) / IMPLEMENTATION.
+        // Replace this flat-copy adapter with U direct assignment to
+        // MasterConfig::metrics, including U source and error handling.
+        // Due: before F02 Block 6 / B05 implementation acceptance.
+        const auto metrics = mooncake::ResolveMetricsBootstrapConfig(
+            conf_path.empty() ? nullptr : &default_config,
+            GetMetricsBootstrapCommandLineOverrides());
+        master_config.enable_metric_reporting = metrics.enabled;
+        master_config.metrics_port = metrics.port;
+        master_config.metrics_host = metrics.host;
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Failed to resolve master metrics configuration: "
+                   << error.what();
+        return 1;
+    }
+    ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     if (master_config.enable_ha && master_config.etcd_endpoints.empty()) {
         LOG(FATAL) << "Etcd endpoints must be set when enable_ha is true";
@@ -600,6 +668,15 @@ int main(int argc, char* argv[]) {
         mooncake::WrappedMasterService wrapped_master_service(
             mooncake::WrappedMasterServiceConfig(master_config, version));
 
+        // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
+        // Stage: UPG1 / F02 Block 6 (metadata/RPC/admin entry) / IMPLEMENTATION.
+        // Replace this old-owner check with fixed U MasterAdminServer::Start
+        // in the non-HA startup path; remove this temporary adapter.
+        // Due: before F02 Block 6 / B05 implementation acceptance.
+        if (!wrapped_master_service.http_server_started()) {
+            LOG(ERROR) << "Failed to start master admin server";
+            return 1;
+        }
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();
     }

@@ -29,11 +29,22 @@ const uint64_t kMetricReportIntervalSeconds = 10;
 WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config)
     : master_service_(MasterServiceConfig(config)),
-      http_server_(4, config.http_port),
+      // TODO-REF(F02-T011, receiver=UPG1-F02-B05):
+      // Stage 1: UPG1 / F02 Block 6 / IMPLEMENTATION: move non-HA HTTP
+      // startup to U MasterAdminServer before Block 6 acceptance.
+      // Stage 2: UPG1 / F12-S50 / IMPLEMENTATION: remove this remaining
+      // shared Wrapped HTTP initializer with the HA owner migration.
+      // Final due: before S50 acceptance; no equivalent local wrapper.
+      http_server_(4, config.http_port, config.http_host),
       metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
 
-    if (config.enable_metric_reporting) {
+    // TODO-REF(F02-T011, receiver=UPG1-F12-S50):
+    // Stage: UPG1 / F12-S50 (centralized HA) / IMPLEMENTATION.
+    // Remove this started-state guard and the old Wrapped metric thread.
+    // Use fixed U MasterAdminServer::Start metric-thread ownership.
+    // Due: before F12-S50 implementation acceptance; final TODO closure.
+    if (http_server_started_ && config.enable_metric_reporting) {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_) {
                 std::string metrics_summary =

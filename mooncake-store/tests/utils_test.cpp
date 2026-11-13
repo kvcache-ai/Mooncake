@@ -249,3 +249,15 @@ TEST(UtilsTest, AutoPortBinderRebindRecoversAndReleasesPort) {
               0)
         << "port was not released, errno=" << errno;
 }
+
+TEST(UtilsTest, GetInterfaceIPv4AddressLoopback) {
+    auto address = GetInterfaceIPv4Address("lo");
+    ASSERT_TRUE(address.has_value()) << address.error();
+    EXPECT_EQ(address.value(), "127.0.0.1");
+}
+
+TEST(UtilsTest, GetInterfaceIPv4AddressMissingInterface) {
+    auto address = GetInterfaceIPv4Address("mooncake_missing_if");
+    ASSERT_FALSE(address.has_value());
+    EXPECT_NE(address.error().find("not found"), std::string::npos);
+}

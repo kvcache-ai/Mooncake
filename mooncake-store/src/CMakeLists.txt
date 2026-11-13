@@ -16,6 +16,7 @@ set(MOONCAKE_STORE_COMMON_CLIENT_SOURCES
     common/client_buffer_allocation.cpp
     common/mmap_buffer.cpp
     client_resources.cpp
+    config/client_auto_port_config.cpp
     posix_file.cpp
     client_buffer.cpp
     real_client.cpp
@@ -249,6 +250,7 @@ if(MOONCAKE_STORE_CLIENT_ARCH STREQUAL "centralized")
     set(MOONCAKE_STORE_CENTRALIZED_MASTER_SOURCES
         master_service.cpp
         master_metric_manager.cpp
+        config/metrics_bootstrap_config_loader.cpp
         ha_helper.cpp
         segment.cpp
         rpc_service.cpp

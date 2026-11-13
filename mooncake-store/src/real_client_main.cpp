@@ -15,6 +15,7 @@ DEFINE_string(master_server_address, "127.0.0.1:50051",
 DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
+DEFINE_string(local_buffer_size, "0", "Size of local buffer (e.g., 16MB, 1GB)");
 DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_uint32(client_rpc_port, 0,
@@ -30,10 +31,7 @@ int main(int argc, char* argv[]) {
     // spawning threads, leading to missing signal processing.
     mooncake::ResourceTracker::getInstance();
 
-    // when separately deploy real client,
-    // local buffer is shared by dummy client,
-    // real client does not have local buffer
-    const uint64_t local_buffer_size = 0;
+    size_t local_buffer_size = string_to_byte_size(FLAGS_local_buffer_size);
     const size_t global_segment_size =
         string_to_byte_size(FLAGS_global_segment_size);
 

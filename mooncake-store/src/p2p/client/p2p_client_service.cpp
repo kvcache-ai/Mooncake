@@ -19,6 +19,7 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_io/coro_io.hpp>
 
+#include "common.h"
 #include "common/scoped_vlog_timer.h"
 
 namespace mooncake {
@@ -510,8 +511,12 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     // 5. Start P2P client RPC service
     // Bind the peer listener before publishing its port to Master.
     client_rpc_service_.emplace(*data_manager_, client_id_, metrics_);
+    const auto& local_host = resources_.GetLocalIp();
+    const auto rpc_bind_host =
+        isValidIpV6(local_host) ? local_host : std::string("0.0.0.0");
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
-        config.rpc_thread_num, config.client_rpc_port);
+        config.rpc_thread_num,
+        buildHostNameWithPort(rpc_bind_host, config.client_rpc_port));
     RegisterClientRpcService(*client_rpc_server_, *client_rpc_service_);
     // async_start binds synchronously;
     // its future completes when the server exits.
@@ -1683,7 +1688,7 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                 data_manager_.get(), key, &slices));
         } else {
             std::string endpoint =
-                candidate.ip_address + ":" + std::to_string(candidate.rpc_port);
+                buildHostNameWithPort(candidate.ip_address, candidate.rpc_port);
             auto* peer = &GetOrCreatePeerClient(endpoint);
             if (transfer_direction_mode_ == TransferDirectionMode::FORWARD) {
                 if (data_manager_ == nullptr) {
@@ -2292,7 +2297,7 @@ std::vector<P2PClientService::ResolvedRoute> P2PClientService::LoadCachedRoutes(
                 continue;
             }
             std::string endpoint =
-                proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+                buildHostNameWithPort(proxy.ip_address, proxy.rpc_port);
             auto& peer = GetOrCreatePeerClient(endpoint);
             routes.push_back(
                 {&peer, proxy.object_size, /*is_cached=*/true, proxy});
@@ -2324,7 +2329,7 @@ P2PClientService::RouteDescriptorsToRoutes(
             continue;
         }
         std::string endpoint =
-            proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+            buildHostNameWithPort(proxy.ip_address, proxy.rpc_port);
         auto& peer = GetOrCreatePeerClient(endpoint);
         routes.push_back({&peer, total_size, /*is_cached=*/false, proxy});
     }
@@ -2975,8 +2980,8 @@ tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key,
                 continue;
             }
         } else {
-            auto& peer = GetOrCreatePeerClient(client.ip_address + ":" +
-                                               std::to_string(client.rpc_port));
+            auto& peer = GetOrCreatePeerClient(
+                buildHostNameWithPort(client.ip_address, client.rpc_port));
             RemoteRemoveRequest request{key, client.client_id};
             result = peer.RemoveRemoteData(request);
         }
@@ -3036,8 +3041,8 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAll(bool force) {
     tasks.reserve(clients->size());
     for (const auto& client : *clients) {
         if (client.client_id == client_id_) continue;
-        auto& peer = GetOrCreatePeerClient(client.ip_address + ":" +
-                                           std::to_string(client.rpc_port));
+        auto& peer = GetOrCreatePeerClient(
+            buildHostNameWithPort(client.ip_address, client.rpc_port));
         requests.push_back({client.client_id});
         tasks.push_back(peer.AsyncRemoveAllRemoteData(requests.back()));
     }
