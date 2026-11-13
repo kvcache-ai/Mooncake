@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -560,6 +561,45 @@ void DistributedStorageBackend::ExecuteShardBatchIo(
 void DistributedStorageBackend::ExecuteBucketBatchIo(
     std::vector<DfsIoOp>& ops,
     std::vector<tl::expected<void, ErrorCode>>& results, bool write) {
+    if (!fs_adapter_->SupportsBatchIo()) {
+        // Scalar adapters keep request order, including short-I/O completion.
+        // Reuse an fd only for consecutive reads of the same immutable bucket;
+        // an unlinked bucket can finish through this fd. The next call opens
+        // again rather than retaining a handle across requests.
+        auto first = ops.begin();
+        while (first != ops.end()) {
+            auto fd = OpenBucket(first->descriptor);
+            if (!fd) {
+                results[first->index] = tl::make_unexpected(fd.error());
+                ++first;
+                continue;
+            }
+            auto last = std::next(first);
+            while (last != ops.end() &&
+                   last->index == std::prev(last)->index + 1 &&
+                   last->descriptor.file_path == first->descriptor.file_path &&
+                   last->descriptor.shard_idx == first->descriptor.shard_idx) {
+                ++last;
+            }
+            for (auto it = first; it != last; ++it) {
+                results[it->index] =
+                    TransferAll(*fs_adapter_, *fd, std::move(it->iovs),
+                                it->file_offset, it->size, 0, write);
+            }
+            auto closed = fs_adapter_->CloseFile(*fd);
+            if (!closed) {
+                for (auto it = first; it != last; ++it) {
+                    if (results[it->index]) {
+                        results[it->index] =
+                            tl::make_unexpected(closed.error());
+                    }
+                }
+            }
+            first = last;
+        }
+        return;
+    }
+
     // Group ops by the full descriptor identity OpenBucket validates, so each
     // bucket is opened once per batch.
     std::map<std::pair<std::string, int>, std::vector<DfsIoOp*>> buckets;
@@ -860,11 +900,18 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     // Storage layout: bucket I/O uses temporary fds and completes short reads;
     // shard I/O reuses cached fds and fails short reads.
     const bool bucket_mode = UsesBucketAllocator();
-    // Execution mode: adapters that opt in (currently 3FS) collect validated
-    // reads for submission after the loop. Other adapters (including POSIX)
-    // execute each read in the loop, preserving per-request bucket handles
-    // and shard I/O locking.
-    const bool batch_io = fs_adapter_->SupportsBatchIo();
+    // Only collect scalar bucket reads when adjacent requests can share an fd;
+    // single-item and fully interleaved batches retain their original path.
+    // Native batching and shard locking keep their existing selection.
+    const bool batch_io =
+        fs_adapter_->SupportsBatchIo() ||
+        (bucket_mode &&
+         std::adjacent_find(
+             requests.begin(), requests.end(),
+             [](const auto& lhs, const auto& rhs) {
+                 return lhs.descriptor.file_path == rhs.descriptor.file_path &&
+                        lhs.descriptor.shard_idx == rhs.descriptor.shard_idx;
+             }) != requests.end());
     std::vector<DfsIoOp> ops;
     if (batch_io) ops.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {

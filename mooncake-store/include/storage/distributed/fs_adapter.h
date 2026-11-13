@@ -132,8 +132,8 @@ class FileSystemAdapter {
     virtual bool SupportsFdReopen() const { return false; }
 
     // Opt in to backend batching and concurrent positional I/O on cached
-    // shard fds. Other adapters retain per-request bucket handles and
-    // serialized shard I/O.
+    // shard fds. Other adapters retain serialized shard I/O; bucket reads may
+    // share a request-scoped handle while still completing each read in order.
     virtual bool SupportsBatchIo() const { return false; }
 
     // Whether ReadAt/BatchReadAt accept iovecs pointing at arbitrary writable

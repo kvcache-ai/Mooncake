@@ -132,13 +132,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     tl::expected<int, ErrorCode> OpenBucket(
         const DistributedFSDescriptor& descriptor);
     bool UsesBucketAllocator() const;
-    // Preserve per-request bucket handles and shard I/O locking for adapters
-    // that do not opt in to batching.
+    // Scalar writes retain per-request bucket handles; non-batched shard I/O
+    // retains its locking and reopen behavior.
     tl::expected<void, ErrorCode> ExecuteSingleIo(DfsIoOp& op, bool write);
-    // Resolve fds for validated ops and submit them through SubmitBatchIo.
-    // Both write failures into results[op.index]. Shard fds come from the
-    // shard cache; bucket fds are opened per batch, at most
-    // kMaxOpenBucketsPerBatch at a time, and closed after their submission.
+    // Execute validated ops, writing failures into results[op.index]. Shard
+    // fds come from the cache. Native bucket batches open at most
+    // kMaxOpenBucketsPerBatch fds; scalar bucket reads share one fd per
+    // consecutive same-bucket run and finish each op before the next.
     void ExecuteShardBatchIo(
         std::vector<DfsIoOp>& ops,
         std::vector<tl::expected<void, ErrorCode>>& results, bool write);
