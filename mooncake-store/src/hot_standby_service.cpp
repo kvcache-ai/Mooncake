@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <utility>
 
 #include "ha/kv/ha_kv_backend_factory.h"
 #include "ha_metric_manager.h"
@@ -86,6 +87,10 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         metadata_store_ = std::make_unique<StandbyMetadataStore>();
     }
     const bool preserve_baseline = preserve_promotion_baseline_;
+    // Without a reader, keep the cursor that a failed Start saved.
+    if (batch_standby_reader_) {
+        warm_start_cursor_ = batch_standby_reader_->GetResumeCursor();
+    }
     batch_standby_reader_.reset();
     if (!preserve_baseline) {
         batch_standby_kv_backend_.reset();
@@ -171,6 +176,8 @@ uint64_t HotStandbyService::GetLocalLastAppliedSequenceIdLocked() const {
 ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
     uint64_t& baseline_seq_id) {
     const uint64_t local_last_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    const std::optional<DurablePrefix> warm_start_cursor =
+        std::exchange(warm_start_cursor_, std::nullopt);
     const bool has_local_metadata =
         metadata_store_ && metadata_store_->GetKeyCount() > 0;
     const bool has_recoverable_local_state =
@@ -219,6 +226,14 @@ ErrorCode HotStandbyService::PrepareBootstrapBaselineLocked(
                   << "), recover last_seq_id=" << local_last_seq_id;
         oplog_applier_->Recover(local_last_seq_id);
         baseline_seq_id = local_last_seq_id;
+        if (warm_start_cursor &&
+            warm_start_cursor->last_seq == local_last_seq_id) {
+            // Resume after the last applied batch. Without the cursor the
+            // reader scans the OpLog from batch 1 again.
+            batch_snapshot_baseline_ = *warm_start_cursor;
+            LOG(INFO) << "Standby warm start resumes batch cursor, batch_id="
+                      << warm_start_cursor->batch_id;
+        }
     } else {
         auto snapshot_err = LoadSnapshotBaselineLocked(baseline_seq_id);
         if (snapshot_err != ErrorCode::OK) {
