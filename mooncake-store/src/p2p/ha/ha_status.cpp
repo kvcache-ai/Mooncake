@@ -553,6 +553,10 @@ void HAStatusManager::SetOpLogProgress(
     status_.oplog_lag = status_.latest_sequence_id > applied_sequence_id
                             ? status_.latest_sequence_id - applied_sequence_id
                             : 0;
+    // Use the same local watermark as /ha/status. On a primary this is the
+    // latest assigned sequence, which can differ from Redis's persisted latest.
+    HAMetricManager::instance().set_oplog_applied_sequence_id(
+        static_cast<int64_t>(applied_sequence_id));
     TouchLocked();
 }
 

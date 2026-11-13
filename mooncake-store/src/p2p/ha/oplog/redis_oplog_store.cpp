@@ -1036,13 +1036,6 @@ ErrorCode RedisOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
     }
     HAMetricManager::instance().set_oplog_last_sequence_id(
         static_cast<int64_t>(sequence_id));
-    // Keep the local metadata watermark exposed by Prometheus aligned with
-    // /ha/status. Primary has no OpLogApplier, so the primary supervisor
-    // supplies its latest assigned sequence as the local apply watermark.
-    if (enable_write_) {
-        HAMetricManager::instance().set_oplog_applied_sequence_id(
-            static_cast<int64_t>(sequence_id));
-    }
     return ErrorCode::OK;
 }
 

@@ -411,6 +411,7 @@ TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
     EXPECT_GT(snapshot.master_view_expires_in_ms, 0);
     EXPECT_EQ(snapshot.applied_sequence_id, 12u);
     EXPECT_EQ(snapshot.oplog_applied_sequence_id, 12u);
+    EXPECT_EQ(HAMetricManager::instance().get_oplog_applied_sequence_id(), 12);
     EXPECT_EQ(snapshot.latest_sequence_id, 15u);
     EXPECT_EQ(snapshot.oplog_latest_sequence_id, 15u);
     EXPECT_TRUE(snapshot.oplog_latest_read_ok);
@@ -423,6 +424,8 @@ TEST_F(HAStatusTest, StatusExposesClearOplogAndMasterViewAliases) {
 
     status.SetOpLogProgress(13, std::nullopt, 4, 5);
     snapshot = status.Snapshot();
+    EXPECT_EQ(snapshot.applied_sequence_id, 13u);
+    EXPECT_EQ(HAMetricManager::instance().get_oplog_applied_sequence_id(), 13);
     EXPECT_EQ(snapshot.latest_sequence_id, 15u);
     EXPECT_EQ(snapshot.oplog_latest_sequence_id, 15u);
     EXPECT_FALSE(snapshot.oplog_latest_read_ok);

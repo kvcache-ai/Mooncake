@@ -783,6 +783,9 @@ TEST_F(P2PMasterHttpEndpointsTest, HAStatusEndpointReturnsCurrentState) {
         ParseMetricValue(metrics_response.resp_body, "ha_registry_heartbeat_ok")
             .value_or(0),
         1);
+    EXPECT_EQ(ParseMetricValue(metrics_response.resp_body,
+                               "ha_oplog_applied_sequence_id"),
+              std::optional<int64_t>(12));
     EXPECT_GT(ParseMetricValue(metrics_response.resp_body,
                                "ha_status_updated_timestamp_ms")
                   .value_or(0),

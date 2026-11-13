@@ -313,18 +313,50 @@ TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
     EXPECT_EQ(2u, latest);
 }
 
-TEST_F(RedisOpLogStoreTest, PrimaryLatestSequenceUpdatesAppliedMetric) {
-    auto writer = CreateWriter();
+TEST_F(RedisOpLogStoreTest, LatestReadsPreserveLocalAppliedMetric) {
+    struct StatusResetGuard {
+        ~StatusResetGuard() { HAStatusManager::instance().Reset(); }
+    } reset_guard;
+    auto& status = HAStatusManager::instance();
+    auto& metrics = HAMetricManager::instance();
+    status.Reset();
+    status.Configure(true, cluster_id_, "local");
+    status.SetRoleState("primary", "RUNNING");
+
+    std::shared_ptr<RedisOpLogStore> writer(CreateWriter());
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
     ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(2), true));
-    ASSERT_EQ(ErrorCode::OK, writer->UpdateLatestSequenceId(2));
-    HAMetricManager::instance().set_oplog_applied_sequence_id(0);
+    OpLogManager manager;
+    manager.SetOpLogStore(writer);
+    ASSERT_EQ(manager.SetInitialSequenceId(2), ErrorCode::OK);
+    // Leave an allocated entry unpersisted so the two watermarks differ
+    // deterministically, without racing an asynchronous Redis writer.
+    const auto pending =
+        manager.AllocateEntry(OpType::PUT_END, "pending", "payload");
+    ASSERT_EQ(pending.sequence_id, 3u);
+    const auto persisted = manager.ReadLatestOpLogSequenceId();
+    ASSERT_TRUE(persisted.has_value());
+    ASSERT_EQ(*persisted, 2u);
+    status.SetOpLogProgress(manager.GetLastSequenceId(), *persisted);
+    EXPECT_EQ(status.Snapshot().applied_sequence_id, 3u);
+    EXPECT_EQ(status.Snapshot().latest_sequence_id, 2u);
+    EXPECT_EQ(metrics.get_oplog_applied_sequence_id(), 3);
 
     uint64_t latest = 0;
     ASSERT_EQ(ErrorCode::OK, writer->GetLatestSequenceId(latest));
     EXPECT_EQ(2u, latest);
-    EXPECT_EQ(static_cast<int64_t>(latest),
-              HAMetricManager::instance().get_oplog_applied_sequence_id());
+    EXPECT_EQ(metrics.get_oplog_last_sequence_id(), 2);
+    EXPECT_EQ(metrics.get_oplog_applied_sequence_id(), 3);
+    auto reader = CreateReader();
+    ASSERT_EQ(reader->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 2u);
+    EXPECT_EQ(metrics.get_oplog_applied_sequence_id(), 3);
+
+    ASSERT_EQ(manager.PersistEntry(pending, /*sync=*/true), ErrorCode::OK);
+    ASSERT_EQ(writer->GetLatestSequenceId(latest), ErrorCode::OK);
+    EXPECT_EQ(latest, 3u);
+    EXPECT_EQ(metrics.get_oplog_last_sequence_id(), 3);
+    EXPECT_EQ(metrics.get_oplog_applied_sequence_id(), 3);
 }
 
 TEST_F(RedisOpLogStoreTest, OpLogKeysDoNotUseRedisHashTags) {
