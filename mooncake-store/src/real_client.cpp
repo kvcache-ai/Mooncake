@@ -11,6 +11,7 @@
 #include <chrono>
 #include <stop_token>
 
+#include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
@@ -44,9 +45,18 @@ ResourceTracker& ResourceTracker::getInstance() {
 }
 
 ResourceTracker::ResourceTracker() {
-    // Start dedicated signal handling thread (best-effort)
-    startSignalThread();
-    // Register exit handler as a backstop
+    // In embedded environments (e.g. Python), the host runtime owns signal
+    // handling.  Blocking SIGINT with pthread_sigmask (done inside
+    // startSignalThread) would prevent Python from raising KeyboardInterrupt,
+    // causing the process to hang on Ctrl-C.  Detect Python at runtime via
+    // dlsym so we don't need to include <Python.h> or change any public API.
+    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
+        // Standalone C/C++ process – install our own signal handling.
+        startSignalThread();
+    }
+
+    // Register exit handler as a backstop (works in both standalone and
+    // embedded modes).
     std::atexit(exitHandler);
 }
 
