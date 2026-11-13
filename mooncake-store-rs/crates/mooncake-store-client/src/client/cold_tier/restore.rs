@@ -762,25 +762,90 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
     mooncake_store_core::apply_route_identity(&mut next, &task.object_id);
     next.qos_tier = task.qos_tier.clone();
 
+    for reservation in &reservations {
+        if reservation.owner == client.lease.runtime {
+            client
+                .allocator
+                .lock()
+                .mark_pending_restore_publication(reservation)?;
+        }
+    }
+
     let cas_tracker = OperationTracker::new("restore_promote_route_cas");
-    let cas_result = client.route_directory.compare_and_swap_object_route(
-        &client.lease,
-        &task.current.key,
-        Some(task.current.version),
-        Some(&next),
-    );
+    // Repeating the same CAS resolves a lost reply without a read/CAS gap.
+    let cas_result = client
+        .route_directory
+        .compare_and_swap_object_route(
+            &client.lease,
+            &task.current.key,
+            Some(task.current.version),
+            Some(&next),
+        )
+        .or_else(|_| {
+            client.route_directory.compare_and_swap_object_route(
+                &client.lease,
+                &task.current.key,
+                Some(task.current.version),
+                Some(&next),
+            )
+        });
     cas_tracker.finish(&cas_result, 0);
     let cas = match cas_result {
         Ok(cas) => cas,
         Err(error) => {
-            client.release_only_legacy_reservations_after_unknown_route_publish(
-                &reservations,
-                "restore_promote_route_cas_outcome_unknown",
-            );
-            return Err(error);
+            let mut all_referenced = true;
+            for (replica, reservation) in next.replicas.iter().zip(&reservations) {
+                match client.route_directory.confirm_replica_reference(
+                    &client.lease,
+                    &next.key,
+                    replica,
+                ) {
+                    Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
+                        client.storage_owner.track_route(&route);
+                        client
+                            .track_remote_storage_owners_best_effort(std::slice::from_ref(&route));
+                    }
+                    confirmation => {
+                        all_referenced = false;
+                        if reservation.owner == client.lease.runtime {
+                            client
+                                .storage_owner
+                                .pending_restore_publications
+                                .lock()
+                                .push_back(super::super::OwnerRestorePublication {
+                                    expected: task.current.clone(),
+                                    next: next.clone(),
+                                    reservation: reservation.clone(),
+                                    release_only: false,
+                                });
+                        }
+                        // Remote lifecycle owners already hold the pending
+                        // publication token created by reservation admission.
+                        warn!(
+                            runtime = %client.lease.runtime,
+                            owner = %reservation.owner,
+                            key = %next.key.0,
+                            allocation_id = reservation.allocation_id,
+                            error = %error,
+                            confirmation = ?confirmation,
+                            "restore promotion publication is indeterminate; retaining reservation"
+                        );
+                    }
+                }
+            }
+            return if all_referenced { Ok(()) } else { Err(error) };
         }
     };
     if !cas.applied {
+        if let Some(current) = cas
+            .current
+            .as_ref()
+            .filter(|current| route_references_restore_allocations(current, &next))
+        {
+            client.storage_owner.track_route(current);
+            client.track_remote_storage_owners_best_effort(std::slice::from_ref(current));
+            return Ok(());
+        }
         client.best_effort_release_reserved_allocations(
             &targets,
             &reservations,
@@ -1311,7 +1376,7 @@ fn release_owner_restore_reservation(
     route: &ObjectRoute,
     reservation: &mooncake_store_core::SegmentReservation,
     release_reason: &str,
-) {
+) -> bool {
     if let Err(error) = storage_owner.allocator.lock().release(
         &storage_owner.runtime,
         &reservation.segment_name,
@@ -1319,6 +1384,14 @@ fn release_owner_restore_reservation(
         reservation.length_bytes,
         reservation.allocation_id,
     ) {
+        storage_owner.pending_restore_publications.lock().push_back(
+            super::super::OwnerRestorePublication {
+                expected: route.clone(),
+                next: route.clone(),
+                reservation: reservation.clone(),
+                release_only: true,
+            },
+        );
         warn!(
             runtime = %storage_owner.runtime,
             key = %route.key.0,
@@ -1329,7 +1402,9 @@ fn release_owner_restore_reservation(
             release_reason,
             "failed to release unpublished cold restore reservation"
         );
+        return false;
     }
+    true
 }
 
 fn build_owner_restored_route(
@@ -1371,40 +1446,139 @@ fn build_owner_restored_route(
     next
 }
 
-fn sync_current_route_by_key(
-    storage_owner: &StorageOwnerState,
-    route_key: &ObjectKey,
-) -> Result<Option<ObjectRoute>> {
-    let current = storage_owner.route_ops.load_route(route_key)?;
-    if let Some(current) = current.as_ref() {
-        storage_owner.sync_route(current);
-    }
-    Ok(current)
+fn route_references_restore_allocations(current: &ObjectRoute, next: &ObjectRoute) -> bool {
+    current.key == next.key
+        && next.replicas.iter().all(|expected| {
+            current.replicas.iter().any(|replica| {
+                replica.owner == expected.owner
+                    && replica.segment_name == expected.segment_name
+                    && replica.segment_offset == expected.segment_offset
+                    && replica.length == expected.length
+                    && replica.allocation_id == expected.allocation_id
+            })
+        })
 }
 
 fn cas_owner_restored_route(
     storage_owner: &StorageOwnerState,
     current: &ObjectRoute,
     next: &ObjectRoute,
+    reservation: &mooncake_store_core::SegmentReservation,
 ) -> Result<Option<ObjectRoute>> {
-    let cas = storage_owner.route_ops.compare_and_swap_route(
-        &current.key,
-        Some(current.version),
-        Some(next),
-    );
+    // The retry context owns this reservation until a CAS has a definite
+    // outcome. It must not enter deadline-based absent-reference recovery.
+    storage_owner
+        .allocator
+        .lock()
+        .mark_pending_restore_publication(reservation)?;
+    let cas = storage_owner
+        .route_ops
+        .compare_and_swap_route(&current.key, Some(current.version), Some(next))
+        .or_else(|_| {
+            storage_owner.route_ops.compare_and_swap_route(
+                &current.key,
+                Some(current.version),
+                Some(next),
+            )
+        });
     match cas {
         Ok(cas) if cas.applied => {
             storage_owner.track_route(next);
             Ok(None)
         }
         Ok(cas) => {
-            if let Some(current) = cas.current.as_ref() {
-                storage_owner.sync_route(current);
+            let Some(current) = cas.current else {
+                release_owner_restore_reservation(
+                    storage_owner,
+                    current,
+                    reservation,
+                    "route_cas_missing",
+                );
+                return Err(StoreError::Conflict(format!(
+                    "cold restore route {} disappeared before publication",
+                    current.key.0
+                )));
+            };
+            if route_references_restore_allocations(&current, next) {
+                storage_owner.track_route(&current);
+                return Ok(None);
             }
-            Ok(cas.current)
+            storage_owner.sync_route(&current);
+            Ok(Some(current))
         }
-        Err(StoreError::Conflict(_)) => sync_current_route_by_key(storage_owner, &current.key),
-        Err(error) => Err(error),
+        Err(error) => {
+            // An RPC error does not prove that either CAS failed. Only an exact
+            // live reference resolves it here; absence still requires fencing.
+            match storage_owner
+                .route_ops
+                .confirm_replica_reference(&next.key, &next.replicas[0])
+            {
+                Ok(mooncake_store_core::RouteReplicaReference::Referenced(route)) => {
+                    storage_owner.track_route(&route);
+                    Ok(None)
+                }
+                confirmation => {
+                    storage_owner.pending_restore_publications.lock().push_back(
+                        super::super::OwnerRestorePublication {
+                            expected: current.clone(),
+                            next: next.clone(),
+                            reservation: reservation.clone(),
+                            release_only: false,
+                        },
+                    );
+                    warn!(
+                        runtime = %storage_owner.runtime,
+                        key = %current.key.0,
+                        allocation_id = reservation.allocation_id,
+                        error = %error,
+                        confirmation = ?confirmation,
+                        "cold restore publication is indeterminate; retaining reservation"
+                    );
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+impl StorageOwnerState {
+    pub(in super::super) fn recover_owner_restore_publications(&self) -> usize {
+        let count = self.pending_restore_publications.lock().len().min(64);
+        let mut resolved = 0;
+        for _ in 0..count {
+            let Some(context) = self.pending_restore_publications.lock().pop_front() else {
+                break;
+            };
+            if context.release_only {
+                resolved += usize::from(release_owner_restore_reservation(
+                    self,
+                    &context.expected,
+                    &context.reservation,
+                    "publication_release_retry",
+                ));
+                continue;
+            }
+            match cas_owner_restored_route(
+                self,
+                &context.expected,
+                &context.next,
+                &context.reservation,
+            ) {
+                Ok(None) => resolved += 1,
+                Ok(Some(_)) => {
+                    resolved += usize::from(release_owner_restore_reservation(
+                        self,
+                        &context.expected,
+                        &context.reservation,
+                        "publication_retry_conflict",
+                    ));
+                }
+                // Indeterminate attempts enqueue their context again. A
+                // definite missing-route conflict has already released it.
+                Err(_) => {}
+            }
+        }
+        resolved
     }
 }
 
@@ -1517,7 +1691,8 @@ fn promote_materialized_cold_backing(
             &cold_backing,
             &reservation,
         );
-        let Some(current) = cas_owner_restored_route(storage_owner, route, &next)? else {
+        let Some(current) = cas_owner_restored_route(storage_owner, route, &next, &reservation)?
+        else {
             return Ok(true);
         };
         if route_restore_race_resolved(storage_owner, &current)
@@ -1532,7 +1707,7 @@ fn promote_materialized_cold_backing(
             &cold_backing,
             &reservation,
         );
-        Ok(cas_owner_restored_route(storage_owner, &current, &next)?.is_none())
+        Ok(cas_owner_restored_route(storage_owner, &current, &next, &reservation)?.is_none())
     })();
     let route_update_us = t_route.elapsed().as_micros() as u64;
 
@@ -1550,10 +1725,7 @@ fn promote_materialized_cold_backing(
             release_owner_restore_reservation(storage_owner, route, &reservation, "route_race");
             Ok(None)
         }
-        Err(error) => {
-            release_owner_restore_reservation(storage_owner, route, &reservation, "error");
-            Err(error)
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -2315,8 +2487,8 @@ pub(in super::super) struct OwnerColdRestoreStagingContext {
 
 /// Phase 2: route CAS update (not on waiter critical path).
 /// On success the route gains a DRAM replica referencing the segment slot.
-/// On failure the reservation is released (safe: RDMA readers have already
-/// completed by the time CAS round-trips finish, ~2-4ms after publish).
+/// Confirmed unpublished reservations are released; unknown publication outcomes
+/// retain their reservation until an identical CAS retry resolves ownership.
 pub(in super::super) fn execute_owner_cold_restore_cas_phase(
     storage_owner: &StorageOwnerState,
     ctx: OwnerColdRestoreCasContext,
@@ -2330,7 +2502,9 @@ pub(in super::super) fn execute_owner_cold_restore_cas_phase(
             &ctx.cold_backing,
             &ctx.reservation,
         );
-        let Some(current) = cas_owner_restored_route(storage_owner, &ctx.route, &next)? else {
+        let Some(current) =
+            cas_owner_restored_route(storage_owner, &ctx.route, &next, &ctx.reservation)?
+        else {
             return Ok(true);
         };
         if route_restore_race_resolved(storage_owner, &current)
@@ -2345,7 +2519,7 @@ pub(in super::super) fn execute_owner_cold_restore_cas_phase(
             &ctx.cold_backing,
             &ctx.reservation,
         );
-        Ok(cas_owner_restored_route(storage_owner, &current, &next)?.is_none())
+        Ok(cas_owner_restored_route(storage_owner, &current, &next, &ctx.reservation)?.is_none())
     })();
     let route_update_us = t_route.elapsed().as_micros() as u64;
     let total_us = ctx.total_start.elapsed().as_micros() as u64;
@@ -2379,17 +2553,11 @@ pub(in super::super) fn execute_owner_cold_restore_cas_phase(
             );
         }
         Err(error) => {
-            release_owner_restore_reservation(
-                storage_owner,
-                &ctx.route,
-                &ctx.reservation,
-                "cas_phase_error",
-            );
             debug!(
                 runtime = %storage_owner.runtime,
                 route_key = %ctx.route.key.0,
                 error = %error,
-                "owner cold restore CAS failed — reservation released"
+                "owner cold restore CAS failed after publication confirmation"
             );
         }
     }

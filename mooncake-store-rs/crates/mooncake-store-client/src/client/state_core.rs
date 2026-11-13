@@ -120,10 +120,10 @@ fn membership_equivalent(left: &[ClientLease], right: &[ClientLease]) -> bool {
     };
     left.iter().all(|(runtime, expected)| {
         right.get(runtime).is_some_and(|candidate| {
-                candidate.runtime == expected.runtime
-                    && candidate.state == expected.state
-                    && candidate.compatibility == expected.compatibility
-                    && candidate.endpoints == expected.endpoints
+            candidate.runtime == expected.runtime
+                && candidate.state == expected.state
+                && candidate.compatibility == expected.compatibility
+                && candidate.endpoints == expected.endpoints
         })
     })
 }
@@ -392,7 +392,8 @@ mod state_core_tests {
         ];
 
         assert!(!membership_equivalent(&left, &right));
-    }    #[test]
+    }
+    #[test]
     fn stale_route_track_does_not_clear_reused_generation_pending_publication() {
         let owner = ClientRuntimeId::new("pending-owner", ClientEpoch(1));
         let segment_name = SegmentName::new("pending-segment");
@@ -755,7 +756,6 @@ mod state_core_tests {
         assert!(retry.is_ready(0));
         assert_eq!(retry.consecutive_failures, 0);
     }
-
 }
 
 #[derive(Default)]
@@ -808,6 +808,7 @@ struct StorageOwnerState {
     offload_mode: ColdTierOffloadMode,
     offload_priority: ColdTierOffloadPriorityConfig,
     owner_cold_restore_flights: OwnerColdRestoreFlightMap,
+    pending_restore_publications: Mutex<VecDeque<OwnerRestorePublication>>,
     cold_restore_io_tracker: ColdRestoreIoTracker,
     /// Signaled by offload when an entry becomes Materialized (clean).
     eviction_ready_signal: EvictionReadySignal,
@@ -816,6 +817,13 @@ struct StorageOwnerState {
     pending_staging_slots: Mutex<HashMap<(SegmentName, u64), (cold_tier::StagingSlot, Instant)>>,
     staging_pool_bytes: usize,
     staging_slot_ttl: Duration,
+}
+
+struct OwnerRestorePublication {
+    expected: ObjectRoute,
+    next: ObjectRoute,
+    reservation: mooncake_store_core::SegmentReservation,
+    release_only: bool,
 }
 
 #[derive(Default)]
@@ -932,6 +940,10 @@ struct LocalAllocatorState {
 
 #[derive(Clone, Debug)]
 enum PendingAllocation {
+    // A cold restore retry context owns this allocation until CAS completion.
+    RestorePublication {
+        allocation_id: u64,
+    },
     // Local publication is synchronously tracked by the allocation owner.
     Legacy {
         deadline_ms: u64,
@@ -1606,6 +1618,30 @@ impl LocalAllocatorState {
             .saturating_add(reservation.length_bytes);
     }
 
+    fn mark_pending_restore_publication(
+        &mut self,
+        reservation: &mooncake_store_core::SegmentReservation,
+    ) -> Result<()> {
+        let allocation = AllocationSpan {
+            segment_name: reservation.segment_name.clone(),
+            offset_bytes: reservation.offset_bytes,
+            length_bytes: reservation.length_bytes,
+        };
+        if self.allocation_id(&allocation) != Some(reservation.allocation_id) {
+            return Err(StoreError::Allocator(
+                "cannot hold a stale cold restore allocation".to_string(),
+            ));
+        }
+        self.remove_pending_allocation(&allocation);
+        self.pending_allocations.insert(
+            allocation,
+            PendingAllocation::RestorePublication {
+                allocation_id: reservation.allocation_id,
+            },
+        );
+        Ok(())
+    }
+
     fn ensure_pending_publication_capacity(
         &self,
         length_bytes: u64,
@@ -1661,6 +1697,7 @@ impl LocalAllocatorState {
     ) -> Option<PendingAllocation> {
         let pending = self.pending_allocations.remove(allocation)?;
         match &pending {
+            PendingAllocation::RestorePublication { .. } => {}
             PendingAllocation::Legacy { deadline_ms } => {
                 self.pending_deadlines.remove(&PendingDeadline {
                     deadline_ms: *deadline_ms,
@@ -1703,7 +1740,8 @@ impl LocalAllocatorState {
             };
             let should_clear = match self.pending_allocations.get(&allocation) {
                 Some(PendingAllocation::Legacy { .. }) => true,
-                Some(PendingAllocation::Publication { allocation_id, .. }) => {
+                Some(PendingAllocation::Publication { allocation_id, .. })
+                | Some(PendingAllocation::RestorePublication { allocation_id }) => {
                     replica.allocation_id.filter(|id| *id != 0) == Some(*allocation_id)
                 }
                 None => false,
@@ -1730,7 +1768,8 @@ impl LocalAllocatorState {
             .iter()
             .filter(|(allocation, pending)| match pending {
                 PendingAllocation::Legacy { deadline_ms } => *deadline_ms > now_ms,
-                PendingAllocation::Publication { allocation_id, .. } => {
+                PendingAllocation::Publication { allocation_id, .. }
+                | PendingAllocation::RestorePublication { allocation_id } => {
                     self.allocation_id(allocation) == Some(*allocation_id)
                 }
             })
@@ -1743,7 +1782,8 @@ impl LocalAllocatorState {
             .get(allocation)
             .is_some_and(|pending| match pending {
                 PendingAllocation::Legacy { deadline_ms } => *deadline_ms > now_ms,
-                PendingAllocation::Publication { allocation_id, .. } => {
+                PendingAllocation::Publication { allocation_id, .. }
+                | PendingAllocation::RestorePublication { allocation_id } => {
                     self.allocation_id(allocation) == Some(*allocation_id)
                 }
             })
@@ -1871,15 +1911,13 @@ impl LocalAllocatorState {
                         *confirmation_in_progress = true;
                         true
                     }
-                    PendingAllocation::Legacy { .. } | PendingAllocation::Publication { .. } => {
-                        false
-                    }
+                    PendingAllocation::Legacy { .. }
+                    | PendingAllocation::Publication { .. }
+                    | PendingAllocation::RestorePublication { .. } => false,
                 },
             );
             if matches_current {
-                candidates.push(PendingPublication {
-                    identity,
-                });
+                candidates.push(PendingPublication { identity });
             }
         }
         candidates
@@ -1910,10 +1948,10 @@ impl LocalAllocatorState {
                         *pending_next_attempt_at_ms = next_attempt_at_ms;
                         Some(previous)
                     }
-                    PendingAllocation::Legacy { .. } | PendingAllocation::Publication { .. } => {
-                        None
-                    }
-        });
+                    PendingAllocation::Legacy { .. }
+                    | PendingAllocation::Publication { .. }
+                    | PendingAllocation::RestorePublication { .. } => None,
+                });
         if let Some(previous_next_attempt_at_ms) = previous_next_attempt_at_ms {
             self.remove_pending_publication_ready(
                 previous_next_attempt_at_ms,
@@ -1942,7 +1980,6 @@ impl LocalAllocatorState {
             })
             .collect()
     }
-
 }
 
 #[derive(Clone, Copy)]
@@ -2045,7 +2082,13 @@ impl SegmentAllocator {
                 .ok_or_else(|| {
                 StoreError::Allocator("segment reservation overflow".to_string())
             })?;
-            self.allocations.insert(offset_bytes, SegmentAllocation { length_bytes, allocation_id });
+            self.allocations.insert(
+                offset_bytes,
+                SegmentAllocation {
+                    length_bytes,
+                    allocation_id,
+                },
+            );
             return Ok(mooncake_store_core::SegmentReservation {
                 owner: owner.clone(),
                 segment_name: segment_name.clone(),
@@ -2389,7 +2432,6 @@ enum ReclaimMode {
     Scheduled,
     Immediate,
     Deferred,
-
 }
 
 #[cfg(test)]
@@ -2444,11 +2486,14 @@ mod offload_pin_tests {
                 reservation.allocation_id,
             )
             .expect("duplicate deferred release should be idempotent");
-        assert_eq!(allocator.allocation_identity(&AllocationSpan {
-            segment_name: segment_name.clone(),
-            offset_bytes: reservation.offset_bytes,
-            length_bytes: reservation.length_bytes,
-        }), Some(identity.clone()));
+        assert_eq!(
+            allocator.allocation_identity(&AllocationSpan {
+                segment_name: segment_name.clone(),
+                offset_bytes: reservation.offset_bytes,
+                length_bytes: reservation.length_bytes,
+            }),
+            Some(identity.clone())
+        );
         assert_eq!(allocator.usage_bytes().0, 4096);
 
         allocator

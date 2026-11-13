@@ -258,9 +258,7 @@ fn allocator_pressure_batches_pending_cold_victims() {
         .transport(Arc::new(TestTransport::new(
             "background-eviction-batch-offload-segment",
         )))
-        .local_memory(
-            storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO),
-        )
+        .local_memory(storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO))
         .cold_tier_target(cold_tier_test_config_with_root(
             "background-eviction-batch-offload",
             cold_root.clone(),
@@ -289,12 +287,10 @@ fn allocator_pressure_batches_pending_cold_victims() {
         .try_begin_materialization()
         .expect("test should reserve the generic materializer guard");
 
-    assert!(
-        client
-            .storage_owner
-            .evict_one_for_reservation_blocking(None)
-            .expect("allocator-pressure eviction should succeed")
-    );
+    assert!(client
+        .storage_owner
+        .evict_one_for_reservation_blocking(None)
+        .expect("allocator-pressure eviction should succeed"));
     for key in &keys {
         let route = client
             .query_route(key)
@@ -315,7 +311,10 @@ fn allocator_pressure_batches_pending_cold_victims() {
             "status=\"ok\"",
         ],
     );
-    assert_eq!(backend_batches, 1, "pending victims should share one backend write batch");
+    assert_eq!(
+        backend_batches, 1,
+        "pending victims should share one backend write batch"
+    );
 
     let _ = std::fs::remove_dir_all(cold_root);
 }
@@ -333,9 +332,7 @@ fn allocator_pressure_batches_hot_only_cold_victims() {
         .transport(Arc::new(TestTransport::new(
             "background-eviction-hot-only-batch-segment",
         )))
-        .local_memory(
-            storage_config_with_bytes(256).eviction_poll_interval(Duration::ZERO),
-        )
+        .local_memory(storage_config_with_bytes(256).eviction_poll_interval(Duration::ZERO))
         .cold_tier_target(cold_tier_test_config_with_root(
             "background-eviction-hot-only-batch",
             cold_root.clone(),
@@ -363,12 +360,10 @@ fn allocator_pressure_batches_hot_only_cold_victims() {
         })
         .collect::<Vec<_>>();
 
-    assert!(
-        client
-            .storage_owner
-            .evict_one_for_reservation_blocking(None)
-            .expect("allocator-pressure eviction should succeed")
-    );
+    assert!(client
+        .storage_owner
+        .evict_one_for_reservation_blocking(None)
+        .expect("allocator-pressure eviction should succeed"));
     for key in &keys {
         let route = client
             .query_route(key)
@@ -449,7 +444,10 @@ fn background_materializer_drains_single_target_admission_waves() {
             "status=\"ok\"",
         ],
     );
-    assert_eq!(backend_batches, 2, "eight writes should use two four-entry waves");
+    assert_eq!(
+        backend_batches, 2,
+        "eight writes should use two four-entry waves"
+    );
     let admission_retries = prometheus_counter_value(
         &metrics,
         "mooncake_store_cold_tier_operation_total{",
@@ -480,9 +478,7 @@ fn stale_pending_entry_does_not_reoffload_materialized_route() {
         .transport(Arc::new(TestTransport::new(
             "stale-pending-materialized-route-segment",
         )))
-        .local_memory(
-            storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO),
-        )
+        .local_memory(storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO))
         .cold_tier_target(cold_tier_test_config_with_root(
             "stale-pending-materialized-route",
             cold_root.clone(),
@@ -570,9 +566,7 @@ fn forced_eviction_preserves_in_flight_offload_owner() {
         .transport(Arc::new(TestTransport::new(
             "forced-eviction-in-flight-owner-segment",
         )))
-        .local_memory(
-            storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO),
-        )
+        .local_memory(storage_config_with_bytes(128).eviction_poll_interval(Duration::ZERO))
         .cold_tier_target(cold_tier_test_config_with_root(
             "forced-eviction-in-flight-owner",
             cold_root.clone(),
@@ -615,12 +609,10 @@ fn forced_eviction_preserves_in_flight_offload_owner() {
     }));
 
     client.storage_owner.pending_offloads.retry(claimed);
-    assert!(
-        client
-            .storage_owner
-            .evict_one_blocking(None)
-            .expect("eviction should proceed after the owner releases the key")
-    );
+    assert!(client
+        .storage_owner
+        .evict_one_blocking(None)
+        .expect("eviction should proceed after the owner releases the key"));
     let materialized = client
         .query_route("forced-eviction-in-flight-owner")
         .expect("route query should succeed")
@@ -842,6 +834,12 @@ fn batch_is_readable_uses_bounded_lookup_for_evicted_cold_only_entry() {
     let full_reads = Arc::new(AtomicUsize::new(0));
     client.route_directory = Arc::new(CountingRouteDirectory {
         inner: client.route_directory.clone(),
+        miss_bounded_reads: AtomicBool::new(false),
+        miss_full_reads: AtomicBool::new(false),
+        bounded_read_hook: Mutex::new(None),
+        owner_visit_hook: Mutex::new(None),
+        before_single_cas_hook: Mutex::new(None),
+        after_single_cas_hook: Mutex::new(None),
         injected_routes: Mutex::new(BTreeMap::new()),
         get_object_routes_calls: AtomicUsize::new(0),
         bounded_reads: bounded_reads.clone(),

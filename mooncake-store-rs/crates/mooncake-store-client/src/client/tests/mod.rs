@@ -1,3 +1,14 @@
+mod full_lifecycle_cold_probe;
+mod full_lifecycle_delete_probe;
+mod full_lifecycle_offload_nof_boundary;
+mod full_lifecycle_publication_probe;
+mod full_lifecycle_restart_probe;
+mod full_restore_retry_tests;
+mod route_cas_boundary_tests;
+mod route_clock_cold_read_tests;
+mod route_clock_offload_tests;
+mod route_snapshot_boundary_tests;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::fs;
@@ -155,6 +166,12 @@ struct CountingMetadataBackend {
 
 struct CountingRouteDirectory {
     inner: Arc<dyn RouteDirectory>,
+    miss_bounded_reads: AtomicBool,
+    miss_full_reads: AtomicBool,
+    bounded_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    owner_visit_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    before_single_cas_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    after_single_cas_hook: Mutex<Option<Box<dyn FnOnce(&mooncake_store_core::CasResult) + Send>>>,
     injected_routes: Mutex<BTreeMap<String, ObjectRoute>>,
     get_object_routes_calls: AtomicUsize,
     bounded_reads: Arc<AtomicUsize>,
@@ -546,6 +563,12 @@ impl CountingRouteDirectory {
     fn new(inner: Arc<dyn RouteDirectory>) -> Self {
         Self {
             inner,
+            miss_bounded_reads: AtomicBool::new(false),
+            miss_full_reads: AtomicBool::new(false),
+            bounded_read_hook: Mutex::new(None),
+            owner_visit_hook: Mutex::new(None),
+            before_single_cas_hook: Mutex::new(None),
+            after_single_cas_hook: Mutex::new(None),
             injected_routes: Mutex::new(BTreeMap::new()),
             get_object_routes_calls: AtomicUsize::new(0),
             bounded_reads: Arc::new(AtomicUsize::new(0)),
@@ -2013,6 +2036,9 @@ impl RouteDirectory for CountingRouteDirectory {
         key: &ObjectKey,
     ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
         self.full_reads.fetch_add(1, Ordering::Relaxed);
+        if self.miss_full_reads.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         if let Some(route) = self.injected_route(key) {
             return Ok(Some(route));
         }
@@ -2035,6 +2061,9 @@ impl RouteDirectory for CountingRouteDirectory {
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.get_object_routes_calls.fetch_add(1, Ordering::Relaxed);
         self.full_reads.fetch_add(1, Ordering::Relaxed);
+        if self.miss_full_reads.load(Ordering::Relaxed) {
+            return Ok(vec![None; keys.len()]);
+        }
         let mut routes = self.inner.get_object_routes(observer, keys)?;
         for (key, route) in keys.iter().zip(routes.iter_mut()) {
             if let Some(injected) = self.injected_route(key) {
@@ -2050,6 +2079,13 @@ impl RouteDirectory for CountingRouteDirectory {
         keys: &[ObjectKey],
     ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
         self.bounded_reads.fetch_add(1, Ordering::Relaxed);
+        let hook = self.bounded_read_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        if self.miss_bounded_reads.load(Ordering::Relaxed) {
+            return Ok(vec![None; keys.len()]);
+        }
         let mut routes = self.inner.get_object_routes_bounded(observer, keys)?;
         for (key, route) in keys.iter().zip(routes.iter_mut()) {
             if let Some(injected) = self.injected_route(key) {
@@ -2092,8 +2128,18 @@ impl RouteDirectory for CountingRouteDirectory {
         next: Option<&ObjectRoute>,
     ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
         self.single_cas_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .compare_and_swap_object_route(observer, key, expected, next)
+        let before = self.before_single_cas_hook.lock().take();
+        let after = self.after_single_cas_hook.lock().take();
+        if let Some(before) = before {
+            before();
+        }
+        let result = self
+            .inner
+            .compare_and_swap_object_route(observer, key, expected, next)?;
+        if let Some(after) = after {
+            after(&result);
+        }
+        Ok(result)
     }
 
     fn compare_and_swap_object_routes(
@@ -2134,6 +2180,10 @@ impl RouteDirectory for CountingRouteDirectory {
             .visit_routes_by_replica_owner_consistent(observer, owner, visitor)?;
         if let Some(injected) = self.injected_route_for_owner(owner) {
             visitor(injected)?;
+        }
+        let hook = self.owner_visit_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
         Ok(())
     }
@@ -2183,6 +2233,15 @@ impl RouteDirectory for CountingRouteDirectory {
         }
         self.inner
             .get_allocation_route_reference_keys_consistent(observer, identities)
+    }
+
+    fn get_allocation_route_references_consistent(
+        &self,
+        observer: &ClientLease,
+        identities: &[AllocationRouteIdentity],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::AllocationRouteReferenceState>> {
+        self.inner
+            .get_allocation_route_references_consistent(observer, identities)
     }
 
     fn metadata(&self) -> &dyn MetadataBackend {
@@ -21604,6 +21663,146 @@ fn capacity_pressure_forces_bounded_reclaim_of_untracked_allocation() {
             .expect("stale route lookup should succeed")
             .is_none(),
         "forced candidate reclaim must not republish the deleted route"
+    );
+}
+
+#[test]
+fn background_eviction_recovers_after_bounded_route_miss() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "bounded-route-miss")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(Arc::new(TestTransport::new("bounded-route-miss-segment")))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(64)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client should build");
+    client
+        .register_local_memory()
+        .expect("memory should register");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    for index in 0..4 {
+        let route = client
+            .put(&format!("live-{index}"), b"0123456789abcdef")
+            .expect("public put should fill local capacity");
+        wait_for_storage_clock_route(&client, &route, false);
+        owner.track_route(&route);
+    }
+    directory.miss_bounded_reads.store(true, Ordering::Relaxed);
+    let initial = owner
+        .evict_until_low_watermark(90, 50)
+        .expect("transient bounded miss should fail closed");
+    assert_eq!(initial, 0);
+    directory.miss_bounded_reads.store(false, Ordering::Relaxed);
+    sleep(Duration::from_millis(120));
+    let recovered = owner
+        .evict_until_low_watermark(90, 50)
+        .expect("healthy authorities should allow eviction again");
+    eprintln!(
+        "recovered={recovered} usage={} pending={} clock={}",
+        owner.allocator.lock().usage_bytes().0,
+        owner.pending_evictions.lock().len(),
+        owner
+            .hot_replicas
+            .clock
+            .lock()
+            .entries
+            .iter()
+            .filter(|x| x.is_some())
+            .count(),
+    );
+    client.storage_owner = owner;
+    client
+        .put("after-recovery", b"fedcba9876543210")
+        .expect("public put must resume after the bounded lookup recovers");
+}
+
+#[test]
+fn repeated_public_put_recovers_after_clock_misses() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let mut client = StoreClientBuilder::new(metadata, "clock-miss-queue")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(Arc::new(TestTransport::new("clock-miss-queue-segment")))
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(16 * 1024)
+                .scratch_bytes(4096)
+                .alignment(1)
+                .eviction_poll_interval(Duration::ZERO),
+        )
+        .build(test_future_expiry_ms())
+        .expect("client should build");
+    client
+        .register_local_memory()
+        .expect("memory should register");
+    let directory = Arc::new(CountingRouteDirectory::new(client.route_directory.clone()));
+    let owner = test_storage_owner_state_with_route_directory(
+        &client,
+        directory.clone(),
+        ColdTierOffloadPriorityConfig::default(),
+    );
+    for index in 0..1024 {
+        let route = client
+            .put(&format!("queue-live-{index}"), b"0123456789abcdef")
+            .expect("public put should fill local capacity");
+        owner.track_route(&route);
+    }
+    directory.miss_bounded_reads.store(true, Ordering::Relaxed);
+    for _ in 0..4 {
+        assert_eq!(
+            owner
+                .evict_until_low_watermark(90, 50)
+                .expect("bounded miss"),
+            0,
+        );
+    }
+    directory.miss_bounded_reads.store(false, Ordering::Relaxed);
+    client.storage_owner = owner.clone();
+    let mut successful_writes = 0;
+    for index in 0..40 {
+        sleep(Duration::from_millis(120));
+        if client
+            .put(&format!("queue-recovered-{index}"), b"fedcba9876543210")
+            .is_ok()
+        {
+            successful_writes += 1;
+        }
+    }
+    eprintln!(
+        "successful_writes={successful_writes} usage={} pending={} clock={}",
+        owner.allocator.lock().usage_bytes().0,
+        owner.pending_evictions.lock().len(),
+        owner
+            .hot_replicas
+            .clock
+            .lock()
+            .entries
+            .iter()
+            .filter(|x| x.is_some())
+            .count(),
+    );
+    assert_eq!(
+        successful_writes, 40,
+        "public writes must recover after the route lookup recovers"
+    );
+    assert!(
+        owner.pending_evictions.lock().is_empty(),
+        "recovery must drain the reclaim queue"
     );
 }
 
