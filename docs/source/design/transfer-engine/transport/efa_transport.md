@@ -109,7 +109,7 @@ pip install -e ../mooncake-wheel --no-build-isolation
 (efa-distributable-wheel)=
 ### 4. Building a Distributable Wheel (optional)
 
-To produce a relocatable wheel for distribution (instead of the editable install above), use `scripts/build_wheel.sh`, which runs `auditwheel repair` to bundle non-system dependencies:
+To produce a relocatable wheel for distribution (instead of the editable install above), use `scripts/build_wheel.sh`, which runs `auditwheel repair` to bundle non-system dependencies. Every wheel ships the Conductor client, so the script fails unless the cmake command above also passed `-DWITH_CONDUCTOR=ON`:
 
 ```bash
 # Run from the repository root, after the cmake/make build above completes:
