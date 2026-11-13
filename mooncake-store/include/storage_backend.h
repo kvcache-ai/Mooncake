@@ -53,6 +53,8 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    // Guarded by BucketStorageBackend::mutex_; not serialized.
+    bool offload_notification_pending_ = false;
     // Index into BucketStorageBackend::disks_ identifying which disk holds
     // this bucket's files. Not serialized: Init() re-derives it from the disk
     // the .meta file was found on.
