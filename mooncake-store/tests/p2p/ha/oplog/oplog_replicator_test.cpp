@@ -143,11 +143,11 @@ class BatchRecordingOpLogStore : public MockOpLogStore {
         return ErrorCode::OK;
     }
 
-    int ReadCount() const { return read_count_; }
+    int ReadCount() const { return read_count_.load(); }
     size_t LastLimit() const { return last_limit_.load(); }
 
    private:
-    int read_count_{0};
+    std::atomic<int> read_count_{0};
     std::atomic<size_t> last_limit_{0};
 };
 
